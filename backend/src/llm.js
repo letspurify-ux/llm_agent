@@ -3,7 +3,7 @@
 // 인터페이스는 함수 시그니처 하나가 전부다:
 //   decide(ctx) → Promise<{action:'answer', answer}
 //                        |{action:'run_query', query_name, params}>
-//   ctx = {question, knowledge[], qaMethods[], queries[], history[], forceAnswer?}
+//   ctx = {question, chat[], knowledge[], qaMethods[], queries[], history[], forceAnswer?}
 //
 // LLM_PROVIDER=openai 이면 vLLM/OpenRouter(OpenAI 호환 API), 아니면 규칙 기반 Mock.
 // agent.js는 provider가 바뀌어도 변경되지 않는다.
@@ -58,12 +58,21 @@ const PARAM_RULES = {
 };
 
 // 바인드 값 채우기: ① 이전 쿼리 결과의 컬럼명 매칭(대소문자 무시) → multi-step 연결
-//                  ② 질문에서 정규식 추출  ③ 따옴표 문자열 fallback. 하나라도 못 채우면 null.
+//                  ② 현재 질문 → 최근 질문 순으로 정규식 추출 (후속 질문 대응)
+//                  ③ 따옴표 문자열 fallback. 하나라도 못 채우면 null.
 function fillParams(registryRow, ctx) {
   const params = {};
+  // 현재 질문을 먼저 본다 — 이전 질문의 오래된 값이 현재 대상을 덮어쓰지 않도록.
+  const texts = [ctx.question, ...(ctx.chat || []).filter(m => m.role === 'user').map(m => m.text).reverse()];
+
   for (const name of bindNames(registryRow.query_sql)) {
     let value = valueFromHistory(name, ctx.history);
-    if (value === undefined && PARAM_RULES[name]) value = PARAM_RULES[name](ctx.question);
+    if (value === undefined && PARAM_RULES[name]) {
+      for (const t of texts) {
+        value = PARAM_RULES[name](t);
+        if (value !== undefined) break;
+      }
+    }
     if (value === undefined) value = (ctx.question.match(/["']([^"']+)["']/) || [])[1];
     if (value === undefined) return null;
     params[name] = value;

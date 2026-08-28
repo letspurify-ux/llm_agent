@@ -13,6 +13,7 @@ export default function App() {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const bottomRef = useRef(null);
+  const historyRef = useRef([]);   // 서버로 보낼 대화 이력 (setState 비동기와 무관하게 즉시 반영)
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -20,6 +21,7 @@ export default function App() {
 
   async function ask(message) {
     if (!message || loading) return;
+    historyRef.current = [...historyRef.current, { role: 'user', text: message }];
     setMessages(m => [...m, { role: 'user', text: message }]);
     setInput('');
     setLoading(true);
@@ -27,10 +29,13 @@ export default function App() {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message }),
+        // 서버는 상태를 저장하지 않으므로 최근 대화를 함께 보낸다 (후속 질문 해석용)
+        body: JSON.stringify({ message, history: historyRef.current.slice(-6) }),
       });
       const data = await res.json();
-      setMessages(m => [...m, { role: 'assistant', text: data.answer ?? data.error, trace: data.trace }]);
+      const answer = data.answer ?? data.error;
+      historyRef.current = [...historyRef.current, { role: 'assistant', text: answer }];
+      setMessages(m => [...m, { role: 'assistant', text: answer, trace: data.trace }]);
     } catch {
       setMessages(m => [...m, { role: 'assistant', text: '서버와 통신하지 못했습니다.' }]);
     } finally {
@@ -98,6 +103,12 @@ export default function App() {
           <input
             value={input}
             onChange={e => setInput(e.target.value)}
+            onKeyDown={e => {
+              if (e.key !== 'Enter') return;
+              // 조합 중 Enter는 폼 제출까지 막는다 — 한글 IME에서 조합 확정 Enter가 오전송되는 문제 방지.
+              e.preventDefault();
+              if (!e.nativeEvent.isComposing) ask(input.trim());
+            }}
             placeholder="질문을 입력하세요 (예: BATCH001 작업 상태 알려줘)"
             autoFocus
           />
