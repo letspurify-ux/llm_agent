@@ -2,6 +2,9 @@
 // 검색 구현은 이 파일에만 있다 — 향후 vector 검색으로 전환할 때 이 두 함수 내부만 교체한다.
 import { query } from './db.js';
 
+const LIMIT = 20;         // LLM에 넘길 최대 후보 수 (건당 약 84토큰)
+const TITLE_WEIGHT = 3;   // 제목 매칭은 본문 매칭보다 높게 — 제목이 문서의 주제를 나타낸다
+
 export function searchKnowledge(question) {
   return likeSearch('knowledge', ['title', 'content'], question);
 }
@@ -10,21 +13,29 @@ export function searchQaMethods(question) {
   return likeSearch('qa_method', ['title', 'method'], question);
 }
 
-// 질문을 공백으로 분리 → 2자 이상 토큰 → 컬럼별 LIKE '%tok%' OR 결합 → 최대 5건
+// 질문을 토큰으로 나눠 LIKE 매칭하고, 관련도 점수 순으로 상위 LIMIT건을 돌려준다.
+// 점수 = Σ (컬럼 가중치 × 토큰 길이)
+//   - 여러 토큰이 맞을수록, 제목에 맞을수록, 긴(구체적인) 토큰이 맞을수록 높다
+//   - 조사를 뗀 변형 토큰은 원형보다 짧으므로 자연히 낮게 반영된다
 async function likeSearch(table, columns, question) {
   const tokens = [...new Set(question.split(/\s+/).flatMap(expandToken).filter(t => t.length >= 2))];
   if (tokens.length === 0) return [];
 
-  const conditions = [];
+  const scoreParts = [];
   const params = [];
   for (const tok of tokens) {
-    for (const col of columns) {
-      conditions.push(`${col} LIKE ?`);
+    columns.forEach((col, i) => {
+      const weight = (i === 0 ? TITLE_WEIGHT : 1) * tok.length;
+      scoreParts.push(`CASE WHEN ${col} LIKE ? THEN ${weight} ELSE 0 END`);
       params.push(`%${tok}%`);
-    }
+    });
   }
+
+  // LIKE '%...%'는 인덱스를 못 쓰므로 WHERE로 거르나 HAVING으로 거르나 비용이 같다.
+  // 점수를 한 번만 계산하도록 HAVING을 쓴다 (파라미터 중복 없음).
   return query(
-    `SELECT * FROM ${table} WHERE ${conditions.join(' OR ')} ORDER BY seq LIMIT 5`,
+    `SELECT *, ${scoreParts.join(' + ')} AS _score FROM ${table}
+     HAVING _score > 0 ORDER BY _score DESC, seq LIMIT ${LIMIT}`,
     params
   );
 }
