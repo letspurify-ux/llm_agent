@@ -20,7 +20,11 @@ const SYSTEM_PROMPT = `당신은 사내 지식 관리 및 DB 조회 Q&A 에이�
 - 관련 지식이나 쿼리 실행 결과가 있으면 반드시 그것에 근거해서 답하라.
 - 관련 지식·처리 방법·쿼리 결과가 전혀 없으면 너의 일반 지식으로 답하되, 답변 서두에 "*등록된 지식에 없는 내용이라 일반 지식으로 답변합니다.*" 한 줄을 붙여라.
 - 일반 지식으로 답할 때도 사내 시스템의 구체적 상태(수치, 상태값, 일정 등)는 절대 지어내지 마라. 확인이 필요하면 확인 방법을 안내하라.
-- answer는 markdown 형식으로 구조화하라: 조회 결과는 표(table)로, 항목 나열은 목록으로, 섹션 구분은 ### 제목으로 작성한다.`;
+- answer는 markdown 형식으로 구조화하라: 조회 결과는 표(table)로, 항목 나열은 목록으로, 섹션 구분은 ### 제목으로 작성한다.
+
+## 대화 맥락
+최근 대화가 함께 주어진다. 현재 질문이 이전 대화를 가리키면(예: "그럼 김철수는?", "재시작은 어떻게 해?") 최근 대화를 참고해
+무엇을 묻는지 해석한 뒤 판단하라. 단, 이미 조회한 값이라도 현재 질문의 대상이 다르면 반드시 쿼리를 다시 실행하라.`;
 
 export async function openaiDecide(ctx) {
   const userPrompt = buildPrompt(ctx);
@@ -56,7 +60,14 @@ async function chatCompletion(userPrompt) {
 }
 
 function buildPrompt(ctx) {
-  const lines = [`## 사용자 질문\n${ctx.question}`];
+  const lines = [];
+
+  if (ctx.chat?.length) {
+    lines.push('## 최근 대화');
+    for (const m of ctx.chat) lines.push(`- ${m.role === 'user' ? '사용자' : '에이전트'}: ${m.text}`);
+    lines.push('');
+  }
+  lines.push(`## 사용자 질문 (현재)\n${ctx.question}`);
 
   lines.push(`\n## 관련 지식 (${ctx.knowledge.length}건)`);
   for (const k of ctx.knowledge) lines.push(`- [${k.title}] ${k.content}`);

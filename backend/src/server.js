@@ -13,7 +13,8 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json({ error: 'message가 필요합니다.' });
   }
   try {
-    const { answer, trace } = await handleQuestion(message.trim());
+    // history: 클라이언트가 보내는 최근 대화 [{role:'user'|'assistant', text}] (서버는 상태를 저장하지 않는다)
+    const { answer, trace } = await handleQuestion(message.trim(), req.body?.history);
     res.json({
       answer,
       trace: trace.map(h => ({
