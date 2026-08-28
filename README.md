@@ -4,7 +4,7 @@
 
 ```
 사용자 질문 (+ 최근 대화)
-  → 지식/Q&A 처리방법 LIKE 검색 (MariaDB, 여러 건 매칭 가능)
+  → 지식/Q&A 처리방법 검색 (MariaDB, LIKE + 관련도 정렬, 상위 20건)
   → LLM 결정 루프: 답변 가능하면 답변 / DB 조회가 필요하면 쿼리 관리 테이블의 쿼리 실행 (여러 번 가능)
   → 최종 답변 (+ 실행된 쿼리 trace)
 ```
@@ -32,7 +32,7 @@ backend/
   src/agent.js               # agentic loop (핵심 제어 흐름)
   src/llm.js                 # LLM 인터페이스 + Mock (provider 선택)
   src/llm-openai.js          # OpenAI 호환 클라이언트 (vLLM/OpenRouter)
-  src/search.js              # LIKE 검색 — vector 검색 교체 지점
+  src/search.js              # LIKE 검색 + 관련도 정렬 — vector 검색 교체 지점
   src/db.js                  # MariaDB 풀 + 관리 테이블 로더
   src/oracle.js              # Oracle 실행기 + SELECT 전용 가드 + mock 모드
 frontend/                    # Vite + React 채팅 UI (App.jsx 단일 컴포넌트)
@@ -146,6 +146,18 @@ LLM 인터페이스는 `llm.js`의 `decide(ctx) → {action:'answer'|'run_query'
 - 그래도 조회 계정(`target_db.db_user`)은 **read-only 권한 계정**을 사용할 것 (심층 방어)
 - `db_password`는 `ENV:변수명` 형식으로 환경변수 참조 권장. 평문 저장은 개발용만
 - 조회 결과는 `maxRows: 100` 제한. 결과가 길면 LLM 컨텍스트/답변에는 20행·셀당 200자까지만 전달하고 "외 N건 생략 (총 N건)"으로 표기 (`agent.js`의 `capRows`)
+
+## 검색
+
+지식·Q&A 처리방법은 질문을 토큰으로 나눠 LIKE 매칭하고 **관련도 점수 순 상위 20건**을 LLM에 넘긴다 (`search.js`).
+
+- 점수 = Σ (컬럼 가중치 × 토큰 길이) — 여러 토큰이 맞을수록, 제목에 맞을수록, 긴(구체적인) 토큰이 맞을수록 높다
+- 제목 매칭은 본문 매칭의 3배로 친다
+- 한국어 조사 대응: 3자 이상 토큰은 끝 1~2글자를 뗀 형태도 함께 검색 ("가상계측이" → "가상계측")
+
+쿼리 목록(`query_registry`)은 검색하지 않고 **전체를 프롬프트에 싣는다** — 목록에서 빠지면 실행 자체가
+불가능하기 때문이다. 쿼리가 수십 건으로 늘면 `query_sql`을 프롬프트에서 빼는 것만으로 토큰이 절반 이하가 된다
+(바인드 변수 정보는 `input_desc`에 있으므로 실행 시에만 SQL을 꺼내 쓰면 된다).
 
 ## 향후 확장 지점
 
