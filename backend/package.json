@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
-    "embed": "node src/embed-sync.js"
+    "dev": "node scripts/ensure-env.js && node src/server.js",
+    "embed": "node src/embed-sync.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
