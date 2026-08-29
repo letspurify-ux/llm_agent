@@ -4,7 +4,7 @@
 //   LLM_API_KEY   vLLM은 보통 빈 값(헤더 생략), OpenRouter는 필수
 //   LLM_MODEL     예) Qwen/Qwen2.5-32B-Instruct, anthropic/claude-sonnet-4.5
 // SDK 없이 Node 내장 fetch 사용.
-import { MAX_ROWS } from './oracle.js';
+import { MAX_ROWS } from './constants.js';
 
 const SYSTEM_PROMPT = `당신은 사내 지식 관리 및 DB 조회 Q&A 에이전트다.
 사용자 질문과 함께 관련 지식, Q&A 처리 방법, 실행 가능한 쿼리 목록, 지금까지의 쿼리 실행 이력이 주어진다.
@@ -94,13 +94,17 @@ function buildPrompt(ctx) {
   lines.push('\n## 쿼리 실행 이력');
   if (!ctx.history.length) lines.push('(없음)');
   for (const h of ctx.history) {
-    if (h.error) {
+    if (h.note) {
+      // 루프 가드가 남긴 제어용 기록 — 실패가 아니므로 '오류'로 알리지 않는다 (모델이 실패로 오해해 불필요한 우회를 하지 않게)
+      lines.push(`- ${h.query_name} params=${JSON.stringify(h.params)} → 실행하지 않음: ${h.note}`);
+    } else if (h.error) {
       lines.push(`- ${h.query_name} params=${JSON.stringify(h.params)} → 오류: ${h.error}`);
     } else {
+      const totalRows = h.totalRows ?? h.rows.length;
       const note = h.capped
         ? ` (조회 상한 ${MAX_ROWS}건 도달 — 실제 총 건수는 더 많을 수 있음, 처음 ${h.rows.length}건만 표시)`
-        : h.totalRows > h.rows.length ? ` (총 ${h.totalRows}건 중 처음 ${h.rows.length}건만 표시)` : '';
-      lines.push(`- ${h.query_name} params=${JSON.stringify(h.params)} → 결과 ${h.totalRows}${h.capped ? '+' : ''}건${note}: ${JSON.stringify(h.rows)}`);
+        : totalRows > h.rows.length ? ` (총 ${totalRows}건 중 처음 ${h.rows.length}건만 표시)` : '';
+      lines.push(`- ${h.query_name} params=${JSON.stringify(h.params)} → 결과 ${totalRows}${h.capped ? '+' : ''}건${note}: ${JSON.stringify(h.rows)}`);
     }
   }
 

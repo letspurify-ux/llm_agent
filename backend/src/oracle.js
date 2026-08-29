@@ -3,51 +3,39 @@
 // ORACLE_MOCK=1 이면 실제 접속 없이 하단 MOCK_DATA의 stub 결과를 반환한다.
 import oracledb from 'oracledb';
 import { loadTargetDb } from './db.js';
+import { bindNames, assertReadOnly } from './sql.js';
+import { MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK, numEnv } from './constants.js';
 
-// CLOB은 기본값이 Lob 스트림 객체다 — 커넥션을 닫으면 무효가 되고 JSON 직렬화도 되지 않으므로
-// 문자열로 받는다 (agent.js의 셀 길이 제한이 그대로 적용된다).
-oracledb.fetchAsString = [oracledb.CLOB];
+// 드라이버 경계에서 타입을 확정한다. LOB은 기본값이 Lob 스트림 객체라 커넥션을 닫으면 무효가 되고
+// JSON 직렬화 시 순환 참조로 예외가 난다 — CLOB만이 아니라 NCLOB/BLOB도 같은 위험이므로 전부 다룬다.
+// 날짜류를 문자열로 받는 이유는 아래 NLS_SESSION_FORMATS 주석 참고.
+//
+// fetchTypeHandler로 직접 타입을 지정하지 않는다: 핸들러가 돌려준 타입은 드라이버가 매핑 없이
+// 그대로 쓰기 때문에, CLOB에 VARCHAR(oracledb.STRING)를 주면 VARCHAR 한도에서 잘린다.
+// fetchAsString/fetchAsBuffer는 드라이버가 각 타입의 올바른 대상(CLOB→LONG, NCLOB→LONG_NVARCHAR,
+// BLOB→LONG_RAW, DATE/TIMESTAMP/TZ/LTZ→VARCHAR)을 스스로 계산한다.
+oracledb.fetchAsString = [oracledb.CLOB, oracledb.NCLOB, oracledb.DATE];
+oracledb.fetchAsBuffer = [oracledb.BLOB];
 
-// 조회 결과 상한 — capped 판정(agent.js)과 사용자 안내 문구(llm*.js)가 같은 값을 봐야 한다
-export const MAX_ROWS = 100;
+// 날짜/시각은 JS Date로 받지 않고 DB가 직접 포맷한 문자열로 받는다.
+//   - JS Date를 로컬 getter로 다시 렌더링하면 TIMESTAMP WITH (LOCAL) TIME ZONE에서
+//     Node 프로세스 TZ와 DB TZ가 다를 때 조용히 어긋난다(UTC 컨테이너 ↔ KST DB = 9시간).
+//   - 세션 포맷을 고정해두면 그 문자열을 다음 스텝의 바인드로 되돌려도 같은 세션 포맷으로
+//     암묵 변환되므로, multi-step 날짜 연결에서 ORA-01861이 나지 않는다.
+// 부작용: 등록 SQL이 포맷 마스크 없는 TO_CHAR(d)/TO_DATE(s)를 쓰면 이제 서버 기본값이 아니라
+// 이 포맷을 따른다. 서버 설정에 따라 달라지던 것이 고정되는 것이므로 등록 쿼리는 포맷을 명시할 것.
+const NLS_SESSION_FORMATS =
+  "ALTER SESSION SET NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS'" +
+  " NLS_TIMESTAMP_FORMAT='YYYY-MM-DD HH24:MI:SS'" +
+  " NLS_TIMESTAMP_TZ_FORMAT='YYYY-MM-DD HH24:MI:SS TZH:TZM'";
 
-// 조회 타임아웃(ms). 잘못된 값은 기본값으로 되돌린다 —
-// 드라이버는 NaN에 NJS-004를 던지므로, 검증 없이 두면 오타 하나로 모든 조회가 실패한다.
-const TIMEOUT_MS = (() => {
-  const raw = process.env.ORACLE_TIMEOUT_MS;
-  const v = Number(raw ?? 30_000);
-  if (Number.isFinite(v) && v >= 0) return v;
-  console.warn(`[oracle] ORACLE_TIMEOUT_MS 값이 올바르지 않아 기본값(30초)을 사용합니다: ${raw}`);
-  return 30_000;
-})();
+// 조회 타임아웃(ms). 0/음수/NaN/빈 값은 기본값으로 되돌린다 —
+// 드라이버는 NaN에 NJS-004를 던지고, 0은 "타임아웃 없음"이라 오타 하나가 무한 대기를 만든다.
+const TIMEOUT_MS = numEnv('ORACLE_TIMEOUT_MS', 30_000);
 
-// 문자열 리터럴과 주석을 공백으로 지운 SQL — 둘 다 "코드가 아닌 부분"이므로
-// 바인드 추출과 조회 전용 가드가 같은 기준을 봐야 한다. 하나의 정규식으로 왼쪽부터 훑어
-// 먼저 시작하는 쪽(리터럴 속 --, 주석 속 ' 등)이 매칭되게 한다.
-const SQL_NOISE = /q'\[[\s\S]*?\]'|q'\{[\s\S]*?\}'|q'\([\s\S]*?\)'|q'<[\s\S]*?>'|'(?:[^']|'')*'|--[^\n]*|\/\*[\s\S]*?\*\//gi;
-const stripNoise = sql => sql.replace(SQL_NOISE, ' ');
-
-// query_sql에서 :bind 변수명 추출.
-// 리터럴의 TO_CHAR(D, 'HH24:MI')나 주석 속 ':name'이 바인드로 잡히면 안 되므로 둘 다 지운 뒤 찾는다.
-export function bindNames(sql) {
-  return [...new Set([...stripNoise(sql).matchAll(/:(\w+)/g)].map(m => m[1]))];
-}
-
-// 조회 전용 가드: 의도치 않은 UPDATE/DELETE/DDL 실행 방지.
-// (1) 주석 제거 후 SELECT 또는 WITH로 시작하는 문장만 허용 (Oracle의 WITH는 조회 전용)
-// (2) 세미콜론이 포함된 다중 문장 금지
-// 추가로 target_db의 계정 자체를 read-only 권한으로 만드는 것을 권장한다 (README 참고).
-function assertReadOnly(sql) {
-  // 리터럴도 함께 지운다 — LISTAGG(name, '; ')처럼 값에 든 세미콜론을 다중 문장으로 오판하지 않도록
-  const s = stripNoise(sql).trim();
-  if (!/^(SELECT|WITH)\b/i.test(s)) {
-    throw new Error('조회(SELECT) 쿼리만 실행할 수 있습니다.');
-  }
-  if (s.replace(/;\s*$/, '').includes(';')) {
-    throw new Error('다중 문장 쿼리는 실행할 수 없습니다.');
-  }
-}
-
+// 반환: { rows, totalRows, capped } — rows는 MAX_ROWS까지, 셀은 MAX_CELL_LEN까지 정규화된 값.
+// capped는 "상한에 걸려 잘렸다"는 뜻이므로 MAX_ROWS+1건을 요청해 판정한다
+// (정확히 MAX_ROWS건인 완전한 결과를 "더 있을 수 있음"으로 잘못 알리지 않도록).
 export async function runQuery(registryRow, params = {}) {
   assertReadOnly(registryRow.query_sql);
 
@@ -58,7 +46,7 @@ export async function runQuery(registryRow, params = {}) {
   if (missing.length) throw new Error(`바인드 변수 누락: ${missing.join(', ')}`);
   const binds = Object.fromEntries(names.map(n => [n, params[n]]));
 
-  if (process.env.ORACLE_MOCK === '1') return mockResult(registryRow.query_name, binds);
+  if (process.env.ORACLE_MOCK === '1') return capResult(mockResult(registryRow.query_name, binds));
 
   const target = await loadTargetDb(registryRow.target_db_name);
   if (!target) throw new Error(`조회대상 DB를 찾을 수 없음: ${registryRow.target_db_name}`);
@@ -77,24 +65,56 @@ export async function runQuery(registryRow, params = {}) {
     // 초과 시 오류가 나고 agent가 history에 기록해 LLM이 안내 답변한다.
     // 반드시 try 안에서 설정한다 — 드라이버가 던지면 밖에서는 finally의 close가 실행되지 않아 커넥션이 샌다.
     conn.callTimeout = TIMEOUT_MS;
+    await setSessionFormats(conn);
     // 사용자 입력은 바인드 값으로만 전달한다 (SQL 문자열 결합 금지)
     const result = await conn.execute(registryRow.query_sql, binds, {
       outFormat: oracledb.OUT_FORMAT_OBJECT,
-      maxRows: MAX_ROWS,
+      maxRows: MAX_ROWS + 1,
     });
-    return formatDates(result.rows ?? []);
+    return capResult(result.rows ?? []);
   } finally {
     await conn.close().catch(() => {}); // close 실패가 원본 쿼리 오류를 덮어쓰지 않게
   }
 }
 
-// DATE/TIMESTAMP 컬럼은 JS Date로 오는데, JSON.stringify가 이를 UTC(toISOString)로 직렬화한다.
-// 그대로 두면 KST 서버에서 DB의 '2026-08-28 01:00'이 프롬프트·로그에 9시간 어긋난 값으로 실린다.
-// DB에서 보이는 그대로의 시각 문자열로 바꿔 전달한다.
-function formatDates(rows) {
-  return rows.map(row => Object.fromEntries(
-    Object.entries(row).map(([k, v]) => [k, v instanceof Date ? localDateTime(v) : v])
-  ));
+// 세션 포맷 고정은 표기 품질을 위한 것이지 조회의 전제 조건이 아니다 —
+// 실패해도 조회는 계속한다 (여기서 던지면 부가 설정 하나가 모든 조회를 막는다).
+// 실패 시 날짜는 DB 기본 NLS 포맷 문자열로 오고, 그 값을 다음 스텝 바인드로 되돌릴 때만
+// 포맷 불일치(ORA-01861) 가능성이 남는다.
+let nlsWarned = false;
+async function setSessionFormats(conn) {
+  try {
+    await conn.execute(NLS_SESSION_FORMATS);
+  } catch (e) {
+    if (!nlsWarned) {
+      nlsWarned = true;
+      console.warn(`[oracle] 세션 날짜 포맷 고정 실패 — DB 기본 포맷을 사용합니다: ${e.message}`);
+    }
+  }
+}
+
+function capResult(allRows) {
+  const capped = allRows.length > MAX_ROWS;
+  const rows = allRows.slice(0, MAX_ROWS).map(normalizeCells);
+  return { rows, totalRows: rows.length, capped };
+}
+
+// 셀 값 정규화 — LOB/이진 값이 그대로 history와 chat_log(JSON)로 흘러가지 않게 드라이버 경계에서 처리한다.
+// 길이 제한을 여기서 적용하는 이유: 대형 CLOB 문자열을 즉시 잘라내 downstream(프롬프트·로그)에
+// 남지 않게 하기 위함. 단, 드라이버가 LOB을 메모리에 올리는 비용 자체는 남는다 (maxRows로만 제한됨).
+function normalizeCells(row) {
+  return Object.fromEntries(Object.entries(row).map(([k, v]) => [k, normalizeValue(v)]));
+}
+
+function normalizeValue(v) {
+  if (typeof v === 'string') {
+    return v.length > MAX_CELL_LEN ? v.slice(0, MAX_CELL_LEN) + TRUNC_MARK : v;
+  }
+  if (Buffer.isBuffer(v)) return `<binary ${v.length} bytes>`;
+  // fetchTypeHandler가 날짜류를 문자열로 받으므로 정상 경로에서는 Date가 오지 않는다.
+  // 드라이버 매핑이 바뀌더라도 JSON.stringify가 UTC로 직렬화해 시각이 어긋나는 일이 없게 방어한다.
+  if (v instanceof Date) return localDateTime(v);
+  return v;
 }
 
 function localDateTime(d) {
@@ -110,24 +130,29 @@ function resolvePassword(stored) {
 }
 
 // ===== ORACLE_MOCK=1 개발용 stub 데이터 =====
-// batch_job_status가 FAILED를 반환해 "쿼리 결과 + 지식 결합 답변" 시나리오를 시연한다.
-// oracle-init.sql의 샘플 배치와 같은 데이터
+// oracle-init.sql의 샘플 배치와 같은 데이터 — mock과 실제 컨테이너가 다른 답을 내면
+// mock으로 검증한 시나리오가 실제 배포에서 재현되지 않는다.
+// BATCH001이 FAILED라 "쿼리 결과 + 지식 결합 답변" 시나리오를 시연한다.
 const MOCK_JOBS = [
   { JOB_ID: 'BATCH001', JOB_NAME: '일별 정산 배치', STATUS: 'FAILED',  LAST_RUN_AT: '2026-08-28 01:00' },
   { JOB_ID: 'BATCH002', JOB_NAME: '주문 집계 배치', STATUS: 'SUCCESS', LAST_RUN_AT: '2026-08-29 02:10' },
   { JOB_ID: 'BATCH003', JOB_NAME: '고객 등급 산정', STATUS: 'RUNNING', LAST_RUN_AT: '2026-08-29 03:00' },
 ];
 
+// 등록 SQL(seed.sql)과 같은 비교·정렬·출력 컬럼을 쓴다.
+// Oracle 문자열 비교는 대소문자를 구분하므로 mock도 구분한다 — mock에서만 통과하는
+// 파라미터(status:'failed' 등)가 실제 DB에서 0건이 되는 것을 데모 단계에서 드러내기 위함.
 const MOCK_DATA = {
-  batch_job_status: p => [
-    { JOB_ID: p.job_id, STATUS: 'FAILED', LAST_RUN_AT: '2026-08-28 01:00' },
-  ],
+  batch_job_status: p => MOCK_JOBS
+    .filter(j => j.JOB_ID === p.job_id)
+    .map(({ JOB_ID, JOB_NAME, STATUS, LAST_RUN_AT }) => ({ JOB_ID, JOB_NAME, STATUS, LAST_RUN_AT })),
   // seed의 '경로B 데모' 쿼리 (qa_method 없이 query_desc만으로 선택된다) — 등록 SQL의 출력 컬럼과 동일하게 STATUS는 제외
   batch_list_by_status: p => MOCK_JOBS
-    .filter(j => j.STATUS === String(p.status ?? '').toUpperCase())
+    .filter(j => j.STATUS === p.status)
+    .sort((a, b) => b.LAST_RUN_AT.localeCompare(a.LAST_RUN_AT)) // ORDER BY LAST_RUN_AT DESC
     .map(({ STATUS, ...row }) => row),
   find_customer_id: p => [
-    { CUSTOMER_ID: 'C-1001', CUSTOMER_NAME: p.customer_name },
+    { CUSTOMER_ID: 'C-1001', CUSTOMER_NAME: p.customer_name, GRADE: 'VIP' },
   ],
   order_status_by_customer: p => [
     { ORDER_ID: 'O-777', CUSTOMER_ID: p.customer_id, STATUS: '배송중', ORDER_DATE: '2026-08-27' },

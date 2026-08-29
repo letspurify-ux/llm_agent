@@ -2,6 +2,12 @@ import { useState, useRef, useEffect, memo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
+// 서버(agent.js normalizeChat)가 실제로 쓰는 상한과 같은 값. 서버 쪽 제한은 본문을 파싱한 뒤에
+// 적용되므로 요청 크기를 실제로 묶어두는 것은 이쪽뿐이다 — 넘기면 express의 본문 크기 제한에 걸려
+// 이후 모든 요청이 같은 이유로 실패한다(이력은 줄지 않으므로 대화가 복구되지 않는다).
+const HISTORY_TURNS = 6;
+const HISTORY_LEN = 500;
+
 const EXAMPLES = [
   'SPACE 시스템이 뭐야',
   'BATCH001 작업 상태 알려줘',
@@ -38,8 +44,9 @@ export default function App() {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const bottomRef = useRef(null);
-  const historyRef = useRef([]);   // 서버로 보낼 대화 이력 (setState 비동기와 무관하게 즉시 반영)
-  const composedAtRef = useRef(0); // 마지막 IME 조합 종료 시각 (Safari 조기 전송 방지용)
+  const historyRef = useRef([]);      // 서버로 보낼 대화 이력 (setState 비동기와 무관하게 즉시 반영)
+  const composingRef = useRef(false); // IME 조합 진행 중
+  const justComposedRef = useRef(false); // 직전 조합을 확정한 키 입력이 아직 끝나지 않음
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -48,8 +55,10 @@ export default function App() {
   async function ask(message) {
     if (!message || loading) return;
     // history는 현재 질문을 넣기 전에 확정한다 — 현재 질문은 message로 따로 가므로 중복 전송하지 않는다.
-    // 실제로 몇 턴을 쓸지는 서버가 정한다(normalizeChat) — 여기서는 페이로드 상한만 둔다.
-    const history = historyRef.current.slice(-20);
+    // 서버가 쓰는 만큼만 보낸다 (턴 수·길이 모두). 더 보내도 서버가 버리고 본문만 커진다.
+    const history = historyRef.current
+      .slice(-HISTORY_TURNS)
+      .map(m => ({ role: m.role, text: m.text.slice(0, HISTORY_LEN) }));
     historyRef.current = [...historyRef.current, { role: 'user', text: message }];
     setMessages(m => [...m, { role: 'user', text: message }]);
     setInput('');
@@ -117,15 +126,28 @@ export default function App() {
           <input
             value={input}
             onChange={e => setInput(e.target.value)}
-            onCompositionEnd={() => { composedAtRef.current = Date.now(); }}
+            onCompositionStart={() => { composingRef.current = true; }}
+            onCompositionEnd={() => {
+              composingRef.current = false;
+              // 조합을 확정한 그 키 입력은 아직 keyup 전이다. Safari는 이 순서에서
+              // compositionend를 keydown보다 먼저 보내 Enter가 isComposing=false로 도착하므로,
+              // "확정 키의 keyup이 올 때까지"를 기준으로 한 번만 흘려보낸다 (시간 재기 대신 이벤트 순서로 판별).
+              justComposedRef.current = true;
+            }}
+            onKeyUp={() => { justComposedRef.current = false; }}
+            onBlur={() => { justComposedRef.current = false; }}
             onKeyDown={e => {
-              if (e.key !== 'Enter') return;
+              if (e.key !== 'Enter') {
+                justComposedRef.current = false;
+                return;
+              }
               // 조합 중 Enter는 폼 제출까지 막는다 — 한글 IME에서 조합 확정 Enter가 오전송되는 문제 방지.
               e.preventDefault();
-              if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
-              // Safari는 조합 확정 Enter의 keydown보다 compositionend를 먼저 보내 isComposing=false로 도착한다.
-              // 같은 키 입력에서 온 것인지 직전 조합 종료 시각으로 함께 판별한다.
-              if (Date.now() - composedAtRef.current < 50) return;
+              if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229 || composingRef.current) return;
+              if (justComposedRef.current) {
+                justComposedRef.current = false;
+                return;
+              }
               ask(input.trim());
             }}
             placeholder="질문을 입력하세요 (예: BATCH001 작업 상태 알려줘)"

@@ -137,18 +137,25 @@ LLM 인터페이스는 `llm.js`의 `decide(ctx) → {action:'answer'|'run_query'
 2. `.env`에서 `ORACLE_MOCK=0`, 참조하는 비밀번호 환경변수(`ORDER_DB_PASSWORD`) 설정
 3. `query_registry`의 쿼리를 실제 테이블 구조에 맞게 등록
 
-로컬 테스트 컨테이너(위 1-2단계)를 쓰는 경우 접속 정보가 이미 `target_db`에 등록되어 있고,
-조회 계정 `VOC_READER`의 비밀번호(`voc_reader_1234`, `oracle-init.sql`이 생성)도 `.env.example`의
-`ORDER_DB_PASSWORD`에 채워져 있다 — `ORACLE_MOCK=0`으로만 바꾸면 된다.
+로컬 테스트 컨테이너(위 1-2단계)를 쓰는 경우 접속 정보는 이미 `target_db`에 등록되어 있다.
+`.env`에서 `ORACLE_MOCK=0`으로 바꾸고, `ORDER_DB_PASSWORD`에 조회 계정 `VOC_READER`의 비밀번호
+(`oracle-init.sql`의 `CREATE USER ... IDENTIFIED BY`에 있는 값)를 채우면 된다.
+`.env.example`에 값을 넣어두지 않는 이유는, 채워져 있으면 "여기는 내가 채워야 한다"는 신호가 사라져
+저장소에 적힌 비밀번호가 그대로 운영 조회 계정에 남기 때문이다.
 
 ## 보안
 
-- **조회 전용 가드**: 실행 직전 SELECT/WITH로 시작하는 단일 문장만 허용 — UPDATE/DELETE/DDL/다중 문장은 차단된다 (`oracle.js`의 `assertReadOnly`)
+- **조회 전용 가드**: 실행 직전 SELECT/WITH로 시작하는 단일 문장만 허용 — UPDATE/DELETE/DDL/다중 문장은 차단된다 (`sql.js`의 `assertReadOnly`).
+  문자열 리터럴·주석 경계는 정규식이 아니라 단일 패스 스캐너로 판정한다 — Oracle q-quote(`q'!...!'`)는 구분자가 임의 문자라
+  일부만 모델링하면 리터럴에 숨은 세미콜론을 놓치거나 정상 쿼리를 오탐한다. 경계를 확정할 수 없는 SQL(닫히지 않은 리터럴)은 거부한다.
+  두 방향 모두 `backend`에서 `npm test`로 회귀 검증한다 (`backend/test/sql.test.js`)
 - LLM은 SQL을 직접 쓸 수 없고 `query_registry`에 등록된 쿼리의 **이름만 선택**한다. 사용자 입력은 바인드 변수 값으로만 전달 (문자열 결합 없음)
 - 그래도 조회 계정(`target_db.db_user`)은 **read-only 권한 계정**을 사용할 것 (심층 방어)
 - `db_password`는 `ENV:변수명` 형식으로 환경변수 참조 권장. 평문 저장은 개발용만
-- 조회 쿼리 타임아웃 `ORACLE_TIMEOUT_MS`(기본 30초) — 느린 쿼리가 요청을 무한 대기시키지 않는다
-- 조회 결과는 `maxRows: 100` 제한. 결과가 길면 LLM 컨텍스트/답변에는 20행·셀당 200자까지만 전달하고 "외 N건 생략 (총 N건)"으로 표기 (`agent.js`의 `capRows`)
+- 조회 쿼리 타임아웃 `ORACLE_TIMEOUT_MS`(기본 30초) — 느린 쿼리가 요청을 무한 대기시키지 않는다.
+  빈 값·0·오타는 기본값으로 되돌리고 경고를 남긴다 (0은 드라이버에서 "타임아웃 없음"을 뜻하므로 그대로 두면 정반대로 동작한다)
+- 조회 결과는 `maxRows: 100` 제한. 셀당 200자 절단은 드라이버 경계(`oracle.js`)에서, 20행 절단은 `agent.js`의 `capRows`에서 적용하고
+  "외 N건 생략 (총 N건)"으로 표기한다. LOB/이진 값도 이 경계에서 문자열로 정규화된다 (커넥션을 닫으면 무효가 되는 스트림 객체가 로그·프롬프트로 새지 않도록)
 
 ## 검색 (하이브리드 — 10,000건 이상 대응)
 
@@ -158,7 +165,10 @@ LLM 인터페이스는 `llm.js`의 `decide(ctx) → {action:'answer'|'run_query'
 - **벡터 저장**: 별도 vector DB 없이 MariaDB 네이티브 `VECTOR(1024)` + 벡터 인덱스 (`vec_store` 테이블).
   원본 3개 테이블은 변경하지 않는 companion 구조
 - **임베딩**: 로컬 Ollama의 OpenAI 호환 API (`embedding.js`). 기본 모델 bge-m3(1024차원)
-- **폴백**: 임베딩 서버가 없으면 자동으로 LIKE-only로 동작 — Ollama 없는 환경에서도 그대로 돌아간다
+- **폴백**: 임베딩 서버가 없으면 자동으로 LIKE-only로 동작 — Ollama 없는 환경에서도 그대로 돌아간다.
+  Ollama를 아예 쓰지 않는다면 `.env`의 `EMBEDDING_URL`을 비워 두면 매 주기 임베딩 시도 자체를 건너뛴다
+  (원본이 삭제된 벡터 정리는 이 경우에도 계속 수행된다). 이 구성에서 `npm run embed`는 정상 종료(0)한다 —
+  종료 코드 1은 "임베딩 서버가 설정돼 있는데 응답하지 않은" 경우뿐이다
 - **동기화**: `embed-sync.js`가 원본 텍스트의 MD5를 비교해 신규/변경분만 임베딩(diff, 멱등).
   서버 기동 시 1회 + `EMBED_SYNC_INTERVAL`(기본 60초) 주기 + `npm run embed` 수동.
   SQL로 직접 등록한 데이터도 1분 내 자동 반영되며, 그 사이에도 LIKE로는 즉시 검색된다
@@ -203,11 +213,15 @@ Windows: `setup/bge-m3/start.bat` 실행 (설치 확인·모델 다운로드·�
 SELECT question, created_at FROM chat_log
 WHERE answer LIKE '%일반 지식으로 답변%'
    OR JSON_EXTRACT(trace, '$.steps[*].error') IS NOT NULL
+   OR JSON_EXTRACT(trace, '$[*].error') IS NOT NULL   -- v 표기 없는 옛 행 (steps 배열이 최상위였던 형식)
 ORDER BY created_at DESC;
 ```
 
 쿼리 실행 오류는 답변 문구가 아니라 `trace`로 판별한다 — 실제 LLM은 답변을 자유롭게 쓰므로
 특정 문구(`실행 오류` 등)로 거르면 정작 실패한 경우를 놓친다.
+`trace.steps[].error`에는 실제 쿼리 실패만 들어간다. 루프 가드가 남기는 제어용 기록(같은 쿼리 반복 등)은
+`note` 필드라 이 집계에 섞이지 않는다 — 정상적으로 답한 턴이 실패로 잡히지 않게 하기 위함.
+`trace.v`는 스키마 버전이다 (현재 2 — `{v, search, steps}`. 이 필드가 없는 행은 trace가 steps 배열 자체였던 옛 형식).
 
 검색이 아무것도 못 찾은 질문 (지식/쿼리 신규 등록 후보 — `trace.search`에 검색 적중 수가 남는다):
 
@@ -215,6 +229,9 @@ ORDER BY created_at DESC;
 SELECT question, created_at FROM chat_log
 WHERE JSON_VALUE(trace, '$.search.knowledge') = 0
   AND JSON_VALUE(trace, '$.search.qaMethods') = 0
+  -- 경로B(qa_method 없이 쿼리만 등록)로 답한 질문을 후보로 잡지 않도록 쿼리 적중도 함께 본다.
+  -- 라우팅이 동작하지 않는 소규모에서는 null이므로 그때는 이 조건을 적용하지 않는다.
+  AND COALESCE(JSON_VALUE(trace, '$.search.queries'), 0) = 0
 ORDER BY created_at DESC;
 ```
 

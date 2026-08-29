@@ -4,30 +4,42 @@
 // 대화 맥락(chat)은 서버가 저장하지 않고 클라이언트가 매 요청에 실어 보낸다 (stateless 유지).
 import { searchKnowledge, searchQaMethods, searchQueries } from './search.js';
 import { loadQueryRegistry, countQueries, loadQueriesByNames } from './db.js';
-import { runQuery, MAX_ROWS } from './oracle.js';
-import { llm, TRUNC_MARK } from './llm.js';
+import { runQuery } from './oracle.js';
+import { bindNames } from './sql.js';
+import { llm } from './llm.js';
+import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN } from './constants.js';
 
 const MAX_STEPS = 5;
 const MAX_PROMPT_QUERIES = 30; // 프롬프트에 싣는 쿼리 상한 (~2.2k토큰)
-const MAX_RESULT_ROWS = 20; // LLM 컨텍스트/답변에 전달할 최대 행 수 (총 건수는 totalRows로 보존)
-const MAX_CELL_LEN = 200;   // 셀 값 최대 길이 (CLOB 등 대형 텍스트 방어)
-const MAX_CHAT_TURNS = 6;   // LLM에 전달할 최근 대화 턴 수 (프롬프트 비대화 방지)
-const MAX_CHAT_LEN = 500;   // 턴별 최대 길이
 const MAX_SAME_QUERY_TRIES = 2; // 같은 쿼리·파라미터의 최대 실행 시도 (1회 실패는 일시 오류일 수 있어 재시도 허용)
+const MAX_GUARD_HITS = 2;       // 루프 가드가 '연속으로' 이만큼 걸리면 남은 스텝을 포기하고 강제 답변으로 간다.
+                                // (첫 1회는 LLM이 경로를 수정할 기회, 그래도 반복하면 LLM 왕복만 낭비된다.
+                                //  조회에 성공하면 진도가 나간 것이므로 카운터를 되돌린다 — 다단계 절차 도중
+                                //  같은 쿼리를 두 번 제안했다는 이유로 정상 흐름이 끊기면 안 된다)
 
-function capRows(rows) {
-  return rows.slice(0, MAX_RESULT_ROWS).map(row =>
-    Object.fromEntries(
-      Object.entries(row).map(([k, v]) => {
-        const s = typeof v === 'string' ? v : null;
-        return [k, s && s.length > MAX_CELL_LEN ? s.slice(0, MAX_CELL_LEN) + TRUNC_MARK : v];
-      })
-    )
+// 셀 길이 제한은 드라이버 경계(oracle.js)에서 이미 적용됐다 — 여기서는 행 수만 줄인다.
+const capRows = rows => rows.slice(0, MAX_RESULT_ROWS);
+
+// 쿼리 이름 비교 키. query_registry 조회는 MariaDB 기본 collation(대소문자·후행 공백 무시)이라
+// JS의 ===로 비교하면 'BATCH_JOB_STATUS'와 'batch_job_status'가 서로 다른 쿼리로 보여
+// 아래 반복 실행 가드가 통째로 무력화된다 (같은 쿼리가 매 스텝 재실행된다).
+const nameKey = s => String(s ?? '').trim().toLowerCase();
+
+// 동일 실행 판정용 파라미터 키 — LLM이 준 원본이 아니라 "실제로 바인드되는 값"으로 만든다.
+// runQuery가 SQL의 바인드 변수만 추려 쓰므로, 여분 키 하나가 붙었다고 다른 실행이 되지는 않는다.
+// 값은 문자열로 정규화한다 (숫자 1과 문자열 '1'은 같은 컬럼에 같은 값으로 바인드된다).
+function paramKey(bindNameList, params) {
+  const entries = bindNameList
+    ? bindNameList.map(n => [n, params?.[n]])
+    : Object.entries(params || {}); // 미등록 쿼리라 바인드를 알 수 없으면 원본 그대로 비교
+  return JSON.stringify(
+    entries
+      .map(([k, v]) => [k, v === undefined ? ['undefined'] : v === null ? ['null'] : String(v)])
+      // 키 문자열로 명시 비교한다 — 비교 함수 없는 sort는 [k,v]를 이어붙인 문자열을 기준으로 삼아
+      // 키에 쉼표가 들어가면 순서가 입력 순서에 좌우된다.
+      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
   );
 }
-
-// 동일 쿼리 재실행 판정용 — 파라미터를 키 순서와 무관하게 비교한다.
-const paramKey = p => JSON.stringify(Object.entries(p || {}).sort());
 
 // 클라이언트가 보낸 대화 이력을 신뢰하지 않고 형식을 검증·제한한다.
 function normalizeChat(chat) {
@@ -74,6 +86,8 @@ export async function handleQuestion(question, rawChat = []) {
 
   const history = [];
   const ctx = () => ({ question, chat, knowledge, qaMethods, queries, history });
+  const resolveCache = new Map(); // 프롬프트 목록 밖 이름의 해석 결과 (미등록도 캐시한다)
+  let guardHits = 0;
 
   for (let step = 0; step < MAX_STEPS; step++) {
     const decision = await llm.decide(ctx());
@@ -81,56 +95,72 @@ export async function handleQuestion(question, rawChat = []) {
       return { answer: decision.answer, trace: history, search };
     }
 
-    let registryRow = queries.find(q => q.query_name === decision.query_name);
-    if (!registryRow) {
-      // 프롬프트 목록은 30건으로 잘릴 수 있다 — 실제 allowlist는 query_registry이므로 이름으로 재확인한다.
-      // (지식·처리방법 본문이 지목한 쿼리가 라우팅에서 빠졌을 때 '등록되지 않은 쿼리'로 오진단되는 것 방지)
-      [registryRow] = await loadQueriesByNames([decision.query_name]);
-      if (registryRow) queries.push(registryRow); // 다음 스텝에서 다시 조회하지 않도록
-    }
-    if (!registryRow) {
-      history.push({ query_name: decision.query_name, params: decision.params, error: '등록되지 않은 쿼리' });
-      continue;
-    }
+    const { row: registryRow, error: resolveError } =
+      await resolveQuery(decision.query_name, queries, resolveCache);
+    // 이력에는 항상 정규 이름(등록된 철자)을 남긴다 — 가드와 프롬프트가 같은 이름을 보게.
+    const canonicalName = registryRow?.query_name ?? decision.query_name;
+    const binds = registryRow ? bindNames(registryRow.query_sql) : null; // 스텝당 1회만 파싱
+    const key = paramKey(binds, decision.params);
+    const isSame = h => nameKey(h.query_name) === nameKey(canonicalName) && paramKey(binds, h.params) === key;
+    // note는 LLM에게 경로를 바꾸라고 알리는 제어용 기록이다. 실제 쿼리 실패(error)와 필드를 나눈다 —
+    // 같은 필드에 넣으면 사용자 trace 패널과 chat_log의 '실패한 질문' 집계에 정상 턴이 섞인다.
+    const push = (field, msg) => history.push({ query_name: canonicalName, params: decision.params, [field]: msg });
+
     // 같은 쿼리를 같은 파라미터로 반복하지 않는다 — 퇴화한 LLM 응답이 결정 루프를
-    // 제자리 돌며 스텝과 Oracle 조회를 소진하는 것 방지. 에러로 기록해 LLM이 경로를 수정하게 한다.
-    const isSame = h => h.query_name === decision.query_name && paramKey(h.params) === paramKey(decision.params);
+    // 제자리 돌며 스텝과 Oracle 조회를 소진하는 것 방지. 미등록 이름의 반복도 같은 가드로 걸리도록
+    // '등록되지 않은 쿼리' 처리보다 앞에 둔다 (가장 흔한 퇴화 패턴이 그것이다).
     if (history.some(h => h.rows && isSame(h))) {
-      history.push({
-        query_name: decision.query_name,
-        params: decision.params,
-        error: '이미 같은 파라미터로 실행된 쿼리 — 실행 이력의 결과로 답변하거나 다른 쿼리를 선택하라',
-      });
+      push('note', '이미 같은 파라미터로 실행된 쿼리 — 실행 이력의 결과로 답변하거나 다른 쿼리를 선택하라');
+      if (++guardHits >= MAX_GUARD_HITS) break;
       continue;
     }
     // 실패도 무한 반복은 막는다 (결정적 오류면 타임아웃 대기가 스텝 수만큼 쌓인다)
     if (history.filter(h => h.error && isSame(h)).length >= MAX_SAME_QUERY_TRIES) {
-      history.push({
-        query_name: decision.query_name,
-        params: decision.params,
-        error: '같은 파라미터로 반복 실패한 쿼리 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라',
-      });
+      push('note', '같은 파라미터로 반복 실패한 쿼리 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라');
+      if (++guardHits >= MAX_GUARD_HITS) break;
       continue;
     }
+    if (!registryRow) {
+      push('error', resolveError ?? '등록되지 않은 쿼리');
+      continue;
+    }
+    // 프롬프트 목록 밖에서 찾은 쿼리는 목록에 넣어준다 — 다음 스텝에서 LLM이 input_desc를 보고
+    // 바인드를 고칠 수 있어야 한다. 중복은 넣지 않고, 늘어나는 상한은 MAX_STEPS건이다
+    // (즉 목록은 최대 MAX_PROMPT_QUERIES + MAX_STEPS건 — 무제한으로 커지지 않는다).
+    if (!queries.includes(registryRow)) queries.push(registryRow);
     try {
-      const rows = await runQuery(registryRow, decision.params);
-      history.push({
-        query_name: registryRow.query_name,
-        params: decision.params,
-        rows: capRows(rows),
-        totalRows: rows.length,
-        // 조회 상한에 도달했으면 실제 총 건수는 그 이상일 수 있다
-        capped: rows.length >= MAX_ROWS,
-      });
+      const { rows, totalRows, capped } = await runQuery(registryRow, decision.params);
+      history.push({ query_name: canonicalName, params: decision.params, rows: capRows(rows), totalRows, capped });
+      guardHits = 0; // 진도가 나갔다 — 가드는 '연속' 헛도는 경우만 센다
     } catch (e) {
       // 실패도 이력에 남기고 루프를 계속한다 — LLM이 에러를 보고 재시도/우회/답변을 판단
-      history.push({ query_name: registryRow.query_name, params: decision.params, error: e.message });
+      push('error', e.message);
     }
   }
 
-  // 안전장치: MAX_STEPS 초과 시 강제 답변
+  // 안전장치: MAX_STEPS 초과(또는 가드 반복) 시 강제 답변
   const final = await llm.decide({ ...ctx(), forceAnswer: true });
   return { answer: final.answer, trace: history, search };
+}
+
+// 결정된 query_name → query_registry 행. 프롬프트 목록은 MAX_PROMPT_QUERIES로 잘릴 수 있으므로
+// (지식·처리방법 본문이 지목한 쿼리가 라우팅에서 빠질 수 있다) 목록에 없으면 이름으로 재확인한다.
+// 결과는 요청 단위로 캐시한다 — 미등록 이름을 LLM이 반복해도 관리 DB를 매 스텝 왕복하지 않도록.
+// 조회 실패는 캐시하지 않고 오류로 돌려준다 (요청 전체를 500으로 버리지 않고 이 스텝만 실패 처리).
+async function resolveQuery(name, queries, cache) {
+  const key = nameKey(name);
+  if (!key) return { row: null };
+  const hit = queries.find(q => nameKey(q.query_name) === key);
+  if (hit) return { row: hit };
+  if (cache.has(key)) return { row: cache.get(key) };
+  try {
+    const [row = null] = await loadQueriesByNames([name]);
+    cache.set(key, row);
+    return { row };
+  } catch (e) {
+    console.warn('[agent] query_registry 재조회 실패:', e.message);
+    return { row: null, error: `쿼리 조회 실패: ${e.message}` };
+  }
 }
 
 // 프롬프트에 실을 쿼리 선정. 등록 수가 적으면 전체(가장 정확), 많으면 두 경로의 합집합:
