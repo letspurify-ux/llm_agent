@@ -6,6 +6,7 @@ SET NAMES utf8mb4;
 CREATE DATABASE IF NOT EXISTS llm_agent DEFAULT CHARACTER SET utf8mb4;
 USE llm_agent;
 
+DROP TABLE IF EXISTS vec_store;
 DROP TABLE IF EXISTS knowledge;
 DROP TABLE IF EXISTS qa_method;
 DROP TABLE IF EXISTS query_registry;

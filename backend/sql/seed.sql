@@ -6,6 +6,12 @@
 SET NAMES utf8mb4;
 USE llm_agent;
 
+-- 재실행 가능(멱등): 시드 데이터를 지우고 다시 넣는다. 운영 데이터에는 사용하지 말 것.
+DELETE FROM knowledge;
+DELETE FROM qa_method;
+DELETE FROM query_registry;
+DELETE FROM target_db;
+
 INSERT INTO knowledge (title, content) VALUES
 ('배치 재시작 방법', '배치 작업이 FAILED 상태이면 배치 서버(batch01)에 접속 후 restart_batch.sh <JOB_ID> 를 실행하여 재시작한다. 실행 전 반드시 로그를 백업한다.'),
 ('시스템 점검 일정', '매월 첫째 주 일요일 02:00~04:00 정기 점검. 점검 중 조회 서비스는 중단된다.');

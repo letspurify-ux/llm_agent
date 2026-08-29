@@ -16,7 +16,21 @@ const SOURCES = {
 };
 const BATCH = 32;
 
+// 중첩 실행 가드 — 초기 대량 동기화(수 분)가 도는 동안 주기 실행이 겹쳐
+// 같은 행을 중복 임베딩하는 것을 막는다. 겹치면 이번 회차는 건너뛴다.
+let running = false;
+
 export async function syncEmbeddings() {
+  if (running) return { embedded: 0, deleted: 0, skipped: false };
+  running = true;
+  try {
+    return await doSync();
+  } finally {
+    running = false;
+  }
+}
+
+async function doSync() {
   let embedded = 0, deleted = 0;
 
   for (const [src, toText] of Object.entries(SOURCES)) {
