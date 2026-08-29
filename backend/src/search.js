@@ -6,30 +6,38 @@ import { embed } from './embedding.js';
 const LIMIT = 20;         // LLM에 넘길 최대 후보 수 (건당 약 84토큰)
 const TITLE_WEIGHT = 3;   // 제목(첫 컬럼) 매칭은 본문 매칭보다 높게
 const RRF_K = 60;         // Reciprocal Rank Fusion 상수 (표준값)
-const EF_SEARCH = 400;
+const EF_SEARCH = 400;    // MHNSW 탐색 깊이. 기본값(20)은 1024차원에서 recall이 크게 떨어진다
+                          // (10k 부하 테스트에서 실측: 기본값은 최근접을 놓치고, 400이면 정확 검색과 일치·~20ms)
 const MAX_DIST = 0.55;    // 벡터 매칭 관련도 임계값 (코사인 거리). 실측: 관련 0.30~0.53, 무관 0.58~0.75.
                           // top-K는 무관해도 항상 K건을 돌려주므로, 이 필터가 없으면 "관련 지식 없음 →
-                          // 일반 지식 답변" 폴백이 무력화된다. LIKE 쪽은 무필터(정확 키워드 보존).    // MHNSW 탐색 깊이. 기본값(20)은 1024차원에서 recall이 크게 떨어진다
-                          // (10k 부하 테스트에서 실측: 기본값은 최근접을 놓치고, 400이면 정확 검색과 일치·~20ms)
+                          // 일반 지식 답변" 폴백이 무력화된다. LIKE 쪽은 무필터(정확 키워드 보존).
+
+// 테이블별 검색 대상 컬럼 (첫 컬럼 = 제목/이름, 가중치가 높다).
+// embed-sync.js가 임베딩 원문을 만들 때도 같은 정의를 쓴다 — LIKE와 벡터가 서로 다른 내용을 보지 않도록.
+export const SEARCH_COLUMNS = {
+  knowledge: ['title', 'content'],
+  qa_method: ['title', 'method'],
+  query_registry: ['query_name', 'query_desc', 'input_desc', 'output_desc'],
+};
 
 export function searchKnowledge(question) {
-  return hybrid('knowledge', ['title', 'content'], question);
+  return hybrid('knowledge', question);
 }
 
 export function searchQaMethods(question) {
-  return hybrid('qa_method', ['title', 'method'], question);
+  return hybrid('qa_method', question);
 }
 
 // 쿼리 직접 검색 — qa_method 등록 없이도 질문으로 쿼리를 찾는 경로 (agent.js 라우팅에서 사용)
 export function searchQueries(question) {
-  return hybrid('query_registry', ['query_name', 'query_desc', 'input_desc', 'output_desc'], question);
+  return hybrid('query_registry', question);
 }
 
 // LIKE(정확 키워드에 강함)와 벡터(표현 차이에 강함)를 병렬 실행 후 RRF로 병합.
 // RRF는 순위만 쓰므로 점수 스케일 튜닝이 필요 없다: score = Σ 1/(K + rank)
-async function hybrid(table, columns, question) {
+async function hybrid(table, question) {
   const [likeRows, vecRows] = await Promise.all([
-    likeSearch(table, columns, question),
+    likeSearch(table, SEARCH_COLUMNS[table], question),
     vecSearch(table, question),
   ]);
   if (!vecRows) return likeRows; // 임베딩 불가 → LIKE-only 폴백

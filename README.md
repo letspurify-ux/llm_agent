@@ -32,7 +32,7 @@ backend/
   src/agent.js               # agentic loop (핵심 제어 흐름)
   src/llm.js                 # LLM 인터페이스 + Mock (provider 선택)
   src/llm-openai.js          # OpenAI 호환 클라이언트 (vLLM/OpenRouter)
-  src/search.js              # LIKE 검색 + 관련도 정렬 — vector 검색 교체 지점
+  src/search.js              # 하이브리드 검색(LIKE 관련도 + 벡터, RRF 병합) — 검색 구현은 이 파일에만 있다
   src/db.js                  # MariaDB 풀 + 관리 테이블 로더
   src/oracle.js              # Oracle 실행기 + SELECT 전용 가드 + mock 모드
 frontend/                    # Vite + React 채팅 UI (App.jsx 단일 컴포넌트)
@@ -137,7 +137,9 @@ LLM 인터페이스는 `llm.js`의 `decide(ctx) → {action:'answer'|'run_query'
 2. `.env`에서 `ORACLE_MOCK=0`, 참조하는 비밀번호 환경변수(`ORDER_DB_PASSWORD`) 설정
 3. `query_registry`의 쿼리를 실제 테이블 구조에 맞게 등록
 
-로컬 테스트 컨테이너(위 1-2단계)를 쓰는 경우 이미 이 값들로 설정되어 있다.
+로컬 테스트 컨테이너(위 1-2단계)를 쓰는 경우 접속 정보가 이미 `target_db`에 등록되어 있고,
+조회 계정 `VOC_READER`의 비밀번호(`voc_reader_1234`, `oracle-init.sql`이 생성)도 `.env.example`의
+`ORDER_DB_PASSWORD`에 채워져 있다 — `ORACLE_MOCK=0`으로만 바꾸면 된다.
 
 ## 보안
 
@@ -189,7 +191,7 @@ Windows: `setup/bge-m3/start.bat` 실행 (설치 확인·모델 다운로드·�
 
 ## 대화 로그
 
-모든 문답이 `chat_log` 테이블에 기록된다 (질문·답변·실행 쿼리 trace·시각). 용도는 두 가지 —
+모든 문답이 `chat_log` 테이블에 기록된다 (질문·답변·검색 적중 수·실행 쿼리 trace·시각). 용도는 두 가지 —
 평가셋 구축, 그리고 "못 답한 질문"을 찾아 지식/쿼리를 보강하는 운영 루프.
 
 - **3일 보존**: 서버가 기동 시 + 1시간 주기로 3일 지난 행을 정리한다 (`server.js`의 `CHAT_LOG_RETENTION_DAYS`)
@@ -199,7 +201,20 @@ Windows: `setup/bge-m3/start.bat` 실행 (설치 확인·모델 다운로드·�
 
 ```sql
 SELECT question, created_at FROM chat_log
-WHERE answer LIKE '%일반 지식으로 답변%' OR answer LIKE '%실행 오류%'
+WHERE answer LIKE '%일반 지식으로 답변%'
+   OR JSON_EXTRACT(trace, '$.steps[*].error') IS NOT NULL
+ORDER BY created_at DESC;
+```
+
+쿼리 실행 오류는 답변 문구가 아니라 `trace`로 판별한다 — 실제 LLM은 답변을 자유롭게 쓰므로
+특정 문구(`실행 오류` 등)로 거르면 정작 실패한 경우를 놓친다.
+
+검색이 아무것도 못 찾은 질문 (지식/쿼리 신규 등록 후보 — `trace.search`에 검색 적중 수가 남는다):
+
+```sql
+SELECT question, created_at FROM chat_log
+WHERE JSON_VALUE(trace, '$.search.knowledge') = 0
+  AND JSON_VALUE(trace, '$.search.qaMethods') = 0
 ORDER BY created_at DESC;
 ```
 
