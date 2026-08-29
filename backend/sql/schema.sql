@@ -6,6 +6,7 @@ SET NAMES utf8mb4;
 CREATE DATABASE IF NOT EXISTS llm_agent DEFAULT CHARACTER SET utf8mb4;
 USE llm_agent;
 
+DROP TABLE IF EXISTS chat_log;
 DROP TABLE IF EXISTS vec_store;
 DROP TABLE IF EXISTS knowledge;
 DROP TABLE IF EXISTS qa_method;
@@ -66,5 +67,17 @@ CREATE TABLE vec_store (
   VECTOR INDEX (embedding) DISTANCE=cosine  -- 검색이 VEC_DISTANCE_COSINE을 쓰므로 반드시 cosine으로.
                                             -- 기본값(euclidean)이면 인덱스를 타지 못해 풀스캔이 된다
 );
--- 앱 계정은 관리 테이블 4개는 SELECT만, 파생 테이블인 vec_store에는 쓰기가 필요하다:
+-- 앱 계정은 관리 테이블 4개는 SELECT만, 파생 테이블(vec_store, chat_log)에는 쓰기가 필요하다:
 --   GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_store TO 'agent'@'localhost';
+--   GRANT SELECT, INSERT, DELETE ON llm_agent.chat_log TO 'agent'@'localhost';
+
+-- 대화 로그: 평가셋 구축과 "못 답한 질문" 발굴용.
+-- 3일 지난 행은 서버가 기동 시 + 1시간 주기로 정리한다 (server.js).
+CREATE TABLE chat_log (
+  seq        INT AUTO_INCREMENT PRIMARY KEY,
+  question   TEXT NOT NULL,
+  answer     TEXT,
+  trace      JSON,                -- 실행된 쿼리·바인드·결과 (답변 근거)
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_created (created_at)    -- 보존 기간 정리(DELETE)용
+);
