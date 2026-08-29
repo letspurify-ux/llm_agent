@@ -77,7 +77,7 @@ function buildPrompt(ctx) {
 
   lines.push('\n## 실행 가능한 쿼리 목록');
   for (const q of ctx.queries) {
-    lines.push(`- ${q.query_name}: 입력(${q.input_desc}) / 출력(${q.output_desc}) / SQL: ${q.query_sql}`);
+    lines.push(`- ${q.query_name}: ${q.query_desc ?? ''} / 입력(${q.input_desc}) / 출력(${q.output_desc}) / SQL: ${q.query_sql}`);
   }
 
   lines.push('\n## 쿼리 실행 이력');

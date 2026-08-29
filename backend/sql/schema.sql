@@ -32,6 +32,8 @@ CREATE TABLE qa_method (
 CREATE TABLE query_registry (
   seq            INT AUTO_INCREMENT PRIMARY KEY,
   query_name     VARCHAR(100) NOT NULL UNIQUE,
+  query_desc     TEXT,          -- 용도 요약: "어떤 질문일 때 무엇을 조회하는 쿼리인지".
+                                -- 벡터/LIKE 검색과 LLM의 쿼리 선택 근거이므로 성실히 작성할 것
   input_desc     TEXT,
   query_sql      TEXT NOT NULL,
   output_desc    TEXT,
@@ -49,3 +51,19 @@ CREATE TABLE target_db (
   db_user         VARCHAR(100),
   db_password     VARCHAR(200)
 );
+
+-- 벡터 검색용 임베딩 저장소.
+-- 원본 3개 테이블(knowledge/qa_method/query_registry)은 변경하지 않고 companion 테이블로 둔다
+-- (VECTOR INDEX는 NOT NULL 필수라, 임베딩이 아직 없는 원본 행과 공존하려면 분리가 단순하다).
+-- embed-sync.js가 원본 텍스트의 MD5(embed_hash)를 비교해 신규/변경분만 임베딩한다.
+CREATE TABLE vec_store (
+  src        VARCHAR(20) NOT NULL,   -- 'knowledge' | 'qa_method' | 'query_registry'
+  seq        INT NOT NULL,           -- 원본 행 seq
+  embed_hash CHAR(32) NOT NULL,      -- MD5(임베딩한 텍스트) — 변경 감지용
+  embedding  VECTOR(1024) NOT NULL,  -- bge-m3 1024차원 (모델을 바꿔도 1024차원 유지)
+  PRIMARY KEY (src, seq),
+  VECTOR INDEX (embedding) DISTANCE=cosine  -- 검색이 VEC_DISTANCE_COSINE을 쓰므로 반드시 cosine으로.
+                                            -- 기본값(euclidean)이면 인덱스를 타지 못해 풀스캔이 된다
+);
+-- 앱 계정은 관리 테이블 4개는 SELECT만, 파생 테이블인 vec_store에는 쓰기가 필요하다:
+--   GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_store TO 'agent'@'localhost';

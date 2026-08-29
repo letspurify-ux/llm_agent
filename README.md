@@ -4,7 +4,7 @@
 
 ```
 사용자 질문 (+ 최근 대화)
-  → 지식/Q&A 처리방법 검색 (MariaDB, LIKE + 관련도 정렬, 상위 20건)
+  → 지식/Q&A처리방법 하이브리드 검색 (LIKE + 벡터, 상위 20건) + 쿼리 라우팅 (관련 쿼리만 선별)
   → LLM 결정 루프: 답변 가능하면 답변 / DB 조회가 필요하면 쿼리 관리 테이블의 쿼리 실행 (여러 번 가능)
   → 최종 답변 (+ 실행된 쿼리 trace)
 ```
@@ -53,7 +53,7 @@ mariadb --default-character-set=utf8mb4 < backend/sql/seed.sql
 앱 계정 생성 (agent 서버는 관리 테이블을 읽기만 하므로 SELECT 권한이면 충분):
 
 ```bash
-mariadb -e "CREATE USER IF NOT EXISTS 'agent'@'localhost' IDENTIFIED BY 'agent1234'; GRANT SELECT ON llm_agent.* TO 'agent'@'localhost';"
+mariadb -e "CREATE USER IF NOT EXISTS 'agent'@'localhost' IDENTIFIED BY 'agent1234'; GRANT SELECT ON llm_agent.* TO 'agent'@'localhost'; GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_store TO 'agent'@'localhost';"
 ```
 
 SPACE 시스템 지식 데이터도 함께 등록:
@@ -147,19 +147,42 @@ LLM 인터페이스는 `llm.js`의 `decide(ctx) → {action:'answer'|'run_query'
 - `db_password`는 `ENV:변수명` 형식으로 환경변수 참조 권장. 평문 저장은 개발용만
 - 조회 결과는 `maxRows: 100` 제한. 결과가 길면 LLM 컨텍스트/답변에는 20행·셀당 200자까지만 전달하고 "외 N건 생략 (총 N건)"으로 표기 (`agent.js`의 `capRows`)
 
-## 검색
+## 검색 (하이브리드 — 10,000건 이상 대응)
 
-지식·Q&A 처리방법은 질문을 토큰으로 나눠 LIKE 매칭하고 **관련도 점수 순 상위 20건**을 LLM에 넘긴다 (`search.js`).
+지식·처리방법·쿼리 모두 **LIKE(관련도 정렬)와 벡터 검색을 병렬 실행해 RRF로 병합**한 상위 20건을 쓴다 (`search.js`).
+정확 키워드(BATCH001 등)는 LIKE가, 표현 차이("측정 안 하고 품질 아는 법" ↔ "가상계측")는 벡터가 잡는다.
 
-- 점수 = Σ (컬럼 가중치 × 토큰 길이) — 여러 토큰이 맞을수록, 제목에 맞을수록, 긴(구체적인) 토큰이 맞을수록 높다
-- 제목 매칭은 본문 매칭의 3배로 친다
-- 한국어 조사 대응: 3자 이상 토큰은 끝 1~2글자를 뗀 형태도 함께 검색 ("가상계측이" → "가상계측")
+- **벡터 저장**: 별도 vector DB 없이 MariaDB 네이티브 `VECTOR(1024)` + 벡터 인덱스 (`vec_store` 테이블).
+  원본 3개 테이블은 변경하지 않는 companion 구조
+- **임베딩**: 로컬 Ollama의 OpenAI 호환 API (`embedding.js`). 기본 모델 bge-m3(1024차원)
+- **폴백**: 임베딩 서버가 없으면 자동으로 LIKE-only로 동작 — Ollama 없는 환경에서도 그대로 돌아간다
+- **동기화**: `embed-sync.js`가 원본 텍스트의 MD5를 비교해 신규/변경분만 임베딩(diff, 멱등).
+  서버 기동 시 1회 + `EMBED_SYNC_INTERVAL`(기본 60초) 주기 + `npm run embed` 수동.
+  SQL로 직접 등록한 데이터도 1분 내 자동 반영되며, 그 사이에도 LIKE로는 즉시 검색된다
 
-쿼리 목록(`query_registry`)은 검색하지 않고 **전체를 프롬프트에 싣는다** — 목록에서 빠지면 실행 자체가
-불가능하기 때문이다. 쿼리가 수십 건으로 늘면 `query_sql`을 프롬프트에서 빼는 것만으로 토큰이 절반 이하가 된다
-(바인드 변수 정보는 `input_desc`에 있으므로 실행 시에만 SQL을 꺼내 쓰면 된다).
+### 임베딩 준비 (선택 — 없으면 LIKE-only)
+
+```bash
+brew services run ollama
+```
+
+```bash
+ollama pull bge-m3
+```
+
+### 쿼리 라우팅 (프롬프트 폭발 방지)
+
+쿼리가 30건 이하면 전체를 프롬프트에 싣고(현행), 초과하면 두 경로의 합집합 최대 30건만 싣는다 (`agent.js`의 `selectQueries`):
+
+- **경로A**: 매칭된 `qa_method` 본문이 지목한 `query_name` — 다단계 절차 보장
+- **경로B**: 질문으로 `query_registry` 자체를 하이브리드 검색 — **qa_method 등록 없이 쿼리만 등록해도 찾는다**
+
+따라서 `qa_method`는 여러 쿼리를 순서대로 쓰는 절차가 필요할 때만 등록하면 되고,
+단일 쿼리는 `query_registry`의 **`query_desc`(용도 요약)**를 성실히 쓰는 것으로 충분하다.
+`query_desc`는 벡터/LIKE 검색과 LLM 선택의 근거이므로 "어떤 질문일 때 무엇을 조회하는지"를 반드시 적을 것.
 
 ## 향후 확장 지점
 
-- **vector 검색**: `search.js`의 두 함수 내부만 교체 (다른 파일 변경 없음)
-- **새 쿼리/지식 추가**: 코드 변경 없이 MariaDB 테이블에 INSERT. `qa_method.method` 본문에 실행할 `query_name`을 순서대로 언급하는 것이 규약
+- **새 쿼리/지식 추가**: 코드 변경 없이 MariaDB 테이블에 INSERT (임베딩은 1분 내 자동 동기화).
+  단일 쿼리는 `query_desc`만 성실히 작성하면 되고, 다단계 절차는 `qa_method.method` 본문에 `query_name`을 순서대로 언급
+- **임베딩 모델 교체**: `EMBEDDING_MODEL`만 변경 (1024차원 유지 시). vLLM/TEI 등 OpenAI 호환 서버는 `EMBEDDING_URL`로 전환
