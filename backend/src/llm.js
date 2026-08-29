@@ -8,11 +8,8 @@
 // LLM_PROVIDER=openai 이면 vLLM/OpenRouter(OpenAI 호환 API), 아니면 규칙 기반 Mock.
 // agent.js는 provider가 바뀌어도 변경되지 않는다.
 import { openaiDecide } from './llm-openai.js';
-import { bindNames, MAX_ROWS } from './oracle.js';
-
-// capRows(agent.js)가 자른 셀에 붙이는 표시. 이 값을 알아야 하는 쪽(아래 valueFromHistory)에 두고
-// agent.js가 가져다 쓴다 — 순환 import 없이 한 곳에서만 정의하기 위함.
-export const TRUNC_MARK = '…(생략)';
+import { bindNames } from './sql.js';
+import { MAX_ROWS, TRUNC_MARK } from './constants.js';
 
 export const llm = {
   decide(ctx) {
@@ -104,10 +101,13 @@ function buildAnswer({ knowledge, history }) {
     if (h.error) {
       parts.push(`**${h.query_name}** 실행 오류: ${h.error}`);
     } else if (h.rows?.length) {
-      const omitted = h.totalRows - h.rows.length;
+      // totalRows는 runQuery가 항상 채우지만, 재생된 trace 등 다른 출처의 기록이 섞여도
+      // 답변에 NaN이 찍히지 않게 폴백을 둔다.
+      const totalRows = h.totalRows ?? h.rows.length;
+      const omitted = totalRows - h.rows.length;
       const note = h.capped
         ? `\n\n_외 ${omitted}건 이상 생략 (조회 상한 ${MAX_ROWS}건 도달 — 실제는 더 많을 수 있음)_`
-        : omitted > 0 ? `\n\n_외 ${omitted}건 생략 (총 ${h.totalRows}건)_` : '';
+        : omitted > 0 ? `\n\n_외 ${omitted}건 생략 (총 ${totalRows}건)_` : '';
       parts.push(`### ${h.query_name} 조회 결과\n\n${rowsToMarkdownTable(h.rows)}${note}`);
     } else if (h.rows) {
       parts.push(`**${h.query_name}** 조회 결과가 없습니다.`);

@@ -77,7 +77,8 @@ CREATE TABLE chat_log (
   seq        INT AUTO_INCREMENT PRIMARY KEY,
   question   TEXT NOT NULL,
   answer     TEXT,
-  trace      JSON,                -- {search: 검색 적중 수(queries는 라우팅 동작 시에만, 아니면 null), steps: 실행 쿼리·바인드·결과}
+  trace      JSON,                -- {v: 스키마 버전, search: 검색 적중 수(queries는 라우팅 동작 시에만, 아니면 null),
+                                  --  steps: 실행 쿼리·바인드·결과. 실패는 steps[].error, 루프 가드 기록은 steps[].note}
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_created (created_at)    -- 보존 기간 정리(DELETE)용
 );
