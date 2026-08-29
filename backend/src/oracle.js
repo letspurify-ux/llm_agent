@@ -31,10 +31,14 @@ function assertReadOnly(sql) {
 export async function runQuery(registryRow, params = {}) {
   assertReadOnly(registryRow.query_sql);
 
-  const missing = bindNames(registryRow.query_sql).filter(n => !(n in params));
+  // SQL에 실제로 있는 바인드만 추려서 전달한다 — LLM이 여분 파라미터를 주면
+  // 드라이버가 바인드 수 불일치(NJS-098)로 실패하므로 필터가 필요하다.
+  const names = bindNames(registryRow.query_sql);
+  const missing = names.filter(n => params?.[n] === undefined);
   if (missing.length) throw new Error(`바인드 변수 누락: ${missing.join(', ')}`);
+  const binds = Object.fromEntries(names.map(n => [n, params[n]]));
 
-  if (process.env.ORACLE_MOCK === '1') return mockResult(registryRow.query_name, params);
+  if (process.env.ORACLE_MOCK === '1') return mockResult(registryRow.query_name, binds);
 
   const target = await loadTargetDb(registryRow.target_db_name);
   if (!target) throw new Error(`조회대상 DB를 찾을 수 없음: ${registryRow.target_db_name}`);
@@ -50,7 +54,7 @@ export async function runQuery(registryRow, params = {}) {
   });
   try {
     // 사용자 입력은 바인드 값으로만 전달한다 (SQL 문자열 결합 금지)
-    const result = await conn.execute(registryRow.query_sql, params, {
+    const result = await conn.execute(registryRow.query_sql, binds, {
       outFormat: oracledb.OUT_FORMAT_OBJECT,
       maxRows: 100,
     });
