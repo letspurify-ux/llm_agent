@@ -12,8 +12,10 @@ import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN } from './constants.js';
 const MAX_STEPS = 5;
 const MAX_PROMPT_QUERIES = 30; // 프롬프트에 싣는 쿼리 상한 (~2.2k토큰)
 const MAX_SAME_QUERY_TRIES = 2; // 같은 쿼리·파라미터의 최대 실행 시도 (1회 실패는 일시 오류일 수 있어 재시도 허용)
-const MAX_GUARD_HITS = 2;       // 루프 가드가 반복해서 걸리면 남은 스텝을 포기하고 강제 답변으로 간다.
-                                // (첫 1회는 LLM이 경로를 수정할 기회, 그래도 반복하면 LLM 왕복만 낭비된다)
+const MAX_GUARD_HITS = 2;       // 루프 가드가 '연속으로' 이만큼 걸리면 남은 스텝을 포기하고 강제 답변으로 간다.
+                                // (첫 1회는 LLM이 경로를 수정할 기회, 그래도 반복하면 LLM 왕복만 낭비된다.
+                                //  조회에 성공하면 진도가 나간 것이므로 카운터를 되돌린다 — 다단계 절차 도중
+                                //  같은 쿼리를 두 번 제안했다는 이유로 정상 흐름이 끊기면 안 된다)
 
 // 셀 길이 제한은 드라이버 경계(oracle.js)에서 이미 적용됐다 — 여기서는 행 수만 줄인다.
 const capRows = rows => rows.slice(0, MAX_RESULT_ROWS);
@@ -129,6 +131,7 @@ export async function handleQuestion(question, rawChat = []) {
     try {
       const { rows, totalRows, capped } = await runQuery(registryRow, decision.params);
       history.push({ query_name: canonicalName, params: decision.params, rows: capRows(rows), totalRows, capped });
+      guardHits = 0; // 진도가 나갔다 — 가드는 '연속' 헛도는 경우만 센다
     } catch (e) {
       // 실패도 이력에 남기고 루프를 계속한다 — LLM이 에러를 보고 재시도/우회/답변을 판단
       push('error', e.message);

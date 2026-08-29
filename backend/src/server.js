@@ -72,8 +72,13 @@ app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
   const tooLarge = err?.type === 'entity.too.large';
   if (tooLarge) console.warn('[chat] 요청 본문이 너무 큽니다:', err.length);
-  res.status(err?.status || 400).json({
-    error: tooLarge ? '요청이 너무 큽니다. 새 대화로 다시 시도해주세요.' : '잘못된 요청입니다.',
+  // 본문 파서 오류는 status를 채워 보낸다(400/413). status가 없으면 클라이언트 잘못이 아니라
+  // 서버 버그이므로 500으로 둔다 — 전부 400으로 뭉개면 원인 분류가 뒤집힌다.
+  const status = err?.status ?? err?.statusCode ?? 500;
+  if (status >= 500) console.error('[server error]', err);
+  res.status(status).json({
+    error: tooLarge ? '요청이 너무 큽니다. 새 대화로 다시 시도해주세요.'
+      : status >= 500 ? '처리 중 오류가 발생했습니다.' : '잘못된 요청입니다.',
   });
 });
 
@@ -108,13 +113,16 @@ const cleanupLogs = () =>
 cleanupLogs();
 setInterval(cleanupLogs, 3600 * 1000);
 
-const port = numEnv('PORT', 3001);
-app.listen(port, () => {
+// PORT=0은 '빈 포트를 아무거나'라는 의도된 값이므로 허용한다 (빈 값·오타만 기본값으로)
+const port = numEnv('PORT', 3001, { allowZero: true });
+const server = app.listen(port, () => {
+  // PORT=0이면 OS가 빈 포트를 고르므로 실제 배정된 포트를 찍는다 (로그가 유일한 확인 수단)
   console.log(
-    `agent server: http://localhost:${port} ` +
+    `agent server: http://localhost:${server.address().port} ` +
     `(LLM=${process.env.LLM_PROVIDER || 'mock'}, ORACLE_MOCK=${process.env.ORACLE_MOCK || '0'})`
   );
-}).on('error', e => {
+});
+server.on('error', e => {
   // 기동 실패(포트 충돌 등)는 이벤트로 오므로 uncaughtException 경로를 타지 않는다 — 명시 종료한다
   console.error('[listen] 기동 실패:', e.message);
   process.exit(1);
