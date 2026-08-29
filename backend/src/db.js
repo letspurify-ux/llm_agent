@@ -42,6 +42,18 @@ export function loadQueriesByNames(names) {
   );
 }
 
+// 대화 로그 기록 — 평가셋/미답변 질문 발굴용. 실패해도 응답에는 영향 없다 (호출부 catch)
+export function insertChatLog(question, answer, trace) {
+  return query(
+    'INSERT INTO chat_log (question, answer, trace) VALUES (?, ?, ?)',
+    [question, answer, JSON.stringify(trace)]
+  );
+}
+
+export function cleanupChatLogs(days) {
+  return query('DELETE FROM chat_log WHERE created_at < NOW() - INTERVAL ? DAY', [days]);
+}
+
 // 조회대상 DB 접속 정보 로드
 export async function loadTargetDb(dbName) {
   const rows = await query(

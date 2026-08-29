@@ -53,7 +53,7 @@ mariadb --default-character-set=utf8mb4 < backend/sql/seed.sql
 앱 계정 생성 (agent 서버는 관리 테이블을 읽기만 하므로 SELECT 권한이면 충분):
 
 ```bash
-mariadb -e "CREATE USER IF NOT EXISTS 'agent'@'localhost' IDENTIFIED BY 'agent1234'; GRANT SELECT ON llm_agent.* TO 'agent'@'localhost'; GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_store TO 'agent'@'localhost';"
+mariadb -e "CREATE USER IF NOT EXISTS 'agent'@'localhost' IDENTIFIED BY 'agent1234'; GRANT SELECT ON llm_agent.* TO 'agent'@'localhost'; GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_store TO 'agent'@'localhost'; GRANT SELECT, INSERT, DELETE ON llm_agent.chat_log TO 'agent'@'localhost';"
 ```
 
 SPACE 시스템 지식 데이터도 함께 등록:
@@ -186,6 +186,22 @@ Windows: `setup/bge-m3/start.bat` 실행 (설치 확인·모델 다운로드·�
 따라서 `qa_method`는 여러 쿼리를 순서대로 쓰는 절차가 필요할 때만 등록하면 되고,
 단일 쿼리는 `query_registry`의 **`query_desc`(용도 요약)**를 성실히 쓰는 것으로 충분하다.
 `query_desc`는 벡터/LIKE 검색과 LLM 선택의 근거이므로 "어떤 질문일 때 무엇을 조회하는지"를 반드시 적을 것.
+
+## 대화 로그
+
+모든 문답이 `chat_log` 테이블에 기록된다 (질문·답변·실행 쿼리 trace·시각). 용도는 두 가지 —
+평가셋 구축, 그리고 "못 답한 질문"을 찾아 지식/쿼리를 보강하는 운영 루프.
+
+- **3일 보존**: 서버가 기동 시 + 1시간 주기로 3일 지난 행을 정리한다 (`server.js`의 `CHAT_LOG_RETENTION_DAYS`)
+- 기록은 비동기라 실패해도 응답에 영향 없다
+
+못 답한 질문 찾기 예시:
+
+```sql
+SELECT question, created_at FROM chat_log
+WHERE answer LIKE '%일반 지식으로 답변%' OR answer LIKE '%실행 오류%'
+ORDER BY created_at DESC;
+```
 
 ## 향후 확장 지점
 

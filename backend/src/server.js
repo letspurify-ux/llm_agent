@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import { handleQuestion } from './agent.js';
 import { syncEmbeddings } from './embed-sync.js';
+import { insertChatLog, cleanupChatLogs } from './db.js';
 
 const app = express();
 app.use(express.json());
@@ -19,6 +20,8 @@ app.post('/api/chat', async (req, res) => {
   try {
     // history: 클라이언트가 보내는 최근 대화 [{role:'user'|'assistant', text}] (서버는 상태를 저장하지 않는다)
     const { answer, trace } = await handleQuestion(message.trim(), req.body?.history);
+    // 대화 로그 (비동기 — 기록 실패가 응답을 막지 않는다)
+    insertChatLog(message.trim(), answer, trace).catch(e => console.warn('[chat_log] 기록 실패:', e.message));
     res.json({
       answer,
       trace: trace.map(h => ({
@@ -47,6 +50,15 @@ if (syncInterval > 0) {
       .catch(() => {});
   }, syncInterval * 1000);
 }
+
+// 대화 로그 보존: 3일 지난 행을 기동 시 + 1시간 주기로 정리
+const CHAT_LOG_RETENTION_DAYS = 3;
+const cleanupLogs = () =>
+  cleanupChatLogs(CHAT_LOG_RETENTION_DAYS)
+    .then(r => { if (r.affectedRows) console.log(`[chat_log] ${r.affectedRows}건 정리 (${CHAT_LOG_RETENTION_DAYS}일 경과)`); })
+    .catch(e => console.warn('[chat_log] 정리 실패:', e.message));
+cleanupLogs();
+setInterval(cleanupLogs, 3600 * 1000);
 
 const port = Number(process.env.PORT || 3001);
 app.listen(port, () => {
