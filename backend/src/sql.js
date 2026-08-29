@@ -8,6 +8,8 @@
 // (q'!...!', q'#...#') 정규식으로 일부 구분자만 모델링하면 나머지에서 리터럴 경계가 어긋난다.
 // 어긋나면 리터럴 안의 세미콜론이 코드로 보이거나(정상 쿼리 오탐), 반대로 진짜 문장 구분자가
 // 리터럴에 삼켜져 조회 전용 가드를 통과한다(가드 우회). 경계 판정은 정확해야 한다.
+// 다루는 어휘: 한 줄/블록 주석, q-quote(임의 구분자 + 괄호쌍), 일반 문자열('' 이스케이프),
+// 따옴표 식별자("..."). 이 중 하나라도 빠지면 그 뒤의 스캔이 통째로 어긋난다.
 const Q_CLOSER = { '[': ']', '{': '}', '(': ')', '<': '>' };
 const isIdentChar = c => c !== undefined && /[A-Za-z0-9_$#]/.test(c);
 
@@ -40,6 +42,12 @@ function scanSql(sql) {
       const end = s.indexOf(close, i + 3);
       out += ' ';
       if (end < 0) { unterminated = true; i = s.length; } else { i = end + close.length; }
+      continue;
+    }
+    if (c === '"') {                                    // 따옴표 식별자 ("a'b" 처럼 아포스트로피를 담을 수 있다)
+      const end = s.indexOf('"', i + 1);
+      out += ' ';
+      if (end < 0) { unterminated = true; i = s.length; } else { i = end + 1; }
       continue;
     }
     if (c === "'") {                                    // 일반 문자열 ('' 는 이스케이프된 따옴표)

@@ -45,3 +45,12 @@ test('바인드 추출은 리터럴·주석 안의 콜론을 무시한다', () =
   assert.deepStrictEqual(bindNames("SELECT q'!don't!' a FROM t WHERE id = :id AND s = 'a;b'"), ['id']);
   assert.deepStrictEqual(bindNames('SELECT 1 FROM t WHERE a = :x AND b = :x'), ['x']); // 중복 제거
 });
+
+test('따옴표 식별자 안의 아포스트로피가 스캔을 어긋내지 않는다', () => {
+  accepts(`SELECT "a'b" FROM t`);             // 아포스트로피를 담은 따옴표 식별자
+  accepts(`SELECT 1 AS "a;b" FROM t`);        // 식별자 안의 세미콜론은 문장 구분자가 아니다
+  accepts(`SELECT 1 FROM "my table"`);
+  rejects(`SELECT 1 FROM "t"; DROP TABLE t`); // 식별자 밖의 세미콜론은 그대로 걸린다
+  rejects('SELECT "unterminated FROM t');
+  accepts(`SELECT 'a" b' FROM t`);            // 문자열 안의 따옴표는 문자열의 일부
+});

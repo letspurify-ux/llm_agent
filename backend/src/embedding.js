@@ -9,7 +9,7 @@ export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'bge-m3';
 // 재구성하면, 여기 설정 경로가 바뀔 때 호출부만 조용히 어긋난다.
 export const isEmbeddingEnabled = () => Boolean(process.env.EMBEDDING_URL);
 
-let warned = false;
+let lastWarning = null;
 
 const TIMEOUT_MS = 60_000; // 모델 콜드 로드가 30초+ 걸릴 수 있어 넉넉히. 초과 시 LIKE-only 폴백
 
@@ -38,8 +38,10 @@ export async function embed(texts) {
     }
     return vectors;
   } catch (e) {
-    if (!warned) {
-      warned = true;
+    // 같은 오류가 매 주기 반복될 때 로그를 도배하지 않되, 오류의 성격이 바뀌면 반드시 다시 알린다 —
+    // 접속 실패로 한 번 경고한 뒤 응답 정합성 오류(개수 불일치 등)로 바뀌면 그게 묻히면 안 된다.
+    if (lastWarning !== e.message) {
+      lastWarning = e.message;
       console.warn(`[embedding] 임베딩 서버 사용 불가 — LIKE 검색만 사용합니다: ${e.message}`);
     }
     return null;
