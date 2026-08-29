@@ -2,12 +2,13 @@
 // 질문 → 지식/처리방법 검색 → LLM 결정 루프(답변 또는 쿼리 실행) → 최종 답변.
 // 루프의 유일한 상태는 history 배열이며, 매 반복 전체 컨텍스트를 LLM에 전달한다.
 // 대화 맥락(chat)은 서버가 저장하지 않고 클라이언트가 매 요청에 실어 보낸다 (stateless 유지).
-import { searchKnowledge, searchQaMethods } from './search.js';
-import { loadQueryRegistry } from './db.js';
+import { searchKnowledge, searchQaMethods, searchQueries } from './search.js';
+import { loadQueryRegistry, countQueries, loadQueriesByNames } from './db.js';
 import { runQuery } from './oracle.js';
 import { llm } from './llm.js';
 
 const MAX_STEPS = 5;
+const MAX_PROMPT_QUERIES = 30; // 프롬프트에 싣는 쿼리 상한 (~2.2k토큰)
 const MAX_RESULT_ROWS = 20; // LLM 컨텍스트/답변에 전달할 최대 행 수 (총 건수는 totalRows로 보존)
 const MAX_CELL_LEN = 200;   // 셀 값 최대 길이 (CLOB 등 대형 텍스트 방어)
 const MAX_CHAT_TURNS = 6;   // LLM에 전달할 최근 대화 턴 수 (프롬프트 비대화 방지)
@@ -36,10 +37,9 @@ function normalizeChat(chat) {
 export async function handleQuestion(question, rawChat = []) {
   const chat = normalizeChat(rawChat);
 
-  const [k0, m0, queries] = await Promise.all([
+  const [k0, m0] = await Promise.all([
     searchKnowledge(question),
     searchQaMethods(question),
-    loadQueryRegistry(),
   ]);
   let knowledge = k0;
   let qaMethods = m0;
@@ -56,6 +56,8 @@ export async function handleQuestion(question, rawChat = []) {
       ]);
     }
   }
+
+  const queries = await selectQueries(qaMethods, question);
 
   const history = [];
   const ctx = () => ({ question, chat, knowledge, qaMethods, queries, history });
@@ -88,4 +90,29 @@ export async function handleQuestion(question, rawChat = []) {
   // 안전장치: MAX_STEPS 초과 시 강제 답변
   const final = await llm.decide({ ...ctx(), forceAnswer: true });
   return { answer: final.answer, trace: history };
+}
+
+// 프롬프트에 실을 쿼리 선정. 등록 수가 적으면 전체(가장 정확), 많으면 두 경로의 합집합:
+//   경로A: 매칭된 qa_method 본문이 지목한 query_name (다단계 절차 보장)
+//   경로B: 질문으로 query_registry 자체를 하이브리드 검색 — qa_method 등록 없는 쿼리도 찾는다
+async function selectQueries(qaMethods, question) {
+  if (await countQueries() <= MAX_PROMPT_QUERIES) return loadQueryRegistry();
+
+  const mentioned = [...new Set(
+    qaMethods.flatMap(m => m.method.match(/[A-Za-z_][A-Za-z0-9_]{2,}/g) || [])
+  )];
+  const [named, direct] = await Promise.all([
+    loadQueriesByNames(mentioned),   // query_name이 아닌 토큰은 IN 절에서 자연히 걸러진다
+    searchQueries(question),
+  ]);
+
+  const seen = new Set();
+  const picked = [];
+  for (const q of [...named, ...direct]) {       // 절차용(경로A)을 우선 포함
+    if (seen.has(q.seq)) continue;
+    seen.add(q.seq);
+    picked.push(q);
+    if (picked.length >= MAX_PROMPT_QUERIES) break;
+  }
+  return picked;
 }

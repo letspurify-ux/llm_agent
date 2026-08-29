@@ -19,10 +19,21 @@ export async function query(sql, params = []) {
   }
 }
 
-// 쿼리 관리 테이블 전체 로드 (소규모 테이블 전제)
+// 쿼리 관리 테이블 전체 로드 — 소규모(라우팅 임계치 이하)일 때만 사용
 export function loadQueryRegistry() {
+  return query('SELECT * FROM query_registry');
+}
+
+export async function countQueries() {
+  return Number((await query('SELECT COUNT(*) AS c FROM query_registry'))[0].c);
+}
+
+// qa_method 본문이 지목한 query_name들을 로드 (라우팅 경로A)
+export function loadQueriesByNames(names) {
+  if (!names.length) return Promise.resolve([]);
   return query(
-    'SELECT seq, query_name, input_desc, query_sql, output_desc, target_db_name FROM query_registry'
+    `SELECT * FROM query_registry WHERE query_name IN (${names.map(() => '?').join(',')})`,
+    names
   );
 }
 
