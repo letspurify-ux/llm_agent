@@ -10,6 +10,11 @@ const pool = mariadb.createPool({
   connectionLimit: 5,
 });
 
+// 커넥션을 직접 쥐어야 할 때 사용 (예: embed-sync의 GET_LOCK — 락은 커넥션에 귀속된다)
+export function getConnection() {
+  return pool.getConnection();
+}
+
 export async function query(sql, params = []) {
   const conn = await pool.getConnection();
   try {
