@@ -94,7 +94,8 @@ function vecQuery(table, vector) {
 //   - 여러 토큰이 맞을수록, 첫 컬럼(제목/이름)에 맞을수록, 긴(구체적인) 토큰이 맞을수록 높다
 //   - 조사를 뗀 변형 토큰은 원형보다 짧으므로 자연히 낮게 반영된다
 async function likeSearch(table, columns, question) {
-  const tokens = [...new Set(question.split(/\s+/).flatMap(expandToken).filter(t => t.length >= 2))];
+  // 토큰 상한: 대형 입력이 CASE 절 수천 개짜리 SQL을 만들면 MariaDB thread stack overrun이 난다
+  const tokens = [...new Set(question.split(/\s+/).flatMap(expandToken).filter(t => t.length >= 2))].slice(0, 50);
   if (tokens.length === 0) return [];
 
   const scoreParts = [];

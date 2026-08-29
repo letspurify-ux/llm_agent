@@ -13,6 +13,9 @@ app.post('/api/chat', async (req, res) => {
   if (typeof message !== 'string' || !message.trim()) {
     return res.status(400).json({ error: 'message가 필요합니다.' });
   }
+  if (message.length > 2000) {
+    return res.status(400).json({ error: '질문이 너무 깁니다 (최대 2,000자).' });
+  }
   try {
     // history: 클라이언트가 보내는 최근 대화 [{role:'user'|'assistant', text}] (서버는 상태를 저장하지 않는다)
     const { answer, trace } = await handleQuestion(message.trim(), req.body?.history);

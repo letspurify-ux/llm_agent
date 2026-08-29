@@ -116,6 +116,7 @@ export default function App() {
               if (!e.nativeEvent.isComposing) ask(input.trim());
             }}
             placeholder="질문을 입력하세요 (예: BATCH001 작업 상태 알려줘)"
+            maxLength={2000}
             autoFocus
           />
           <button className="send" disabled={loading || !input.trim()} aria-label="전송">➤</button>
