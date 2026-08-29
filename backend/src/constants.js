@@ -19,15 +19,18 @@ export const TRUNC_MARK = '…(생략)';
 export const MAX_CHAT_TURNS = 6;  // LLM에 전달할 최근 대화 턴 수 (프롬프트 비대화 방지)
 export const MAX_CHAT_LEN = 500;  // 턴별 최대 길이
 
-// 숫자 환경변수 파서. 빈 문자열('')과 공백은 미설정으로 취급한다 —
+// 정수 환경변수 파서. 빈 문자열('')과 공백은 미설정으로 취급한다 —
 // `Number(process.env.X ?? 기본값)`은 `X=`(빈 값)에서 ??가 발동하지 않아 0이 되고,
 // 0이 "타임아웃 없음"이나 "주기 동기화 끔" 같은 정반대 의미를 갖는 자리에서 조용히 기능을 꺼버린다.
+// 정수만 허용하는 이유: 이 값들이 가는 곳이 전부 정수를 요구한다 —
+// node-oracledb의 callTimeout 세터는 정수가 아니면 던지고(모든 조회 실패), listen()의 포트도 마찬가지다.
+// 검증한다고 해놓고 소수를 흘려보내면 '검증했다'는 착각만 남는다.
 // allowZero: 0을 유효한 값(끄기)으로 허용할지. 기본은 양수만 허용.
 export function numEnv(name, fallback, { allowZero = false } = {}) {
   const raw = process.env[name];
   if (raw === undefined || String(raw).trim() === '') return fallback;
   const v = Number(raw);
-  if (Number.isFinite(v) && (v > 0 || (allowZero && v === 0))) return v;
+  if (Number.isInteger(v) && (v > 0 || (allowZero && v === 0))) return v;
   console.warn(`[env] ${name} 값이 올바르지 않아 기본값(${fallback})을 사용합니다: ${JSON.stringify(raw)}`);
   return fallback;
 }
