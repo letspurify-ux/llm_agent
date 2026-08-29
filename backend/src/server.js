@@ -21,7 +21,7 @@ app.post('/api/chat', async (req, res) => {
       trace: trace.map(h => ({
         query_name: h.query_name,
         params: h.params,
-        rowCount: h.totalRows ?? h.rows?.length ?? 0,
+        rowCount: h.capped ? `${h.totalRows}+` : (h.totalRows ?? h.rows?.length ?? 0),
         rows: h.rows?.slice(0, 10),
         ...(h.error && { error: h.error }),
       })),

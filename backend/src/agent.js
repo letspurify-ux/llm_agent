@@ -80,6 +80,8 @@ export async function handleQuestion(question, rawChat = []) {
         params: decision.params,
         rows: capRows(rows),
         totalRows: rows.length,
+        // oracle.js의 maxRows(100)에 도달했으면 실제 총 건수는 그 이상일 수 있다
+        capped: rows.length >= 100,
       });
     } catch (e) {
       // 실패도 이력에 남기고 루프를 계속한다 — LLM이 에러를 보고 재시도/우회/답변을 판단
