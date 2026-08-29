@@ -64,19 +64,19 @@ mariadb --default-character-set=utf8mb4 < backend/sql/seed-space.sql
 
 ### 1-2. 조회용 Oracle 테스트 DB (Docker)
 
-로컬에서 실제 Oracle로 테스트하려면 컨테이너를 띄운다 (`ORACLE_MOCK=1`로 두면 이 단계는 건너뛰어도 된다):
+로컬에서 실제 Oracle로 테스트하려면 gvenzl/oracle-free 컨테이너를 쓴다 (`ORACLE_MOCK=1`로 두면 이 단계는 건너뛰어도 된다). 이미 있는 컨테이너를 재사용해도 되고, 없으면 새로 띄운다:
 
 ```bash
-docker run -d --name space-voc-oracle -p 1521:1521 -e ORACLE_PASSWORD=oracle_sys_1234 -e APP_USER=app_user -e APP_USER_PASSWORD=app_user_1234 gvenzl/oracle-free:latest
+docker run -d --name oracle1521 -p 1521:1521 -e ORACLE_PASSWORD=password gvenzl/oracle-free:latest
 ```
 
-`docker logs -f space-voc-oracle`에 "DATABASE IS READY TO USE"가 뜨면 스키마·샘플 데이터·조회 계정을 생성한다 (재실행 가능):
+`docker logs -f oracle1521`에 "DATABASE IS READY TO USE"가 뜨면 스키마·샘플 데이터·계정을 생성한다 (재실행 가능 — APP_USER가 없으면 스크립트가 직접 만든다):
 
 ```bash
-docker exec -i space-voc-oracle sqlplus -s system/oracle_sys_1234@localhost:1521/FREEPDB1 < backend/sql/oracle-init.sql
+docker exec -i oracle1521 sqlplus -s system/password@localhost:1521/FREEPDB1 < backend/sql/oracle-init.sql
 ```
 
-생성되는 것 — `APP_USER` 스키마의 `BATCH_JOBS`/`CUSTOMERS`/`ORDERS` 테이블과 샘플 데이터, 그리고 **SELECT 권한만 가진 조회 전용 계정 `VOC_READER`**(agent가 이 계정으로 접속). 접속 정보는 `target_db` 테이블에 `localhost:1521/FREEPDB1`로 등록되어 있다.
+생성되는 것 — `APP_USER` 계정과 그 스키마의 `BATCH_JOBS`/`CUSTOMERS`/`ORDERS` 테이블과 샘플 데이터, 그리고 **SELECT 권한만 가진 조회 전용 계정 `VOC_READER`**(agent가 이 계정으로 접속). 접속 정보는 `target_db` 테이블에 `localhost:1521/FREEPDB1`로 등록되어 있다.
 
 ### 2. 백엔드
 

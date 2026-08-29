@@ -1,9 +1,18 @@
--- 조회용 Oracle 테스트 DB 초기화 스크립트 (재실행 가능).
--- 컨테이너 기동 후 아래 명령으로 적용한다 (README 참고):
---   docker exec -i space-voc-oracle sqlplus -s system/oracle_sys_1234@localhost:1521/FREEPDB1 < backend/sql/oracle-init.sql
--- (APP_USER 계정은 컨테이너의 APP_USER/APP_USER_PASSWORD 환경변수로 생성됨)
+-- 조회용 Oracle 테스트 DB 초기화 스크립트 (재실행 가능, 컨테이너 독립적).
+-- 컨테이너 기동 후 SYSTEM 계정으로 적용한다 (README 참고):
+--   docker exec -i <컨테이너명> sqlplus -s system/<SYSTEM비밀번호>@localhost:1521/FREEPDB1 < backend/sql/oracle-init.sql
 
 SET DEFINE OFF
+
+-- ===== 데이터 소유 계정 (없으면 생성) =====
+BEGIN
+  EXECUTE IMMEDIATE 'CREATE USER APP_USER IDENTIFIED BY "app_user_1234"';
+EXCEPTION
+  WHEN OTHERS THEN IF SQLCODE != -1920 THEN RAISE; END IF;  -- 이미 존재하면 무시
+END;
+/
+GRANT CREATE SESSION, CREATE TABLE TO APP_USER;
+ALTER USER APP_USER QUOTA UNLIMITED ON USERS;
 
 -- 기존 테이블 정리 (재실행 대비)
 BEGIN
