@@ -5,7 +5,7 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import { query } from './db.js';
+import { query, getConnection } from './db.js';
 import { embed } from './embedding.js';
 
 // 테이블별 임베딩 원문 — 요약(제목/용도)과 본문을 합쳐 "이 행이 무엇인지"를 표현한다
@@ -16,16 +16,28 @@ const SOURCES = {
 };
 const BATCH = 32;
 
-// 중첩 실행 가드 — 초기 대량 동기화(수 분)가 도는 동안 주기 실행이 겹쳐
-// 같은 행을 중복 임베딩하는 것을 막는다. 겹치면 이번 회차는 건너뛴다.
+// 중첩 실행 가드 — 초기 대량 동기화(수 분)가 도는 동안 다른 실행이 겹쳐 같은 행을
+// 중복 임베딩하는 것을 막는다. 프로세스 내부는 running 플래그로, 프로세스 간(서버 주기
+// 동기화 vs npm run embed)은 MariaDB GET_LOCK으로 배타한다. 겹치면 이번 회차는 건너뛴다.
+// (락은 커넥션에 귀속되므로 전용 커넥션을 동기화가 끝날 때까지 쥔다. 프로세스가 죽으면
+//  커넥션이 닫히며 서버가 락을 자동 해제한다.)
 let running = false;
+const LOCK_NAME = 'space_voc_embed_sync';
 
 export async function syncEmbeddings() {
   if (running) return { embedded: 0, deleted: 0, skipped: false };
   running = true;
+  const lockConn = await getConnection();
   try {
-    return await doSync();
+    const got = (await lockConn.query(`SELECT GET_LOCK('${LOCK_NAME}', 0) AS l`))[0].l;
+    if (!Number(got)) return { embedded: 0, deleted: 0, skipped: false };
+    try {
+      return await doSync();
+    } finally {
+      await lockConn.query(`SELECT RELEASE_LOCK('${LOCK_NAME}')`).catch(() => {});
+    }
   } finally {
+    lockConn.release();
     running = false;
   }
 }

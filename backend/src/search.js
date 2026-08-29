@@ -6,7 +6,10 @@ import { embed } from './embedding.js';
 const LIMIT = 20;         // LLM에 넘길 최대 후보 수 (건당 약 84토큰)
 const TITLE_WEIGHT = 3;   // 제목(첫 컬럼) 매칭은 본문 매칭보다 높게
 const RRF_K = 60;         // Reciprocal Rank Fusion 상수 (표준값)
-const EF_SEARCH = 400;    // MHNSW 탐색 깊이. 기본값(20)은 1024차원에서 recall이 크게 떨어진다
+const EF_SEARCH = 400;
+const MAX_DIST = 0.55;    // 벡터 매칭 관련도 임계값 (코사인 거리). 실측: 관련 0.30~0.53, 무관 0.58~0.75.
+                          // top-K는 무관해도 항상 K건을 돌려주므로, 이 필터가 없으면 "관련 지식 없음 →
+                          // 일반 지식 답변" 폴백이 무력화된다. LIKE 쪽은 무필터(정확 키워드 보존).    // MHNSW 탐색 깊이. 기본값(20)은 1024차원에서 recall이 크게 떨어진다
                           // (10k 부하 테스트에서 실측: 기본값은 최근접을 놓치고, 400이면 정확 검색과 일치·~20ms)
 
 export function searchKnowledge(question) {
@@ -84,7 +87,7 @@ function vecQuery(table, vector) {
      SELECT t.* FROM (
        SELECT seq, VEC_DISTANCE_COSINE(embedding, VEC_FromText(?)) AS _dist
        FROM vec_store WHERE src = ? ORDER BY _dist LIMIT ${LIMIT}
-     ) v JOIN ${table} t ON t.seq = v.seq ORDER BY v._dist`,
+     ) v JOIN ${table} t ON t.seq = v.seq WHERE v._dist <= ${MAX_DIST} ORDER BY v._dist`,
     [JSON.stringify(vector), table]
   );
 }
