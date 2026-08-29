@@ -39,10 +39,13 @@ async function doSync() {
       (await query('SELECT seq, embed_hash FROM vec_store WHERE src = ?', [src])).map(r => [r.seq, r.embed_hash])
     );
 
+    // 해시에 모델명을 포함한다 — EMBEDDING_MODEL을 바꾸면 모든 해시가 불일치해
+    // 자동으로 전체 재임베딩된다 (구 모델 벡터와 새 모델 질문 벡터를 섞으면 검색이 무의미해짐)
+    const model = process.env.EMBEDDING_MODEL || 'bge-m3';
     const stale = [];
     for (const r of rows) {
       const text = toText(r);
-      const hash = crypto.createHash('md5').update(text).digest('hex');
+      const hash = crypto.createHash('md5').update(`${model}\n${text}`).digest('hex');
       if (stored.get(r.seq) !== hash) stale.push({ seq: r.seq, text, hash });
       stored.delete(r.seq);
     }

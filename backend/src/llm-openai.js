@@ -96,8 +96,10 @@ function buildPrompt(ctx) {
     if (h.error) {
       lines.push(`- ${h.query_name} params=${JSON.stringify(h.params)} → 오류: ${h.error}`);
     } else {
-      const note = h.totalRows > h.rows.length ? ` (총 ${h.totalRows}건 중 처음 ${h.rows.length}건만 표시)` : '';
-      lines.push(`- ${h.query_name} params=${JSON.stringify(h.params)} → 결과 ${h.totalRows ?? h.rows.length}건${note}: ${JSON.stringify(h.rows)}`);
+      const note = h.capped
+        ? ` (조회 상한 100건 도달 — 실제 총 건수는 더 많을 수 있음, 처음 ${h.rows.length}건만 표시)`
+        : h.totalRows > h.rows.length ? ` (총 ${h.totalRows}건 중 처음 ${h.rows.length}건만 표시)` : '';
+      lines.push(`- ${h.query_name} params=${JSON.stringify(h.params)} → 결과 ${h.totalRows ?? h.rows.length}${h.capped ? '+' : ''}건${note}: ${JSON.stringify(h.rows)}`);
     }
   }
 

@@ -62,10 +62,23 @@ function embedQuestion(question) {
   return embedCache.get(question);
 }
 
-// 질문 임베딩 후 vec_store에서 코사인 거리 상위 LIMIT건 → 원본 행 JOIN
+// 질문 임베딩 후 vec_store에서 코사인 거리 상위 LIMIT건 → 원본 행 JOIN.
+// SQL 오류(vec_store 미생성, 차원 불일치 등)도 null로 폴백해 LIKE-only로 계속 동작한다.
 async function vecSearch(table, question) {
   const vector = await embedQuestion(question);
   if (!vector) return null;
+  return vecQuery(table, vector).catch(e => {
+    if (!vecWarned) {
+      vecWarned = true;
+      console.warn(`[search] 벡터 검색 실패 — LIKE 검색만 사용합니다: ${e.message}`);
+    }
+    return null;
+  });
+}
+
+let vecWarned = false;
+
+function vecQuery(table, vector) {
   return query(
     `SET STATEMENT mhnsw_ef_search=${EF_SEARCH} FOR
      SELECT t.* FROM (

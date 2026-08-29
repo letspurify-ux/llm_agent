@@ -7,7 +7,10 @@ import { loadTargetDb } from './db.js';
 // query_sql에서 :bind 변수명 추출.
 // 문자열 리터럴은 먼저 제거한다 — TO_CHAR(D, 'HH24:MI')의 :MI 같은 것이 바인드로 잡히면 안 된다.
 export function bindNames(sql) {
-  const withoutLiterals = sql.replace(/'(?:[^']|'')*'/g, "''");
+  const withoutLiterals = sql
+    // Oracle q-quote 리터럴(q'[...]', q'{...}', q'(...)', q'<...>')을 먼저 제거
+    .replace(/q'\[[\s\S]*?\]'|q'\{[\s\S]*?\}'|q'\([\s\S]*?\)'|q'<[\s\S]*?>'/gi, "''")
+    .replace(/'(?:[^']|'')*'/g, "''");
   return [...new Set([...withoutLiterals.matchAll(/:(\w+)/g)].map(m => m[1]))];
 }
 

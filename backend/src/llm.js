@@ -101,10 +101,10 @@ function buildAnswer({ knowledge, history }) {
       parts.push(`**${h.query_name}** 실행 오류: ${h.error}`);
     } else if (h.rows?.length) {
       const omitted = (h.totalRows ?? h.rows.length) - h.rows.length;
-      parts.push(
-        `### ${h.query_name} 조회 결과\n\n${rowsToMarkdownTable(h.rows)}` +
-        (omitted > 0 ? `\n\n_외 ${omitted}건 생략 (총 ${h.totalRows}건)_` : '')
-      );
+      const note = h.capped
+        ? `\n\n_외 ${omitted}건 이상 생략 (조회 상한 100건 도달 — 실제는 더 많을 수 있음)_`
+        : omitted > 0 ? `\n\n_외 ${omitted}건 생략 (총 ${h.totalRows}건)_` : '';
+      parts.push(`### ${h.query_name} 조회 결과\n\n${rowsToMarkdownTable(h.rows)}${note}`);
     } else if (h.rows) {
       parts.push(`**${h.query_name}** 조회 결과가 없습니다.`);
     }
