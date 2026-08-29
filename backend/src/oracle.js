@@ -52,6 +52,9 @@ export async function runQuery(registryRow, params = {}) {
     password: resolvePassword(target.db_password),
     connectString: target.connection_info,
   });
+  // 조회 타임아웃 — 느린 쿼리(락 대기, 잘못된 실행계획)가 요청을 무한 대기시키지 않게.
+  // 초과 시 오류가 나고 agent가 history에 기록해 LLM이 안내 답변한다.
+  conn.callTimeout = Number(process.env.ORACLE_TIMEOUT_MS || 30_000);
   try {
     // 사용자 입력은 바인드 값으로만 전달한다 (SQL 문자열 결합 금지)
     const result = await conn.execute(registryRow.query_sql, binds, {
