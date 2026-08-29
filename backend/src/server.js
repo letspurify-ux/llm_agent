@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { writeSync } from 'node:fs';
 import express from 'express';
 import { handleQuestion } from './agent.js';
 import { syncEmbeddings, SKIP } from './embed-sync.js';
@@ -12,7 +13,9 @@ process.on('unhandledRejection', e => console.error('[unhandledRejection]', e));
 // /api/health는 DB를 건드리지 않아 계속 ok를 돌려주므로 감시자가 재시작을 걸지 못한다.
 // 로그를 남기고 즉시 종료해 supervisor가 깨끗한 프로세스로 재시작하게 한다.
 process.on('uncaughtException', e => {
-  console.error('[uncaughtException]', e);
+  // stderr가 파이프(도커 로그 등)면 console.error는 비동기라 process.exit에 잘려 나간다 —
+  // 종료하는 이유가 이 메시지를 남기기 위함이므로 동기로 쓴다.
+  try { writeSync(2, `[uncaughtException] ${e?.stack ?? e}\n`); } catch { /* 로그 실패가 종료를 막지 않게 */ }
   process.exit(1);
 });
 

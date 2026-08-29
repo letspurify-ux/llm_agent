@@ -30,6 +30,8 @@ oracledb.fetchTypeHandler = metaData => {
 //     Node 프로세스 TZ와 DB TZ가 다를 때 조용히 어긋난다(UTC 컨테이너 ↔ KST DB = 9시간).
 //   - 세션 포맷을 고정해두면 그 문자열을 다음 스텝의 바인드로 되돌려도 같은 세션 포맷으로
 //     암묵 변환되므로, multi-step 날짜 연결에서 ORA-01861이 나지 않는다.
+// 부작용: 등록 SQL이 포맷 마스크 없는 TO_CHAR(d)/TO_DATE(s)를 쓰면 이제 서버 기본값이 아니라
+// 이 포맷을 따른다. 서버 설정에 따라 달라지던 것이 고정되는 것이므로 등록 쿼리는 포맷을 명시할 것.
 const NLS_SESSION_FORMATS =
   "ALTER SESSION SET NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS'" +
   " NLS_TIMESTAMP_FORMAT='YYYY-MM-DD HH24:MI:SS'" +

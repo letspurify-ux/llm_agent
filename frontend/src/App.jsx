@@ -135,6 +135,7 @@ export default function App() {
               justComposedRef.current = true;
             }}
             onKeyUp={() => { justComposedRef.current = false; }}
+            onBlur={() => { justComposedRef.current = false; }}
             onKeyDown={e => {
               if (e.key !== 'Enter') {
                 justComposedRef.current = false;

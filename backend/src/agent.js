@@ -26,10 +26,10 @@ const nameKey = s => String(s ?? '').trim().toLowerCase();
 // 동일 실행 판정용 파라미터 키 — LLM이 준 원본이 아니라 "실제로 바인드되는 값"으로 만든다.
 // runQuery가 SQL의 바인드 변수만 추려 쓰므로, 여분 키 하나가 붙었다고 다른 실행이 되지는 않는다.
 // 값은 문자열로 정규화한다 (숫자 1과 문자열 '1'은 같은 컬럼에 같은 값으로 바인드된다).
-function paramKey(registryRow, params) {
-  const entries = registryRow
-    ? bindNames(registryRow.query_sql).map(n => [n, params?.[n]])
-    : Object.entries(params || {});
+function paramKey(bindNameList, params) {
+  const entries = bindNameList
+    ? bindNameList.map(n => [n, params?.[n]])
+    : Object.entries(params || {}); // 미등록 쿼리라 바인드를 알 수 없으면 원본 그대로 비교
   return JSON.stringify(
     entries
       .map(([k, v]) => [k, v === undefined ? ['undefined'] : v === null ? ['null'] : String(v)])
@@ -97,8 +97,9 @@ export async function handleQuestion(question, rawChat = []) {
       await resolveQuery(decision.query_name, queries, resolveCache);
     // 이력에는 항상 정규 이름(등록된 철자)을 남긴다 — 가드와 프롬프트가 같은 이름을 보게.
     const canonicalName = registryRow?.query_name ?? decision.query_name;
-    const key = paramKey(registryRow, decision.params);
-    const isSame = h => nameKey(h.query_name) === nameKey(canonicalName) && paramKey(registryRow, h.params) === key;
+    const binds = registryRow ? bindNames(registryRow.query_sql) : null; // 스텝당 1회만 파싱
+    const key = paramKey(binds, decision.params);
+    const isSame = h => nameKey(h.query_name) === nameKey(canonicalName) && paramKey(binds, h.params) === key;
     // note는 LLM에게 경로를 바꾸라고 알리는 제어용 기록이다. 실제 쿼리 실패(error)와 필드를 나눈다 —
     // 같은 필드에 넣으면 사용자 trace 패널과 chat_log의 '실패한 질문' 집계에 정상 턴이 섞인다.
     const push = (field, msg) => history.push({ query_name: canonicalName, params: decision.params, [field]: msg });
@@ -121,6 +122,10 @@ export async function handleQuestion(question, rawChat = []) {
       push('error', resolveError ?? '등록되지 않은 쿼리');
       continue;
     }
+    // 프롬프트 목록 밖에서 찾은 쿼리는 목록에 넣어준다 — 다음 스텝에서 LLM이 input_desc를 보고
+    // 바인드를 고칠 수 있어야 한다. 중복은 넣지 않고, 늘어나는 상한은 MAX_STEPS건이다
+    // (즉 목록은 최대 MAX_PROMPT_QUERIES + MAX_STEPS건 — 무제한으로 커지지 않는다).
+    if (!queries.includes(registryRow)) queries.push(registryRow);
     try {
       const { rows, totalRows, capped } = await runQuery(registryRow, decision.params);
       history.push({ query_name: canonicalName, params: decision.params, rows: capRows(rows), totalRows, capped });
