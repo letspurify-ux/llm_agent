@@ -35,6 +35,9 @@ export async function runQuery(registryRow, params = {}) {
 
   const target = await loadTargetDb(registryRow.target_db_name);
   if (!target) throw new Error(`조회대상 DB를 찾을 수 없음: ${registryRow.target_db_name}`);
+  if (target.db_type && target.db_type !== 'oracle') {
+    throw new Error(`지원하지 않는 db_type: ${target.db_type} (현재 oracle만 지원)`);
+  }
 
   // 풀 없이 실행마다 접속/해제 — 사내 Q&A 트래픽 수준에 충분, 다중 target_db 관리 단순
   const conn = await oracledb.getConnection({
