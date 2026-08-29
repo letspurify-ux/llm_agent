@@ -73,7 +73,7 @@ export async function runQuery(registryRow, params = {}) {
     // 초과 시 오류가 나고 agent가 history에 기록해 LLM이 안내 답변한다.
     // 반드시 try 안에서 설정한다 — 드라이버가 던지면 밖에서는 finally의 close가 실행되지 않아 커넥션이 샌다.
     conn.callTimeout = TIMEOUT_MS;
-    await conn.execute(NLS_SESSION_FORMATS);
+    await setSessionFormats(conn);
     // 사용자 입력은 바인드 값으로만 전달한다 (SQL 문자열 결합 금지)
     const result = await conn.execute(registryRow.query_sql, binds, {
       outFormat: oracledb.OUT_FORMAT_OBJECT,
@@ -82,6 +82,22 @@ export async function runQuery(registryRow, params = {}) {
     return capResult(result.rows ?? []);
   } finally {
     await conn.close().catch(() => {}); // close 실패가 원본 쿼리 오류를 덮어쓰지 않게
+  }
+}
+
+// 세션 포맷 고정은 표기 품질을 위한 것이지 조회의 전제 조건이 아니다 —
+// 실패해도 조회는 계속한다 (여기서 던지면 부가 설정 하나가 모든 조회를 막는다).
+// 실패 시 날짜는 DB 기본 NLS 포맷 문자열로 오고, 그 값을 다음 스텝 바인드로 되돌릴 때만
+// 포맷 불일치(ORA-01861) 가능성이 남는다.
+let nlsWarned = false;
+async function setSessionFormats(conn) {
+  try {
+    await conn.execute(NLS_SESSION_FORMATS);
+  } catch (e) {
+    if (!nlsWarned) {
+      nlsWarned = true;
+      console.warn(`[oracle] 세션 날짜 포맷 고정 실패 — DB 기본 포맷을 사용합니다: ${e.message}`);
+    }
   }
 }
 
