@@ -163,6 +163,8 @@ LLM 인터페이스는 `llm.js`의 `decide(ctx) → {action:'answer'|'run_query'
 
 ### 임베딩 준비 (선택 — 없으면 LIKE-only)
 
+macOS:
+
 ```bash
 brew services run ollama
 ```
@@ -170,6 +172,9 @@ brew services run ollama
 ```bash
 ollama pull bge-m3
 ```
+
+Windows: `setup/bge-m3/start.bat` 실행 (설치 확인·모델 다운로드·검증까지 자동, 중지는 `stop.bat`).
+자세한 내용은 [setup/bge-m3/README.md](setup/bge-m3/README.md) 참고.
 
 ### 쿼리 라우팅 (프롬프트 폭발 방지)
 
