@@ -46,17 +46,33 @@ function rrfMerge(...lists) {
 }
 
 // ===== 벡터 검색 =====
-// 질문을 임베딩(요청당 1회)해 vec_store에서 코사인 거리 상위 LIMIT건 → 원본 행 JOIN
+// 같은 질문은 임베딩을 1회만 계산한다 — 요청 1건이 지식/처리방법/쿼리 검색으로
+// vecSearch를 3회 이상 호출하므로, promise를 캐시해 병렬 호출까지 합친다.
+const embedCache = new Map();
+
+function embedQuestion(question) {
+  if (!embedCache.has(question)) {
+    if (embedCache.size >= 100) embedCache.clear();
+    const p = embed([question]).then(v => {
+      if (!v) embedCache.delete(question); // 실패는 캐시하지 않는다 (다음 요청에서 재시도)
+      return v && v[0];
+    });
+    embedCache.set(question, p);
+  }
+  return embedCache.get(question);
+}
+
+// 질문 임베딩 후 vec_store에서 코사인 거리 상위 LIMIT건 → 원본 행 JOIN
 async function vecSearch(table, question) {
-  const vectors = await embed([question]);
-  if (!vectors) return null;
+  const vector = await embedQuestion(question);
+  if (!vector) return null;
   return query(
     `SET STATEMENT mhnsw_ef_search=${EF_SEARCH} FOR
      SELECT t.* FROM (
        SELECT seq, VEC_DISTANCE_COSINE(embedding, VEC_FromText(?)) AS _dist
        FROM vec_store WHERE src = ? ORDER BY _dist LIMIT ${LIMIT}
      ) v JOIN ${table} t ON t.seq = v.seq ORDER BY v._dist`,
-    [JSON.stringify(vectors[0]), table]
+    [JSON.stringify(vector), table]
   );
 }
 
@@ -74,7 +90,7 @@ async function likeSearch(table, columns, question) {
     columns.forEach((col, i) => {
       const weight = (i === 0 ? TITLE_WEIGHT : 1) * tok.length;
       scoreParts.push(`CASE WHEN ${col} LIKE ? THEN ${weight} ELSE 0 END`);
-      params.push(`%${tok}%`);
+      params.push(`%${tok.replace(/[\\%_]/g, '\\$&')}%`); // %와 _는 LIKE 와일드카드이므로 이스케이프
     });
   }
 

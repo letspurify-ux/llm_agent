@@ -84,6 +84,8 @@ function valueFromHistory(name, history) {
   for (let i = history.length - 1; i >= 0; i--) {
     for (const row of history[i].rows || []) {
       for (const [col, val] of Object.entries(row)) {
+        // capRows가 자른 값('…(생략)')은 원본이 아니므로 바인드 값으로 쓰지 않는다
+        if (typeof val === 'string' && val.endsWith('…(생략)')) continue;
         if (col.toLowerCase() === name.toLowerCase()) return val;
       }
     }

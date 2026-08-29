@@ -26,14 +26,23 @@ const SYSTEM_PROMPT = `당신은 사내 지식 관리 및 DB 조회 Q&A 에이�
 최근 대화가 함께 주어진다. 현재 질문이 이전 대화를 가리키면(예: "그럼 김철수는?", "재시작은 어떻게 해?") 최근 대화를 참고해
 무엇을 묻는지 해석한 뒤 판단하라. 단, 이미 조회한 값이라도 현재 질문의 대상이 다르면 반드시 쿼리를 다시 실행하라.`;
 
+const TIMEOUT_MS = 120_000;
+
+// HTTP 오류·타임아웃·파싱 실패 모두 1회 재시도하고, 그래도 실패하면 500 대신
+// 오류 안내 답변으로 정상 응답한다 (이미 실행한 쿼리 결과가 버려지지 않도록).
 export async function openaiDecide(ctx) {
   const userPrompt = buildPrompt(ctx);
   for (let attempt = 0; attempt < 2; attempt++) {
-    const content = await chatCompletion(userPrompt);
-    const decision = parseDecision(content, ctx.forceAnswer);
-    if (decision) return decision;
+    try {
+      const content = await chatCompletion(userPrompt);
+      const decision = parseDecision(content, ctx.forceAnswer);
+      if (decision) return decision;
+    } catch (e) {
+      console.warn(`[llm] 호출 실패 (시도 ${attempt + 1}/2):`, e.message);
+    }
   }
-  return { action: 'answer', answer: 'LLM 응답을 해석하지 못했습니다. 잠시 후 다시 시도해주세요.' };
+  // 상세 오류는 위 warn 로그에만 남긴다 — 사용자에게는 일반화된 메시지 (내부 정보 노출 방지)
+  return { action: 'answer', answer: 'LLM 호출에 실패했습니다. 잠시 후 다시 시도해주세요.' };
 }
 
 async function chatCompletion(userPrompt) {
@@ -43,6 +52,7 @@ async function chatCompletion(userPrompt) {
   const res = await fetch(`${process.env.LLM_BASE_URL}/chat/completions`, {
     method: 'POST',
     headers,
+    signal: AbortSignal.timeout(TIMEOUT_MS),
     body: JSON.stringify({
       model: process.env.LLM_MODEL,
       temperature: 0,

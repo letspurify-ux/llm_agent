@@ -21,24 +21,30 @@ export default function App() {
 
   async function ask(message) {
     if (!message || loading) return;
+    // history는 현재 질문을 넣기 전에 확정한다 — 현재 질문은 message로 따로 가므로 중복 전송하지 않는다
+    const history = historyRef.current.slice(-6);
     historyRef.current = [...historyRef.current, { role: 'user', text: message }];
     setMessages(m => [...m, { role: 'user', text: message }]);
     setInput('');
     setLoading(true);
+    let answer = '서버와 통신하지 못했습니다.';
+    let trace;
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         // 서버는 상태를 저장하지 않으므로 최근 대화를 함께 보낸다 (후속 질문 해석용)
-        body: JSON.stringify({ message, history: historyRef.current.slice(-6) }),
+        body: JSON.stringify({ message, history }),
       });
       const data = await res.json();
-      const answer = data.answer ?? data.error;
-      historyRef.current = [...historyRef.current, { role: 'assistant', text: answer }];
-      setMessages(m => [...m, { role: 'assistant', text: answer, trace: data.trace }]);
+      answer = data.answer ?? data.error;
+      trace = data.trace;
     } catch {
-      setMessages(m => [...m, { role: 'assistant', text: '서버와 통신하지 못했습니다.' }]);
+      // answer는 통신 오류 기본값 유지
     } finally {
+      // 오류 응답도 이력에 남겨 화면과 서버로 보내는 대화가 항상 일치하게 한다
+      historyRef.current = [...historyRef.current, { role: 'assistant', text: answer }];
+      setMessages(m => [...m, { role: 'assistant', text: answer, trace }]);
       setLoading(false);
     }
   }
