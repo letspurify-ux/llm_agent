@@ -53,7 +53,7 @@ export async function runQuery(registryRow, params = {}) {
     });
     return result.rows;
   } finally {
-    await conn.close();
+    await conn.close().catch(() => {}); // close 실패가 원본 쿼리 오류를 덮어쓰지 않게
   }
 }
 
