@@ -8,22 +8,14 @@ import { MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK, numEnv } from './constants.js';
 
 // 드라이버 경계에서 타입을 확정한다. LOB은 기본값이 Lob 스트림 객체라 커넥션을 닫으면 무효가 되고
 // JSON 직렬화 시 순환 참조로 예외가 난다 — CLOB만이 아니라 NCLOB/BLOB도 같은 위험이므로 전부 다룬다.
-// 날짜류를 STRING으로 받는 이유는 아래 NLS_SESSION_FORMATS 주석 참고.
-oracledb.fetchTypeHandler = metaData => {
-  switch (metaData.dbType) {
-    case oracledb.DB_TYPE_DATE:
-    case oracledb.DB_TYPE_TIMESTAMP:
-    case oracledb.DB_TYPE_TIMESTAMP_TZ:
-    case oracledb.DB_TYPE_TIMESTAMP_LTZ:
-    case oracledb.DB_TYPE_CLOB:
-    case oracledb.DB_TYPE_NCLOB:
-      return { type: oracledb.STRING };
-    case oracledb.DB_TYPE_BLOB:
-      return { type: oracledb.BUFFER };
-    default:
-      return undefined; // 나머지는 드라이버 기본 매핑
-  }
-};
+// 날짜류를 문자열로 받는 이유는 아래 NLS_SESSION_FORMATS 주석 참고.
+//
+// fetchTypeHandler로 직접 타입을 지정하지 않는다: 핸들러가 돌려준 타입은 드라이버가 매핑 없이
+// 그대로 쓰기 때문에, CLOB에 VARCHAR(oracledb.STRING)를 주면 VARCHAR 한도에서 잘린다.
+// fetchAsString/fetchAsBuffer는 드라이버가 각 타입의 올바른 대상(CLOB→LONG, NCLOB→LONG_NVARCHAR,
+// BLOB→LONG_RAW, DATE/TIMESTAMP/TZ/LTZ→VARCHAR)을 스스로 계산한다.
+oracledb.fetchAsString = [oracledb.CLOB, oracledb.NCLOB, oracledb.DATE];
+oracledb.fetchAsBuffer = [oracledb.BLOB];
 
 // 날짜/시각은 JS Date로 받지 않고 DB가 직접 포맷한 문자열로 받는다.
 //   - JS Date를 로컬 getter로 다시 렌더링하면 TIMESTAMP WITH (LOCAL) TIME ZONE에서
