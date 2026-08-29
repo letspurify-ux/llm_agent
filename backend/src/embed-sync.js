@@ -6,14 +6,12 @@ import 'dotenv/config';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { query, getConnection } from './db.js';
-import { embed } from './embedding.js';
+import { embed, EMBEDDING_MODEL } from './embedding.js';
+import { SEARCH_COLUMNS } from './search.js';
 
-// 테이블별 임베딩 원문 — 요약(제목/용도)과 본문을 합쳐 "이 행이 무엇인지"를 표현한다
-const SOURCES = {
-  knowledge: r => `${r.title}\n${r.content}`,
-  qa_method: r => `${r.title}\n${r.method}`,
-  query_registry: r => `${r.query_name}\n${r.query_desc ?? ''}\n${r.input_desc ?? ''}\n${r.output_desc ?? ''}`,
-};
+// 임베딩 원문 — 검색 대상 컬럼(search.js)을 이어붙여 "이 행이 무엇인지"를 표현한다.
+// 검색과 같은 정의를 써야 LIKE와 벡터가 서로 다른 내용을 보지 않는다.
+const toText = (cols, row) => cols.map(c => row[c] ?? '').join('\n');
 const BATCH = 32;
 
 // 중첩 실행 가드 — 초기 대량 동기화(수 분)가 도는 동안 다른 실행이 겹쳐 같은 행을
@@ -25,19 +23,27 @@ let running = false;
 const LOCK_NAME = 'space_voc_embed_sync';
 
 export async function syncEmbeddings() {
+  // 임베딩 서버를 쓰지 않는 환경(LIKE-only)에서는 원본 스캔 자체가 무의미하다 —
+  // 전 테이블 읽기와 해시 계산을 통째로 건너뛴다 (10k 규모에서 매분 수십 MB 절약)
+  if (!process.env.EMBEDDING_URL) return { embedded: 0, deleted: 0, skipped: true };
   if (running) return { embedded: 0, deleted: 0, skipped: false };
   running = true;
-  const lockConn = await getConnection();
   try {
-    const got = (await lockConn.query(`SELECT GET_LOCK('${LOCK_NAME}', 0) AS l`))[0].l;
-    if (!Number(got)) return { embedded: 0, deleted: 0, skipped: false };
+    // 커넥션 획득도 이 try 안에서 한다 — 실패(MariaDB 다운·풀 포화) 시에도 running이 반드시 풀려야
+    // 다음 주기에 재시도된다. 밖에 두면 한 번의 실패로 동기화가 재시작 전까지 영구 정지한다.
+    const lockConn = await getConnection();
     try {
-      return await doSync();
+      const got = (await lockConn.query(`SELECT GET_LOCK('${LOCK_NAME}', 0) AS l`))[0].l;
+      if (!Number(got)) return { embedded: 0, deleted: 0, skipped: false };
+      try {
+        return await doSync();
+      } finally {
+        await lockConn.query(`SELECT RELEASE_LOCK('${LOCK_NAME}')`).catch(() => {});
+      }
     } finally {
-      await lockConn.query(`SELECT RELEASE_LOCK('${LOCK_NAME}')`).catch(() => {});
+      lockConn.release();
     }
   } finally {
-    lockConn.release();
     running = false;
   }
 }
@@ -45,7 +51,7 @@ export async function syncEmbeddings() {
 async function doSync() {
   let embedded = 0, deleted = 0;
 
-  for (const [src, toText] of Object.entries(SOURCES)) {
+  for (const [src, cols] of Object.entries(SEARCH_COLUMNS)) {
     const rows = await query(`SELECT * FROM ${src}`);
     const stored = new Map(
       (await query('SELECT seq, embed_hash FROM vec_store WHERE src = ?', [src])).map(r => [r.seq, r.embed_hash])
@@ -53,11 +59,10 @@ async function doSync() {
 
     // 해시에 모델명을 포함한다 — EMBEDDING_MODEL을 바꾸면 모든 해시가 불일치해
     // 자동으로 전체 재임베딩된다 (구 모델 벡터와 새 모델 질문 벡터를 섞으면 검색이 무의미해짐)
-    const model = process.env.EMBEDDING_MODEL || 'bge-m3';
     const stale = [];
     for (const r of rows) {
-      const text = toText(r);
-      const hash = crypto.createHash('md5').update(`${model}\n${text}`).digest('hex');
+      const text = toText(cols, r);
+      const hash = crypto.createHash('md5').update(`${EMBEDDING_MODEL}\n${text}`).digest('hex');
       if (stored.get(r.seq) !== hash) stale.push({ seq: r.seq, text, hash });
       stored.delete(r.seq);
     }
@@ -75,12 +80,11 @@ async function doSync() {
       const batch = stale.slice(i, i + BATCH);
       const vectors = await embed(batch.map(b => b.text));
       if (!vectors) return { embedded, deleted, skipped: true }; // 임베딩 서버 없음 — 다음 주기에 재시도
-      for (let j = 0; j < batch.length; j++) {
-        await query(
-          'REPLACE INTO vec_store (src, seq, embed_hash, embedding) VALUES (?, ?, ?, VEC_FromText(?))',
-          [src, batch[j].seq, batch[j].hash, JSON.stringify(vectors[j])]
-        );
-      }
+      // 배치 전체를 한 문장으로 쓴다 — 행마다 왕복하면 초기 1만건 동기화가 1만 번 왕복이 된다
+      await query(
+        `REPLACE INTO vec_store (src, seq, embed_hash, embedding) VALUES ${batch.map(() => '(?, ?, ?, VEC_FromText(?))').join(', ')}`,
+        batch.flatMap((b, j) => [src, b.seq, b.hash, JSON.stringify(vectors[j])])
+      );
       embedded += batch.length;
     }
   }

@@ -77,7 +77,7 @@ CREATE TABLE chat_log (
   seq        INT AUTO_INCREMENT PRIMARY KEY,
   question   TEXT NOT NULL,
   answer     TEXT,
-  trace      JSON,                -- 실행된 쿼리·바인드·결과 (답변 근거)
+  trace      JSON,                -- {search: 검색 적중 수(queries는 라우팅 동작 시에만, 아니면 null), steps: 실행 쿼리·바인드·결과}
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_created (created_at)    -- 보존 기간 정리(DELETE)용
 );

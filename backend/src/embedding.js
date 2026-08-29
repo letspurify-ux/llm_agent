@@ -2,6 +2,9 @@
 //   EMBEDDING_URL   예) http://localhost:11434/v1 (Ollama 기본)
 //   EMBEDDING_MODEL 예) bge-m3 (1024차원 — vec_store.embedding 차원과 일치해야 함)
 // 실패/미설정 시 null을 반환하고, 호출부는 LIKE 검색만으로 동작한다 (graceful degradation).
+// 모델명은 embed-sync의 embed_hash에도 들어간다(모델 교체 시 자동 재임베딩) — 한 곳에서만 정의한다
+export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'bge-m3';
+
 let warned = false;
 
 const TIMEOUT_MS = 60_000; // 모델 콜드 로드가 30초+ 걸릴 수 있어 넉넉히. 초과 시 LIKE-only 폴백
@@ -13,7 +16,7 @@ export async function embed(texts) {
     const res = await fetch(`${base}/embeddings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: process.env.EMBEDDING_MODEL || 'bge-m3', input: texts }),
+      body: JSON.stringify({ model: EMBEDDING_MODEL, input: texts }),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     if (!res.ok) throw new Error(`embeddings API ${res.status}: ${(await res.text()).slice(0, 200)}`);

@@ -8,7 +8,11 @@
 // LLM_PROVIDER=openai 이면 vLLM/OpenRouter(OpenAI 호환 API), 아니면 규칙 기반 Mock.
 // agent.js는 provider가 바뀌어도 변경되지 않는다.
 import { openaiDecide } from './llm-openai.js';
-import { bindNames } from './oracle.js';
+import { bindNames, MAX_ROWS } from './oracle.js';
+
+// capRows(agent.js)가 자른 셀에 붙이는 표시. 이 값을 알아야 하는 쪽(아래 valueFromHistory)에 두고
+// agent.js가 가져다 쓴다 — 순환 import 없이 한 곳에서만 정의하기 위함.
+export const TRUNC_MARK = '…(생략)';
 
 export const llm = {
   decide(ctx) {
@@ -84,8 +88,8 @@ function valueFromHistory(name, history) {
   for (let i = history.length - 1; i >= 0; i--) {
     for (const row of history[i].rows || []) {
       for (const [col, val] of Object.entries(row)) {
-        // capRows가 자른 값('…(생략)')은 원본이 아니므로 바인드 값으로 쓰지 않는다
-        if (typeof val === 'string' && val.endsWith('…(생략)')) continue;
+        // capRows가 자른 값은 원본이 아니므로 바인드 값으로 쓰지 않는다
+        if (typeof val === 'string' && val.endsWith(TRUNC_MARK)) continue;
         if (col.toLowerCase() === name.toLowerCase()) return val;
       }
     }
@@ -100,9 +104,9 @@ function buildAnswer({ knowledge, history }) {
     if (h.error) {
       parts.push(`**${h.query_name}** 실행 오류: ${h.error}`);
     } else if (h.rows?.length) {
-      const omitted = (h.totalRows ?? h.rows.length) - h.rows.length;
+      const omitted = h.totalRows - h.rows.length;
       const note = h.capped
-        ? `\n\n_외 ${omitted}건 이상 생략 (조회 상한 100건 도달 — 실제는 더 많을 수 있음)_`
+        ? `\n\n_외 ${omitted}건 이상 생략 (조회 상한 ${MAX_ROWS}건 도달 — 실제는 더 많을 수 있음)_`
         : omitted > 0 ? `\n\n_외 ${omitted}건 생략 (총 ${h.totalRows}건)_` : '';
       parts.push(`### ${h.query_name} 조회 결과\n\n${rowsToMarkdownTable(h.rows)}${note}`);
     } else if (h.rows) {
