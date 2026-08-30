@@ -23,18 +23,18 @@ process.on('uncaughtException', e => {
 // .env는 gitignore 대상이라 새 클론에는 없다. 없는 채로 뜨면 관리 DB 접속도, ORACLE_MOCK도
 // 설정되지 않아 모든 질문이 500이 되는데 /api/health는 계속 ok를 돌려줘 원인을 찾기 어렵다.
 if (!process.env.MARIADB_USER) {
-  console.warn('[setup] MARIADB_USER가 없습니다 — backend/.env가 없거나 비어 있습니다. `cp backend/.env.example backend/.env` 후 다시 실행하세요.');
+  console.warn('[setup] MARIADB_USER is not set — backend/.env is missing or empty. Run `cp backend/.env.example backend/.env` and restart.');
 } else if (!process.env.MARIADB_PASSWORD) {
   // .env.example은 비밀번호를 비워 배포한다(알려진 비밀번호가 운영까지 따라가지 않게 — .env.example 주석 참고).
   // 비운 채 뜨면 모든 질문이 인증 실패로 500이 되는데 /api/health는 ok라 원인이 안 보인다 — 기동 시점에 알린다.
-  console.warn('[setup] MARIADB_PASSWORD가 비어 있습니다 — backend/.env에 관리 DB 계정 비밀번호를 채우세요 (README의 앱 계정 생성 단계에서 정한 값).');
+  console.warn("[setup] MARIADB_PASSWORD is empty — fill in the management DB account password in backend/.env (the value you chose in the README's app account setup step).");
 }
 // LLM 쪽도 같은 함정이다: provider=openai인데 접속 정보가 비면 모든 질문이 'LLM 호출 실패'가
 // 되는데 /api/health는 계속 ok고, 원인은 요청마다 warn 로그로 흩어져 남는다 — 기동 시점에 알린다.
 if (process.env.LLM_PROVIDER === 'openai') {
   const missing = ['LLM_BASE_URL', 'LLM_MODEL'].filter(k => !process.env[k]);
   if (missing.length) {
-    console.warn(`[setup] LLM_PROVIDER=openai인데 ${missing.join(', ')}이(가) 비어 있습니다 — 모든 질문이 "LLM 호출 실패"로 끝납니다. backend/.env를 확인하세요.`);
+    console.warn(`[setup] LLM_PROVIDER=openai but ${missing.join(', ')} is empty — every question will end in "LLM call failed". Check backend/.env.`);
   }
 }
 
@@ -61,7 +61,7 @@ app.post('/api/chat', async (req, res) => {
     // "검색 0건이라 못 답한 질문"을 SQL로 바로 찾을 수 있게 한다 (README의 chat_log 예시 참고).
     // v는 trace 스키마 버전 — 형식이 바뀌어도 분석 SQL이 옛 행과 새 행을 구분할 수 있게 한다.
     insertChatLog(message.trim(), answer, { v: 2, search, steps: trace })
-      .catch(e => console.warn('[chat_log] 기록 실패:', e.message));
+      .catch(e => console.warn('[chat_log] failed to record:', e.message));
     res.json({
       answer,
       // note만 있는 항목은 루프 가드가 LLM에게 남긴 제어용 기록이고 실행된 쿼리가 아니다 —
@@ -93,7 +93,7 @@ app.post('/api/chat', async (req, res) => {
 app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
   const tooLarge = err?.type === 'entity.too.large';
-  if (tooLarge) console.warn('[chat] 요청 본문이 너무 큽니다:', err.length);
+  if (tooLarge) console.warn('[chat] request body too large:', err.length);
   // 본문 파서 오류는 status를 채워 보낸다(400/413). status가 없으면 클라이언트 잘못이 아니라
   // 서버 버그이므로 500으로 둔다 — 전부 400으로 뭉개면 원인 분류가 뒤집힌다.
   const status = err?.status ?? err?.statusCode ?? 500;
@@ -113,27 +113,27 @@ const everyMs = (fn, ms) => timers.push(setInterval(fn, ms));
 // 결과 문구는 embed-sync.js가 SKIP 옆에서 만든다 — 여기서 SKIP 키 맵을 다시 들면
 // 값이 하나 늘 때 CLI와 손으로 맞춰야 하고, 한쪽만 고치면 그 경로에서만 안내가 사라진다.
 syncEmbeddings()
-  .then(r => console.log(`[embed] 동기화: ${syncSummary(r)}`))
-  .catch(e => console.warn('[embed] 동기화 실패:', e.message));
+  .then(r => console.log(`[embed] sync: ${syncSummary(r)}`))
+  .catch(e => console.warn('[embed] sync failed:', e.message));
 // 0은 "주기 동기화 끔"이라는 의도된 값이므로 허용하되, 빈 값·오타는 기본값으로 되돌린다
 // (검증이 없으면 EMBED_SYNC_INTERVAL= 한 줄로 주기 동기화가 로그 없이 사라진다).
 const syncInterval = numEnv('EMBED_SYNC_INTERVAL', 60, { allowZero: true });
 if (syncInterval > 0) {
   everyMs(() => {
     syncEmbeddings()
-      .then(r => { if (r.embedded || r.deleted || r.failed) console.log(`[embed] 동기화: ${syncSummary(r)}`); })
+      .then(r => { if (r.embedded || r.deleted || r.failed) console.log(`[embed] sync: ${syncSummary(r)}`); })
       .catch(() => {});
   }, syncInterval * 1000);
 } else {
-  console.log('[embed] 주기 동기화 꺼짐 (EMBED_SYNC_INTERVAL=0) — npm run embed로 수동 동기화');
+  console.log('[embed] periodic sync disabled (EMBED_SYNC_INTERVAL=0) — run `npm run embed` to sync manually');
 }
 
 // 대화 로그 보존: 3일 지난 행을 기동 시 + 1시간 주기로 정리
 const CHAT_LOG_RETENTION_DAYS = 3;
 const cleanupLogs = () =>
   cleanupChatLogs(CHAT_LOG_RETENTION_DAYS)
-    .then(r => { if (r.affectedRows) console.log(`[chat_log] ${r.affectedRows}건 정리 (${CHAT_LOG_RETENTION_DAYS}일 경과)`); })
-    .catch(e => console.warn('[chat_log] 정리 실패:', e.message));
+    .then(r => { if (r.affectedRows) console.log(`[chat_log] cleaned up ${r.affectedRows} rows (older than ${CHAT_LOG_RETENTION_DAYS} days)`); })
+    .catch(e => console.warn('[chat_log] cleanup failed:', e.message));
 cleanupLogs();
 everyMs(cleanupLogs, 3600 * 1000);
 
@@ -148,7 +148,7 @@ const server = app.listen(port, () => {
 });
 server.on('error', e => {
   // 기동 실패(포트 충돌 등)는 이벤트로 오므로 uncaughtException 경로를 타지 않는다 — 명시 종료한다
-  console.error('[listen] 기동 실패:', e.message);
+  console.error('[listen] failed to start:', e.message);
   process.exit(1);
 });
 
@@ -160,17 +160,17 @@ let shuttingDown = false;
 async function shutdown(signal) {
   if (shuttingDown) return; // 두 번째 시그널은 무시한다 — 종료 도중 다시 들어오는 일이 흔하다
   shuttingDown = true;
-  console.log(`[shutdown] ${signal} 수신 — 정리 후 종료합니다.`);
+  console.log(`[shutdown] received ${signal} — cleaning up and exiting.`);
   for (const t of timers) clearInterval(t);
   // 안전장치: keep-alive 연결이 남아 close가 끝나지 않을 수 있다. supervisor의 SIGKILL을
   // 기다리지 않고 우리가 먼저 접는다. unref로 이 타이머 자체가 종료를 붙잡지 않게 한다.
   const force = setTimeout(() => {
-    console.warn('[shutdown] 정리 시간 초과 — 강제 종료합니다.');
+    console.warn('[shutdown] cleanup timed out — forcing exit.');
     process.exit(1);
   }, 10_000);
   force.unref();
   await new Promise(resolve => server.close(resolve));
-  await closePool().catch(e => console.warn('[shutdown] 커넥션 풀 종료 실패:', e.message));
+  await closePool().catch(e => console.warn('[shutdown] failed to close connection pool:', e.message));
   clearTimeout(force);
   process.exit(0);
 }

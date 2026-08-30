@@ -62,17 +62,17 @@ export const SKIP = {
 // (SKIP을 상수로 모은 이유가 '설정상 안 쓰는 것'과 '쓰려는데 실패한 것'을 호출부가 구분하게 하려는
 //  것인데, 구분해서 보여줄 문구가 호출부마다 흩어져 있으면 그 목적이 반만 달성된다.)
 const SKIP_NOTE = {
-  [SKIP.BUSY]: '다른 동기화가 진행 중이라 건너뛰었습니다',
-  [SKIP.UNCONFIGURED]: 'EMBEDDING_URL 미설정 — LIKE-only 구성이라 임베딩을 생략합니다',
-  [SKIP.UNAVAILABLE]: '임베딩 서버에 연결하지 못해 일부를 건너뛰었습니다 — LIKE-only로 계속합니다',
+  [SKIP.BUSY]: 'skipped — another sync is already in progress',
+  [SKIP.UNCONFIGURED]: 'EMBEDDING_URL not set — LIKE-only setup, embedding skipped',
+  [SKIP.UNAVAILABLE]: 'could not reach the embedding server — some rows skipped, continuing LIKE-only',
 };
 
 // 건너뛴 행은 원본을 고치기 전까지 매 주기 다시 실패하므로 반드시 눈에 띄어야 한다
 // (0건이면 문구를 붙이지 않아 평소 로그는 조용하다).
 export function syncSummary(r) {
-  const failed = r.failed ? `, 건너뜀 ${r.failed}건(원본 확인 필요)` : '';
+  const failed = r.failed ? `, skipped ${r.failed} (check source rows)` : '';
   const note = SKIP_NOTE[r.skipped];
-  return `생성/갱신 ${r.embedded}건, 정리 ${r.deleted}건${failed}${note ? ` — ${note}` : ''}`;
+  return `created/updated ${r.embedded}, cleaned up ${r.deleted}${failed}${note ? ` — ${note}` : ''}`;
 }
 
 // 중첩 실행 가드 — 초기 대량 동기화(수 분)가 도는 동안 다른 실행이 겹쳐 같은 행을
@@ -199,7 +199,7 @@ async function embedRows(src, batch) {
       failed++;
       // 이 행은 이번에도 다음에도 같은 이유로 거부된다 — 해시가 갱신되지 않아 매 주기 재시도되므로
       // 원본을 고치기 전까지 계속 남는다. 조용히 빠지지 않도록 seq를 찍는다.
-      console.warn(`[embed] ${src}#${b.seq} 임베딩 실패 — 이 행만 건너뜁니다: ${e.message}`);
+      console.warn(`[embed] ${src}#${b.seq} embedding failed — skipping this row only: ${e.message}`);
     }
   }
   return { embedded, failed, unavailable: false };
@@ -216,7 +216,7 @@ async function storeBatch(src, batch, vectors) {
     );
     return batch.length;
   } catch (e) {
-    console.warn(`[embed] ${src} 배치 저장 실패 — 행 단위로 재시도합니다: ${e.message}`);
+    console.warn(`[embed] ${src} batch store failed — retrying row by row: ${e.message}`);
     let ok = 0;
     for (const [j, b] of batch.entries()) {
       try {
@@ -226,7 +226,7 @@ async function storeBatch(src, batch, vectors) {
         );
         ok++;
       } catch (e2) {
-        console.warn(`[embed] ${src}#${b.seq} 저장 실패: ${e2.message}`);
+        console.warn(`[embed] ${src}#${b.seq} store failed: ${e2.message}`);
       }
     }
     return ok;
@@ -242,7 +242,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   // try/catch는 필수다: 논블로킹 파이프에서 writeSync는 EAGAIN을 던지는데, 그게 새어 나가면
   // 아래 process.exit가 실행되지 않아 성공한 동기화가 0이 아닌 종료 코드로 보고된다.
   // (server.js의 uncaughtException 핸들러가 같은 이유로 같은 형태를 쓴다)
-  const summary = `임베딩 동기화 완료: ${syncSummary(r)}, ${((Date.now() - t) / 1000).toFixed(1)}s\n`;
+  const summary = `embedding sync complete: ${syncSummary(r)}, ${((Date.now() - t) / 1000).toFixed(1)}s\n`;
   try { writeSync(1, summary); } catch { /* 로그 실패가 종료 코드를 바꾸지 않게 */ }
   // 실패로 종료하는 것은 "쓰려고 했는데 안 된" 경우뿐이다 — LIKE-only는 지원되는 구성이므로
   // 프로비저닝 스크립트가 이 명령의 종료 코드로 실패 판정을 하면 안 된다.

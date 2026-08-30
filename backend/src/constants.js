@@ -64,7 +64,7 @@ if (FLOOR_SUM > MAX_PROMPT_TOTAL_LEN) {
   // import 시점에 터뜨린다 — 예산이 어긋난 채로 뜨면 등록이 늘어난 뒤에야, 그것도
   // '모든 질문이 LLM 호출 실패'라는 원인이 안 보이는 형태로 드러난다.
   throw new Error(
-    `프롬프트 섹션 최소 몫 합계(${FLOOR_SUM})가 전체 예산(${MAX_PROMPT_TOTAL_LEN})을 넘습니다 — constants.js를 확인하세요.`
+    `Sum of prompt section floors (${FLOOR_SUM}) exceeds the total budget (${MAX_PROMPT_TOTAL_LEN}) — check constants.js.`
   );
 }
 
@@ -151,6 +151,6 @@ export function numEnv(name, fallback, { allowZero = false } = {}) {
   if (raw === undefined || String(raw).trim() === '') return fallback;
   const v = Number(raw);
   if (Number.isInteger(v) && (v > 0 || (allowZero && v === 0))) return v;
-  console.warn(`[env] ${name} 값이 올바르지 않아 기본값(${fallback})을 사용합니다: ${JSON.stringify(raw)}`);
+  console.warn(`[env] invalid value for ${name}, falling back to default (${fallback}): ${JSON.stringify(raw)}`);
   return fallback;
 }

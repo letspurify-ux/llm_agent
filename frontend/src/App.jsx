@@ -126,7 +126,7 @@ export default function App() {
     } catch (e) {
       // answer는 통신 오류 기본값 유지. 콘솔에는 남긴다 —
       // 네트워크 실패·타임아웃·클라이언트 예외가 화면에서는 모두 같은 문구로 보이기 때문이다.
-      console.error('[chat] 요청 실패:', e);
+      console.error('[chat] request failed:', e);
     } finally {
       clearTimeout(timer);
       // 화면에는 항상 남기지만, 서버로 되돌려 보내는 이력에는 서버가 준 답만 넣는다 —

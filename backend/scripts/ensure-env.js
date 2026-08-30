@@ -10,5 +10,5 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const env = join(root, '.env');
 if (!existsSync(env)) {
   copyFileSync(join(root, '.env.example'), env);
-  console.log('[setup] .env가 없어 .env.example로 생성했습니다 (ORACLE_MOCK=1 개발 기본값). MARIADB_PASSWORD는 비어 있으니 채워야 관리 DB에 접속됩니다.');
+  console.log('[setup] .env not found — created it from .env.example (ORACLE_MOCK=1 dev default). MARIADB_PASSWORD is empty, so fill it in to connect to the management DB.');
 }

@@ -32,7 +32,7 @@ export class EmbeddingError extends Error {
 // embed()가 던지게 되면서 경고 시점이 호출부로 옮겨졌으므로, 이름은 여기 남기고
 // 억제 방식은 constants.js의 warnOnce 하나로 모은다 (벡터 검색·NLS 포맷도 같은 것을 쓴다).
 export function warnEmbeddingFailure(e) {
-  warnOnce('embedding', `임베딩 호출 실패: ${e.message}`);
+  warnOnce('embedding', `embedding call failed: ${e.message}`);
 }
 
 // 성공하면 texts와 같은 길이·순서의 벡터 배열, 실패하면 EmbeddingError를 던진다.

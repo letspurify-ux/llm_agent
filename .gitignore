@@ -7,3 +7,5 @@ dist/
 logs/
 .backend.pid
 .frontend.pid
+*.swp
+*.swo

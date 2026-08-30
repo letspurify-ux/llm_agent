@@ -250,7 +250,7 @@ async function decide(ctx) {
     return await llm.decide(ctx);
   } catch (e) {
     // 원문은 로그에만 — 스키마명·호스트가 섞일 수 있고, 사용자 문구는 호출부가 만든다.
-    console.error('[agent] LLM 결정 실패:', e);
+    console.error('[agent] LLM decision failed:', e);
     return null;
   }
 }
@@ -277,7 +277,7 @@ async function resolveQuery(name, queries, cache) {
     // 상세는 로그에만 남긴다 — 이 문구는 프롬프트와 화면 양쪽으로 나가는데, MariaDB 원문에는
     // 스키마·호스트가 들어 있고 모델의 복구 판단에 보탬이 되지도 않는다.
     // hint(모델 전용 지침)와 error(화면에도 나가는 문구)를 나눈다 — constants.safeError 참고.
-    console.warn('[agent] query_registry 재조회 실패:', e.message);
+    console.warn('[agent] failed to re-fetch query_registry:', e.message);
     return { row: null, error: '쿼리 목록을 조회하지 못했습니다.', hint: '다른 쿼리를 선택하거나 지금까지의 정보로 답변하라' };
   }
 }

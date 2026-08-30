@@ -103,7 +103,7 @@ async function vecSearch(table, question) {
     // 억제는 warnOnce에 맡긴다 — '한 번만 경고' 플래그를 쓰면 vec_store 미생성으로 한 번 알린 뒤
     // 차원 불일치·인덱스 손상 같은 전혀 다른 이유로 벡터 검색이 죽어도 로그가 남지 않는다.
     // 이 경로는 조용히 LIKE-only로 폴백하므로 로그가 유일한 단서다.
-    warnOnce('search', `벡터 검색 실패 — LIKE 검색만 사용합니다: ${e.message}`);
+    warnOnce('search', `vector search failed — falling back to LIKE-only search: ${e.message}`);
     return null;
   });
 }

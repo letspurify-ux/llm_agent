@@ -27,8 +27,8 @@ function resolveReasoningEffort() {
   if (raw === 'off') return null;
   if (REASONING_EFFORTS.includes(raw)) return raw;
   console.warn(
-    `[llm] LLM_REASONING_EFFORT 값이 올바르지 않아 기본값(low)을 사용합니다: ` +
-    `${JSON.stringify(process.env.LLM_REASONING_EFFORT)} (가능: ${REASONING_EFFORTS.join(', ')}, off)`
+    `[llm] invalid LLM_REASONING_EFFORT value, falling back to default (low): ` +
+    `${JSON.stringify(process.env.LLM_REASONING_EFFORT)} (valid: ${REASONING_EFFORTS.join(', ')}, off)`
   );
   return 'low';
 }
@@ -89,12 +89,12 @@ export async function openaiDecide(ctx) {
       // 내부 정보를 숨긴다고 해놓고 로그로 흘리면 숨긴 의미가 없다.
       // 길이·첫 글자·중괄호와 </think> 유무면 "산문인지 / 잘렸는지 / 사고 과정이 샜는지"는 구분된다.
       console.warn(
-        `[llm] 결정 JSON을 찾지 못함 (시도 ${attempt + 1}/2): ` +
-        `길이=${content.length} 첫글자=${JSON.stringify(content.trim()[0] ?? '')} ` +
-        `중괄호=${content.includes('{')} 사고과정태그=${/<\/?think\b/i.test(content)}`
+        `[llm] no decision JSON found (attempt ${attempt + 1}/2): ` +
+        `length=${content.length} firstChar=${JSON.stringify(content.trim()[0] ?? '')} ` +
+        `hasBrace=${content.includes('{')} hasThinkTag=${/<\/?think\b/i.test(content)}`
       );
     } catch (e) {
-      console.warn(`[llm] 호출 실패 (시도 ${attempt + 1}/2):`, e.message);
+      console.warn(`[llm] call failed (attempt ${attempt + 1}/2):`, e.message);
     }
   }
   // 상세 오류는 위 warn 로그에만 남긴다 — 사용자용 문구는 호출부가 만든다 (위 주석 참고).
@@ -125,7 +125,7 @@ async function chatCompletion(userPrompt, timeoutMs) {
     // 바로 이어지는 재시도가 성공한다 (설정 하나 때문에 모든 질문이 실패하지 않게).
     if (res.status === 400 && effortAccepted && /reasoning/i.test(detail)) {
       effortAccepted = false;
-      console.warn('[llm] 이 엔드포인트가 reasoning_effort를 지원하지 않아 이후 요청에서 제외합니다.');
+      console.warn('[llm] this endpoint does not support reasoning_effort — omitting it from future requests.');
     }
     throw new Error(`LLM API ${res.status}: ${detail}`);
   }

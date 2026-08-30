@@ -34,7 +34,7 @@ export async function releaseConnection(conn) {
   try {
     await conn.release();
   } catch (e) {
-    console.warn('[db] 커넥션 반납 실패:', e.message);
+    console.warn('[db] failed to release connection:', e.message);
   }
 }
 

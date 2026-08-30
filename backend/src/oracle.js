@@ -145,7 +145,7 @@ async function setSessionFormats(conn) {
   } catch (e) {
     // 억제는 warnOnce에 맡긴다 (search.js의 벡터 검색 경고와 같은 이유) — '한 번만' 플래그로 두면
     // 권한 문제로 한 번 알린 뒤 접속 자체가 다른 이유로 흔들려도 로그가 남지 않는다.
-    warnOnce('oracle', `세션 날짜 포맷 고정 실패 — DB 기본 포맷을 사용합니다: ${e.message}`);
+    warnOnce('oracle', `failed to fix session date format — falling back to the DB's default format: ${e.message}`);
   }
 }
 
