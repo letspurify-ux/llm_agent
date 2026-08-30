@@ -4,7 +4,7 @@
 import oracledb from 'oracledb';
 import { loadTargetDb } from './db.js';
 import { bindNames, assertReadOnly } from './sql.js';
-import { MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK, numEnv, nameKey, safeError, clipText } from './constants.js';
+import { MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK, numEnv, nameKey, safeError, clipText, warnOnce } from './constants.js';
 
 // 드라이버 경계에서 타입을 확정한다. LOB은 기본값이 Lob 스트림 객체라 커넥션을 닫으면 무효가 되고
 // JSON 직렬화 시 순환 참조로 예외가 난다 — CLOB만이 아니라 NCLOB/BLOB도 같은 위험이므로 전부 다룬다.
@@ -60,7 +60,11 @@ export async function runQuery(registryRow, params = {}) {
 
   const target = await loadTargetDb(registryRow.target_db_name);
   if (!target) throw safeError(`조회대상 DB를 찾을 수 없음: ${registryRow.target_db_name}`);
-  if (target.db_type && target.db_type !== 'oracle') {
+  // 이름 비교는 nameKey로 한다 — target_db는 대소문자를 무시하는 collation이라 db_name 조회는
+  // 'order_db'로도 'ORDER_DB' 행을 찾아준다. 그런데 db_type만 JS ===로 보면 'Oracle'로 등록한
+  // 순간 그 DB의 모든 조회가 '지원하지 않는 db_type'으로 죽고, 화면에 나가는 문구는 등록 철자가
+  // 아니라 DB 종류를 탓하는 것처럼 읽힌다. query_name에 nameKey를 둔 것과 같은 이유·같은 방식이다.
+  if (target.db_type && nameKey(target.db_type) !== 'oracle') {
     throw safeError(`지원하지 않는 db_type: ${target.db_type} (현재 oracle만 지원)`);
   }
 
@@ -102,15 +106,13 @@ export async function runQuery(registryRow, params = {}) {
 // 실패해도 조회는 계속한다 (여기서 던지면 부가 설정 하나가 모든 조회를 막는다).
 // 실패 시 날짜는 DB 기본 NLS 포맷 문자열로 오고, 그 값을 다음 스텝 바인드로 되돌릴 때만
 // 포맷 불일치(ORA-01861) 가능성이 남는다.
-let nlsWarned = false;
 async function setSessionFormats(conn) {
   try {
     await conn.execute(NLS_SESSION_FORMATS);
   } catch (e) {
-    if (!nlsWarned) {
-      nlsWarned = true;
-      console.warn(`[oracle] 세션 날짜 포맷 고정 실패 — DB 기본 포맷을 사용합니다: ${e.message}`);
-    }
+    // 억제는 warnOnce에 맡긴다 (search.js의 벡터 검색 경고와 같은 이유) — '한 번만' 플래그로 두면
+    // 권한 문제로 한 번 알린 뒤 접속 자체가 다른 이유로 흔들려도 로그가 남지 않는다.
+    warnOnce('oracle', `세션 날짜 포맷 고정 실패 — DB 기본 포맷을 사용합니다: ${e.message}`);
   }
 }
 
@@ -128,14 +130,24 @@ function normalizeCells(row) {
 }
 
 function normalizeValue(v) {
+  if (v === null || v === undefined) return null;
   if (typeof v === 'string') {
     return v.length > MAX_CELL_LEN ? clipText(v, MAX_CELL_LEN) + TRUNC_MARK : v;
   }
+  if (typeof v === 'number' || typeof v === 'boolean') return v;
+  // BigInt는 JSON.stringify가 던진다 — 여기서 문자열로 확정하지 않으면 프롬프트 조립과
+  // chat_log 기록이 함께 죽는다 (드라이버가 큰 NUMBER를 BigInt로 주도록 설정이 바뀌는 경우).
+  if (typeof v === 'bigint') return v.toString();
   if (Buffer.isBuffer(v)) return `<binary ${v.length} bytes>`;
   // fetchTypeHandler가 날짜류를 문자열로 받으므로 정상 경로에서는 Date가 오지 않는다.
   // 드라이버 매핑이 바뀌더라도 JSON.stringify가 UTC로 직렬화해 시각이 어긋나는 일이 없게 방어한다.
   if (v instanceof Date) return localDateTime(v);
-  return v;
+  // 남은 것은 전부 드라이버 객체다 — LOB 스트림, 객체/컬렉션 타입(DbObject), 중첩 커서(ResultSet).
+  // 이 함수가 '드라이버 경계에서 한 번' 정규화한다고 해놓고 문자열·이진값만 다루면 그 약속이 깨진다:
+  // 이 값들은 커넥션에 묶여 있어 아래 finally의 close() 뒤에는 무효이고, JSON.stringify가
+  // 순환 참조로 던지거나 '{}'로 직렬화한다. 던지는 쪽이 특히 나쁘다 — 프롬프트 조립이 통째로
+  // 실패해 이미 조회해둔 결과까지 버려진다. 값의 정체를 남긴 문자열로 확정한다.
+  return `<${v?.constructor?.name ?? typeof v} 값 — 지원하지 않는 컬럼 타입>`;
 }
 
 function localDateTime(d) {
@@ -171,9 +183,14 @@ function bindProblem(v) {
 // 시도하면 DB는 ORA-01017(잘못된 사용자명/비밀번호)을 돌려주고, 운영자는 설정 누락이 아니라
 // 저장된 자격증명이 틀렸다고 읽는다. 게다가 빈 비밀번호 로그인이 매 조회마다 반복되면
 // 공용 조회 계정이 FAILED_LOGIN_ATTEMPTS에 걸려 잠긴다.
+// 접두사 판정은 대소문자를 가리지 않는다 — 'env:'로 등록하면 그 문자열 자체가 비밀번호로 전송돼
+// 매 조회마다 ORA-01017이 나고, 바로 위 주석이 막으려던 계정 잠금(FAILED_LOGIN_ATTEMPTS)이
+// 그대로 재현된다. 게다가 오류 원문은 화면에 나가지 않으므로 원인이 보이지 않는다.
+const ENV_PREFIX = /^\s*env:/i;
+
 function resolvePassword(stored) {
-  if (typeof stored === 'string' && stored.startsWith('ENV:')) {
-    const name = stored.slice(4);
+  if (typeof stored === 'string' && ENV_PREFIX.test(stored)) {
+    const name = stored.replace(ENV_PREFIX, '').trim();
     const value = process.env[name];
     if (!value) throw safeError(`조회대상 DB 비밀번호 환경변수(${name})가 설정되지 않았습니다.`);
     return value;
@@ -234,6 +251,18 @@ const MOCK_DATA = {
     .sort((a, b) => b.ORDER_DATE.localeCompare(a.ORDER_DATE))
     .slice(0, 5)
     .map(o => pick(o, ['ORDER_ID', 'STATUS', 'ORDER_DATE', 'AMOUNT'])),
+  // 바인드 없는 쿼리 (params를 보지 않는다)
+  // SELECT TO_CHAR(SYSTIMESTAMP AT TIME ZONE 'Asia/Seoul', 'YYYY-MM-DD') AS TODAY, … AS NOW_TIME FROM DUAL
+  // 등록 SQL이 KST로 고정되어 있으므로 mock도 프로세스 로컬 시각이 아니라 KST로 맞춘다 —
+  // 다른 타임존 노트북에서 mock으로 검증한 답이 실제 실행과 하루 어긋나지 않도록.
+  // 위 고정 데이터와 달리 이 값만 실행할 때마다 달라진다 — 원래 그런 쿼리이므로 고정하지 않는다.
+  today_date: () => {
+    // sv-SE 로케일이 'YYYY-MM-DD HH:MM:SS' 형식을 준다 (등록 SQL의 출력 형식과 같다)
+    const [TODAY, NOW_TIME] = new Intl.DateTimeFormat('sv-SE', {
+      timeZone: 'Asia/Seoul', dateStyle: 'short', timeStyle: 'medium',
+    }).format(new Date()).split(' ');
+    return [{ TODAY, NOW_TIME }];
+  },
 };
 
 // MOCK_DATA 키는 소문자다. query_registry.query_name은 MariaDB collation상 대소문자를 구분하지 않아

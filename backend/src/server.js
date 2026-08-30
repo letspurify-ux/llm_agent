@@ -2,8 +2,8 @@ import 'dotenv/config';
 import { writeSync } from 'node:fs';
 import express from 'express';
 import { handleQuestion } from './agent.js';
-import { syncEmbeddings, SKIP } from './embed-sync.js';
-import { insertChatLog, cleanupChatLogs } from './db.js';
+import { syncEmbeddings, syncSummary } from './embed-sync.js';
+import { insertChatLog, cleanupChatLogs, closePool } from './db.js';
 import { numEnv } from './constants.js';
 import { rowCounts } from './result.js';
 
@@ -91,25 +91,24 @@ app.use((err, req, res, next) => {
   });
 });
 
-// 임베딩 diff 동기화: 기동 시 1회 + 주기 실행 (SQL로 직접 등록한 데이터도 자동 반영)
-const syncNote = r => ({
-  [SKIP.UNCONFIGURED]: ' (EMBEDDING_URL 미설정 — LIKE-only)',
-  [SKIP.UNAVAILABLE]: ' (임베딩 서버 응답 없음 — LIKE-only로 계속)',
-  [SKIP.BUSY]: ' (다른 동기화 진행 중 — 건너뜀)',
-}[r.skipped] ?? '');
-// 건너뛴 행은 원본을 고치기 전까지 매 주기 다시 실패하므로 반드시 눈에 띄어야 한다
-// (0건이면 문구를 붙이지 않아 평소 로그는 조용하다).
-const syncFailed = r => (r.failed ? `, 건너뜀 ${r.failed}건(원본 확인 필요)` : '');
+// 정상 종료 때 멈춰야 할 타이머 — 등록과 정리가 떨어져 있으면 새 주기 작업이 추가될 때
+// 종료 경로만 조용히 빠진다. 만드는 자리에서 바로 모은다.
+const timers = [];
+const everyMs = (fn, ms) => timers.push(setInterval(fn, ms));
+
+// 임베딩 diff 동기화: 기동 시 1회 + 주기 실행 (SQL로 직접 등록한 데이터도 자동 반영).
+// 결과 문구는 embed-sync.js가 SKIP 옆에서 만든다 — 여기서 SKIP 키 맵을 다시 들면
+// 값이 하나 늘 때 CLI와 손으로 맞춰야 하고, 한쪽만 고치면 그 경로에서만 안내가 사라진다.
 syncEmbeddings()
-  .then(r => console.log(`[embed] 동기화: 생성/갱신 ${r.embedded}건, 정리 ${r.deleted}건${syncFailed(r)}${syncNote(r)}`))
+  .then(r => console.log(`[embed] 동기화: ${syncSummary(r)}`))
   .catch(e => console.warn('[embed] 동기화 실패:', e.message));
 // 0은 "주기 동기화 끔"이라는 의도된 값이므로 허용하되, 빈 값·오타는 기본값으로 되돌린다
 // (검증이 없으면 EMBED_SYNC_INTERVAL= 한 줄로 주기 동기화가 로그 없이 사라진다).
 const syncInterval = numEnv('EMBED_SYNC_INTERVAL', 60, { allowZero: true });
 if (syncInterval > 0) {
-  setInterval(() => {
+  everyMs(() => {
     syncEmbeddings()
-      .then(r => { if (r.embedded || r.deleted || r.failed) console.log(`[embed] 동기화: 생성/갱신 ${r.embedded}건, 정리 ${r.deleted}건${syncFailed(r)}`); })
+      .then(r => { if (r.embedded || r.deleted || r.failed) console.log(`[embed] 동기화: ${syncSummary(r)}`); })
       .catch(() => {});
   }, syncInterval * 1000);
 } else {
@@ -123,7 +122,7 @@ const cleanupLogs = () =>
     .then(r => { if (r.affectedRows) console.log(`[chat_log] ${r.affectedRows}건 정리 (${CHAT_LOG_RETENTION_DAYS}일 경과)`); })
     .catch(e => console.warn('[chat_log] 정리 실패:', e.message));
 cleanupLogs();
-setInterval(cleanupLogs, 3600 * 1000);
+everyMs(cleanupLogs, 3600 * 1000);
 
 // PORT=0은 '빈 포트를 아무거나'라는 의도된 값이므로 허용한다 (빈 값·오타만 기본값으로)
 const port = numEnv('PORT', 3001, { allowZero: true });
@@ -139,3 +138,27 @@ server.on('error', e => {
   console.error('[listen] 기동 실패:', e.message);
   process.exit(1);
 });
+
+// 정상 종료 — 진행 중인 요청을 끝내고 타이머·커넥션 풀을 정리한 뒤 빠진다.
+// 위 uncaughtException 핸들러는 '커넥션이 샌 채로 살아남는 것'을 막으려고 즉시 종료까지 하는데,
+// 정작 재배포마다 반드시 도는 정상 종료 경로가 비어 있으면 같은 누수를 매번 만들면서
+// 사용자에게는 '서버와 통신하지 못했습니다'로만 보인다(원인이 앱 오류처럼 읽힌다).
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return; // 두 번째 시그널은 무시한다 — 종료 도중 다시 들어오는 일이 흔하다
+  shuttingDown = true;
+  console.log(`[shutdown] ${signal} 수신 — 정리 후 종료합니다.`);
+  for (const t of timers) clearInterval(t);
+  // 안전장치: keep-alive 연결이 남아 close가 끝나지 않을 수 있다. supervisor의 SIGKILL을
+  // 기다리지 않고 우리가 먼저 접는다. unref로 이 타이머 자체가 종료를 붙잡지 않게 한다.
+  const force = setTimeout(() => {
+    console.warn('[shutdown] 정리 시간 초과 — 강제 종료합니다.');
+    process.exit(1);
+  }, 10_000);
+  force.unref();
+  await new Promise(resolve => server.close(resolve));
+  await closePool().catch(e => console.warn('[shutdown] 커넥션 풀 종료 실패:', e.message));
+  clearTimeout(force);
+  process.exit(0);
+}
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => shutdown(sig));

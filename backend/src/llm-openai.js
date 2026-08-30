@@ -7,7 +7,8 @@
 // SDK 없이 Node 내장 fetch 사용.
 import {
   MAX_ROWS, TRUNC_MARK,
-  MAX_PROMPT_ITEM_LEN, MAX_PROMPT_SQL_LEN, MAX_PROMPT_SECTION_LEN, MAX_PROMPT_QUERY_SECTION_LEN,
+  MAX_PROMPT_ITEM_LEN, MAX_PROMPT_SQL_LEN, MAX_PROMPT_STEP_LEN,
+  MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS,
   clipText,
 } from './constants.js';
 import { bindNames } from './sql.js';
@@ -61,8 +62,12 @@ const SYSTEM_PROMPT = `당신은 사내 지식 관리 및 DB 조회 Q&A 에이�
 // 시도마다 타이머를 새로 주면 느린 엔드포인트에서 2배가 되고, 그 값이 다시 스텝 수만큼 곱해진다.
 const TIMEOUT_MS = 120_000;
 
-// HTTP 오류·타임아웃·파싱 실패 모두 1회 재시도하고, 그래도 실패하면 500 대신
-// 오류 안내 답변으로 정상 응답한다 (이미 실행한 쿼리 결과가 버려지지 않도록).
+// HTTP 오류·타임아웃·파싱 실패 모두 1회 재시도하고, 그래도 결정을 얻지 못하면 null을 돌려준다.
+//
+// 여기서 사용자용 문구를 만들지 않는 것이 중요하다: 무엇을 안내할지는 이 요청이 지금까지 무엇을
+// 해냈는지를 아는 쪽만 정할 수 있다. 조회를 세 번 성공해놓고 'LLM 호출에 실패했습니다' 한 줄만
+// 내보내면 그 성과가 통째로 사라지는데, provider는 실행 이력을 해석할 위치가 아니다.
+// agent.js가 null을 받아 손에 든 결과로 답을 만들고(renderAnswer), 그것마저 없을 때만 실패를 알린다.
 export async function openaiDecide(ctx) {
   const userPrompt = buildPrompt(ctx);
   const deadline = Date.now() + TIMEOUT_MS;
@@ -91,8 +96,8 @@ export async function openaiDecide(ctx) {
       console.warn(`[llm] 호출 실패 (시도 ${attempt + 1}/2):`, e.message);
     }
   }
-  // 상세 오류는 위 warn 로그에만 남긴다 — 사용자에게는 일반화된 메시지 (내부 정보 노출 방지)
-  return { action: 'answer', answer: 'LLM 호출에 실패했습니다. 잠시 후 다시 시도해주세요.' };
+  // 상세 오류는 위 warn 로그에만 남긴다 — 사용자용 문구는 호출부가 만든다 (위 주석 참고).
+  return null;
 }
 
 async function chatCompletion(userPrompt, timeoutMs) {
@@ -139,24 +144,113 @@ const clip = (v, max = MAX_PROMPT_ITEM_LEN) => {
 // 검색 결과는 관련도 순으로 정렬돼 있으므로 예산을 넘기면 뒤(덜 관련된 것)부터 버린다.
 // 최소 1건은 반드시 싣는다 — 항목별 clip이 이미 1건의 크기를 묶어두었으므로 그래도 예산을 크게 벗어나지 않는다.
 // 몇 건을 버렸는지 모델에게 알린다: '이게 전부'라고 읽으면 없는 것을 없다고 단정한다.
-function pushItems(lines, items, render, budget = MAX_PROMPT_SECTION_LEN) {
+function renderItems(items, render, budget) {
+  const lines = [];
   let used = 0;
-  let shown = 0;
   for (const item of items) {
     const line = render(item);
-    if (shown > 0 && used + line.length > budget) break;
+    if (lines.length > 0 && used + line.length > budget) break;
     lines.push(line);
     used += line.length;
-    shown++;
   }
-  if (shown < items.length) {
-    lines.push(`- (이하 ${items.length - shown}건은 프롬프트 길이 제한으로 생략)`);
+  if (lines.length < items.length) {
+    lines.push(`- (이하 ${items.length - lines.length}건은 프롬프트 길이 제한으로 생략)`);
   }
+  return lines;
 }
 
-function buildPrompt(ctx) {
+// 바인드 변수명을 SQL과 따로 싣는다 — SQL이 길어 잘리더라도 채워야 할 파라미터가 사라지지 않게.
+// 사라지면 모델이 params를 비우고, runQuery가 '바인드 변수를 쓸 수 없습니다'로 실패한다.
+const queryItem = q =>
+  `- ${q.query_name}: ${clip(q.query_desc)}` +
+  ` / 입력(${clip(q.input_desc, 300)}) / 출력(${clip(q.output_desc, 300)})` +
+  ` / 바인드(${bindNames(q.query_sql).map(n => `:${n}`).join(', ') || '없음'})` +
+  ` / SQL: ${clip(q.query_sql, MAX_PROMPT_SQL_LEN)}`;
+
+// 예산 안에 들어가는 가장 긴 앞부분을 돌려준다. 행 단위로 줄이는 이유: JSON 문자열을 중간에서
+// 자르면 모델이 파싱할 수 없는 조각이 남고, 그 조각을 값으로 읽어 바인드로 되돌린다.
+// 최소 1건은 남긴다 — 0건이면 모델이 '결과가 없다'로 읽고, 1건의 크기는 셀 상한(MAX_CELL_LEN)이 이미 묶었다.
+function fitRows(rows, budget) {
+  let used = 2; // '[]'
+  for (let i = 0; i < rows.length; i++) {
+    used += JSON.stringify(rows[i]).length + (i ? 1 : 0); // 구분자 ','
+    if (i > 0 && used > budget) return rows.slice(0, i);
+  }
+  return rows;
+}
+
+function historyLine(h) {
+  if (h.note) {
+    // 루프 가드가 남긴 제어용 기록 — 실패가 아니므로 '오류'로 알리지 않는다 (모델이 실패로 오해해 불필요한 우회를 하지 않게)
+    return `- ${h.query_name} params=${JSON.stringify(h.params)} → 실행하지 않음: ${h.note}`;
+  }
+  if (h.error) {
+    // 드라이버 오류 원문은 길 수 있다 — 항목 상한을 여기에도 건다.
+    return `- ${h.query_name} params=${JSON.stringify(h.params)} → 오류: ${clip(h.error)}`;
+  }
+  // 건수 해석은 rowCounts 한 곳에서만 한다 (사용자 답변·화면 trace도 같은 해석을 쓴다).
+  // 여기서 더 줄이는 것은 '몇 건을 인쇄하는가'뿐이므로 해석이 갈라지지 않는다: printed ≤ shown ≤ totalRows.
+  const { rows, totalRows, capped } = rowCounts(h);
+  const printedRows = fitRows(rows, MAX_PROMPT_STEP_LEN);
+  const printed = printedRows.length;
+  const note = capped
+    ? ` (조회 상한 ${MAX_ROWS}건 도달 — 실제 총 건수는 더 많을 수 있음, 처음 ${printed}건만 표시)`
+    : totalRows > printed ? ` (총 ${totalRows}건 중 처음 ${printed}건만 표시)` : '';
+  return `- ${h.query_name} params=${JSON.stringify(h.params)} → 결과 ${totalRows}${capped ? '+' : ''}건${note}: ${JSON.stringify(printedRows)}`;
+}
+
+// 실행 이력은 다른 섹션과 반대로 '뒤에서부터' 채운다 — 최신 기록이 가장 중요하기 때문이다.
+// 꼬리부터 버리면 방금 조회한 결과가 먼저 사라져 그 스텝이 통째로 헛수고가 되고,
+// 모델은 결과를 못 본 채 같은 쿼리를 다시 제안한다(그러면 루프 가드에 걸려 답변만 부실해진다).
+// 표시 순서는 시간순으로 되돌린다.
+function renderHistory(history, budget) {
+  if (!history.length) return ['(없음)'];
+  const lines = [];
+  let used = 0;
+  for (let i = history.length - 1; i >= 0; i--) {
+    const line = historyLine(history[i]);
+    if (lines.length > 0 && used + line.length > budget) break;
+    lines.push(line);
+    used += line.length;
+  }
+  lines.reverse();
+  const omitted = history.length - lines.length;
+  if (omitted > 0) lines.unshift(`- (앞선 ${omitted}건은 프롬프트 길이 제한으로 생략)`);
+  return lines;
+}
+
+// 섹션별 예산 배분 — 전체 상한 하나를 PROMPT_FLOORS 선언 순서대로 나눠준다.
+// 각 섹션의 몫 = max(자기 최소 몫, 남은 예산 - 뒤 섹션들의 최소 몫 합).
+// 뒤 섹션들의 최소 몫을 미리 떼어놓으므로 앞 섹션이 뒤를 굶기지 못하고, 앞이 짧으면 그 여유가
+// 그대로 뒤로 넘어간다 — 그래서 가장 중요한 섹션(쿼리 목록)을 맨 뒤에 두었다(constants.js 참고).
+// 이 배분 덕에 어느 섹션이 얼마나 길어지든 합계는 MAX_PROMPT_TOTAL_LEN을 넘지 않는다.
+function renderSections(ctx) {
+  const builders = {
+    knowledge: budget => renderItems(ctx.knowledge, k => `- [${k.title}] ${clip(k.content)}`, budget),
+    qaMethods: budget => renderItems(ctx.qaMethods, m => `- [${m.title}] ${clip(m.method)}`, budget),
+    history: budget => renderHistory(ctx.history, budget),
+    queries: budget => renderItems(ctx.queries, queryItem, budget),
+  };
+  const keys = Object.keys(PROMPT_FLOORS);
+  const out = {};
+  let remaining = MAX_PROMPT_TOTAL_LEN;
+  keys.forEach((key, i) => {
+    const reserved = keys.slice(i + 1).reduce((sum, k) => sum + PROMPT_FLOORS[k], 0);
+    const lines = builders[key](Math.max(PROMPT_FLOORS[key], remaining - reserved));
+    remaining -= lines.reduce((sum, line) => sum + line.length + 1, 0); // +1 = 개행
+    out[key] = lines;
+  });
+  return out;
+}
+
+// (테스트에서 쓰므로 export 한다 — 예산이 어긋나도 티가 나지 않는 종류의 실패라 회귀 테스트가 필요하다)
+export function buildPrompt(ctx) {
+  // 배분 순서와 출력 순서는 별개다 — 배분은 우선순위대로, 출력은 모델이 읽기 좋은 고정 순서로.
+  const s = renderSections(ctx);
   const lines = [];
 
+  // 대화와 질문은 이 예산 밖이다: 각각 MAX_CHAT_TURNS×MAX_CHAT_LEN과 서버의 2,000자 제한으로
+  // 이미 묶여 있고, 둘 다 빠지면 질문 자체가 성립하지 않아 버릴 수 있는 대상이 아니다.
   if (ctx.chat?.length) {
     lines.push('## 최근 대화');
     for (const m of ctx.chat) lines.push(`- ${m.role === 'user' ? '사용자' : '에이전트'}: ${m.text}`);
@@ -164,39 +258,10 @@ function buildPrompt(ctx) {
   }
   lines.push(`## 사용자 질문 (현재)\n${ctx.question}`);
 
-  lines.push(`\n## 관련 지식 (${ctx.knowledge.length}건)`);
-  pushItems(lines, ctx.knowledge, k => `- [${k.title}] ${clip(k.content)}`);
-
-  lines.push(`\n## Q&A 처리 방법 (${ctx.qaMethods.length}건)`);
-  pushItems(lines, ctx.qaMethods, m => `- [${m.title}] ${clip(m.method)}`);
-
-  lines.push('\n## 실행 가능한 쿼리 목록');
-  // 바인드 변수명을 SQL과 따로 싣는다 — SQL이 길어 잘리더라도 채워야 할 파라미터가 사라지지 않게.
-  // 사라지면 모델이 params를 비우고, runQuery가 '바인드 변수를 쓸 수 없습니다'로 실패한다.
-  pushItems(lines, ctx.queries, q =>
-    `- ${q.query_name}: ${clip(q.query_desc)}` +
-    ` / 입력(${clip(q.input_desc, 300)}) / 출력(${clip(q.output_desc, 300)})` +
-    ` / 바인드(${bindNames(q.query_sql).map(n => `:${n}`).join(', ') || '없음'})` +
-    ` / SQL: ${clip(q.query_sql, MAX_PROMPT_SQL_LEN)}`,
-    MAX_PROMPT_QUERY_SECTION_LEN);
-
-  lines.push('\n## 쿼리 실행 이력');
-  if (!ctx.history.length) lines.push('(없음)');
-  for (const h of ctx.history) {
-    if (h.note) {
-      // 루프 가드가 남긴 제어용 기록 — 실패가 아니므로 '오류'로 알리지 않는다 (모델이 실패로 오해해 불필요한 우회를 하지 않게)
-      lines.push(`- ${h.query_name} params=${JSON.stringify(h.params)} → 실행하지 않음: ${h.note}`);
-    } else if (h.error) {
-      lines.push(`- ${h.query_name} params=${JSON.stringify(h.params)} → 오류: ${h.error}`);
-    } else {
-      // 건수 해석은 rowCounts 한 곳에서만 한다 (사용자 답변·화면 trace도 같은 해석을 쓴다).
-      const { rows, shown, totalRows, capped } = rowCounts(h);
-      const note = capped
-        ? ` (조회 상한 ${MAX_ROWS}건 도달 — 실제 총 건수는 더 많을 수 있음, 처음 ${shown}건만 표시)`
-        : totalRows > shown ? ` (총 ${totalRows}건 중 처음 ${shown}건만 표시)` : '';
-      lines.push(`- ${h.query_name} params=${JSON.stringify(h.params)} → 결과 ${totalRows}${capped ? '+' : ''}건${note}: ${JSON.stringify(rows)}`);
-    }
-  }
+  lines.push(`\n## 관련 지식 (${ctx.knowledge.length}건)`, ...s.knowledge);
+  lines.push(`\n## Q&A 처리 방법 (${ctx.qaMethods.length}건)`, ...s.qaMethods);
+  lines.push('\n## 실행 가능한 쿼리 목록', ...s.queries);
+  lines.push('\n## 쿼리 실행 이력', ...s.history);
 
   if (ctx.forceAnswer) {
     lines.push('\n## 지시\n더 이상 쿼리를 실행할 수 없다. 지금까지의 정보만으로 action="answer"로 최종 답변하라.');

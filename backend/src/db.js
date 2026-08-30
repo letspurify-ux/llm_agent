@@ -25,20 +25,35 @@ export function getConnection() {
   return getPool().getConnection();
 }
 
+// 커넥션 반납의 단일 지점 — 직접 쥔 쪽(embed-sync)도 반드시 이 함수를 쓴다.
+// 반납을 기다린다: 기다리지 않으면 아직 풀로 돌아가지 않은 커넥션을 반납된 것으로 세어
+// connectionLimit을 잠시 넘겨 쓰고, 뒤이은 요청이 커넥터 기본 acquireTimeout(10초)에 걸려 500이 난다.
+// 반납 실패가 원래 결과(또는 원래 오류)를 덮지 않도록 여기서 삼킨다 —
+// 삼키지 않으면 잡는 곳이 없어 unhandledRejection으로 새고, 로그에는 원인 없는 거부만 남는다.
+export async function releaseConnection(conn) {
+  try {
+    await conn.release();
+  } catch (e) {
+    console.warn('[db] 커넥션 반납 실패:', e.message);
+  }
+}
+
 export async function query(sql, params = []) {
   const conn = await getPool().getConnection();
   try {
     return await conn.query(sql, params);
   } finally {
-    // 반납을 기다린다 — 기다리지 않으면 아직 풀로 돌아가지 않은 커넥션을 반납된 것으로 세어
-    // connectionLimit을 잠시 넘겨 쓰고, 뒤이은 요청이 acquireTimeout으로 떨어진다.
-    // 반납 실패가 원래 결과(또는 원래 오류)를 덮지 않도록 여기서 삼킨다.
-    try {
-      await conn.release();
-    } catch (e) {
-      console.warn('[db] 커넥션 반납 실패:', e.message);
-    }
+    await releaseConnection(conn);
   }
+}
+
+// 정상 종료용 — 풀을 닫아 반납된 커넥션까지 정리한다 (server.js의 shutdown 참고).
+// 다시 호출되면 getPool()이 새 풀을 만들도록 참조를 비운다.
+export async function closePool() {
+  const p = pool;
+  if (!p) return;
+  pool = undefined;
+  await p.end();
 }
 
 // 쿼리 관리 테이블 로드 — 소규모(라우팅 임계치 이하)일 때만 사용.

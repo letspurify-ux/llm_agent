@@ -2,6 +2,7 @@
 // 검색 구현은 이 파일에만 있다. 임베딩 서버가 없으면 자동으로 LIKE-only로 동작한다.
 import { query } from './db.js';
 import { embed, isEmbeddingEnabled, warnEmbeddingFailure } from './embedding.js';
+import { warnOnce } from './constants.js';
 
 const LIMIT = 20;         // LLM에 넘길 최대 후보 수 (건당 약 84토큰)
 const TITLE_WEIGHT = 3;   // 제목(첫 컬럼) 매칭은 본문 매칭보다 높게
@@ -95,15 +96,13 @@ async function vecSearch(table, question) {
   const vector = await embedQuestion(question);
   if (!vector) return null;
   return vecQuery(table, vector).catch(e => {
-    if (!vecWarned) {
-      vecWarned = true;
-      console.warn(`[search] 벡터 검색 실패 — LIKE 검색만 사용합니다: ${e.message}`);
-    }
+    // 억제는 warnOnce에 맡긴다 — '한 번만 경고' 플래그를 쓰면 vec_store 미생성으로 한 번 알린 뒤
+    // 차원 불일치·인덱스 손상 같은 전혀 다른 이유로 벡터 검색이 죽어도 로그가 남지 않는다.
+    // 이 경로는 조용히 LIKE-only로 폴백하므로 로그가 유일한 단서다.
+    warnOnce('search', `벡터 검색 실패 — LIKE 검색만 사용합니다: ${e.message}`);
     return null;
   });
 }
-
-let vecWarned = false;
 
 function vecQuery(table, vector) {
   return query(

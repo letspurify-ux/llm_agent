@@ -56,10 +56,7 @@ test('사고 과정 안의 초안 JSON을 결정으로 오인하지 않는다', 
     { action: 'answer', answer: '최근 주문은 O-777입니다' }
   );
   // 닫히지 않은 <think>(토큰 한도로 잘린 응답)도 결정으로 새어 나오면 안 된다
-  assert.match(
-    (await decide('<think>{"action":"answer","answer":"초안"} 으로 할까')).answer,
-    /LLM 호출에 실패/
-  );
+  assert.equal(await decide('<think>{"action":"answer","answer":"초안"} 으로 할까'), null);
   // Qwen3·R1 계열 기본 템플릿은 <think>를 프롬프트에 미리 붙이므로 content에는 닫는 태그만 온다.
   // 여는 태그만 찾으면 이 형태에서 사고 과정이 통째로 살아남아 초안이 결정으로 잡힌다.
   assert.deepStrictEqual(
@@ -86,8 +83,8 @@ test('JSON 바깥 산문의 홀수 따옴표가 스캔을 삼키지 않는다', 
 
 test('내용이 빈 결정은 결정으로 보지 않는다', async () => {
   // 빈 말풍선이 뜨고 그 빈 턴이 다음 질문의 맥락으로 되돌아오는 것을 막는다
-  assert.match((await decide('{"action":"answer","answer":"   "}')).answer, /LLM 호출에 실패/);
-  assert.match((await decide('{"action":"run_query","query_name":""}')).answer, /LLM 호출에 실패/);
+  assert.equal(await decide('{"action":"answer","answer":"   "}'), null);
+  assert.equal(await decide('{"action":"run_query","query_name":""}'), null);
 });
 
 test('answer 본문에 든 중괄호·따옴표는 경계를 어긋내지 않는다', async () => {
@@ -122,10 +119,10 @@ test('기존에 되던 형태는 그대로 된다', async () => {
   );
 });
 
-test('결정을 못 읽으면 500 대신 안내 답변으로 정상 응답한다', async () => {
-  const r = await decide('죄송합니다. 답변할 수 없습니다.');
-  assert.equal(r.action, 'answer');
-  assert.match(r.answer, /LLM 호출에 실패/);
+test('결정을 못 읽으면 null을 돌려준다 (사용자 문구는 호출부가 만든다)', async () => {
+  // provider가 여기서 '실패했습니다' 답변을 지어내면, 조회를 세 번 성공한 요청도 그 한 줄로 끝난다.
+  // 무엇을 안내할지는 실행 이력을 쥔 agent.js가 정한다 (renderAnswer 폴백).
+  assert.equal(await decide('죄송합니다. 답변할 수 없습니다.'), null);
 });
 
 // LLM_REASONING_EFFORT는 모듈 로드 시점에 읽으므로, 값마다 캐시를 우회해 새로 import한다.
@@ -164,6 +161,5 @@ test('알 수 없는 값은 기본값으로 되돌린다', async () => {
 });
 
 test('forceAnswer일 때는 run_query를 결정으로 받지 않는다', async () => {
-  const r = await decide('{"action":"run_query","query_name":"a","params":{}}', { ...CTX, forceAnswer: true });
-  assert.equal(r.action, 'answer');
+  assert.equal(await decide('{"action":"run_query","query_name":"a","params":{}}', { ...CTX, forceAnswer: true }), null);
 });

@@ -4,6 +4,8 @@
 // 실패 시 EmbeddingError를 던진다 — 호출부가 '재시도할 실패'와 '입력이 거부된 실패'를 구분해야 하기 때문이다.
 // 미설정(LIKE-only)은 실패가 아니므로 호출부가 isEmbeddingEnabled()로 먼저 갈라낸다.
 // 모델명은 embed-sync의 embed_hash에도 들어간다(모델 교체 시 자동 재임베딩) — 한 곳에서만 정의한다
+import { warnOnce } from './constants.js';
+
 export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'bge-m3';
 
 // 임베딩 서버 사용 여부의 단일 판단 지점 — 호출부가 EMBEDDING_URL을 직접 읽어 같은 판단을
@@ -27,12 +29,10 @@ export class EmbeddingError extends Error {
 
 // 같은 오류가 매 주기 반복될 때 로그를 도배하지 않되, 오류의 성격이 바뀌면 반드시 다시 알린다 —
 // 접속 실패로 한 번 경고한 뒤 응답 정합성 오류(개수 불일치 등)로 바뀌면 그게 묻히면 안 된다.
-// embed()가 던지게 되면서 경고 시점이 호출부로 옮겨졌으므로, 중복 억제 상태는 여기 남긴다.
-let lastWarning = null;
+// embed()가 던지게 되면서 경고 시점이 호출부로 옮겨졌으므로, 이름은 여기 남기고
+// 억제 방식은 constants.js의 warnOnce 하나로 모은다 (벡터 검색·NLS 포맷도 같은 것을 쓴다).
 export function warnEmbeddingFailure(e) {
-  if (lastWarning === e.message) return;
-  lastWarning = e.message;
-  console.warn(`[embedding] 임베딩 호출 실패: ${e.message}`);
+  warnOnce('embedding', `임베딩 호출 실패: ${e.message}`);
 }
 
 // 성공하면 texts와 같은 길이·순서의 벡터 배열, 실패하면 EmbeddingError를 던진다.

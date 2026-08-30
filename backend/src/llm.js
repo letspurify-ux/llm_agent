@@ -38,8 +38,14 @@ async function mockDecide(ctx) {
       // 바인드 값을 채울 수 없는 쿼리는 건너뛴다 (이 질문과 무관한 쿼리로 간주)
     }
   }
-  return { action: 'answer', answer: buildAnswer(ctx) };
+  // 조립할 것이 없으면 Mock은 '일반 지식이 없다'고 안내한다 — 실제 LLM 폴백은 다른 문구를 쓰므로
+  // 그 판단은 renderAnswer가 아니라 각 호출부가 한다 (renderAnswer 주석 참고).
+  return { action: 'answer', answer: renderAnswer(ctx) ?? MOCK_NO_KNOWLEDGE };
 }
+
+const MOCK_NO_KNOWLEDGE =
+  '*등록된 지식에 없는 내용이라 일반 지식으로 답변합니다.*\n\n' +
+  '(Mock LLM은 일반 지식이 없습니다 — 실제 LLM(vLLM/OpenRouter) 연결 시 이 자리에 모델의 기본 지식 답변이 표시됩니다.)';
 
 function plannedQueries(qaMethods, queries) {
   const planned = [];
@@ -92,6 +98,11 @@ function valueFromHistory(name, history) {
       for (const [col, val] of Object.entries(row)) {
         // capRows가 자른 값은 원본이 아니므로 바인드 값으로 쓰지 않는다
         if (typeof val === 'string' && val.endsWith(TRUNC_MARK)) continue;
+        // NULL 컬럼도 '값을 못 찾았다'로 다룬다 — 그대로 돌려주면 undefined가 아니라는 이유로
+        // 아래 fillParams가 질문·따옴표 fallback을 건너뛰고 params를 null로 확정하는데,
+        // 그 null은 runQuery의 bindProblem이 '값 없음'으로 반드시 실패시킨다.
+        // 실패가 확정된 쿼리를 제안하느라 스텝 하나와 왕복 한 번을 버리는 셈이다.
+        if (val === null || val === undefined) continue;
         if (col.toLowerCase() === name.toLowerCase()) return val;
       }
     }
@@ -99,8 +110,14 @@ function valueFromHistory(name, history) {
   return undefined;
 }
 
-// 답변 조립 (markdown 형식): 쿼리 실행 결과 요약 + 관련 지식 첨부
-function buildAnswer({ knowledge, history }) {
+// 답변 조립 (markdown 형식): 쿼리 실행 결과 요약 + 관련 지식 첨부.
+//
+// 두 곳이 쓴다: Mock provider의 답변이자, 실제 LLM이 끝내 결정을 내지 못했을 때 agent.js가 쓰는
+// 폴백이다. 조회에 성공해놓고 'LLM 호출 실패' 한 줄만 내보내면 그 요청이 실제로 한 일이 통째로
+// 사라지는데, 손에 든 행과 지식으로 답을 만드는 방법은 이미 여기 있다.
+// 조립할 것이 하나도 없으면 null을 돌려주고 무엇을 안내할지는 호출부가 정한다 —
+// Mock은 '일반 지식 없음', agent 폴백은 'LLM 호출 실패'로 서로 다른 말을 해야 한다.
+export function renderAnswer({ knowledge, history }) {
   const parts = [];
   for (const h of history) {
     if (h.error) {
@@ -140,13 +157,7 @@ function buildAnswer({ knowledge, history }) {
   if (attach) {
     parts.push(`### 관련 지식: ${attach.title}\n\n${attach.content}`);
   }
-  if (!parts.length) {
-    // 등록된 지식/쿼리 결과가 전혀 없는 경우 — 실제 LLM은 자체 일반 지식으로 답변한다
-    // (llm-openai.js 시스템 프롬프트 참고). Mock은 일반 지식이 없으므로 안내만 한다.
-    return '*등록된 지식에 없는 내용이라 일반 지식으로 답변합니다.*\n\n' +
-      '(Mock LLM은 일반 지식이 없습니다 — 실제 LLM(vLLM/OpenRouter) 연결 시 이 자리에 모델의 기본 지식 답변이 표시됩니다.)';
-  }
-  return parts.join('\n\n');
+  return parts.length ? parts.join('\n\n') : null;
 }
 
 // 셀 값에 든 '|'와 개행은 표 문법 그 자체다 — 그대로 흘리면 remark-gfm가 컬럼 수를 잘못 세어

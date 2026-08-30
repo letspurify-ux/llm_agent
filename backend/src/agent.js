@@ -6,7 +6,7 @@ import { searchKnowledge, searchQaMethods, searchQueries } from './search.js';
 import { loadQueryRegistry, loadQueriesByNames } from './db.js';
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
-import { llm } from './llm.js';
+import { llm, renderAnswer } from './llm.js';
 import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, nameKey } from './constants.js';
 
 const MAX_STEPS = 5;
@@ -28,7 +28,8 @@ const capRows = rows => rows.slice(0, MAX_RESULT_ROWS);
 // 동일 실행 판정용 파라미터 키 — LLM이 준 원본이 아니라 "실제로 바인드되는 값"으로 만든다.
 // runQuery가 SQL의 바인드 변수만 추려 쓰므로, 여분 키 하나가 붙었다고 다른 실행이 되지는 않는다.
 // 값은 문자열로 정규화한다 (숫자 1과 문자열 '1'은 같은 컬럼에 같은 값으로 바인드된다).
-function paramKey(bindNameList, params) {
+// (테스트에서 쓰므로 export 한다 — 아래 loopGuard 주석 참고)
+export function paramKey(bindNameList, params) {
   const entries = bindNameList
     ? bindNameList.map(n => [n, params?.[n]])
     : Object.entries(params || {}); // 미등록 쿼리라 바인드를 알 수 없으면 원본 그대로 비교
@@ -41,8 +42,32 @@ function paramKey(bindNameList, params) {
   );
 }
 
+// 루프 가드 — 같은 쿼리를 같은 파라미터로 반복하는 퇴화한 결정을 걸러낸다.
+// 진행해도 되면 null, 아니면 모델에게 남길 안내 문구를 돌려준다 (호출부가 note로 기록한다).
+//
+// 순수 함수로 떼어낸 이유: 이 판정은 양쪽 방향 모두로 '조용히' 깨진다.
+//   느슨해지면 — 퇴화한 LLM 응답이 결정 루프를 제자리 돌며 스텝과 Oracle 조회를 소진한다.
+//   빡빡해지면 — 다단계 절차의 정상 흐름이 '이미 실행된 쿼리'로 끊겨 답변만 부실해진다.
+// 둘 다 오류를 남기지 않아 배포 뒤에도 원인이 보이지 않는다. 그래서 DB 없이 돌릴 수 있게 분리해
+// 회귀 테스트를 붙인다 (test/agent.test.js).
+export function loopGuard(history, canonicalName, binds, params) {
+  const key = paramKey(binds, params);
+  const isSame = h => nameKey(h.query_name) === nameKey(canonicalName) && paramKey(binds, h.params) === key;
+  // 미등록 이름의 반복도 같은 가드로 걸리도록 '등록되지 않은 쿼리' 처리보다 앞에서 부른다
+  // (가장 흔한 퇴화 패턴이 그것이다).
+  if (history.some(h => h.rows && isSame(h))) {
+    return '이미 같은 파라미터로 실행된 쿼리 — 실행 이력의 결과로 답변하거나 다른 쿼리를 선택하라';
+  }
+  // 실패도 무한 반복은 막는다 (결정적 오류면 타임아웃 대기가 스텝 수만큼 쌓인다)
+  if (history.filter(h => h.error && isSame(h)).length >= MAX_SAME_QUERY_TRIES) {
+    return '같은 파라미터로 반복 실패한 쿼리 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라';
+  }
+  return null;
+}
+
 // 클라이언트가 보낸 대화 이력을 신뢰하지 않고 형식을 검증·제한한다.
-function normalizeChat(chat) {
+// (테스트에서 쓰므로 export 한다 — 클라이언트가 보낸 값을 그대로 믿지 않는 유일한 지점이다)
+export function normalizeChat(chat) {
   if (!Array.isArray(chat)) return [];
   return chat
     .filter(m => m && typeof m.text === 'string' && (m.role === 'user' || m.role === 'assistant'))
@@ -100,7 +125,8 @@ export async function handleQuestion(question, rawChat = []) {
     // 스텝 수만으로는 소요 시간이 묶이지 않는다 — 느린 LLM 엔드포인트에서는
     // 스텝마다 LLM 타임아웃이 통째로 쌓여 요청 하나가 수십 분씩 워커를 점유한다.
     if (Date.now() > deadline) break;
-    const decision = await llm.decide(ctx());
+    const decision = await decide(ctx());
+    if (!decision) break; // 결정을 얻지 못했다 — 아래 강제 답변/폴백으로 간다
     if (decision.action === 'answer') {
       return { answer: decision.answer, trace: history, search };
     }
@@ -114,26 +140,16 @@ export async function handleQuestion(question, rawChat = []) {
       await resolveQuery(decision.query_name, queries, resolveCache);
     // 이력에는 항상 정규 이름(등록된 철자)을 남긴다 — 가드와 프롬프트가 같은 이름을 보게.
     const canonicalName = registryRow?.query_name ?? decision.query_name;
-    const binds = registryRow ? bindNames(registryRow.query_sql) : null; // 스텝당 1회만 파싱
-    const key = paramKey(binds, decision.params);
-    const isSame = h => nameKey(h.query_name) === nameKey(canonicalName) && paramKey(binds, h.params) === key;
+    const binds = registryRow ? bindNames(registryRow.query_sql) : null;
     // note는 LLM에게 경로를 바꾸라고 알리는 제어용 기록이다. 실제 쿼리 실패(error)와 필드를 나눈다 —
     // 같은 필드에 넣으면 사용자 trace 패널과 chat_log의 '실패한 질문' 집계에 정상 턴이 섞인다.
     // extra.safe = 이 문구를 사용자 화면(trace 패널)에 그대로 내보내도 되는가.
     // 우리가 문구를 만든 오류만 true다 — 드라이버·DB 원문은 스키마명·호스트를 담고 있다(server.js가 이 표시를 본다).
     const push = (field, msg, extra) => history.push({ query_name: canonicalName, params: decision.params, [field]: msg, ...extra });
 
-    // 같은 쿼리를 같은 파라미터로 반복하지 않는다 — 퇴화한 LLM 응답이 결정 루프를
-    // 제자리 돌며 스텝과 Oracle 조회를 소진하는 것 방지. 미등록 이름의 반복도 같은 가드로 걸리도록
-    // '등록되지 않은 쿼리' 처리보다 앞에 둔다 (가장 흔한 퇴화 패턴이 그것이다).
-    if (history.some(h => h.rows && isSame(h))) {
-      push('note', '이미 같은 파라미터로 실행된 쿼리 — 실행 이력의 결과로 답변하거나 다른 쿼리를 선택하라');
-      if (++guardHits >= MAX_GUARD_HITS) break;
-      continue;
-    }
-    // 실패도 무한 반복은 막는다 (결정적 오류면 타임아웃 대기가 스텝 수만큼 쌓인다)
-    if (history.filter(h => h.error && isSame(h)).length >= MAX_SAME_QUERY_TRIES) {
-      push('note', '같은 파라미터로 반복 실패한 쿼리 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라');
+    const guardNote = loopGuard(history, canonicalName, binds, decision.params);
+    if (guardNote) {
+      push('note', guardNote);
       if (++guardHits >= MAX_GUARD_HITS) break;
       continue;
     }
@@ -144,7 +160,7 @@ export async function handleQuestion(question, rawChat = []) {
     // 프롬프트 목록 밖에서 찾은 쿼리는 목록에 넣어준다 — 다음 스텝에서 LLM이 input_desc를 보고
     // 바인드를 고칠 수 있어야 한다. 중복은 넣지 않고, 늘어나는 상한은 MAX_STEPS건이다
     // (즉 목록은 최대 MAX_PROMPT_QUERIES + MAX_STEPS건 — 무제한으로 커지지 않는다).
-    // 뒤가 아니라 앞에 넣는다 — 프롬프트 예산(llm-openai.js pushItems)은 '뒤쪽일수록 관련도가 낮다'는
+    // 뒤가 아니라 앞에 넣는다 — 프롬프트 예산(llm-openai.js renderItems)은 '뒤쪽일수록 관련도가 낮다'는
     // 전제로 꼬리부터 버린다. 방금 LLM이 이름을 대서 찾아낸 쿼리는 이번 스텝에서 가장 관련이 높은데,
     // 뒤에 붙이면 등록이 조금만 많아도 그 한 건이 먼저 잘려 나가 이 복구 경로 자체가 조용히 사라진다.
     if (!queries.includes(registryRow)) queries.unshift(registryRow);
@@ -160,9 +176,30 @@ export async function handleQuestion(question, rawChat = []) {
     }
   }
 
-  // 안전장치: MAX_STEPS 초과(또는 가드 반복) 시 강제 답변
-  const final = await llm.decide({ ...ctx(), forceAnswer: true });
-  return { answer: final.answer, trace: history, search };
+  // 안전장치: MAX_STEPS 초과(또는 가드 반복) 시 강제 답변.
+  // 그마저 실패하면 손에 든 실행 이력·지식으로 직접 답을 조립한다 — 조회를 몇 번 성공해놓고
+  // 'LLM 호출 실패' 한 줄만 내보내면 그 요청이 실제로 한 일이 통째로 사라진다.
+  const finalCtx = { ...ctx(), forceAnswer: true };
+  const final = await decide(finalCtx);
+  const answer = (final?.action === 'answer' && final.answer) || renderAnswer(finalCtx) || LLM_FAILED;
+  return { answer, trace: history, search };
+}
+
+const LLM_FAILED = 'LLM 호출에 실패했습니다. 잠시 후 다시 시도해주세요.';
+
+// LLM 호출은 무엇이 실패하든 요청 전체를 500으로 만들지 않는다 — 함께 버려지는 것이
+// 이미 조회해둔 결과이기 때문이다. provider는 자기 재시도 루프 안의 실패만 흡수하므로
+// (HTTP·타임아웃·파싱), 그 밖의 실패는 여기서 받는다: 프롬프트 조립 오류, mock provider의 예외,
+// ctx에 예상 밖의 값이 섞인 경우. 보장은 provider가 아니라 '누적된 성과를 쥐고 있는' 이 경계에 둔다.
+// 결정을 얻지 못하면 null을 돌려주고, 호출부가 강제 답변 또는 폴백 답변으로 넘어간다.
+async function decide(ctx) {
+  try {
+    return await llm.decide(ctx);
+  } catch (e) {
+    // 원문은 로그에만 — 스키마명·호스트가 섞일 수 있고, 사용자 문구는 호출부가 만든다.
+    console.error('[agent] LLM 결정 실패:', e);
+    return null;
+  }
 }
 
 // 결정된 query_name → query_registry 행. 프롬프트 목록은 MAX_PROMPT_QUERIES로 잘릴 수 있으므로

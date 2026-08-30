@@ -59,10 +59,23 @@ export default function App() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, loading]);
 
+  // loading은 state라 같은 tick에 두 번 호출되면 두 번 다 false로 읽힐 수 있다 —
+  // 실제 중복 전송을 막는 것은 ref 쪽이다 (state는 버튼 비활성화 등 렌더에만 쓴다).
+  const canSend = () => !loading && !sendingRef.current;
+
+  // 입력창에서 보내는 경로. setInput('')을 ask가 아니라 여기서 하는 이유:
+  // ask는 예시 칩(ask(x))에서도 불리는데, 거기서 입력창을 비우면 사용자가 쓰던 초안이
+  // 보낸 적도 없이 사라진다(빈 상태 화면은 입력 중에도 칩을 계속 보여준다).
+  // 전송이 실제로 받아들여질 때만 비우도록 가드도 여기서 함께 본다.
+  function submitInput() {
+    const message = input.trim();
+    if (!message || !canSend()) return;
+    setInput('');
+    ask(message);
+  }
+
   async function ask(message) {
-    // loading은 state라 같은 tick에 두 번 호출되면 두 번 다 false로 읽힐 수 있다 —
-    // 실제 중복 전송을 막는 것은 ref 쪽이다 (state는 버튼 비활성화 등 렌더에만 쓴다).
-    if (!message || loading || sendingRef.current) return;
+    if (!message || !canSend()) return;
     let answer = '서버와 통신하지 못했습니다.';
     let trace;
     let answered = false; // 서버가 실제로 '답'을 돌려줬는가 (통신 실패·타임아웃·서버 오류와 구분)
@@ -85,7 +98,6 @@ export default function App() {
         .map(m => ({ role: m.role, text: String(m.text ?? '').slice(0, HISTORY_LEN) }));
       historyRef.current = [...historyRef.current, { role: 'user', text: message }];
       setMessages(m => [...m, { role: 'user', text: message }]);
-      setInput('');
       setLoading(true);
       const res = await fetch('/api/chat', {
         method: 'POST',
@@ -155,7 +167,7 @@ export default function App() {
       </main>
 
       <div className="composer-wrap">
-        <form className="composer" onSubmit={e => { e.preventDefault(); ask(input.trim()); }}>
+        <form className="composer" onSubmit={e => { e.preventDefault(); submitInput(); }}>
           <input
             value={input}
             onChange={e => setInput(e.target.value)}
@@ -181,7 +193,7 @@ export default function App() {
                 justComposedRef.current = false;
                 return;
               }
-              ask(input.trim());
+              submitInput();
             }}
             placeholder="질문을 입력하세요"
             maxLength={2000}  /* 입력 단계 안내용 — 실제 제한은 서버가 검증한다 (server.js) */

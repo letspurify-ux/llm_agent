@@ -6,7 +6,7 @@ import 'dotenv/config';
 import crypto from 'node:crypto';
 import { writeSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { query, getConnection } from './db.js';
+import { query, getConnection, releaseConnection } from './db.js';
 import { embed, EMBEDDING_MODEL, isEmbeddingEnabled, warnEmbeddingFailure } from './embedding.js';
 import { SEARCH_COLUMNS } from './search.js';
 import { MAX_EMBED_TEXT_LEN, clipText } from './constants.js';
@@ -29,6 +29,24 @@ export const SKIP = {
   UNCONFIGURED: 'unconfigured', // EMBEDDING_URL 미설정 — LIKE-only 정상 구성
   UNAVAILABLE: 'unavailable',   // 임베딩 서버가 설정돼 있으나 응답하지 않음
 };
+
+// 결과 문구는 SKIP 바로 옆에 둔다 — 서버 로그와 CLI가 각자 SKIP 키 맵을 들고 있으면
+// 값이 하나 추가될 때 두 곳을 손으로 맞춰야 하고, 한쪽만 고치면 그 실행 경로에서만 안내가 사라진다.
+// (SKIP을 상수로 모은 이유가 '설정상 안 쓰는 것'과 '쓰려는데 실패한 것'을 호출부가 구분하게 하려는
+//  것인데, 구분해서 보여줄 문구가 호출부마다 흩어져 있으면 그 목적이 반만 달성된다.)
+const SKIP_NOTE = {
+  [SKIP.BUSY]: '다른 동기화가 진행 중이라 건너뛰었습니다',
+  [SKIP.UNCONFIGURED]: 'EMBEDDING_URL 미설정 — LIKE-only 구성이라 임베딩을 생략합니다',
+  [SKIP.UNAVAILABLE]: '임베딩 서버에 연결하지 못해 일부를 건너뛰었습니다 — LIKE-only로 계속합니다',
+};
+
+// 건너뛴 행은 원본을 고치기 전까지 매 주기 다시 실패하므로 반드시 눈에 띄어야 한다
+// (0건이면 문구를 붙이지 않아 평소 로그는 조용하다).
+export function syncSummary(r) {
+  const failed = r.failed ? `, 건너뜀 ${r.failed}건(원본 확인 필요)` : '';
+  const note = SKIP_NOTE[r.skipped];
+  return `생성/갱신 ${r.embedded}건, 정리 ${r.deleted}건${failed}${note ? ` — ${note}` : ''}`;
+}
 
 // 중첩 실행 가드 — 초기 대량 동기화(수 분)가 도는 동안 다른 실행이 겹쳐 같은 행을
 // 중복 임베딩하는 것을 막는다. 프로세스 내부는 running 플래그로, 프로세스 간(서버 주기
@@ -53,7 +71,10 @@ export async function syncEmbeddings() {
       // 쥐지 않은 락에 대한 RELEASE_LOCK은 0을 돌려주는 무해한 no-op이라 락 해제와 커넥션 반납을
       // 한 단계에서 처리할 수 있다 (자원 수명이 같은데 블록만 나뉘면 다음 수정이 엉뚱한 곳에 붙는다).
       await lockConn.query(`SELECT RELEASE_LOCK('${LOCK_NAME}')`).catch(() => {});
-      lockConn.release();
+      // 반납은 db.js와 같은 함수로 한다 — 기다리지 않으면 아직 풀로 돌아가지 않은 커넥션을
+      // 반납된 것으로 세어 connectionLimit을 잠시 넘겨 쓰고, 실패하면 잡는 곳이 없어 샌다.
+      // 풀을 쓰는 쪽과 직접 쥐는 쪽이 반납 규칙을 따로 갖고 있으면 한쪽만 조용히 어긋난다.
+      await releaseConnection(lockConn);
     }
   } finally {
     running = false;
@@ -179,18 +200,12 @@ async function storeBatch(src, batch, vectors) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const t = Date.now();
   const r = await syncEmbeddings();
-  const suffix = {
-    [SKIP.UNAVAILABLE]: ' — 임베딩 서버에 연결하지 못해 일부를 건너뛰었습니다',
-    [SKIP.UNCONFIGURED]: ' — EMBEDDING_URL 미설정 (LIKE-only 구성, 임베딩 생략)',
-    [SKIP.BUSY]: ' — 다른 동기화가 진행 중이라 건너뛰었습니다',
-  }[r.skipped] ?? '';
   // stdout이 파이프(tee, CI 로그, docker build 등)면 console.log는 비동기라 아래 process.exit에
   // 잘려 나간다 — 이 명령의 존재 이유가 프로비저닝 스크립트에 결과를 알리는 것이므로 동기로 쓴다.
   // try/catch는 필수다: 논블로킹 파이프에서 writeSync는 EAGAIN을 던지는데, 그게 새어 나가면
   // 아래 process.exit가 실행되지 않아 성공한 동기화가 0이 아닌 종료 코드로 보고된다.
   // (server.js의 uncaughtException 핸들러가 같은 이유로 같은 형태를 쓴다)
-  const skippedRows = r.failed ? `, 건너뜀 ${r.failed}건(원본 확인 필요)` : '';
-  const summary = `임베딩 동기화 완료: 생성/갱신 ${r.embedded}건, 정리 ${r.deleted}건${skippedRows}, ${((Date.now() - t) / 1000).toFixed(1)}s${suffix}\n`;
+  const summary = `임베딩 동기화 완료: ${syncSummary(r)}, ${((Date.now() - t) / 1000).toFixed(1)}s\n`;
   try { writeSync(1, summary); } catch { /* 로그 실패가 종료 코드를 바꾸지 않게 */ }
   // 실패로 종료하는 것은 "쓰려고 했는데 안 된" 경우뿐이다 — LIKE-only는 지원되는 구성이므로
   // 프로비저닝 스크립트가 이 명령의 종료 코드로 실패 판정을 하면 안 된다.

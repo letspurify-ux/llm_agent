@@ -80,8 +80,24 @@ const stripNoise = sql => scanSql(sql).text;
 
 // query_sql에서 :bind 변수명 추출.
 // 리터럴의 TO_CHAR(D, 'HH24:MI')나 주석 속 ':name'이 바인드로 잡히면 안 되므로 둘 다 지운 뒤 찾는다.
+//
+// 결과를 캐시한다: 같은 query_sql이 요청 하나 안에서 반복해 들어온다 —
+// 프롬프트 조립은 스텝마다 쿼리 목록 전체(최대 35건)에 대해 다시 부르므로 요청당 최대 175회이고,
+// 파싱은 SQL 전체를 도는 문자 단위 스캐너다. agent.js가 같은 이유로 '스텝당 1회만 파싱'이라고
+// 손으로 캐시해 두었는데, 캐시를 함수 안에 두면 호출부마다 그 요령을 반복할 필요가 없다.
+// 키가 외부에서 온 문자열이므로 상한을 두고 오래된 것부터 밀어낸다(Map은 삽입 순서를 지킨다).
+// 돌려주는 배열은 freeze한다 — 캐시된 같은 배열을 여러 호출부가 나눠 쓰므로 한 곳의 변형이
+// 다른 곳으로 번지면 안 된다.
+const bindCache = new Map();
+const BIND_CACHE_MAX = 500;
+
 export function bindNames(sql) {
-  return [...new Set([...stripNoise(sql).matchAll(/:(\w+)/g)].map(m => m[1]))];
+  const hit = bindCache.get(sql);
+  if (hit) return hit;
+  const names = Object.freeze([...new Set([...stripNoise(sql).matchAll(/:(\w+)/g)].map(m => m[1]))]);
+  while (bindCache.size >= BIND_CACHE_MAX) bindCache.delete(bindCache.keys().next().value);
+  bindCache.set(sql, names);
+  return names;
 }
 
 // 조회 전용 가드: 의도치 않은 UPDATE/DELETE/DDL 실행 방지.
