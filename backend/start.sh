@@ -21,9 +21,12 @@ fi
 node scripts/ensure-env.js
 
 mkdir -p logs
+# 로그는 덮어쓰지 않고 이어 쓴다 — 덮어쓰면 재기동 순간 직전 실행의 크래시 원인이 사라진다.
+# 회차는 시작 구분선으로 가른다.
+echo "===== $(date '+%Y-%m-%d %H:%M:%S') 시작 =====" >> "$LOG_FILE"
 # npm start가 아니라 서버 스크립트를 직접 실행한다 — npm 래퍼를 거치면 $!가 npm 프로세스가 되어,
 # stop.sh가 npm만 죽이고 실제 서버(node src/server.js)는 남는 경우가 있다.
-nohup node src/server.js > "$LOG_FILE" 2>&1 &
+nohup node src/server.js >> "$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
 
 sleep 1

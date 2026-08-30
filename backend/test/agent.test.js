@@ -103,6 +103,17 @@ test('클라이언트 대화 이력은 형식·턴 수·길이를 모두 제한�
   assert.deepStrictEqual(normalizeChat(undefined), []);
 });
 
+test('이력 절단이 서로게이트 쌍을 쪼개지 않는다', () => {
+  // 상한 경계가 이모지 한가운데 걸리면 단순 slice는 짝 잃은 상위 서로게이트를 남긴다 —
+  // 그 문자열은 LLM API로 보내는 인코딩 단계에서 U+FFFD로 조용히 훼손된다 (constants.clipText와 같은 불변식).
+  const [cut] = normalizeChat([{ role: 'user', text: 'a'.repeat(MAX_CHAT_LEN - 1) + '😀' }]);
+  assert.equal(cut.text, 'a'.repeat(MAX_CHAT_LEN - 1));
+
+  // 클라이언트가 자기 쪽 절단에서 이미 쪼개 보낸 문자열(상한 이하)도 끝의 짝 잃은 서로게이트를 뗀다.
+  const [preSplit] = normalizeChat([{ role: 'user', text: 'ab\ud83d' }]);
+  assert.equal(preSplit.text, 'ab');
+});
+
 // ===== 잘린 셀 값 가드 (truncatedBinds) =====
 // 잘린 값을 바인드하면 조용히 0건이 나오고 모델은 그것을 "그런 데이터가 없다"로 읽는다 —
 // 반대로 넓게 막으면 질문에서 온 정당한 긴 값이 영구히 거부된다. 양쪽 다 오류가 남지 않는다.

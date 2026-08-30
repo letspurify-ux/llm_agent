@@ -7,7 +7,7 @@ import { loadQueryRegistry, loadQueriesByNames } from './db.js';
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
 import { llm, renderAnswer } from './llm.js';
-import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, TRUNC_MARK, nameKey } from './constants.js';
+import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, TRUNC_MARK, nameKey, clipText } from './constants.js';
 
 const MAX_STEPS = 5;
 const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포함). 초과하면 남은 스텝을 포기하고 강제 답변으로 간다.
@@ -95,7 +95,19 @@ export function normalizeChat(chat) {
   return chat
     .filter(m => m && typeof m.text === 'string' && (m.role === 'user' || m.role === 'assistant'))
     .slice(-MAX_CHAT_TURNS)
-    .map(m => ({ role: m.role, text: m.text.slice(0, MAX_CHAT_LEN) }));
+    .map(m => ({ role: m.role, text: clipChatText(m.text) }));
+}
+
+// 턴 본문은 단순 slice가 아니라 clipText로 자른다 — 경계의 서로게이트 쌍(이모지 등)을 반으로
+// 쪼개면 짝 잃은 코드유닛이 프롬프트에 실려, LLM API로 보내는 인코딩 단계에서 U+FFFD로
+// 조용히 훼손된다 (constants.clipText 주석 참고).
+// clipText는 상한 이하 문자열에는 손대지 않으므로, 클라이언트가 자기 쪽 절단(App.jsx)에서
+// 이미 쪼개 보낸 문자열은 그대로 통과한다 — 끝이 상위 서로게이트인 문자열은 절단 여부와
+// 무관하게 항상 손상된 문자열이므로, 여기서 마지막 코드유닛을 마저 뗀다.
+function clipChatText(text) {
+  const t = clipText(text, MAX_CHAT_LEN);
+  const last = t.charCodeAt(t.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? t.slice(0, -1) : t;
 }
 
 export async function handleQuestion(question, rawChat = []) {

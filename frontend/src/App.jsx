@@ -8,6 +8,15 @@ import remarkGfm from 'remark-gfm';
 const HISTORY_TURNS = 6;
 const HISTORY_LEN = 500;
 
+// 단순 slice는 경계의 서로게이트 쌍(이모지 등)을 반으로 쪼개 짝 잃은 코드유닛을 남기고,
+// 그 값은 서버를 거쳐 LLM 프롬프트로 가는 인코딩 단계에서 U+FFFD로 조용히 훼손된다.
+// 경계에 걸린 상위 서로게이트 하나를 떼어 항상 온전한 문자열만 보낸다 (서버 constants.clipText와 같은 방식).
+const clipTurn = s => {
+  const t = String(s ?? '').slice(0, HISTORY_LEN);
+  const last = t.charCodeAt(t.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? t.slice(0, -1) : t;
+};
+
 // 요청 상한. 서버 최악 = 루프 진입 예산 180초(agent.js MAX_LOOP_MS) + 마지막 LLM 호출 120초
 // + 강제 답변 120초 ≈ 420초이므로 그보다 뒤에 둔다. 짧게 잡으면 서버가 답을 만들어 보내는 중에
 // 클라이언트가 먼저 끊어 "서버와 통신하지 못했습니다"로 뭉개진다.
@@ -95,7 +104,7 @@ export default function App() {
       // 서버가 쓰는 만큼만 보낸다 (턴 수·길이 모두). 더 보내도 서버가 버리고 본문만 커진다.
       const history = historyRef.current
         .slice(-HISTORY_TURNS)
-        .map(m => ({ role: m.role, text: String(m.text ?? '').slice(0, HISTORY_LEN) }));
+        .map(m => ({ role: m.role, text: clipTurn(m.text) }));
       historyRef.current = [...historyRef.current, { role: 'user', text: message }];
       setMessages(m => [...m, { role: 'user', text: message }]);
       setLoading(true);
