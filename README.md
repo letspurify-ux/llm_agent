@@ -58,8 +58,16 @@ mariadb --default-character-set=utf8mb4 < backend/sql/schema.sql
 > -- 이미 중복 제목이 있으면 ALTER가 실패하므로 아래로 먼저 확인하고 정리할 것.
 > SELECT title, COUNT(*) c FROM knowledge  GROUP BY title HAVING c > 1;
 > SELECT title, COUNT(*) c FROM qa_method GROUP BY title HAVING c > 1;
-> ALTER TABLE knowledge  ADD UNIQUE (title);
-> ALTER TABLE qa_method ADD UNIQUE (title);
+> -- 인덱스 이름을 uk_title로 맞춘다 — 시드 파일이 그 이름으로 존재 여부를 확인하므로,
+> -- 이름이 다르면 같은 컬럼에 UNIQUE 인덱스가 두 벌 생긴다.
+> ALTER TABLE knowledge  ADD UNIQUE KEY IF NOT EXISTS uk_title (title);
+> ALTER TABLE qa_method ADD UNIQUE KEY IF NOT EXISTS uk_title (title);
+> -- 이전 안내를 따라 이름 없이 UNIQUE를 만들었다면 인덱스 이름이 title이다. 그때만 정리한다:
+> --   ALTER TABLE knowledge  DROP INDEX title;
+> --   ALTER TABLE qa_method DROP INDEX title;
+>
+> -- collation 고정 (서버 기본값이 버전마다 달라 대소문자 비교 전제가 흔들린다)
+> ALTER DATABASE llm_agent CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 > ```
 
 ```bash

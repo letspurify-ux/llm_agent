@@ -11,6 +11,13 @@ USE llm_agent;
 -- "지울 이름 목록"을 따로 두지 않는 이유는 그 목록이 아래 INSERT와 손으로 맞춰야 하는 사본이라
 -- 한쪽만 고치는 순간 옛 행이 남거나(UNIQUE 없는 테이블) 시드가 중간에 죽기(UNIQUE 있는 테이블) 때문이다.
 -- ON DUPLICATE KEY UPDATE는 그 사본 자체를 없앤다.
+--
+-- 단, 그 방식은 자연키에 UNIQUE가 있어야 성립한다. 없으면 ON DUPLICATE KEY가 발동하지 않고
+-- 재실행마다 같은 행이 그대로 쌓인다 — 조용히, 오류 하나 없이. (구 스키마에서 실측: 3회 실행에
+-- knowledge 7건 → 21건.) README 마이그레이션을 건너뛴 설치에서 그 일이 벌어지므로 여기서 보장한다.
+-- 이미 중복이 있으면 이 ALTER가 실패하는데, 그게 조용한 중복보다 낫다.
+ALTER TABLE knowledge  ADD UNIQUE KEY IF NOT EXISTS uk_title (title);
+ALTER TABLE qa_method ADD UNIQUE KEY IF NOT EXISTS uk_title (title);
 
 INSERT INTO knowledge (title, content) VALUES
 ('배치 재시작 방법', '배치 작업이 FAILED 상태이면 배치 서버(batch01)에 접속 후 restart_batch.sh <JOB_ID> 를 실행하여 재시작한다. 실행 전 반드시 로그를 백업한다.'),

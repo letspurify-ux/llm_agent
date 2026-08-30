@@ -8,6 +8,8 @@ USE llm_agent;
 -- 재실행 가능(멱등): knowledge.title UNIQUE에 얹어 덮어쓴다 (seed.sql과 같은 방식).
 -- 지울 제목 목록을 따로 두면 아래 INSERT와 손으로 맞춰야 하는 사본이 생기고,
 -- 한쪽만 고치는 순간 옛 행이 남아 같은 지식이 두 벌 검색된다.
+-- UNIQUE가 없으면 ON DUPLICATE KEY가 발동하지 않아 재실행마다 조용히 중복이 쌓이므로 여기서 보장한다.
+ALTER TABLE knowledge ADD UNIQUE KEY IF NOT EXISTS uk_title (title);
 
 INSERT INTO knowledge (title, content) VALUES
 ('SPACE 시스템 개요',
