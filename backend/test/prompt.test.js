@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { buildPrompt } from '../src/llm-openai.js';
-import { MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS, MAX_CHAT_TURNS, MAX_CHAT_LEN } from '../src/constants.js';
+import { MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN } from '../src/constants.js';
 
 const big = n => 'ㄱ'.repeat(n);
 
@@ -27,7 +27,7 @@ const queries = n => new Array(n).fill(0).map((_, i) => ({
 }));
 
 // 대화·질문은 이 예산 밖이다(각자 다른 상한으로 이미 묶여 있다) — 그 몫만큼 여유를 둔다.
-const OUTSIDE_BUDGET = MAX_CHAT_TURNS * MAX_CHAT_LEN + 2000;
+const OUTSIDE_BUDGET = MAX_CHAT_TURNS * MAX_CHAT_LEN + MAX_QUESTION_LEN;
 
 test('한 섹션이 아무리 길어도 프롬프트 전체가 예산을 넘지 않는다', () => {
   // 네 섹션이 동시에 예산을 꽉 채우는 최악 — 예전에는 섹션마다 독립 상한이라 합계가 그대로 더해졌다
@@ -103,6 +103,20 @@ test('평범한 등록량은 아무것도 잘리지 않는다', () => {
   }));
   assert.ok(!p.includes('프롬프트 길이 제한으로 생략'), '평범한 등록량에서 잘렸다');
   assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN + OUTSIDE_BUDGET);
+});
+
+test('LLM이 만든 거대한 query_name·params도 예산을 넘지 못한다', () => {
+  // 결정 경계(llm.js sanitizeDecision)가 값을 묶지만, 프롬프트 조립은 그 경계가 우회되거나
+  // 느슨해져도 스스로 유계여야 한다 — renderHistory는 최소 1줄을 반드시 실으므로
+  // 줄 자체가 유계가 아니면 섹션 배분으로는 막을 수 없다 (역사적으로 이 경로가 뚫려 있었다).
+  const p = buildPrompt(ctx({
+    history: [
+      { query_name: big(5000), params: { [big(500)]: big(30000), b: big(30000), c: { nested: big(30000) } }, error: big(30000), hint: big(30000) },
+      { query_name: big(5000), params: { a: big(30000) }, rows: [{ A: 1 }], totalRows: 1 },
+      { query_name: big(5000), params: { a: big(30000) }, note: '실행하지 않음 사유' },
+    ],
+  }));
+  assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN, `프롬프트가 예산을 넘었다: ${p.length}`);
 });
 
 test('섹션 최소 몫 합계가 전체 예산을 넘지 않는다', () => {

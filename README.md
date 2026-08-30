@@ -66,18 +66,30 @@ mariadb --default-character-set=utf8mb4 < backend/sql/schema.sql
 > --   ALTER TABLE knowledge  DROP INDEX title;
 > --   ALTER TABLE qa_method DROP INDEX title;
 >
-> -- collation 고정 (서버 기본값이 버전마다 달라 대소문자 비교 전제가 흔들린다)
+> -- collation 고정 (서버 기본값이 버전마다 달라 대소문자 비교 전제가 흔들린다).
+> -- ALTER DATABASE는 '이후에 만드는' 테이블의 기본값만 바꾼다 — 이미 있는 테이블·컬럼의
+> -- collation은 그대로 남으므로, 실제 비교가 일어나는 기존 컬럼은 테이블마다 변환해야
+> -- nameKey()가 전제하는 대소문자 무시 비교가 정말로 고정된다 (schema.sql 주석 참고).
 > ALTER DATABASE llm_agent CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+> ALTER TABLE knowledge      CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+> ALTER TABLE qa_method      CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+> ALTER TABLE query_registry CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+> ALTER TABLE target_db      CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+> ALTER TABLE chat_log       CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+> -- vec_store는 제외 — 유일한 텍스트 컬럼(src)이 ASCII 고정값이라 collation의 영향이 없고,
+> -- VECTOR 컬럼이 있는 테이블의 문자셋 일괄 변환은 버전에 따라 지원되지 않는다.
 > ```
 
 ```bash
 mariadb --default-character-set=utf8mb4 < backend/sql/seed.sql
 ```
 
-앱 계정 생성 (agent 서버는 관리 테이블을 읽기만 하므로 SELECT 권한이면 충분):
+앱 계정 생성 (agent 서버는 관리 테이블을 읽기만 하므로 SELECT 권한이면 충분).
+`<비밀번호>`는 직접 정하고, 같은 값을 `backend/.env`의 `MARIADB_PASSWORD`에 채운다
+(문서에 고정 비밀번호를 적어 두면 저장소에 공개된 자격증명이 운영까지 그대로 따라간다):
 
 ```bash
-mariadb -e "CREATE USER IF NOT EXISTS 'agent'@'localhost' IDENTIFIED BY 'agent1234'; GRANT SELECT ON llm_agent.* TO 'agent'@'localhost'; GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_store TO 'agent'@'localhost'; GRANT SELECT, INSERT, DELETE ON llm_agent.chat_log TO 'agent'@'localhost';"
+mariadb -e "CREATE USER IF NOT EXISTS 'agent'@'localhost' IDENTIFIED BY '<비밀번호>'; GRANT SELECT ON llm_agent.* TO 'agent'@'localhost'; GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_store TO 'agent'@'localhost'; GRANT SELECT, INSERT, DELETE ON llm_agent.chat_log TO 'agent'@'localhost';"
 ```
 
 SPACE 시스템 지식 데이터도 함께 등록:
@@ -105,7 +117,9 @@ docker exec -i oracle1521 sqlplus -s system/password@localhost:1521/FREEPDB1 < b
 ### 2. 백엔드
 
 ```bash
-cd backend && npm install && cp .env.example .env && npm start
+cd backend && npm install && cp .env.example .env
+# .env의 MARIADB_PASSWORD에 위 앱 계정 생성 단계에서 정한 비밀번호를 채운 뒤:
+npm start
 ```
 
 `http://localhost:3001` 에서 기동. 기본값은 `LLM_PROVIDER=mock`, `ORACLE_MOCK=1` 이라 MariaDB만 있으면 동작한다.

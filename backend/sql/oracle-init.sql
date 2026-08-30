@@ -2,6 +2,15 @@
 -- 컨테이너 기동 후 SYSTEM 계정으로 적용한다 (README 참고):
 --   docker exec -i <컨테이너명> sqlplus -s system/<SYSTEM비밀번호>@localhost:1521/FREEPDB1 < backend/sql/oracle-init.sql
 
+-- 문장 하나라도 실패하면 즉시 0이 아닌 코드로 종료한다. 이 지시가 없으면 sqlplus는 오류를 찍고도
+-- 다음 문장을 계속 실행하고 종료 코드 0을 돌려준다 — 예컨대 테이블스페이스 권한(ORA-01950)으로
+-- CREATE TABLE이 전부 실패해도 운영자는 성공으로 읽고, 이후 모든 조회가 ORA-00942로 죽는데
+-- 그 원문은 화면에 나가지 않아(server.js가 드라이버 원문을 숨긴다) 원인이 보이지 않는다.
+-- 스크립트는 재실행 가능하므로 중간에 멈춘 상태는 원인 해소 후 다시 돌리면 된다.
+-- (아래 PL/SQL 블록의 '이미 존재하면 무시'는 블록 안에서 예외를 삼키므로 이 지시에 걸리지 않는다)
+WHENEVER SQLERROR EXIT FAILURE
+WHENEVER OSERROR EXIT FAILURE
+
 SET DEFINE OFF
 
 -- ===== 데이터 소유 계정 (없으면 생성) =====

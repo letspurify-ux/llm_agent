@@ -83,7 +83,11 @@ function embedQuestion(question) {
     .then(v => v[0])
     .catch(e => {
       warnEmbeddingFailure(e);
-      embedCache.delete(question); // 실패는 캐시하지 않는다 (다음 요청에서 재시도)
+      // 실패는 캐시하지 않는다 (다음 요청에서 재시도). 단, 그 자리에 있는 것이 '이 promise'일 때만
+      // 지운다 — 느린 실패가 돌아오는 사이 위의 LRU가 이 항목을 밀어내고 같은 질문의 새 요청이
+      // 새 promise를 넣었을 수 있는데, 키로만 지우면 그 진행 중인 항목까지 함께 버려
+      // 다음 검색이 합류하지 못하고 60초짜리 임베딩 호출을 한 번 더 만든다.
+      if (embedCache.get(question) === p) embedCache.delete(question);
       return null;                 // 검색은 LIKE-only로 계속한다
     });
   embedCache.set(question, p);

@@ -29,7 +29,7 @@ export const TRUNC_MARK = '…(생략)';
 //
 // 값은 32k 컨텍스트 모델(예: Qwen2.5-32B-Instruct)을 기준으로 잡았다. 한국어는 토큰 밀도가 높아
 // 문자 수와 토큰 수가 거의 1:1까지 갈 수 있으므로 문자 기준으로 보수적으로 묶는다.
-// 이 예산 밖에 있는 몫: 최근 대화(MAX_CHAT_TURNS×MAX_CHAT_LEN = 3k)와 질문(서버가 2k로 제한) =
+// 이 예산 밖에 있는 몫: 최근 대화(MAX_CHAT_TURNS×MAX_CHAT_LEN = 3k)와 질문(MAX_QUESTION_LEN = 2k) =
 // 이미 다른 상한으로 묶여 있는 5k, 그리고 시스템 프롬프트 ~1.5k.
 // 합계 ≈ 28.5k자 → 32k 모델에서 답변 몫으로 3.5k가 남는다.
 export const MAX_PROMPT_TOTAL_LEN = 22_000;
@@ -64,6 +64,10 @@ export const MAX_PROMPT_SQL_LEN = 2000;   // query_sql — 잘려도 바인드�
 // 실행 이력 1스텝의 상한. 스텝 하나가 이력 예산을 통째로 먹으면 나머지 스텝이 전부 밀려난다 —
 // 다단계 절차에서 앞 단계의 결과가 사라지면 모델이 그 단계를 다시 실행하려 든다.
 export const MAX_PROMPT_STEP_LEN = 2500;
+// 실행 이력 한 줄의 params 표시 상한 — rows와 달리 params는 LLM이 만든 값이라 그 자체로는 상한이
+// 없고, renderHistory는 최소 1줄을 반드시 실으므로 줄이 유계가 아니면 전체 예산이 그대로 뚫린다.
+// 표시용으로만 자른다 (실행에 쓰는 값은 MAX_BIND_LEN이 결정 경계에서 따로 묶는다).
+export const MAX_PROMPT_PARAMS_LEN = 500;
 
 // 임베딩 원문 상한 — 모델 입력 한도를 넘는 행 하나가 배치 전체를 실패시키는 것을 입력 단계에서 막는다.
 // bge-m3는 8192토큰이고 한국어는 대략 문자당 1토큰 미만이라 4000자면 한도 안에 든다.
@@ -72,6 +76,19 @@ export const MAX_EMBED_TEXT_LEN = 4000;
 // 서버가 클라이언트에서 받는 대화 이력 상한 — 프런트가 페이로드를 맞추는 기준이기도 하다.
 export const MAX_CHAT_TURNS = 6;  // LLM에 전달할 최근 대화 턴 수 (프롬프트 비대화 방지)
 export const MAX_CHAT_LEN = 500;  // 턴별 최대 길이
+
+// 질문 한 건의 최대 길이 — 서버 입력 검증(server.js), 프롬프트 예산 계산(위 주석), 회귀 테스트가
+// 같은 값을 봐야 한다. 예산의 모든 항이 이름 있는 export인데 이 항만 리터럴로 흩어져 있으면
+// server.js의 숫자 하나를 올리는 순간 문서화된 합계와 테스트의 여유분이 소리 없이 어긋난다.
+// (프런트 App.jsx의 maxLength는 입력 안내용 사본이다 — 실제 제한은 서버가 한다)
+export const MAX_QUESTION_LEN = 2000;
+
+// LLM 결정의 바인드 값 상한 — 결정이 시스템에 들어오는 경계(llm.js sanitizeDecision)에서 적용한다.
+// 정당한 바인드 값의 출처는 질문(≤ MAX_QUESTION_LEN)과 조회 결과 셀(≤ MAX_CELL_LEN)뿐이므로
+// 이보다 긴 값은 모델이 지어냈거나 어딘가에서 통째로 복사해 온 것이다. 자른 값에는 TRUNC_MARK가
+// 붙어 바인드 가드(oracle.js bindProblem)가 실행 전에 거부한다 — 조용히 잘린 값으로 조회해
+// 0건 오답을 만드는 대신 소리 나게 실패시킨다.
+export const MAX_BIND_LEN = MAX_QUESTION_LEN;
 
 // 길이 상한으로 문자열을 자르는 단일 지점.
 // 단순 slice는 서로게이트 쌍(이모지 등 BMP 밖 문자)을 반으로 쪼개 짝 잃은 코드유닛을 남긴다.
@@ -107,7 +124,11 @@ export function warnOnce(scope, message) {
 // 사용자에게 그대로 보여도 되는 오류 — 우리가 문구를 만든 오류에만 붙인다.
 // 드라이버·DB가 던진 원문은 스키마명·호스트·계정을 담고 있어 화면으로 나가면 안 된다(server.js가 이 표시를 본다).
 // 프롬프트와 chat_log에는 양쪽 다 원문이 들어간다 — 모델의 복구 판단과 운영 분석에는 상세가 필요하다.
-export const safeError = msg => Object.assign(new Error(msg), { safe: true });
+//
+// 두 번째 인자(hint)는 모델에게만 주는 복구 지침이다 — 프롬프트(llm-openai.js historyLine)에는 붙고,
+// 사용자 trace 패널(server.js)에는 message만 나간다. 한 문자열에 섞으면 "…쿼리를 선택하라"류의
+// 내부 지시문이 safe 표시를 타고 화면까지 나간다 — note와 error를 나눈 것과 같은 이유로 필드를 나눈다.
+export const safeError = (msg, hint) => Object.assign(new Error(msg), { safe: true, ...(hint && { hint }) });
 
 // 정수 환경변수 파서. 빈 문자열('')과 공백은 미설정으로 취급한다 —
 // `Number(process.env.X ?? 기본값)`은 `X=`(빈 값)에서 ??가 발동하지 않아 0이 되고,

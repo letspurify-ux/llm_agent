@@ -88,7 +88,8 @@ CREATE TABLE chat_log (
   trace      JSON,                -- {v: 스키마 버전, search: 검색 적중 수(queries는 라우팅 동작 시에만, 아니면 null),
                                   --  steps: 실행 쿼리·바인드·결과. 실패는 steps[].error, 루프 가드 기록은 steps[].note,
                                   --  steps[].safe는 그 error 문구를 사용자 화면에 그대로 내보내도 되는지(우리가 쓴 안내문이면 true,
-                                  --  드라이버·DB 원문이면 없음) — 화면에는 서버가 후자를 일반 문구로 바꿔 내보낸다}
+                                  --  드라이버·DB 원문이면 없음) — 화면에는 서버가 후자를 일반 문구로 바꿔 내보낸다.
+                                  --  steps[].hint는 모델에게만 준 복구 지침(있을 때만) — 화면에는 나가지 않는다}
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_created (created_at)    -- 보존 기간 정리(DELETE)용
 );
@@ -96,14 +97,14 @@ CREATE TABLE chat_log (
 -- 벡터 검색용 임베딩 저장소.
 -- 원본 3개 테이블(knowledge/qa_method/query_registry)은 변경하지 않고 companion 테이블로 둔다
 -- (VECTOR INDEX는 NOT NULL 필수라, 임베딩이 아직 없는 원본 행과 공존하려면 분리가 단순하다).
--- embed-sync.js가 원본 텍스트의 MD5(embed_hash)를 비교해 신규/변경분만 임베딩한다.
+-- embed-sync.js가 원본 텍스트의 MD5(embed_hash, DB에서 계산)를 비교해 신규/변경분만 임베딩한다.
 --
 -- 이 테이블만 MariaDB 11.7+를 요구하므로 파일 맨 뒤에 둔다 — 낮은 버전에서 여기서 멈춰도
 -- 앞의 5개 테이블은 온전하고, 앱은 벡터 검색만 빼고(LIKE-only 폴백) 정상 동작한다.
 CREATE TABLE vec_store (
   src        VARCHAR(20) NOT NULL,   -- 'knowledge' | 'qa_method' | 'query_registry'
   seq        INT NOT NULL,           -- 원본 행 seq
-  embed_hash CHAR(32) NOT NULL,      -- MD5(임베딩한 텍스트) — 변경 감지용
+  embed_hash CHAR(32) NOT NULL,      -- 변경 감지용 MD5(모델명+원문) — MariaDB가 계산한다 (embed-sync.js hashExpr)
   embedding  VECTOR(1024) NOT NULL,  -- bge-m3 1024차원 (모델을 바꿔도 1024차원 유지)
   PRIMARY KEY (src, seq),
   VECTOR INDEX (embedding) DISTANCE=cosine  -- 검색이 VEC_DISTANCE_COSINE을 쓰므로 반드시 cosine으로.

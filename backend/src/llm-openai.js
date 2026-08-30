@@ -6,9 +6,9 @@
 //   LLM_REASONING_EFFORT  low(기본) | medium | high | off
 // SDK 없이 Node 내장 fetch 사용.
 import {
-  MAX_ROWS, TRUNC_MARK,
+  MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK,
   MAX_PROMPT_ITEM_LEN, MAX_PROMPT_SQL_LEN, MAX_PROMPT_STEP_LEN,
-  MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS,
+  MAX_PROMPT_PARAMS_LEN, MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS,
   clipText,
 } from './constants.js';
 import { bindNames } from './sql.js';
@@ -52,6 +52,7 @@ const SYSTEM_PROMPT = `당신은 사내 지식 관리 및 DB 조회 Q&A 에이�
 - 관련 지식이나 쿼리 실행 결과가 있으면 반드시 그것에 근거해서 답하라.
 - 관련 지식·처리 방법·쿼리 결과가 전혀 없으면 너의 일반 지식으로 답하되, 답변 서두에 "*등록된 지식에 없는 내용이라 일반 지식으로 답변합니다.*" 한 줄을 붙여라.
 - 일반 지식으로 답할 때도 사내 시스템의 구체적 상태(수치, 상태값, 일정 등)는 절대 지어내지 마라. 확인이 필요하면 확인 방법을 안내하라.
+- 실행 이력의 오류 원문에 든 내부 정보(호스트·포트·접속 주소, 스키마·테이블·계정명, SQL 원문)는 answer에 옮겨 적지 마라. 오류는 "조회에 실패했다"는 사실과 사용자가 할 수 있는 다음 행동만 전달하라.
 - answer는 markdown 형식으로 구조화하라: 조회 결과는 표(table)로, 항목 나열은 목록으로, 섹션 구분은 ### 제목으로 작성한다.
 
 ## 대화 맥락
@@ -179,14 +180,32 @@ function fitRows(rows, budget) {
   return rows;
 }
 
+// params 표시 — query_name과 함께 이 줄에서 유일하게 LLM이 만든(상한 없는) 값이다.
+// renderHistory는 최소 1줄을 반드시 실으므로, 여기가 유계가 아니면 값 하나가 섹션 배분을 통째로
+// 우회해 전체 예산(MAX_PROMPT_TOTAL_LEN)을 뚫는다 — 결정 경계(llm.js sanitizeDecision)가 이미
+// 값을 묶지만, 프롬프트 조립은 그 경계가 우회되거나 느슨해져도 스스로 유계여야 한다.
+// 값 단위로 먼저 잘라 JSON을 유효하게 유지하고(중간에서 자르면 모델이 조각을 값으로 되읽는다),
+// 여러 값의 합이 그래도 크면 전체를 한 번 더 자른다.
+function paramsJson(params) {
+  const entries = Object.entries(params || {}).map(([k, v]) => [
+    clip(k, 100),
+    typeof v === 'string' ? clip(v, MAX_CELL_LEN)
+      : v === null || typeof v === 'number' || typeof v === 'boolean' ? v
+        : clip(JSON.stringify(v) ?? String(v), MAX_CELL_LEN),
+  ]);
+  return clip(JSON.stringify(Object.fromEntries(entries)), MAX_PROMPT_PARAMS_LEN);
+}
+
 function historyLine(h) {
+  const head = `- ${clip(h.query_name, 100)} params=${paramsJson(h.params)}`;
   if (h.note) {
     // 루프 가드가 남긴 제어용 기록 — 실패가 아니므로 '오류'로 알리지 않는다 (모델이 실패로 오해해 불필요한 우회를 하지 않게)
-    return `- ${h.query_name} params=${JSON.stringify(h.params)} → 실행하지 않음: ${h.note}`;
+    return `${head} → 실행하지 않음: ${h.note}`;
   }
   if (h.error) {
     // 드라이버 오류 원문은 길 수 있다 — 항목 상한을 여기에도 건다.
-    return `- ${h.query_name} params=${JSON.stringify(h.params)} → 오류: ${clip(h.error)}`;
+    // hint는 모델 전용 복구 지침이다 — 사용자 trace에는 나가지 않으므로 여기서만 붙인다 (constants.safeError 참고).
+    return `${head} → 오류: ${clip(h.error)}${h.hint ? ` / 대응: ${clip(h.hint)}` : ''}`;
   }
   // 건수 해석은 rowCounts 한 곳에서만 한다 (사용자 답변·화면 trace도 같은 해석을 쓴다).
   // 여기서 더 줄이는 것은 '몇 건을 인쇄하는가'뿐이므로 해석이 갈라지지 않는다: printed ≤ shown ≤ totalRows.
@@ -196,7 +215,7 @@ function historyLine(h) {
   const note = capped
     ? ` (조회 상한 ${MAX_ROWS}건 도달 — 실제 총 건수는 더 많을 수 있음, 처음 ${printed}건만 표시)`
     : totalRows > printed ? ` (총 ${totalRows}건 중 처음 ${printed}건만 표시)` : '';
-  return `- ${h.query_name} params=${JSON.stringify(h.params)} → 결과 ${totalRows}${capped ? '+' : ''}건${note}: ${JSON.stringify(printedRows)}`;
+  return `${head} → 결과 ${totalRows}${capped ? '+' : ''}건${note}: ${JSON.stringify(printedRows)}`;
 }
 
 // 실행 이력은 다른 섹션과 반대로 '뒤에서부터' 채운다 — 최신 기록이 가장 중요하기 때문이다.

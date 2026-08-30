@@ -7,7 +7,7 @@ import { loadQueryRegistry, loadQueriesByNames } from './db.js';
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
 import { llm, renderAnswer } from './llm.js';
-import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, nameKey } from './constants.js';
+import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, TRUNC_MARK, nameKey } from './constants.js';
 
 const MAX_STEPS = 5;
 const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포함). 초과하면 남은 스텝을 포기하고 강제 답변으로 간다.
@@ -63,6 +63,29 @@ export function loopGuard(history, canonicalName, binds, params) {
     return '같은 파라미터로 반복 실패한 쿼리 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라';
   }
   return null;
+}
+
+// 잘린 셀 값 가드 — 실행 이력의 잘린 셀(TRUNC_MARK가 붙은 값)에서 표시만 보고 마크를 뗀
+// 앞부분을 옮겨 적은 바인드 값을, 실행 전에 이력의 원본과 대조해 걸러낸다.
+// 문제가 있는 바인드명 목록을 돌려준다 (없으면 빈 배열). (테스트에서 쓰므로 export)
+//
+// oracle.js의 bindProblem과 역할을 나눈다: 저쪽은 값 자체로 판정되는 문제(값 없음·구조·
+// TRUNC_MARK가 그대로 붙은 값·절단 길이와 정확히 같은 값)를, 여기는 이력이 있어야 판정되는
+// 문제(마크를 뗀 앞부분)를 본다. 길이 휴리스틱만으로 넓게 막으면 질문에서 온 정당한 긴 값
+// (자유 검색어·경로·연결 키)까지 영구히 거부된다 — "이 값이 잘린 조각인가"는 그 값을 잘랐던
+// 이력을 쥔 쪽만 정확히 답할 수 있으므로 판정을 여기로 가져온다.
+// 잘린 값을 그대로 바인드하면 조용히 0건이 나오고 LLM은 그것을 "그런 데이터가 없다"로 읽는다.
+export function truncatedBinds(history, bindNameList, params) {
+  const prefixes = new Set();
+  for (const h of history) {
+    for (const row of h.rows || []) {
+      for (const v of Object.values(row)) {
+        if (typeof v === 'string' && v.endsWith(TRUNC_MARK)) prefixes.add(v.slice(0, -TRUNC_MARK.length));
+      }
+    }
+  }
+  if (!prefixes.size) return [];
+  return (bindNameList || []).filter(n => typeof params?.[n] === 'string' && prefixes.has(params[n]));
 }
 
 // 클라이언트가 보낸 대화 이력을 신뢰하지 않고 형식을 검증·제한한다.
@@ -136,7 +159,7 @@ export async function handleQuestion(question, rawChat = []) {
     // LLM 응답을 받은 뒤 다시 확인해, 남지 않았으면 조회를 태우지 않고 강제 답변으로 간다.
     if (Date.now() > deadline) break;
 
-    const { row: registryRow, error: resolveError } =
+    const { row: registryRow, error: resolveError, hint: resolveHint } =
       await resolveQuery(decision.query_name, queries, resolveCache);
     // 이력에는 항상 정규 이름(등록된 철자)을 남긴다 — 가드와 프롬프트가 같은 이름을 보게.
     const canonicalName = registryRow?.query_name ?? decision.query_name;
@@ -154,7 +177,15 @@ export async function handleQuestion(question, rawChat = []) {
       continue;
     }
     if (!registryRow) {
-      push('error', resolveError ?? '등록되지 않은 쿼리', { safe: true });
+      push('error', resolveError ?? '등록되지 않은 쿼리', {
+        safe: true,
+        hint: resolveHint ?? '쿼리 목록에 있는 이름만 실행할 수 있다 — 목록에서 고르거나 지금까지의 정보로 답변하라',
+      });
+      // 미등록 이름의 반복이 '가장 흔한 퇴화 패턴'(loopGuard 주석)인데, 모델이 매번 다른 이름을
+      // 지어내면 loopGuard의 동일 실행 판정에는 한 번도 걸리지 않는다 — 스텝마다 LLM 왕복(최대
+      // 120초)만 태우며 MAX_STEPS를 전부 소진한다. 이름이 무엇이든 '실행 없이 헛돈 스텝'이므로
+      // guardNote와 같은 연속 카운터로 센다 (조회에 성공하면 0으로 되돌리는 것도 같다).
+      if (++guardHits >= MAX_GUARD_HITS) break;
       continue;
     }
     // 프롬프트 목록 밖에서 찾은 쿼리는 목록에 넣어준다 — 다음 스텝에서 LLM이 input_desc를 보고
@@ -164,6 +195,16 @@ export async function handleQuestion(question, rawChat = []) {
     // 전제로 꼬리부터 버린다. 방금 LLM이 이름을 대서 찾아낸 쿼리는 이번 스텝에서 가장 관련이 높은데,
     // 뒤에 붙이면 등록이 조금만 많아도 그 한 건이 먼저 잘려 나가 이 복구 경로 자체가 조용히 사라진다.
     if (!queries.includes(registryRow)) queries.unshift(registryRow);
+    // 이력의 잘린 셀에서 옮겨 적은 값은 원본과 달라 절대 매칭되지 않는다 — Oracle 왕복 없이
+    // 이 스텝만 실패 처리한다 (판정이 여기 있는 이유는 truncatedBinds 주석 참고).
+    const clippedBinds = truncatedBinds(history, binds, decision.params);
+    if (clippedBinds.length) {
+      push('error', `바인드 변수를 쓸 수 없습니다 — ${clippedBinds.map(n => `${n}: 잘린 값이라 원본과 다름`).join(', ')}.`, {
+        safe: true,
+        hint: '이 값의 온전한 원본은 조회 결과에 없다 — 다른 컬럼·다른 쿼리로 원본을 구하거나 사용자에게 되물어라',
+      });
+      continue;
+    }
     try {
       const { rows, totalRows, capped } = await runQuery(registryRow, decision.params);
       history.push({ query_name: canonicalName, params: decision.params, rows: capRows(rows), totalRows, capped });
@@ -172,7 +213,7 @@ export async function handleQuestion(question, rawChat = []) {
       // 실패도 이력에 남기고 루프를 계속한다 — LLM이 에러를 보고 재시도/우회/답변을 판단.
       // 메시지가 비면 안 된다: error가 falsy면 프롬프트·답변 조립이 이 기록을 '오류'로 보지 않고
       // rows가 있는 정상 결과로 취급해 들어간다.
-      push('error', e?.message || String(e), { safe: e?.safe === true });
+      push('error', e?.message || String(e), { safe: e?.safe === true, ...(e?.hint && { hint: e.hint }) });
     }
   }
 
@@ -213,14 +254,19 @@ async function resolveQuery(name, queries, cache) {
   if (hit) return { row: hit };
   if (cache.has(key)) return { row: cache.get(key) };
   try {
-    const [row = null] = await loadQueriesByNames([name]);
+    // DB 조회도 정규화한 키로 한다 — 프롬프트 목록 검색은 nameKey로 맞추면서 여기만 원본을 쓰면,
+    // 앞 공백이 붙은 이름이 '목록에 있으면 실행되고, 라우팅에서 빠졌으면 미등록'이 된다
+    // (MariaDB collation은 대소문자·뒤 공백은 무시하지만 앞 공백은 구분한다) —
+    // 같은 이름이 등록 규모에 따라 다르게 동작하는 셈이다. 소문자화는 collation이 흡수한다.
+    const [row = null] = await loadQueriesByNames([key]);
     cache.set(key, row);
     return { row };
   } catch (e) {
     // 상세는 로그에만 남긴다 — 이 문구는 프롬프트와 화면 양쪽으로 나가는데, MariaDB 원문에는
     // 스키마·호스트가 들어 있고 모델의 복구 판단에 보탬이 되지도 않는다.
+    // hint(모델 전용 지침)와 error(화면에도 나가는 문구)를 나눈다 — constants.safeError 참고.
     console.warn('[agent] query_registry 재조회 실패:', e.message);
-    return { row: null, error: '쿼리 목록을 조회하지 못했습니다 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라' };
+    return { row: null, error: '쿼리 목록을 조회하지 못했습니다.', hint: '다른 쿼리를 선택하거나 지금까지의 정보로 답변하라' };
   }
 }
 

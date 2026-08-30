@@ -1,9 +1,12 @@
 // 임베딩 diff 동기화 — 기존/신규 행을 구분하지 않는다.
 // 매 실행마다 "원본 텍스트의 현재 MD5 ≠ vec_store.embed_hash"인 행만 임베딩하므로
 // 신규 INSERT / 내용 UPDATE / 원본 DELETE 가 전부 같은 로직으로 처리된다 (멱등).
+// 해시는 MariaDB가 계산한다(hashExpr) — 본문은 불일치한 행만 읽는다.
+// 기존(JS 계산) 해시와 바이트 단위로 호환된다: 양쪽 다 MD5(모델명 + '\n' + 컬럼들을 '\n'으로
+// 연결한 원문)이라 기존 설치에서 재임베딩이 일어나지 않는다. 예외는 MAX_EMBED_TEXT_LEN을 넘는
+// 행뿐이다(예전엔 자른 뒤 해싱, 지금은 원문 전체 해싱) — 그 행만 1회 재임베딩되고 안정된다.
 // 실행 경로: ① server.js 기동 시 1회  ② EMBED_SYNC_INTERVAL 주기  ③ npm run embed
 import 'dotenv/config';
-import crypto from 'node:crypto';
 import { writeSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { query, getConnection, releaseConnection } from './db.js';
@@ -15,11 +18,35 @@ import { MAX_EMBED_TEXT_LEN, clipText } from './constants.js';
 // 검색과 같은 정의를 써야 LIKE와 벡터가 서로 다른 내용을 보지 않는다.
 // 원문 상한을 여기서 적용한다 — 모델 입력 한도를 넘는 행 하나가 배치 전체(32건)를 실패시키는 것을
 // 애초에 막는다. 원본 컬럼은 TEXT(최대 64KB)라 등록만으로 한도를 넘길 수 있다.
-// 자른 뒤의 텍스트로 해시를 계산하므로(아래 doSync가 toText 결과를 그대로 해싱한다) 멱등성은 유지된다.
+// 변경 감지 해시는 자르기 전의 원문 전체로 DB가 계산한다(hashExpr) — 상한 밖(4000자 이후)만 바뀐
+// 수정도 재임베딩이 한 번 돌지만 결과 벡터는 같고, 해시가 갱신되므로 반복되지는 않는다.
 const toText = (cols, row) => {
   return clipText(cols.map(c => row[c] ?? '').join('\n'), MAX_EMBED_TEXT_LEN);
 };
 const BATCH = 32;
+
+// IN 절 상한 — 쿼리 하나에 싣는 플레이스홀더 수. 수만 건을 한 문장에 담으면 커넥터가
+// 클라이언트에서 확장한 쿼리 문자열이 max_allowed_packet을 넘어 그 문장이 매 주기 실패한다 —
+// 고아 정리가 그 상태에 빠지면 삭제된 지식이 검색에 계속 노출되는, 이 경로가 막으려던 바로 그
+// 결과가 영구화된다 (storeBatch가 INSERT를 BATCH 단위로 나누는 것과 같은 이유·같은 방식).
+const IN_CHUNK = 1000;
+
+const chunked = (arr, n) => {
+  const out = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+};
+
+// 변경 감지 해시는 MariaDB가 계산한다 — 원문 전송 없이 행당 seq + 해시 32자만 받는다.
+// JS로 해시하려면 매 주기(기본 60초) 세 테이블의 본문 전체(TEXT 최대 64KB × 전 행)를 실어 날라야
+// 하는데, stale 집합은 거의 항상 비어 있다 — 1만 행 규모면 분당 수백 MB가 순수 낭비다.
+// 모델명을 맨 앞에 붙여, EMBEDDING_MODEL 변경 시 전체 해시가 불일치 → 자동 전체 재임베딩되는
+// 성질(아래 doSync 주석)은 그대로 유지한다.
+// CONCAT_WS는 NULL 인자를 건너뛴다 — COALESCE로 빈 문자열을 고정하지 않으면 NULL 컬럼 유무에
+// 따라 구분자 수가 달라져 같은 내용이 다른 해시가 된다. 구분자는 CHAR(10)으로 박는다
+// (리터럴 '\n'은 서버의 NO_BACKSLASH_ESCAPES 설정에 따라 뜻이 바뀐다).
+const hashExpr = cols =>
+  `MD5(CONCAT_WS(CHAR(10), ?, ${cols.map(c => `COALESCE(${c}, '')`).join(', ')}))`;
 
 // skipped 값 — 호출부(서버 로그, CLI 종료 코드)가 "설정상 안 쓰는 것"과 "쓰려는데 실패한 것"을
 // 구분해야 한다. LIKE-only 운영은 정상 구성이므로 실패로 보고하면 안 된다.
@@ -93,35 +120,45 @@ async function doSync() {
   let unavailable = false;
 
   for (const [src, cols] of Object.entries(SEARCH_COLUMNS)) {
-    // 필요한 컬럼만 읽는다 — query_registry의 query_sql처럼 임베딩에 쓰지 않는 대형 TEXT를
-    // 매 주기(기본 60초) 전송하지 않도록. cols는 코드가 정의한 식별자다(외부 입력 아님).
-    // 임베딩 서버가 이미 끊긴 뒤라면 본문도 읽지 않는다 — 어차피 임베딩하지 않을 텍스트를
-    // 실어 나르고 해시까지 계산해 버리는 일이 서버가 죽어 있는 내내 매 주기 반복된다.
-    const readContent = enabled && !unavailable;
-    const rows = await query(`SELECT seq${readContent ? `, ${cols.join(', ')}` : ''} FROM ${src}`);
+    // 임베딩 서버가 이미 끊긴 뒤라면 해시 스캔도 걸지 않는다 — 어차피 임베딩하지 않을 변경분을
+    // 찾느라 DB가 매 주기 전 행을 해싱하는 일이 서버가 죽어 있는 내내 반복된다.
+    const checkContent = enabled && !unavailable;
+    // 해시는 DB에서 계산해 seq+해시만 받는다 (hashExpr 주석 참고). cols는 코드가 정의한 식별자다(외부 입력 아님).
+    // 해시에 모델명을 포함한다 — EMBEDDING_MODEL을 바꾸면 모든 해시가 불일치해
+    // 자동으로 전체 재임베딩된다 (구 모델 벡터와 새 모델 질문 벡터를 섞으면 검색이 무의미해짐)
+    const rows = checkContent
+      ? await query(`SELECT seq, ${hashExpr(cols)} AS h FROM ${src}`, [EMBEDDING_MODEL])
+      : await query(`SELECT seq FROM ${src}`);
     const stored = new Map(
       (await query('SELECT seq, embed_hash FROM vec_store WHERE src = ?', [src])).map(r => [r.seq, r.embed_hash])
     );
 
-    // 해시에 모델명을 포함한다 — EMBEDDING_MODEL을 바꾸면 모든 해시가 불일치해
-    // 자동으로 전체 재임베딩된다 (구 모델 벡터와 새 모델 질문 벡터를 섞으면 검색이 무의미해짐)
-    const stale = [];
+    const staleHash = new Map(); // seq → 새 해시. 본문은 아래에서 불일치한 행만 읽는다.
     for (const r of rows) {
-      if (readContent) {
-        const text = toText(cols, r);
-        const hash = crypto.createHash('md5').update(`${EMBEDDING_MODEL}\n${text}`).digest('hex');
-        if (stored.get(r.seq) !== hash) stale.push({ seq: r.seq, text, hash });
-      }
+      if (checkContent && stored.get(r.seq) !== r.h) staleHash.set(r.seq, r.h);
       stored.delete(r.seq);
     }
 
-    // 원본이 삭제된 행 정리 (stored에 남은 것 = 원본 없음)
-    if (stored.size) {
+    // 원본이 삭제된 행 정리 (stored에 남은 것 = 원본 없음). IN 절은 상한 단위로 나눈다 —
+    // 대량 삭제 직후 수만 개의 플레이스홀더가 한 문장에 실리면 정리가 매 주기 실패한다 (IN_CHUNK 주석).
+    for (const seqs of chunked([...stored.keys()], IN_CHUNK)) {
       await query(
-        `DELETE FROM vec_store WHERE src = ? AND seq IN (${[...stored.keys()].map(() => '?').join(',')})`,
-        [src, ...stored.keys()]
+        `DELETE FROM vec_store WHERE src = ? AND seq IN (${seqs.map(() => '?').join(',')})`,
+        [src, ...seqs]
       );
-      deleted += stored.size;
+      deleted += seqs.length;
+    }
+
+    // 변경된 행만 본문을 읽는다. 해시 스캔과 이 읽기 사이에 원본이 또 바뀌면 새 본문을 임베딩하면서
+    // 스캔 시점 해시를 저장하게 되는데, 다음 주기에 불일치로 다시 잡혀 한 번 더 임베딩될 뿐이다(자가 치유).
+    // 그 사이 삭제된 행은 여기서 빠지고, vec_store에 남은 벡터는 다음 주기의 고아 정리가 거둔다.
+    const stale = [];
+    for (const seqs of chunked([...staleHash.keys()], IN_CHUNK)) {
+      const contentRows = await query(
+        `SELECT seq, ${cols.join(', ')} FROM ${src} WHERE seq IN (${seqs.map(() => '?').join(',')})`,
+        seqs
+      );
+      for (const r of contentRows) stale.push({ seq: r.seq, text: toText(cols, r), hash: staleHash.get(r.seq) });
     }
 
     for (let i = 0; i < stale.length; i += BATCH) {

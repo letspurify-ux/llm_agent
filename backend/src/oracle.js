@@ -47,14 +47,18 @@ export async function runQuery(registryRow, params = {}) {
   // SQL에 실제로 있는 바인드만 추려서 전달한다 — LLM이 여분 파라미터를 주면
   // 드라이버가 바인드 수 불일치(NJS-098)로 실패하므로 필터가 필요하다.
   const names = bindNames(registryRow.query_sql);
-  const bad = names.map(n => [n, bindProblem(params?.[n])]).filter(([, p]) => p);
+  // 소유 키만 읽는다 — 바인드명이 '__proto__' 같은 프로토타입 멤버와 겹치면 params?.[n]이
+  // Object.prototype을 돌려줘, '값 없음'이어야 할 판정이 '값이 아닌 구조'로 어긋난다.
+  const val = n => (Object.hasOwn(params ?? {}, n) ? params[n] : undefined);
+  const bad = names.map(n => [n, bindProblem(val(n))]).filter(([, p]) => p);
   if (bad.length) {
+    // 두 번째 인자(hint)는 모델 전용 지침 — 사용자 trace에는 message만 나간다 (constants.safeError 참고)
     throw safeError(
-      `바인드 변수를 쓸 수 없습니다 — ${bad.map(([n, p]) => `${n}: ${p}`).join(', ')}. ` +
+      `바인드 변수를 쓸 수 없습니다 — ${bad.map(([n, p]) => `${n}: ${p}`).join(', ')}.`,
       '질문이나 실행 이력에서 값을 확인하고, 알 수 없으면 사용자에게 되묻거나 다른 쿼리를 선택하라'
     );
   }
-  const binds = Object.fromEntries(names.map(n => [n, params[n]]));
+  const binds = Object.fromEntries(names.map(n => [n, val(n)]));
 
   if (process.env.ORACLE_MOCK === '1') return capResult(mockResult(registryRow.query_name, binds));
 
@@ -164,15 +168,18 @@ function localDateTime(d) {
 //   잘린 값  → normalizeValue가 MAX_CELL_LEN에서 자르고 TRUNC_MARK를 붙인 값이다. 그 값이 프롬프트를
 //              거쳐 다음 스텝의 바인드로 되돌아오면 원본과 다르므로 절대 매칭되지 않는다.
 //              (mock provider는 llm.js에서 아예 제안조차 하지 않게 막지만, 실제 LLM에는 그 가드가 없다)
-//              표시만 보고 TRUNC_MARK를 뗀 앞부분만 넣는 경우가 더 흔하므로 길이로도 막는다 —
-//              MAX_CELL_LEN 이상의 바인드 값은 잘린 조각일 가능성이 압도적이다
-//              (등록 쿼리의 `= :bind`는 ID·코드·이름을 받지, 200자짜리 본문을 받지 않는다).
+//              표시만 보고 TRUNC_MARK를 뗀 앞부분만 넣는 경우가 더 흔하다 — 그 값이 이번 요청의
+//              실행 이력에 있으면 agent.js(truncatedBinds)가 원본 대조로 정확히 걸러낸다.
+//              여기의 길이 판정은 이력 밖에서 온 조각(이전 턴 답변의 잘린 표를 보고 옮겨 적은 값)용이다:
+//              clipText가 자른 앞부분은 정확히 MAX_CELL_LEN자이므로 '이상'이 아니라 '그 길이'만 본다 —
+//              '이상'으로 잡으면 질문에서 온 정당한 긴 값(자유 검색어·경로·연결 키)까지 영구히 거부돼
+//              그 입력으로는 등록 쿼리를 아예 실행할 수 없게 된다.
 // 주의: `WHERE (:opt IS NULL OR col = :opt)` 같은 선택적 필터 패턴은 이 가드에 걸린다 —
 // 그런 쿼리는 '전체'를 뜻하는 별도 센티널 값(예: 'ALL')을 쓰도록 등록할 것.
 function bindProblem(v) {
   if (v === undefined || v === null || v === '') return '값 없음';
   if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') return '값이 아닌 구조';
-  if (typeof v === 'string' && (v.endsWith(TRUNC_MARK) || v.length >= MAX_CELL_LEN)) {
+  if (typeof v === 'string' && (v.endsWith(TRUNC_MARK) || v.length === MAX_CELL_LEN)) {
     return '잘린 값이라 원본과 다름';
   }
   return null;
@@ -269,7 +276,10 @@ const MOCK_DATA = {
 // 'Batch_Job_Status'로 등록해도 다른 경로는 모두 정상 동작하므로, 여기만 대소문자를 구분하면
 // 철자 하나 때문에 데모 시나리오가 'mock 데이터 미정의'로 죽는다.
 function mockResult(queryName, params) {
-  const gen = MOCK_DATA[nameKey(queryName)];
+  // 소유 키만 본다 — 'constructor'나 '__proto__' 같은 이름이 프로토타입 체인을 타면 !gen 가드를
+  // 지나쳐 함수가 아닌 값을 호출하다 unsafe TypeError로 죽는다 (safe 안내 대신 일반 오류 문구가 나간다).
+  const key = nameKey(queryName);
+  const gen = Object.hasOwn(MOCK_DATA, key) ? MOCK_DATA[key] : undefined;
   if (!gen) throw safeError(`mock 데이터가 정의되지 않은 쿼리: ${queryName}`);
   return gen(params);
 }

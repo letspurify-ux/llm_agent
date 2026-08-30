@@ -5,8 +5,8 @@
 // 어느 쪽도 오류를 남기지 않아 로그로는 알 수 없다. 테스트가 유일한 방어선이다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { loopGuard, paramKey, normalizeChat } from '../src/agent.js';
-import { MAX_CHAT_TURNS, MAX_CHAT_LEN } from '../src/constants.js';
+import { loopGuard, paramKey, normalizeChat, truncatedBinds } from '../src/agent.js';
+import { MAX_CHAT_TURNS, MAX_CHAT_LEN, TRUNC_MARK } from '../src/constants.js';
 
 const ran = (name, params, rows = [{ A: 1 }]) => ({ query_name: name, params, rows, totalRows: rows.length });
 const failed = (name, params) => ({ query_name: name, params, error: 'ORA-00942' });
@@ -101,4 +101,24 @@ test('클라이언트 대화 이력은 형식·턴 수·길이를 모두 제한�
   assert.ok(out.every(m => m.role === 'user' || m.role === 'assistant'));
   assert.deepStrictEqual(normalizeChat('배열이 아님'), []);
   assert.deepStrictEqual(normalizeChat(undefined), []);
+});
+
+// ===== 잘린 셀 값 가드 (truncatedBinds) =====
+// 잘린 값을 바인드하면 조용히 0건이 나오고 모델은 그것을 "그런 데이터가 없다"로 읽는다 —
+// 반대로 넓게 막으면 질문에서 온 정당한 긴 값이 영구히 거부된다. 양쪽 다 오류가 남지 않는다.
+
+test('이력의 잘린 셀에서 마크를 뗀 값은 바인드로 쓰지 못한다', () => {
+  const history = [ran('q1', {}, [{ BODY: `앞부분${TRUNC_MARK}`, ID: 'A1' }])];
+  assert.deepStrictEqual(truncatedBinds(history, ['key'], { key: '앞부분' }), ['key']);
+});
+
+test('잘린 셀과 무관한 값은 통과한다', () => {
+  const history = [ran('q1', {}, [{ BODY: `앞부분${TRUNC_MARK}` }])];
+  assert.deepStrictEqual(truncatedBinds(history, ['key'], { key: '다른값' }), []);
+  // 질문에서 온 정당한 긴 값 — 길이만으로 거부하면 이 입력으로는 그 쿼리를 영영 실행할 수 없다
+  assert.deepStrictEqual(truncatedBinds(history, ['key'], { key: 'x'.repeat(300) }), []);
+  // 이력에 잘린 셀이 없으면 아무것도 걸리지 않는다
+  assert.deepStrictEqual(truncatedBinds([], ['key'], { key: '앞부분' }), []);
+  // 온전한 셀 값(마크가 그대로 붙은 값)은 여기 몫이 아니다 — bindProblem(oracle.js)이 거부한다
+  assert.deepStrictEqual(truncatedBinds(history, ['key'], { key: 7 }), []);
 });

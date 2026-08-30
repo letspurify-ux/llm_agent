@@ -9,14 +9,46 @@
 // agent.js는 provider가 바뀌어도 변경되지 않는다.
 import { openaiDecide } from './llm-openai.js';
 import { bindNames } from './sql.js';
-import { MAX_ROWS, TRUNC_MARK, nameKey } from './constants.js';
+import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, clipText, nameKey } from './constants.js';
 import { rowCounts } from './result.js';
 
 export const llm = {
-  decide(ctx) {
-    return process.env.LLM_PROVIDER === 'openai' ? openaiDecide(ctx) : mockDecide(ctx);
+  async decide(ctx) {
+    const d = await (process.env.LLM_PROVIDER === 'openai' ? openaiDecide(ctx) : mockDecide(ctx));
+    return sanitizeDecision(d);
   },
 };
+
+// 실제 쿼리의 바인드 수는 한 자릿수다 — 이보다 많은 params는 퇴화한 응답이고,
+// 초과분을 실어 나르면 history·chat_log·프롬프트가 함께 부푼다.
+const MAX_DECISION_PARAMS = 20;
+
+// LLM 결정이 시스템에 들어오는 유일한 경계 — 여기서 크기를 확정한다. (테스트에서 쓰므로 export)
+// Oracle 값을 드라이버 경계(oracle.js normalizeValue)에서 한 번에 정규화하는 것과 같은 이유다:
+// query_name과 params는 이대로 history에 기록되어 프롬프트·chat_log·화면 trace 세 곳으로
+// 흘러가는데, 하류마다 각자 자르게 두면 한 곳만 빠져도 30KB짜리 값 하나가 프롬프트 예산을 뚫어
+// 그 요청의 남은 모든 LLM 호출이 컨텍스트 초과로 실패한다.
+// 잘린 문자열에는 TRUNC_MARK를 붙인다 — 바인드 가드(oracle.js bindProblem)가 실행 전에 거부해,
+// 조용히 잘린 값으로 조회해 0건 오답을 만드는 대신 소리 나게 실패한다. 정당한 바인드 값의
+// 출처(질문·조회 결과 셀)는 전부 MAX_BIND_LEN 안이므로 이 절단이 정상 값을 건드리는 일은 없다.
+export function sanitizeDecision(d) {
+  if (!d || d.action !== 'run_query') return d;
+  const clipVal = v => {
+    if (typeof v === 'string') return v.length > MAX_BIND_LEN ? clipText(v, MAX_BIND_LEN) + TRUNC_MARK : v;
+    if (v === null || typeof v === 'number' || typeof v === 'boolean') return v;
+    // 구조(객체·배열)는 bindProblem이 어차피 거부한다 — 거대한 구조만 문자열로 확정해 크기를 묶는다
+    const s = JSON.stringify(v) ?? String(v);
+    return s.length > MAX_BIND_LEN ? clipText(s, MAX_BIND_LEN) + TRUNC_MARK : v;
+  };
+  // Object.fromEntries로 다시 조립한다 — params[k] = v 대입은 '__proto__' 키에서 조용히 사라진다
+  const params = Object.fromEntries(
+    Object.entries(d.params || {})
+      .slice(0, MAX_DECISION_PARAMS)
+      .map(([k, v]) => [k.length > 100 ? clipText(k, 100) : k, clipVal(v)])
+  );
+  // trim: 이름 앞뒤 공백은 등록 철자와의 비교(agent.js resolveQuery)를 어긋내는 것 외에 아무 역할이 없다
+  return { action: 'run_query', query_name: clipText(String(d.query_name).trim(), 200), params };
+}
 
 // ===== MockLLM: 규칙 기반 구현 (개발용) =====
 
@@ -73,13 +105,17 @@ const PARAM_RULES = {
 //                  ② 현재 질문 → 최근 질문 순으로 정규식 추출 (후속 질문 대응)
 //                  ③ 따옴표 문자열 fallback. 하나라도 못 채우면 null.
 function fillParams(registryRow, ctx) {
-  const params = {};
+  // 대입(params[name] = v)이 아니라 entries로 모은다 — '__proto__' 바인드명은 대입 시
+  // setter를 타고 조용히 사라져, 채웠다고 믿은 값이 실행 단계에서 '값 없음'으로 실패한다.
+  const entries = [];
   // 현재 질문을 먼저 본다 — 이전 질문의 오래된 값이 현재 대상을 덮어쓰지 않도록.
   const texts = [ctx.question, ...(ctx.chat || []).filter(m => m.role === 'user').map(m => m.text).reverse()];
 
   for (const name of bindNames(registryRow.query_sql)) {
     let value = valueFromHistory(name, ctx.history);
-    if (value === undefined && PARAM_RULES[name]) {
+    // 소유 키만 본다 — 바인드명이 '__proto__' 같은 프로토타입 멤버와 겹치면 함수가 아닌 값을
+    // 호출하다 결정 루프 전체가 죽는다 (oracle.js mockResult와 같은 이유·같은 방식).
+    if (value === undefined && Object.hasOwn(PARAM_RULES, name)) {
       for (const t of texts) {
         value = PARAM_RULES[name](t);
         if (value !== undefined) break;
@@ -87,9 +123,9 @@ function fillParams(registryRow, ctx) {
     }
     if (value === undefined) value = (ctx.question.match(/["']([^"']+)["']/) || [])[1];
     if (value === undefined) return null;
-    params[name] = value;
+    entries.push([name, value]);
   }
-  return params;
+  return Object.fromEntries(entries);
 }
 
 function valueFromHistory(name, history) {
@@ -121,7 +157,9 @@ export function renderAnswer({ knowledge, history }) {
   const parts = [];
   for (const h of history) {
     if (h.error) {
-      parts.push(`**${h.query_name}** 실행 오류: ${h.error}`);
+      // 이 답변은 사용자에게 그대로 나간다 — 드라이버·DB 원문은 스키마명·호스트를 담고 있으므로
+      // 화면 trace(server.js)와 같은 기준을 적용한다: 우리가 문구를 만든 오류(h.safe)만 원문으로.
+      parts.push(`**${h.query_name}** 실행 오류: ${h.safe ? h.error : '조회 중 오류가 발생했습니다.'}`);
     } else if (h.rows?.length) {
       // 건수 해석은 rowCounts 한 곳에서만 한다 — 프롬프트(llm-openai.js)·화면 trace(server.js)가
       // 같은 기록을 각자 렌더하므로, 해석이 갈리면 사용자와 모델이 다른 건수를 보게 된다.

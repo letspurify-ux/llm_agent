@@ -196,7 +196,7 @@ export default function App() {
               submitInput();
             }}
             placeholder="질문을 입력하세요"
-            maxLength={2000}  /* 입력 단계 안내용 — 실제 제한은 서버가 검증한다 (server.js) */
+            maxLength={2000}  /* 입력 단계 안내용 사본 — 실제 제한은 서버가 검증한다 (backend constants.js MAX_QUESTION_LEN) */
             autoFocus
           />
           <button className="send" disabled={loading || !input.trim()} aria-label="전송">➤</button>

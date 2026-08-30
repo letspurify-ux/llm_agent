@@ -4,7 +4,7 @@ import express from 'express';
 import { handleQuestion } from './agent.js';
 import { syncEmbeddings, syncSummary } from './embed-sync.js';
 import { insertChatLog, cleanupChatLogs, closePool } from './db.js';
-import { numEnv } from './constants.js';
+import { numEnv, MAX_QUESTION_LEN } from './constants.js';
 import { rowCounts } from './result.js';
 
 // 놓친 promise 거부는 기록만 하고 계속 진행한다 (요청 단위 오류는 각 경로에서 이미 처리한다).
@@ -24,6 +24,10 @@ process.on('uncaughtException', e => {
 // 설정되지 않아 모든 질문이 500이 되는데 /api/health는 계속 ok를 돌려줘 원인을 찾기 어렵다.
 if (!process.env.MARIADB_USER) {
   console.warn('[setup] MARIADB_USER가 없습니다 — backend/.env가 없거나 비어 있습니다. `cp backend/.env.example backend/.env` 후 다시 실행하세요.');
+} else if (!process.env.MARIADB_PASSWORD) {
+  // .env.example은 비밀번호를 비워 배포한다(알려진 비밀번호가 운영까지 따라가지 않게 — .env.example 주석 참고).
+  // 비운 채 뜨면 모든 질문이 인증 실패로 500이 되는데 /api/health는 ok라 원인이 안 보인다 — 기동 시점에 알린다.
+  console.warn('[setup] MARIADB_PASSWORD가 비어 있습니다 — backend/.env에 관리 DB 계정 비밀번호를 채우세요 (README의 앱 계정 생성 단계에서 정한 값).');
 }
 
 const app = express();
@@ -38,8 +42,9 @@ app.post('/api/chat', async (req, res) => {
   if (typeof message !== 'string' || !message.trim()) {
     return res.status(400).json({ error: 'message가 필요합니다.' });
   }
-  if (message.length > 2000) {
-    return res.status(400).json({ error: '질문이 너무 깁니다 (최대 2,000자).' });
+  // 상한은 constants.js가 정한다 — 프롬프트 예산 계산과 회귀 테스트가 같은 값을 본다.
+  if (message.length > MAX_QUESTION_LEN) {
+    return res.status(400).json({ error: `질문이 너무 깁니다 (최대 ${MAX_QUESTION_LEN.toLocaleString('ko-KR')}자).` });
   }
   try {
     // history: 클라이언트가 보내는 최근 대화 [{role:'user'|'assistant', text}] (서버는 상태를 저장하지 않는다)
