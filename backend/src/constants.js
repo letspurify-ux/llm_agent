@@ -15,9 +15,18 @@ export const MAX_CELL_LEN = 200;
 // 잘린 셀에 붙이는 표시. 자르는 쪽(oracle.js)과 그 값을 바인드로 재사용하면 안 되는 쪽(llm.js)이 함께 본다.
 export const TRUNC_MARK = '…(생략)';
 
+// 결과 행의 컬럼 수 상한 — 셀 길이(MAX_CELL_LEN)·행 수(MAX_ROWS)와 함께 결과 크기의 세 축을
+// 전부 묶는다. 이 축만 비면 SELECT *로 등록된 넓은 테이블의 행 하나(컬럼 수 × 셀 상한)가
+// 프롬프트 예산과 답변·trace·chat_log를 그대로 관통한다 — 아래 프롬프트 예산이 "행 하나는
+// 유계"라는 전제 위에 서 있는데, 그 전제를 보장하는 곳이 없었다. 셀과 같은 드라이버 경계
+// (oracle.js normalizeCells)에서 적용하고, 잘랐다는 표시를 행 안에 남긴다 —
+// 조용히 자르면 모델과 사용자가 그 컬럼을 '없다'로 단정한다.
+export const MAX_RESULT_COLS = 30;
+
 // ===== 프롬프트 길이 예산 =====
-// knowledge.content / qa_method.method / query_sql은 전부 TEXT(최대 64KB)이고, 조회 결과 행은
-// 컬럼 수에 상한이 없다 — 어느 쪽도 그 자체로는 프롬프트 크기를 묶어주지 않는다. 긴 문서 몇 건이나
+// knowledge.content / qa_method.method / query_sql은 전부 TEXT(최대 64KB)이고, 조회 결과 행도
+// 컬럼 수 상한까지(MAX_RESULT_COLS × MAX_CELL_LEN ≈ 6천 자) 커진다 — 어느 쪽도 그 자체로는
+// 프롬프트 크기를 묶어주지 않는다. 긴 문서 몇 건이나
 // 컬럼 많은 쿼리 한 건이 등록되는 것만으로 컨텍스트를 넘겨 그 뒤 모든 질문이 'LLM 호출 실패'로 끝난다.
 // Oracle 셀을 MAX_CELL_LEN으로 막는 것과 같은 이유이므로 같은 방식(경계에서 한 번)으로 막는다.
 //

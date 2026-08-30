@@ -29,6 +29,14 @@ if (!process.env.MARIADB_USER) {
   // 비운 채 뜨면 모든 질문이 인증 실패로 500이 되는데 /api/health는 ok라 원인이 안 보인다 — 기동 시점에 알린다.
   console.warn('[setup] MARIADB_PASSWORD가 비어 있습니다 — backend/.env에 관리 DB 계정 비밀번호를 채우세요 (README의 앱 계정 생성 단계에서 정한 값).');
 }
+// LLM 쪽도 같은 함정이다: provider=openai인데 접속 정보가 비면 모든 질문이 'LLM 호출 실패'가
+// 되는데 /api/health는 계속 ok고, 원인은 요청마다 warn 로그로 흩어져 남는다 — 기동 시점에 알린다.
+if (process.env.LLM_PROVIDER === 'openai') {
+  const missing = ['LLM_BASE_URL', 'LLM_MODEL'].filter(k => !process.env[k]);
+  if (missing.length) {
+    console.warn(`[setup] LLM_PROVIDER=openai인데 ${missing.join(', ')}이(가) 비어 있습니다 — 모든 질문이 "LLM 호출 실패"로 끝납니다. backend/.env를 확인하세요.`);
+  }
+}
 
 const app = express();
 // 기본값(100kb)은 표 형태 답변이 쌓인 대화 이력에 부족하다 — 초과하면 핸들러에 닿기도 전에

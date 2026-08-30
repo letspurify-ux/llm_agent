@@ -14,7 +14,8 @@ const ctx = (over = {}) => ({
   question: '질문', chat: [], knowledge: [], qaMethods: [], queries: [], history: [], ...over,
 });
 
-// 컬럼 수는 등록 SQL이 정하므로 상한이 없다 — 셀 길이(200자)만 드라이버 경계가 묶는다.
+// 컬럼 수는 드라이버 경계(oracle.js MAX_RESULT_COLS)가 묶지만, 프롬프트 조립은 그 경계가
+// 우회되거나 느슨해져도 스스로 유계여야 하므로 여기서는 일부러 상한 없이 만든다.
 const wideRows = (rows, cols) =>
   new Array(rows).fill(0).map((_, r) =>
     Object.fromEntries(new Array(cols).fill(0).map((__, c) => [`COL_${c}`, `${r}-${big(200)}`])));
@@ -63,14 +64,37 @@ test('잘린 행은 유효한 JSON으로 남고 건수를 정직하게 알린다
 
 test('최신 스텝을 남기고 오래된 스텝부터 버린다', () => {
   // 꼬리부터 버리면 방금 조회한 결과가 먼저 사라져 그 스텝이 통째로 헛수고가 된다.
-  const history = new Array(5).fill(0).map((_, i) => ({
+  // (스텝 한 줄은 fitCols가 스텝 예산 안으로 줄이므로, 이력 예산을 넘기려면 스텝 수로 채운다)
+  const history = new Array(8).fill(0).map((_, i) => ({
     query_name: `step${i}`, params: {}, rows: wideRows(20, 20), totalRows: 20,
   }));
   const p = buildPrompt(ctx({ history }));
-  assert.ok(p.includes('step4'), '가장 최신 스텝이 남아야 한다');
+  assert.ok(p.includes('step7'), '가장 최신 스텝이 남아야 한다');
   assert.ok(p.includes('프롬프트 길이 제한으로 생략'), '버린 사실을 모델에게 알려야 한다');
   // 시간순 표시는 유지된다
-  assert.ok(p.indexOf('step3') < p.indexOf('step4') || !p.includes('step3'));
+  assert.ok(p.indexOf('step6') < p.indexOf('step7') || !p.includes('step6'));
+});
+
+test('컬럼 수가 아무리 많은 행도 예산을 넘지 못한다', () => {
+  // fitRows의 '최소 1행 보장'이 컬럼 단위 절단(fitCols) 없이는 그대로 구멍이 된다 —
+  // 드라이버 경계(MAX_RESULT_COLS)가 우회돼도 프롬프트 조립 스스로 유계여야 한다.
+  const p = buildPrompt(ctx({
+    history: [{ query_name: 'wide', params: {}, rows: wideRows(20, 300), totalRows: 20 }],
+  }));
+  assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN, `프롬프트가 예산을 넘었다: ${p.length}`);
+  assert.ok(p.includes('컬럼 생략'), '컬럼을 버린 사실을 모델에게 알려야 한다');
+  // 줄어든 행도 유효한 JSON이어야 한다 — 조각이면 모델이 값으로 되읽는다
+  JSON.parse(p.slice(p.lastIndexOf(': [') + 2));
+});
+
+test('바인드가 수백 개인 SQL 등록도 쿼리 목록 예산을 뚫지 못한다', () => {
+  // 바인드 목록은 표시용 절단 전의 SQL 원문에서 나온다 — 이 줄에서 유일하게 유계가 아니던 부분.
+  const sql = `SELECT 1 FROM t WHERE ${new Array(500).fill(0).map((_, i) => `c${i} = :b${i}`).join(' AND ')}`;
+  const p = buildPrompt(ctx({
+    queries: [{ seq: 1, query_name: 'manybinds', query_desc: 'd', input_desc: 'i', output_desc: 'o', query_sql: sql, target_db_name: 'D' }],
+  }));
+  assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN, `프롬프트가 예산을 넘었다: ${p.length}`);
+  assert.match(p, /외 \d+개/, '바인드를 버린 사실을 모델에게 알려야 한다');
 });
 
 test('앞 섹션이 짧으면 그 여유가 쿼리 목록으로 넘어간다', () => {

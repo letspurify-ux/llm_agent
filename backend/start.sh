@@ -7,7 +7,13 @@ cd "$(dirname "$0")"
 PID_FILE=.backend.pid
 LOG_FILE=logs/backend.log
 
-if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+# PID 파일의 프로세스가 '우리 서버'인지 명령행으로 확인한다 — kill -0(생존 여부)만으로 판정하면
+# 서버가 죽고 남은 stale PID를 무관한 프로세스가 재사용했을 때 "이미 실행 중"으로 오판하고,
+# stop.sh는 같은 판정으로 그 무관한 프로세스를 강제 종료(-9)까지 한다. 판정 기준을 두 스크립트가
+# 공유해야 하므로 문구를 바꾸면 stop.sh도 함께 바꿀 것.
+is_ours() { [ -n "${1:-}" ] && ps -p "$1" -o command= 2>/dev/null | grep -q "src/server.js"; }
+
+if [ -f "$PID_FILE" ] && is_ours "$(cat "$PID_FILE")"; then
   echo "[backend] 이미 실행 중입니다 (PID $(cat "$PID_FILE")) — 로그: $LOG_FILE"
   exit 0
 fi

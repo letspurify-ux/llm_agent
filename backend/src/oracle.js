@@ -4,18 +4,41 @@
 import oracledb from 'oracledb';
 import { loadTargetDb } from './db.js';
 import { bindNames, assertReadOnly } from './sql.js';
-import { MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK, numEnv, nameKey, safeError, clipText, warnOnce } from './constants.js';
+import { MAX_ROWS, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK, numEnv, nameKey, safeError, clipText, warnOnce } from './constants.js';
 
 // 드라이버 경계에서 타입을 확정한다. LOB은 기본값이 Lob 스트림 객체라 커넥션을 닫으면 무효가 되고
 // JSON 직렬화 시 순환 참조로 예외가 난다 — CLOB만이 아니라 NCLOB/BLOB도 같은 위험이므로 전부 다룬다.
 // 날짜류를 문자열로 받는 이유는 아래 NLS_SESSION_FORMATS 주석 참고.
 //
-// fetchTypeHandler로 직접 타입을 지정하지 않는다: 핸들러가 돌려준 타입은 드라이버가 매핑 없이
-// 그대로 쓰기 때문에, CLOB에 VARCHAR(oracledb.STRING)를 주면 VARCHAR 한도에서 잘린다.
+// LOB·날짜에 fetchTypeHandler로 직접 타입을 지정하지 않는 이유: 핸들러가 돌려준 타입은 드라이버가
+// 매핑 없이 그대로 쓰기 때문에, CLOB에 VARCHAR(oracledb.STRING)를 주면 VARCHAR 한도에서 잘린다.
 // fetchAsString/fetchAsBuffer는 드라이버가 각 타입의 올바른 대상(CLOB→LONG, NCLOB→LONG_NVARCHAR,
 // BLOB→LONG_RAW, DATE/TIMESTAMP/TZ/LTZ→VARCHAR)을 스스로 계산한다.
+// (NUMBER만 아래에서 fetchTypeHandler를 쓴다 — 그쪽은 STRING 매핑이 정확히 의도한 동작이다.)
 oracledb.fetchAsString = [oracledb.CLOB, oracledb.NCLOB, oracledb.DATE];
 oracledb.fetchAsBuffer = [oracledb.BLOB];
+
+// NUMBER는 기본 매핑(JS number)이 배정밀도라 16자리부터 조용히 반올림된다 — 18자리 채번 키가
+// 끝자리만 다른 값으로 답변되고, 그 값이 다음 스텝의 바인드로도 흘러가 0건 오답까지 만든다.
+// 날짜를 문자열로 받는 것과 같은 이유(조용한 어긋남)로, 정밀도가 보장되는 열(선언된 precision
+// 1~15)만 기본 매핑에 맡기고 나머지(선언 없는 NUMBER·식 결과 — precision 0 또는 미상)는
+// 문자열로 받아 정확한 값을 확보한다. "위험이 증명된 열만 문자열"이 아니라 "안전이 증명된 열만
+// 숫자"로 뒤집은 이유: 메타데이터가 비는 쪽으로 어긋나도 정확성이 깨지지 않는 방향이 이쪽이다.
+oracledb.fetchTypeHandler = md => {
+  if (md.dbType === oracledb.DB_TYPE_NUMBER && !(md.precision >= 1 && md.precision <= 15)) {
+    return { type: oracledb.STRING, converter: numberFromString };
+  }
+};
+
+// 문자열로 받은 NUMBER를, JS number로 정밀도 손실 없이 왕복될 때만 숫자로 되돌린다.
+// 전부 문자열로 두면 mock(숫자 리터럴)과 실제가 JSON 표기부터 달라져, mock으로 검증한 시나리오가
+// 실제 배포에서 재현되지 않는다(MOCK_DATA 주석과 같은 원칙). 왕복이 어긋나는 값(16자리+)만
+// 문자열 그대로 남아 정확한 자릿수를 지킨다. (테스트에서 쓰므로 export)
+export function numberFromString(v) {
+  if (v === null) return null;
+  const n = Number(v);
+  return String(n) === v ? n : v;
+}
 
 // 날짜/시각은 JS Date로 받지 않고 DB가 직접 포맷한 문자열로 받는다.
 //   - JS Date를 로컬 getter로 다시 렌더링하면 TIMESTAMP WITH (LOCAL) TIME ZONE에서
@@ -95,8 +118,14 @@ export async function runQuery(registryRow, params = {}) {
     // 반드시 try 안에서 설정한다 — 드라이버가 던지면 밖에서는 finally의 close가 실행되지 않아 커넥션이 샌다.
     conn.callTimeout = TIMEOUT_MS;
     await setSessionFormats(conn);
+    // 후행 세미콜론은 실행 직전에 뗀다 — 조회 전용 가드(sql.js assertReadOnly)는 후행 ';'를 단일
+    // 문장으로 인정하는데 드라이버는 거부한다(ORA-00911). 가드만 통과시키면 SQL 클라이언트에서
+    // 복사해 ';'째 등록한 쿼리가 mock(SQL을 실행하지 않는다)에서는 잘 돌다가 실제 DB에서만 죽고,
+    // 화면에는 일반화된 문구만 나가 원인이 보이지 않는다. 허용하기로 한 표기는 실행까지 허용한다.
+    // 리터럴 속 ';'는 여기 걸리지 않는다 — 문자열 끝의 ';'가 리터럴 안에 있으려면 리터럴이
+    // 닫히지 않았어야 하는데, 그런 SQL은 assertReadOnly가 먼저 거부한다.
     // 사용자 입력은 바인드 값으로만 전달한다 (SQL 문자열 결합 금지)
-    const result = await conn.execute(registryRow.query_sql, binds, {
+    const result = await conn.execute(registryRow.query_sql.replace(/;\s*$/, ''), binds, {
       outFormat: oracledb.OUT_FORMAT_OBJECT,
       maxRows: MAX_ROWS + 1,
     });
@@ -126,11 +155,21 @@ function capResult(allRows) {
   return { rows, totalRows: rows.length, capped };
 }
 
-// 셀 값 정규화 — LOB/이진 값이 그대로 history와 chat_log(JSON)로 흘러가지 않게 드라이버 경계에서 처리한다.
-// 길이 제한을 여기서 적용하는 이유: 대형 CLOB 문자열을 즉시 잘라내 downstream(프롬프트·로그)에
-// 남지 않게 하기 위함. 단, 드라이버가 LOB을 메모리에 올리는 비용 자체는 남는다 (maxRows로만 제한됨).
-function normalizeCells(row) {
-  return Object.fromEntries(Object.entries(row).map(([k, v]) => [k, normalizeValue(v)]));
+// 셀 값 정규화 + 컬럼 수 상한 — LOB/이진 값이 그대로 history와 chat_log(JSON)로 흘러가지 않게
+// 드라이버 경계에서 처리한다. 길이 제한을 여기서 적용하는 이유: 대형 CLOB 문자열을 즉시 잘라내
+// downstream(프롬프트·로그)에 남지 않게 하기 위함. 단, 드라이버가 LOB을 메모리에 올리는 비용
+// 자체는 남는다 (maxRows로만 제한됨).
+// 컬럼 수도 같은 경계에서 묶는다 — 셀 길이·행 수만 막고 이 축을 열어두면 SELECT * 넓은 테이블의
+// 행 하나(컬럼 수 × 셀 상한)가 프롬프트 예산과 답변·trace·chat_log를 그대로 관통한다
+// (constants.MAX_RESULT_COLS 주석 참고). (테스트에서 쓰므로 export)
+export function normalizeCells(row) {
+  const entries = Object.entries(row);
+  const kept = entries.slice(0, MAX_RESULT_COLS).map(([k, v]) => [k, normalizeValue(v)]);
+  // 자른 사실은 행 안에 표시로 남긴다 — 조용히 자르면 모델과 사용자가 그 컬럼을 '없다'로 읽는다.
+  if (entries.length > MAX_RESULT_COLS) {
+    kept.push(['…', `외 ${entries.length - MAX_RESULT_COLS}개 컬럼 생략 (컬럼 수 상한 ${MAX_RESULT_COLS}개)`]);
+  }
+  return Object.fromEntries(kept);
 }
 
 function normalizeValue(v) {

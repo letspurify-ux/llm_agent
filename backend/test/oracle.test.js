@@ -3,8 +3,8 @@
 // 실제 접속 여부와 무관하게 같은 코드를 타므로 여기서 검증하는 판정이 실배포에도 그대로 적용된다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { runQuery } from '../src/oracle.js';
-import { MAX_CELL_LEN, TRUNC_MARK } from '../src/constants.js';
+import { runQuery, normalizeCells, numberFromString } from '../src/oracle.js';
+import { MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK } from '../src/constants.js';
 
 process.env.ORACLE_MOCK = '1';
 
@@ -52,6 +52,28 @@ test('정확히 절단 길이인 값만 잘린 조각으로 의심한다', async
   // '이상'으로 잡으면 자유 검색어·경로 같은 긴 값으로는 등록 쿼리를 영영 실행할 수 없다.
   const r = await runQuery(withBind(), { job_id: 'x'.repeat(MAX_CELL_LEN + 50) });
   assert.deepStrictEqual(r.rows, []);
+});
+
+test('컬럼 수가 상한을 넘는 행은 드라이버 경계에서 잘리고 표시가 남는다', () => {
+  // 셀 길이·행 수만 묶고 컬럼 수를 열어두면 SELECT * 넓은 테이블의 행 하나가
+  // 프롬프트 예산과 답변·trace·chat_log를 그대로 관통한다.
+  const wide = Object.fromEntries(new Array(MAX_RESULT_COLS + 5).fill(0).map((_, i) => [`C${i}`, i]));
+  const row = normalizeCells(wide);
+  assert.strictEqual(Object.keys(row).length, MAX_RESULT_COLS + 1); // 상한 + 생략 표시
+  assert.match(String(row['…']), /5개 컬럼 생략/, '자른 사실이 행 안에 남아야 한다');
+  // 상한 이하의 행은 손대지 않는다
+  assert.deepStrictEqual(normalizeCells({ A: 1, B: null }), { A: 1, B: null });
+});
+
+test('NUMBER 문자열은 정밀도가 보존될 때만 숫자로 되돌린다', () => {
+  // 전부 숫자로 바꾸면 16자리+가 조용히 반올림되고, 전부 문자열로 두면 mock(숫자 리터럴)과
+  // 실제의 JSON 표기가 갈라진다 — 왕복이 정확한 값만 숫자로.
+  assert.strictEqual(numberFromString('128000'), 128000);
+  assert.strictEqual(numberFromString('12.5'), 12.5);
+  assert.strictEqual(numberFromString('0'), 0);
+  assert.strictEqual(numberFromString(null), null);
+  // 배정밀도로 반올림되는 18자리 채번 키 — 숫자로 바꾸면 끝자리가 달라진다
+  assert.strictEqual(numberFromString('123456789012345678'), '123456789012345678');
 });
 
 test('바인드명이 프로토타입 멤버와 겹쳐도 판정이 어긋나지 않는다', async () => {

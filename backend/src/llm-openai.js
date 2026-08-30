@@ -162,22 +162,59 @@ function renderItems(items, render, budget) {
 
 // 바인드 변수명을 SQL과 따로 싣는다 — SQL이 길어 잘리더라도 채워야 할 파라미터가 사라지지 않게.
 // 사라지면 모델이 params를 비우고, runQuery가 '바인드 변수를 쓸 수 없습니다'로 실패한다.
-const queryItem = q =>
-  `- ${q.query_name}: ${clip(q.query_desc)}` +
-  ` / 입력(${clip(q.input_desc, 300)}) / 출력(${clip(q.output_desc, 300)})` +
-  ` / 바인드(${bindNames(q.query_sql).map(n => `:${n}`).join(', ') || '없음'})` +
-  ` / SQL: ${clip(q.query_sql, MAX_PROMPT_SQL_LEN)}`;
+// 개수·이름 길이에 상한을 둔다 — bindNames는 표시용 절단(MAX_PROMPT_SQL_LEN) 전의 SQL 원문
+// (TEXT 64KB)을 파싱하므로, 이 목록이 이 줄에서 유일하게 유계가 아닌 부분이었다. 바인드 수백
+// 개짜리 SQL 하나가 등록되면 renderItems의 '최소 1건 보장'을 타고 그 한 항목이 예산을 뚫는다.
+// 정상 쿼리의 바인드는 한 자릿수다(llm.js MAX_DECISION_PARAMS와 같은 근거) — 20이면 개입하지 않는다.
+const MAX_PROMPT_BIND_NAMES = 20;
+const queryItem = q => {
+  const binds = bindNames(q.query_sql);
+  const shown = binds.slice(0, MAX_PROMPT_BIND_NAMES).map(n => `:${clip(n, 100)}`).join(', ');
+  const omitted = binds.length - Math.min(binds.length, MAX_PROMPT_BIND_NAMES);
+  return `- ${clip(q.query_name, 100)}: ${clip(q.query_desc)}` +
+    ` / 입력(${clip(q.input_desc, 300)}) / 출력(${clip(q.output_desc, 300)})` +
+    ` / 바인드(${shown || '없음'}${omitted ? ` 외 ${omitted}개` : ''})` +
+    ` / SQL: ${clip(q.query_sql, MAX_PROMPT_SQL_LEN)}`;
+};
 
 // 예산 안에 들어가는 가장 긴 앞부분을 돌려준다. 행 단위로 줄이는 이유: JSON 문자열을 중간에서
 // 자르면 모델이 파싱할 수 없는 조각이 남고, 그 조각을 값으로 읽어 바인드로 되돌린다.
-// 최소 1건은 남긴다 — 0건이면 모델이 '결과가 없다'로 읽고, 1건의 크기는 셀 상한(MAX_CELL_LEN)이 이미 묶었다.
+// 최소 1건은 남긴다 — 0건이면 모델이 '결과가 없다'로 읽는다. 단, 셀 상한(MAX_CELL_LEN)은 행의
+// 크기를 묶어주지 않으므로(컬럼 수 × 셀 상한) 그 1건이 예산을 넘으면 컬럼 단위로 줄인다(fitCols) —
+// 드라이버 경계(MAX_RESULT_COLS)가 컬럼 수를 묶지만, 그 상한 안에서도 행 하나가 스텝 예산을
+// 넘을 수 있고, 프롬프트 조립은 경계가 우회되거나 느슨해져도 스스로 유계여야 한다(paramsJson 참고).
 function fitRows(rows, budget) {
   let used = 2; // '[]'
   for (let i = 0; i < rows.length; i++) {
     used += JSON.stringify(rows[i]).length + (i ? 1 : 0); // 구분자 ','
-    if (i > 0 && used > budget) return rows.slice(0, i);
+    if (used > budget) {
+      // 첫 행부터 예산을 넘으면 행 단위로는 더 줄일 수 없다 — 컬럼 단위로 줄인다.
+      return i === 0 ? [fitCols(rows[0], budget)] : rows.slice(0, i);
+    }
   }
   return rows;
+}
+
+// 행 하나를 예산 안으로 줄인다 — 컬럼(값) 단위로 자르고, 몇 개를 버렸는지 행 안에 남긴다
+// (JSON을 중간에서 자르지 않는 이유는 fitRows와 같다). 여기가 유계가 아니면 renderHistory의
+// '최소 1줄 보장'을 타고 행 하나가 섹션 배분 전체를 우회한다. 키·값도 표시 상한으로 자른다 —
+// 드라이버 경계가 우회된 거대 셀 하나가 '컬럼 하나는 무조건 싣는다'를 뚫으면 안 된다.
+function fitCols(row, budget) {
+  const entries = Object.entries(row);
+  const kept = [];
+  let used = 2; // '{}'
+  for (const [k0, v0] of entries) {
+    const k = clip(k0, 100);
+    const v = clipVal(v0);
+    const len = JSON.stringify(k).length + (JSON.stringify(v) ?? 'null').length + 2; // ':' + ','
+    if (kept.length > 0 && used + len > budget) break;
+    kept.push([k, v]);
+    used += len;
+  }
+  if (kept.length < entries.length) {
+    kept.push(['…', `외 ${entries.length - kept.length}개 컬럼 생략 (프롬프트 길이 제한)`]);
+  }
+  return Object.fromEntries(kept);
 }
 
 // params 표시 — query_name과 함께 이 줄에서 유일하게 LLM이 만든(상한 없는) 값이다.
@@ -187,14 +224,16 @@ function fitRows(rows, budget) {
 // 값 단위로 먼저 잘라 JSON을 유효하게 유지하고(중간에서 자르면 모델이 조각을 값으로 되읽는다),
 // 여러 값의 합이 그래도 크면 전체를 한 번 더 자른다.
 function paramsJson(params) {
-  const entries = Object.entries(params || {}).map(([k, v]) => [
-    clip(k, 100),
-    typeof v === 'string' ? clip(v, MAX_CELL_LEN)
-      : v === null || typeof v === 'number' || typeof v === 'boolean' ? v
-        : clip(JSON.stringify(v) ?? String(v), MAX_CELL_LEN),
-  ]);
+  const entries = Object.entries(params || {}).map(([k, v]) => [clip(k, 100), clipVal(v)]);
   return clip(JSON.stringify(Object.fromEntries(entries)), MAX_PROMPT_PARAMS_LEN);
 }
+
+// 표시용 값 절단 — params(위)와 컬럼 절단 행(fitCols)이 같은 규칙을 쓴다.
+// 문자열은 셀 상한으로, 스칼라는 그대로(수 리터럴은 짧다), 구조는 직렬화해 같은 상한으로.
+const clipVal = v =>
+  typeof v === 'string' ? clip(v, MAX_CELL_LEN)
+    : v === null || typeof v === 'number' || typeof v === 'boolean' ? v
+      : clip(JSON.stringify(v) ?? String(v), MAX_CELL_LEN);
 
 function historyLine(h) {
   const head = `- ${clip(h.query_name, 100)} params=${paramsJson(h.params)}`;
