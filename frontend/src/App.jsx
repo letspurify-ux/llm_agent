@@ -194,6 +194,12 @@ export default function App() {
             }}
             onKeyUp={() => { justComposedRef.current = false; }}
             onBlur={() => { justComposedRef.current = false; }}
+            // 조합을 확정하는 것이 키가 아니라 마우스일 수도 있다(조합 중 입력창 '안'을 클릭).
+            // 그때는 keyup도 blur도 오지 않아 위 플래그가 켜진 채 남고, 그다음 Enter 한 번이
+            // 통째로 먹힌다 — 사용자에게는 "가끔 Enter가 안 먹는다"로만 보인다.
+            // click은 mouseup 뒤에 오므로 compositionend와의 선후(브라우저마다 다르다)에
+            // 기대지 않고 확실히 뒤에서 푼다.
+            onClick={() => { justComposedRef.current = false; }}
             onKeyDown={e => {
               if (e.key !== 'Enter') {
                 justComposedRef.current = false;

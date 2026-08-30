@@ -67,10 +67,15 @@ const SKIP_NOTE = {
   [SKIP.UNAVAILABLE]: 'could not reach the embedding server — some rows skipped, continuing LIKE-only',
 };
 
-// 건너뛴 행은 원본을 고치기 전까지 매 주기 다시 실패하므로 반드시 눈에 띄어야 한다
+// 건너뛴 행은 사람이 원인을 없애기 전까지 매 주기 다시 실패하므로 반드시 눈에 띄어야 한다
 // (0건이면 문구를 붙이지 않아 평소 로그는 조용하다).
+// 원인을 단정하지 않고 행별 경고로 넘긴다 — failed에는 성격이 다른 둘이 함께 들어온다:
+// 임베딩 서버가 그 입력을 거부한 것(원본 행 문제)과 벡터를 저장하지 못한 것(차원 불일치·
+// vec_store 권한/스키마 문제)이다. 한쪽을 지목하는 문구('원본 행을 확인하라')를 쓰면 나머지
+// 절반에서 운영자를 엉뚱한 곳으로 보낸다. 행별 경고는 src#seq와 원문 오류를 그대로 찍으므로
+// 그쪽이 정확하다 (embedRows / storeBatch의 console.warn).
 export function syncSummary(r) {
-  const failed = r.failed ? `, skipped ${r.failed} (check source rows)` : '';
+  const failed = r.failed ? `, skipped ${r.failed} (see the [embed] row warnings)` : '';
   const note = SKIP_NOTE[r.skipped];
   return `created/updated ${r.embedded}, cleaned up ${r.deleted}${failed}${note ? ` — ${note}` : ''}`;
 }
@@ -179,7 +184,9 @@ async function doSync() {
         if (r.unavailable) { unavailable = true; break; }
         continue;
       }
-      embedded += await storeBatch(src, batch, vectors);
+      const r = await storeBatch(src, batch, vectors);
+      embedded += r.stored;
+      failed += r.failed;
     }
   }
   return { embedded, deleted, failed, skipped: unavailable ? SKIP.UNAVAILABLE : skipped };
@@ -192,7 +199,9 @@ async function embedRows(src, batch) {
   let embedded = 0, failed = 0;
   for (const b of batch) {
     try {
-      embedded += await storeBatch(src, [b], await embed([b.text]));
+      const r = await storeBatch(src, [b], await embed([b.text]));
+      embedded += r.stored;
+      failed += r.failed;   // 저장에 실패한 행도 다음 주기에 그대로 되돌아온다 (storeBatch 주석)
     } catch (e) {
       warnEmbeddingFailure(e);
       if (e.retriable) return { embedded, failed, unavailable: true };
@@ -208,28 +217,35 @@ async function embedRows(src, batch) {
 // 배치 전체를 한 문장으로 쓴다 — 행마다 왕복하면 초기 1만건 동기화가 1만 번 왕복이 된다.
 // 다만 한 문장은 전부 아니면 전무라, 행 하나가 문제(차원 불일치 등)면 정상인 31건까지 매 주기
 // 다시 임베딩되고 버려진다. 실패하면 행 단위로 한 번 더 시도해 성한 행은 진도를 나가게 한다.
+//
+// 반환은 {stored, failed}다 — 저장하지 못한 행은 해시가 갱신되지 않아 다음 주기에 그대로
+// 되돌아오므로, 임베딩이 거부된 행(embedRows)과 똑같이 집계에 잡혀야 한다. 성공 수만 돌려주면
+// 그 행들이 syncSummary의 skipped 집계에서 통째로 빠져, 로그에는
+// "created/updated 27, cleaned up 0"처럼 정상 회차와 글자 그대로 같은 줄만 남는다 —
+// 매 주기 조용히 되풀이되는 실패에 눈에 띄는 표시를 남기려고 failed를 둔 것인데(위 syncSummary
+// 주석), 이 경로만 그 집계 밖에 있었다.
 async function storeBatch(src, batch, vectors) {
   try {
     await query(
       `REPLACE INTO vec_store (src, seq, embed_hash, embedding) VALUES ${batch.map(() => '(?, ?, ?, VEC_FromText(?))').join(', ')}`,
       batch.flatMap((b, j) => [src, b.seq, b.hash, JSON.stringify(vectors[j])])
     );
-    return batch.length;
+    return { stored: batch.length, failed: 0 };
   } catch (e) {
     console.warn(`[embed] ${src} batch store failed — retrying row by row: ${e.message}`);
-    let ok = 0;
+    let stored = 0;
     for (const [j, b] of batch.entries()) {
       try {
         await query(
           'REPLACE INTO vec_store (src, seq, embed_hash, embedding) VALUES (?, ?, ?, VEC_FromText(?))',
           [src, b.seq, b.hash, JSON.stringify(vectors[j])]
         );
-        ok++;
+        stored++;
       } catch (e2) {
         console.warn(`[embed] ${src}#${b.seq} store failed: ${e2.message}`);
       }
     }
-    return ok;
+    return { stored, failed: batch.length - stored };
   }
 }
 

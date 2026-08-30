@@ -383,6 +383,18 @@ function matchingBrace(text, start) {
 // 진짜 결정 앞에 이만큼의 '{"' 가 놓인 응답이라면 어차피 신뢰할 수 없다.
 const MAX_JSON_CANDIDATES = 100;
 
+// 구역별 예산과 별개로 '전체' 상한이 하나 더 필요하다.
+// 구역 수는 응답 길이에 비례해 늘 수 있으므로(닫는 태그만 반복되는 퇴화 응답) 구역마다 예산을
+// 새로 주면 matchingBrace 호출 수가 구역 수 × 구역 예산이 되어 전역 비용 상한이 사라진다 —
+// 짝 없는 '{"'는 매번 남은 텍스트를 끝까지 훑으므로 정확히 이차다.
+// 실측('</think>{"a' 반복): 11KB 29ms → 21KB 88ms → 43KB 349ms → 86KB 1,580ms (크기 2배마다 4배).
+// 같은 크기라도 구역이 하나뿐이면 45ms다. 그 1.5초는 동기 작업이라 그 요청만이 아니라
+// 동시에 처리 중인 모든 요청이 함께 멈춘다 — MAX_JSON_CANDIDATES가 원래 막던 바로 그 실패가,
+// 상한을 구역별로 나누면서 전역 쪽 문으로 되살아났다.
+// 구역별 몫(100)보다 넉넉히 커야 '한 구역이 다른 구역을 굶기지 않는다'는 성질이 유지된다 —
+// 시끄러운 구역은 자기 몫 100에서 멈추므로 이 값이면 그런 구역 다섯을 채우고도 남는다.
+const MAX_JSON_CANDIDATES_TOTAL = 500;
+
 // '{'마다 독립적으로 짝을 찾는다. 한 번의 스캔으로 깊이를 누적하면 산문에 섞인 짝 없는 '{' 하나가
 // ("params에 {job_id 값을 넣자") 깊이를 영구히 어긋내 뒤의 진짜 JSON을 통째로 놓친다.
 // 시작점마다 따로 훑으면 그런 시작점은 그냥 실패하고 다음 후보로 넘어간다.
@@ -412,12 +424,16 @@ const MAX_JSON_CANDIDATES = 100;
 function jsonSpans(text, zoneOf) {
   const spans = [];
   const left = new Map();
+  let spent = 0;
   const candidate = /\{\s*"/g;
-  for (let m; (m = candidate.exec(text)); ) {   // exec가 위치를 옮기므로 반드시 끝난다
+  // exec가 위치를 옮기므로 반드시 끝난다. 전체 상한은 구역 수가 아무리 많아도 훑는 총량을
+  // 묶어준다 (MAX_JSON_CANDIDATES_TOTAL 주석 참고).
+  for (let m; spent < MAX_JSON_CANDIDATES_TOTAL && (m = candidate.exec(text)); ) {
     const zone = zoneOf(m.index);
     const budget = left.get(zone) ?? MAX_JSON_CANDIDATES;
     if (budget === 0) continue;
     left.set(zone, budget - 1);
+    spent++;
     const end = matchingBrace(text, m.index);
     if (end > 0) spans.push({ start: m.index, end });
   }

@@ -55,6 +55,24 @@ test('정확히 절단 길이인 값만 잘린 조각으로 의심한다', async
   assert.deepStrictEqual(r.rows, []);
 });
 
+test('서로게이트 경계에서 잘린 조각도 잘린 값으로 걸러진다', async () => {
+  // clipText는 절단 경계가 서로게이트 쌍을 가르면 짝 잃은 상위 서로게이트를 하나 더 뗀다 —
+  // 그 셀의 잘린 앞부분은 MAX_CELL_LEN자가 아니라 MAX_CELL_LEN-1자다.
+  // 길이 판정이 MAX_CELL_LEN 하나만 보면 이모지가 든 셀에서만 가드가 조용히 빠져,
+  // 마크를 뗀 조각이 그대로 바인드되고 0건이 나온다 — 모델은 그 0건을 "그런 데이터가 없다"로
+  // 읽으므로 오류 하나 없이 확신에 찬 오답이 나간다. (이력 밖에서 온 조각이라 truncatedBinds도 못 잡는다)
+  const clipped = normalizeCells({ C: 'a'.repeat(MAX_CELL_LEN - 1) + '\u{1F600}' + 'tail' }).C;
+  const stripped = clipped.slice(0, -TRUNC_MARK.length);
+  assert.equal(stripped.length, MAX_CELL_LEN - 1, '이 셀의 잘린 앞부분은 한 칸 짧다');
+  await assert.rejects(
+    runQuery(withBind(), { job_id: stripped }),
+    e => e.safe === true && /잘린 값/.test(e.message)
+  );
+  // 그보다 한 칸 더 짧은 값은 절단으로 생길 수 없다 — 정당한 입력이므로 통과해야 한다.
+  const r = await runQuery(withBind(), { job_id: 'x'.repeat(MAX_CELL_LEN - 2) });
+  assert.deepStrictEqual(r.rows, []);
+});
+
 test('컬럼 수가 상한을 넘는 행은 드라이버 경계에서 잘리고 표시가 남는다', () => {
   // 셀 길이·행 수만 묶고 컬럼 수를 열어두면 SELECT * 넓은 테이블의 행 하나가
   // 프롬프트 예산과 답변·trace·chat_log를 그대로 관통한다.

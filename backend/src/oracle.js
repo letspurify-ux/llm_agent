@@ -216,15 +216,25 @@ function localDateTime(d) {
 //              표시만 보고 TRUNC_MARK를 뗀 앞부분만 넣는 경우가 더 흔하다 — 그 값이 이번 요청의
 //              실행 이력에 있으면 agent.js(truncatedBinds)가 원본 대조로 정확히 걸러낸다.
 //              여기의 길이 판정은 이력 밖에서 온 조각(이전 턴 답변의 잘린 표를 보고 옮겨 적은 값)용이다:
-//              clipText가 자른 앞부분은 정확히 MAX_CELL_LEN자이므로 '이상'이 아니라 '그 길이'만 본다 —
+//              clipText가 자른 앞부분의 길이는 isClippedLen이 정한다 — '이상'이 아니라 '그 길이들'만 본다.
 //              '이상'으로 잡으면 질문에서 온 정당한 긴 값(자유 검색어·경로·연결 키)까지 영구히 거부돼
 //              그 입력으로는 등록 쿼리를 아예 실행할 수 없게 된다.
 // 주의: `WHERE (:opt IS NULL OR col = :opt)` 같은 선택적 필터 패턴은 이 가드에 걸린다 —
 // 그런 쿼리는 '전체'를 뜻하는 별도 센티널 값(예: 'ALL')을 쓰도록 등록할 것.
+// clipText가 남기는 절단 길이. 보통 MAX_CELL_LEN이지만, 절단 경계가 서로게이트 쌍(이모지 등)을
+// 가르면 짝 잃은 상위 서로게이트 하나를 더 떼므로 MAX_CELL_LEN-1이 된다.
+// 이 한 칸을 빼놓으면 그 셀에서만 가드가 조용히 빠진다 — 실측: 199자 + 이모지 셀의 잘린
+// 앞부분은 200자가 아니라 199자여서, 마크를 뗀 조각이 그대로 바인드되고 조회가 0건이 된다.
+// 모델은 그 0건을 "그런 데이터가 없다"로 읽으므로 오류 하나 없이 확신에 찬 오답이 나가고,
+// 하필 이모지가 든 셀에서만 재현되어 원인을 잡기 어렵다.
+// 늘어나는 오탐은 '정확히 MAX_CELL_LEN-1자인 정당한 값' 하나뿐이다 — MAX_CELL_LEN자를 이미
+// 거부하기로 한 것과 같은 성격·같은 크기의 대가라, 위 주석의 판단이 그대로 적용된다.
+const isClippedLen = n => n === MAX_CELL_LEN || n === MAX_CELL_LEN - 1;
+
 function bindProblem(v) {
   if (v === undefined || v === null || v === '') return '값 없음';
   if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') return '값이 아닌 구조';
-  if (typeof v === 'string' && (v.endsWith(TRUNC_MARK) || v.length === MAX_CELL_LEN)) {
+  if (typeof v === 'string' && (v.endsWith(TRUNC_MARK) || isClippedLen(v.length))) {
     return '잘린 값이라 원본과 다름';
   }
   return null;
