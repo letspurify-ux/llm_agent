@@ -4,7 +4,7 @@
 import oracledb from 'oracledb';
 import { loadTargetDb } from './db.js';
 import { bindNames, assertReadOnly } from './sql.js';
-import { MAX_ROWS, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK, numEnv, nameKey, safeError, clipText, warnOnce } from './constants.js';
+import { MAX_ROWS, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK, numEnv, nameKey, safeError, clipText, warnOnce, ownProp } from './constants.js';
 
 // 드라이버 경계에서 타입을 확정한다. LOB은 기본값이 Lob 스트림 객체라 커넥션을 닫으면 무효가 되고
 // JSON 직렬화 시 순환 참조로 예외가 난다 — CLOB만이 아니라 NCLOB/BLOB도 같은 위험이므로 전부 다룬다.
@@ -74,14 +74,16 @@ const TRANSPORT_CONNECT_TIMEOUT_S = 5;
 // capped는 "상한에 걸려 잘렸다"는 뜻이므로 MAX_ROWS+1건을 요청해 판정한다
 // (정확히 MAX_ROWS건인 완전한 결과를 "더 있을 수 있음"으로 잘못 알리지 않도록).
 export async function runQuery(registryRow, params = {}) {
-  assertReadOnly(registryRow.query_sql);
+  // 가드가 '실행용 SQL'까지 함께 돌려준다 — 무엇을 허용했는지 아는 쪽이 무엇을 실행할지도 정한다.
+  // 실행부가 따로 문자열을 손보면 둘의 판단이 갈라진다 (sql.js assertReadOnly 주석 참고).
+  const sql = assertReadOnly(registryRow.query_sql);
 
   // SQL에 실제로 있는 바인드만 추려서 전달한다 — LLM이 여분 파라미터를 주면
   // 드라이버가 바인드 수 불일치(NJS-098)로 실패하므로 필터가 필요하다.
   const names = bindNames(registryRow.query_sql);
-  // 소유 키만 읽는다 — 바인드명이 '__proto__' 같은 프로토타입 멤버와 겹치면 params?.[n]이
-  // Object.prototype을 돌려줘, '값 없음'이어야 할 판정이 '값이 아닌 구조'로 어긋난다.
-  const val = n => (Object.hasOwn(params ?? {}, n) ? params[n] : undefined);
+  // 소유 키만 읽는다 (constants.ownProp) — 바인드명이 '__proto__' 같은 프로토타입 멤버와 겹치면
+  // Object.prototype이 돌아와 '값 없음'이어야 할 판정이 '값이 아닌 구조'로 어긋난다.
+  const val = n => ownProp(params, n);
   const bad = names.map(n => [n, bindProblem(val(n))]).filter(([, p]) => p);
   if (bad.length) {
     // 두 번째 인자(hint)는 모델 전용 지침 — 사용자 trace에는 message만 나간다 (constants.safeError 참고)
@@ -127,14 +129,9 @@ export async function runQuery(registryRow, params = {}) {
     // 반드시 try 안에서 설정한다 — 드라이버가 던지면 밖에서는 finally의 close가 실행되지 않아 커넥션이 샌다.
     conn.callTimeout = TIMEOUT_MS;
     await setSessionFormats(conn);
-    // 후행 세미콜론은 실행 직전에 뗀다 — 조회 전용 가드(sql.js assertReadOnly)는 후행 ';'를 단일
-    // 문장으로 인정하는데 드라이버는 거부한다(ORA-00911). 가드만 통과시키면 SQL 클라이언트에서
-    // 복사해 ';'째 등록한 쿼리가 mock(SQL을 실행하지 않는다)에서는 잘 돌다가 실제 DB에서만 죽고,
-    // 화면에는 일반화된 문구만 나가 원인이 보이지 않는다. 허용하기로 한 표기는 실행까지 허용한다.
-    // 리터럴 속 ';'는 여기 걸리지 않는다 — 문자열 끝의 ';'가 리터럴 안에 있으려면 리터럴이
-    // 닫히지 않았어야 하는데, 그런 SQL은 assertReadOnly가 먼저 거부한다.
-    // 사용자 입력은 바인드 값으로만 전달한다 (SQL 문자열 결합 금지)
-    const result = await conn.execute(registryRow.query_sql.replace(/;\s*$/, ''), binds, {
+    // 사용자 입력은 바인드 값으로만 전달한다 (SQL 문자열 결합 금지).
+    // sql은 가드가 승인하며 만든 실행용 형태다 — 여기서 다시 손보지 않는다.
+    const result = await conn.execute(sql, binds, {
       outFormat: oracledb.OUT_FORMAT_OBJECT,
       maxRows: MAX_ROWS + 1,
     });
@@ -324,10 +321,11 @@ const MOCK_DATA = {
 // 'Batch_Job_Status'로 등록해도 다른 경로는 모두 정상 동작하므로, 여기만 대소문자를 구분하면
 // 철자 하나 때문에 데모 시나리오가 'mock 데이터 미정의'로 죽는다.
 function mockResult(queryName, params) {
-  // 소유 키만 본다 — 'constructor'나 '__proto__' 같은 이름이 프로토타입 체인을 타면 !gen 가드를
-  // 지나쳐 함수가 아닌 값을 호출하다 unsafe TypeError로 죽는다 (safe 안내 대신 일반 오류 문구가 나간다).
+  // 소유 키만 본다 (constants.ownProp) — 'constructor'나 '__proto__' 같은 이름이 프로토타입 체인을
+  // 타면 !gen 가드를 지나쳐 함수가 아닌 값을 호출하다 unsafe TypeError로 죽는다
+  // (safe 안내 대신 일반 오류 문구가 나간다).
   const key = nameKey(queryName);
-  const gen = Object.hasOwn(MOCK_DATA, key) ? MOCK_DATA[key] : undefined;
+  const gen = ownProp(MOCK_DATA, key);
   if (!gen) throw safeError(`mock 데이터가 정의되지 않은 쿼리: ${queryName}`);
   return gen(params);
 }

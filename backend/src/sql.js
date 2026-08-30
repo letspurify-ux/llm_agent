@@ -15,11 +15,19 @@ import { safeError } from './constants.js';
 const Q_CLOSER = { '[': ']', '{': '}', '(': ')', '<': '>' };
 const isIdentChar = c => c !== undefined && /[A-Za-z0-9_$#]/.test(c);
 
+// 지운 구간은 '같은 길이의 공백'으로 채운다 — text의 인덱스가 원문과 1:1로 맞는다.
+// 그래야 가드가 승인한 지점(후행 세미콜론)을 원문에서 정확히 집어낼 수 있다 (assertReadOnly 참고).
+// 길이를 보존해도 토큰 경계는 유지된다: 리터럴·주석은 최소 두 글자라 공백이 최소 한 칸은 남는다.
+const blank = n => ' '.repeat(n);
+
 function scanSql(sql) {
   const s = String(sql ?? '');
   let out = '';
   let i = 0;
   let unterminated = false;
+  const skip = end => { out += blank(end - i); i = end; };
+  // 경계를 찾지 못한 어휘 — 남은 전부를 지우고 끝낸다 (경계 미확정 SQL은 호출부가 거부한다)
+  const cut = () => { unterminated = true; skip(s.length); };
 
   while (i < s.length) {
     const c = s[i];
@@ -27,29 +35,25 @@ function scanSql(sql) {
 
     if (c === '-' && next === '-') {                    // 한 줄 주석
       const nl = s.indexOf('\n', i);
-      out += ' ';
-      i = nl < 0 ? s.length : nl;                       // 개행은 남긴다
+      skip(nl < 0 ? s.length : nl);                     // 개행은 남긴다
       continue;
     }
     if (c === '/' && next === '*') {                    // 블록 주석
       const end = s.indexOf('*/', i + 2);
-      out += ' ';
-      if (end < 0) { unterminated = true; i = s.length; } else { i = end + 2; }
+      if (end < 0) cut(); else skip(end + 2);
       continue;
     }
     if ((c === 'q' || c === 'Q') && next === "'" && isQuoteStart(s, i)) {
       const delim = s[i + 2];
-      if (delim === undefined) { unterminated = true; out += ' '; break; }
+      if (delim === undefined) { cut(); continue; }
       const close = (Q_CLOSER[delim] ?? delim) + "'";
       const end = s.indexOf(close, i + 3);
-      out += ' ';
-      if (end < 0) { unterminated = true; i = s.length; } else { i = end + close.length; }
+      if (end < 0) cut(); else skip(end + close.length);
       continue;
     }
     if (c === '"') {                                    // 따옴표 식별자 ("a'b" 처럼 아포스트로피를 담을 수 있다)
       const end = s.indexOf('"', i + 1);
-      out += ' ';
-      if (end < 0) { unterminated = true; i = s.length; } else { i = end + 1; }
+      if (end < 0) cut(); else skip(end + 1);
       continue;
     }
     if (c === "'") {                                    // 일반 문자열 ('' 는 이스케이프된 따옴표)
@@ -59,8 +63,7 @@ function scanSql(sql) {
         if (s[j + 1] === "'") { j++; continue; }
         break;
       }
-      out += ' ';
-      if (j >= s.length) { unterminated = true; i = s.length; } else { i = j + 1; }
+      if (j >= s.length) cut(); else skip(j + 1);
       continue;
     }
     out += c;
@@ -113,6 +116,16 @@ export function bindNames(sql) {
 // (2) 세미콜론이 포함된 다중 문장 금지
 // (3) 닫히지 않은 리터럴/주석은 거부 — 경계를 확정할 수 없으면 (1)(2)를 신뢰할 수 없다
 // 추가로 target_db의 계정 자체를 read-only 권한으로 만드는 것을 권장한다 (README 참고).
+//
+// 통과하면 '실행용 SQL'을 돌려준다 — 호출부는 원문이 아니라 이 값을 실행해야 한다.
+// 가드와 실행이 각자 문자열을 손보면 둘의 판단이 갈라진다. 실제로 갈라져 있었다: 가드는 주석을
+// 지운 뒤 후행 ';'를 단일 문장으로 인정하는데 실행부는 원문에 /;\s*$/를 걸어, `SELECT … ; -- 메모`
+// 처럼 ';' 뒤에 주석이 붙으면 정규식이 매치되지 않아 ';'가 남은 채 드라이버로 나갔다.
+// 그 결과가 서버 버전에 좌우된다는 점이 특히 나쁘다 — Oracle 23ai는 후행 ';'를 그냥 받아주지만
+// (실측: 23.26에서 `SELECT 1 FROM DUAL;`도 `; -- 주석`도 통과) 19c 이하는 ORA-00911로 거부한다.
+// 개발 컨테이너에서는 멀쩡하다가 운영 DB에서만 죽고, 그 오류는 드라이버 원문이라 화면에는
+// '조회 중 오류' 한 줄만 나가 원인이 보이지 않는다.
+// 승인한 쪽이 실행할 형태까지 함께 돌려주면 그 어긋남이 구조적으로 불가능해진다.
 export function assertReadOnly(sql) {
   // 리터럴도 함께 지운다 — LISTAGG(name, '; ')처럼 값에 든 세미콜론을 다중 문장으로 오판하지 않도록
   const { text, unterminated } = scanSql(sql);
@@ -140,4 +153,21 @@ export function assertReadOnly(sql) {
   if (/\bFOR\s+UPDATE\b/i.test(s)) {
     throw safeError('행 잠금을 거는 쿼리(FOR UPDATE)는 실행할 수 없습니다.');
   }
+  return executableSql(String(sql ?? ''), text);
+}
+
+// 가드가 허용한 후행 세미콜론을 원문에서 떼어낸다(공백으로 바꾼다).
+// Oracle 19c 이하는 SQL 문장 끝의 ';'를 ORA-00911로 거부한다 — 등록 표기로 허용하기로 했으면
+// 실행까지 허용해야 한다. 23ai처럼 받아주는 서버에서도 떼어내는 편이 안전하다(동작이 같아진다).
+// 위치는 스캔 결과에서 찾는다 — text는 원문과 길이·인덱스가 같고 리터럴·주석은 공백으로 지워져
+// 있으므로, "마지막 코드 문자가 ';'인가"가 곧 "문장 끝의 세미콜론인가"다.
+// 정규식으로 원문을 직접 자르지 않는 이유가 이것이다: ';' 뒤에 주석이 붙으면 /;\s*$/는 매치되지
+// 않고, 반대로 리터럴 끝의 ';'를 매치할 수도 있다. 경계 판정은 스캐너 한 곳에서만 한다.
+// 잘라내지 않고 공백으로 바꾸는 이유: 뒤에 남은 주석은 Oracle이 그대로 받아들이고,
+// 인덱스를 보존하면 오류 메시지의 문자 위치가 등록 SQL과 계속 일치한다.
+function executableSql(raw, text) {
+  const last = text.trimEnd().length - 1;   // 마지막 코드 문자의 인덱스 (원문과 같다)
+  return last >= 0 && text[last] === ';'
+    ? `${raw.slice(0, last)} ${raw.slice(last + 1)}`
+    : raw;
 }

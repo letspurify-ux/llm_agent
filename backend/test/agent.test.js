@@ -5,7 +5,7 @@
 // 어느 쪽도 오류를 남기지 않아 로그로는 알 수 없다. 테스트가 유일한 방어선이다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { loopGuard, paramKey, normalizeChat, truncatedBinds } from '../src/agent.js';
+import { loopGuard, paramKey, normalizeChat, truncatedBinds, fallbackAnswer } from '../src/agent.js';
 import { MAX_CHAT_TURNS, MAX_CHAT_LEN, TRUNC_MARK } from '../src/constants.js';
 
 const ran = (name, params, rows = [{ A: 1 }]) => ({ query_name: name, params, rows, totalRows: rows.length });
@@ -58,6 +58,17 @@ test('키 순서가 달라도 같은 실행으로 본다', () => {
 test('쉼표가 든 키가 순서 판정을 흔들지 않는다', () => {
   // 비교 함수 없는 sort는 [k,v]를 이어붙인 문자열을 기준으로 삼아 입력 순서에 좌우된다.
   assert.equal(paramKey(null, { 'a,z': 1, b: 2 }), paramKey(null, { b: 2, 'a,z': 1 }));
+});
+
+test('프로토타입 멤버와 겹치는 바인드명이 실행 판정을 어긋내지 않는다', () => {
+  // params?.['__proto__']가 값 대신 Object.prototype을 돌려주면 '값 없음'이 다른 문자열로 굳어,
+  // 같은 '값 없음' 상태 둘이 서로 다른 실행으로 보인다 — 가드가 그 경로에서만 무력해진다.
+  // 실행 경계(oracle.js)와 Mock(llm.js)이 이미 소유 키 기준인데 여기만 체인을 타고 있었다.
+  assert.equal(paramKey(['__proto__'], {}), paramKey(['__proto__'], undefined));
+  assert.equal(paramKey(['toString'], {}), paramKey(['toString'], { other: 1 }));
+  // 반대 방향 — 실제로 채워진 값은 '값 없음'과 구분되어야 한다
+  assert.notEqual(paramKey(['__proto__'], Object.fromEntries([['__proto__', 'V1']])), paramKey(['__proto__'], {}));
+  assert.notEqual(paramKey(['toString'], { toString: 'x' }), paramKey(['toString'], {}));
 });
 
 test('첫 실패는 재시도를 허용하고 반복 실패만 막는다', () => {
@@ -159,4 +170,35 @@ test('내용이 빈 대화 턴은 프롬프트에 실리지 않는다', () => {
     normalizeChat(mixed).map(m => m.text),
     Array.from({ length: MAX_CHAT_TURNS }, (_, i) => `질문${i}`)
   );
+});
+
+test('프로토타입 멤버와 겹치는 바인드명이 잘린 값 가드를 어긋내지 않는다', () => {
+  // params?.[n]으로 읽으면 이 가드에서만 '소유 키만 본다'는 전제가 깨진다.
+  // 지금은 Object.prototype에 문자열 멤버가 없어 무해하지만, 전제가 갈라진 채로 남으면
+  // 값을 하나 더 보게 되는 순간 이 경로에서만 조용히 어긋난다 (constants.ownProp).
+  const history = [{ rows: [{ A: `조각${TRUNC_MARK}` }] }];
+  assert.deepStrictEqual(truncatedBinds(history, ['toString', '__proto__'], {}), [],
+    '값이 없는 바인드가 프로토타입 멤버 때문에 잘린 값으로 잡히면 안 된다');
+  assert.deepStrictEqual(
+    truncatedBinds(history, ['__proto__'], Object.fromEntries([['__proto__', '조각']])), ['__proto__'],
+    '소유 키로 실제 담긴 잘린 조각은 그대로 걸러야 한다');
+});
+
+// ===== LLM이 끝내 결정을 내지 못했을 때 (fallbackAnswer) =====
+// 두 방향으로 조용히 깨진다: 표시 없이 조립해 내보내면 'LLM이 죽었다'가 화면에서도 chat_log에서도
+// 사라지고(정상 답변과 글자 그대로 구분되지 않는다), 조립을 포기하면 이미 조회해둔 결과가 버려진다.
+
+test('폴백 답변은 조립된 답이라는 사실을 함께 알린다', () => {
+  const a = fallbackAnswer({
+    knowledge: [{ title: '배치 재시작 방법', content: 'restart_batch.sh 를 실행한다' }],
+    history: [],
+  });
+  assert.match(a, /^\*LLM 응답을 받지 못해/, 'LLM 실패가 화면에서 사라지면 안 된다');
+  assert.match(a, /restart_batch\.sh/, '손에 든 지식·조회 결과는 그대로 살려야 한다');
+});
+
+test('조립할 것이 하나도 없으면 실패만 알린다', () => {
+  const a = fallbackAnswer({ knowledge: [], history: [] });
+  assert.match(a, /LLM 호출에 실패/);
+  assert.ok(!a.includes('정리한 답변'), '조립한 것이 없는데 조립했다고 말하면 안 된다');
 });

@@ -9,7 +9,7 @@
 // agent.js는 provider가 바뀌어도 변경되지 않는다.
 import { openaiDecide } from './llm-openai.js';
 import { bindNames } from './sql.js';
-import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, clipText, nameKey } from './constants.js';
+import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, clipText, nameKey, ownProp } from './constants.js';
 import { rowCounts } from './result.js';
 
 export const llm = {
@@ -96,9 +96,24 @@ function plannedQueries(qaMethods, queries) {
 }
 
 // mock 전용 하드코딩 규칙 — 실제 LLM은 질문 문맥에서 스스로 값을 추출한다.
+//
+// 규칙이 좁으면 '값을 못 뽑는다'로 끝나지 않는다는 점이 중요하다. 아래 fillParams가 현재 질문에서
+// 못 뽑으면 이전 질문으로 넘어가 거기서 뽑으므로, 대상만 바꿔 묻는 후속 질문이 직전 대상의
+// 결과로 답변된다 — "홍길동 고객 주문 상태 알려줘" 다음 "그럼 김철수는?"이 홍길동의 주문 표를
+// 붙여 답하고 있었다(실측). 조회는 성공하고 오류도 없어서 사용자도 chat_log도 그것이 다른
+// 사람의 답이라는 사실을 알 방법이 없다 — 이 코드베이스가 가장 나쁜 실패로 보는 형태다.
+// 그래서 '이름 + 조사'라는 한국어 후속 질문의 기본형까지 규칙에 넣는다.
+//
+// 넓혀서 엉뚱한 명사가 잡히는 쪽은 감수한다: 그 경우 조회가 0건이 되어 "결과가 없습니다"로
+// 화면에 드러나므로, 조용한 오답 대신 소리 나는 빈 결과가 된다.
+// (?<![가-힣])와 (?![가-힣])는 조사처럼 보이는 글자가 낱말 가운데에 걸리지 않게 경계를 잡는다.
+const CUSTOMER_NAME_RE =
+  /([가-힣]{2,4})\s*(?:고객|님)|(?<![가-힣])([가-힣]{2,4})(?:은|는|이|가|의)(?![가-힣])/;
+
 const PARAM_RULES = {
   job_id: q => (q.match(/\b[A-Z]{2,}\d+\b/) || [])[0],
-  customer_name: q => (q.match(/([가-힣]{2,4})\s*(?:고객|님)/) || [])[1],
+  // 대안이 둘이라 캡처 그룹도 둘이다 — 먼저 맞은 쪽을 쓴다('홍길동 고객' / '김철수는').
+  customer_name: q => { const m = q.match(CUSTOMER_NAME_RE); return m ? (m[1] ?? m[2]) : undefined; },
 };
 
 // 바인드 값 채우기: ① 이전 쿼리 결과의 컬럼명 매칭(대소문자 무시) → multi-step 연결
@@ -113,11 +128,12 @@ function fillParams(registryRow, ctx) {
 
   for (const name of bindNames(registryRow.query_sql)) {
     let value = valueFromHistory(name, ctx.history);
-    // 소유 키만 본다 — 바인드명이 '__proto__' 같은 프로토타입 멤버와 겹치면 함수가 아닌 값을
-    // 호출하다 결정 루프 전체가 죽는다 (oracle.js mockResult와 같은 이유·같은 방식).
-    if (value === undefined && Object.hasOwn(PARAM_RULES, name)) {
+    // 소유 키만 본다 (constants.ownProp) — 바인드명이 '__proto__' 같은 프로토타입 멤버와 겹치면
+    // 함수가 아닌 값을 호출하다 결정 루프 전체가 죽는다 (oracle.js mockResult와 같은 이유·같은 방식).
+    const rule = ownProp(PARAM_RULES, name);
+    if (value === undefined && rule) {
       for (const t of texts) {
-        value = PARAM_RULES[name](t);
+        value = rule(t);
         if (value !== undefined) break;
       }
     }
@@ -207,8 +223,11 @@ const cell = v => String(v ?? '')
   .replace(/\|/g, '\\|')
   .replace(/\r?\n/g, ' ');
 
+// 컬럼은 모든 행의 합집합으로 잡는다(등장 순서 유지). 첫 행만 보면 뒤 행에만 있는 컬럼의 값이
+// 표에서 조용히 사라진다 — 드라이버가 주는 행은 보통 동종이지만, 값이 사라지는 실패는 오류를
+// 남기지 않아 답변을 읽는 쪽에서 확인할 방법이 없다. 없는 컬럼은 빈 칸으로 채운다.
 function rowsToMarkdownTable(rows) {
-  const cols = Object.keys(rows[0]);
+  const cols = [...new Set(rows.flatMap(r => Object.keys(r)))];
   return [
     `| ${cols.map(cell).join(' | ')} |`,
     `| ${cols.map(() => '---').join(' | ')} |`,

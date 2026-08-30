@@ -9,7 +9,7 @@ import {
   MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK,
   MAX_PROMPT_ITEM_LEN, MAX_PROMPT_SQL_LEN, MAX_PROMPT_STEP_LEN,
   MAX_PROMPT_PARAMS_LEN, MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS,
-  clipText,
+  clipText, warnOnce,
 } from './constants.js';
 import { bindNames } from './sql.js';
 import { rowCounts } from './result.js';
@@ -40,6 +40,7 @@ let effortAccepted = REASONING_EFFORT !== null;
 const SYSTEM_PROMPT = `당신은 사내 지식 관리 및 DB 조회 Q&A 에이전트다.
 사용자 질문과 함께 관련 지식, Q&A 처리 방법, 실행 가능한 쿼리 목록, 지금까지의 쿼리 실행 이력이 주어진다.
 반드시 아래 두 형식 중 하나의 JSON 객체 하나만으로 응답하라. 다른 텍스트를 붙이지 마라.
+생각을 적어야 한다면 <think> 와 </think> 사이에만 적어라. 그 블록 밖에는 위 JSON 하나만 남긴다.
 
 1. 답변 전에 DB 조회가 더 필요하면:
 {"action":"run_query","query_name":"<쿼리이름>","params":{"<바인드변수명>":"<값>"}}
@@ -327,21 +328,35 @@ export function buildPrompt(ctx) {
   return lines.join('\n');
 }
 
-// 응답 텍스트에서 최상위 {…} 덩어리를 순서대로 뽑는다.
+// ===== 응답 텍스트 → 결정 JSON =====
+//
+// 응답에서 최상위 {…} 덩어리를 뽑아 결정을 고른다.
 // "첫 '{'부터 마지막 '}'까지"로 자르면 JSON 바깥에 중괄호가 하나만 있어도 슬라이스가 JSON이 아니게 된다
 // (추론 모델의 <think> 블록, JSON 뒤에 붙는 설명문, 계획+결정 두 덩어리 — 전부 실제로 나오는 형태다).
 // 그러면 정상 응답이 파싱 실패로 버려지고, temperature=0이라 재시도도 같은 응답을 받아 똑같이 실패한다.
-// 추론 모델의 사고 과정 블록을 먼저 걷어낸다. 그 안에는 "일단 {…}로 해볼까, 아니다" 식의
-// 초안 JSON이 들어 있는 일이 있어, 남겨두면 초안이 최종 결정보다 먼저 잡힌다.
-// 세 가지 형태를 모두 다룬다:
+//
+// 사고 과정(<think>) 블록도 가려내야 한다. 그 안에는 "일단 {…}로 해볼까, 아니다" 식의 초안 JSON이
+// 들어 있는 일이 있어, 그냥 두면 초안이 최종 결정보다 먼저 잡힌다. 세 형태가 실제로 나온다:
 //   ① <think>…</think>  짝이 맞는 경우
 //   ② …</think>         Qwen3·R1 계열의 기본 채팅 템플릿은 <think>를 프롬프트에 미리 붙이므로
 //                       content에는 닫는 태그만 온다 — 이 형태가 오히려 더 흔하다
 //   ③ <think>…(끝)      토큰 한도로 잘려 닫히지 않은 경우
-const stripReasoning = text => text
-  .replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, ' ')
-  .replace(/^[\s\S]*?<\/think>/i, ' ')
-  .replace(/<think\b[^>]*>[\s\S]*$/i, ' ');
+//
+// 핵심은 사고 과정을 '텍스트에서 지우지 않고' 인덱스 구간으로만 다룬다는 것이다.
+// 지우는 방식은 태그가 JSON 문자열 안에 있는 경우와 진짜 태그를 구분할 수 없어, 모델이 답변 본문에
+// 태그 문자열을 쓰는 순간(그 태그가 무엇인지 묻는 질문 등) 양방향으로 깨졌다:
+//   {"answer":"<think> 는 …"}      → 태그부터 끝까지 지워져 JSON이 깨지고 결정이 통째로 사라진다
+//   {"answer":"<think>x</think>"}  → 본문만 도려낸 채 '정상 결정'으로 나간다
+// 뒤쪽이 특히 나쁘다 — 훼손된 답변이 오류도 재시도도 없이 그대로 사용자에게 간다.
+// 앞쪽도 temperature=0이라 재시도가 같은 응답을 받아 똑같이 실패한다.
+// (닫는 태그만 되돌려 보는 식으로 한 갈래씩 막으면 나머지 갈래가 그대로 남는다.)
+//
+// 원문을 건드리지 않으면 후보 JSON은 언제나 온전하고, 판정은 '어디에서 시작하는가'만 본다.
+// 두 사실이 태그와 본문을 정확히 갈라준다:
+//   ⓐ 유효한 JSON에서 '<'는 문자열 리터럴 안에만 올 수 있다 → 파싱되는 후보 객체의 span 안에 든
+//      태그는 태그가 아니라 answer 본문의 글자다 (span 포함 여부만으로 판정된다).
+//   ⓑ 그렇게 걸러낸 진짜 태그로만 사고 과정 구간을 계산하면, 그 구간 밖에서 시작하는 후보가
+//      곧 모델이 최종적으로 내놓은 결정이다.
 
 // text[start]가 '{'일 때 짝이 되는 '}'의 인덱스 (없으면 -1).
 // 문자열 리터럴 안의 중괄호·따옴표는 세지 않는다 — answer 본문에 '{'가 들어갈 수 있다.
@@ -378,33 +393,264 @@ const MAX_JSON_CANDIDATES = 100;
 // 통째로 떨어뜨린다. 모델이 JSON을 6칸 이상 들여쓰면 후보가 0건이 되고, 제대로 답한 응답이
 // '결정 JSON을 찾지 못함'으로 버려진다 (temperature=0이라 재시도도 같은 응답을 받아 똑같이 실패한다).
 // 전역 정규식으로 한 번에 훑으면 들여쓰기 길이와 무관하고 전체 비용도 선형이다.
-// lastIndex를 공유하면 제너레이터가 겹칠 때 서로의 탐색 위치를 밟으므로 호출마다 새로 만든다.
-function* jsonObjects(text) {
+// lastIndex를 공유하면 호출이 겹칠 때 서로의 탐색 위치를 밟으므로 호출마다 새로 만든다.
+//
+// 반환은 원문 인덱스가 붙은 span이다 — 잘라낸 문자열만 넘기면 '어디에서 시작하는가'를 잃고,
+// 이 파일이 사고 과정을 위치로 판정하는 근거가 통째로 사라진다.
+//
+// 상한은 zoneOf가 나눠주는 '구역별로' 센다. 지우는 방식에서는 사고 과정이 텍스트에서 사라져
+// 후보로 세어질 일 자체가 없었는데, 위치로 다루면 그 안의 '{"'도 전부 후보 자리에 들어온다 —
+// 한 통에 세면 '{"'가 잔뜩 든 장황한 사고 과정 하나가 상한을 다 먹어 그 뒤의 진짜 결정에
+// 닿지 못한다. 구역마다 따로 세면 어느 구역이 시끄럽든 다른 구역의 몫은 그대로 남는다.
+// zoneOf가 '구간 종류'가 아니라 '구간 자체'를 돌려줘야 그 말이 성립한다 (parseDecision 참고).
+//
+// zoneOf는 '예산을 어느 통에서 빼는가'만 정한다 — 어떤 후보도 여기서 탈락시키지 않는다.
+// 구역을 나누는 근거(잠정 구간)는 아직 마스킹을 거치지 않은 것이라, 그것으로 후보를 빼버리면
+// 마스킹이 그 구간을 지워줄 기회 자체가 사라진다: 결정 앞에 놓인 JSON 하나가 문자열 안에
+// '<think>'를 담고 있으면(형식 예시 등) 그 뒤 전부가 사고 과정으로 보여 진짜 결정이 후보에도
+// 오르지 못한다. 비용 문제(예산)와 채택 문제(구간)를 한 함수에 섞으면 정확히 이렇게 깨진다.
+function jsonSpans(text, zoneOf) {
+  const spans = [];
+  const left = new Map();
   const candidate = /\{\s*"/g;
-  for (let tried = 0, m; tried < MAX_JSON_CANDIDATES && (m = candidate.exec(text)); tried++) {
+  for (let m; (m = candidate.exec(text)); ) {   // exec가 위치를 옮기므로 반드시 끝난다
+    const zone = zoneOf(m.index);
+    const budget = left.get(zone) ?? MAX_JSON_CANDIDATES;
+    if (budget === 0) continue;
+    left.set(zone, budget - 1);
     const end = matchingBrace(text, m.index);
-    if (end > 0) yield text.slice(m.index, end + 1);
+    if (end > 0) spans.push({ start: m.index, end });
+  }
+  return spans;
+}
+
+// 파싱까지 끝난 후보 — 태그 마스킹(ⓐ)과 결정 선택(ⓑ)이 반드시 같은 목록을 봐야 한다.
+// 두 곳이 각자 파싱하면 "이 태그는 본문 안"과 "이 후보는 결정"이 서로 다른 근거 위에 서게 된다.
+function parsedObjects(text, zoneOf) {
+  const out = [];
+  for (const { start, end } of jsonSpans(text, zoneOf)) {
+    try {
+      out.push({ start, end, value: JSON.parse(text.slice(start, end + 1)) });
+    } catch { /* JSON이 아닌 중괄호 덩어리 — 다음 후보로 */ }
+  }
+  return out;
+}
+
+// 정렬된 비겹침 구간 목록에서 i를 담는 구간(없으면 null). 반열림 [start, end).
+// 이분 탐색이어야 한다 — 선형으로 훑으면 조회 수 × 구간 수가 되고, 둘 다 응답 길이에 비례해
+// 커질 수 있다. '</think>{"…}' 가 번갈아 5만 번 들어온 응답 하나로 실측 11.5초였다:
+// MAX_JSON_CANDIDATES가 막으려던 것과 같은 종류의 실패(요청 하나가 이벤트 루프를 붙잡아
+// 동시에 처리 중인 모든 요청을 멈춘다)가 구간 쪽 문으로 그대로 되살아난다.
+function rangeAt(ranges, i) {
+  let lo = 0, hi = ranges.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const r = ranges[mid];
+    if (i < r.start) hi = mid - 1;
+    else if (i >= r.end) lo = mid + 1;
+    else return r;
+  }
+  return null;
+}
+
+// 객체 span을 비겹침 목록으로 합친다 — 이분 탐색의 전제(정렬·비겹침)를 만들기 위해서다.
+// span이 겹치는 경우는 중첩 객체뿐이고(안쪽은 바깥쪽이 닫히기 전에 닫힌다) 목록은 이미
+// 시작 위치 오름차순이므로, 앞의 것과 닿으면 끝을 넓히는 한 번의 훑기로 충분하다.
+function mergeSpans(objects) {
+  const merged = [];
+  for (const o of objects) {
+    const last = merged[merged.length - 1];
+    if (last && o.start <= last.end) last.end = Math.max(last.end, o.end);
+    else merged.push({ start: o.start, end: o.end });
+  }
+  return merged;
+}
+
+// span '안'은 여는 중괄호와 닫는 중괄호 '사이'다 — 경계는 중괄호 자신이라 태그가 놓일 수 없다.
+const insideSpans = (merged, i) => {
+  const r = rangeAt(merged, i);
+  return r !== null && i > r.start;
+};
+
+// 태그 안(<think 와 > 사이)에서 허용하는 문자와 그 길이 상한.
+//
+// '<'를 빼는 것이 핵심이다. 속성에 raw '<'가 오는 태그는 없는데, 허용하면 매치가 태그 경계를 넘어
+// 다음 태그를 통째로 삼킨다: `<think 태그를 물었다</think>` 가 통째로 '여는 태그 하나'로 잡혀
+// 진짜 닫는 태그가 사라지고, 닫히지 않은 블록(③)이 되어 그 뒤의 정상 결정이 통째로 버려진다.
+// 하필 이 파일이 지키려는 바로 그 상황에서 터진다 — 사용자가 think 태그를 물으면 모델의 사고
+// 과정이 자연스럽게 '<think'를 언급하고, 그 언급은 JSON 밖이라 마스킹도 구해주지 못한다.
+// (실측: 같은 문장에서 '<think' 언급만 빼면 정상 동작했다.)
+//
+// 길이 상한이 없으면(`*`) '>'가 없는 입력에서 매 '<think'마다 남은 텍스트를 끝까지 훑고
+// 되돌아온다 — 시작점 수 × 길이라 정확히 이차다(ReDoS). 실측: '<think'만 반복한 응답이 94KB에서
+// 578ms, 크기를 2배로 하면 시간은 4배가 되어 1MB면 1분을 넘긴다. temperature=0에서 모델이 같은
+// 토큰을 반복하는 퇴화한 응답은 실제로 나오고, 그 한 건이 동시에 처리 중인 모든 요청을 그만큼
+// 멈춰 세운다 (MAX_JSON_CANDIDATES가 막으려던 것과 같은 종류의 실패다).
+// 상한을 두면 되돌아오는 폭이 상수라 전체가 선형이 된다(같은 입력 3ms). 실제 템플릿이 내는 태그는
+// '<think>'·'</think>' 그대로이고 속성이 붙어도 짧다 — 100자면 개입하지 않는다.
+// '{'와 '}'도 같은 이유로 뺀다. 속성에 중괄호가 오는 태그는 없는데, 허용하면 매치가 결정 JSON
+// 안으로 들어가 그 안의 '>'를 태그의 끝으로 삼는다: `설명: <think 태그입니다. {"…"a>b"}` 에서
+// `<think … a>` 까지가 '여는 태그'가 되어 닫히지 않은 블록(③)이 되고, 뒤의 정상 결정이 버려진다.
+// ('>'가 답변 본문에 들어가는 것은 흔하다 — 마크다운 인용, '->', HTML 예시.)
+//
+// 상한을 넘거나 '<'·'{'·'}'를 만난 것은 태그로 보지 않는다: '>' 없는 '<think'를 태그로 치지 않는
+// 지금 동작과 같다. (반대로 '미완성 여는 태그'로 취급하면, 산문에서 태그 이름을 언급한 질문의
+// 정상 답변이 통째로 사고 과정으로 몰려 버려진다.)
+const MAX_TAG_ATTR_LEN = 100;
+
+// 사고 과정 블록에 쓰이는 태그 이름. '<think>'만 보면 다른 표기를 쓰는 모델에서 초안이 그대로
+// 결정으로 새어 나온다 — 블록이 인식되지 않으니 그 안의 JSON이 '사고 과정 밖'으로 분류되고,
+// 후보 중 처음이라 진짜 결정보다 먼저 채택된다(실측: 검토하다 접은 run_query가 실행됐다).
+// LLM_MODEL은 설정으로 바뀌고 시스템 프롬프트가 사고 과정 표기를 지정하지도 않으므로, 어떤 표기가
+// 올지는 이쪽이 정할 수 없다. 초안을 실행하는 것보다 결정을 못 찾는 편이 낫다는 이 파일의 기준대로,
+// 널리 쓰이는 표기를 모두 사고 과정으로 본다.
+// 긴 이름을 앞에 둔다 — 뒤의 \b가 'think'와 'thinking'을 갈라주지만 순서가 분명한 편이 읽기 좋다.
+const REASONING_TAGS = ['thinking', 'think', 'reasoning', 'reflection', 'scratchpad', 'thought'];
+
+const thinkTagRe = () => {
+  const name = `(?:${REASONING_TAGS.join('|')})`;
+  const attr = `[^<>{}]{0,${MAX_TAG_ATTR_LEN}}`;
+  return new RegExp(`<${name}\\b${attr}>|</${name}\\b${attr}>`, 'gi');
+};
+
+// ===== 모르는 사고 과정 표기 감지 =====
+//
+// 위 목록 밖의 표기를 쓰는 모델에서는 사고 과정 블록이 인식되지 않는다. 그러면 그 안의 초안이
+// '사고 과정 밖'으로 분류돼 후보 중 처음이라 진짜 결정보다 먼저 채택된다 — 모델이 검토하다 접은
+// 쿼리가 실제로 실행되고, 그 결과가 최종 답변의 근거가 된다.
+// 문제는 그 실패가 '정상 응답'처럼 보인다는 것이다: 결정 JSON은 멀쩡하고, 오류도 재시도도 없다.
+// 시스템 프롬프트로 <think> 표기를 지정하지만 사고 과정 태그는 대개 모델의 채팅 템플릿이 붙이는
+// 것이라 지시로 완전히 통제되지 않는다 — LLM_MODEL도 설정으로 바뀐다.
+// 그래서 '모르는 표기가 왔다'는 사실만은 반드시 소리가 나게 한다. 무엇을 지원해야 하는지
+// (REASONING_TAGS에 무엇을 더해야 하는지) 알 수 있는 단서는 이 로그뿐이다.
+//
+// 마커 후보를 넓게 훑되 길이 상한을 둔다 — 태그 정규식과 같은 이유로 되돌아오는 폭을 상수로 묶어
+// 전체를 선형으로 유지한다. 특수 토큰(<|…|>)과 일부 모델이 쓰는 ◁…▶ 형태까지 본다.
+const MARKER_RE = () => new RegExp(
+  `<\\|[^|<>]{0,${MAX_TAG_ATTR_LEN}}\\|>` +          // <|thinking|>, <|begin_of_thought|>
+  `|◁[^◁▶]{0,${MAX_TAG_ATTR_LEN}}▶` +               // ◁think▶
+  `|</?[A-Za-z][^<>{}]{0,${MAX_TAG_ATTR_LEN}}>`,    // <thoughts>, <analysis>
+  'g');
+// 마커 이름이 '생각'을 가리키는지 — 무관한 XML 태그(<b>, <br/>)까지 알리면 로그만 시끄러워진다.
+const REASONING_WORD = /think|thought|reason|reflect|scratch|analysis|monologue/i;
+// 이미 다루는 표기인지 (부분이 아니라 마커 전체가 우리 태그여야 한다)
+const handledTagRe = () => new RegExp(
+  `^</?(?:${REASONING_TAGS.join('|')})\\b[^<>{}]{0,${MAX_TAG_ATTR_LEN}}>$`, 'i');
+
+// insideDecision(i): 그 위치가 파싱된 결정 JSON 안인지. 답변 본문이 태그를 '설명'하는 경우
+// (이 파일이 지키려는 바로 그 상황)까지 경고하면 진짜 신호가 묻힌다.
+function warnUnknownReasoningMarkup(content, insideDecision) {
+  const handled = handledTagRe();
+  for (const m of content.matchAll(MARKER_RE())) {
+    if (!REASONING_WORD.test(m[0]) || handled.test(m[0]) || insideDecision(m.index)) continue;
+    warnOnce('llm',
+      `unrecognized reasoning markup ${JSON.stringify(m[0])} — this model's reasoning block is not ` +
+      `being separated from its decision, so a discarded draft can be executed. ` +
+      `Add the tag name to REASONING_TAGS in llm-openai.js if this is a reasoning marker.`);
+    return; // 한 종류만 알리면 충분하다 — 나머지는 그 표기를 지원한 뒤 다시 드러난다
   }
 }
 
-// 후보 중 '처음' 유효한 결정을 채택한다.
-// 모델이 결정을 먼저 내고 뒤에 설명이나 예시를 붙이는 쪽이 훨씬 흔하다 —
-// 마지막을 고르면 '예시 형식: {"action":"answer","answer":"..."}' 한 줄이 진짜 결정을 덮어써서
-// 실행돼야 할 쿼리가 실행되지 않고 사용자에게 예시 문자열이 답변으로 나간다 (오류 흔적도 남지 않는다).
-// 반대 방향(사고 과정 속 초안이 먼저 잡히는 것)은 위 stripReasoning이 막는다.
-function parseDecision(content, forceAnswer) {
-  for (const raw of jsonObjects(stripReasoning(content))) {
-    let d;
-    try {
-      d = JSON.parse(raw);
-    } catch {
-      continue; // JSON이 아닌 중괄호 덩어리 — 다음 후보로
+// 사고 과정 구간 목록. masked(i)가 참인 태그는 태그로 세지 않는다(ⓐ).
+//   explicit — 여는 태그가 실제로 있다(① 짝이 맞거나 ③ 닫히지 않았다). 그 안의 JSON은 초안이다.
+//   assumed  — 닫는 태그만 왔다(②). "여는 태그가 프롬프트에 있었다"는 추정이라 틀릴 수 있다.
+// 이 구분이 곧 아래 선택 순위의 근거다.
+function reasoningRegions(text, masked) {
+  const regions = [];
+  let depth = 0, openStart = -1, cursor = 0;
+  for (const m of text.matchAll(thinkTagRe())) {
+    if (masked(m.index)) continue;
+    const end = m.index + m[0].length;
+    const closing = m[0][1] === '/';
+    // '<think/>' — 내용이 없는 빈 블록이다. 여는 태그로 세면 영영 닫히지 않아(③) 그 뒤 전부가
+    // 사고 과정이 되고, 그 응답의 결정이 통째로 버려진다. 모델이 이 표기를 한 번 쓰기 시작하면
+    // 모든 질문이 같은 이유로 실패하는데, 화면에는 'LLM 호출 실패' 한 줄만 나가 원인이 보이지 않는다.
+    // 빈 블록은 구간에 아무것도 보태지 않으므로 그냥 건너뛴다 (cursor도 그대로 두어,
+    // 뒤에 닫는 태그가 오면 이 자리까지 포함해 보수적으로 잡는다).
+    if (!closing && m[0].endsWith('/>')) continue;
+    if (!closing) {                        // 여는 태그
+      if (depth === 0) openStart = m.index;
+      depth++;
+    } else if (depth === 0) {              // ② 여는 태그 없이 닫는 태그만 — 직전 구간 뒤부터가 사고 과정이다
+      regions.push({ start: cursor, end, kind: 'assumed' });
+      cursor = end;
+    } else if (--depth === 0) {            // ① 짝이 맞는 블록
+      regions.push({ start: openStart, end, kind: 'explicit' });
+      cursor = end;
     }
-    // 빈 answer는 결정으로 보지 않는다 — 화면에 빈 말풍선이 뜨고, 그 빈 턴이 다음 질문의 맥락으로
-    // 서버에 되돌아온다. 형식만 맞고 내용이 없는 응답은 실패로 처리하는 편이 낫다.
-    if (d.action === 'answer' && typeof d.answer === 'string' && d.answer.trim()) return d;
-    if (!forceAnswer && d.action === 'run_query' && typeof d.query_name === 'string' && d.query_name.trim()) {
-      return { action: 'run_query', query_name: d.query_name, params: d.params || {} };
+  }
+  // ③ 토큰 한도로 잘려 닫히지 않았다 — 남은 전부가 사고 과정이다
+  if (depth > 0) regions.push({ start: openStart, end: text.length, kind: 'explicit' });
+  return regions;
+}
+
+// 결정 형식 검증. 빈 answer는 결정으로 보지 않는다 — 화면에 빈 말풍선이 뜨고, 그 빈 턴이
+// 다음 질문의 맥락으로 서버에 되돌아온다. 형식만 맞고 내용이 없는 응답은 실패로 처리하는 편이 낫다.
+// answerOnly면 run_query를 결정으로 받지 않는다 — 강제 답변 단계(더 이상 조회할 수 없다)와
+// 아래 2순위 채택(조회까지 맡기기에는 근거가 약하다)이 같은 판정을 쓴다.
+function toDecision(d, answerOnly) {
+  if (!d || typeof d !== 'object') return null;
+  if (d.action === 'answer' && typeof d.answer === 'string' && d.answer.trim()) return d;
+  if (!answerOnly && d.action === 'run_query' && typeof d.query_name === 'string' && d.query_name.trim()) {
+    return { action: 'run_query', query_name: d.query_name, params: d.params || {} };
+  }
+  return null;
+}
+
+function parseDecision(content, forceAnswer) {
+  // 1) 마스킹 전 위치로 잡은 잠정 구간 — 오직 후보 예산을 나누는 데만 쓴다.
+  //    아직 "본문 속 태그"를 걸러내기 전이라 이 구간은 틀릴 수 있다. 채택 여부는 반드시
+  //    2)의 마스킹된 구간으로만 판정한다 (여기서 후보를 빼면 마스킹이 일할 기회가 사라진다).
+  const provisional = reasoningRegions(content, () => false);
+  //    예산 통은 '구간 종류'가 아니라 '구간 자체'로 나눈다. kind로 묶으면 통이 explicit/assumed
+  //    두 개뿐이라, 후보가 잔뜩 든 구간 하나가 같은 종류의 '다른' 구간 몫까지 먹는다. 그 다른
+  //    구간에 진짜 결정이 있으면 후보로 오르지도 못해 '결정 JSON을 찾지 못함'이 된다 — 실측:
+  //    닫는 태그만 오는 구간(②)이 둘 이어지고 뒤 구간에 결정이 있는 응답에서 null이 나왔다.
+  //    ②는 Qwen3·R1 기본 템플릿에서 가장 흔한 형태이므로 드문 조합이 아니다.
+  //    구간 객체는 이 호출 안에서만 살고 서로 구별되므로 그대로 Map 키로 쓴다.
+  const OUTSIDE = 'outside';   // 구간 밖은 하나의 통 (문자열이라 구간 객체와 섞이지 않는다)
+  const zoneOf = i => rangeAt(provisional, i) ?? OUTSIDE;
+
+  // 2) 후보를 원문 그대로 뽑아 파싱하고, 그 span 안에 든 태그는 태그가 아니라 본문으로 본다(ⓐ).
+  const objects = parsedObjects(content, zoneOf);
+  const objectSpans = mergeSpans(objects);
+  const regions = reasoningRegions(content, i => insideSpans(objectSpans, i));
+
+  // 모르는 표기가 왔다는 사실만은 소리 나게 한다 — 이 실패는 '정상 응답'처럼 보여
+  // 로그가 유일한 단서다 (warnUnknownReasoningMarkup 주석 참고).
+  // JSON 안의 마커는 답변 본문이 태그를 설명하는 것이므로 세지 않는다.
+  warnUnknownReasoningMarkup(content, i => insideSpans(objectSpans, i));
+
+  // 3) 후보를 위치로 나눈다(ⓑ).
+  //    1순위 = 사고 과정 밖. 2순위 = assumed 구간(②) 안 — 그 추정이 틀렸을 때(모델이 답변에
+  //    '</think>'를 쓴 경우처럼) 제대로 답한 응답을 통째로 버리지 않기 위한 뒷문이다.
+  //    explicit 구간(①③) 안의 JSON은 어느 순위에도 넣지 않는다: 여는 태그가 실제로 있었으니
+  //    그 안은 초안이고, 초안을 결정으로 내보내는 것은 결정을 못 찾는 것보다 나쁘다
+  //    (잘린 응답이 그대로 쿼리 실행으로 이어진다).
+  const outside = [], assumed = [];
+  for (const o of objects) {
+    const r = rangeAt(regions, o.start);
+    if (!r) outside.push(o);
+    else if (r.kind === 'assumed') assumed.push(o);
+  }
+
+  // 순위 안에서는 '처음' 유효한 결정을 채택한다. 모델이 결정을 먼저 내고 뒤에 설명이나 예시를
+  // 붙이는 쪽이 훨씬 흔하다 — 마지막을 고르면 '예시 형식: {"action":"answer","answer":"..."}'
+  // 한 줄이 진짜 결정을 덮어써서, 실행돼야 할 쿼리가 실행되지 않고 예시 문자열이 답변으로 나간다
+  // (오류 흔적도 남지 않는다).
+  //
+  // 2순위에서는 run_query를 받지 않는다. 2순위는 '사고 과정일 것'이라고 본 구간 안에서 꺼내 오는
+  // 뒷문이라 그 JSON이 초안일 가능성이 남아 있고, 손해가 양쪽으로 전혀 다르다:
+  //   answer    — 최악이라도 사용자가 덜 다듬어진 답변을 본다.
+  //   run_query — 모델이 검토하다 접은 쿼리를 조회대상 DB에 실제로 실행하고, 그 결과가 다시
+  //               최종 답변의 근거가 된다. explicit 구간(①③)에서 초안을 막는 이유가 그대로 여기에도 있다.
+  // 실제로 ②는 가장 흔한 형태이고(Qwen3·R1 기본 템플릿), 뒤쪽 응답이 잘리는 것도 흔하다 —
+  // 그 조합에서 초안 쿼리가 그대로 실행되고 있었다.
+  // 이 제한으로 잃는 것은 "run_query를 낸 뒤 뒤에 '</think>'를 언급하는 산문을 붙인 응답"뿐이다.
+  for (const [tier, answerOnly] of [[outside, forceAnswer], [assumed, true]]) {
+    for (const o of tier) {
+      const decision = toDecision(o.value, answerOnly);
+      if (decision) return decision;
     }
   }
   return null;

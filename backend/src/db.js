@@ -4,6 +4,15 @@ import { numEnv } from './constants.js';
 
 // 풀은 처음 쓸 때 만든다 — import만으로 만들면 이 모듈을 (간접적으로라도) 불러오는 모든 코드가
 // DB에 접속을 시도한다. 검색 로직만 import하는 테스트가 MariaDB 기동 여부에 따라 10초씩 매달리는 식이다.
+// 풀 크기의 근거. 셋을 따로 두는 이유는 성격이 다르기 때문이다 — 앞의 둘은 곱해지는 양이고,
+// 마지막 하나는 '짧게 빌려 쓰는' 나머지와 달리 동기화가 끝날 때까지 계속 쥐고 있는 몫이라
+// 곱셈 밖에서 더해야 한다. 이전 값(10)은 실질 동시 처리가 2건이었다.
+const CONNS_PER_REQUEST = 4;   // 요청 1건의 동시 점유 최대치 — 지식·처리방법 검색이 병렬이고
+                               // 각각 LIKE+벡터가 다시 병렬이다 (search.js hybrid).
+const CONCURRENT_REQUESTS = 4; // 이 크기로 감당하려는 동시 질문 수 (사내 Q&A 트래픽 기준).
+const RESERVED_FOR_SYNC = 1;   // embed-sync가 동기화 내내 쥐는 GET_LOCK 전용 커넥션.
+const POOL_SIZE = CONNS_PER_REQUEST * CONCURRENT_REQUESTS + RESERVED_FOR_SYNC;
+
 let pool;
 function getPool() {
   pool ??= mariadb.createPool({
@@ -12,10 +21,11 @@ function getPool() {
     user: process.env.MARIADB_USER,
     password: process.env.MARIADB_PASSWORD,
     database: process.env.MARIADB_DATABASE || 'llm_agent',
-    // 요청 1건이 최대 4개를 동시에 쥔다 (지식·처리방법 검색이 병렬, 각각 LIKE+벡터가 다시 병렬).
-    // 여기에 embed-sync가 동기화 내내 락 커넥션 1개를 계속 쥐므로, 5면 동시 사용자 2명에서
-    // 풀이 마르고 커넥터 기본 acquireTimeout(10초)에 걸려 500이 난다.
-    connectionLimit: numEnv('MARIADB_POOL_SIZE', 10),
+    // 기본값은 손으로 고른 수가 아니라 아래 세 항의 식이다 (POOL_SIZE 주석 참고) —
+    // 풀이 마르면 커넥터 기본 acquireTimeout(10초) 뒤 500이 나는데, 그 500은 '질문이 어렵다'처럼
+    // 보일 뿐 원인이 풀 크기라는 단서를 남기지 않는다. 근거를 식으로 적어두면 어느 항이
+    // 바뀌어 부족해졌는지 계산으로 확인할 수 있다.
+    connectionLimit: numEnv('MARIADB_POOL_SIZE', POOL_SIZE),
   });
   return pool;
 }

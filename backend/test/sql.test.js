@@ -85,6 +85,43 @@ test('행 잠금을 거는 조회(FOR UPDATE)는 거부한다', () => {
   accepts('SELECT for_update_yn FROM t');                            // 이름의 일부는 걸리지 않는다
 });
 
+// ===== 실행용 SQL (가드가 승인한 형태를 그대로 돌려준다) =====
+// 가드와 실행부가 각자 문자열을 손보면 판단이 갈라진다. 실제로 갈라져 있었다: 가드는 주석을
+// 지운 뒤 후행 ';'를 단일 문장으로 인정하는데 실행부는 원문에 /;\s*$/를 걸어, ';' 뒤에 주석이
+// 붙는 순간 매치가 실패해 ';'가 드라이버로 나갔다. 결과는 서버 버전에 좌우된다 —
+// Oracle 23ai는 받아주고 19c 이하는 ORA-00911로 거부하므로, 개발 컨테이너에서는 멀쩡하다가
+// 운영 DB에서만 죽는다. mock은 SQL을 실행하지 않아 재현조차 되지 않는다.
+
+test('가드가 허용한 후행 세미콜론은 실행용 SQL에서 사라진다', () => {
+  assert.equal(assertReadOnly('SELECT 1 FROM dual;'), 'SELECT 1 FROM dual ');
+  assert.equal(assertReadOnly('SELECT 1 FROM dual;\n'), 'SELECT 1 FROM dual \n');
+  // ';' 뒤에 주석이 붙는 형태 — SQL 클라이언트에서 복사해 등록하면 흔하다
+  assert.equal(assertReadOnly('SELECT 1 FROM dual; -- 복사본'), 'SELECT 1 FROM dual  -- 복사본');
+  assert.equal(assertReadOnly('SELECT 1 FROM dual; /* 메모 */'), 'SELECT 1 FROM dual  /* 메모 */');
+  assert.equal(assertReadOnly('SELECT 1 FROM dual;\n-- 메모\n'), 'SELECT 1 FROM dual \n-- 메모\n');
+});
+
+test('문장 끝이 아닌 세미콜론은 실행용 SQL에서 건드리지 않는다', () => {
+  // 리터럴·식별자·주석 안의 ';'는 코드가 아니다 — 떼어내면 값이 바뀌거나 SQL이 깨진다.
+  // 원문을 정규식으로 자르면 이 구분이 안 되므로 위치 판정은 스캐너 한 곳에서만 한다.
+  for (const sql of [
+    'SELECT 1 FROM dual',
+    "SELECT LISTAGG(name, '; ') FROM t",
+    "SELECT q'#it's; ok#' AS msg FROM dual",
+    'SELECT 1 AS "a;b" FROM t',
+    '-- comment; DELETE\nSELECT 1 FROM dual',
+    '(SELECT ORDER_ID FROM ORDERS WHERE CUSTOMER_ID = :cid) FETCH FIRST 5 ROWS ONLY',
+  ]) assert.equal(assertReadOnly(sql), sql, sql);
+});
+
+test('실행용 SQL은 그 자체로 다시 가드를 통과한다', () => {
+  // 멱등성 — 가드가 내놓은 형태에 문장 구분자가 남아 있지 않다는 것을 가드 자신으로 확인한다.
+  for (const sql of ['SELECT 1 FROM dual;', 'SELECT 1 FROM dual; -- 복사본', "SELECT LISTAGG(n, '; ') FROM t"]) {
+    const exec = assertReadOnly(sql);
+    assert.equal(assertReadOnly(exec), exec, sql);
+  }
+});
+
 test('바인드 캐시는 가장 오래 "안 쓴" 것부터 밀어낸다', () => {
   // 삽입 순서만 보고 밀어내면(FIFO) 활성 SQL이 상한을 넘는 순간 방금 쓴 항목부터 차례로
   // 밀려나 적중률이 0에 수렴한다 — 오류 없이 파싱 비용만 매 요청 되돌아온다.

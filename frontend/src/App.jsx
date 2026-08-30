@@ -44,7 +44,11 @@ const Message = memo(function Message({ role, text, trace }) {
             {trace.map((t, j) => (
               <pre key={j}>
                 {t.query_name} {JSON.stringify(t.params)}
-                {'\n'}{t.error ? `오류: ${t.error}` : `${t.rowCount}건: ${JSON.stringify(t.rows)}`}
+                {/* 조회 건수와 여기 실린 행 수는 다를 수 있다 — 몇 건을 보고 있는지 밝히지 않으면
+                    사용자가 이 표본을 전부로 읽는다 (서버 result.js clientTrace가 omittedRows를 준다) */}
+                {'\n'}{t.error
+                  ? `오류: ${t.error}`
+                  : `${t.rowCount}건${t.omittedRows ? ` (아래는 그중 ${t.rows.length}건)` : ''}: ${JSON.stringify(t.rows)}`}
               </pre>
             ))}
           </details>

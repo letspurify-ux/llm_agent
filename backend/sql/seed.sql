@@ -45,7 +45,10 @@ INSERT INTO query_registry (query_name, query_desc, input_desc, query_sql, outpu
 ON DUPLICATE KEY UPDATE query_desc = VALUES(query_desc), input_desc = VALUES(input_desc),
   query_sql = VALUES(query_sql), output_desc = VALUES(output_desc), target_db_name = VALUES(target_db_name);
 
--- qa_method 없이 단독 등록된 쿼리 — query_desc만으로 검색·선택되는 경로B 데모
+-- qa_method 없이 단독 등록된 쿼리 — query_desc만으로 검색·선택되는 경로B 데모.
+-- 주의: 이 경로는 LLM_PROVIDER=openai에서만 시연된다. Mock은 매칭된 qa_method 본문에 이름이
+-- 적힌 쿼리만 후보로 삼으므로(llm.js plannedQueries) 이 쿼리를 절대 고르지 않는다 — 오류 없이
+-- 지식만으로 답이 나간다. 아래 today_date도 같다 (README 데모 시나리오 표의 주 참고).
 INSERT INTO query_registry (query_name, query_desc, input_desc, query_sql, output_desc, target_db_name) VALUES
 ('batch_list_by_status', '특정 상태(FAILED/SUCCESS/RUNNING)인 배치 작업 전체 목록을 조회한다. "실패한 배치 다 보여줘", "지금 돌고 있는 배치 있어?" 같은 질문에 사용',
  ':status = 배치 상태 코드 (실패=FAILED, 성공=SUCCESS, 진행중=RUNNING)',

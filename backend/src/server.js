@@ -5,7 +5,7 @@ import { handleQuestion } from './agent.js';
 import { syncEmbeddings, syncSummary } from './embed-sync.js';
 import { insertChatLog, cleanupChatLogs, closePool } from './db.js';
 import { numEnv, warnOnce, MAX_QUESTION_LEN } from './constants.js';
-import { rowCounts } from './result.js';
+import { clientTrace } from './result.js';
 
 // 놓친 promise 거부는 기록만 하고 계속 진행한다 (요청 단위 오류는 각 경로에서 이미 처리한다).
 process.on('unhandledRejection', e => console.error('[unhandledRejection]', e));
@@ -62,24 +62,9 @@ app.post('/api/chat', async (req, res) => {
     // v는 trace 스키마 버전 — 형식이 바뀌어도 분석 SQL이 옛 행과 새 행을 구분할 수 있게 한다.
     insertChatLog(message.trim(), answer, { v: 2, search, steps: trace })
       .catch(e => console.warn('[chat_log] failed to record:', e.message));
-    res.json({
-      answer,
-      // note만 있는 항목은 루프 가드가 LLM에게 남긴 제어용 기록이고 실행된 쿼리가 아니다 —
-      // 화면의 '실행된 쿼리 N건' 목록에서 제외한다 (내부 지시문이 사용자에게 노출되지 않게).
-      trace: trace.filter(h => !h.note).map(h => {
-        const { totalRows, capped } = rowCounts(h);
-        return {
-          query_name: h.query_name,
-          params: h.params,
-          rowCount: capped ? `${totalRows}+` : totalRows,
-          rows: h.rows?.slice(0, 10),
-          // 드라이버·DB가 던진 원문은 스키마명·테이블명·접속 주소를 담고 있다 —
-          // 화면에는 우리가 문구를 만든 오류(h.safe)만 내보내고 원문은 로그와 chat_log에만 남긴다.
-          // (사용자에게 일반화된 문구만 주는 llm-openai.js와 같은 기준이다)
-          ...(h.error && { error: h.safe ? h.error : '조회 중 오류가 발생했습니다.' }),
-        };
-      }),
-    });
+    // 화면용 정리(제어용 기록 제외, 원문 오류 가리기, 행 상한과 생략 건수)는 result.js가 한다 —
+    // 건수 해석을 답변 본문·프롬프트와 한 곳에서 공유해야 하고, 여기 두면 테스트가 붙지 않는다.
+    res.json({ answer, trace: clientTrace(trace) });
   } catch (e) {
     console.error('[chat error]', e);
     // 실패는 400/413/500 어느 경로든 error 필드로 통일한다 — 여기만 answer로 보내면

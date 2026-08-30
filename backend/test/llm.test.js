@@ -29,6 +29,15 @@ test('셀 안의 파이프·개행·역슬래시가 표를 무너뜨리지 않�
   assert.ok(a.includes('한 줄'), '개행은 공백으로 바뀌어야 한다');
 });
 
+test('행마다 컬럼이 달라도 값이 표에서 사라지지 않는다', () => {
+  // 첫 행만 보고 컬럼을 정하면 뒤 행에만 있는 값이 조용히 빠진다 — 오류가 남지 않아
+  // 답변을 읽는 쪽에서는 그 컬럼이 '없다'로 읽힌다.
+  const a = renderAnswer({ knowledge: [], history: [ok('q', [{ A: 1 }, { A: 2, B: 'x' }])] });
+  assert.match(a, /\| A \| B \|/, '컬럼은 모든 행의 합집합이어야 한다');
+  assert.match(a, /\| 1 \|\s+\|/, '없는 컬럼은 빈 칸으로 채운다');
+  assert.match(a, /\| 2 \| x \|/);
+});
+
 test('조회 0건과 조회 실패를 구분해 알린다', () => {
   assert.match(renderAnswer({ knowledge: [], history: [ok('q', [])] }), /조회 결과가 없습니다/);
   assert.match(
@@ -120,4 +129,53 @@ test('프로토타입 멤버와 겹치는 바인드명이 Mock 결정을 죽이�
   assert.equal(d.action, 'run_query');
   assert.ok(Object.hasOwn(d.params, '__proto__'), '값이 소유 키로 채워져야 한다 (대입은 setter를 타고 사라진다)');
   assert.equal(d.params['__proto__'], 'V1'); // 따옴표 fallback으로 채워진 값
+});
+
+// ===== Mock provider의 후속 질문 처리 (fillParams / PARAM_RULES) =====
+// 규칙이 좁으면 '못 뽑는다'로 끝나지 않는다: 현재 질문에서 못 뽑으면 이전 질문으로 넘어가므로,
+// 대상만 바꿔 묻는 후속 질문이 직전 대상의 결과로 답변된다. 조회는 성공하고 표까지 붙어서
+// 사용자도 chat_log도 그것이 다른 사람의 답이라는 사실을 알 수 없다.
+
+const CUSTOMER_CTX = {
+  knowledge: [],
+  qaMethods: [{ seq: 1, title: '고객 주문 상태 확인', method: 'find_customer_id 쿼리로 고객명(:customer_name)을 조회한다' }],
+  queries: [{ seq: 1, query_name: 'find_customer_id', query_sql: 'SELECT CUSTOMER_ID FROM CUSTOMERS WHERE CUSTOMER_NAME = :customer_name' }],
+  history: [],
+};
+
+test('후속 질문의 새 대상이 직전 질문의 대상으로 덮이지 않는다', async () => {
+  delete process.env.LLM_PROVIDER; // mock 경로
+  const d = await llm.decide({
+    ...CUSTOMER_CTX,
+    question: '그럼 김철수는?',
+    chat: [{ role: 'user', text: '홍길동 고객 주문 상태 알려줘' }, { role: 'assistant', text: '(표)' }],
+  });
+  assert.equal(d.action, 'run_query');
+  assert.equal(d.params.customer_name, '김철수', '직전 대상(홍길동)의 결과로 답변되고 있었다');
+});
+
+test('이름에 붙은 표지를 그대로 쓰던 형태도 계속 읽는다', async () => {
+  delete process.env.LLM_PROVIDER;
+  for (const [question, expected] of [
+    ['홍길동 고객 주문 상태 알려줘', '홍길동'],
+    ['이영희님 주문 알려줘', '이영희'],
+    ['김철수의 주문 상태는?', '김철수'],
+  ]) {
+    const d = await llm.decide({ ...CUSTOMER_CTX, question, chat: [] });
+    assert.equal(d.params.customer_name, expected, question);
+  }
+});
+
+test('현재 질문이 대상을 말하지 않을 때만 직전 질문에서 가져온다', async () => {
+  // 후속 질문 처리의 존재 이유 — 이 폴백까지 막으면 "재시작은 어떻게 해?"가 대상을 잃는다
+  delete process.env.LLM_PROVIDER;
+  const d = await llm.decide({
+    knowledge: [],
+    qaMethods: [{ seq: 1, title: '배치 상태', method: 'batch_job_status 쿼리를 실행한다' }],
+    queries: [{ seq: 1, query_name: 'batch_job_status', query_sql: 'SELECT STATUS FROM BATCH_JOBS WHERE JOB_ID = :job_id' }],
+    history: [],
+    question: '재시작은 어떻게 해?',
+    chat: [{ role: 'user', text: '그럼 BATCH002는?' }, { role: 'assistant', text: '(표)' }],
+  });
+  assert.equal(d.params.job_id, 'BATCH002');
 });

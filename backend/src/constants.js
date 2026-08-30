@@ -8,6 +8,12 @@ export const MAX_ROWS = 100;
 // LLM 컨텍스트/답변에 전달할 최대 행 수 (총 건수는 totalRows로 보존)
 export const MAX_RESULT_ROWS = 20;
 
+// 화면 trace 패널 한 스텝에 싣는 행 수. 답변 본문(MAX_RESULT_ROWS)보다 적게 잡는다 — 패널은
+// '무엇을 근거로 답했는지' 확인하는 곳이라 표본이면 충분하고, 이 크기가 스텝 수만큼 곱해진다.
+// 리터럴로 두면 안 되는 값이다: 몇 건을 감췄는지 함께 알리려면 표시 쪽과 계산 쪽이 같은 수를
+// 봐야 하는데, 서버 파일 안의 숫자 하나는 그것을 보장하지 못한다 (result.js clientTrace).
+export const MAX_TRACE_ROWS = 10;
+
 // 셀 값 최대 길이 (CLOB 등 대형 텍스트 방어). 드라이버 경계(oracle.js)에서 바로 적용해
 // 대형 LOB 문자열이 history·chat_log까지 흘러가지 않게 한다.
 export const MAX_CELL_LEN = 200;
@@ -111,6 +117,15 @@ export function clipText(s, max) {
   const last = cut.charCodeAt(cut.length - 1);
   return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
 }
+
+// 소유 키만 읽는 프로퍼티 접근.
+// 바인드명·쿼리명이 '__proto__'·'toString' 같은 프로토타입 멤버와 겹치면 obj[key]가 값 대신
+// Object.prototype의 멤버를 돌려준다. 그러면 '값 없음'이어야 할 자리가 다른 문자열·함수로 굳어
+// 실행 판정이 어긋나거나(agent 루프 가드), 함수가 아닌 값을 호출하다 결정 루프가 통째로 죽는다.
+// 판정(agent.js)·실행(oracle.js)·Mock(llm.js, oracle.js)이 전부 이 함수를 쓴다 — 사본을 두면
+// 한 곳이 체인을 타도 그 경로에서만 조용히 어긋나고, 어긋난 쪽은 '값이 있다'고 판정할 뿐이라
+// 오류를 남기지 않는다. 그래서 nameKey와 같은 이유로 접근 방식 자체를 여기 하나로 모은다.
+export const ownProp = (obj, key) => (Object.hasOwn(obj ?? {}, key) ? obj[key] : undefined);
 
 // 쿼리 이름 비교 키. query_registry 조회는 MariaDB 기본 collation(대소문자·후행 공백 무시)이라
 // JS의 ===로 비교하면 'BATCH_JOB_STATUS'와 'batch_job_status'가 서로 다른 쿼리로 보인다.

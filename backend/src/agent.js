@@ -7,7 +7,7 @@ import { loadQueryRegistry, loadQueriesByNames } from './db.js';
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
 import { llm, renderAnswer } from './llm.js';
-import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, TRUNC_MARK, nameKey, clipText } from './constants.js';
+import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, TRUNC_MARK, nameKey, clipText, ownProp } from './constants.js';
 
 const MAX_STEPS = 5;
 const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포함). 초과하면 남은 스텝을 포기하고 강제 답변으로 간다.
@@ -30,8 +30,11 @@ const capRows = rows => rows.slice(0, MAX_RESULT_ROWS);
 // 값은 문자열로 정규화한다 (숫자 1과 문자열 '1'은 같은 컬럼에 같은 값으로 바인드된다).
 // (테스트에서 쓰므로 export 한다 — 아래 loopGuard 주석 참고)
 export function paramKey(bindNameList, params) {
+  // 소유 키만 읽는다 (constants.ownProp) — 바인드명이 프로토타입 멤버와 겹치면 '값 없음'이어야
+  // 할 자리가 다른 값으로 굳는다. 실행 경계(oracle.js runQuery)·잘린 값 가드(아래 truncatedBinds)·
+  // Mock(llm.js fillParams)이 같은 함수를 쓴다 — 한 곳이라도 체인을 타면 그 경로에서만 판정이 어긋난다.
   const entries = bindNameList
-    ? bindNameList.map(n => [n, params?.[n]])
+    ? bindNameList.map(n => [n, ownProp(params, n)])
     : Object.entries(params || {}); // 미등록 쿼리라 바인드를 알 수 없으면 원본 그대로 비교
   return JSON.stringify(
     entries
@@ -85,7 +88,12 @@ export function truncatedBinds(history, bindNameList, params) {
     }
   }
   if (!prefixes.size) return [];
-  return (bindNameList || []).filter(n => typeof params?.[n] === 'string' && prefixes.has(params[n]));
+  // 값 읽기는 paramKey·runQuery와 같은 ownProp으로 한다 — 여기만 params?.[n]으로 체인을 타면
+  // 이 가드에서만 '소유 키만 본다'는 전제가 깨진다 (지금은 무해해도 전제가 갈라진 채로 남는다).
+  return (bindNameList || []).filter(n => {
+    const v = ownProp(params, n);
+    return typeof v === 'string' && prefixes.has(v);
+  });
 }
 
 // 클라이언트가 보낸 대화 이력을 신뢰하지 않고 형식을 검증·제한한다.
@@ -237,15 +245,30 @@ export async function handleQuestion(question, rawChat = []) {
   }
 
   // 안전장치: MAX_STEPS 초과(또는 가드 반복) 시 강제 답변.
-  // 그마저 실패하면 손에 든 실행 이력·지식으로 직접 답을 조립한다 — 조회를 몇 번 성공해놓고
-  // 'LLM 호출 실패' 한 줄만 내보내면 그 요청이 실제로 한 일이 통째로 사라진다.
+  // 그마저 실패하면 fallbackAnswer가 손에 든 것으로 답을 조립한다.
   const finalCtx = { ...ctx(), forceAnswer: true };
   const final = await decide(finalCtx);
-  const answer = (final?.action === 'answer' && final.answer) || renderAnswer(finalCtx) || LLM_FAILED;
+  const answer = (final?.action === 'answer' && final.answer) || fallbackAnswer(finalCtx);
   return { answer, trace: history, search };
 }
 
 const LLM_FAILED = 'LLM 호출에 실패했습니다. 잠시 후 다시 시도해주세요.';
+
+// 폴백 답변에 붙이는 머리말. 이 답을 만든 것은 모델이 아니라 이 파일이다.
+// 표시가 없으면 조립된 답이 정상 답변과 글자 그대로 구분되지 않는다 — 특히 조회를 한 번도
+// 못 한 요청에서는 검색된 지식 본문이 그대로 답변으로 나가므로, LLM이 통째로 죽어 있어도
+// 화면은 평소와 똑같아 보이고 chat_log에도 그 사실이 남지 않는다.
+// 문구 형식은 llm-openai.js의 '*등록된 지식에 없는 내용이라…*'와 같은 기울임 한 줄로 맞춘다.
+const LLM_FAILED_NOTE = '*LLM 응답을 받지 못해, 조회 결과와 등록된 지식만으로 정리한 답변입니다.*';
+
+// LLM이 끝내 결정을 내지 못했을 때의 답변.
+// 조회를 몇 번 성공해놓고 'LLM 호출 실패' 한 줄만 내보내면 그 요청이 실제로 한 일이 통째로
+// 사라지고, 반대로 표시 없이 조립해 내보내면 실패한 사실이 사라진다 — 둘 다 남긴다.
+// (테스트에서 쓰므로 export 한다 — 두 실패 모드 다 오류를 남기지 않아 회귀가 보이지 않는다)
+export function fallbackAnswer(ctx) {
+  const rendered = renderAnswer(ctx);
+  return rendered ? `${LLM_FAILED_NOTE}\n\n${rendered}` : LLM_FAILED;
+}
 
 // LLM 호출은 무엇이 실패하든 요청 전체를 500으로 만들지 않는다 — 함께 버려지는 것이
 // 이미 조회해둔 결과이기 때문이다. provider는 자기 재시도 루프 안의 실패만 흡수하므로
