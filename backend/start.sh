@@ -1,45 +1,46 @@
 #!/usr/bin/env bash
-# 백엔드 서버 시작 (macOS/Linux). 이미 떠 있으면 그대로 두고 안내만 한다.
-# PID는 .backend.pid에 남긴다 — stop.sh가 이 파일로 정확히 같은 프로세스를 종료한다.
+# Start the backend server (macOS/Linux). If it is already running, leave it as is.
+# The PID is kept in .backend.pid — stop.sh uses this file to kill exactly the same process.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 PID_FILE=.backend.pid
 LOG_FILE=logs/backend.log
 
-# PID 파일의 프로세스가 '우리 서버'인지 명령행으로 확인한다 — kill -0(생존 여부)만으로 판정하면
-# 서버가 죽고 남은 stale PID를 무관한 프로세스가 재사용했을 때 "이미 실행 중"으로 오판하고,
-# stop.sh는 같은 판정으로 그 무관한 프로세스를 강제 종료(-9)까지 한다. 판정 기준을 두 스크립트가
-# 공유해야 하므로 문구를 바꾸면 stop.sh도 함께 바꿀 것.
+# Verify that the process in the PID file is really *our server* by checking its command line —
+# judging by kill -0 (liveness) alone, a stale PID reused by an unrelated process makes this
+# script misreport "already running", and stop.sh would even force-kill (-9) that process.
+# The two scripts must share this check — if you change the pattern, change stop.sh too.
 is_ours() { [ -n "${1:-}" ] && ps -p "$1" -o command= 2>/dev/null | grep -q "src/server.js"; }
 
 if [ -f "$PID_FILE" ] && is_ours "$(cat "$PID_FILE")"; then
-  echo "[backend] 이미 실행 중입니다 (PID $(cat "$PID_FILE")) — 로그: $LOG_FILE"
+  echo "[backend] already running (PID $(cat "$PID_FILE")) — log: $LOG_FILE"
   exit 0
 fi
 
 if [ ! -d node_modules ]; then
-  echo "[backend] node_modules가 없어 npm install을 실행합니다."
+  echo "[backend] node_modules not found — running npm install."
   npm install
 fi
 
-# .env 부트스트랩 (없으면 .env.example로 생성) — npm run dev와 같은 로직, 동기로 먼저 끝낸다.
+# Bootstrap .env (created from .env.example if missing) — same logic as npm run dev, done synchronously first.
 node scripts/ensure-env.js
 
 mkdir -p logs
-# 로그는 덮어쓰지 않고 이어 쓴다 — 덮어쓰면 재기동 순간 직전 실행의 크래시 원인이 사라진다.
-# 회차는 시작 구분선으로 가른다.
-echo "===== $(date '+%Y-%m-%d %H:%M:%S') 시작 =====" >> "$LOG_FILE"
-# npm start가 아니라 서버 스크립트를 직접 실행한다 — npm 래퍼를 거치면 $!가 npm 프로세스가 되어,
-# stop.sh가 npm만 죽이고 실제 서버(node src/server.js)는 남는 경우가 있다.
+# Append to the log instead of overwriting — overwriting on restart erases the crash cause
+# of the previous run. Runs are separated by a start marker line.
+echo "===== $(date '+%Y-%m-%d %H:%M:%S') start =====" >> "$LOG_FILE"
+# Run the server script directly instead of npm start — through the npm wrapper, $! would be
+# the npm process, and stop.sh could end up killing only npm while the actual server
+# (node src/server.js) keeps running.
 nohup node src/server.js >> "$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
 
 sleep 1
 if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-  echo "[backend] 시작됨 (PID $(cat "$PID_FILE")) — 접속 주소는 로그에서 확인: $LOG_FILE"
+  echo "[backend] started (PID $(cat "$PID_FILE")) — see the log for the listen address: $LOG_FILE"
 else
-  echo "[backend] 시작 실패 — 로그를 확인하세요: $LOG_FILE"
+  echo "[backend] failed to start — check the log: $LOG_FILE"
   rm -f "$PID_FILE"
   exit 1
 fi

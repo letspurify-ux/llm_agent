@@ -3,17 +3,19 @@ setlocal
 cd /d "%~dp0"
 set TITLE=llm_agent-backend
 
-REM 접두 일치("%TITLE%*")로 찾는다 - cmd는 명령을 실행하는 동안 창 제목 뒤에 " - <명령>"을
-REM 덧붙이므로 완전 일치는 서버가 도는 내내 빗나간다 (start.bat과 같은 기준).
+REM Prefix match ("%TITLE%*") - while cmd is running a command it appends " - <command>" to
+REM the window title, so an exact match would miss the window the whole time the server is
+REM running (same rule as start.bat).
 tasklist /FI "WINDOWTITLE eq %TITLE%*" 2>NUL | find /I "cmd.exe" >NUL
 if errorlevel 1 (
-  echo [backend] 실행 중인 프로세스를 찾지 못했습니다.
+  echo [backend] no running process found.
   exit /b 0
 )
 
-REM /T: 창 안에서 실행 중인 node.exe 자식 프로세스까지 함께 종료한다.
-REM /F: 강제 종료 - Windows는 콘솔 프로세스에 SIGTERM을 신뢰성 있게 전달할 방법이 없어
-REM     server.js의 정상 종료 경로(SIGTERM 핸들러)를 태우지 못한다. macOS/Linux는 stop.sh를 쓸 것.
+REM /T: also kills the child node.exe processes running inside the window.
+REM /F: force kill - Windows has no reliable way to deliver SIGTERM to a console process,
+REM     so the graceful-shutdown path in server.js (SIGTERM handler) cannot be used here.
+REM     Use stop.sh on macOS/Linux for a graceful stop.
 taskkill /FI "WINDOWTITLE eq %TITLE%*" /T /F >NUL
 
-echo [backend] 종료했습니다.
+echo [backend] stopped.
