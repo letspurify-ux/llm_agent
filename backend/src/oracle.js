@@ -70,6 +70,25 @@ const TIMEOUT_MS = numEnv('ORACLE_TIMEOUT_MS', 30_000);
 const CONNECT_TIMEOUT_S = 10;
 const TRANSPORT_CONNECT_TIMEOUT_S = 5;
 
+// ORACLE_MOCK의 단일 해석 지점. '1'만 보면 ORACLE_MOCK=true·yes·on이 전부 '실제 접속'으로
+// 떨어지는데, 기동 배너는 원본 값을 그대로 찍어 'ORACLE_MOCK=true'라고 알린다 —
+// mock인 줄 알고 운영 DB에 그대로 붙는다. LLM_PROVIDER와 같은 함정이라 같은 방식으로 막는다.
+// 모르는 값은 '실제 접속'으로 두되(현재 동작 유지) 반드시 소리가 나게 한다 — 조용히 mock으로
+// 돌리면 운영 DB를 조회한다고 믿는 답변이 stub 데이터로 나간다.
+// 값은 호출 시점에 읽는다 (test/oracle.test.js가 import 뒤에 설정한다).
+const MOCK_ON = ['1', 'true', 'yes', 'on'];
+const MOCK_OFF = ['0', 'false', 'no', 'off'];
+
+export function oracleMock() {
+  const raw = process.env.ORACLE_MOCK;
+  if (raw === undefined || String(raw).trim() === '') return false;
+  const v = nameKey(raw);
+  if (MOCK_ON.includes(v)) return true;
+  if (MOCK_OFF.includes(v)) return false;
+  warnOnce('setup', `unknown ORACLE_MOCK ${JSON.stringify(raw)} — treating it as off, so queries go to the real Oracle (valid: ${[...MOCK_ON, ...MOCK_OFF].join(', ')}). Check backend/.env.`);
+  return false;
+}
+
 // 반환: { rows, totalRows, capped } — rows는 MAX_ROWS까지, 셀은 MAX_CELL_LEN까지 정규화된 값.
 // capped는 "상한에 걸려 잘렸다"는 뜻이므로 MAX_ROWS+1건을 요청해 판정한다
 // (정확히 MAX_ROWS건인 완전한 결과를 "더 있을 수 있음"으로 잘못 알리지 않도록).
@@ -94,7 +113,7 @@ export async function runQuery(registryRow, params = {}) {
   }
   const binds = Object.fromEntries(names.map(n => [n, val(n)]));
 
-  if (process.env.ORACLE_MOCK === '1') return capResult(mockResult(registryRow.query_name, binds));
+  if (oracleMock()) return capResult(mockResult(registryRow.query_name, binds));
 
   const target = await loadTargetDb(registryRow.target_db_name);
   if (!target) throw safeError(`조회대상 DB를 찾을 수 없음: ${registryRow.target_db_name}`);

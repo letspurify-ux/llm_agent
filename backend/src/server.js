@@ -2,6 +2,8 @@ import 'dotenv/config';
 import { writeSync } from 'node:fs';
 import express from 'express';
 import { handleQuestion } from './agent.js';
+import { llmProvider } from './llm.js';
+import { oracleMock } from './oracle.js';
 import { syncEmbeddings, syncSummary } from './embed-sync.js';
 import { insertChatLog, cleanupChatLogs, closePool } from './db.js';
 import { numEnv, warnOnce, MAX_QUESTION_LEN } from './constants.js';
@@ -31,7 +33,7 @@ if (!process.env.MARIADB_USER) {
 }
 // LLM 쪽도 같은 함정이다: provider=openai인데 접속 정보가 비면 모든 질문이 'LLM 호출 실패'가
 // 되는데 /api/health는 계속 ok고, 원인은 요청마다 warn 로그로 흩어져 남는다 — 기동 시점에 알린다.
-if (process.env.LLM_PROVIDER === 'openai') {
+if (llmProvider() === 'openai') {
   const missing = ['LLM_BASE_URL', 'LLM_MODEL'].filter(k => !process.env[k]);
   if (missing.length) {
     console.warn(`[setup] LLM_PROVIDER=openai but ${missing.join(', ')} is empty — every question will end in "LLM call failed". Check backend/.env.`);
@@ -140,9 +142,12 @@ everyMs(cleanupLogs, 3600 * 1000);
 const port = numEnv('PORT', 3001, { allowZero: true });
 const server = app.listen(port, () => {
   // PORT=0이면 OS가 빈 포트를 고르므로 실제 배정된 포트를 찍는다 (로그가 유일한 확인 수단)
+  // 원본 환경변수가 아니라 '실제로 고른 것'을 찍는다 — 원본을 찍으면 오타 하나가
+  // 'LLM=OpenAI'처럼 멀쩡해 보이는 배너를 남기면서 실제로는 Mock이 돈다
+  // (llmProvider/oracleMock 주석 참고). 배너의 존재 이유가 이 확인이다.
   console.log(
     `agent server: http://localhost:${server.address().port} ` +
-    `(LLM=${process.env.LLM_PROVIDER || 'mock'}, ORACLE_MOCK=${process.env.ORACLE_MOCK || '0'})`
+    `(LLM=${llmProvider()}, ORACLE_MOCK=${oracleMock() ? '1' : '0'})`
   );
 });
 server.on('error', e => {

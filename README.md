@@ -205,6 +205,10 @@ LLM 인터페이스는 `llm.js`의 `decide(ctx) → {action:'answer'|'run_query'
   Oracle 12c+라면 `GRANT SELECT`가 아니라 `GRANT READ`를 준다 — 차이는 딱 하나, READ에는 `LOCK TABLE`과 `SELECT … FOR UPDATE`가 빠져 있어
   위 가드와 같은 규칙이 계정 차원에서도 강제된다 (`sql/oracle-init.sql`이 그렇게 부여한다)
 - `db_password`는 `ENV:변수명` 형식으로 환경변수 참조 권장. 평문 저장은 개발용만
+- 관리 DB 조회 타임아웃 `MARIADB_TIMEOUT_MS`(기본 30초) — 관리 DB만 예산 없는 I/O였다(Oracle·LLM·임베딩은 전부 상한이 있다).
+  검색은 agent 루프의 예산 검사보다 앞에서 돌기 때문에, 여기가 매달리면 문서화된 요청 상한이 통째로 성립하지 않는다.
+  커넥터의 `socketTimeout`이 아니라 `queryTimeout`을 쓴다 — 전자는 다시 세팅되지 않는 무활동 타이머라 풀에서 노는 커넥션이 그대로 걸린다
+  (실측: 2초로 두면 유휴 5초마다 커넥션이 죽고 fatal 오류가 로그에 쌓인다)
 - 조회 쿼리 타임아웃 `ORACLE_TIMEOUT_MS`(기본 30초) — 느린 쿼리가 요청을 무한 대기시키지 않는다.
   빈 값·0·오타는 기본값으로 되돌리고 경고를 남긴다 (0은 드라이버에서 "타임아웃 없음"을 뜻하므로 그대로 두면 정반대로 동작한다)
 - 조회 결과는 `maxRows: 100` 제한. 셀당 200자 절단은 드라이버 경계(`oracle.js`)에서, 20행 절단은 `agent.js`의 `capRows`에서 적용하고

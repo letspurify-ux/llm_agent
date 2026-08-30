@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import oracledb from 'oracledb';
-import { runQuery, normalizeCells, numberFromString } from '../src/oracle.js';
+import { runQuery, normalizeCells, numberFromString, oracleMock } from '../src/oracle.js';
 import { MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK } from '../src/constants.js';
 
 process.env.ORACLE_MOCK = '1';
@@ -53,6 +53,34 @@ test('정확히 절단 길이인 값만 잘린 조각으로 의심한다', async
   // '이상'으로 잡으면 자유 검색어·경로 같은 긴 값으로는 등록 쿼리를 영영 실행할 수 없다.
   const r = await runQuery(withBind(), { job_id: 'x'.repeat(MAX_CELL_LEN + 50) });
   assert.deepStrictEqual(r.rows, []);
+});
+
+test('ORACLE_MOCK 표기를 흡수하고 모르는 값은 실제 접속으로 두되 알린다', () => {
+  // '1'만 보면 ORACLE_MOCK=true·yes·on이 전부 '실제 접속'으로 떨어지는데, 기동 배너는 원본 값을
+  // 그대로 찍어 'ORACLE_MOCK=true'라고 알린다 — mock인 줄 알고 운영 DB에 붙는다.
+  const saved = process.env.ORACLE_MOCK;
+  const warned = [];
+  const origWarn = console.warn;
+  console.warn = m => warned.push(String(m));
+  try {
+    for (const v of ['1', 'true', 'TRUE', ' on ', 'yes']) {
+      process.env.ORACLE_MOCK = v;
+      assert.equal(oracleMock(), true, v);
+    }
+    for (const v of ['0', 'false', 'no', 'off', '']) {
+      process.env.ORACLE_MOCK = v;
+      assert.equal(oracleMock(), false, v);
+    }
+    // 모르는 값은 실제 접속(기존 동작)으로 두고 알린다 — 조용히 mock으로 돌리면
+    // 운영 DB를 조회했다고 믿는 답변이 stub 데이터로 나간다.
+    warned.length = 0;
+    process.env.ORACLE_MOCK = 'maybe';
+    assert.equal(oracleMock(), false);
+    assert.ok(warned.some(m => /ORACLE_MOCK/.test(m)), '모르는 값에 경고가 없다');
+  } finally {
+    console.warn = origWarn;
+    process.env.ORACLE_MOCK = saved ?? '1';   // 이 파일의 나머지 테스트가 mock 경로를 쓴다
+  }
 });
 
 test('서로게이트 경계에서 잘린 조각도 잘린 값으로 걸러진다', async () => {

@@ -13,6 +13,22 @@ const CONCURRENT_REQUESTS = 4; // 이 크기로 감당하려는 동시 질문 �
 const RESERVED_FOR_SYNC = 1;   // embed-sync가 동기화 내내 쥐는 GET_LOCK 전용 커넥션.
 const POOL_SIZE = CONNS_PER_REQUEST * CONCURRENT_REQUESTS + RESERVED_FOR_SYNC;
 
+// 관리 DB 조회 상한(ms). 이 시스템에서 유일하게 예산 없는 I/O였다 — Oracle은 callTimeout,
+// LLM은 AbortSignal.timeout, 임베딩은 자체 타임아웃으로 전부 묶여 있는데 관리 DB만 무제한이었다.
+// 검색(search.js)은 agent 루프의 deadline '검사 지점'보다 앞에서 돌기 때문에, 여기서 매달리면
+// 문서화된 요청 상한(agent.js 주석의 약 420초)이 통째로 성립하지 않는다 — 프런트는 450초에
+// 끊고 '서버와 통신하지 못했습니다'를 띄우지만 워커는 커넥션을 쥔 채 계속 남는다.
+//
+// socketTimeout이 아니라 queryTimeout을 쓴다. socketTimeout은 커넥션을 만들 때 한 번 걸고 다시
+// 세팅하지 않는 '무활동' 타이머라, 풀에서 놀고 있는 커넥션이 그대로 걸린다 — 실측: 2초로 두고
+// 5초 유휴하니 커넥션이 죽고 재생성되면서 fatal 'socket timeout' 오류가 4건 찍혔다.
+// 트래픽이 뜸한 시간대마다 오류 로그가 쌓이는 셈이라 쓸 수 없다.
+// queryTimeout은 접속 시 `SET max_statement_time`을 한 번 걸 뿐 쿼리 문자열을 건드리지 않으므로,
+// search.js의 `SET STATEMENT mhnsw_ef_search=… FOR …`와도 부딪히지 않는다(실측 확인).
+// 적용 범위는 조회다 — 요청 경로(검색·쿼리 목록)가 전부 조회이므로 필요한 곳은 덮는다.
+// 쓰기(chat_log INSERT, vec_store REPLACE/DELETE)는 요청 경로 밖이라 응답을 막지 않는다.
+const QUERY_TIMEOUT_MS = numEnv('MARIADB_TIMEOUT_MS', 30_000);
+
 let pool;
 function getPool() {
   pool ??= mariadb.createPool({
@@ -26,6 +42,7 @@ function getPool() {
     // 보일 뿐 원인이 풀 크기라는 단서를 남기지 않는다. 근거를 식으로 적어두면 어느 항이
     // 바뀌어 부족해졌는지 계산으로 확인할 수 있다.
     connectionLimit: numEnv('MARIADB_POOL_SIZE', POOL_SIZE),
+    queryTimeout: QUERY_TIMEOUT_MS,
   });
   return pool;
 }

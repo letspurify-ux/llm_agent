@@ -4,7 +4,7 @@
 // '조립할 것이 없음'을 null로 알리는 계약이 핵심이다 — 안내 문구는 두 호출부가 서로 달라야 한다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { llm, renderAnswer, sanitizeDecision } from '../src/llm.js';
+import { llm, renderAnswer, sanitizeDecision, llmProvider } from '../src/llm.js';
 import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN } from '../src/constants.js';
 
 const ok = (name, rows, extra = {}) => ({ query_name: name, params: {}, rows, totalRows: rows.length, ...extra });
@@ -112,6 +112,37 @@ test('정상 크기의 결정은 값이 그대로 통과한다', () => {
   const a = { action: 'answer', answer: '답' };
   assert.strictEqual(sanitizeDecision(a), a);
   assert.strictEqual(sanitizeDecision(null), null);
+});
+
+test('provider 이름의 대소문자·공백을 흡수하고 모르는 값은 소리 나게 알린다', () => {
+  // 정확한 일치만 보면 'OpenAI'·'openai '가 조용히 Mock으로 떨어진다. Mock도 지식과 조회 표를
+  // 그럴듯하게 렌더하므로 답변만 봐서는 구분되지 않고, 기동 배너·접속정보 누락 검사도 같은
+  // 비교를 쓰던 탓에 함께 비켜갔다 — 로그가 유일한 단서라 경고까지 함께 못 박는다.
+  const saved = process.env.LLM_PROVIDER;
+  const warned = [];
+  const origWarn = console.warn;
+  console.warn = m => warned.push(String(m));
+  try {
+    for (const v of ['openai', 'OpenAI', ' openai ', 'OPENAI']) {
+      process.env.LLM_PROVIDER = v;
+      assert.equal(llmProvider(), 'openai', v);
+    }
+    for (const v of ['mock', 'Mock', '', '   ']) {
+      process.env.LLM_PROVIDER = v;
+      assert.equal(llmProvider(), 'mock', v);
+    }
+    delete process.env.LLM_PROVIDER;
+    assert.equal(llmProvider(), 'mock', '미설정은 mock이 기본이다');
+    // 모르는 값은 Mock으로 떨어지되 반드시 경고가 남아야 한다.
+    warned.length = 0;
+    process.env.LLM_PROVIDER = 'vllm';
+    assert.equal(llmProvider(), 'mock');
+    assert.ok(warned.some(m => /LLM_PROVIDER/.test(m)), '모르는 값에 경고가 없다');
+  } finally {
+    console.warn = origWarn;
+    if (saved === undefined) delete process.env.LLM_PROVIDER;
+    else process.env.LLM_PROVIDER = saved;
+  }
 });
 
 test('프로토타입 멤버와 겹치는 바인드명이 Mock 결정을 죽이지 않는다', async () => {

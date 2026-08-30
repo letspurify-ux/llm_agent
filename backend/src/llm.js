@@ -9,12 +9,31 @@
 // agent.js는 provider가 바뀌어도 변경되지 않는다.
 import { openaiDecide } from './llm-openai.js';
 import { bindNames } from './sql.js';
-import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, clipText, nameKey, ownProp } from './constants.js';
+import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, clipText, nameKey, ownProp, warnOnce } from './constants.js';
 import { rowCounts } from './result.js';
+
+// LLM provider 선택의 단일 해석 지점.
+// 정확한 문자열 일치만 보면 'OpenAI'·'openai '(뒤 공백)·'vllm'·'openrouter' 같은 값이 전부
+// 조용히 Mock으로 떨어진다. 그런데 Mock도 지식과 조회 표를 그럴듯하게 렌더하므로 답변만 봐서는
+// 구분되지 않고, 기동 배너는 원본 값을 그대로 찍어 'LLM=OpenAI'라고 알리며, server.js의
+// 접속정보 누락 검사도 같은 비교를 쓰던 탓에 함께 비켜갔다 — 세 곳이 같은 오타에 함께 속았다.
+// 그래서 해석을 여기 하나로 모으고, 모르는 값은 반드시 소리가 나게 한다
+// (numEnv·LLM_REASONING_EFFORT가 잘못된 값에 경고를 남기는 것과 같은 기준이다).
+// 값은 호출 시점에 읽는다 — 모듈 로드 시점에 굳히면 테스트가 실행 중에 바꾸는 경로가 깨진다.
+const PROVIDERS = ['openai', 'mock'];
+
+export function llmProvider() {
+  const raw = process.env.LLM_PROVIDER;
+  if (raw === undefined || String(raw).trim() === '') return 'mock';
+  const v = nameKey(raw);                       // 앞뒤 공백·대소문자는 흡수한다
+  if (PROVIDERS.includes(v)) return v;
+  warnOnce('setup', `unknown LLM_PROVIDER ${JSON.stringify(raw)} — every answer will come from the rule-based mock (valid: ${PROVIDERS.join(', ')}). Check backend/.env.`);
+  return 'mock';
+}
 
 export const llm = {
   async decide(ctx) {
-    const d = await (process.env.LLM_PROVIDER === 'openai' ? openaiDecide(ctx) : mockDecide(ctx));
+    const d = await (llmProvider() === 'openai' ? openaiDecide(ctx) : mockDecide(ctx));
     return sanitizeDecision(d);
   },
 };
