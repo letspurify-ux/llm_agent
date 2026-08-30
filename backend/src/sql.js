@@ -85,7 +85,8 @@ const stripNoise = sql => scanSql(sql).text;
 // 프롬프트 조립은 스텝마다 쿼리 목록 전체(최대 35건)에 대해 다시 부르므로 요청당 최대 175회이고,
 // 파싱은 SQL 전체를 도는 문자 단위 스캐너다. agent.js가 같은 이유로 '스텝당 1회만 파싱'이라고
 // 손으로 캐시해 두었는데, 캐시를 함수 안에 두면 호출부마다 그 요령을 반복할 필요가 없다.
-// 키가 외부에서 온 문자열이므로 상한을 두고 오래된 것부터 밀어낸다(Map은 삽입 순서를 지킨다).
+// 키가 외부에서 온 문자열이므로 상한을 두고 가장 오래 '안 쓴' 것부터 밀어낸다
+// (Map은 삽입 순서를 지키므로, 적중할 때마다 맨 뒤로 다시 넣으면 그 순서가 곧 LRU가 된다).
 // 돌려주는 배열은 freeze한다 — 캐시된 같은 배열을 여러 호출부가 나눠 쓰므로 한 곳의 변형이
 // 다른 곳으로 번지면 안 된다.
 const bindCache = new Map();
@@ -93,7 +94,14 @@ const BIND_CACHE_MAX = 500;
 
 export function bindNames(sql) {
   const hit = bindCache.get(sql);
-  if (hit) return hit;
+  if (hit) {
+    // 적중한 항목을 맨 뒤로 옮긴다 — 삽입 순서만 보고 밀어내면(FIFO) 활성 SQL이 상한을 넘는
+    // 순간 '방금 쓴 항목'부터 차례로 밀려나, 캐시가 가득 찬 채로 적중률이 0에 수렴한다.
+    // 오류는 나지 않고 요청마다 같은 SQL을 다시 파싱하는 비용만 조용히 되돌아온다.
+    bindCache.delete(sql);
+    bindCache.set(sql, hit);
+    return hit;
+  }
   const names = Object.freeze([...new Set([...stripNoise(sql).matchAll(/:(\w+)/g)].map(m => m[1]))]);
   while (bindCache.size >= BIND_CACHE_MAX) bindCache.delete(bindCache.keys().next().value);
   bindCache.set(sql, names);
@@ -120,5 +128,16 @@ export function assertReadOnly(sql) {
   }
   if (s.replace(/;\s*$/, '').includes(';')) {
     throw safeError('다중 문장 쿼리는 실행할 수 없습니다.');
+  }
+  // (4) SELECT … FOR UPDATE 금지 — 조회 문장이지만 조회대상 DB의 행에 잠금을 건다.
+  // 위 (1)은 '첫 키워드가 SELECT인가'만 보므로 이 문장은 그대로 통과한다. LLM은 SQL을 만들지
+  // 못하니 들어오는 경로는 등록 실수뿐인데, 등록 실수를 잡는 것이 이 가드의 존재 이유다.
+  // 잠금은 트랜잭션이 끝날 때까지 유지되고 이 실행기는 조회마다 접속을 여닫으므로(oracle.js),
+  // 잠긴 행을 기다리는 쪽은 운영 트랜잭션이 된다 — 그런데 화면에는 '조회 중 오류' 한 줄만 남아
+  // (server.js가 드라이버 원문을 숨긴다) 조회 Q&A가 원인이라는 사실 자체가 보이지 않는다.
+  // 리터럴·주석은 위에서 이미 지워졌고 FOR는 Oracle 예약어라 식별자로 쓸 수 없다 — 오탐 경로가 없다.
+  // FOR UPDATE OF/NOWAIT/SKIP LOCKED는 전부 이 접두에서 걸린다.
+  if (/\bFOR\s+UPDATE\b/i.test(s)) {
+    throw safeError('행 잠금을 거는 쿼리(FOR UPDATE)는 실행할 수 없습니다.');
   }
 }

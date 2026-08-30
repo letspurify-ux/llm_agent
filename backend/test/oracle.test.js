@@ -3,6 +3,7 @@
 // 실제 접속 여부와 무관하게 같은 코드를 타므로 여기서 검증하는 판정이 실배포에도 그대로 적용된다.
 import { test } from 'node:test';
 import assert from 'node:assert';
+import oracledb from 'oracledb';
 import { runQuery, normalizeCells, numberFromString } from '../src/oracle.js';
 import { MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK } from '../src/constants.js';
 
@@ -82,4 +83,27 @@ test('바인드명이 프로토타입 멤버와 겹쳐도 판정이 어긋나지
     runQuery(reg('batch_job_status', 'SELECT 1 FROM T WHERE A = :__proto__'), {}),
     e => e.safe === true && /값 없음/.test(e.message)
   );
+});
+
+test('음수 scale NUMBER는 정밀도 가드를 우회하지 못한다', () => {
+  // 값이 가질 수 있는 자릿수는 precision이 아니라 precision - scale이다. precision만 보면
+  // NUMBER(15,-2)가 '안전이 증명된 열'로 분류돼 17자리 값이 배정밀도에서 조용히 반올림된다 —
+  // 이 핸들러가 막겠다고 한 바로 그 실패가 이 한 유형에서만 살아남는다.
+  const md = (precision, scale) => ({ dbType: oracledb.DB_TYPE_NUMBER, precision, scale });
+  const asString = m => oracledb.fetchTypeHandler(m)?.type === oracledb.STRING;
+
+  assert.ok(asString(md(15, -2)), '음수 scale은 값의 크기를 precision 밖으로 늘린다');
+  assert.ok(asString(md(9, -9)), '유효 숫자가 적어도 자릿수는 18자리까지 간다');
+  assert.ok(asString(md(0, -127)), '선언 없는 NUMBER는 정밀도가 미상이다');
+  assert.ok(asString(md(18, 0)), '18자리는 배정밀도를 넘는다');
+  assert.ok(asString(md(15, undefined)), 'scale이 없는 메타데이터는 안전이 증명되지 않은 쪽이다');
+
+  // 반대 방향도 지킨다 — 정밀도가 보장되는 열까지 문자열로 바꾸면 mock(숫자 리터럴)과
+  // 실제의 JSON 표기가 갈라져, mock으로 검증한 시나리오가 실제 배포에서 재현되지 않는다.
+  assert.ok(!asString(md(12, 2)), 'NUMBER(12,2)는 기본 숫자 매핑 그대로여야 한다');
+  assert.ok(!asString(md(15, 0)), 'NUMBER(15)는 안전하다');
+  assert.ok(!asString({ dbType: oracledb.DB_TYPE_VARCHAR, precision: 0, scale: -127 }), 'NUMBER가 아닌 타입은 건드리지 않는다');
+
+  // 위 판정이 실제 손실을 막고 있는지 — 17자리는 double 왕복에서 끝자리가 바뀐다
+  assert.notStrictEqual(Number('12345678901234567').toString(), '12345678901234567');
 });

@@ -74,7 +74,15 @@ INSERT INTO APP_USER.ORDERS VALUES ('O-802', 'C-1003', '주문접수', TO_DATE('
 COMMIT;
 
 -- ===== agent 전용 조회 계정 (read-only) =====
--- agent는 이 계정으로만 접속한다. SELECT 권한만 부여하여 UPDATE/DELETE가 원천 차단된다.
+-- agent는 이 계정으로만 접속한다. 읽기 권한만 부여하여 UPDATE/DELETE가 원천 차단된다.
+--
+-- SELECT가 아니라 READ를 준다(12c+). 둘의 차이는 딱 하나, READ에는 LOCK TABLE과
+-- SELECT … FOR UPDATE가 빠져 있다 — FOR UPDATE는 조회 문장이라 "SELECT만 등록하라"는
+-- 규칙과 앱의 조회 전용 가드를 모두 통과하면서 조회대상 DB의 행에 잠금을 건다.
+-- 앱에서도 막지만(sql.js assertReadOnly), 잠금은 운영 트랜잭션을 대기시키는 종류의 사고라
+-- 계정 차원에서도 불가능하게 둔다 — 앱 가드가 우회되거나 다른 클라이언트가 이 계정을 써도
+-- 같은 규칙이 유지된다.
+-- (11g 이하를 대상으로 한다면 READ가 없으므로 GRANT SELECT로 되돌릴 것)
 
 BEGIN
   EXECUTE IMMEDIATE 'CREATE USER VOC_READER IDENTIFIED BY "voc_reader_1234"';
@@ -85,9 +93,9 @@ END;
 
 GRANT CREATE SESSION TO VOC_READER;
 
-GRANT SELECT ON APP_USER.BATCH_JOBS TO VOC_READER;
-GRANT SELECT ON APP_USER.CUSTOMERS  TO VOC_READER;
-GRANT SELECT ON APP_USER.ORDERS     TO VOC_READER;
+GRANT READ ON APP_USER.BATCH_JOBS TO VOC_READER;
+GRANT READ ON APP_USER.CUSTOMERS  TO VOC_READER;
+GRANT READ ON APP_USER.ORDERS     TO VOC_READER;
 
 -- 등록된 쿼리가 스키마 접두사 없이 테이블명만으로 조회할 수 있도록 시노님 생성
 CREATE OR REPLACE SYNONYM VOC_READER.BATCH_JOBS FOR APP_USER.BATCH_JOBS;

@@ -21,11 +21,20 @@ oracledb.fetchAsBuffer = [oracledb.BLOB];
 // NUMBER는 기본 매핑(JS number)이 배정밀도라 16자리부터 조용히 반올림된다 — 18자리 채번 키가
 // 끝자리만 다른 값으로 답변되고, 그 값이 다음 스텝의 바인드로도 흘러가 0건 오답까지 만든다.
 // 날짜를 문자열로 받는 것과 같은 이유(조용한 어긋남)로, 정밀도가 보장되는 열(선언된 precision
-// 1~15)만 기본 매핑에 맡기고 나머지(선언 없는 NUMBER·식 결과 — precision 0 또는 미상)는
-// 문자열로 받아 정확한 값을 확보한다. "위험이 증명된 열만 문자열"이 아니라 "안전이 증명된 열만
-// 숫자"로 뒤집은 이유: 메타데이터가 비는 쪽으로 어긋나도 정확성이 깨지지 않는 방향이 이쪽이다.
+// 1~15이면서 scale이 음수가 아닌 열)만 기본 매핑에 맡기고 나머지(선언 없는 NUMBER·식 결과 —
+// precision 0 또는 미상)는 문자열로 받아 정확한 값을 확보한다. "위험이 증명된 열만 문자열"이
+// 아니라 "안전이 증명된 열만 숫자"로 뒤집은 이유: 메타데이터가 비는 쪽으로 어긋나도 정확성이
+// 깨지지 않는 방향이 이쪽이다.
+//
+// precision과 함께 scale을 보는 이유: 음수 scale은 값의 크기를 precision 밖으로 늘린다.
+// 값이 가질 수 있는 자릿수는 precision이 아니라 precision - scale이므로, NUMBER(15,-2)는
+// 유효 숫자 15자리지만 값은 17자리까지 가서 2^53을 넘고 그대로 반올림된다(실측:
+// 12345678901234567 → …568). precision만 보면 이 열이 '안전이 증명된 열'로 분류돼,
+// 위 주석이 막겠다고 한 그 반올림이 이 한 유형에서만 조용히 살아남는다.
+// (FLOAT은 scale이 -127이지만 precision 검사에서 이미 걸러진다. scale이 없는 메타데이터도
+//  비교가 false가 되어 문자열 경로로 가므로, 어긋나도 정확성이 지켜지는 방향은 그대로다.)
 oracledb.fetchTypeHandler = md => {
-  if (md.dbType === oracledb.DB_TYPE_NUMBER && !(md.precision >= 1 && md.precision <= 15)) {
+  if (md.dbType === oracledb.DB_TYPE_NUMBER && !(md.precision >= 1 && md.precision <= 15 && md.scale >= 0)) {
     return { type: oracledb.STRING, converter: numberFromString };
   }
 };

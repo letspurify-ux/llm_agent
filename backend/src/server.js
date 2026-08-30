@@ -4,7 +4,7 @@ import express from 'express';
 import { handleQuestion } from './agent.js';
 import { syncEmbeddings, syncSummary } from './embed-sync.js';
 import { insertChatLog, cleanupChatLogs, closePool } from './db.js';
-import { numEnv, MAX_QUESTION_LEN } from './constants.js';
+import { numEnv, warnOnce, MAX_QUESTION_LEN } from './constants.js';
 import { rowCounts } from './result.js';
 
 // 놓친 promise 거부는 기록만 하고 계속 진행한다 (요청 단위 오류는 각 경로에서 이미 처리한다).
@@ -122,7 +122,12 @@ if (syncInterval > 0) {
   everyMs(() => {
     syncEmbeddings()
       .then(r => { if (r.embedded || r.deleted || r.failed) console.log(`[embed] sync: ${syncSummary(r)}`); })
-      .catch(() => {});
+      // 삼키면 안 된다 — 임베딩 서버 쪽 실패는 embed-sync가 스스로 알리지만, 관리 DB 오류
+      // (vec_store 권한 상실·테이블 유실 등)로 query()가 던지면 그 실패는 여기로만 온다.
+      // 조용히 버리면 벡터가 낡아가는 동안 검색은 LIKE 폴백으로 계속 동작하므로 로그 말고는
+      // 단서가 없다 — 바로 위 기동 시 1회 실행은 이 실패를 알리고 있었고 주기 실행만 빠져 있었다.
+      // warnOnce로 억제해 매 주기 도배는 막되, 오류의 성격이 바뀌면 반드시 다시 알린다.
+      .catch(e => warnOnce('embed', `periodic sync failed: ${e.message}`));
   }, syncInterval * 1000);
 } else {
   console.log('[embed] periodic sync disabled (EMBED_SYNC_INTERVAL=0) — run `npm run embed` to sync manually');
@@ -169,7 +174,17 @@ async function shutdown(signal) {
     process.exit(1);
   }, 10_000);
   force.unref();
-  await new Promise(resolve => server.close(resolve));
+  // close()는 새 접속만 막을 뿐 이미 열린 keep-alive 연결은 기다린다 — 브라우저 탭 하나가
+  // 남긴 idle 연결 때문에 아래 10초 강제 타이머까지 갔다가 종료 코드 1로 빠질 수 있다.
+  // 정상 종료가 매번 실패로 기록되면 supervisor의 재시작 판정이 어긋나고, 무엇보다 이 경로가
+  // 하려던 일(풀 정리)이 타이머에 밀려 실행되지 않는다.
+  // Node 19+는 close()가 idle 연결을 스스로 닫아주므로 지금 런타임에서는 이 호출이 동작을
+  // 바꾸지 않는다(실측 확인). 그래도 명시하는 이유는 이 보장이 런타임 버전에 딸려 오는 것이라
+  // Node 18에서는 그대로 사라지기 때문이다 — engines 제약이 없어 그 버전으로도 뜬다.
+  // 처리 중인 요청의 연결은 건드리지 않고 idle 연결만 닫는다.
+  const closed = new Promise(resolve => server.close(resolve));
+  server.closeIdleConnections();
+  await closed;
   await closePool().catch(e => console.warn('[shutdown] failed to close connection pool:', e.message));
   clearTimeout(force);
   process.exit(0);

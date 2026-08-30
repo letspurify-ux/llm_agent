@@ -133,3 +133,30 @@ test('잘린 셀과 무관한 값은 통과한다', () => {
   // 온전한 셀 값(마크가 그대로 붙은 값)은 여기 몫이 아니다 — bindProblem(oracle.js)이 거부한다
   assert.deepStrictEqual(truncatedBinds(history, ['key'], { key: 7 }), []);
 });
+
+test('내용이 빈 대화 턴은 프롬프트에 실리지 않는다', () => {
+  // 빈 턴은 '- 사용자: ' 한 줄로 실려 모델이 내용 없는 발화를 맥락으로 읽는다.
+  assert.deepStrictEqual(
+    normalizeChat([
+      { role: 'user', text: '' },
+      { role: 'user', text: '   ' },
+      { role: 'assistant', text: '\n\t' },
+      { role: 'user', text: '실제 질문' },
+    ]),
+    [{ role: 'user', text: '실제 질문' }]
+  );
+
+  // 절단 뒤에 비는 경우도 걸러야 한다 — 짝 잃은 상위 서로게이트 하나뿐인 턴은
+  // clipChatText가 그 코드유닛을 떼면서 빈 문자열이 된다 (앞에서만 거르면 이 경로로 남는다).
+  assert.deepStrictEqual(normalizeChat([{ role: 'user', text: '\ud83d' }]), []);
+
+  // 빈 턴이 턴 예산 자리를 차지하지 않는다 — 정상 턴이 상한만큼 그대로 남아야 한다.
+  const mixed = [];
+  for (let i = 0; i < MAX_CHAT_TURNS; i++) {
+    mixed.push({ role: 'user', text: '' }, { role: 'user', text: `질문${i}` });
+  }
+  assert.deepStrictEqual(
+    normalizeChat(mixed).map(m => m.text),
+    Array.from({ length: MAX_CHAT_TURNS }, (_, i) => `질문${i}`)
+  );
+});

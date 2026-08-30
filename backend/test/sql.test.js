@@ -66,3 +66,38 @@ test('따옴표 식별자 안의 아포스트로피가 스캔을 어긋내지 �
   rejects('SELECT "unterminated FROM t');
   accepts(`SELECT 'a" b' FROM t`);            // 문자열 안의 따옴표는 문자열의 일부
 });
+
+test('행 잠금을 거는 조회(FOR UPDATE)는 거부한다', () => {
+  // SELECT로 시작하는 단일 문장이라 다른 검사는 전부 통과한다 — 그런데 조회대상 DB의 행에
+  // 잠금을 걸어 운영 트랜잭션을 대기시킨다. 화면에는 '조회 중 오류' 한 줄만 남아 원인이 안 보인다.
+  rejects('SELECT * FROM orders WHERE id = :id FOR UPDATE');
+  rejects('SELECT * FROM orders WHERE id = :id FOR UPDATE NOWAIT');
+  rejects('SELECT * FROM orders WHERE id = :id FOR UPDATE SKIP LOCKED');
+  rejects('SELECT * FROM orders WHERE id = :id FOR UPDATE OF status');
+  rejects('SELECT * FROM orders\n  FOR\n  UPDATE');                 // 개행·들여쓰기
+  rejects('SELECT * FROM orders FOR /* 주석 */ UPDATE');            // 주석은 공백으로 지워진다
+  rejects('WITH x AS (SELECT 1 c FROM dual) SELECT * FROM x FOR UPDATE');
+
+  // 오탐 방향: 리터럴·식별자 안의 표현은 코드가 아니므로 걸리면 안 된다
+  accepts("SELECT 'FOR UPDATE' AS msg FROM dual");
+  accepts('SELECT 1 AS "FOR UPDATE" FROM dual');
+  accepts('-- FOR UPDATE 금지\nSELECT 1 FROM dual');
+  accepts('SELECT for_update_yn FROM t');                            // 이름의 일부는 걸리지 않는다
+});
+
+test('바인드 캐시는 가장 오래 "안 쓴" 것부터 밀어낸다', () => {
+  // 삽입 순서만 보고 밀어내면(FIFO) 활성 SQL이 상한을 넘는 순간 방금 쓴 항목부터 차례로
+  // 밀려나 적중률이 0에 수렴한다 — 오류 없이 파싱 비용만 매 요청 되돌아온다.
+  // 캐시된 배열은 freeze된 같은 객체이므로 동일성으로 적중 여부를 본다.
+  const hot = 'SELECT 1 FROM t WHERE a = :hot_bind';
+  const cold = 'SELECT 1 FROM t WHERE a = :cold_bind';
+  const hot0 = bindNames(hot);
+  const cold0 = bindNames(cold);
+  for (let i = 0; i < 1000; i++) {
+    bindNames(hot);                                     // 계속 쓰는 SQL
+    bindNames(`SELECT 1 FROM t WHERE a = :flood${i}`);   // 캐시를 밀어내는 유입
+  }
+  // 음성 대조 — 상한이 실제로 동작해 안 쓴 항목은 밀려난다 (아래 단언이 공허하지 않음을 보장)
+  assert.notStrictEqual(bindNames(cold), cold0, '안 쓰는 SQL은 상한을 넘기면 밀려나야 한다');
+  assert.strictEqual(bindNames(hot), hot0, '계속 쓰는 SQL은 남아야 한다 (FIFO면 밀려난다)');
+});

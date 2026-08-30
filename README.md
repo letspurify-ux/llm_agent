@@ -112,7 +112,7 @@ docker run -d --name oracle1521 -p 1521:1521 -e ORACLE_PASSWORD=password gvenzl/
 docker exec -i oracle1521 sqlplus -s system/password@localhost:1521/FREEPDB1 < backend/sql/oracle-init.sql
 ```
 
-생성되는 것 — `APP_USER` 계정과 그 스키마의 `BATCH_JOBS`/`CUSTOMERS`/`ORDERS` 테이블과 샘플 데이터, 그리고 **SELECT 권한만 가진 조회 전용 계정 `VOC_READER`**(agent가 이 계정으로 접속). 접속 정보는 `target_db` 테이블에 `localhost:1521/FREEPDB1`로 등록되어 있다.
+생성되는 것 — `APP_USER` 계정과 그 스키마의 `BATCH_JOBS`/`CUSTOMERS`/`ORDERS` 테이블과 샘플 데이터, 그리고 **읽기 권한만 가진 조회 전용 계정 `VOC_READER`**(agent가 이 계정으로 접속). 접속 정보는 `target_db` 테이블에 `localhost:1521/FREEPDB1`로 등록되어 있다.
 
 ### 2. 백엔드
 
@@ -185,11 +185,14 @@ LLM 인터페이스는 `llm.js`의 `decide(ctx) → {action:'answer'|'run_query'
 ## 보안
 
 - **조회 전용 가드**: 실행 직전 SELECT/WITH로 시작하는 단일 문장만 허용 — UPDATE/DELETE/DDL/다중 문장은 차단된다 (`sql.js`의 `assertReadOnly`).
+  `SELECT … FOR UPDATE`도 거부한다 — 조회 문장이라 '첫 키워드' 검사는 통과하지만 조회대상 DB의 행에 잠금을 걸어 운영 트랜잭션을 대기시킨다.
   문자열 리터럴·주석 경계는 정규식이 아니라 단일 패스 스캐너로 판정한다 — Oracle q-quote(`q'!...!'`)는 구분자가 임의 문자라
   일부만 모델링하면 리터럴에 숨은 세미콜론을 놓치거나 정상 쿼리를 오탐한다. 경계를 확정할 수 없는 SQL(닫히지 않은 리터럴)은 거부한다.
   두 방향 모두 `backend`에서 `npm test`로 회귀 검증한다 (`backend/test/sql.test.js`)
 - LLM은 SQL을 직접 쓸 수 없고 `query_registry`에 등록된 쿼리의 **이름만 선택**한다. 사용자 입력은 바인드 변수 값으로만 전달 (문자열 결합 없음)
-- 그래도 조회 계정(`target_db.db_user`)은 **read-only 권한 계정**을 사용할 것 (심층 방어)
+- 그래도 조회 계정(`target_db.db_user`)은 **read-only 권한 계정**을 사용할 것 (심층 방어).
+  Oracle 12c+라면 `GRANT SELECT`가 아니라 `GRANT READ`를 준다 — 차이는 딱 하나, READ에는 `LOCK TABLE`과 `SELECT … FOR UPDATE`가 빠져 있어
+  위 가드와 같은 규칙이 계정 차원에서도 강제된다 (`sql/oracle-init.sql`이 그렇게 부여한다)
 - `db_password`는 `ENV:변수명` 형식으로 환경변수 참조 권장. 평문 저장은 개발용만
 - 조회 쿼리 타임아웃 `ORACLE_TIMEOUT_MS`(기본 30초) — 느린 쿼리가 요청을 무한 대기시키지 않는다.
   빈 값·0·오타는 기본값으로 되돌리고 경고를 남긴다 (0은 드라이버에서 "타임아웃 없음"을 뜻하므로 그대로 두면 정반대로 동작한다)

@@ -92,10 +92,17 @@ export function truncatedBinds(history, bindNameList, params) {
 // (테스트에서 쓰므로 export 한다 — 클라이언트가 보낸 값을 그대로 믿지 않는 유일한 지점이다)
 export function normalizeChat(chat) {
   if (!Array.isArray(chat)) return [];
+  // 내용이 빈 턴은 걸러낸다 — 프롬프트에는 '- 사용자: ' 한 줄로 실려 모델이 내용 없는 발화를
+  // 맥락으로 읽고(무엇을 가리키는지 없는 지시대명사처럼 다룬다), 턴 예산 자리도 하나 차지한다.
+  // 같은 판정을 절단 뒤에 한 번 더 한다: 짝 잃은 서로게이트 하나만 담긴 턴은 clipChatText가
+  // 그 코드유닛을 떼면서 빈 문자열이 되므로, 앞에서만 거르면 그 경로로 빈 턴이 그대로 남는다.
+  const isTurn = m =>
+    m && (m.role === 'user' || m.role === 'assistant') && typeof m.text === 'string' && m.text.trim();
   return chat
-    .filter(m => m && typeof m.text === 'string' && (m.role === 'user' || m.role === 'assistant'))
+    .filter(isTurn)
     .slice(-MAX_CHAT_TURNS)
-    .map(m => ({ role: m.role, text: clipChatText(m.text) }));
+    .map(m => ({ role: m.role, text: clipChatText(m.text) }))
+    .filter(isTurn);
 }
 
 // 턴 본문은 단순 slice가 아니라 clipText로 자른다 — 경계의 서로게이트 쌍(이모지 등)을 반으로
