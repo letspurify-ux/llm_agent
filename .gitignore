@@ -2,3 +2,8 @@ node_modules/
 .env
 dist/
 .DS_Store
+
+# start.sh/stop.sh(백엔드·프론트엔드)가 남기는 실행 상태
+logs/
+.backend.pid
+.frontend.pid
