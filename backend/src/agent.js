@@ -3,13 +3,17 @@
 // 루프의 유일한 상태는 history 배열이며, 매 반복 전체 컨텍스트를 LLM에 전달한다.
 // 대화 맥락(chat)은 서버가 저장하지 않고 클라이언트가 매 요청에 실어 보낸다 (stateless 유지).
 import { searchKnowledge, searchQaMethods, searchQueries } from './search.js';
-import { loadQueryRegistry, countQueries, loadQueriesByNames } from './db.js';
+import { loadQueryRegistry, loadQueriesByNames } from './db.js';
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
 import { llm } from './llm.js';
 import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN } from './constants.js';
 
 const MAX_STEPS = 5;
+const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포함). 초과하면 남은 스텝을 포기하고 강제 답변으로 간다.
+                               // (스텝 상한과 별개로 필요하다 — 스텝 수는 LLM/조회가 얼마나 느린지를 모른다)
+                               // 요청 전체 상한 = 이 값 + 마지막 LLM 호출(120초) + 강제 답변(120초) ≈ 420초.
+                               // 프런트(App.jsx REQUEST_TIMEOUT_MS)가 이 계산에 맞춰져 있으니 함께 고칠 것.
 const MAX_PROMPT_QUERIES = 30; // 프롬프트에 싣는 쿼리 상한 (~2.2k토큰)
 const MAX_SAME_QUERY_TRIES = 2; // 같은 쿼리·파라미터의 최대 실행 시도 (1회 실패는 일시 오류일 수 있어 재시도 허용)
 const MAX_GUARD_HITS = 2;       // 루프 가드가 '연속으로' 이만큼 걸리면 남은 스텝을 포기하고 강제 답변으로 간다.
@@ -52,6 +56,9 @@ function normalizeChat(chat) {
 
 export async function handleQuestion(question, rawChat = []) {
   const chat = normalizeChat(rawChat);
+  // 예산은 요청 시작점에서 잡는다 — 검색 뒤에 잡으면 임베딩 타임아웃(최대 2회 × 60초)이
+  // 예산 밖에 놓여, 문서화한 요청 상한과 프런트 abort 시각이 실제보다 낙관적이 된다.
+  const deadline = Date.now() + MAX_LOOP_MS;
 
   const [k0, m0] = await Promise.all([
     searchKnowledge(question),
@@ -59,6 +66,9 @@ export async function handleQuestion(question, rawChat = []) {
   ]);
   let knowledge = k0;
   let qaMethods = m0;
+  // 쿼리 검색에도 같은 문장을 써야 한다 — 아래에서 맥락을 덧붙여 재검색했는데
+  // 쿼리 라우팅만 원래 질문을 보면, qa_method 없이 등록된 쿼리(경로B)는 후속 질문마다 통째로 빠진다.
+  let searchText = question;
 
   // "그럼 김철수는?" 같은 후속 질문은 그 문장만으로는 검색되지 않는다.
   // 현재 질문으로 아무것도 못 찾았을 때만 직전 질문을 덧붙여 재검색한다
@@ -66,14 +76,15 @@ export async function handleQuestion(question, rawChat = []) {
   if (!knowledge.length && !qaMethods.length && chat.length) {
     const prevQuestions = chat.filter(m => m.role === 'user').slice(-2).map(m => m.text).join(' ');
     if (prevQuestions) {
+      searchText = `${prevQuestions} ${question}`;
       [knowledge, qaMethods] = await Promise.all([
-        searchKnowledge(`${prevQuestions} ${question}`),
-        searchQaMethods(`${prevQuestions} ${question}`),
+        searchKnowledge(searchText),
+        searchQaMethods(searchText),
       ]);
     }
   }
 
-  const { list: queries, routed } = await selectQueries(qaMethods, question);
+  const { list: queries, routed } = await selectQueries(qaMethods, searchText);
 
   // 검색 적중 수 — chat_log 분석용: 검색 0건(지식/쿼리 신규 등록 필요)과
   // 적중은 했지만 답이 부실한 경우(내용 보강 필요)를 구분할 수 있게 한다.
@@ -90,10 +101,18 @@ export async function handleQuestion(question, rawChat = []) {
   let guardHits = 0;
 
   for (let step = 0; step < MAX_STEPS; step++) {
+    // 스텝 수만으로는 소요 시간이 묶이지 않는다 — 느린 LLM 엔드포인트에서는
+    // 스텝마다 LLM 타임아웃이 통째로 쌓여 요청 하나가 수십 분씩 워커를 점유한다.
+    if (Date.now() > deadline) break;
     const decision = await llm.decide(ctx());
     if (decision.action === 'answer') {
       return { answer: decision.answer, trace: history, search };
     }
+
+    // 예산은 스텝 진입에서만 보면 부족하다 — 239초에 시작한 스텝이 LLM 120초를 쓰고 나서
+    // Oracle 접속·조회까지 더 태우면 프런트가 먼저 끊는 지점을 넘긴다.
+    // LLM 응답을 받은 뒤 다시 확인해, 남지 않았으면 조회를 태우지 않고 강제 답변으로 간다.
+    if (Date.now() > deadline) break;
 
     const { row: registryRow, error: resolveError } =
       await resolveQuery(decision.query_name, queries, resolveCache);
@@ -133,8 +152,10 @@ export async function handleQuestion(question, rawChat = []) {
       history.push({ query_name: canonicalName, params: decision.params, rows: capRows(rows), totalRows, capped });
       guardHits = 0; // 진도가 나갔다 — 가드는 '연속' 헛도는 경우만 센다
     } catch (e) {
-      // 실패도 이력에 남기고 루프를 계속한다 — LLM이 에러를 보고 재시도/우회/답변을 판단
-      push('error', e.message);
+      // 실패도 이력에 남기고 루프를 계속한다 — LLM이 에러를 보고 재시도/우회/답변을 판단.
+      // 메시지가 비면 안 된다: error가 falsy면 프롬프트·답변 조립이 이 기록을 '오류'로 보지 않고
+      // rows가 있는 정상 결과로 취급해 들어간다.
+      push('error', e?.message || String(e));
     }
   }
 
@@ -168,7 +189,15 @@ async function resolveQuery(name, queries, cache) {
 //   경로B: 질문으로 query_registry 자체를 하이브리드 검색 — qa_method 등록 없는 쿼리도 찾는다
 // 반환: { list, routed } — routed=false면 전체를 실은 것이므로 '적중 수' 개념이 없다.
 async function selectQueries(qaMethods, question) {
-  if (await countQueries() <= MAX_PROMPT_QUERIES) return { list: await loadQueryRegistry(), routed: false };
+  // 상한+1건만 읽어 "전체를 실어도 되는 규모인지"를 같은 왕복에서 판정한다.
+  // COUNT 후 다시 SELECT하면 매 요청이 왕복 2회 + 풀 점유 2회가 되고, 그렇다고 무조건
+  // 전체를 읽으면 등록이 많을 때 대형 SELECT가 된다 — 상한+1은 양쪽 다 피한다.
+  // 대가: 라우팅이 도는 규모(등록 30건 초과)에서는 이 31행이 그대로 버려진다.
+  // 31행은 상한이 걸린 고정 비용이라 지금은 왕복 1회 쪽이 낫다고 봤다 —
+  // 등록이 크게 늘고 설명 컬럼이 길어져 이 전송이 부담이 되면
+  // 규모 판정만 `SELECT seq … LIMIT 31`로 떼고 전체 로드를 조건부로 되돌릴 것.
+  const head = await loadQueryRegistry(MAX_PROMPT_QUERIES + 1);
+  if (head.length <= MAX_PROMPT_QUERIES) return { list: head, routed: false };
 
   const mentioned = [...new Set(
     qaMethods.flatMap(m => m.method.match(/[A-Za-z_][A-Za-z0-9_]{2,}/g) || [])

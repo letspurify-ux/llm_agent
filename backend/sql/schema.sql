@@ -14,9 +14,14 @@ DROP TABLE IF EXISTS query_registry;
 DROP TABLE IF EXISTS target_db;
 
 -- 지식 관리: 단순 지식 질문은 이 내용으로 답변한다
+-- title에 UNIQUE를 두는 이유는 두 가지다.
+--  ① 같은 제목의 지식이 두 벌 들어가면 각각 별도 seq로 임베딩되어 검색 결과에 나란히 올라오고,
+--     프롬프트만 갉아먹으면서 어디에도 오류가 남지 않는다.
+--  ② 시드 파일이 INSERT … ON DUPLICATE KEY UPDATE 하나로 멱등해진다 —
+--     "지울 제목 목록"을 INSERT와 따로 손으로 맞추던 방식은 한쪽만 고치는 순간 조용히 어긋난다.
 CREATE TABLE knowledge (
   seq     INT AUTO_INCREMENT PRIMARY KEY,
-  title   VARCHAR(200) NOT NULL,
+  title   VARCHAR(200) NOT NULL UNIQUE,
   content TEXT NOT NULL
 );
 
@@ -24,7 +29,7 @@ CREATE TABLE knowledge (
 -- 실행할 쿼리가 있으면 query_registry.query_name을 실행 순서대로 본문에 그대로 언급한다.
 CREATE TABLE qa_method (
   seq    INT AUTO_INCREMENT PRIMARY KEY,
-  title  VARCHAR(200) NOT NULL,
+  title  VARCHAR(200) NOT NULL UNIQUE,  -- knowledge.title과 같은 이유 (위 주석 참고)
   method TEXT NOT NULL
 );
 
@@ -75,8 +80,10 @@ CREATE TABLE vec_store (
 -- 3일 지난 행은 서버가 기동 시 + 1시간 주기로 정리한다 (server.js).
 CREATE TABLE chat_log (
   seq        INT AUTO_INCREMENT PRIMARY KEY,
-  question   TEXT NOT NULL,
-  answer     TEXT,
+  question   TEXT NOT NULL,        -- 서버가 2,000자로 제한한다 (server.js)
+  answer     MEDIUMTEXT,           -- TEXT(65,535바이트)로는 부족하다: 20행×다컬럼 표에 셀당 200자면
+                                   -- utf8mb4 한글 기준 100KB를 넘고, strict 모드에서 INSERT가 거부돼
+                                   -- 하필 '결과가 큰 대화'만 로그에서 빠진다
   trace      JSON,                -- {v: 스키마 버전, search: 검색 적중 수(queries는 라우팅 동작 시에만, 아니면 null),
                                   --  steps: 실행 쿼리·바인드·결과. 실패는 steps[].error, 루프 가드 기록은 steps[].note}
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,

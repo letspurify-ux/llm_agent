@@ -115,10 +115,22 @@ function buildAnswer({ knowledge, history }) {
   }
   // 지식 첨부 규칙: 쿼리를 실행하지 않았으면 항상, 실행했으면 결과 값이 지식 내용에
   // 등장할 때만 첨부한다 (예: STATUS=FAILED ↔ "FAILED 상태이면 …" 지식).
+  // 짧은 값은 매칭에서 뺀다 — ''는 모든 문자열에 포함되고(항상 참), 한 글자 값('Y', 등급 'A',
+  // 상태코드 '1')은 어지간한 한국어 본문에 다 들어 있어 무관한 지식이 딸려온다.
+  const MIN_MATCH_LEN = 2;
+  // 기준은 "쿼리를 실행했는가"가 아니라 "조회가 성공했는가"다.
+  //   조회가 전부 실패했으면(에러만 있음) 첨부한다 — 손에 든 지식 대신 드라이버 오류 문구만 남으면 안 된다.
+  //   조회가 성공했으면 0건이어도 값 일치를 요구한다 — 여기서 무조건 첨부하면
+  //   "BATCH999는 없습니다" 뒤에 존재하지도 않는 작업의 재시작 절차가 확신에 차서 붙는다.
+  // (h.rows는 성공 시 빈 배열이라도 존재하므로 length가 아니라 유무로 판정한다)
+  const querySucceeded = history.some(h => h.rows);
   const attach = knowledge.find(k =>
-    history.length === 0 ||
+    !querySucceeded ||
     history.some(h => (h.rows || []).some(row =>
-      Object.values(row).some(v => k.content.includes(String(v)))
+      Object.values(row).some(v => {
+        const s = String(v ?? '');
+        return s.length >= MIN_MATCH_LEN && k.content.includes(s);
+      })
     ))
   );
   if (attach) {
@@ -133,11 +145,20 @@ function buildAnswer({ knowledge, history }) {
   return parts.join('\n\n');
 }
 
+// 셀 값에 든 '|'와 개행은 표 문법 그 자체다 — 그대로 흘리면 remark-gfm가 컬럼 수를 잘못 세어
+// 그 행부터 값이 밀리거나(파이프), 표가 중간에 끊기고 나머지가 본문으로 렌더된다(개행).
+// 역슬래시를 '먼저' 이스케이프해야 한다: 나중에 하면 'C:\|share'가 'C:\\|share'가 되어
+// GFM이 '\\'를 역슬래시 한 글자로 읽고 그 뒤 '|'를 살아 있는 구분자로 처리한다 (막으려던 그 오정렬).
+const cell = v => String(v ?? '')
+  .replace(/\\/g, '\\\\')
+  .replace(/\|/g, '\\|')
+  .replace(/\r?\n/g, ' ');
+
 function rowsToMarkdownTable(rows) {
   const cols = Object.keys(rows[0]);
   return [
-    `| ${cols.join(' | ')} |`,
+    `| ${cols.map(cell).join(' | ')} |`,
     `| ${cols.map(() => '---').join(' | ')} |`,
-    ...rows.map(r => `| ${cols.map(c => r[c]).join(' | ')} |`),
+    ...rows.map(r => `| ${cols.map(c => cell(r[c])).join(' | ')} |`),
   ].join('\n');
 }

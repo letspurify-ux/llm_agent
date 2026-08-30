@@ -4,6 +4,7 @@
 // 실행 경로: ① server.js 기동 시 1회  ② EMBED_SYNC_INTERVAL 주기  ③ npm run embed
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import { writeSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { query, getConnection } from './db.js';
 import { embed, EMBEDDING_MODEL, isEmbeddingEnabled } from './embedding.js';
@@ -59,11 +60,18 @@ async function doSync() {
   // 건너뛰면 삭제된 지식의 벡터가 남아, 임베딩을 다시 켤 때까지 검색에 노출된다.
   const enabled = isEmbeddingEnabled();
   let embedded = 0, deleted = 0, skipped = enabled ? SKIP.NONE : SKIP.UNCONFIGURED;
+  // 임베딩 서버가 도중에 끊기면 임베딩만 멈추고 루프는 끝까지 돈다.
+  // 여기서 return하면 뒤쪽 테이블의 고아 벡터 정리가 통째로 빠지는데, 그 정리는 이 함수에만 있어
+  // 삭제된 qa_method/query_registry의 벡터가 다음 성공 동기화까지 검색에 남는다.
+  let unavailable = false;
 
   for (const [src, cols] of Object.entries(SEARCH_COLUMNS)) {
     // 필요한 컬럼만 읽는다 — query_registry의 query_sql처럼 임베딩에 쓰지 않는 대형 TEXT를
     // 매 주기(기본 60초) 전송하지 않도록. cols는 코드가 정의한 식별자다(외부 입력 아님).
-    const rows = await query(`SELECT seq${enabled ? `, ${cols.join(', ')}` : ''} FROM ${src}`);
+    // 임베딩 서버가 이미 끊긴 뒤라면 본문도 읽지 않는다 — 어차피 임베딩하지 않을 텍스트를
+    // 실어 나르고 해시까지 계산해 버리는 일이 서버가 죽어 있는 내내 매 주기 반복된다.
+    const readContent = enabled && !unavailable;
+    const rows = await query(`SELECT seq${readContent ? `, ${cols.join(', ')}` : ''} FROM ${src}`);
     const stored = new Map(
       (await query('SELECT seq, embed_hash FROM vec_store WHERE src = ?', [src])).map(r => [r.seq, r.embed_hash])
     );
@@ -72,7 +80,7 @@ async function doSync() {
     // 자동으로 전체 재임베딩된다 (구 모델 벡터와 새 모델 질문 벡터를 섞으면 검색이 무의미해짐)
     const stale = [];
     for (const r of rows) {
-      if (enabled) {
+      if (readContent) {
         const text = toText(cols, r);
         const hash = crypto.createHash('md5').update(`${EMBEDDING_MODEL}\n${text}`).digest('hex');
         if (stored.get(r.seq) !== hash) stale.push({ seq: r.seq, text, hash });
@@ -92,11 +100,11 @@ async function doSync() {
     for (let i = 0; i < stale.length; i += BATCH) {
       const batch = stale.slice(i, i + BATCH);
       const vectors = await embed(batch.map(b => b.text));
-      if (!vectors) return { embedded, deleted, skipped: SKIP.UNAVAILABLE }; // 임베딩 서버 응답 없음 — 다음 주기에 재시도
+      if (!vectors) { unavailable = true; break; } // 임베딩 서버 응답 없음 — 다음 주기에 재시도
       embedded += await storeBatch(src, batch, vectors);
     }
   }
-  return { embedded, deleted, skipped };
+  return { embedded, deleted, skipped: unavailable ? SKIP.UNAVAILABLE : skipped };
 }
 
 // 배치 전체를 한 문장으로 쓴다 — 행마다 왕복하면 초기 1만건 동기화가 1만 번 왕복이 된다.
@@ -136,9 +144,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     [SKIP.UNCONFIGURED]: ' — EMBEDDING_URL 미설정 (LIKE-only 구성, 임베딩 생략)',
     [SKIP.BUSY]: ' — 다른 동기화가 진행 중이라 건너뛰었습니다',
   }[r.skipped] ?? '';
-  console.log(
-    `임베딩 동기화 완료: 생성/갱신 ${r.embedded}건, 정리 ${r.deleted}건, ${((Date.now() - t) / 1000).toFixed(1)}s${suffix}`
-  );
+  // stdout이 파이프(tee, CI 로그, docker build 등)면 console.log는 비동기라 아래 process.exit에
+  // 잘려 나간다 — 이 명령의 존재 이유가 프로비저닝 스크립트에 결과를 알리는 것이므로 동기로 쓴다.
+  // try/catch는 필수다: 논블로킹 파이프에서 writeSync는 EAGAIN을 던지는데, 그게 새어 나가면
+  // 아래 process.exit가 실행되지 않아 성공한 동기화가 0이 아닌 종료 코드로 보고된다.
+  // (server.js의 uncaughtException 핸들러가 같은 이유로 같은 형태를 쓴다)
+  const summary = `임베딩 동기화 완료: 생성/갱신 ${r.embedded}건, 정리 ${r.deleted}건, ${((Date.now() - t) / 1000).toFixed(1)}s${suffix}\n`;
+  try { writeSync(1, summary); } catch { /* 로그 실패가 종료 코드를 바꾸지 않게 */ }
   // 실패로 종료하는 것은 "쓰려고 했는데 안 된" 경우뿐이다 — LIKE-only는 지원되는 구성이므로
   // 프로비저닝 스크립트가 이 명령의 종료 코드로 실패 판정을 하면 안 된다.
   process.exit(r.skipped === SKIP.UNAVAILABLE ? 1 : 0);

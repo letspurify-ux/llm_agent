@@ -33,6 +33,11 @@ const NLS_SESSION_FORMATS =
 // 드라이버는 NaN에 NJS-004를 던지고, 0은 "타임아웃 없음"이라 오타 하나가 무한 대기를 만든다.
 const TIMEOUT_MS = numEnv('ORACLE_TIMEOUT_MS', 30_000);
 
+// 접속 단계 상한(초). 주소마다 적용되므로 작게 잡는다 — 아래 getConnection 주석 참고.
+// 사내망의 정상 접속은 1초 안쪽이라 10초면 넉넉하고, 주소 2개여도 최악 20초로 묶인다.
+const CONNECT_TIMEOUT_S = 10;
+const TRANSPORT_CONNECT_TIMEOUT_S = 5;
+
 // 반환: { rows, totalRows, capped } — rows는 MAX_ROWS까지, 셀은 MAX_CELL_LEN까지 정규화된 값.
 // capped는 "상한에 걸려 잘렸다"는 뜻이므로 MAX_ROWS+1건을 요청해 판정한다
 // (정확히 MAX_ROWS건인 완전한 결과를 "더 있을 수 있음"으로 잘못 알리지 않도록).
@@ -42,8 +47,13 @@ export async function runQuery(registryRow, params = {}) {
   // SQL에 실제로 있는 바인드만 추려서 전달한다 — LLM이 여분 파라미터를 주면
   // 드라이버가 바인드 수 불일치(NJS-098)로 실패하므로 필터가 필요하다.
   const names = bindNames(registryRow.query_sql);
-  const missing = names.filter(n => params?.[n] === undefined);
-  if (missing.length) throw new Error(`바인드 변수 누락: ${missing.join(', ')}`);
+  const bad = names.map(n => [n, bindProblem(params?.[n])]).filter(([, p]) => p);
+  if (bad.length) {
+    throw new Error(
+      `바인드 변수를 쓸 수 없습니다 — ${bad.map(([n, p]) => `${n}: ${p}`).join(', ')}. ` +
+      '질문이나 실행 이력에서 값을 확인하고, 알 수 없으면 사용자에게 되묻거나 다른 쿼리를 선택하라'
+    );
+  }
   const binds = Object.fromEntries(names.map(n => [n, params[n]]));
 
   if (process.env.ORACLE_MOCK === '1') return capResult(mockResult(registryRow.query_name, binds));
@@ -59,6 +69,17 @@ export async function runQuery(registryRow, params = {}) {
     user: target.db_user,
     password: resolvePassword(target.db_password),
     connectString: target.connection_info,
+    // 접속 자체에도 상한이 필요하다 — callTimeout은 커넥션이 생긴 뒤부터 적용되므로,
+    // 리스너가 TCP는 받아주고 핸드셰이크를 끝내지 않는 상태(기동 중이거나 멈춘 DB)에서는
+    // 여기서 무한정 매달려 agent의 요청 예산 검사가 무의미해진다. 단위는 초다(callTimeout만 ms).
+    //
+    // 둘 다 지정한다: 드라이버는 "둘 다 미설정"일 때만 transportConnectTimeout 기본값(20초)을 넣으므로,
+    // connectTimeout만 주면 TCP 단계의 기본 상한이 오히려 사라진다 (sessionAtts.js).
+    // 값을 작게 잡는 이유는 이 상한이 '주소마다' 적용되기 때문이다 — connect1이 주소 목록을
+    // do/while로 돌며 시도마다 타이머를 새로 건다. 'localhost'는 ::1과 127.0.0.1 둘로 풀리므로
+    // 실제 최악은 주소 수 × 값이다. 조회 타임아웃(ORACLE_TIMEOUT_MS)과 별개인 것도 그래서다.
+    connectTimeout: CONNECT_TIMEOUT_S,
+    transportConnectTimeout: TRANSPORT_CONNECT_TIMEOUT_S,
   });
   try {
     // 조회 타임아웃 — 느린 쿼리(락 대기, 잘못된 실행계획)가 요청을 무한 대기시키지 않게.
@@ -123,6 +144,28 @@ function localDateTime(d) {
          `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+// 바인드로 쓸 수 없는 값이면 그 이유를 돌려준다 (쓸 수 있으면 null).
+// 세 경우 모두 실패시키지 않으면 조용히 0건이 나오고, LLM은 그 0건을 "그런 데이터가 없다"로 읽어
+// 확신에 찬 오답을 만든다. 실패시켜야 LLM이 되묻거나 다른 경로를 잡는다.
+//   값 없음  → Oracle에서 `WHERE col = NULL`은 영원히 참이 아니다 (빈 문자열도 NULL로 취급된다)
+//   구조     → node-oracledb가 객체/배열을 바인드 서술자로 해석해 val 없이 NULL을 바인드한다
+//   잘린 값  → normalizeValue가 MAX_CELL_LEN에서 자르고 TRUNC_MARK를 붙인 값이다. 그 값이 프롬프트를
+//              거쳐 다음 스텝의 바인드로 되돌아오면 원본과 다르므로 절대 매칭되지 않는다.
+//              (mock provider는 llm.js에서 아예 제안조차 하지 않게 막지만, 실제 LLM에는 그 가드가 없다)
+//              표시만 보고 TRUNC_MARK를 뗀 앞부분만 넣는 경우가 더 흔하므로 길이로도 막는다 —
+//              MAX_CELL_LEN 이상의 바인드 값은 잘린 조각일 가능성이 압도적이다
+//              (등록 쿼리의 `= :bind`는 ID·코드·이름을 받지, 200자짜리 본문을 받지 않는다).
+// 주의: `WHERE (:opt IS NULL OR col = :opt)` 같은 선택적 필터 패턴은 이 가드에 걸린다 —
+// 그런 쿼리는 '전체'를 뜻하는 별도 센티널 값(예: 'ALL')을 쓰도록 등록할 것.
+function bindProblem(v) {
+  if (v === undefined || v === null || v === '') return '값 없음';
+  if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') return '값이 아닌 구조';
+  if (typeof v === 'string' && (v.endsWith(TRUNC_MARK) || v.length >= MAX_CELL_LEN)) {
+    return '잘린 값이라 원본과 다름';
+  }
+  return null;
+}
+
 // 'ENV:변수명' 형식이면 서버 환경변수에서 읽는다. 평문은 개발용으로만 허용.
 function resolvePassword(stored) {
   if (stored?.startsWith('ENV:')) return process.env[stored.slice(4)] || '';
@@ -139,24 +182,49 @@ const MOCK_JOBS = [
   { JOB_ID: 'BATCH003', JOB_NAME: '고객 등급 산정', STATUS: 'RUNNING', LAST_RUN_AT: '2026-08-29 03:00' },
 ];
 
-// 등록 SQL(seed.sql)과 같은 비교·정렬·출력 컬럼을 쓴다.
+const MOCK_CUSTOMERS = [
+  { CUSTOMER_ID: 'C-1001', CUSTOMER_NAME: '홍길동', GRADE: 'VIP' },
+  { CUSTOMER_ID: 'C-1002', CUSTOMER_NAME: '김철수', GRADE: 'GOLD' },
+  { CUSTOMER_ID: 'C-1003', CUSTOMER_NAME: '이영희', GRADE: 'SILVER' },
+];
+
+const MOCK_ORDERS = [
+  { ORDER_ID: 'O-777', CUSTOMER_ID: 'C-1001', STATUS: '배송중',   ORDER_DATE: '2026-08-27', AMOUNT: 128000 },
+  { ORDER_ID: 'O-778', CUSTOMER_ID: 'C-1001', STATUS: '결제완료', ORDER_DATE: '2026-08-25', AMOUNT: 45000 },
+  { ORDER_ID: 'O-779', CUSTOMER_ID: 'C-1001', STATUS: '배송완료', ORDER_DATE: '2026-08-20', AMOUNT: 233000 },
+  { ORDER_ID: 'O-801', CUSTOMER_ID: 'C-1002', STATUS: '배송완료', ORDER_DATE: '2026-08-26', AMOUNT: 71000 },
+  { ORDER_ID: 'O-802', CUSTOMER_ID: 'C-1003', STATUS: '주문접수', ORDER_DATE: '2026-08-29', AMOUNT: 19900 },
+];
+
+// 등록 SQL(seed.sql)과 같은 비교·정렬·출력 컬럼을 쓴다. 출력 컬럼이 하나라도 다르면
+// mock으로 검증한 시나리오가 실제 배포에서 그대로 재현되지 않는다 — 없는 컬럼을 근거로 답하거나
+// (mock에만 있는 CUSTOMER_ID), 있는 컬럼을 못 쓰거나(실제에만 있는 AMOUNT) 한다.
 // Oracle 문자열 비교는 대소문자를 구분하므로 mock도 구분한다 — mock에서만 통과하는
 // 파라미터(status:'failed' 등)가 실제 DB에서 0건이 되는 것을 데모 단계에서 드러내기 위함.
+const pick = (row, cols) => Object.fromEntries(cols.map(c => [c, row[c]]));
+
 const MOCK_DATA = {
+  // SELECT JOB_ID, JOB_NAME, STATUS, LAST_RUN_AT ... WHERE JOB_ID = :job_id
   batch_job_status: p => MOCK_JOBS
     .filter(j => j.JOB_ID === p.job_id)
-    .map(({ JOB_ID, JOB_NAME, STATUS, LAST_RUN_AT }) => ({ JOB_ID, JOB_NAME, STATUS, LAST_RUN_AT })),
-  // seed의 '경로B 데모' 쿼리 (qa_method 없이 query_desc만으로 선택된다) — 등록 SQL의 출력 컬럼과 동일하게 STATUS는 제외
+    .map(j => pick(j, ['JOB_ID', 'JOB_NAME', 'STATUS', 'LAST_RUN_AT'])),
+  // seed의 '경로B 데모' 쿼리 (qa_method 없이 query_desc만으로 선택된다)
+  // SELECT JOB_ID, JOB_NAME, LAST_RUN_AT ... WHERE STATUS = :status ORDER BY LAST_RUN_AT DESC
   batch_list_by_status: p => MOCK_JOBS
     .filter(j => j.STATUS === p.status)
-    .sort((a, b) => b.LAST_RUN_AT.localeCompare(a.LAST_RUN_AT)) // ORDER BY LAST_RUN_AT DESC
-    .map(({ STATUS, ...row }) => row),
-  find_customer_id: p => [
-    { CUSTOMER_ID: 'C-1001', CUSTOMER_NAME: p.customer_name, GRADE: 'VIP' },
-  ],
-  order_status_by_customer: p => [
-    { ORDER_ID: 'O-777', CUSTOMER_ID: p.customer_id, STATUS: '배송중', ORDER_DATE: '2026-08-27' },
-  ],
+    .sort((a, b) => b.LAST_RUN_AT.localeCompare(a.LAST_RUN_AT))
+    .map(j => pick(j, ['JOB_ID', 'JOB_NAME', 'LAST_RUN_AT'])),
+  // SELECT CUSTOMER_ID, CUSTOMER_NAME, GRADE ... WHERE CUSTOMER_NAME = :customer_name
+  find_customer_id: p => MOCK_CUSTOMERS
+    .filter(c => c.CUSTOMER_NAME === p.customer_name)
+    .map(c => pick(c, ['CUSTOMER_ID', 'CUSTOMER_NAME', 'GRADE'])),
+  // SELECT ORDER_ID, STATUS, ORDER_DATE, AMOUNT ... WHERE CUSTOMER_ID = :customer_id
+  //   ORDER BY ORDER_DATE DESC FETCH FIRST 5 ROWS ONLY
+  order_status_by_customer: p => MOCK_ORDERS
+    .filter(o => o.CUSTOMER_ID === p.customer_id)
+    .sort((a, b) => b.ORDER_DATE.localeCompare(a.ORDER_DATE))
+    .slice(0, 5)
+    .map(o => pick(o, ['ORDER_ID', 'STATUS', 'ORDER_DATE', 'AMOUNT'])),
 };
 
 function mockResult(queryName, params) {

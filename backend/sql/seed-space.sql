@@ -5,6 +5,10 @@
 SET NAMES utf8mb4;
 USE llm_agent;
 
+-- 재실행 가능(멱등): knowledge.title UNIQUE에 얹어 덮어쓴다 (seed.sql과 같은 방식).
+-- 지울 제목 목록을 따로 두면 아래 INSERT와 손으로 맞춰야 하는 사본이 생기고,
+-- 한쪽만 고치는 순간 옛 행이 남아 같은 지식이 두 벌 검색된다.
+
 INSERT INTO knowledge (title, content) VALUES
 ('SPACE 시스템 개요',
  'SPACE는 삼성전자의 인공지능(AI) 기반 가상계측(Virtual Metrology) 시스템이다. 반도체 제조 공정에서 설비 센서 데이터를 AI 모델로 분석하여, 실제 계측 장비로 측정하지 않은 웨이퍼의 품질 값(두께, 선폭, 식각량 등)을 예측한다. 이를 통해 계측 시간과 비용을 줄이면서도 전수(全數) 수준의 품질 확인이 가능하다.'),
@@ -19,4 +23,5 @@ INSERT INTO knowledge (title, content) VALUES
  'SPACE의 예측 모델은 공정 조건 변경, 설비 정비(PM), 부품 교체 등으로 인해 시간이 지나면 예측 정확도가 저하될 수 있다(모델 드리프트). 따라서 실측값과 예측값의 오차를 지속 모니터링하고, 정확도가 기준치 아래로 떨어지면 최신 데이터로 모델을 재학습하여 배포한다. 모델 재학습 이력과 버전은 시스템에서 관리된다.'),
 
 ('SPACE 주요 용어',
- 'VM(Virtual Metrology): 가상계측. FDC(Fault Detection and Classification): 설비 센서 데이터 기반 이상 감지 시스템으로 가상계측의 주요 입력 데이터. 실측(Actual): 계측 장비로 실제 측정한 값. 예측값(Predicted): AI 모델이 추정한 값. 모델 드리프트: 시간 경과에 따라 예측 정확도가 저하되는 현상. R2/RMSE: 예측 모델의 정확도를 평가하는 지표.');
+ 'VM(Virtual Metrology): 가상계측. FDC(Fault Detection and Classification): 설비 센서 데이터 기반 이상 감지 시스템으로 가상계측의 주요 입력 데이터. 실측(Actual): 계측 장비로 실제 측정한 값. 예측값(Predicted): AI 모델이 추정한 값. 모델 드리프트: 시간 경과에 따라 예측 정확도가 저하되는 현상. R2/RMSE: 예측 모델의 정확도를 평가하는 지표.')
+ON DUPLICATE KEY UPDATE content = VALUES(content);

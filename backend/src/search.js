@@ -106,7 +106,7 @@ function vecQuery(table, vector) {
 //   - 조사를 뗀 변형 토큰은 원형보다 짧으므로 자연히 낮게 반영된다
 async function likeSearch(table, columns, question) {
   // 토큰 상한: 대형 입력이 CASE 절 수천 개짜리 SQL을 만들면 MariaDB thread stack overrun이 난다
-  const tokens = [...new Set(question.split(/\s+/).flatMap(expandToken).filter(t => t.length >= 2))].slice(0, 50);
+  const tokens = searchTokens(question).slice(0, 50);
   if (tokens.length === 0) return [];
 
   const scoreParts = [];
@@ -127,6 +127,25 @@ async function likeSearch(table, columns, question) {
     params
   );
 }
+
+// 질문 → LIKE 검색 토큰. 공백으로 나눈 뒤 앞뒤 문장부호를 떼고 조사 변형을 붙인다.
+// 문장부호 제거가 먼저여야 한다: expandToken의 조사 판정이 /[가-힣]$/라서, 물음표 하나만 붙어도
+// 판정이 실패해 변형이 하나도 만들어지지 않는다. "가상계측이란?"은 그 상태로 0건이 되고
+// "가상계측이란"은 정상 적중한다 — 한국어 질문에 물음표를 붙이는 건 지극히 자연스러운 입력이다.
+// (테스트에서 쓰므로 export 한다)
+export function searchTokens(question) {
+  return [...new Set(
+    String(question ?? '')
+      .split(/\s+/)
+      .map(stripPunctuation)
+      .flatMap(expandToken)
+      .filter(t => t.length >= 2)
+  )];
+}
+
+// 토큰 앞뒤의 문장부호·따옴표·괄호를 뗀다. 가운데는 건드리지 않는다 —
+// 'BATCH-001'이나 'restart_batch.sh'처럼 부호가 식별자의 일부인 경우가 있다.
+const stripPunctuation = t => t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
 
 // 한국어는 조사가 붙어("가상계측이") 원형("가상계측")과 LIKE 매칭이 되지 않는다.
 // 3자 이상 토큰은 끝 1~2글자를 뗀 형태도 함께 검색해 조사를 흡수한다.

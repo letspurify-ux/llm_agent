@@ -8,6 +8,12 @@ import remarkGfm from 'remark-gfm';
 const HISTORY_TURNS = 6;
 const HISTORY_LEN = 500;
 
+// 요청 상한. 서버 최악 = 루프 진입 예산 180초(agent.js MAX_LOOP_MS) + 마지막 LLM 호출 120초
+// + 강제 답변 120초 ≈ 420초이므로 그보다 뒤에 둔다. 짧게 잡으면 서버가 답을 만들어 보내는 중에
+// 클라이언트가 먼저 끊어 "서버와 통신하지 못했습니다"로 뭉개진다.
+// 이게 없으면 반대로 서버가 응답하지 않을 때 타이핑 표시가 영원히 돈다.
+const REQUEST_TIMEOUT_MS = 450_000;
+
 const EXAMPLES = [
   'SPACE 시스템이 뭐야',
   'BATCH001 작업 상태 알려줘',
@@ -47,41 +53,66 @@ export default function App() {
   const historyRef = useRef([]);      // 서버로 보낼 대화 이력 (setState 비동기와 무관하게 즉시 반영)
   const composingRef = useRef(false); // IME 조합 진행 중
   const justComposedRef = useRef(false); // 직전 조합을 확정한 키 입력이 아직 끝나지 않음
+  const sendingRef = useRef(false);   // 전송 진행 중 (loading state와 달리 같은 tick에도 즉시 보인다)
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, loading]);
 
   async function ask(message) {
-    if (!message || loading) return;
-    // history는 현재 질문을 넣기 전에 확정한다 — 현재 질문은 message로 따로 가므로 중복 전송하지 않는다.
-    // 서버가 쓰는 만큼만 보낸다 (턴 수·길이 모두). 더 보내도 서버가 버리고 본문만 커진다.
-    const history = historyRef.current
-      .slice(-HISTORY_TURNS)
-      .map(m => ({ role: m.role, text: m.text.slice(0, HISTORY_LEN) }));
-    historyRef.current = [...historyRef.current, { role: 'user', text: message }];
-    setMessages(m => [...m, { role: 'user', text: message }]);
-    setInput('');
-    setLoading(true);
+    // loading은 state라 같은 tick에 두 번 호출되면 두 번 다 false로 읽힐 수 있다 —
+    // 실제 중복 전송을 막는 것은 ref 쪽이다 (state는 버튼 비활성화 등 렌더에만 쓴다).
+    if (!message || loading || sendingRef.current) return;
+    sendingRef.current = true;
     let answer = '서버와 통신하지 못했습니다.';
     let trace;
+    let answered = false; // 서버가 실제로 '답'을 돌려줬는가 (통신 실패·타임아웃·서버 오류와 구분)
+    // AbortSignal.timeout()이 아니라 AbortController를 쓴다 — 전자는 Chrome 103/Safari 16 이상이고
+    // Vite 기본 빌드 타깃(chrome87/safari14)은 문법만 변환할 뿐 런타임 API를 폴리필하지 않는다.
+    // 구형 브라우저에서 fetch 호출 전에 TypeError가 나고, 그게 아래 catch에 삼켜져
+    // 모든 질문이 "서버와 통신하지 못했습니다"로 보인다 — 백엔드 장애와 구분이 안 된다.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+    // 플래그를 세운 직후부터 finally로 감싼다 — 사이에서 무엇이 던지든 플래그가 반드시 풀려야 한다.
+    // 안 그러면 화면은 멀쩡한데 전송만 영구히 막힌다 (loading은 false라 버튼도 활성으로 보인다).
     try {
+      // history는 현재 질문을 넣기 전에 확정한다 — 현재 질문은 message로 따로 가므로 중복 전송하지 않는다.
+      // 서버가 쓰는 만큼만 보낸다 (턴 수·길이 모두). 더 보내도 서버가 버리고 본문만 커진다.
+      const history = historyRef.current
+        .slice(-HISTORY_TURNS)
+        .map(m => ({ role: m.role, text: String(m.text ?? '').slice(0, HISTORY_LEN) }));
+      historyRef.current = [...historyRef.current, { role: 'user', text: message }];
+      setMessages(m => [...m, { role: 'user', text: message }]);
+      setInput('');
+      setLoading(true);
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: ctrl.signal,
         // 서버는 상태를 저장하지 않으므로 최근 대화를 함께 보낸다 (후속 질문 해석용)
         body: JSON.stringify({ message, history }),
       });
       const data = await res.json();
-      answer = data.answer ?? data.error;
+      // ??가 아니라 ||인 이유: 빈 문자열도 걸러야 한다. undefined는 이력에 들어가면 다음 전송을 깨고,
+      // ''는 빈 말풍선으로 렌더된 뒤 그 빈 턴이 다음 질문의 맥락으로 서버에 되돌아간다.
+      // (답변은 항상 문자열이므로 0·false가 ||에 걸려 사라질 일은 없다)
+      answer = data.answer || data.error || answer;
       trace = data.trace;
-    } catch {
-      // answer는 통신 오류 기본값 유지
+      // 오류 응답(4xx/5xx, 또는 error 필드)은 모델이 한 말이 아니다 — 이력에 넣지 않는다.
+      answered = res.ok && !data.error;
+    } catch (e) {
+      // answer는 통신 오류 기본값 유지. 콘솔에는 남긴다 —
+      // 네트워크 실패·타임아웃·클라이언트 예외가 화면에서는 모두 같은 문구로 보이기 때문이다.
+      console.error('[chat] 요청 실패:', e);
     } finally {
-      // 오류 응답도 이력에 남겨 화면과 서버로 보내는 대화가 항상 일치하게 한다
-      historyRef.current = [...historyRef.current, { role: 'assistant', text: answer }];
+      clearTimeout(timer);
+      // 화면에는 항상 남기지만, 서버로 되돌려 보내는 이력에는 서버가 준 답만 넣는다 —
+      // 타임아웃·네트워크 실패 문구를 이력에 남기면 다음 질문의 '## 최근 대화'에
+      // "에이전트: 서버와 통신하지 못했습니다."로 실려, 모델이 자기가 한 말로 알고 사과하거나 그걸 근거로 추론한다.
+      if (answered) historyRef.current = [...historyRef.current, { role: 'assistant', text: answer }];
       setMessages(m => [...m, { role: 'assistant', text: answer, trace }]);
       setLoading(false);
+      sendingRef.current = false;
     }
   }
 

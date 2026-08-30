@@ -62,7 +62,9 @@ app.post('/api/chat', async (req, res) => {
     });
   } catch (e) {
     console.error('[chat error]', e);
-    res.status(500).json({ answer: '처리 중 오류가 발생했습니다.' });
+    // 실패는 400/413/500 어느 경로든 error 필드로 통일한다 — 여기만 answer로 보내면
+    // error 유무로 실패를 판정하는 클라이언트가 서버 오류를 정상 답변으로 읽는다.
+    res.status(500).json({ error: '처리 중 오류가 발생했습니다.' });
   }
 });
 

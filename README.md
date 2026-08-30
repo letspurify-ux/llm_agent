@@ -46,6 +46,22 @@ frontend/                    # Vite + React 채팅 UI (App.jsx 단일 컴포넌�
 mariadb --default-character-set=utf8mb4 < backend/sql/schema.sql
 ```
 
+> **이미 운영 중인 DB에는 실행하지 말 것** — schema.sql은 맨 앞에서 모든 테이블을 DROP한다.
+> 기존 설치에 변경분만 반영하려면 아래 마이그레이션을 쓴다:
+>
+> ```sql
+> -- chat_log.answer: TEXT(65,535바이트)로는 결과가 큰 대화가 strict 모드에서 통째로 기록되지 않는다
+> ALTER TABLE chat_log MODIFY answer MEDIUMTEXT;
+>
+> -- 제목 UNIQUE: 시드 파일이 ON DUPLICATE KEY UPDATE로 멱등해지고,
+> -- 같은 제목의 지식이 두 벌 임베딩되어 검색 결과에 나란히 뜨는 것도 막힌다.
+> -- 이미 중복 제목이 있으면 ALTER가 실패하므로 아래로 먼저 확인하고 정리할 것.
+> SELECT title, COUNT(*) c FROM knowledge  GROUP BY title HAVING c > 1;
+> SELECT title, COUNT(*) c FROM qa_method GROUP BY title HAVING c > 1;
+> ALTER TABLE knowledge  ADD UNIQUE (title);
+> ALTER TABLE qa_method ADD UNIQUE (title);
+> ```
+
 ```bash
 mariadb --default-character-set=utf8mb4 < backend/sql/seed.sql
 ```
