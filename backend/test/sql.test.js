@@ -39,6 +39,18 @@ test('정상 조회 쿼리는 통과한다', () => {
   accepts('-- comment; DELETE\nSELECT 1 FROM dual');
 });
 
+test('괄호로 시작하는 조회 쿼리도 통과한다', () => {
+  // 등록 SQL이 `(SELECT …) FETCH FIRST n ROWS ONLY` 형태일 수 있다. 조회인데 거부되면 그 쿼리는
+  // 영구히 죽고, 오류 문구가 "SELECT만 실행할 수 있다"라 원인이 정반대로 보인다.
+  accepts('(SELECT ORDER_ID FROM ORDERS WHERE CUSTOMER_ID = :cid) FETCH FIRST 5 ROWS ONLY');
+  accepts('( SELECT 1 FROM dual )');
+  accepts('((SELECT 1 FROM dual))');
+  // 괄호를 걷어낸 뒤에도 SELECT/WITH가 아니면 그대로 거부한다
+  rejects('(DELETE FROM t)');
+  rejects('(UPDATE t SET a = 1)');
+  rejects('(SELECT 1 FROM dual); DROP TABLE t');
+});
+
 test('바인드 추출은 리터럴·주석 안의 콜론을 무시한다', () => {
   assert.deepStrictEqual(bindNames("SELECT TO_CHAR(d, 'HH24:MI') FROM t WHERE a = :job_id"), ['job_id']);
   assert.deepStrictEqual(bindNames('SELECT 1 FROM t WHERE a = :a /* :nope */ AND b = :b -- :nope2'), ['a', 'b']);

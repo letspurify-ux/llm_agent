@@ -15,9 +15,9 @@ const HISTORY_LEN = 500;
 const REQUEST_TIMEOUT_MS = 450_000;
 
 const EXAMPLES = [
-  'SPACE 시스템이 뭐야',
-  'BATCH001 작업 상태 알려줘',
-  '홍길동 고객 주문 상태 알려줘',
+  'SPACE 시스템이 뭐야?',
+  'VM Agent Dashboard 현황 알려줘',
+  '너는 어떤 일을 할 수 있어?',
 ];
 
 // 입력창 타이핑마다 전체 대화가 다시 렌더되지 않도록 메시지 하나를 분리해 memo한다
@@ -63,19 +63,21 @@ export default function App() {
     // loading은 state라 같은 tick에 두 번 호출되면 두 번 다 false로 읽힐 수 있다 —
     // 실제 중복 전송을 막는 것은 ref 쪽이다 (state는 버튼 비활성화 등 렌더에만 쓴다).
     if (!message || loading || sendingRef.current) return;
-    sendingRef.current = true;
     let answer = '서버와 통신하지 못했습니다.';
     let trace;
     let answered = false; // 서버가 실제로 '답'을 돌려줬는가 (통신 실패·타임아웃·서버 오류와 구분)
-    // AbortSignal.timeout()이 아니라 AbortController를 쓴다 — 전자는 Chrome 103/Safari 16 이상이고
-    // Vite 기본 빌드 타깃(chrome87/safari14)은 문법만 변환할 뿐 런타임 API를 폴리필하지 않는다.
-    // 구형 브라우저에서 fetch 호출 전에 TypeError가 나고, 그게 아래 catch에 삼켜져
-    // 모든 질문이 "서버와 통신하지 못했습니다"로 보인다 — 백엔드 장애와 구분이 안 된다.
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
-    // 플래그를 세운 직후부터 finally로 감싼다 — 사이에서 무엇이 던지든 플래그가 반드시 풀려야 한다.
-    // 안 그러면 화면은 멀쩡한데 전송만 영구히 막힌다 (loading은 false라 버튼도 활성으로 보인다).
+    let timer;            // finally에서 지운다 (세우기 전에 던졌으면 undefined — clearTimeout은 무해하다)
+    // 플래그를 세우는 것까지 try 안에서 한다 — 세운 뒤 try 밖에서 무엇이든 던지면 finally가 돌지 않아
+    // 플래그가 걸린 채 영구히 남는다. 그러면 화면은 멀쩡한데 전송만 막힌다
+    // (loading은 false라 버튼도 활성으로 보인다). 바로 아래 AbortController가 없는 구형 브라우저가 그 경우다.
     try {
+      sendingRef.current = true;
+      // AbortSignal.timeout()이 아니라 AbortController를 쓴다 — 전자는 Chrome 103/Safari 16 이상이고
+      // Vite 기본 빌드 타깃(chrome87/safari14)은 문법만 변환할 뿐 런타임 API를 폴리필하지 않는다.
+      // 구형 브라우저에서 fetch 호출 전에 TypeError가 나고, 그게 아래 catch에 삼켜져
+      // 모든 질문이 "서버와 통신하지 못했습니다"로 보인다 — 백엔드 장애와 구분이 안 된다.
+      const ctrl = new AbortController();
+      timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
       // history는 현재 질문을 넣기 전에 확정한다 — 현재 질문은 message로 따로 가므로 중복 전송하지 않는다.
       // 서버가 쓰는 만큼만 보낸다 (턴 수·길이 모두). 더 보내도 서버가 버리고 본문만 커진다.
       const history = historyRef.current
@@ -121,8 +123,8 @@ export default function App() {
       <header className="header">
         <div className="logo">S</div>
         <div>
-          <h1><span>SPACE VOC</span> Agent</h1>
-          <p>지식 · 운영 DB 조회 기반 Q&amp;A</p>
+          <h1><span>SPACE</span> Assistant</h1>
+          <p>지식 · 운영 DB 조회 기반</p>
         </div>
       </header>
 
@@ -181,7 +183,7 @@ export default function App() {
               }
               ask(input.trim());
             }}
-            placeholder="질문을 입력하세요 (예: BATCH001 작업 상태 알려줘)"
+            placeholder="질문을 입력하세요"
             maxLength={2000}  /* 입력 단계 안내용 — 실제 제한은 서버가 검증한다 (server.js) */
             autoFocus
           />

@@ -5,6 +5,7 @@ import { handleQuestion } from './agent.js';
 import { syncEmbeddings, SKIP } from './embed-sync.js';
 import { insertChatLog, cleanupChatLogs } from './db.js';
 import { numEnv } from './constants.js';
+import { rowCounts } from './result.js';
 
 // 놓친 promise 거부는 기록만 하고 계속 진행한다 (요청 단위 오류는 각 경로에서 이미 처리한다).
 process.on('unhandledRejection', e => console.error('[unhandledRejection]', e));
@@ -52,13 +53,19 @@ app.post('/api/chat', async (req, res) => {
       answer,
       // note만 있는 항목은 루프 가드가 LLM에게 남긴 제어용 기록이고 실행된 쿼리가 아니다 —
       // 화면의 '실행된 쿼리 N건' 목록에서 제외한다 (내부 지시문이 사용자에게 노출되지 않게).
-      trace: trace.filter(h => !h.note).map(h => ({
-        query_name: h.query_name,
-        params: h.params,
-        rowCount: h.capped ? `${h.totalRows}+` : (h.totalRows ?? 0),
-        rows: h.rows?.slice(0, 10),
-        ...(h.error && { error: h.error }),
-      })),
+      trace: trace.filter(h => !h.note).map(h => {
+        const { totalRows, capped } = rowCounts(h);
+        return {
+          query_name: h.query_name,
+          params: h.params,
+          rowCount: capped ? `${totalRows}+` : totalRows,
+          rows: h.rows?.slice(0, 10),
+          // 드라이버·DB가 던진 원문은 스키마명·테이블명·접속 주소를 담고 있다 —
+          // 화면에는 우리가 문구를 만든 오류(h.safe)만 내보내고 원문은 로그와 chat_log에만 남긴다.
+          // (사용자에게 일반화된 문구만 주는 llm-openai.js와 같은 기준이다)
+          ...(h.error && { error: h.safe ? h.error : '조회 중 오류가 발생했습니다.' }),
+        };
+      }),
     });
   } catch (e) {
     console.error('[chat error]', e);
@@ -90,8 +97,11 @@ const syncNote = r => ({
   [SKIP.UNAVAILABLE]: ' (임베딩 서버 응답 없음 — LIKE-only로 계속)',
   [SKIP.BUSY]: ' (다른 동기화 진행 중 — 건너뜀)',
 }[r.skipped] ?? '');
+// 건너뛴 행은 원본을 고치기 전까지 매 주기 다시 실패하므로 반드시 눈에 띄어야 한다
+// (0건이면 문구를 붙이지 않아 평소 로그는 조용하다).
+const syncFailed = r => (r.failed ? `, 건너뜀 ${r.failed}건(원본 확인 필요)` : '');
 syncEmbeddings()
-  .then(r => console.log(`[embed] 동기화: 생성/갱신 ${r.embedded}건, 정리 ${r.deleted}건${syncNote(r)}`))
+  .then(r => console.log(`[embed] 동기화: 생성/갱신 ${r.embedded}건, 정리 ${r.deleted}건${syncFailed(r)}${syncNote(r)}`))
   .catch(e => console.warn('[embed] 동기화 실패:', e.message));
 // 0은 "주기 동기화 끔"이라는 의도된 값이므로 허용하되, 빈 값·오타는 기본값으로 되돌린다
 // (검증이 없으면 EMBED_SYNC_INTERVAL= 한 줄로 주기 동기화가 로그 없이 사라진다).
@@ -99,7 +109,7 @@ const syncInterval = numEnv('EMBED_SYNC_INTERVAL', 60, { allowZero: true });
 if (syncInterval > 0) {
   setInterval(() => {
     syncEmbeddings()
-      .then(r => { if (r.embedded || r.deleted) console.log(`[embed] 동기화: 생성/갱신 ${r.embedded}건, 정리 ${r.deleted}건`); })
+      .then(r => { if (r.embedded || r.deleted || r.failed) console.log(`[embed] 동기화: 생성/갱신 ${r.embedded}건, 정리 ${r.deleted}건${syncFailed(r)}`); })
       .catch(() => {});
   }, syncInterval * 1000);
 } else {

@@ -1,13 +1,19 @@
 // 지식/Q&A처리방법/쿼리 검색 — 하이브리드(LIKE 관련도 + 벡터, RRF 병합).
 // 검색 구현은 이 파일에만 있다. 임베딩 서버가 없으면 자동으로 LIKE-only로 동작한다.
 import { query } from './db.js';
-import { embed } from './embedding.js';
+import { embed, isEmbeddingEnabled, warnEmbeddingFailure } from './embedding.js';
 
 const LIMIT = 20;         // LLM에 넘길 최대 후보 수 (건당 약 84토큰)
 const TITLE_WEIGHT = 3;   // 제목(첫 컬럼) 매칭은 본문 매칭보다 높게
 const RRF_K = 60;         // Reciprocal Rank Fusion 상수 (표준값)
 const EF_SEARCH = 400;    // MHNSW 탐색 깊이. 기본값(20)은 1024차원에서 recall이 크게 떨어진다
                           // (10k 부하 테스트에서 실측: 기본값은 최근접을 놓치고, 400이면 정확 검색과 일치·~20ms)
+const VEC_OVERFETCH = 5;  // vec_store는 세 소스(knowledge/qa_method/query_registry)를 한 테이블·한 인덱스에 담는다.
+                          // ANN이 상위 K건을 고른 뒤 src로 거르는 순서가 되면, 큰 소스가 K건을 다 차지해
+                          // 작은 소스(예: query_registry 30건)의 벡터 검색이 조용히 0~2건으로 주저앉는다 —
+                          // 경로B(qa_method 없이 등록한 쿼리) 라우팅이 통째로 사라지는데 오류는 남지 않는다.
+                          // 넉넉히 뽑아 거른 뒤 LIMIT을 다시 적용해 그 순서 의존을 없앤다
+                          // (EF_SEARCH가 LIMIT×OVERFETCH보다 커야 의미가 있다 — 400 > 100).
 const MAX_DIST = 0.55;    // 벡터 매칭 관련도 임계값 (코사인 거리). 실측: 관련 0.30~0.53, 무관 0.58~0.75.
                           // top-K는 무관해도 항상 K건을 돌려주므로, 이 필터가 없으면 "관련 지식 없음 →
                           // 일반 지식 답변" 폴백이 무력화된다. LIKE 쪽은 무필터(정확 키워드 보존).
@@ -60,17 +66,27 @@ function rrfMerge(...lists) {
 // 같은 질문은 임베딩을 1회만 계산한다 — 요청 1건이 지식/처리방법/쿼리 검색으로
 // vecSearch를 3회 이상 호출하므로, promise를 캐시해 병렬 호출까지 합친다.
 const embedCache = new Map();
+const EMBED_CACHE_MAX = 100;
 
 function embedQuestion(question) {
-  if (!embedCache.has(question)) {
-    if (embedCache.size >= 100) embedCache.clear();
-    const p = embed([question]).then(v => {
-      if (!v) embedCache.delete(question); // 실패는 캐시하지 않는다 (다음 요청에서 재시도)
-      return v && v[0];
-    });
-    embedCache.set(question, p);
+  if (!isEmbeddingEnabled()) return null; // 설정상 LIKE-only — 오류 경로가 아니다
+  const hit = embedCache.get(question);
+  if (hit) return hit;
+  // 가득 차면 통째로 비우지 않고 오래된 것부터 하나씩 밀어낸다 (Map은 삽입 순서를 지킨다).
+  // clear()는 아직 응답을 기다리는 최신 항목까지 버려서, 같은 질문의 다음 검색이
+  // 진행 중인 요청에 합류하지 못하고 60초짜리 임베딩 호출을 한 번 더 만든다.
+  while (embedCache.size >= EMBED_CACHE_MAX) {
+    embedCache.delete(embedCache.keys().next().value);
   }
-  return embedCache.get(question);
+  const p = embed([question])
+    .then(v => v[0])
+    .catch(e => {
+      warnEmbeddingFailure(e);
+      embedCache.delete(question); // 실패는 캐시하지 않는다 (다음 요청에서 재시도)
+      return null;                 // 검색은 LIKE-only로 계속한다
+    });
+  embedCache.set(question, p);
+  return p;
 }
 
 // 질문 임베딩 후 vec_store에서 코사인 거리 상위 LIMIT건 → 원본 행 JOIN.
@@ -94,8 +110,9 @@ function vecQuery(table, vector) {
     `SET STATEMENT mhnsw_ef_search=${EF_SEARCH} FOR
      SELECT t.* FROM (
        SELECT seq, VEC_DISTANCE_COSINE(embedding, VEC_FromText(?)) AS _dist
-       FROM vec_store WHERE src = ? ORDER BY _dist LIMIT ${LIMIT}
-     ) v JOIN ${table} t ON t.seq = v.seq WHERE v._dist <= ${MAX_DIST} ORDER BY v._dist`,
+       FROM vec_store WHERE src = ? ORDER BY _dist LIMIT ${LIMIT * VEC_OVERFETCH}
+     ) v JOIN ${table} t ON t.seq = v.seq WHERE v._dist <= ${MAX_DIST}
+     ORDER BY v._dist LIMIT ${LIMIT}`,
     [JSON.stringify(vector), table]
   );
 }

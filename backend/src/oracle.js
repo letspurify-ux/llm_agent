@@ -4,7 +4,7 @@
 import oracledb from 'oracledb';
 import { loadTargetDb } from './db.js';
 import { bindNames, assertReadOnly } from './sql.js';
-import { MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK, numEnv } from './constants.js';
+import { MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK, numEnv, nameKey, safeError, clipText } from './constants.js';
 
 // 드라이버 경계에서 타입을 확정한다. LOB은 기본값이 Lob 스트림 객체라 커넥션을 닫으면 무효가 되고
 // JSON 직렬화 시 순환 참조로 예외가 난다 — CLOB만이 아니라 NCLOB/BLOB도 같은 위험이므로 전부 다룬다.
@@ -49,7 +49,7 @@ export async function runQuery(registryRow, params = {}) {
   const names = bindNames(registryRow.query_sql);
   const bad = names.map(n => [n, bindProblem(params?.[n])]).filter(([, p]) => p);
   if (bad.length) {
-    throw new Error(
+    throw safeError(
       `바인드 변수를 쓸 수 없습니다 — ${bad.map(([n, p]) => `${n}: ${p}`).join(', ')}. ` +
       '질문이나 실행 이력에서 값을 확인하고, 알 수 없으면 사용자에게 되묻거나 다른 쿼리를 선택하라'
     );
@@ -59,9 +59,9 @@ export async function runQuery(registryRow, params = {}) {
   if (process.env.ORACLE_MOCK === '1') return capResult(mockResult(registryRow.query_name, binds));
 
   const target = await loadTargetDb(registryRow.target_db_name);
-  if (!target) throw new Error(`조회대상 DB를 찾을 수 없음: ${registryRow.target_db_name}`);
+  if (!target) throw safeError(`조회대상 DB를 찾을 수 없음: ${registryRow.target_db_name}`);
   if (target.db_type && target.db_type !== 'oracle') {
-    throw new Error(`지원하지 않는 db_type: ${target.db_type} (현재 oracle만 지원)`);
+    throw safeError(`지원하지 않는 db_type: ${target.db_type} (현재 oracle만 지원)`);
   }
 
   // 풀 없이 실행마다 접속/해제 — 사내 Q&A 트래픽 수준에 충분, 다중 target_db 관리 단순
@@ -129,7 +129,7 @@ function normalizeCells(row) {
 
 function normalizeValue(v) {
   if (typeof v === 'string') {
-    return v.length > MAX_CELL_LEN ? v.slice(0, MAX_CELL_LEN) + TRUNC_MARK : v;
+    return v.length > MAX_CELL_LEN ? clipText(v, MAX_CELL_LEN) + TRUNC_MARK : v;
   }
   if (Buffer.isBuffer(v)) return `<binary ${v.length} bytes>`;
   // fetchTypeHandler가 날짜류를 문자열로 받으므로 정상 경로에서는 Date가 오지 않는다.
@@ -167,8 +167,17 @@ function bindProblem(v) {
 }
 
 // 'ENV:변수명' 형식이면 서버 환경변수에서 읽는다. 평문은 개발용으로만 허용.
+// 변수가 비어 있으면 빈 비밀번호로 접속을 시도하지 않고 여기서 멈춘다 —
+// 시도하면 DB는 ORA-01017(잘못된 사용자명/비밀번호)을 돌려주고, 운영자는 설정 누락이 아니라
+// 저장된 자격증명이 틀렸다고 읽는다. 게다가 빈 비밀번호 로그인이 매 조회마다 반복되면
+// 공용 조회 계정이 FAILED_LOGIN_ATTEMPTS에 걸려 잠긴다.
 function resolvePassword(stored) {
-  if (stored?.startsWith('ENV:')) return process.env[stored.slice(4)] || '';
+  if (typeof stored === 'string' && stored.startsWith('ENV:')) {
+    const name = stored.slice(4);
+    const value = process.env[name];
+    if (!value) throw safeError(`조회대상 DB 비밀번호 환경변수(${name})가 설정되지 않았습니다.`);
+    return value;
+  }
   return stored;
 }
 
@@ -227,8 +236,11 @@ const MOCK_DATA = {
     .map(o => pick(o, ['ORDER_ID', 'STATUS', 'ORDER_DATE', 'AMOUNT'])),
 };
 
+// MOCK_DATA 키는 소문자다. query_registry.query_name은 MariaDB collation상 대소문자를 구분하지 않아
+// 'Batch_Job_Status'로 등록해도 다른 경로는 모두 정상 동작하므로, 여기만 대소문자를 구분하면
+// 철자 하나 때문에 데모 시나리오가 'mock 데이터 미정의'로 죽는다.
 function mockResult(queryName, params) {
-  const gen = MOCK_DATA[queryName];
-  if (!gen) throw new Error(`mock 데이터가 정의되지 않은 쿼리: ${queryName}`);
+  const gen = MOCK_DATA[nameKey(queryName)];
+  if (!gen) throw safeError(`mock 데이터가 정의되지 않은 쿼리: ${queryName}`);
   return gen(params);
 }

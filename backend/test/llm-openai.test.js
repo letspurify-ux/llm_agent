@@ -101,6 +101,18 @@ test('answer 본문에 든 중괄호·따옴표는 경계를 어긋내지 않는
   );
 });
 
+test('들여쓴 JSON도 결정으로 읽는다', async () => {
+  // 후보를 '{ 뒤 고정 길이 창'으로 판정하면 들여쓰기가 창 밖으로 밀려 후보가 0건이 된다 —
+  // 제대로 답한 응답이 통째로 버려지고, temperature=0이라 재시도도 같은 응답을 받아 똑같이 실패한다.
+  assert.deepStrictEqual(
+    await decide(JSON.stringify({ action: 'answer', answer: '안녕' }, null, 6)),
+    { action: 'answer', answer: '안녕' }
+  );
+  const run = { action: 'run_query', query_name: 'batch_job_status', params: { job_id: 'BATCH001' } };
+  assert.deepStrictEqual(await decide(`\`\`\`json\n${JSON.stringify(run, null, 4)}\n\`\`\``), run);
+  assert.deepStrictEqual(await decide(JSON.stringify(run, null, 8)), run);
+});
+
 test('기존에 되던 형태는 그대로 된다', async () => {
   assert.deepStrictEqual(await decide('{"action":"answer","answer":"안녕"}'), { action: 'answer', answer: '안녕' });
   assert.deepStrictEqual(await decide('```json\n{"action":"answer","answer":"안녕"}\n```'), { action: 'answer', answer: '안녕' });
@@ -114,6 +126,41 @@ test('결정을 못 읽으면 500 대신 안내 답변으로 정상 응답한다
   const r = await decide('죄송합니다. 답변할 수 없습니다.');
   assert.equal(r.action, 'answer');
   assert.match(r.answer, /LLM 호출에 실패/);
+});
+
+// LLM_REASONING_EFFORT는 모듈 로드 시점에 읽으므로, 값마다 캐시를 우회해 새로 import한다.
+async function sentBody(envValue) {
+  if (envValue === undefined) delete process.env.LLM_REASONING_EFFORT;
+  else process.env.LLM_REASONING_EFFORT = envValue;
+  const mod = await import(`../src/llm-openai.js?effort=${encodeURIComponent(String(envValue))}`);
+  let body;
+  globalThis.fetch = async (_url, init) => {
+    body = JSON.parse(init.body);
+    return { ok: true, json: async () => ({ choices: [{ message: { content: '{"action":"answer","answer":"ok"}' } }] }), text: async () => '' };
+  };
+  await mod.openaiDecide(CTX);
+  delete process.env.LLM_REASONING_EFFORT;
+  return body;
+}
+
+test('reasoning_effort 기본값은 low다', async () => {
+  // 매 스텝 결정 JSON 하나만 받는 구조라 추론을 길게 돌릴수록 왕복만 길어진다 (실측 5.4초 → 1.9초)
+  assert.equal((await sentBody(undefined)).reasoning_effort, 'low');
+  assert.equal((await sentBody('')).reasoning_effort, 'low');
+});
+
+test('reasoning_effort를 설정으로 바꿀 수 있다', async () => {
+  assert.equal((await sentBody('high')).reasoning_effort, 'high');
+  assert.equal((await sentBody(' MEDIUM ')).reasoning_effort, 'medium'); // 공백·대소문자 허용
+});
+
+test('off면 파라미터를 아예 보내지 않는다', async () => {
+  // 이 필드를 모르는 OpenAI 호환 서버에서 400이 나지 않게 하는 탈출구
+  assert.ok(!('reasoning_effort' in (await sentBody('off'))));
+});
+
+test('알 수 없는 값은 기본값으로 되돌린다', async () => {
+  assert.equal((await sentBody('아주높게')).reasoning_effort, 'low');
 });
 
 test('forceAnswer일 때는 run_query를 결정으로 받지 않는다', async () => {

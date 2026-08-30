@@ -3,8 +3,38 @@
 //   LLM_BASE_URL  예) vLLM: http://localhost:8000/v1 / OpenRouter: https://openrouter.ai/api/v1
 //   LLM_API_KEY   vLLM은 보통 빈 값(헤더 생략), OpenRouter는 필수
 //   LLM_MODEL     예) Qwen/Qwen2.5-32B-Instruct, anthropic/claude-sonnet-4.5
+//   LLM_REASONING_EFFORT  low(기본) | medium | high | off
 // SDK 없이 Node 내장 fetch 사용.
-import { MAX_ROWS } from './constants.js';
+import {
+  MAX_ROWS, TRUNC_MARK,
+  MAX_PROMPT_ITEM_LEN, MAX_PROMPT_SQL_LEN, MAX_PROMPT_SECTION_LEN, MAX_PROMPT_QUERY_SECTION_LEN,
+  clipText,
+} from './constants.js';
+import { bindNames } from './sql.js';
+import { rowCounts } from './result.js';
+
+// 추론 강도. 기본을 low로 두는 이유: 이 에이전트가 모델에게 요구하는 건 매 스텝 결정 JSON 하나이고,
+// 판단 근거(지식·처리방법·실행 이력)는 프롬프트에 이미 다 들어가 있다. 길게 생각할수록
+// 정확해지는 문제가 아니라 왕복만 길어지는데, 그 왕복이 스텝 수만큼 곱해진다.
+// 'off'는 파라미터 자체를 빼고 보낸다 — 이 필드를 모르는 OpenAI 호환 서버 대비.
+const REASONING_EFFORTS = ['low', 'medium', 'high'];
+const REASONING_EFFORT = resolveReasoningEffort();
+
+function resolveReasoningEffort() {
+  const raw = String(process.env.LLM_REASONING_EFFORT ?? '').trim().toLowerCase();
+  if (!raw) return 'low';
+  if (raw === 'off') return null;
+  if (REASONING_EFFORTS.includes(raw)) return raw;
+  console.warn(
+    `[llm] LLM_REASONING_EFFORT 값이 올바르지 않아 기본값(low)을 사용합니다: ` +
+    `${JSON.stringify(process.env.LLM_REASONING_EFFORT)} (가능: ${REASONING_EFFORTS.join(', ')}, off)`
+  );
+  return 'low';
+}
+
+// 서버가 이 파라미터를 거부하면 프로세스 수명 동안 다시 보내지 않는다 —
+// 지원하지 않는 엔드포인트에서 모든 질문이 실패하는 것보다, 한 번 배우고 빼는 편이 낫다.
+let effortAccepted = REASONING_EFFORT !== null;
 
 const SYSTEM_PROMPT = `당신은 사내 지식 관리 및 DB 조회 Q&A 에이전트다.
 사용자 질문과 함께 관련 지식, Q&A 처리 방법, 실행 가능한 쿼리 목록, 지금까지의 쿼리 실행 이력이 주어진다.
@@ -76,6 +106,7 @@ async function chatCompletion(userPrompt, timeoutMs) {
     body: JSON.stringify({
       model: process.env.LLM_MODEL,
       temperature: 0,
+      ...(effortAccepted && { reasoning_effort: REASONING_EFFORT }),
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: userPrompt },
@@ -83,10 +114,44 @@ async function chatCompletion(userPrompt, timeoutMs) {
     }),
   });
   if (!res.ok) {
-    throw new Error(`LLM API ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    const detail = (await res.text()).slice(0, 300);
+    // 이 파라미터를 모르는 서버는 400으로 거절한다. 한 번 겪으면 빼고 가도록 표시해두면
+    // 바로 이어지는 재시도가 성공한다 (설정 하나 때문에 모든 질문이 실패하지 않게).
+    if (res.status === 400 && effortAccepted && /reasoning/i.test(detail)) {
+      effortAccepted = false;
+      console.warn('[llm] 이 엔드포인트가 reasoning_effort를 지원하지 않아 이후 요청에서 제외합니다.');
+    }
+    throw new Error(`LLM API ${res.status}: ${detail}`);
   }
   const data = await res.json();
   return data.choices?.[0]?.message?.content ?? '';
+}
+
+// 검색 결과 본문(knowledge.content / qa_method.method / query_sql)은 전부 TEXT라 그 자체로는 상한이 없다.
+// 항목 하나가 컨텍스트를 통째로 잡아먹지 않게 항목별로 자르고, 항목 수가 많을 때를 대비해
+// 섹션 합계에도 예산을 둔다. 자른 사실은 모델에게도 보이게 남긴다(TRUNC_MARK) —
+// 잘린 줄 모르면 끊긴 문장을 근거로 단정한다.
+const clip = (v, max = MAX_PROMPT_ITEM_LEN) => {
+  const s = String(v ?? '');
+  return s.length > max ? clipText(s, max) + TRUNC_MARK : s;
+};
+
+// 검색 결과는 관련도 순으로 정렬돼 있으므로 예산을 넘기면 뒤(덜 관련된 것)부터 버린다.
+// 최소 1건은 반드시 싣는다 — 항목별 clip이 이미 1건의 크기를 묶어두었으므로 그래도 예산을 크게 벗어나지 않는다.
+// 몇 건을 버렸는지 모델에게 알린다: '이게 전부'라고 읽으면 없는 것을 없다고 단정한다.
+function pushItems(lines, items, render, budget = MAX_PROMPT_SECTION_LEN) {
+  let used = 0;
+  let shown = 0;
+  for (const item of items) {
+    const line = render(item);
+    if (shown > 0 && used + line.length > budget) break;
+    lines.push(line);
+    used += line.length;
+    shown++;
+  }
+  if (shown < items.length) {
+    lines.push(`- (이하 ${items.length - shown}건은 프롬프트 길이 제한으로 생략)`);
+  }
 }
 
 function buildPrompt(ctx) {
@@ -100,15 +165,20 @@ function buildPrompt(ctx) {
   lines.push(`## 사용자 질문 (현재)\n${ctx.question}`);
 
   lines.push(`\n## 관련 지식 (${ctx.knowledge.length}건)`);
-  for (const k of ctx.knowledge) lines.push(`- [${k.title}] ${k.content}`);
+  pushItems(lines, ctx.knowledge, k => `- [${k.title}] ${clip(k.content)}`);
 
   lines.push(`\n## Q&A 처리 방법 (${ctx.qaMethods.length}건)`);
-  for (const m of ctx.qaMethods) lines.push(`- [${m.title}] ${m.method}`);
+  pushItems(lines, ctx.qaMethods, m => `- [${m.title}] ${clip(m.method)}`);
 
   lines.push('\n## 실행 가능한 쿼리 목록');
-  for (const q of ctx.queries) {
-    lines.push(`- ${q.query_name}: ${q.query_desc ?? ''} / 입력(${q.input_desc}) / 출력(${q.output_desc}) / SQL: ${q.query_sql}`);
-  }
+  // 바인드 변수명을 SQL과 따로 싣는다 — SQL이 길어 잘리더라도 채워야 할 파라미터가 사라지지 않게.
+  // 사라지면 모델이 params를 비우고, runQuery가 '바인드 변수를 쓸 수 없습니다'로 실패한다.
+  pushItems(lines, ctx.queries, q =>
+    `- ${q.query_name}: ${clip(q.query_desc)}` +
+    ` / 입력(${clip(q.input_desc, 300)}) / 출력(${clip(q.output_desc, 300)})` +
+    ` / 바인드(${bindNames(q.query_sql).map(n => `:${n}`).join(', ') || '없음'})` +
+    ` / SQL: ${clip(q.query_sql, MAX_PROMPT_SQL_LEN)}`,
+    MAX_PROMPT_QUERY_SECTION_LEN);
 
   lines.push('\n## 쿼리 실행 이력');
   if (!ctx.history.length) lines.push('(없음)');
@@ -119,14 +189,12 @@ function buildPrompt(ctx) {
     } else if (h.error) {
       lines.push(`- ${h.query_name} params=${JSON.stringify(h.params)} → 오류: ${h.error}`);
     } else {
-      // rows가 없는 기록(오류 메시지가 빈 문자열이라 위 분기를 빠져나온 경우)에도 죽지 않게 한다 —
-      // 여기서 던지면 buildPrompt가 try 밖이라 요청 전체가 500이 되고, 이미 조회한 결과까지 버려진다.
-      const rows = h.rows ?? [];
-      const totalRows = h.totalRows ?? rows.length;
-      const note = h.capped
-        ? ` (조회 상한 ${MAX_ROWS}건 도달 — 실제 총 건수는 더 많을 수 있음, 처음 ${rows.length}건만 표시)`
-        : totalRows > rows.length ? ` (총 ${totalRows}건 중 처음 ${rows.length}건만 표시)` : '';
-      lines.push(`- ${h.query_name} params=${JSON.stringify(h.params)} → 결과 ${totalRows}${h.capped ? '+' : ''}건${note}: ${JSON.stringify(rows)}`);
+      // 건수 해석은 rowCounts 한 곳에서만 한다 (사용자 답변·화면 trace도 같은 해석을 쓴다).
+      const { rows, shown, totalRows, capped } = rowCounts(h);
+      const note = capped
+        ? ` (조회 상한 ${MAX_ROWS}건 도달 — 실제 총 건수는 더 많을 수 있음, 처음 ${shown}건만 표시)`
+        : totalRows > shown ? ` (총 ${totalRows}건 중 처음 ${shown}건만 표시)` : '';
+      lines.push(`- ${h.query_name} params=${JSON.stringify(h.params)} → 결과 ${totalRows}${capped ? '+' : ''}건${note}: ${JSON.stringify(rows)}`);
     }
   }
 
@@ -182,13 +250,17 @@ const MAX_JSON_CANDIDATES = 100;
 // 시작점마다 따로 훑으면 그런 시작점은 그냥 실패하고 다음 후보로 넘어간다.
 // 후보는 '{' 다음이 (공백을 건너뛰어) '"'인 것만 본다 — 우리가 찾는 결정 객체는 반드시 키로 시작하므로,
 // 산문 속 '{job_id'나 '{중괄호}'는 애초에 후보가 아니다. 정확도와 비용을 함께 줄인다.
+//
+// 그 판정을 '{ 뒤 8글자'라는 고정 길이 창으로 하면 안 된다: 창 밖으로 밀려난 들여쓰기가 후보를
+// 통째로 떨어뜨린다. 모델이 JSON을 6칸 이상 들여쓰면 후보가 0건이 되고, 제대로 답한 응답이
+// '결정 JSON을 찾지 못함'으로 버려진다 (temperature=0이라 재시도도 같은 응답을 받아 똑같이 실패한다).
+// 전역 정규식으로 한 번에 훑으면 들여쓰기 길이와 무관하고 전체 비용도 선형이다.
+// lastIndex를 공유하면 제너레이터가 겹칠 때 서로의 탐색 위치를 밟으므로 호출마다 새로 만든다.
 function* jsonObjects(text) {
-  let tried = 0;
-  for (let i = 0; i < text.length && tried < MAX_JSON_CANDIDATES; i++) {
-    if (text[i] !== '{' || !/^\{\s*"/.test(text.slice(i, i + 8))) continue;
-    tried++;
-    const end = matchingBrace(text, i);
-    if (end > 0) yield text.slice(i, end + 1);
+  const candidate = /\{\s*"/g;
+  for (let tried = 0, m; tried < MAX_JSON_CANDIDATES && (m = candidate.exec(text)); tried++) {
+    const end = matchingBrace(text, m.index);
+    if (end > 0) yield text.slice(m.index, end + 1);
   }
 }
 

@@ -7,12 +7,18 @@ import crypto from 'node:crypto';
 import { writeSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { query, getConnection } from './db.js';
-import { embed, EMBEDDING_MODEL, isEmbeddingEnabled } from './embedding.js';
+import { embed, EMBEDDING_MODEL, isEmbeddingEnabled, warnEmbeddingFailure } from './embedding.js';
 import { SEARCH_COLUMNS } from './search.js';
+import { MAX_EMBED_TEXT_LEN, clipText } from './constants.js';
 
 // 임베딩 원문 — 검색 대상 컬럼(search.js)을 이어붙여 "이 행이 무엇인지"를 표현한다.
 // 검색과 같은 정의를 써야 LIKE와 벡터가 서로 다른 내용을 보지 않는다.
-const toText = (cols, row) => cols.map(c => row[c] ?? '').join('\n');
+// 원문 상한을 여기서 적용한다 — 모델 입력 한도를 넘는 행 하나가 배치 전체(32건)를 실패시키는 것을
+// 애초에 막는다. 원본 컬럼은 TEXT(최대 64KB)라 등록만으로 한도를 넘길 수 있다.
+// 자른 뒤의 텍스트로 해시를 계산하므로(아래 doSync가 toText 결과를 그대로 해싱한다) 멱등성은 유지된다.
+const toText = (cols, row) => {
+  return clipText(cols.map(c => row[c] ?? '').join('\n'), MAX_EMBED_TEXT_LEN);
+};
 const BATCH = 32;
 
 // skipped 값 — 호출부(서버 로그, CLI 종료 코드)가 "설정상 안 쓰는 것"과 "쓰려는데 실패한 것"을
@@ -33,7 +39,7 @@ let running = false;
 const LOCK_NAME = 'space_voc_embed_sync';
 
 export async function syncEmbeddings() {
-  if (running) return { embedded: 0, deleted: 0, skipped: SKIP.BUSY };
+  if (running) return { embedded: 0, deleted: 0, failed: 0, skipped: SKIP.BUSY };
   running = true;
   try {
     // 커넥션 획득도 이 try 안에서 한다 — 실패(MariaDB 다운·풀 포화) 시에도 running이 반드시 풀려야
@@ -41,7 +47,7 @@ export async function syncEmbeddings() {
     const lockConn = await getConnection();
     try {
       const got = (await lockConn.query(`SELECT GET_LOCK('${LOCK_NAME}', 0) AS l`))[0].l;
-      if (!Number(got)) return { embedded: 0, deleted: 0, skipped: SKIP.BUSY };
+      if (!Number(got)) return { embedded: 0, deleted: 0, failed: 0, skipped: SKIP.BUSY };
       return await doSync();
     } finally {
       // 쥐지 않은 락에 대한 RELEASE_LOCK은 0을 돌려주는 무해한 no-op이라 락 해제와 커넥션 반납을
@@ -59,7 +65,7 @@ async function doSync() {
   // 단, 원본이 삭제된 vec_store 행 정리는 이 함수에만 있으므로 그 경로는 계속 태운다 —
   // 건너뛰면 삭제된 지식의 벡터가 남아, 임베딩을 다시 켤 때까지 검색에 노출된다.
   const enabled = isEmbeddingEnabled();
-  let embedded = 0, deleted = 0, skipped = enabled ? SKIP.NONE : SKIP.UNCONFIGURED;
+  let embedded = 0, deleted = 0, failed = 0, skipped = enabled ? SKIP.NONE : SKIP.UNCONFIGURED;
   // 임베딩 서버가 도중에 끊기면 임베딩만 멈추고 루프는 끝까지 돈다.
   // 여기서 return하면 뒤쪽 테이블의 고아 벡터 정리가 통째로 빠지는데, 그 정리는 이 함수에만 있어
   // 삭제된 qa_method/query_registry의 벡터가 다음 성공 동기화까지 검색에 남는다.
@@ -99,12 +105,46 @@ async function doSync() {
 
     for (let i = 0; i < stale.length; i += BATCH) {
       const batch = stale.slice(i, i + BATCH);
-      const vectors = await embed(batch.map(b => b.text));
-      if (!vectors) { unavailable = true; break; } // 임베딩 서버 응답 없음 — 다음 주기에 재시도
+      let vectors;
+      try {
+        vectors = await embed(batch.map(b => b.text));
+      } catch (e) {
+        warnEmbeddingFailure(e);
+        // 서버에 닿지 못한 것이면 이번 회차는 여기서 접는다 (다음 주기에 그대로 재시도된다).
+        if (e.retriable) { unavailable = true; break; }
+        // 서버는 살아 있고 이 입력을 거부했다. 배치를 통째로 포기하면 성한 31건이 매 주기 되풀이되고,
+        // 뒤쪽 테이블은 아예 건너뛰게 된다 — 문제 행 하나가 전체 동기화를 영구히 멈춰 세우는 셈이다.
+        // storeBatch가 저장 실패에 쓰는 것과 같은 방식으로 행을 갈라 성한 행만 진도를 낸다.
+        const r = await embedRows(src, batch);
+        embedded += r.embedded;
+        failed += r.failed;
+        if (r.unavailable) { unavailable = true; break; }
+        continue;
+      }
       embedded += await storeBatch(src, batch, vectors);
     }
   }
-  return { embedded, deleted, skipped: unavailable ? SKIP.UNAVAILABLE : skipped };
+  return { embedded, deleted, failed, skipped: unavailable ? SKIP.UNAVAILABLE : skipped };
+}
+
+// 내용 때문에 거부된 배치를 행 단위로 갈라 성한 행만 저장한다.
+// 도중에 서버가 죽으면(retriable) 남은 행을 붙잡지 않고 즉시 물러난다 —
+// 죽은 서버에 행마다 매달리면 회차 하나가 임베딩 타임아웃(60초) × 행 수만큼 늘어진다.
+async function embedRows(src, batch) {
+  let embedded = 0, failed = 0;
+  for (const b of batch) {
+    try {
+      embedded += await storeBatch(src, [b], await embed([b.text]));
+    } catch (e) {
+      warnEmbeddingFailure(e);
+      if (e.retriable) return { embedded, failed, unavailable: true };
+      failed++;
+      // 이 행은 이번에도 다음에도 같은 이유로 거부된다 — 해시가 갱신되지 않아 매 주기 재시도되므로
+      // 원본을 고치기 전까지 계속 남는다. 조용히 빠지지 않도록 seq를 찍는다.
+      console.warn(`[embed] ${src}#${b.seq} 임베딩 실패 — 이 행만 건너뜁니다: ${e.message}`);
+    }
+  }
+  return { embedded, failed, unavailable: false };
 }
 
 // 배치 전체를 한 문장으로 쓴다 — 행마다 왕복하면 초기 1만건 동기화가 1만 번 왕복이 된다.
@@ -149,7 +189,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   // try/catch는 필수다: 논블로킹 파이프에서 writeSync는 EAGAIN을 던지는데, 그게 새어 나가면
   // 아래 process.exit가 실행되지 않아 성공한 동기화가 0이 아닌 종료 코드로 보고된다.
   // (server.js의 uncaughtException 핸들러가 같은 이유로 같은 형태를 쓴다)
-  const summary = `임베딩 동기화 완료: 생성/갱신 ${r.embedded}건, 정리 ${r.deleted}건, ${((Date.now() - t) / 1000).toFixed(1)}s${suffix}\n`;
+  const skippedRows = r.failed ? `, 건너뜀 ${r.failed}건(원본 확인 필요)` : '';
+  const summary = `임베딩 동기화 완료: 생성/갱신 ${r.embedded}건, 정리 ${r.deleted}건${skippedRows}, ${((Date.now() - t) / 1000).toFixed(1)}s${suffix}\n`;
   try { writeSync(1, summary); } catch { /* 로그 실패가 종료 코드를 바꾸지 않게 */ }
   // 실패로 종료하는 것은 "쓰려고 했는데 안 된" 경우뿐이다 — LIKE-only는 지원되는 구성이므로
   // 프로비저닝 스크립트가 이 명령의 종료 코드로 실패 판정을 하면 안 된다.

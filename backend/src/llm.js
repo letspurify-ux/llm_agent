@@ -9,7 +9,8 @@
 // agent.js는 provider가 바뀌어도 변경되지 않는다.
 import { openaiDecide } from './llm-openai.js';
 import { bindNames } from './sql.js';
-import { MAX_ROWS, TRUNC_MARK } from './constants.js';
+import { MAX_ROWS, TRUNC_MARK, nameKey } from './constants.js';
+import { rowCounts } from './result.js';
 
 export const llm = {
   decide(ctx) {
@@ -29,7 +30,9 @@ async function mockDecide(ctx) {
     // 매칭된 qa_method 본문에 등장하는 순서대로 실행할 쿼리 계획 도출
     const planned = plannedQueries(qaMethods, queries);
     for (const q of planned) {
-      if (history.some(h => h.query_name === q.query_name && h.rows)) continue; // 이미 성공 실행
+      // 이름 비교는 nameKey로 한다 — query_registry가 대소문자를 구분하지 않으므로
+      // ===로 보면 철자만 다른 같은 쿼리를 '아직 실행 안 함'으로 읽고 매 스텝 다시 제안한다.
+      if (history.some(h => nameKey(h.query_name) === nameKey(q.query_name) && h.rows)) continue;
       const params = fillParams(q, ctx);
       if (params) return { action: 'run_query', query_name: q.query_name, params };
       // 바인드 값을 채울 수 없는 쿼리는 건너뛴다 (이 질문과 무관한 쿼리로 간주)
@@ -41,8 +44,10 @@ async function mockDecide(ctx) {
 function plannedQueries(qaMethods, queries) {
   const planned = [];
   for (const m of qaMethods) {
+    // 본문의 표기와 등록 철자가 대소문자만 다를 수 있으므로 양쪽을 같은 기준으로 낮춰 찾는다
+    const method = m.method.toLowerCase();
     const found = queries
-      .map(q => ({ q, pos: m.method.indexOf(q.query_name) }))
+      .map(q => ({ q, pos: method.indexOf(nameKey(q.query_name)) }))
       .filter(x => x.pos >= 0)
       .sort((a, b) => a.pos - b.pos);
     for (const { q } of found) {
@@ -101,14 +106,13 @@ function buildAnswer({ knowledge, history }) {
     if (h.error) {
       parts.push(`**${h.query_name}** 실행 오류: ${h.error}`);
     } else if (h.rows?.length) {
-      // totalRows는 runQuery가 항상 채우지만, 재생된 trace 등 다른 출처의 기록이 섞여도
-      // 답변에 NaN이 찍히지 않게 폴백을 둔다.
-      const totalRows = h.totalRows ?? h.rows.length;
-      const omitted = totalRows - h.rows.length;
-      const note = h.capped
+      // 건수 해석은 rowCounts 한 곳에서만 한다 — 프롬프트(llm-openai.js)·화면 trace(server.js)가
+      // 같은 기록을 각자 렌더하므로, 해석이 갈리면 사용자와 모델이 다른 건수를 보게 된다.
+      const { rows, totalRows, omitted, capped } = rowCounts(h);
+      const note = capped
         ? `\n\n_외 ${omitted}건 이상 생략 (조회 상한 ${MAX_ROWS}건 도달 — 실제는 더 많을 수 있음)_`
         : omitted > 0 ? `\n\n_외 ${omitted}건 생략 (총 ${totalRows}건)_` : '';
-      parts.push(`### ${h.query_name} 조회 결과\n\n${rowsToMarkdownTable(h.rows)}${note}`);
+      parts.push(`### ${h.query_name} 조회 결과\n\n${rowsToMarkdownTable(rows)}${note}`);
     } else if (h.rows) {
       parts.push(`**${h.query_name}** 조회 결과가 없습니다.`);
     }

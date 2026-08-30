@@ -30,7 +30,14 @@ export async function query(sql, params = []) {
   try {
     return await conn.query(sql, params);
   } finally {
-    conn.release();
+    // 반납을 기다린다 — 기다리지 않으면 아직 풀로 돌아가지 않은 커넥션을 반납된 것으로 세어
+    // connectionLimit을 잠시 넘겨 쓰고, 뒤이은 요청이 acquireTimeout으로 떨어진다.
+    // 반납 실패가 원래 결과(또는 원래 오류)를 덮지 않도록 여기서 삼킨다.
+    try {
+      await conn.release();
+    } catch (e) {
+      console.warn('[db] 커넥션 반납 실패:', e.message);
+    }
   }
 }
 

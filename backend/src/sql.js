@@ -10,6 +10,8 @@
 // 리터럴에 삼켜져 조회 전용 가드를 통과한다(가드 우회). 경계 판정은 정확해야 한다.
 // 다루는 어휘: 한 줄/블록 주석, q-quote(임의 구분자 + 괄호쌍), 일반 문자열('' 이스케이프),
 // 따옴표 식별자("..."). 이 중 하나라도 빠지면 그 뒤의 스캔이 통째로 어긋난다.
+import { safeError } from './constants.js';
+
 const Q_CLOSER = { '[': ']', '{': '}', '(': ')', '<': '>' };
 const isIdentChar = c => c !== undefined && /[A-Za-z0-9_$#]/.test(c);
 
@@ -91,13 +93,16 @@ export function assertReadOnly(sql) {
   // 리터럴도 함께 지운다 — LISTAGG(name, '; ')처럼 값에 든 세미콜론을 다중 문장으로 오판하지 않도록
   const { text, unterminated } = scanSql(sql);
   if (unterminated) {
-    throw new Error('닫히지 않은 문자열 리터럴 또는 주석이 있어 실행할 수 없습니다.');
+    throw safeError('닫히지 않은 문자열 리터럴 또는 주석이 있어 실행할 수 없습니다.');
   }
   const s = text.trim();
-  if (!/^(SELECT|WITH)\b/i.test(s)) {
-    throw new Error('조회(SELECT) 쿼리만 실행할 수 있습니다.');
+  // 여는 괄호는 건너뛰고 첫 키워드를 본다 — `(SELECT …) FETCH FIRST n ROWS ONLY`처럼
+  // 괄호로 시작하는 정상 조회 쿼리가 '조회가 아니다'로 거부되던 것을 막는다.
+  // 괄호를 걷어낸 뒤에도 SELECT/WITH만 허용하므로 DML은 그대로 걸린다.
+  if (!/^(SELECT|WITH)\b/i.test(s.replace(/^[(\s]+/, ''))) {
+    throw safeError('조회(SELECT) 쿼리만 실행할 수 있습니다.');
   }
   if (s.replace(/;\s*$/, '').includes(';')) {
-    throw new Error('다중 문장 쿼리는 실행할 수 없습니다.');
+    throw safeError('다중 문장 쿼리는 실행할 수 없습니다.');
   }
 }

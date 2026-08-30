@@ -7,7 +7,7 @@ import { loadQueryRegistry, loadQueriesByNames } from './db.js';
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
 import { llm } from './llm.js';
-import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN } from './constants.js';
+import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, nameKey } from './constants.js';
 
 const MAX_STEPS = 5;
 const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포함). 초과하면 남은 스텝을 포기하고 강제 답변으로 간다.
@@ -16,6 +16,7 @@ const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포�
                                // 프런트(App.jsx REQUEST_TIMEOUT_MS)가 이 계산에 맞춰져 있으니 함께 고칠 것.
 const MAX_PROMPT_QUERIES = 30; // 프롬프트에 싣는 쿼리 상한 (~2.2k토큰)
 const MAX_SAME_QUERY_TRIES = 2; // 같은 쿼리·파라미터의 최대 실행 시도 (1회 실패는 일시 오류일 수 있어 재시도 허용)
+const MAX_MENTIONED_TOKENS = 100; // qa_method 본문에서 뽑아 query_registry에 물어볼 토큰 상한
 const MAX_GUARD_HITS = 2;       // 루프 가드가 '연속으로' 이만큼 걸리면 남은 스텝을 포기하고 강제 답변으로 간다.
                                 // (첫 1회는 LLM이 경로를 수정할 기회, 그래도 반복하면 LLM 왕복만 낭비된다.
                                 //  조회에 성공하면 진도가 나간 것이므로 카운터를 되돌린다 — 다단계 절차 도중
@@ -23,11 +24,6 @@ const MAX_GUARD_HITS = 2;       // 루프 가드가 '연속으로' 이만큼 걸
 
 // 셀 길이 제한은 드라이버 경계(oracle.js)에서 이미 적용됐다 — 여기서는 행 수만 줄인다.
 const capRows = rows => rows.slice(0, MAX_RESULT_ROWS);
-
-// 쿼리 이름 비교 키. query_registry 조회는 MariaDB 기본 collation(대소문자·후행 공백 무시)이라
-// JS의 ===로 비교하면 'BATCH_JOB_STATUS'와 'batch_job_status'가 서로 다른 쿼리로 보여
-// 아래 반복 실행 가드가 통째로 무력화된다 (같은 쿼리가 매 스텝 재실행된다).
-const nameKey = s => String(s ?? '').trim().toLowerCase();
 
 // 동일 실행 판정용 파라미터 키 — LLM이 준 원본이 아니라 "실제로 바인드되는 값"으로 만든다.
 // runQuery가 SQL의 바인드 변수만 추려 쓰므로, 여분 키 하나가 붙었다고 다른 실행이 되지는 않는다.
@@ -123,7 +119,9 @@ export async function handleQuestion(question, rawChat = []) {
     const isSame = h => nameKey(h.query_name) === nameKey(canonicalName) && paramKey(binds, h.params) === key;
     // note는 LLM에게 경로를 바꾸라고 알리는 제어용 기록이다. 실제 쿼리 실패(error)와 필드를 나눈다 —
     // 같은 필드에 넣으면 사용자 trace 패널과 chat_log의 '실패한 질문' 집계에 정상 턴이 섞인다.
-    const push = (field, msg) => history.push({ query_name: canonicalName, params: decision.params, [field]: msg });
+    // extra.safe = 이 문구를 사용자 화면(trace 패널)에 그대로 내보내도 되는가.
+    // 우리가 문구를 만든 오류만 true다 — 드라이버·DB 원문은 스키마명·호스트를 담고 있다(server.js가 이 표시를 본다).
+    const push = (field, msg, extra) => history.push({ query_name: canonicalName, params: decision.params, [field]: msg, ...extra });
 
     // 같은 쿼리를 같은 파라미터로 반복하지 않는다 — 퇴화한 LLM 응답이 결정 루프를
     // 제자리 돌며 스텝과 Oracle 조회를 소진하는 것 방지. 미등록 이름의 반복도 같은 가드로 걸리도록
@@ -140,13 +138,16 @@ export async function handleQuestion(question, rawChat = []) {
       continue;
     }
     if (!registryRow) {
-      push('error', resolveError ?? '등록되지 않은 쿼리');
+      push('error', resolveError ?? '등록되지 않은 쿼리', { safe: true });
       continue;
     }
     // 프롬프트 목록 밖에서 찾은 쿼리는 목록에 넣어준다 — 다음 스텝에서 LLM이 input_desc를 보고
     // 바인드를 고칠 수 있어야 한다. 중복은 넣지 않고, 늘어나는 상한은 MAX_STEPS건이다
     // (즉 목록은 최대 MAX_PROMPT_QUERIES + MAX_STEPS건 — 무제한으로 커지지 않는다).
-    if (!queries.includes(registryRow)) queries.push(registryRow);
+    // 뒤가 아니라 앞에 넣는다 — 프롬프트 예산(llm-openai.js pushItems)은 '뒤쪽일수록 관련도가 낮다'는
+    // 전제로 꼬리부터 버린다. 방금 LLM이 이름을 대서 찾아낸 쿼리는 이번 스텝에서 가장 관련이 높은데,
+    // 뒤에 붙이면 등록이 조금만 많아도 그 한 건이 먼저 잘려 나가 이 복구 경로 자체가 조용히 사라진다.
+    if (!queries.includes(registryRow)) queries.unshift(registryRow);
     try {
       const { rows, totalRows, capped } = await runQuery(registryRow, decision.params);
       history.push({ query_name: canonicalName, params: decision.params, rows: capRows(rows), totalRows, capped });
@@ -155,7 +156,7 @@ export async function handleQuestion(question, rawChat = []) {
       // 실패도 이력에 남기고 루프를 계속한다 — LLM이 에러를 보고 재시도/우회/답변을 판단.
       // 메시지가 비면 안 된다: error가 falsy면 프롬프트·답변 조립이 이 기록을 '오류'로 보지 않고
       // rows가 있는 정상 결과로 취급해 들어간다.
-      push('error', e?.message || String(e));
+      push('error', e?.message || String(e), { safe: e?.safe === true });
     }
   }
 
@@ -179,8 +180,10 @@ async function resolveQuery(name, queries, cache) {
     cache.set(key, row);
     return { row };
   } catch (e) {
+    // 상세는 로그에만 남긴다 — 이 문구는 프롬프트와 화면 양쪽으로 나가는데, MariaDB 원문에는
+    // 스키마·호스트가 들어 있고 모델의 복구 판단에 보탬이 되지도 않는다.
     console.warn('[agent] query_registry 재조회 실패:', e.message);
-    return { row: null, error: `쿼리 조회 실패: ${e.message}` };
+    return { row: null, error: '쿼리 목록을 조회하지 못했습니다 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라' };
   }
 }
 
@@ -199,9 +202,13 @@ async function selectQueries(qaMethods, question) {
   const head = await loadQueryRegistry(MAX_PROMPT_QUERIES + 1);
   if (head.length <= MAX_PROMPT_QUERIES) return { list: head, routed: false };
 
+  // 본문의 영문 토큰은 대부분 query_name이 아니다(상태값·명령어·영단어). 전부 IN 절에 실으면
+  // 매 요청이 수백 개짜리 플레이스홀더 목록을 보내게 된다 — 걸러지는 곳이 MariaDB라 이미 늦다.
+  // 등장 순서를 유지한 채 상한을 둔다: 앞쪽이 절차의 첫 단계이므로 잘려도 다단계 절차의 시작은 남는다.
+  // (likeSearch가 검색 토큰에 두는 상한과 같은 이유·같은 방식이다)
   const mentioned = [...new Set(
     qaMethods.flatMap(m => m.method.match(/[A-Za-z_][A-Za-z0-9_]{2,}/g) || [])
-  )];
+  )].slice(0, MAX_MENTIONED_TOKENS);
   const [named, direct] = await Promise.all([
     loadQueriesByNames(mentioned),   // query_name이 아닌 토큰은 IN 절에서 자연히 걸러진다
     searchQueries(question),
