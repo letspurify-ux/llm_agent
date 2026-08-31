@@ -1,8 +1,7 @@
 import { useState, useRef, useEffect, memo } from 'react';
 import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import remarkMath from 'remark-math';
-import rehypeKatex from 'rehype-katex';
+// 수식 표기의 계약(무엇이 수식인가 + 그것을 어떻게 그리는가)은 전부 math.js에 있다.
+import { REMARK_PLUGINS, REHYPE_PLUGINS } from './math.js';
 
 // 서버(agent.js normalizeChat)가 실제로 쓰는 상한과 같은 값. 서버 쪽 제한은 본문을 파싱한 뒤에
 // 적용되므로 요청 크기를 실제로 묶어두는 것은 이쪽뿐이다 — 넘기면 express의 본문 크기 제한에 걸려
@@ -39,23 +38,9 @@ const Message = memo(function Message({ role, text, trace }) {
       <div className={`bubble ${role}`}>
         {role === 'assistant'
           ? <div className="md">
-              {/* 수식 표기는 $$ 뿐이다 (백엔드 시스템 프롬프트가 모델에 지정하는 표기와 같아야 한다
-                  — 한쪽만 바꾸면 수식이 원문 그대로 노출된다):
-                    $$E=mc^2$$        한 줄이면 인라인
-                    $$ 를 앞뒤 독립된 줄에 두면 별행(가운데 정렬 + 가로 스크롤)
-
-                  singleDollarTextMath=false — $ 하나는 수식으로 보지 않는다. 켜 두면 본문의 $가
-                  둘만 있어도 그 사이가 통째로 수식이 되어 문장이나 표가 깨진다. 실측:
-                  '| 배송 | $100 |' / '| 상품 | $200 |' 두 행이 하나의 수식으로 먹혀 표가 무너졌다.
-                  이 앱은 조회 결과를 표로 보여주는 것이 본업이라 그 손상이 수식을 예쁘게 그리는
-                  이득보다 훨씬 크다. 모델 프롬프트로도 막고 있지만, 프롬프트는 지켜질 때만 막는다.
-
-                  throwOnError=false: 모델이 만든 수식은 언제든 문법이 틀릴 수 있는데, 던지게 두면
-                  수식 하나가 답변 전체를 렌더 오류로 날린다. 틀린 부분만 붉게 표시하고 나머지는 살린다. */}
-              <ReactMarkdown
-                remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: false }]]}
-                rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}
-              >{text}</ReactMarkdown>
+              {/* 플러그인 배열은 math.js의 상수를 그대로 쓴다 — react-markdown은 렌더마다 options로
+                  파이프라인을 다시 조립하므로, 여기서 새 배열 리터럴을 만들면 매 렌더가 프로세서 재구축이 된다. */}
+              <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS}>{text}</ReactMarkdown>
             </div>
           : text}
         {trace?.length > 0 && (

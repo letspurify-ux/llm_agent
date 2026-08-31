@@ -55,10 +55,9 @@ const SYSTEM_PROMPT = `당신은 사내 지식 관리 및 DB 조회 Q&A 에이�
 - 일반 지식으로 답할 때도 사내 시스템의 구체적 상태(수치, 상태값, 일정 등)는 절대 지어내지 마라. 확인이 필요하면 확인 방법을 안내하라.
 - 실행 이력의 오류 원문에 든 내부 정보(호스트·포트·접속 주소, 스키마·테이블·계정명, SQL 원문)는 answer에 옮겨 적지 마라. 오류는 "조회에 실패했다"는 사실과 사용자가 할 수 있는 다음 행동만 전달하라.
 - answer는 markdown 형식으로 구조화하라: 조회 결과는 표(table)로, 항목 나열은 목록으로, 섹션 구분은 ### 제목으로 작성한다.
-- 수식은 LaTeX로 쓰되 반드시 $$ 로 감싼다. 한 줄에 $$E=mc^2$$ 로 쓰면 문장 안에 들어가는 인라인 수식이고, $$ 를 앞뒤로 각각 '독립된 줄'에 두면 가운데 정렬된 별행 수식이다. 넓은 수식은 반드시 별행으로 써라 — 인라인은 접히지 않아 넓으면 잘린다.
-- $ 하나로 감싼 $E=mc^2$ 는 수식으로 인식되지 않고 화면에 원문 그대로 나온다. \\( \\) 나 \\[ \\] 표기도 마찬가지다. 둘 다 쓰지 마라.
-- 반대로 수식이 아닌 $ 기호(금액 $100, 환경변수 $ORACLE_HOME 등)는 그냥 써도 된다 — $ 하나는 수식으로 해석하지 않는다.
-- answer는 JSON 문자열이므로 그 안의 백슬래시는 반드시 두 번 써라: "$$x=\\\\frac{1}{2}$$", "$$a \\\\times b$$". 한 번만 쓰면 수식이 깨지거나 응답 전체가 버려진다.
+- 수식은 LaTeX로 쓴다. 문장 안에 넣는 인라인 수식은 $E=mc^2$ 또는 $$E=mc^2$$, 넓은 수식은 $$ 를 앞뒤로 각각 '독립된 줄'에 두어 별행으로 써라 — 인라인 수식은 접히지 않아 넓으면 잘린다. \\( \\) 와 \\[ \\] 표기도 그대로 인식되므로 익숙한 쪽을 쓰면 된다.
+- 수식이 아닌 $ 기호(금액 $100, 환경변수 $ORACLE_HOME 등)는 이스케이프 없이 그냥 써라 — 화면에 그대로 나오고 수식으로 오인되지 않는다.
+- answer는 JSON 문자열이므로 그 안의 백슬래시는 두 번 쓰는 것이 정확하다: "$$x=\\\\frac{1}{2}$$", "$$a \\\\times b$$". (한 번만 써도 대부분 복구하지만, 두 번 쓰면 복구에 기대지 않는다.)
 
 ## 대화 맥락
 최근 대화가 함께 주어진다. 현재 질문이 이전 대화를 가리키면(예: "그럼 김철수는?", "재시작은 어떻게 해?") 최근 대화를 참고해
@@ -106,6 +105,15 @@ export async function openaiDecide(ctx) {
   return null;
 }
 
+// response_format(구조화 출력, guided decoding)을 보내지 않는다. 두 가지를 재보고 내린 결론이다.
+//   - 이 파일이 실제로 겪는 손상은 '유효하지 않은 JSON'이 아니라 '유효한데 뜻이 바뀐 JSON'이다.
+//     \times 는 \t + "imes"로 문법상 완전히 유효하므로 문법을 강제해도 그대로 통과한다 —
+//     guided decoding이 없애주는 것은 \[ 같은 무효 이스케이프뿐이고, 그건 아래 정규화가 이미 덮는다.
+//     즉 가장 위험한(조용한) 부류는 구조화 출력으로 사라지지 않는다.
+//   - 반대로 위험은 있다. 사고 과정 블록을 쓰는 모델에서 reasoning 파서 없이 스키마를 강제하면
+//     <think> 자체를 낼 수 없게 되어(vLLM은 완성 전체에 문법을 건다) 이 파일이 공들여 다루는
+//     ①②③ 형태가 서버 설정에 따라 통째로 달라진다.
+// 그래서 '모델이 어떻게 쓰든 잃지 않게 읽는' 쪽(normalizeJsonEscapes)을 근본 대응으로 둔다.
 async function chatCompletion(userPrompt, timeoutMs) {
   const headers = { 'Content-Type': 'application/json' };
   if (process.env.LLM_API_KEY) headers.Authorization = `Bearer ${process.env.LLM_API_KEY}`;
@@ -444,30 +452,75 @@ function jsonSpans(text, zoneOf) {
   return spans;
 }
 
-// JSON이 인정하는 한 글자 이스케이프. \u는 뒤에 16진수 4자리가 붙어야 유효하다.
-const JSON_ESCAPES = '"\\/bfnrtu';
+// ===== 이스케이프 정규화 =====
+//
+// answer·params는 JSON 문자열 필드인데 LaTeX는 백슬래시투성이다. 모델이 백슬래시를 한 번만 쓰면
+// JSON의 이스케이프 표와 LaTeX 명령이 같은 두 글자를 놓고 부딪치고, 그 결과가 두 갈래로 갈린다:
+//   \[ x^2 \]  → JSON에 없는 이스케이프라 JSON.parse가 던진다 → 후보 0건 → 답변이 통째로 소실
+//   \frac \times → JSON에 '있는' 이스케이프라 파싱이 성공하면서 명령이 제어문자 한 글자로 바뀐다
+//                  (\f→폼피드+rac, \t→탭+imes). 오류가 없어 로그에도 남지 않고, 화면에는
+//                  'rac'·'imes'만 남는다 — 조용해서 가장 나쁜 쪽이다.
+//
+// 그래서 파싱 전에 '무엇을 이스케이프로 인정할지'를 우리가 정한다. JSON.parse의 고정된 표에
+// 맡기는 한 두 번째 갈래는 손댈 수 없다 — 파싱이 성공해버리므로 실패를 볼 기회 자체가 없다.
+// 판단 기준은 하나다: 그 제어문자가 markdown 답변 본문에 정말로 쓰일 수 있는가.
+//   \b \f (백스페이스·폼피드) — 쓰일 일이 없다 → 항상 두 글자로 되돌린다 (\beta \begin \frac \forall).
+//   \t \r (탭·복귀)          — 쓰일 수 있다 → 뒤에 영문자가 올 때만 되돌린다. 명령 이름은 반드시
+//                              영문자로 이어지므로, 탭+'{'·탭+공백처럼 명령이 될 수 없는 자리는
+//                              탭 그대로 둔다 (\times \text \theta \to \rho \right \rightarrow).
+//   \n (줄바꿈)              — markdown의 뼈대다 → 아래 목록에 있는 명령 이름이 통째로 이어질
+//                              때만 되돌린다. 이 조건이 없으면 멀쩡한 답변의 줄바꿈이 전부 깨진다.
+// 되돌리지 못하는 경우가 남지만(예: 줄바꿈 뒤에 우연히 'eq'로 시작하는 줄) 그때도 손해는
+// '수식 한 줄이 이상하게 보인다'이지, 답변이 사라지거나 조용히 바뀌는 것이 아니다.
+//
+// 문자열 '안'에서만 동작한다 — 구조를 이루는 중괄호·콜론은 건드리지 않는다.
+// 항상 돌린다. 파싱에 실패했을 때만 돌리면 두 번째 갈래(파싱은 성공하는 손상)를 영원히 놓친다.
 
-// 잘못된 이스케이프의 백슬래시를 되살린다. LaTeX 때문에 필요하다: 모델이 answer 안에
-// \[ x^2 \] 나 \alpha 처럼 백슬래시를 한 번만 쓰면 JSON.parse가 통째로 던지고, 후보가 하나도
-// 남지 않아 "LLM 호출에 실패했습니다"가 나간다 — 모델은 제대로 답했는데도 답이 사라진다.
-// 여기서 고치는 것은 '어차피 유효한 JSON이 아닌' 자리뿐이라 멀쩡한 응답의 해석을 바꾸지 않는다:
-// \\ 는 유효한 이스케이프이므로 두 글자째까지 그대로 넘겨, 제대로 쓴 \\frac 을 건드리지 않는다.
-// 고칠 것이 없으면 null을 돌려준다 — 호출부가 '원본으로도 실패, 수리해도 그대로'를 구분한다.
-function repairJsonEscapes(text) {
-  let out = '', inStr = false, changed = false;
+// JSON이 인정하는 한 글자 이스케이프 중 '뜻이 하나뿐인' 것들. \u는 뒤에 16진수 4자리가 붙어야 유효하다.
+const UNAMBIGUOUS_ESCAPES = '"\\/';
+
+// \n 다음에 이것이 이어지면 줄바꿈이 아니라 LaTeX 명령으로 본다(\nabla, \neq, …). 긴 것부터 본다 —
+// 'otin'을 'ot'으로 먼저 끊으면 \notin이 \not+in이 된다.
+// 답변에서 '줄이 이 글자로 시작할 수 있는가'만 기준으로 골랐다. 그래서 \ne·\ni·\nu(줄이 'e '·'i '·'u '로
+// 시작하는 것은 수식 안에서 흔하다)는 일부러 뺐다 — 그쪽은 되돌리지 않는 편이 안전하다.
+const N_COMMAND_TAILS = ['rightarrow', 'leftarrow', 'subseteq', 'supseteq', 'parallel', 'onumber', 'exists', 'ewline', 'otin', 'abla', 'eq'];
+
+// 문자열 안에 그대로 온 제어문자(0x1F 이하)는 JSON에서 무효라 파싱이 통째로 실패한다.
+// 모델이 answer 안에서 진짜로 줄을 바꿔 쓰는 일은 드물지 않은데, 그 한 번이 '답변 소실'이 된다.
+// 뜻이 분명하므로(줄바꿈은 줄바꿈이다) 유효한 이스케이프로 바꿔 살린다.
+const CONTROL_ESCAPES = { '\n': '\\n', '\r': '\\r', '\t': '\\t', '\b': '\\b', '\f': '\\f' };
+const escapeControl = c => CONTROL_ESCAPES[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`;
+
+const isLetter = c => c !== undefined && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'));
+
+// text[i+1]이 n일 때, 그 이스케이프를 '제어문자'로 볼지(true) 'LaTeX 명령'으로 볼지(false).
+function keepsControlMeaning(text, i, n) {
+  if (n === 'b' || n === 'f') return false;                 // 답변 본문에 올 수 없는 문자
+  if (n === 't' || n === 'r') return !isLetter(text[i + 2]); // 명령 이름이 될 수 있는 자리에서만 되돌린다
+  // n — 뒤에 명령 이름이 통째로 이어지고 그 뒤가 영문자가 아닐 때만 명령으로 본다.
+  // 여기서 남은 문자열을 잘라내면(slice) '이스케이프 수 × 응답 길이'라 긴 응답에서 이차가 된다.
+  return !N_COMMAND_TAILS.some(tail => text.startsWith(tail, i + 2) && !isLetter(text[i + 2 + tail.length]));
+}
+
+function normalizeJsonEscapes(text) {
+  let out = '', inStr = false;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (!inStr) { if (c === '"') inStr = true; out += c; continue; }
     if (c === '"') { inStr = false; out += c; continue; }
+    if (c < ' ') { out += escapeControl(c); continue; }
     if (c !== '\\') { out += c; continue; }
     const n = text[i + 1];
-    const valid = n !== undefined && JSON_ESCAPES.includes(n) &&
-      (n !== 'u' || /^[0-9a-fA-F]{4}$/.test(text.slice(i + 2, i + 6)));
-    if (valid) { out += c + n; i++; continue; }
+    // \uXXXX는 뜻이 분명하다 — 16진수 4자리가 붙어야 유효하고, 아니면 아래에서 \upsilon처럼 명령으로 산다.
+    if (n === 'u' && /^[0-9a-fA-F]{4}$/.test(text.slice(i + 2, i + 6))) { out += c + n; i++; continue; }
+    if (n !== undefined && UNAMBIGUOUS_ESCAPES.includes(n)) { out += c + n; i++; continue; }
+    if (n !== undefined && 'bfnrt'.includes(n) && keepsControlMeaning(text, i, n)) { out += c + n; i++; continue; }
+    // 남은 것은 전부 '백슬래시 그 자체' — 무효한 이스케이프(\[, \alpha)와 위에서 명령으로 판정된
+    // 자리(\times, \beta)가 여기로 온다. 다음 글자는 소비하지 않고 평범한 글자로 흘려보낸다
+    // (제어문자면 다음 회차에서 이스케이프된다).
     out += '\\\\';
-    changed = true;
   }
-  return changed ? out : null;
+  return out;
 }
 
 // 파싱까지 끝난 후보 — 태그 마스킹(ⓐ)과 결정 선택(ⓑ)이 반드시 같은 목록을 봐야 한다.
@@ -477,16 +530,9 @@ function parsedObjects(text, zoneOf) {
   for (const { start, end } of jsonSpans(text, zoneOf)) {
     const raw = text.slice(start, end + 1);
     let value;
-    try {
-      value = JSON.parse(raw);
-    } catch {
-      // 이스케이프만 어긋난 것인지 다시 본다. 여기서도 실패하면 JSON이 아닌 중괄호 덩어리다.
-      // 구간(start·end)은 원문 기준 그대로 둔다 — 수리본은 길이가 달라지므로 그 위치를 쓰면
-      // 이 파일이 '사고 과정 안인가'를 판정하는 근거가 어긋난다.
-      const repaired = repairJsonEscapes(raw);
-      if (repaired === null) continue;
-      try { value = JSON.parse(repaired); } catch { continue; }
-    }
+    // 구간(start·end)은 원문 기준 그대로 둔다 — 정규화본은 길이가 달라지므로 그 위치를 쓰면
+    // 이 파일이 '사고 과정 안인가'를 판정하는 근거가 어긋난다.
+    try { value = JSON.parse(normalizeJsonEscapes(raw)); } catch { continue; }
     out.push({ start, end, value });
   }
   return out;
@@ -640,28 +686,17 @@ function reasoningRegions(text, masked) {
   return regions;
 }
 
-// \b·\f는 JSON에서 '유효한' 이스케이프라 파싱이 성공한다 — 대신 \beta·\begin·\frac 같은
-// LaTeX 명령이 백스페이스·폼피드 한 글자로 조용히 바뀐다. 오류가 없어 로그에도 남지 않고,
-// 화면에는 'eta', 'rac'만 남은 깨진 수식으로 나온다. 이 두 제어문자는 답변 본문에 정당하게
-// 쓰일 일이 없으므로 원래의 두 글자로 되돌린다.
-// \n·\r·\t는 되돌리지 않는다: 줄바꿈·탭은 markdown에서 실제로 쓰는 문자라 \nabla·\rho·\times와
-// 구별할 근거가 없고, 되돌리면 멀쩡한 답변의 줄바꿈이 전부 깨진다. 그쪽은 시스템 프롬프트가 막는다.
-const recoverMathEscapes = s => s.replace(/[\b\f]/g, c => (c === '\b' ? '\\b' : '\\f'));
-
 // 결정 형식 검증. 빈 answer는 결정으로 보지 않는다 — 화면에 빈 말풍선이 뜨고, 그 빈 턴이
 // 다음 질문의 맥락으로 서버에 되돌아온다. 형식만 맞고 내용이 없는 응답은 실패로 처리하는 편이 낫다.
 // answerOnly면 run_query를 결정으로 받지 않는다 — 강제 답변 단계(더 이상 조회할 수 없다)와
 // 아래 2순위 채택(조회까지 맡기기에는 근거가 약하다)이 같은 판정을 쓴다.
+//
+// '빈 답변인가'를 여기서 재도 되는 것은 이스케이프 정규화(normalizeJsonEscapes)가 파싱 '전에'
+// 끝났기 때문이다. 정규화 없이 재면 \f·\b로 시작하는 수식이 폼피드·백스페이스 한 글자가 되고,
+// trim()이 그 문자를 공백으로 세어 멀쩡한 답변이 빈 답변으로 오판된다(퍼징으로 잡은 회귀).
 function toDecision(d, answerOnly) {
   if (!d || typeof d !== 'object') return null;
-  if (d.action === 'answer' && typeof d.answer === 'string') {
-    // '빈 답변인가'는 반드시 복구를 마친 값으로 판정한다. \f는 파싱되면 폼피드가 되는데
-    // 그 문자는 trim()이 공백으로 세므로, 복구 전에 재면 원래 LaTeX 명령이던 자리가 공백으로
-    // 계산된다 — 그런 문자로만 이뤄진 답변은 빈 답변으로 오판돼 통째로 버려지고,
-    // 모델은 제대로 답했는데 "LLM 호출에 실패했습니다"가 나간다.
-    const answer = recoverMathEscapes(d.answer);
-    if (answer.trim()) return { ...d, answer };
-  }
+  if (d.action === 'answer' && typeof d.answer === 'string' && d.answer.trim()) return d;
   if (!answerOnly && d.action === 'run_query' && typeof d.query_name === 'string' && d.query_name.trim()) {
     return { action: 'run_query', query_name: d.query_name, params: d.params || {} };
   }
