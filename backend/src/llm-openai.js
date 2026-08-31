@@ -55,6 +55,10 @@ const SYSTEM_PROMPT = `당신은 사내 지식 관리 및 DB 조회 Q&A 에이�
 - 일반 지식으로 답할 때도 사내 시스템의 구체적 상태(수치, 상태값, 일정 등)는 절대 지어내지 마라. 확인이 필요하면 확인 방법을 안내하라.
 - 실행 이력의 오류 원문에 든 내부 정보(호스트·포트·접속 주소, 스키마·테이블·계정명, SQL 원문)는 answer에 옮겨 적지 마라. 오류는 "조회에 실패했다"는 사실과 사용자가 할 수 있는 다음 행동만 전달하라.
 - answer는 markdown 형식으로 구조화하라: 조회 결과는 표(table)로, 항목 나열은 목록으로, 섹션 구분은 ### 제목으로 작성한다.
+- 수식은 LaTeX로 쓰되 반드시 $$ 로 감싼다. 한 줄에 $$E=mc^2$$ 로 쓰면 문장 안에 들어가는 인라인 수식이고, $$ 를 앞뒤로 각각 '독립된 줄'에 두면 가운데 정렬된 별행 수식이다. 넓은 수식은 반드시 별행으로 써라 — 인라인은 접히지 않아 넓으면 잘린다.
+- $ 하나로 감싼 $E=mc^2$ 는 수식으로 인식되지 않고 화면에 원문 그대로 나온다. \\( \\) 나 \\[ \\] 표기도 마찬가지다. 둘 다 쓰지 마라.
+- 반대로 수식이 아닌 $ 기호(금액 $100, 환경변수 $ORACLE_HOME 등)는 그냥 써도 된다 — $ 하나는 수식으로 해석하지 않는다.
+- answer는 JSON 문자열이므로 그 안의 백슬래시는 반드시 두 번 써라: "$$x=\\\\frac{1}{2}$$", "$$a \\\\times b$$". 한 번만 쓰면 수식이 깨지거나 응답 전체가 버려진다.
 
 ## 대화 맥락
 최근 대화가 함께 주어진다. 현재 질문이 이전 대화를 가리키면(예: "그럼 김철수는?", "재시작은 어떻게 해?") 최근 대화를 참고해
@@ -440,14 +444,50 @@ function jsonSpans(text, zoneOf) {
   return spans;
 }
 
+// JSON이 인정하는 한 글자 이스케이프. \u는 뒤에 16진수 4자리가 붙어야 유효하다.
+const JSON_ESCAPES = '"\\/bfnrtu';
+
+// 잘못된 이스케이프의 백슬래시를 되살린다. LaTeX 때문에 필요하다: 모델이 answer 안에
+// \[ x^2 \] 나 \alpha 처럼 백슬래시를 한 번만 쓰면 JSON.parse가 통째로 던지고, 후보가 하나도
+// 남지 않아 "LLM 호출에 실패했습니다"가 나간다 — 모델은 제대로 답했는데도 답이 사라진다.
+// 여기서 고치는 것은 '어차피 유효한 JSON이 아닌' 자리뿐이라 멀쩡한 응답의 해석을 바꾸지 않는다:
+// \\ 는 유효한 이스케이프이므로 두 글자째까지 그대로 넘겨, 제대로 쓴 \\frac 을 건드리지 않는다.
+// 고칠 것이 없으면 null을 돌려준다 — 호출부가 '원본으로도 실패, 수리해도 그대로'를 구분한다.
+function repairJsonEscapes(text) {
+  let out = '', inStr = false, changed = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (!inStr) { if (c === '"') inStr = true; out += c; continue; }
+    if (c === '"') { inStr = false; out += c; continue; }
+    if (c !== '\\') { out += c; continue; }
+    const n = text[i + 1];
+    const valid = n !== undefined && JSON_ESCAPES.includes(n) &&
+      (n !== 'u' || /^[0-9a-fA-F]{4}$/.test(text.slice(i + 2, i + 6)));
+    if (valid) { out += c + n; i++; continue; }
+    out += '\\\\';
+    changed = true;
+  }
+  return changed ? out : null;
+}
+
 // 파싱까지 끝난 후보 — 태그 마스킹(ⓐ)과 결정 선택(ⓑ)이 반드시 같은 목록을 봐야 한다.
 // 두 곳이 각자 파싱하면 "이 태그는 본문 안"과 "이 후보는 결정"이 서로 다른 근거 위에 서게 된다.
 function parsedObjects(text, zoneOf) {
   const out = [];
   for (const { start, end } of jsonSpans(text, zoneOf)) {
+    const raw = text.slice(start, end + 1);
+    let value;
     try {
-      out.push({ start, end, value: JSON.parse(text.slice(start, end + 1)) });
-    } catch { /* JSON이 아닌 중괄호 덩어리 — 다음 후보로 */ }
+      value = JSON.parse(raw);
+    } catch {
+      // 이스케이프만 어긋난 것인지 다시 본다. 여기서도 실패하면 JSON이 아닌 중괄호 덩어리다.
+      // 구간(start·end)은 원문 기준 그대로 둔다 — 수리본은 길이가 달라지므로 그 위치를 쓰면
+      // 이 파일이 '사고 과정 안인가'를 판정하는 근거가 어긋난다.
+      const repaired = repairJsonEscapes(raw);
+      if (repaired === null) continue;
+      try { value = JSON.parse(repaired); } catch { continue; }
+    }
+    out.push({ start, end, value });
   }
   return out;
 }
@@ -600,13 +640,28 @@ function reasoningRegions(text, masked) {
   return regions;
 }
 
+// \b·\f는 JSON에서 '유효한' 이스케이프라 파싱이 성공한다 — 대신 \beta·\begin·\frac 같은
+// LaTeX 명령이 백스페이스·폼피드 한 글자로 조용히 바뀐다. 오류가 없어 로그에도 남지 않고,
+// 화면에는 'eta', 'rac'만 남은 깨진 수식으로 나온다. 이 두 제어문자는 답변 본문에 정당하게
+// 쓰일 일이 없으므로 원래의 두 글자로 되돌린다.
+// \n·\r·\t는 되돌리지 않는다: 줄바꿈·탭은 markdown에서 실제로 쓰는 문자라 \nabla·\rho·\times와
+// 구별할 근거가 없고, 되돌리면 멀쩡한 답변의 줄바꿈이 전부 깨진다. 그쪽은 시스템 프롬프트가 막는다.
+const recoverMathEscapes = s => s.replace(/[\b\f]/g, c => (c === '\b' ? '\\b' : '\\f'));
+
 // 결정 형식 검증. 빈 answer는 결정으로 보지 않는다 — 화면에 빈 말풍선이 뜨고, 그 빈 턴이
 // 다음 질문의 맥락으로 서버에 되돌아온다. 형식만 맞고 내용이 없는 응답은 실패로 처리하는 편이 낫다.
 // answerOnly면 run_query를 결정으로 받지 않는다 — 강제 답변 단계(더 이상 조회할 수 없다)와
 // 아래 2순위 채택(조회까지 맡기기에는 근거가 약하다)이 같은 판정을 쓴다.
 function toDecision(d, answerOnly) {
   if (!d || typeof d !== 'object') return null;
-  if (d.action === 'answer' && typeof d.answer === 'string' && d.answer.trim()) return d;
+  if (d.action === 'answer' && typeof d.answer === 'string') {
+    // '빈 답변인가'는 반드시 복구를 마친 값으로 판정한다. \f는 파싱되면 폼피드가 되는데
+    // 그 문자는 trim()이 공백으로 세므로, 복구 전에 재면 원래 LaTeX 명령이던 자리가 공백으로
+    // 계산된다 — 그런 문자로만 이뤄진 답변은 빈 답변으로 오판돼 통째로 버려지고,
+    // 모델은 제대로 답했는데 "LLM 호출에 실패했습니다"가 나간다.
+    const answer = recoverMathEscapes(d.answer);
+    if (answer.trim()) return { ...d, answer };
+  }
   if (!answerOnly && d.action === 'run_query' && typeof d.query_name === 'string' && d.query_name.trim()) {
     return { action: 'run_query', query_name: d.query_name, params: d.params || {} };
   }

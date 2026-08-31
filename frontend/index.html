@@ -87,6 +87,13 @@
            word-break를 앞에 함께 둔다 (지원 범위는 App.jsx의 빌드 타깃 주석 참고). */
         word-break: break-word;
         overflow-wrap: anywhere;
+        /* 최후의 그물. 위 규칙들과 코드블록·표·별행수식의 가로 스크롤이 실제 사례를 모두 덮지만,
+           끊을 수도 스크롤할 수도 없는 내용(예: \rule{500em} 같은 극단적 수식)이 오면 여전히
+           말풍선을 뚫는다 — 그런 것은 잘라서라도 상자 안에 가둔다.
+           auto가 아니라 clip인 이유: auto는 세로 overflow까지 visible이 아니게 만들어 인라인
+           수식의 위아래가 잘리고 스크롤바가 생긴다. clip은 가로만 자르고 세로는 건드리지 않는다.
+           Safari 16 미만은 clip을 모르고 무시한다 — 그 경우 이전과 같이 동작할 뿐 나빠지지 않는다. */
+        overflow-x: clip;
         animation: pop 0.18s ease;
       }
       @keyframes pop { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
@@ -122,6 +129,25 @@
       /* 블록 안의 code에는 인라인용 알약 배경·여백을 걷어낸다 — 두 배경이 겹쳐 얼룩덜룩해진다 */
       .md pre code { background: none; padding: 0; border-radius: 0; font-size: inherit; }
       .md img { max-width: 100%; }
+
+      /* ===== 수식 (KaTeX) ===== */
+      /* .bubble의 줄바꿈 규칙(overflow-wrap: anywhere)이 여기까지 상속되면, KaTeX가 span으로
+         조립한 수식을 기호 한가운데서 끊어 분수·근호가 어긋난 채 렌더된다 — 수식 안에서만 되돌린다. */
+      .md .katex { word-break: normal; overflow-wrap: normal; }
+      /* 폭이 말풍선을 넘는 '인라인' 수식은 CSS로 접거나 스크롤시킬 수 없다. 세 가지를 다 재봤고
+         전부 다른 것을 망가뜨렸다:
+           - .katex를 inline-block+overflow로 → 기준선이 바뀌어 문장 속 수식이 전부 5px 들려 올라간다.
+           - .md p에 overflow-x: auto  → overflow-y까지 visible이 아니게 되어 분수·합기호의 위아래가 잘린다.
+           - .katex .text에 white-space: normal → KaTeX가 글자마다 span을 두므로 한 글자씩 줄바꿈된다.
+         KaTeX가 .base에 white-space: nowrap을 걸어 두는 한 인라인 수식은 통째로 한 덩어리다.
+         그래서 넓은 수식은 별행($$)으로 쓰게 하고(백엔드 시스템 프롬프트), 그래도 넘치는 것은
+         위 .bubble의 overflow-x: clip이 상자 안에 가둔다. */
+      /* 별행 수식($$)은 말풍선보다 넓어질 수 있다. 코드블록·표와 같은 처방으로 가로 스크롤에 가둔다.
+         세로 여백은 남긴다 — 적분·행렬처럼 키 큰 수식이 위아래로 잘리는 것을 막는다. */
+      .md .katex-display { overflow-x: auto; overflow-y: hidden; padding: 4px 0; margin: 10px 0; }
+      /* 문법이 틀린 수식은 KaTeX가 원문을 붉게 남긴다(throwOnError=false). 그 원문이 길면
+         다시 말풍선을 뚫으므로, 여기서는 줄바꿈을 허용한다. */
+      .md .katex-error { word-break: break-word; overflow-wrap: anywhere; }
       .md > :first-child { margin-top: 0; }
       .md > :last-child { margin-bottom: 0; }
 

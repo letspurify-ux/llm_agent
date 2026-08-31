@@ -522,3 +522,53 @@ test('알 수 없는 값은 기본값으로 되돌린다', async () => {
 test('forceAnswer일 때는 run_query를 결정으로 받지 않는다', async () => {
   assert.equal(await decide('{"action":"run_query","query_name":"a","params":{}}', { ...CTX, forceAnswer: true }), null);
 });
+
+// ===== LaTeX 수식이 JSON 문자열을 건너오는 길 =====
+// answer는 JSON 문자열 필드인데 LaTeX는 백슬래시투성이다. 모델이 백슬래시를 한 번만 쓰면
+// 두 가지로 깨지고 둘 다 오류처럼 보이지 않는다:
+//   - JSON에 없는 이스케이프(\[, \alpha) → JSON.parse가 던져 후보가 0건이 되고
+//     "LLM 호출에 실패했습니다"가 나간다. 모델은 제대로 답했는데 답이 사라진다.
+//   - JSON에 있는 이스케이프(\f, \b)     → 파싱이 '성공'하면서 명령이 제어문자 한 글자로 바뀐다
+//     (\frac → 폼피드+rac). 오류가 없어 로그에도 남지 않는다.
+// 테스트 문자열에 백슬래시를 직접 적지 않는다 — JS 리터럴에서 한 번, JSON에서 또 한 번 먹혀
+// '무엇을 검증하는지'가 보이지 않게 된다. B로 한 개를 명시적으로 만든다.
+const B = String.fromCharCode(92);
+const answerOf = async content => (await decide(content))?.answer ?? null;
+
+test('JSON에 없는 이스케이프가 답변을 통째로 버리지 않는다', async () => {
+  assert.equal(
+    await answerOf(`{"action":"answer","answer":"${B}[ x^2 ${B}] 와 $${B}alpha$"}`),
+    `${B}[ x^2 ${B}] 와 $${B}alpha$`
+  );
+});
+
+test('\\frac·\\beta가 제어문자로 뭉개지지 않는다', async () => {
+  assert.equal(await answerOf(`{"action":"answer","answer":"$x=${B}frac{1}{2}$"}`), `$x=${B}frac{1}{2}$`);
+  assert.equal(await answerOf(`{"action":"answer","answer":"$${B}beta$"}`), `$${B}beta$`);
+});
+
+test('제대로 이스케이프한 수식은 해석이 바뀌지 않는다', async () => {
+  // 수리는 '어차피 유효한 JSON이 아닌' 자리만 건드려야 한다.
+  assert.equal(await answerOf(`{"action":"answer","answer":"$x=${B}${B}frac{1}{2}$"}`), `$x=${B}frac{1}{2}$`);
+});
+
+test('답변의 진짜 줄바꿈은 복원 대상이 아니다', async () => {
+  // \n·\r·\t는 markdown에서 실제로 쓰는 문자라 \nabla·\times와 구별할 근거가 없다.
+  // 되돌리면 멀쩡한 답변의 줄바꿈이 전부 깨진다 — 그쪽은 시스템 프롬프트가 막는다.
+  assert.equal(await answerOf(`{"action":"answer","answer":"### 제목${B}n${B}n본문"}`), '### 제목\n\n본문');
+});
+
+test('이스케이프 수리가 run_query 결정까지 되살린다', async () => {
+  // 답변만의 문제가 아니다 — params 값에 백슬래시가 섞여도 같은 이유로 결정 전체가 사라진다.
+  assert.deepStrictEqual(
+    await decide(`{"action":"run_query","query_name":"q","params":{"p":"C:${B}Users"}}`),
+    { action: 'run_query', query_name: 'q', params: { p: `C:${B}Users` } }
+  );
+});
+
+test('복구 전에 빈 답변으로 오판하지 않는다', async () => {
+  // \f는 파싱되면 폼피드가 되고 그 문자는 trim()이 공백으로 센다. '빈 답변인가'를 복구 전에
+  // 재면, 원래 LaTeX 명령이던 자리가 공백으로 계산돼 답변이 통째로 버려진다.
+  // 판정은 반드시 복구를 마친 값으로 해야 한다 (퍼징으로 잡은 회귀).
+  assert.equal(await answerOf(`{"action":"answer","answer":"${B}f"}`), `${B}f`);
+});
