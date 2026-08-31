@@ -70,7 +70,7 @@ export default function App() {
   const bottomRef = useRef(null);
   const historyRef = useRef([]);      // 서버로 보낼 대화 이력 (setState 비동기와 무관하게 즉시 반영)
   const composingRef = useRef(false); // IME 조합 진행 중
-  const justComposedRef = useRef(false); // 직전 조합을 확정한 키 입력이 아직 끝나지 않음
+  const pendingSubmitRef = useRef(false); // 조합 중에 눌린 Enter — 조합이 확정되면 그때 보낸다
   const sendingRef = useRef(false);   // 전송 진행 중 (loading state와 달리 같은 tick에도 즉시 보인다)
 
   useEffect(() => {
@@ -85,8 +85,10 @@ export default function App() {
   // ask는 예시 칩(ask(x))에서도 불리는데, 거기서 입력창을 비우면 사용자가 쓰던 초안이
   // 보낸 적도 없이 사라진다(빈 상태 화면은 입력 중에도 칩을 계속 보여준다).
   // 전송이 실제로 받아들여질 때만 비우도록 가드도 여기서 함께 본다.
-  function submitInput() {
-    const message = input.trim();
+  // 보낼 글자를 인자로도 받는 이유: 조합 확정 시점의 최종 문자열은 입력창(DOM)에만 확실히 있다.
+  // state는 마지막 input 이벤트가 compositionend보다 뒤에 오는 브라우저에서 한 글자 뒤처진다.
+  function submitInput(text = input) {
+    const message = text.trim();
     if (!message || !canSend()) return;
     setInput('');
     ask(message);
@@ -190,33 +192,31 @@ export default function App() {
             value={input}
             onChange={e => setInput(e.target.value)}
             onCompositionStart={() => { composingRef.current = true; }}
-            onCompositionEnd={() => {
+            onCompositionEnd={e => {
               composingRef.current = false;
-              // 조합을 확정한 그 키 입력은 아직 keyup 전이다. Safari는 이 순서에서
-              // compositionend를 keydown보다 먼저 보내 Enter가 isComposing=false로 도착하므로,
-              // "확정 키의 keyup이 올 때까지"를 기준으로 한 번만 흘려보낸다 (시간 재기 대신 이벤트 순서로 판별).
-              justComposedRef.current = true;
+              if (!pendingSubmitRef.current) return;
+              pendingSubmitRef.current = false;
+              // 조합 중에 눌린 Enter를 여기서 갚는다. 한글은 마지막 글자가 늘 조합 중이라
+              // 그 Enter를 버리면 사용자는 언제나 Enter를 두 번 눌러야 한다.
+              submitInput(e.currentTarget.value);
             }}
-            onKeyUp={() => { justComposedRef.current = false; }}
-            onBlur={() => { justComposedRef.current = false; }}
-            // 조합을 확정하는 것이 키가 아니라 마우스일 수도 있다(조합 중 입력창 '안'을 클릭).
-            // 그때는 keyup도 blur도 오지 않아 위 플래그가 켜진 채 남고, 그다음 Enter 한 번이
-            // 통째로 먹힌다 — 사용자에게는 "가끔 Enter가 안 먹는다"로만 보인다.
-            // click은 mouseup 뒤에 오므로 compositionend와의 선후(브라우저마다 다르다)에
-            // 기대지 않고 확실히 뒤에서 푼다.
-            onClick={() => { justComposedRef.current = false; }}
+            // Enter가 조합을 확정하지 못한 채 삼켜졌을 수도 있다. 그때 플래그가 켜진 채 남으면
+            // 한참 뒤 엉뚱한 조합이 끝나는 순간 전송된다 — 입력창을 떠날 때 확실히 내린다.
+            onBlur={() => { pendingSubmitRef.current = false; }}
             onKeyDown={e => {
               if (e.key !== 'Enter') {
-                justComposedRef.current = false;
+                pendingSubmitRef.current = false; // 위와 같은 이유 (계속 타이핑하면 그 Enter는 없던 일이다)
                 return;
               }
-              // 조합 중 Enter는 폼 제출까지 막는다 — 한글 IME에서 조합 확정 Enter가 오전송되는 문제 방지.
+              // 폼 기본 제출은 항상 막는다 — 보낼 시점은 아래에서 직접 정한다.
               e.preventDefault();
-              if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229 || composingRef.current) return;
-              if (justComposedRef.current) {
-                justComposedRef.current = false;
+              // 조합 중이면 지금 보낼 수 없다. 아직 확정되지 않은 글자가 빠지고,
+              // 뒤늦은 확정이 이미 비워둔 입력창에 다시 들어온다. compositionEnd에 넘긴다.
+              if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229 || composingRef.current) {
+                pendingSubmitRef.current = true;
                 return;
               }
+              // Safari는 compositionend를 keydown보다 먼저 보내 확정 Enter가 여기로 온다 — 그대로 보내면 된다.
               submitInput();
             }}
             placeholder="질문을 입력하세요"
