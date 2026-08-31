@@ -9,7 +9,7 @@
 // agent.js는 provider가 바뀌어도 변경되지 않는다.
 import { openaiDecide } from './llm-openai.js';
 import { bindNames } from './sql.js';
-import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, clipText, nameKey, ownProp, warnOnce } from './constants.js';
+import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, clipText, nameKey, ownProp, warnOnce } from './constants.js';
 import { rowCounts } from './result.js';
 
 // LLM provider 선택의 단일 해석 지점.
@@ -42,6 +42,14 @@ export const llm = {
 // 초과분을 실어 나르면 history·chat_log·프롬프트가 함께 부푼다.
 const MAX_DECISION_PARAMS = 20;
 
+// 바인드명 상한은 Oracle 식별자 최대 길이(12.2+ 기준 128자)로 잡는다 — 그보다 짧게 자르면
+// 101~128자짜리 '적법한' 바인드명이 실행 단계에서 매칭되지 않아 반드시 '값 없음'으로 실패한다.
+const MAX_PARAM_NAME_LEN = 128;
+
+// 상한을 넘겨 자른 답변에 붙이는 표시. 사용자에게 그대로 보이는 문구다 —
+// 조용히 자르면 끊긴 문장을 답변의 끝으로 읽는다 (프롬프트의 TRUNC_MARK와 같은 이유).
+const ANSWER_TRUNC_NOTE = '\n\n*(답변이 너무 길어 이후 내용을 생략했습니다.)*';
+
 // LLM 결정이 시스템에 들어오는 유일한 경계 — 여기서 크기를 확정한다. (테스트에서 쓰므로 export)
 // Oracle 값을 드라이버 경계(oracle.js normalizeValue)에서 한 번에 정규화하는 것과 같은 이유다:
 // query_name과 params는 이대로 history에 기록되어 프롬프트·chat_log·화면 trace 세 곳으로
@@ -51,7 +59,17 @@ const MAX_DECISION_PARAMS = 20;
 // 조용히 잘린 값으로 조회해 0건 오답을 만드는 대신 소리 나게 실패한다. 정당한 바인드 값의
 // 출처(질문·조회 결과 셀)는 전부 MAX_BIND_LEN 안이므로 이 절단이 정상 값을 건드리는 일은 없다.
 export function sanitizeDecision(d) {
-  if (!d || d.action !== 'run_query') return d;
+  if (!d) return d;
+  // answer도 여기서 크기를 확정한다 (constants.MAX_ANSWER_LEN 주석 참고).
+  // 상한을 요청의 max_tokens가 아니라 여기에 두는 이유: 완성을 토큰 수로 끊으면 JSON이 중간에서
+  // 잘려 파싱 자체가 실패하고, 그 스텝의 결정이 통째로 버려진다 — 자를 곳은 파싱이 끝난 뒤다.
+  if (d.action === 'answer') {
+    const answer = String(d.answer ?? '');
+    return answer.length > MAX_ANSWER_LEN
+      ? { ...d, answer: clipText(answer, MAX_ANSWER_LEN) + ANSWER_TRUNC_NOTE }
+      : d;
+  }
+  if (d.action !== 'run_query') return d;
   const clipVal = v => {
     if (typeof v === 'string') return v.length > MAX_BIND_LEN ? clipText(v, MAX_BIND_LEN) + TRUNC_MARK : v;
     if (v === null || typeof v === 'number' || typeof v === 'boolean') return v;
@@ -59,11 +77,22 @@ export function sanitizeDecision(d) {
     const s = JSON.stringify(v) ?? String(v);
     return s.length > MAX_BIND_LEN ? clipText(s, MAX_BIND_LEN) + TRUNC_MARK : v;
   };
-  // Object.fromEntries로 다시 조립한다 — params[k] = v 대입은 '__proto__' 키에서 조용히 사라진다
+  // Object.fromEntries로 다시 조립한다 — params[k] = v 대입은 '__proto__' 키에서 조용히 사라진다.
+  // 이름을 자를 때는 겹침까지 확인한다: 앞부분이 같은 두 이름이 같은 키로 뭉개지면 fromEntries가
+  // 나중 것만 남겨 다른 바인드의 값이 통째로 사라지고, 그 바인드는 실행 단계에서 '값 없음'으로
+  // 실패한다 — 크기를 확정해야 할 경계가 데이터를 버리는 셈이다. 겹치면 순번을 붙여 구분한다
+  // (원본 params는 객체이므로 키가 이미 유일하다 — 겹침은 오직 절단에서만 생긴다).
+  const seenNames = new Set();
   const params = Object.fromEntries(
     Object.entries(d.params || {})
       .slice(0, MAX_DECISION_PARAMS)
-      .map(([k, v]) => [k.length > 100 ? clipText(k, 100) : k, clipVal(v)])
+      .map(([k0, v]) => {
+        const base = k0.length > MAX_PARAM_NAME_LEN ? clipText(k0, MAX_PARAM_NAME_LEN) : k0;
+        let k = base;
+        for (let i = 2; seenNames.has(k); i++) k = `${base}~${i}`;
+        seenNames.add(k);
+        return [k, clipVal(v)];
+      })
   );
   // trim: 이름 앞뒤 공백은 등록 철자와의 비교(agent.js resolveQuery)를 어긋내는 것 외에 아무 역할이 없다
   return { action: 'run_query', query_name: clipText(String(d.query_name).trim(), 200), params };
@@ -218,15 +247,15 @@ export function renderAnswer({ knowledge, history }) {
   //   "BATCH999는 없습니다" 뒤에 존재하지도 않는 작업의 재시작 절차가 확신에 차서 붙는다.
   // (h.rows는 성공 시 빈 배열이라도 존재하므로 length가 아니라 유무로 판정한다)
   const querySucceeded = history.some(h => h.rows);
-  const attach = knowledge.find(k =>
-    !querySucceeded ||
-    history.some(h => (h.rows || []).some(row =>
-      Object.values(row).some(v => {
-        const s = String(v ?? '');
-        return s.length >= MIN_MATCH_LEN && k.content.includes(s);
-      })
-    ))
-  );
+  // 비교할 셀 값 집합을 지식 루프 '밖에서' 한 번만 만든다. 지식마다 이력을 다시 훑으면
+  // (지식 20건 × 행 20개 × 컬럼 30개 = 12,000회) 매번 최대 64KB짜리 TEXT 본문을 스캔하며
+  // 그동안 이벤트 루프가 통째로 막힌다 — find는 '맞는 지식이 없을 때'(가장 흔한 경우)
+  // 언제나 전액을 지불하므로 최악이 곧 평상시다. 값은 많아야 수백 개이고 전부 짧다(MAX_CELL_LEN).
+  const cellValues = querySucceeded
+    ? [...new Set(history.flatMap(h => (h.rows || []).flatMap(row =>
+        Object.values(row).map(v => String(v ?? '')).filter(s => s.length >= MIN_MATCH_LEN))))]
+    : null;
+  const attach = knowledge.find(k => !cellValues || cellValues.some(s => k.content.includes(s)));
   if (attach) {
     parts.push(`### 관련 지식: ${attach.title}\n\n${attach.content}`);
   }

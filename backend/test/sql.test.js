@@ -58,6 +58,15 @@ test('바인드 추출은 리터럴·주석 안의 콜론을 무시한다', () =
   assert.deepStrictEqual(bindNames('SELECT 1 FROM t WHERE a = :x AND b = :x'), ['x']); // 중복 제거
 });
 
+test('$·#이 든 바인드명을 잘라내지 않는다', () => {
+  // \w+는 [A-Za-z0-9_]라 EMP$NO 같은 '적법한' Oracle 식별자를 ':emp'로 잘라 싣는다.
+  // 그 잘린 이름이 프롬프트로 나가 모델이 그 이름에 값을 채우면, 실행 단계에서 드라이버가
+  // 진짜 바인드의 값을 찾지 못해 NJS-098/ORA-01008로 죽는다 — 화면에는 '조회 중 오류'
+  // 한 줄만 나가므로 그 쿼리는 등록된 채 영원히 실행되지 않는다.
+  assert.deepStrictEqual(bindNames('SELECT * FROM emp WHERE emp$no = :emp$no'), ['emp$no']);
+  assert.deepStrictEqual(bindNames('SELECT 1 FROM t WHERE a = :tab#id'), ['tab#id']);
+});
+
 test('따옴표 식별자 안의 아포스트로피가 스캔을 어긋내지 않는다', () => {
   accepts(`SELECT "a'b" FROM t`);             // 아포스트로피를 담은 따옴표 식별자
   accepts(`SELECT 1 AS "a;b" FROM t`);        // 식별자 안의 세미콜론은 문장 구분자가 아니다

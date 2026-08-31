@@ -1,6 +1,6 @@
 // MariaDB (agent 관리 DB) 커넥션 풀 + 관리 테이블 로더
 import mariadb from 'mariadb';
-import { numEnv } from './constants.js';
+import { numEnv, nameKey } from './constants.js';
 
 // 풀은 처음 쓸 때 만든다 — import만으로 만들면 이 모듈을 (간접적으로라도) 불러오는 모든 코드가
 // DB에 접속을 시도한다. 검색 로직만 import하는 테스트가 MariaDB 기동 여부에 따라 10초씩 매달리는 식이다.
@@ -25,8 +25,15 @@ const POOL_SIZE = CONNS_PER_REQUEST * CONCURRENT_REQUESTS + RESERVED_FOR_SYNC;
 // 트래픽이 뜸한 시간대마다 오류 로그가 쌓이는 셈이라 쓸 수 없다.
 // queryTimeout은 접속 시 `SET max_statement_time`을 한 번 걸 뿐 쿼리 문자열을 건드리지 않으므로,
 // search.js의 `SET STATEMENT mhnsw_ef_search=… FOR …`와도 부딪히지 않는다(실측 확인).
-// 적용 범위는 조회다 — 요청 경로(검색·쿼리 목록)가 전부 조회이므로 필요한 곳은 덮는다.
-// 쓰기(chat_log INSERT, vec_store REPLACE/DELETE)는 요청 경로 밖이라 응답을 막지 않는다.
+// 적용 범위는 '이 풀이 보내는 모든 문장'이다 — 조회만이 아니다. MariaDB의 max_statement_time은
+// MySQL의 max_execution_time(읽기 전용)과 달리 DML에도 걸리고, 커넥터는 커넥션마다
+// `SET max_statement_time=<초>`를 한 번 발행한다(mariadb/lib/connection.js).
+// 그래서 요청 경로 밖의 쓰기도 이 상한 안에서 끝나야 한다:
+//   embed-sync의 `REPLACE INTO vec_store` (1024차원 벡터 배치 + VECTOR INDEX 갱신)
+//   보존 정책의 `DELETE FROM chat_log`
+// 둘 중 하나가 상한을 넘기면 'Query execution was interrupted'로 끊기고 로그에는
+// '[embed] batch store failed' / '[chat_log] cleanup failed'만 남는다 — 메시지에 타임아웃이라는
+// 단서가 없으므로, 그 문구를 만나면 먼저 이 값(MARIADB_TIMEOUT_MS)을 의심할 것.
 const QUERY_TIMEOUT_MS = numEnv('MARIADB_TIMEOUT_MS', 30_000);
 
 let pool;
@@ -75,12 +82,19 @@ export async function query(sql, params = []) {
 }
 
 // 정상 종료용 — 풀을 닫아 반납된 커넥션까지 정리한다 (server.js의 shutdown 참고).
-// 다시 호출되면 getPool()이 새 풀을 만들도록 참조를 비운다.
+// 다시 호출되면 getPool()이 새 풀을 만들도록 참조를 비우되, 그 시점은 end()가 끝난 뒤여야 한다.
+// 먼저 비우면 종료 도중 도착한 쿼리가 getPool()에서 '아무도 닫지 않는 두 번째 풀'을 만든다 —
+// 호출부(server.js)는 방금 닫은 풀만 기다리고 곧바로 process.exit를 부르므로, 새 풀의 커넥션은
+// 핸드셰이크 도중 끊기고 그 위에서 돌던 기록(chat_log INSERT)은 흔적 없이 사라진다.
+// 참조를 나중에 비우면 같은 쿼리가 닫히는 중인 풀에서 오류로 끝난다 — 조용한 누수보다 낫다.
 export async function closePool() {
   const p = pool;
   if (!p) return;
-  pool = undefined;
-  await p.end();
+  try {
+    await p.end();
+  } finally {
+    if (pool === p) pool = undefined;
+  }
 }
 
 // 쿼리 관리 테이블 로드 — 소규모(라우팅 임계치 이하)일 때만 사용.
@@ -93,13 +107,24 @@ export function loadQueryRegistry(limit) {
     : query('SELECT * FROM query_registry LIMIT ?', [limit]);
 }
 
-// qa_method 본문이 지목한 query_name들을 로드 (라우팅 경로A)
-export function loadQueriesByNames(names) {
-  if (!names.length) return Promise.resolve([]);
-  return query(
+// qa_method 본문이 지목한 query_name들을 로드 (라우팅 경로A).
+// 요청한 이름 순서를 유지해 돌려준다 — 호출부(agent.js selectQueries)는 '앞쪽이 절차의 첫 단계'라는
+// 전제로 상한을 두고, 프롬프트 예산(llm-openai.js renderItems)도 같은 전제로 꼬리부터 버린다.
+// SQL은 IN(...)의 인자 순서를 결과 순서로 보장하지 않으므로(인덱스·PK 순으로 돌아온다) 그 전제가
+// 이 경계에서 조용히 사라졌다: 다단계 절차의 '첫 단계'가 프롬프트에서 잘려 나가면 에이전트는
+// 절차를 시작조차 못 하는데, 어디에도 오류가 남지 않는다.
+// 비교는 nameKey로 한다 — 매칭 자체가 대소문자를 가리지 않는 collation이라, 본문 표기와 등록
+// 철자가 대소문자만 다르면 ===로는 순서를 되돌리지 못하고 그 행만 맨 뒤로 밀린다.
+export async function loadQueriesByNames(names) {
+  if (!names.length) return [];
+  const rows = await query(
     `SELECT * FROM query_registry WHERE query_name IN (${names.map(() => '?').join(',')})`,
     names
   );
+  const order = new Map();
+  names.forEach((n, i) => { const k = nameKey(n); if (!order.has(k)) order.set(k, i); });
+  return rows.sort((a, b) =>
+    (order.get(nameKey(a.query_name)) ?? Infinity) - (order.get(nameKey(b.query_name)) ?? Infinity));
 }
 
 // 대화 로그 기록 — 평가셋/미답변 질문 발굴용. 실패해도 응답에는 영향 없다 (호출부 catch).

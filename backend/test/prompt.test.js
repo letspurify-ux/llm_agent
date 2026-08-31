@@ -143,6 +143,20 @@ test('LLM이 만든 거대한 query_name·params도 예산을 넘지 못한다',
   assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN, `프롬프트가 예산을 넘었다: ${p.length}`);
 });
 
+test('두 단계의 컬럼 생략 안내가 서로를 덮어쓰지 않는다', () => {
+  // 드라이버 경계(oracle.js normalizeCells)가 컬럼 수 상한으로 자르며 남긴 표시와, 프롬프트
+  // 조립이 길이 제한으로 자르며 남기는 표시는 키가 같다 — 한 행에 둘이 겹치면 fromEntries가
+  // 나중 것만 남겨 상류의 안내가 사라지고, 모델은 실제보다 훨씬 적은 수의 컬럼만 생략된 것으로
+  // 읽는다. 두 주석이 나란히 막겠다고 적어둔 실패('없는 컬럼을 없다로 단정')가 바로 그것이다.
+  const row = Object.fromEntries(new Array(30).fill(0).map((_, c) => [`COL_${c}`, big(200)]));
+  row['…'] = '외 10개 컬럼 생략 (컬럼 수 상한 30개)';
+  const p = buildPrompt(ctx({
+    history: [{ query_name: 'q0', params: {}, rows: [row], totalRows: 1 }],
+  }));
+  assert.ok(p.includes('컬럼 수 상한 30개'), '드라이버 단계의 생략 안내가 사라졌다');
+  assert.ok(p.includes('개 컬럼 생략 (프롬프트 길이 제한)'), '프롬프트 단계의 생략 안내가 사라졌다');
+});
+
 test('섹션 최소 몫 합계가 전체 예산을 넘지 않는다', () => {
   // constants.js가 import 시점에 던지므로 여기까지 왔다면 이미 참이지만, 그 검증 자체가
   // 사라지는 것을 막는다 — 이 불변식이 깨진 채로 배포된 것이 원래 버그였다.

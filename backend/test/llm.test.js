@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { llm, renderAnswer, sanitizeDecision, llmProvider } from '../src/llm.js';
-import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN } from '../src/constants.js';
+import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN } from '../src/constants.js';
 
 const ok = (name, rows, extra = {}) => ({ query_name: name, params: {}, rows, totalRows: rows.length, ...extra });
 
@@ -103,6 +103,27 @@ test('결정 경계가 거대한 바인드 값을 자르고 잘렸음을 표시�
   assert.ok(d.params.a.endsWith(TRUNC_MARK), '잘린 값은 바인드 가드가 거부하도록 표시가 남아야 한다');
   assert.equal(d.params.n, 7);
   assert.equal(d.params.z, null);
+});
+
+test('결정 경계가 거대한 answer도 자르고 잘렸음을 알린다', () => {
+  // 결정에 실려 오는 세 값 중 answer만 상한이 없었다 — query_name(200자)·params(MAX_BIND_LEN)를
+  // 묶으면서 정작 가장 큰 값이 그대로 통과해 응답 JSON과 chat_log.answer로 두 번 직렬화됐다.
+  // 조용히 자르면 끊긴 문장을 답변의 끝으로 읽으므로 표시를 남긴다.
+  const d = sanitizeDecision({ action: 'answer', answer: 'ㄱ'.repeat(MAX_ANSWER_LEN + 1000) });
+  assert.ok(d.answer.length < MAX_ANSWER_LEN + 100, `상한을 넘겼다: ${d.answer.length}`);
+  assert.match(d.answer, /생략했습니다/, '잘린 사실이 사용자에게 보여야 한다');
+});
+
+test('앞부분이 같은 긴 바인드명이 서로를 지우지 않는다', () => {
+  // 이름을 자른 뒤 fromEntries로 조립하면 겹친 키가 하나로 뭉개져 다른 바인드의 값이 통째로
+  // 사라진다 — 크기를 확정해야 할 경계가 데이터를 버리는 셈이고, 사라진 쪽은 실행 단계에서
+  // '값 없음'으로 실패해 원인이 엉뚱한 곳(모델이 값을 안 줬다)으로 읽힌다.
+  const head = 'a'.repeat(200);
+  const d = sanitizeDecision({
+    action: 'run_query', query_name: 'q', params: { [`${head}X`]: 'v1', [`${head}Y`]: 'v2' },
+  });
+  assert.equal(Object.keys(d.params).length, 2, '서로 다른 바인드가 한 키로 뭉개졌다');
+  assert.deepStrictEqual(Object.values(d.params).sort(), ['v1', 'v2']);
 });
 
 test('정상 크기의 결정은 값이 그대로 통과한다', () => {

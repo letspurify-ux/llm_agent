@@ -47,6 +47,20 @@ app.use(express.json({ limit: '1mb' }));
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
+// 대화 로그 기록은 응답을 막지 않는다(await 하지 않는다) — 대신 진행 중인 기록을 붙잡아 두어
+// 종료 경로가 기다릴 수 있게 한다. 재배포의 SIGTERM이 res.json 직후에 닿으면 shutdown이
+// 커넥션 풀을 닫아버려 아직 날아가지 않은 INSERT가 통째로 사라지는데, 남는 것은
+// '[chat_log] failed to record' 한 줄뿐이다. chat_log는 '답하지 못한 질문' 분석의 유일한
+// 출처이므로(README) 그 손실은 정작 데이터에서는 보이지 않는다 — 배포 직전 질문만 조용히 빈다.
+const pendingLogWrites = new Set();
+function recordChatLog(question, answer, trace) {
+  // 실패를 먼저 삼킨 promise를 담는다 — 그래야 종료 경로의 Promise.all이 기록 실패로 거부되지 않는다.
+  const p = insertChatLog(question, answer, trace)
+    .catch(e => console.warn('[chat_log] failed to record:', e.message))
+    .finally(() => pendingLogWrites.delete(p));
+  pendingLogWrites.add(p);
+}
+
 app.post('/api/chat', async (req, res) => {
   const message = req.body?.message;
   if (typeof message !== 'string' || !message.trim()) {
@@ -62,8 +76,7 @@ app.post('/api/chat', async (req, res) => {
     // 대화 로그 (비동기 — 기록 실패가 응답을 막지 않는다). search(검색 적중 수)를 함께 남겨
     // "검색 0건이라 못 답한 질문"을 SQL로 바로 찾을 수 있게 한다 (README의 chat_log 예시 참고).
     // v는 trace 스키마 버전 — 형식이 바뀌어도 분석 SQL이 옛 행과 새 행을 구분할 수 있게 한다.
-    insertChatLog(message.trim(), answer, { v: 2, search, steps: trace })
-      .catch(e => console.warn('[chat_log] failed to record:', e.message));
+    recordChatLog(message.trim(), answer, { v: 2, search, steps: trace });
     // 화면용 정리(제어용 기록 제외, 원문 오류 가리기, 행 상한과 생략 건수)는 result.js가 한다 —
     // 건수 해석을 답변 본문·프롬프트와 한 곳에서 공유해야 하고, 여기 두면 테스트가 붙지 않는다.
     res.json({ answer, trace: clientTrace(trace) });
@@ -184,6 +197,10 @@ async function shutdown(signal) {
   const closed = new Promise(resolve => server.close(resolve));
   server.closeIdleConnections();
   await closed;
+  // 풀을 닫기 전에 진행 중인 chat_log 기록을 마저 기다린다 — 응답은 이미 나갔지만 기록은
+  // 아직 날아가는 중일 수 있다 (recordChatLog 주석 참고). 무한정 기다리지는 않는다:
+  // 위 10초 강제 타이머가 상한이고, 각 promise는 자기 실패를 이미 삼켰다.
+  if (pendingLogWrites.size) await Promise.all(pendingLogWrites);
   await closePool().catch(e => console.warn('[shutdown] failed to close connection pool:', e.message));
   clearTimeout(force);
   process.exit(0);

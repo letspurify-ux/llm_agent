@@ -5,8 +5,8 @@
 // 어느 쪽도 오류를 남기지 않아 로그로는 알 수 없다. 테스트가 유일한 방어선이다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { loopGuard, paramKey, normalizeChat, truncatedBinds, fallbackAnswer } from '../src/agent.js';
-import { MAX_CHAT_TURNS, MAX_CHAT_LEN, TRUNC_MARK } from '../src/constants.js';
+import { loopGuard, paramKey, normalizeChat, fallbackAnswer } from '../src/agent.js';
+import { MAX_CHAT_TURNS, MAX_CHAT_LEN } from '../src/constants.js';
 
 const ran = (name, params, rows = [{ A: 1 }]) => ({ query_name: name, params, rows, totalRows: rows.length });
 const failed = (name, params) => ({ query_name: name, params, error: 'ORA-00942' });
@@ -125,25 +125,9 @@ test('이력 절단이 서로게이트 쌍을 쪼개지 않는다', () => {
   assert.equal(preSplit.text, 'ab');
 });
 
-// ===== 잘린 셀 값 가드 (truncatedBinds) =====
-// 잘린 값을 바인드하면 조용히 0건이 나오고 모델은 그것을 "그런 데이터가 없다"로 읽는다 —
-// 반대로 넓게 막으면 질문에서 온 정당한 긴 값이 영구히 거부된다. 양쪽 다 오류가 남지 않는다.
-
-test('이력의 잘린 셀에서 마크를 뗀 값은 바인드로 쓰지 못한다', () => {
-  const history = [ran('q1', {}, [{ BODY: `앞부분${TRUNC_MARK}`, ID: 'A1' }])];
-  assert.deepStrictEqual(truncatedBinds(history, ['key'], { key: '앞부분' }), ['key']);
-});
-
-test('잘린 셀과 무관한 값은 통과한다', () => {
-  const history = [ran('q1', {}, [{ BODY: `앞부분${TRUNC_MARK}` }])];
-  assert.deepStrictEqual(truncatedBinds(history, ['key'], { key: '다른값' }), []);
-  // 질문에서 온 정당한 긴 값 — 길이만으로 거부하면 이 입력으로는 그 쿼리를 영영 실행할 수 없다
-  assert.deepStrictEqual(truncatedBinds(history, ['key'], { key: 'x'.repeat(300) }), []);
-  // 이력에 잘린 셀이 없으면 아무것도 걸리지 않는다
-  assert.deepStrictEqual(truncatedBinds([], ['key'], { key: '앞부분' }), []);
-  // 온전한 셀 값(마크가 그대로 붙은 값)은 여기 몫이 아니다 — bindProblem(oracle.js)이 거부한다
-  assert.deepStrictEqual(truncatedBinds(history, ['key'], { key: 7 }), []);
-});
+// 이력의 잘린 셀에서 마크만 떼고 옮겨 적은 값에 대한 가드는 여기 없다 —
+// 그 앞부분의 길이는 반드시 clipText가 남기는 절단 길이이므로 oracle.js bindProblem이
+// Oracle 접속 전에 같은 문구로 이미 거부한다 (그쪽 isClippedLen 주석과 test/oracle.test.js 참고).
 
 test('내용이 빈 대화 턴은 프롬프트에 실리지 않는다', () => {
   // 빈 턴은 '- 사용자: ' 한 줄로 실려 모델이 내용 없는 발화를 맥락으로 읽는다.
@@ -170,18 +154,6 @@ test('내용이 빈 대화 턴은 프롬프트에 실리지 않는다', () => {
     normalizeChat(mixed).map(m => m.text),
     Array.from({ length: MAX_CHAT_TURNS }, (_, i) => `질문${i}`)
   );
-});
-
-test('프로토타입 멤버와 겹치는 바인드명이 잘린 값 가드를 어긋내지 않는다', () => {
-  // params?.[n]으로 읽으면 이 가드에서만 '소유 키만 본다'는 전제가 깨진다.
-  // 지금은 Object.prototype에 문자열 멤버가 없어 무해하지만, 전제가 갈라진 채로 남으면
-  // 값을 하나 더 보게 되는 순간 이 경로에서만 조용히 어긋난다 (constants.ownProp).
-  const history = [{ rows: [{ A: `조각${TRUNC_MARK}` }] }];
-  assert.deepStrictEqual(truncatedBinds(history, ['toString', '__proto__'], {}), [],
-    '값이 없는 바인드가 프로토타입 멤버 때문에 잘린 값으로 잡히면 안 된다');
-  assert.deepStrictEqual(
-    truncatedBinds(history, ['__proto__'], Object.fromEntries([['__proto__', '조각']])), ['__proto__'],
-    '소유 키로 실제 담긴 잘린 조각은 그대로 걸러야 한다');
 });
 
 // ===== LLM이 끝내 결정을 내지 못했을 때 (fallbackAnswer) =====

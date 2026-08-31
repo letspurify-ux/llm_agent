@@ -208,15 +208,25 @@ function fitRows(rows, budget) {
   return rows;
 }
 
+// 생략 표시의 키. 드라이버 경계(oracle.js normalizeCells)가 컬럼 수 상한으로 자를 때 쓰는 키와
+// 같은 값이다 — 같은 행에 두 표시가 함께 들어오면 Object.fromEntries가 나중 것만 남기므로,
+// 여기서 무심코 다시 붙이면 상류의 안내가 조용히 사라지고 모델은 '프롬프트 길이 제한으로 N개'만
+// 생략된 것으로 읽는다(실제로는 두 단계에서 잘린 합계다). 없는 컬럼을 '없다'로 단정하게 만드는,
+// 두 주석이 나란히 막겠다고 적어둔 바로 그 실패다. 그래서 상류 표시를 예산 경쟁에서 빼고
+// 반드시 실은 뒤, 두 단계의 생략을 한 값에 합쳐 둘 다 남긴다.
+const OMIT_KEY = '…';
+
 // 행 하나를 예산 안으로 줄인다 — 컬럼(값) 단위로 자르고, 몇 개를 버렸는지 행 안에 남긴다
 // (JSON을 중간에서 자르지 않는 이유는 fitRows와 같다). 여기가 유계가 아니면 renderHistory의
 // '최소 1줄 보장'을 타고 행 하나가 섹션 배분 전체를 우회한다. 키·값도 표시 상한으로 자른다 —
 // 드라이버 경계가 우회된 거대 셀 하나가 '컬럼 하나는 무조건 싣는다'를 뚫으면 안 된다.
 function fitCols(row, budget) {
   const entries = Object.entries(row);
+  const upstream = entries.find(([k]) => k === OMIT_KEY)?.[1];
+  const cols = entries.filter(([k]) => k !== OMIT_KEY);
   const kept = [];
   let used = 2; // '{}'
-  for (const [k0, v0] of entries) {
+  for (const [k0, v0] of cols) {
     const k = clip(k0, 100);
     const v = clipVal(v0);
     const len = JSON.stringify(k).length + (JSON.stringify(v) ?? 'null').length + 2; // ':' + ','
@@ -224,8 +234,12 @@ function fitCols(row, budget) {
     kept.push([k, v]);
     used += len;
   }
-  if (kept.length < entries.length) {
-    kept.push(['…', `외 ${entries.length - kept.length}개 컬럼 생략 (프롬프트 길이 제한)`]);
+  const omitted = cols.length - kept.length;
+  if (omitted > 0 || upstream !== undefined) {
+    const notes = [];
+    if (omitted > 0) notes.push(`외 ${omitted}개 컬럼 생략 (프롬프트 길이 제한)`);
+    if (upstream !== undefined) notes.push(String(clipVal(upstream)));
+    kept.push([OMIT_KEY, notes.join(' / ')]);
   }
   return Object.fromEntries(kept);
 }

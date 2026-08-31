@@ -95,6 +95,15 @@ const stripNoise = sql => scanSql(sql).text;
 const bindCache = new Map();
 const BIND_CACHE_MAX = 500;
 
+// 바인드명에 쓰이는 문자 = Oracle 식별자 문자(위 isIdentChar와 같은 집합이어야 한다).
+// \w+ 로 잡으면 안 된다: \w는 [A-Za-z0-9_]라 '$'·'#'이 든 이름(EMP$NO, TAB#ID — 둘 다 적법한
+// Oracle 식별자다)을 앞에서 잘라 ':emp'로 만든다. 그 잘린 이름이 프롬프트에 실리고 모델은 그것으로
+// params를 채우므로, 실행 단계에서 드라이버가 진짜 바인드(:emp$no)의 값을 찾지 못해
+// NJS-098/ORA-01008로 죽는다 — 드라이버 원문이라 화면에는 '조회 중 오류' 한 줄만 나가고
+// (server.js가 원문을 숨긴다) 그 쿼리는 등록된 채로 영원히 실행되지 않는다.
+// 같은 파일 안에서 식별자 판정이 두 갈래로 갈라져 있던 것이 원인이다.
+const BIND_RE = /:([A-Za-z0-9_$#]+)/g;
+
 export function bindNames(sql) {
   const hit = bindCache.get(sql);
   if (hit) {
@@ -105,7 +114,7 @@ export function bindNames(sql) {
     bindCache.set(sql, hit);
     return hit;
   }
-  const names = Object.freeze([...new Set([...stripNoise(sql).matchAll(/:(\w+)/g)].map(m => m[1]))]);
+  const names = Object.freeze([...new Set([...stripNoise(sql).matchAll(BIND_RE)].map(m => m[1]))]);
   while (bindCache.size >= BIND_CACHE_MAX) bindCache.delete(bindCache.keys().next().value);
   bindCache.set(sql, names);
   return names;

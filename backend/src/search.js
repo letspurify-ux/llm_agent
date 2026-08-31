@@ -44,7 +44,17 @@ export function searchQueries(question) {
 // RRF는 순위만 쓰므로 점수 스케일 튜닝이 필요 없다: score = Σ 1/(K + rank)
 async function hybrid(table, question) {
   const [likeRows, vecRows] = await Promise.all([
-    likeSearch(table, SEARCH_COLUMNS[table], question),
+    // 벡터 쪽만 자기 실패를 삼키고 있었다 — 같은 Promise.all 안에서 LIKE 쪽이 거부하면
+    // searchKnowledge → handleQuestion → /api/chat 순으로 그대로 올라가 '모든 질문이 500'이 된다.
+    // 관리 DB가 잠깐 흔들리는 것(조회 타임아웃·테이블 락·권한 상실)만으로 서비스가 통째로 멈추는
+    // 셈인데, 이 시스템의 나머지 I/O 경계는 전부 degrade하도록 되어 있다. 여기만 예외였다.
+    // 검색이 비면 답변이 부실해질 뿐이고, 그 사실은 chat_log의 search 적중 수에 남는다.
+    // 억제 범위(scope)를 벡터 경고와 나눈다 — 한 scope로 묶으면 두 실패가 번갈아 일어날 때
+    // warnOnce가 '성격이 바뀌었다'고 보고 매번 다시 찍어 로그를 도배한다.
+    likeSearch(table, SEARCH_COLUMNS[table], question).catch(e => {
+      warnOnce('search-like', `LIKE search failed on ${table} — continuing without keyword matches: ${e.message}`);
+      return [];
+    }),
     vecSearch(table, question),
   ]);
   if (!vecRows) return likeRows; // 임베딩 불가 → LIKE-only 폴백
@@ -125,8 +135,9 @@ function vecQuery(table, vector) {
 //   - 여러 토큰이 맞을수록, 첫 컬럼(제목/이름)에 맞을수록, 긴(구체적인) 토큰이 맞을수록 높다
 //   - 조사를 뗀 변형 토큰은 원형보다 짧으므로 자연히 낮게 반영된다
 async function likeSearch(table, columns, question) {
-  // 토큰 상한: 대형 입력이 CASE 절 수천 개짜리 SQL을 만들면 MariaDB thread stack overrun이 난다
-  const tokens = searchTokens(question).slice(0, 50);
+  // 상한은 searchTokens가 '확장 전 낱말'에 건다 (그 주석 참고) — 여기서 확장된 토큰 목록을
+  // 다시 자르면 상한이 앞쪽 낱말의 조사 변형들로 소진되어 질문 뒤쪽 낱말이 통째로 빠진다.
+  const tokens = searchTokens(question);
   if (tokens.length === 0) return [];
 
   const scoreParts = [];
@@ -148,19 +159,30 @@ async function likeSearch(table, columns, question) {
   );
 }
 
+// 상한은 조사 변형을 붙이기 '전'의 낱말에 건다. 확장 뒤에 자르면 상한이 앞쪽 낱말의 변형들로
+// 소진되어(낱말 하나가 최대 3개를 차지한다) 질문 뒤쪽 낱말이 SQL에 아예 실리지 않는다 —
+// 긴 한국어 질문에서 변별력 있는 명사는 대개 뒤에 온다('… 가상계측 배치 재시작 절차').
+// 그 낱말이 빠져도 쿼리는 성공하므로 오류가 남지 않는다: 앞부분의 일반적인 낱말로만 점수가
+// 매겨져 엉뚱한 지식이 정답 위로 올라올 뿐이다.
+// 상한의 목적 자체는 그대로다 — 대형 입력이 CASE 절 수천 개짜리 SQL을 만들면 MariaDB
+// thread stack overrun이 난다. 낱말 30개 × 변형 3개 × 컬럼 4개 = 최대 360개 CASE로 유계다.
+const MAX_SEARCH_WORDS = 30;
+
 // 질문 → LIKE 검색 토큰. 공백으로 나눈 뒤 앞뒤 문장부호를 떼고 조사 변형을 붙인다.
 // 문장부호 제거가 먼저여야 한다: expandToken의 조사 판정이 /[가-힣]$/라서, 물음표 하나만 붙어도
 // 판정이 실패해 변형이 하나도 만들어지지 않는다. "가상계측이란?"은 그 상태로 0건이 되고
 // "가상계측이란"은 정상 적중한다 — 한국어 질문에 물음표를 붙이는 건 지극히 자연스러운 입력이다.
 // (테스트에서 쓰므로 export 한다)
 export function searchTokens(question) {
-  return [...new Set(
+  // 2자 미만은 확장해도 2자 미만이라(변형은 원형보다 짧다) 상한을 세기 전에 버린다 —
+  // 버릴 낱말이 상한을 차지하면 그만큼 실제 검색어가 밀려난다.
+  const words = [...new Set(
     String(question ?? '')
       .split(/\s+/)
       .map(stripPunctuation)
-      .flatMap(expandToken)
       .filter(t => t.length >= 2)
-  )];
+  )].slice(0, MAX_SEARCH_WORDS);
+  return [...new Set(words.flatMap(expandToken).filter(t => t.length >= 2))];
 }
 
 // 토큰 앞뒤의 문장부호·따옴표·괄호를 뗀다. 가운데는 건드리지 않는다 —

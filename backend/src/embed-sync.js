@@ -9,7 +9,7 @@
 import 'dotenv/config';
 import { writeSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { query, getConnection, releaseConnection } from './db.js';
+import { query, getConnection, releaseConnection, closePool } from './db.js';
 import { embed, EMBEDDING_MODEL, isEmbeddingEnabled, warnEmbeddingFailure } from './embedding.js';
 import { SEARCH_COLUMNS } from './search.js';
 import { MAX_EMBED_TEXT_LEN, clipText } from './constants.js';
@@ -147,11 +147,14 @@ async function doSync() {
     // 원본이 삭제된 행 정리 (stored에 남은 것 = 원본 없음). IN 절은 상한 단위로 나눈다 —
     // 대량 삭제 직후 수만 개의 플레이스홀더가 한 문장에 실리면 정리가 매 주기 실패한다 (IN_CHUNK 주석).
     for (const seqs of chunked([...stored.keys()], IN_CHUNK)) {
-      await query(
+      const r = await query(
         `DELETE FROM vec_store WHERE src = ? AND seq IN (${seqs.map(() => '?').join(',')})`,
         [src, ...seqs]
       );
-      deleted += seqs.length;
+      // 지우려 한 수(seqs.length)가 아니라 실제로 지워진 수를 센다 — 다른 프로세스(락을 방금 놓은
+      // 동시 `npm run embed`, 수동 정리)가 이미 지웠으면 0행인데도 요약은 정리했다고 보고한다.
+      // 요약의 존재 이유가 '진짜 고아 정리'와 '아무 일도 없던 주기'를 운영자가 구분하는 것이다.
+      deleted += Number(r?.affectedRows ?? 0);
     }
 
     // 변경된 행만 본문을 읽는다. 해시 스캔과 이 읽기 사이에 원본이 또 바뀌면 새 본문을 임베딩하면서
@@ -260,6 +263,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   // (server.js의 uncaughtException 핸들러가 같은 이유로 같은 형태를 쓴다)
   const summary = `embedding sync complete: ${syncSummary(r)}, ${((Date.now() - t) / 1000).toFixed(1)}s\n`;
   try { writeSync(1, summary); } catch { /* 로그 실패가 종료 코드를 바꾸지 않게 */ }
+  // 풀을 닫고 나간다 — process.exit는 풀에 남은 커넥션을 정리하지 않고 소켓째 끊으므로,
+  // 프로비저닝 진입점인 이 명령을 돌릴 때마다 MariaDB 에러 로그에 커넥션 수만큼
+  // 'Aborted connection … Got an error reading communication packets'가 쌓인다.
+  // server.js의 정상 종료가 closePool을 부르는 것과 같은 이유인데 이쪽 종료 경로만 빠져 있었다.
+  await closePool().catch(e => console.warn('[embed] failed to close connection pool:', e.message));
   // 실패로 종료하는 것은 "쓰려고 했는데 안 된" 경우뿐이다 — LIKE-only는 지원되는 구성이므로
   // 프로비저닝 스크립트가 이 명령의 종료 코드로 실패 판정을 하면 안 된다.
   process.exit(r.skipped === SKIP.UNAVAILABLE ? 1 : 0);

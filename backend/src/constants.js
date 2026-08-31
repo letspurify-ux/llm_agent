@@ -105,6 +105,15 @@ export const MAX_QUESTION_LEN = 2000;
 // 0건 오답을 만드는 대신 소리 나게 실패시킨다.
 export const MAX_BIND_LEN = MAX_QUESTION_LEN;
 
+// LLM 답변(answer)의 상한 — 바인드 값과 같은 이유로 같은 경계(llm.js sanitizeDecision)에서 적용한다.
+// 결정에 실려 오는 세 값 중 이것만 상한이 없었다: query_name은 200자, params는 MAX_BIND_LEN으로
+// 묶으면서 정작 가장 큰 값이 그대로 통과했다. answer는 응답 JSON·chat_log.answer·화면으로 나가며
+// JSON 직렬화를 두 번 지난다 — 퇴화한 응답(temperature=0의 반복)이나 64KB짜리 지식 본문을 그대로
+// 실은 폴백 답변(llm.js renderAnswer) 하나가 응답과 로그를 통째로 부풀린다.
+// 값의 근거: 정상 답변은 프롬프트에 실린 근거(MAX_PROMPT_TOTAL_LEN = 22k자)보다 길 수 없다.
+// 그보다 넉넉히 잡아 정당한 답변은 건드리지 않으면서 퇴화한 응답만 묶는다.
+export const MAX_ANSWER_LEN = 30_000;
+
 // 길이 상한으로 문자열을 자르는 단일 지점.
 // 단순 slice는 서로게이트 쌍(이모지 등 BMP 밖 문자)을 반으로 쪼개 짝 잃은 코드유닛을 남긴다.
 // 그 문자열은 JSON.stringify는 통과하지만(\uD83D로 이스케이프된다) 유효한 UTF-8이 아니라서

@@ -7,7 +7,7 @@ import { loadQueryRegistry, loadQueriesByNames } from './db.js';
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
 import { llm, renderAnswer } from './llm.js';
-import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, TRUNC_MARK, nameKey, clipText, ownProp } from './constants.js';
+import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, nameKey, clipText, ownProp } from './constants.js';
 
 const MAX_STEPS = 5;
 const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포함). 초과하면 남은 스텝을 포기하고 강제 답변으로 간다.
@@ -31,8 +31,8 @@ const capRows = rows => rows.slice(0, MAX_RESULT_ROWS);
 // (테스트에서 쓰므로 export 한다 — 아래 loopGuard 주석 참고)
 export function paramKey(bindNameList, params) {
   // 소유 키만 읽는다 (constants.ownProp) — 바인드명이 프로토타입 멤버와 겹치면 '값 없음'이어야
-  // 할 자리가 다른 값으로 굳는다. 실행 경계(oracle.js runQuery)·잘린 값 가드(아래 truncatedBinds)·
-  // Mock(llm.js fillParams)이 같은 함수를 쓴다 — 한 곳이라도 체인을 타면 그 경로에서만 판정이 어긋난다.
+  // 할 자리가 다른 값으로 굳는다. 실행 경계(oracle.js runQuery)와 Mock(llm.js fillParams)이 같은
+  // 함수를 쓴다 — 한 곳이라도 체인을 타면 그 경로에서만 판정이 어긋난다.
   const entries = bindNameList
     ? bindNameList.map(n => [n, ownProp(params, n)])
     : Object.entries(params || {}); // 미등록 쿼리라 바인드를 알 수 없으면 원본 그대로 비교
@@ -66,34 +66,6 @@ export function loopGuard(history, canonicalName, binds, params) {
     return '같은 파라미터로 반복 실패한 쿼리 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라';
   }
   return null;
-}
-
-// 잘린 셀 값 가드 — 실행 이력의 잘린 셀(TRUNC_MARK가 붙은 값)에서 표시만 보고 마크를 뗀
-// 앞부분을 옮겨 적은 바인드 값을, 실행 전에 이력의 원본과 대조해 걸러낸다.
-// 문제가 있는 바인드명 목록을 돌려준다 (없으면 빈 배열). (테스트에서 쓰므로 export)
-//
-// oracle.js의 bindProblem과 역할을 나눈다: 저쪽은 값 자체로 판정되는 문제(값 없음·구조·
-// TRUNC_MARK가 그대로 붙은 값·절단 길이와 정확히 같은 값)를, 여기는 이력이 있어야 판정되는
-// 문제(마크를 뗀 앞부분)를 본다. 길이 휴리스틱만으로 넓게 막으면 질문에서 온 정당한 긴 값
-// (자유 검색어·경로·연결 키)까지 영구히 거부된다 — "이 값이 잘린 조각인가"는 그 값을 잘랐던
-// 이력을 쥔 쪽만 정확히 답할 수 있으므로 판정을 여기로 가져온다.
-// 잘린 값을 그대로 바인드하면 조용히 0건이 나오고 LLM은 그것을 "그런 데이터가 없다"로 읽는다.
-export function truncatedBinds(history, bindNameList, params) {
-  const prefixes = new Set();
-  for (const h of history) {
-    for (const row of h.rows || []) {
-      for (const v of Object.values(row)) {
-        if (typeof v === 'string' && v.endsWith(TRUNC_MARK)) prefixes.add(v.slice(0, -TRUNC_MARK.length));
-      }
-    }
-  }
-  if (!prefixes.size) return [];
-  // 값 읽기는 paramKey·runQuery와 같은 ownProp으로 한다 — 여기만 params?.[n]으로 체인을 타면
-  // 이 가드에서만 '소유 키만 본다'는 전제가 깨진다 (지금은 무해해도 전제가 갈라진 채로 남는다).
-  return (bindNameList || []).filter(n => {
-    const v = ownProp(params, n);
-    return typeof v === 'string' && prefixes.has(v);
-  });
 }
 
 // 클라이언트가 보낸 대화 이력을 신뢰하지 않고 형식을 검증·제한한다.
@@ -155,7 +127,16 @@ export async function handleQuestion(question, rawChat = []) {
     }
   }
 
-  const { list: queries, routed } = await selectQueries(qaMethods, searchText);
+  // 쿼리 목록 로드 실패로 요청 전체를 버리지 않는다 — 함께 버려지는 것이 바로 위에서 이미
+  // 조회해둔 지식·처리방법이고, 그중에는 DB 조회가 아예 필요 없는 순수 지식 질문도 있다.
+  // 같은 테이블의 같은 실패를 한 스텝 뒤(resolveQuery)에서는 이미 이렇게 다루고 있었다 —
+  // 경계가 갈라져 있어서, 관리 DB가 흔들리면 모든 질문이 500이 되고 여기만 그 이유가 됐다.
+  const { list: queries, routed, failed: queriesFailed } =
+    await selectQueries(qaMethods, searchText).catch(e => {
+      // 상세는 로그에만 — 화면 문구는 호출부가 만들고, MariaDB 원문에는 스키마·호스트가 들어 있다.
+      console.warn('[agent] failed to load the query list:', e.message);
+      return { list: [], routed: false, failed: true };
+    });
 
   // 검색 적중 수 — chat_log 분석용: 검색 0건(지식/쿼리 신규 등록 필요)과
   // 적중은 했지만 답이 부실한 경우(내용 보강 필요)를 구분할 수 있게 한다.
@@ -164,6 +145,9 @@ export async function handleQuestion(question, rawChat = []) {
     knowledge: knowledge.length,
     qaMethods: qaMethods.length,
     queries: routed ? queries.length : null,
+    // 목록을 못 읽어 조회 경로가 통째로 빠진 요청은 '등록이 없어서 못 답한 질문'과 구분되어야 한다 —
+    // 둘을 섞으면 chat_log 분석이 지식 보강이 필요한 질문으로 잘못 집계한다.
+    ...(queriesFailed && { queriesFailed: true }),
   };
 
   const history = [];
@@ -222,16 +206,11 @@ export async function handleQuestion(question, rawChat = []) {
     // 전제로 꼬리부터 버린다. 방금 LLM이 이름을 대서 찾아낸 쿼리는 이번 스텝에서 가장 관련이 높은데,
     // 뒤에 붙이면 등록이 조금만 많아도 그 한 건이 먼저 잘려 나가 이 복구 경로 자체가 조용히 사라진다.
     if (!queries.includes(registryRow)) queries.unshift(registryRow);
-    // 이력의 잘린 셀에서 옮겨 적은 값은 원본과 달라 절대 매칭되지 않는다 — Oracle 왕복 없이
-    // 이 스텝만 실패 처리한다 (판정이 여기 있는 이유는 truncatedBinds 주석 참고).
-    const clippedBinds = truncatedBinds(history, binds, decision.params);
-    if (clippedBinds.length) {
-      push('error', `바인드 변수를 쓸 수 없습니다 — ${clippedBinds.map(n => `${n}: 잘린 값이라 원본과 다름`).join(', ')}.`, {
-        safe: true,
-        hint: '이 값의 온전한 원본은 조회 결과에 없다 — 다른 컬럼·다른 쿼리로 원본을 구하거나 사용자에게 되물어라',
-      });
-      continue;
-    }
+    // 이력의 잘린 셀에서 마크만 떼고 옮겨 적은 바인드 값을 여기서 다시 걸러내지 않는다 —
+    // 그 앞부분의 길이는 반드시 clipText가 남기는 절단 길이(MAX_CELL_LEN 또는 그 -1)이므로
+    // oracle.js bindProblem의 isClippedLen이 Oracle에 접속하기도 전에, 글자까지 같은 문구로
+    // 이미 거부한다. 이력을 훑는 별도 판정을 두면 스텝마다 O(이력 × 행 × 컬럼) 스캔만 늘고
+    // 걸러내는 값은 한 건도 늘지 않는다 (역할을 나눈 것처럼 보였지만 실제로는 겹쳐 있었다).
     try {
       const { rows, totalRows, capped } = await runQuery(registryRow, decision.params);
       history.push({ query_name: canonicalName, params: decision.params, rows: capRows(rows), totalRows, capped });
