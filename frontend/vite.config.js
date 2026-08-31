@@ -31,5 +31,7 @@ export default defineConfig({
   server,
   // `npm run build` 결과를 확인하는 preview 서버도 같은 규칙으로 연다 — 한쪽만 열어두면
   // dev에서 되던 외부 접속이 preview에서만 안 되는 이유를 찾느라 시간을 버린다.
-  preview: server,
+  // 같은 객체를 그대로 넘기지 않고 복사한다: 두 모드가 한 객체를 공유하면 vite가 설정을
+  // 정규화하며 손대는 순간 한쪽 변경이 다른 쪽으로 새고, 그 인과는 추적하기 어렵다.
+  preview: { ...server },
 });
