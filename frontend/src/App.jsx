@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, memo } from 'react';
+import { useState, useRef, useEffect, useLayoutEffect, memo } from 'react';
 import ReactMarkdown from 'react-markdown';
 // 수식 표기의 계약(무엇이 수식인가 + 그것을 어떻게 그리는가)은 전부 math.js에 있다.
 import { REMARK_PLUGINS, REHYPE_PLUGINS } from './math.js';
@@ -68,14 +68,40 @@ export default function App() {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const bottomRef = useRef(null);
+  const inputRef = useRef(null);
   const historyRef = useRef([]);      // 서버로 보낼 대화 이력 (setState 비동기와 무관하게 즉시 반영)
   const composingRef = useRef(false); // IME 조합 진행 중
-  const pendingSubmitRef = useRef(false); // 조합 중에 눌린 Enter — 조합이 확정되면 그때 보낸다
+  const pendingSendRef = useRef(false); // 조합 중에 눌린 Enter — 조합이 확정되면 그때 보낸다
   const sendingRef = useRef(false);   // 전송 진행 중 (loading state와 달리 같은 tick에도 즉시 보인다)
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, loading]);
+
+  // textarea는 내용이 늘어도 스스로 커지지 않는다 — 줄 수에 맞춰 높이를 직접 맞춘다.
+  // 최대 높이는 CSS(max-height)가 잡고, 그 뒤로는 입력창 안에서 스크롤된다.
+  // useEffect가 아니라 useLayoutEffect인 이유: 그리기 전에 높이가 정해져야 한 프레임 깜빡이지 않는다.
+  useLayoutEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    // 지금 높이를 먼저 풀어야 한다 — 그러지 않으면 scrollHeight가 이미 늘어난 높이에 갇혀
+    // 줄을 지워도 다시 줄어들지 않는다 (한 번 커지면 그대로 남는다).
+    el.style.height = 'auto';
+    // 빈 입력창은 재지 않고 rows=1이 정한 높이를 그대로 쓴다. 잴 내용이 없기도 하지만,
+    // 무엇보다 mount 직후의 첫 측정은 레이아웃이 아직 서지 않아 엉뚱한 값(수백 px)을 준다 —
+    // 그 값이 인라인 높이로 굳으면 빈 입력창이 처음부터 세 배 크기로 열린다.
+    if (input) el.style.height = `${el.scrollHeight}px`;
+    // 스크롤은 높이가 max-height에 걸려 내용이 남을 때만 켠다. 늘 켜 두면 스크롤할 것이 없어도
+    // 세로 스크롤바가 자리를 차지해 입력창이 좁아 보인다 (브라우저·OS 설정에 따라 늘 보인다).
+    el.style.overflowY = el.scrollHeight > el.clientHeight ? 'auto' : 'hidden';
+    // 최대 높이에 걸린 뒤로는 높이가 늘지 않으므로, 새로 생긴 줄은 화면 밖에 있다 —
+    // 커서가 맨 끝에 있으면 그 줄이 보이게 내린다. 그러지 않으면 Alt+Enter로 줄을 바꿔도
+    // 화면은 그대로여서 보이지 않는 곳에 글을 쓰게 된다.
+    // (커서가 글 중간이면 건드리지 않는다 — 그때는 브라우저가 알아서 커서를 따라간다)
+    if (el.scrollHeight > el.clientHeight && el.selectionStart === el.value.length) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [input]);
 
   // loading은 state라 같은 tick에 두 번 호출되면 두 번 다 false로 읽힐 수 있다 —
   // 실제 중복 전송을 막는 것은 ref 쪽이다 (state는 버튼 비활성화 등 렌더에만 쓴다).
@@ -92,6 +118,33 @@ export default function App() {
     if (!message || !canSend()) return;
     setInput('');
     ask(message);
+  }
+
+  // 조합을 지금 끝낸다. 포커스를 뺐다가 되돌리면 IME가 조합 중이던 글자를 확정한다 —
+  // 조합 중인 입력창의 값을 건드려도 되는 상태로 만드는 방법이 이것뿐이다.
+  // (조합 중에 값을 갈아끼우면 뒤늦은 확정이 그 위에 덮여 글자가 뒤엉킨다)
+  function endComposition(el) {
+    const { selectionStart, selectionEnd } = el;
+    el.blur();
+    el.focus();
+    // 포커스를 되찾을 때 커서를 글 끝으로 밀어버리는 브라우저가 있다 — 있던 자리로 되돌린다.
+    el.setSelectionRange(selectionStart, selectionEnd);
+    // 보통은 위 blur가 compositionend를 일으켜 이 표시가 내려가지만, 그것까지 기다리지 않는다.
+    // 조합이 끝난 것은 방금 우리가 한 일이고, 이 표시가 켜진 채 남으면 그 뒤로 Enter가
+    // 영영 "조합 중"으로 취급돼 전송이 통째로 멈춘다.
+    composingRef.current = false;
+  }
+
+  // 줄바꿈은 직접 끼워 넣는다 — Enter를 preventDefault로 막았으므로 브라우저가 넣어주지 않는다.
+  // execCommand는 폐기 예정이지만 이 용도는 아직 모든 브라우저가 지원하고, 값을 직접 갈아끼우는 것과 달리
+  // 진짜 input 이벤트를 일으켜 controlled state가 따라오고 되돌리기(Ctrl+Z) 이력도 남는다.
+  function insertNewline(el) {
+    if (document.execCommand('insertText', false, '\n')) return;
+    // 막혔을 때의 대비. 이게 없으면 Alt+Enter가 아무 일도 하지 않는 것처럼 보인다.
+    const { selectionStart: start, selectionEnd: end, value } = el;
+    setInput(`${value.slice(0, start)}\n${value.slice(end)}`);
+    // 커서는 React가 새 값을 그린 뒤에 옮긴다 — 지금 옮기면 그 렌더가 커서를 맨 뒤로 되돌린다.
+    queueMicrotask(() => el.setSelectionRange(start + 1, start + 1));
   }
 
   async function ask(message) {
@@ -188,38 +241,54 @@ export default function App() {
 
       <div className="composer-wrap">
         <form className="composer" onSubmit={e => { e.preventDefault(); submitInput(); }}>
-          <input
+          <textarea
+            ref={inputRef}
+            rows={1}  /* 높이는 위 useLayoutEffect가 내용에 맞춰 준다 — 여기서는 시작 높이만 잡는다 */
             value={input}
             onChange={e => setInput(e.target.value)}
             onCompositionStart={() => { composingRef.current = true; }}
             onCompositionEnd={e => {
               composingRef.current = false;
-              if (!pendingSubmitRef.current) return;
-              pendingSubmitRef.current = false;
+              if (!pendingSendRef.current) return;
+              pendingSendRef.current = false;
               // 조합 중에 눌린 Enter를 여기서 갚는다. 한글은 마지막 글자가 늘 조합 중이라
               // 그 Enter를 버리면 사용자는 언제나 Enter를 두 번 눌러야 한다.
+              // 보낼 글자는 state가 아니라 입력창의 값에서 읽는다 (submitInput 주석 참고).
               submitInput(e.currentTarget.value);
             }}
-            // Enter가 조합을 확정하지 못한 채 삼켜졌을 수도 있다. 그때 플래그가 켜진 채 남으면
-            // 한참 뒤 엉뚱한 조합이 끝나는 순간 전송된다 — 입력창을 떠날 때 확실히 내린다.
-            onBlur={() => { pendingSubmitRef.current = false; }}
+            // Enter가 조합을 확정하지 못한 채 삼켜졌을 수도 있다. 그때 이 표시가 남아 있으면
+            // 한참 뒤 엉뚱한 조합이 끝나는 순간 전송된다 — 입력창을 떠날 때 확실히 지운다.
+            onBlur={() => { pendingSendRef.current = false; }}
             onKeyDown={e => {
               if (e.key !== 'Enter') {
-                pendingSubmitRef.current = false; // 위와 같은 이유 (계속 타이핑하면 그 Enter는 없던 일이다)
+                pendingSendRef.current = false; // 위와 같은 이유 (계속 타이핑하면 그 Enter는 없던 일이다)
                 return;
               }
-              // 폼 기본 제출은 항상 막는다 — 보낼 시점은 아래에서 직접 정한다.
+              const el = e.currentTarget;
+              const composing = e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229 || composingRef.current;
+              // 브라우저 기본 동작(줄바꿈)을 막는다 — 줄을 바꿀지 보낼지는 여기서 직접 정한다.
               e.preventDefault();
-              // 조합 중이면 지금 보낼 수 없다. 아직 확정되지 않은 글자가 빠지고,
-              // 뒤늦은 확정이 이미 비워둔 입력창에 다시 들어온다. compositionEnd에 넘긴다.
-              if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229 || composingRef.current) {
-                pendingSubmitRef.current = true;
+              // Alt+Enter가 줄바꿈. Shift+Enter도 함께 받는다 — 다른 채팅 입력창에서 손이 먼저
+              // 기억하는 조합이라, 여기서만 전송이 되면 쓰다 만 글이 그대로 나간다.
+              if (e.altKey || e.shiftKey) {
+                // 줄바꿈은 조합이 끝나기를 기다리지 않는다. IME는 Alt가 눌린 Enter를 확정 키로
+                // 보지 않고 그냥 흘려보내기도 하는데, 그러면 compositionEnd가 영영 오지 않아
+                // 기다리던 줄바꿈이 통째로 사라진다 — 조합을 직접 끝내고 지금 넣는다.
+                if (composing) endComposition(el);
+                insertNewline(el);
                 return;
               }
-              // Safari는 compositionend를 keydown보다 먼저 보내 확정 Enter가 여기로 온다 — 그대로 보내면 된다.
+              // 전송은 미룬다. 조합 중에 보내면 아직 확정되지 않은 글자가 빠지고,
+              // 뒤늦은 확정이 이미 비워둔 입력창에 다시 들어온다.
+              // (Enter는 IME가 확정 키로 받으므로 compositionEnd가 곧바로 따라온다)
+              if (composing) {
+                pendingSendRef.current = true;
+                return;
+              }
+              // Safari는 compositionend를 keydown보다 먼저 보내 확정 Enter가 여기로 온다 — 그대로 보낸다.
               submitInput();
             }}
-            placeholder="질문을 입력하세요"
+            placeholder="질문을 입력하세요 (Alt+Enter 줄바꿈)"
             maxLength={2000}  /* 입력 단계 안내용 사본 — 실제 제한은 서버가 검증한다 (backend constants.js MAX_QUESTION_LEN) */
             autoFocus
           />
