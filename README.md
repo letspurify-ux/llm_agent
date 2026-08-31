@@ -132,6 +132,25 @@ cd frontend && npm install && npm run dev
 
 `http://localhost:5173` 접속 (`/api`는 vite proxy로 백엔드에 전달).
 
+#### 다른 PC에서 접속하기
+
+dev 서버는 모든 인터페이스에 바인딩되므로, 기동 로그(`logs/frontend.log`)의 `Network:` 줄에 찍힌
+주소(`http://<이 PC의 IP>:5173`)를 같은 망의 다른 PC 브라우저에 그대로 입력하면 된다.
+백엔드는 열 필요가 없다 — 브라우저가 아니라 vite가 `localhost:3001`을 대신 호출한다.
+
+| 변수 | 용도 |
+|---|---|
+| `FRONTEND_HOST` | 바인딩 주소. `localhost`로 주면 다시 이 PC에서만 열린다 |
+| `FRONTEND_ALLOWED_HOSTS` | IP가 아니라 **도메인 이름**으로 붙을 때 그 이름을 쉼표로 나열. 없으면 vite가 `Blocked request`로 막는다 |
+
+```bash
+FRONTEND_ALLOWED_HOSTS=agent.corp.local npm run dev
+```
+
+안 열린다면 방화벽부터 본다 — macOS는 첫 기동 때 수신 연결 허용 여부를 묻고, Windows는
+`제어판 > Windows Defender 방화벽`에서 해당 포트의 인바운드를 허용해야 한다.
+그리고 dev 서버에는 인증이 없다 — 신뢰하는 사내망에서만 열고, 공인 IP에 그대로 노출하지 않는다.
+
 ## 데모 시나리오 (seed 데이터 기준)
 
 | 질문 | 동작 |
