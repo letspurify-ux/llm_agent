@@ -81,6 +81,12 @@
       .row.user { justify-content: flex-end; }
       .bubble {
         max-width: 78%; padding: 12px 16px; font-size: 14px; line-height: 1.6;
+        /* 말풍선 '상자'는 max-width로 묶이지만 내용은 그렇지 않다 — URL·식별자처럼 공백 없는
+           긴 토큰은 기본값(overflow-wrap: normal)에서 줄바꿈 지점이 없어 상자를 그대로 뚫고 나간다.
+           표준은 anywhere지만 Safari 15.4 미만은 모르므로, 구형에서도 같은 효과를 내는
+           word-break를 앞에 함께 둔다 (지원 범위는 App.jsx의 빌드 타깃 주석 참고). */
+        word-break: break-word;
+        overflow-wrap: anywhere;
         animation: pop 0.18s ease;
       }
       @keyframes pop { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
@@ -105,6 +111,17 @@
       .md th { background: #f1f3fb; font-weight: 600; }
       .md tr:nth-child(even) td { background: #fafbfe; }
       .md code { background: #eef0fa; padding: 1px 6px; border-radius: 5px; font-size: 12.5px; }
+      /* 코드블록(```). 이 규칙이 없으면 <pre> 기본값(white-space: pre)대로 한 줄을 끝까지 늘여
+         말풍선 밖으로 수백 px 삐져나간다 — 위의 줄바꿈 규칙은 pre에 닿지 않으므로
+         (줄바꿈을 막는 것이 pre의 정의다) 대신 가로 스크롤로 가둔다. .trace pre와 같은 처방이다. */
+      .md pre {
+        margin: 8px 0; padding: 10px 12px; border-radius: 10px;
+        background: #f1f3fb; border: 1px solid var(--border);
+        overflow-x: auto; font-size: 12.5px; line-height: 1.5;
+      }
+      /* 블록 안의 code에는 인라인용 알약 배경·여백을 걷어낸다 — 두 배경이 겹쳐 얼룩덜룩해진다 */
+      .md pre code { background: none; padding: 0; border-radius: 0; font-size: inherit; }
+      .md img { max-width: 100%; }
       .md > :first-child { margin-top: 0; }
       .md > :last-child { margin-bottom: 0; }
 
