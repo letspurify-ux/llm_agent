@@ -185,68 +185,93 @@ async function doSync() {
     // 변경된 행만 본문을 읽는다. 해시 스캔과 이 읽기 사이에 원본이 또 바뀌면 새 본문을 임베딩하면서
     // 스캔 시점 해시를 저장하게 되는데, 다음 주기에 불일치로 다시 잡혀 한 번 더 임베딩될 뿐이다(자가 치유).
     // 그 사이 삭제된 행은 여기서 빠지고, vec_store에 남은 벡터는 다음 주기의 고아 정리가 거둔다.
-    const stale = [];
+    //
+    // 읽은 덩어리를 바로 임베딩한다 — 테이블 전체를 배열 하나에 모아두고 시작하면 메모리 최고점이
+    // BATCH가 아니라 '테이블 크기'에 비례한다. 첫 동기화나 EMBEDDING_MODEL 변경(설계상 전 행의
+    // 해시가 불일치한다) 뒤가 정확히 그 경우로, 5만 행 × MAX_EMBED_TEXT_LEN이면 수백 MB를
+    // 동기화가 끝날 때까지(수 분) 쥐고 있게 된다 — 그동안 GET_LOCK 커넥션도 함께 잡고 있다.
+    // 읽기는 이미 IN_CHUNK 단위로 나뉘어 있었으므로, 그 덩어리를 그대로 넘기면 최고점이 IN_CHUNK로 묶인다.
     for (const seqs of chunked([...staleHash.keys()], IN_CHUNK)) {
       const contentRows = await query(
         `SELECT seq, ${cols.join(', ')} FROM ${src} WHERE seq IN (${seqs.map(() => '?').join(',')})`,
         seqs
       );
-      for (const r of contentRows) stale.push({ seq: r.seq, text: toText(cols, r), hash: staleHash.get(r.seq) });
-    }
-
-    for (let i = 0; i < stale.length; i += BATCH) {
-      // 배치 경계에서 접는다 — 해시가 갱신되지 않은 행은 다음 실행에서 그대로 다시 잡힌다(멱등).
-      if (stopRequested) { stopped = true; break; }
-      const batch = stale.slice(i, i + BATCH);
-      let vectors;
-      try {
-        vectors = await embed(batch.map(b => b.text), stopSignal.signal);
-      } catch (e) {
-        // 종료 신호로 끊긴 호출은 실패가 아니다 — 경고를 남기면 정상 재배포마다
-        // '임베딩 서버에 닿지 못했다'는 오해를 부르는 줄이 로그에 쌓인다.
-        if (stopRequested) { stopped = true; break; }
-        warnEmbeddingFailure(e);
-        // 서버에 닿지 못한 것이면 이번 회차는 여기서 접는다 (다음 주기에 그대로 재시도된다).
-        if (e.retriable) { unavailable = true; break; }
-        // 서버는 살아 있고 이 입력을 거부했다. 배치를 통째로 포기하면 성한 31건이 매 주기 되풀이되고,
-        // 뒤쪽 테이블은 아예 건너뛰게 된다 — 문제 행 하나가 전체 동기화를 영구히 멈춰 세우는 셈이다.
-        // storeBatch가 저장 실패에 쓰는 것과 같은 방식으로 행을 갈라 성한 행만 진도를 낸다.
-        const r = await embedRows(src, batch);
-        embedded += r.embedded;
-        failed += r.failed;
-        if (r.unavailable) { unavailable = true; break; }
-        continue;
-      }
-      const r = await storeBatch(src, batch, vectors);
-      embedded += r.stored;
+      const stale = contentRows.map(r => ({ seq: r.seq, text: toText(cols, r), hash: staleHash.get(r.seq) }));
+      const r = await embedStale(src, stale);
+      embedded += r.embedded;
       failed += r.failed;
+      // 임베딩 서버가 죽었거나 종료 요청이 들어왔으면 이 테이블의 남은 덩어리는 읽지 않는다.
+      // (테이블 루프는 계속 돈다 — 뒤쪽 테이블의 고아 벡터 정리는 이 함수에만 있다)
+      if (r.unavailable) { unavailable = true; break; }
+      if (r.stopped) { stopped = true; break; }
     }
   }
   return { embedded, deleted, failed, skipped: stopped ? SKIP.STOPPED : unavailable ? SKIP.UNAVAILABLE : skipped };
 }
 
+// 본문을 읽어온 행들을 BATCH 단위로 임베딩·저장한다.
+// 반환의 unavailable/stopped는 '남은 행을 두고 물러났다'는 뜻이다 — 호출부가 이 둘을 받아
+// 적지 않으면 도중에 접은 회차가 정상 완료와 구분되지 않는다 (doSync의 SKIP 판정).
+async function embedStale(src, stale) {
+  let embedded = 0, failed = 0;
+  const left = (unavailable, stopped) => ({ embedded, failed, unavailable, stopped });
+  for (let i = 0; i < stale.length; i += BATCH) {
+    // 배치 경계에서 접는다 — 해시가 갱신되지 않은 행은 다음 실행에서 그대로 다시 잡힌다(멱등).
+    if (stopRequested) return left(false, true);
+    const batch = stale.slice(i, i + BATCH);
+    let vectors;
+    try {
+      vectors = await embed(batch.map(b => b.text), stopSignal.signal);
+    } catch (e) {
+      // 종료 신호로 끊긴 호출은 실패가 아니다 — 경고를 남기면 정상 재배포마다
+      // '임베딩 서버에 닿지 못했다'는 오해를 부르는 줄이 로그에 쌓인다.
+      if (stopRequested) return left(false, true);
+      warnEmbeddingFailure(e);
+      // 서버에 닿지 못한 것이면 이번 회차는 여기서 접는다 (다음 주기에 그대로 재시도된다).
+      if (e.retriable) return left(true, false);
+      // 서버는 살아 있고 이 입력을 거부했다. 배치를 통째로 포기하면 성한 31건이 매 주기 되풀이되고,
+      // 뒤쪽 테이블은 아예 건너뛰게 된다 — 문제 행 하나가 전체 동기화를 영구히 멈춰 세우는 셈이다.
+      // storeBatch가 저장 실패에 쓰는 것과 같은 방식으로 행을 갈라 성한 행만 진도를 낸다.
+      const r = await embedRows(src, batch);
+      embedded += r.embedded;
+      failed += r.failed;
+      if (r.unavailable || r.stopped) return left(r.unavailable, r.stopped);
+      continue;
+    }
+    const r = await storeBatch(src, batch, vectors);
+    embedded += r.stored;
+    failed += r.failed;
+  }
+  return left(false, false);
+}
+
 // 내용 때문에 거부된 배치를 행 단위로 갈라 성한 행만 저장한다.
 // 도중에 서버가 죽으면(retriable) 남은 행을 붙잡지 않고 즉시 물러난다 —
 // 죽은 서버에 행마다 매달리면 회차 하나가 임베딩 타임아웃(60초) × 행 수만큼 늘어진다.
+// 접고 물러날 때는 그 사실을 반드시 돌려준다(stopped). break로 조용히 빠져나오면 호출부는
+// '이 배치를 끝까지 처리했다'와 구분하지 못한다 — 마지막 테이블의 마지막 배치에서 종료 신호를
+// 받은 회차가 정상 완료로 보고되어(SKIP.STOPPED 없음), 남겨둔 행이 있다는 사실이 로그에서
+// 통째로 사라진다. SKIP.STOPPED가 존재하는 유일한 이유가 그 구분이다.
 async function embedRows(src, batch) {
   let embedded = 0, failed = 0;
+  const left = (unavailable, stopped) => ({ embedded, failed, unavailable, stopped });
   for (const b of batch) {
-    if (stopRequested) break;   // 종료 중에는 남은 행을 붙잡지 않는다 (다음 실행이 그대로 이어받는다)
+    if (stopRequested) return left(false, true);   // 종료 중에는 남은 행을 붙잡지 않는다 (다음 실행이 그대로 이어받는다)
     try {
       const r = await storeBatch(src, [b], await embed([b.text], stopSignal.signal));
       embedded += r.stored;
       failed += r.failed;   // 저장에 실패한 행도 다음 주기에 그대로 되돌아온다 (storeBatch 주석)
     } catch (e) {
-      if (stopRequested) break;
+      if (stopRequested) return left(false, true);
       warnEmbeddingFailure(e);
-      if (e.retriable) return { embedded, failed, unavailable: true };
+      if (e.retriable) return left(true, false);
       failed++;
       // 이 행은 이번에도 다음에도 같은 이유로 거부된다 — 해시가 갱신되지 않아 매 주기 재시도되므로
       // 원본을 고치기 전까지 계속 남는다. 조용히 빠지지 않도록 seq를 찍는다.
       console.warn(`[embed] ${src}#${b.seq} embedding failed — skipping this row only: ${e.message}`);
     }
   }
-  return { embedded, failed, unavailable: false };
+  return left(false, false);
 }
 
 // 배치 전체를 한 문장으로 쓴다 — 행마다 왕복하면 초기 1만건 동기화가 1만 번 왕복이 된다.

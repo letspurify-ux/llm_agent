@@ -6,8 +6,8 @@ import { searchKnowledge, searchQaMethods, searchQueries } from './search.js';
 import { loadQueryRegistry, loadQueriesByNames } from './db.js';
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
-import { llm, renderAnswer } from './llm.js';
-import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, nameKey, clipText, stripLoneSurrogates, ownProp } from './constants.js';
+import { llm, renderAnswer, clipAnswer } from './llm.js';
+import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, nameKey, clipText, stripLoneSurrogates, bindValue } from './constants.js';
 
 const MAX_STEPS = 5;
 const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포함). 초과하면 남은 스텝을 포기하고 강제 답변으로 간다.
@@ -30,19 +30,47 @@ const capRows = rows => rows.slice(0, MAX_RESULT_ROWS);
 // 값은 문자열로 정규화한다 (숫자 1과 문자열 '1'은 같은 컬럼에 같은 값으로 바인드된다).
 // (테스트에서 쓰므로 export 한다 — 아래 loopGuard 주석 참고)
 export function paramKey(bindNameList, params) {
-  // 소유 키만 읽는다 (constants.ownProp) — 바인드명이 프로토타입 멤버와 겹치면 '값 없음'이어야
-  // 할 자리가 다른 값으로 굳는다. 실행 경계(oracle.js runQuery)와 Mock(llm.js fillParams)이 같은
-  // 함수를 쓴다 — 한 곳이라도 체인을 타면 그 경로에서만 판정이 어긋난다.
+  // 값 조회는 실행 경계와 같은 함수로 한다 (constants.bindValue) — 소유 키만 보고(프로토타입 멤버와
+  // 겹치는 바인드명이 '값 없음'을 다른 값으로 굳히지 않게), 대소문자는 Oracle과 같이 무시한다.
+  // 판정과 실행이 다른 규칙을 쓰면 그 차이만큼 가드가 조용히 비켜간다: 실행 경계가 :job_id에
+  // {"JOB_ID": …}를 바인드하는데 여기서 '값 없음'으로 보면, 같은 조회를 대문자·소문자로 번갈아
+  // 제안하는 반복이 매번 '다른 실행'으로 통과한다.
   const entries = bindNameList
-    ? bindNameList.map(n => [n, ownProp(params, n)])
-    : Object.entries(params || {}); // 미등록 쿼리라 바인드를 알 수 없으면 원본 그대로 비교
+    ? bindNameList.map(n => [n, bindValue(params, n)])
+    // 미등록 쿼리라 바인드를 알 수 없으면 원본 키로 비교한다. 키는 nameKey로 낮춘다 —
+    // 실행되면 어차피 같은 바인드가 될 표기 차이가 여기서 '다른 실행'이 되면 안 된다.
+    : Object.entries(params || {}).map(([k, v]) => [nameKey(k), v]);
   return JSON.stringify(
     entries
-      .map(([k, v]) => [k, v === undefined ? ['undefined'] : v === null ? ['null'] : String(v)])
+      .map(([k, v]) => [k, valueKey(v)])
       // 키 문자열로 명시 비교한다 — 비교 함수 없는 sort는 [k,v]를 이어붙인 문자열을 기준으로 삼아
       // 키에 쉼표가 들어가면 순서가 입력 순서에 좌우된다.
       .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
   );
+}
+
+// 값 하나를 비교 가능한 형태로 정규화한다.
+// 스칼라는 문자열로 낮춘다 (숫자 1과 문자열 '1'은 같은 컬럼에 같은 값으로 바인드된다).
+// null·undefined는 배열로 감싸 문자열 'null'·'undefined'와 구분한다.
+// 구조(객체·배열)를 String(v)로 낮추면 안 된다 — 전부 '[object Object]'로 뭉개져 서로 다른
+// 결정이 같은 실행으로 판정된다. 값이 아닌 구조는 실행 경계(oracle.js bindProblem)가 매번
+// 거부하므로 이력에는 '실패'로 남는데, 그 실패 둘이 한 실행으로 뭉개지면 MAX_GUARD_HITS가
+// 실제보다 한 스텝 일찍 차서 모델이 값을 고쳐 잡을 기회를 잃는다.
+// 키 순서까지 정규화한다 — {a,b}와 {b,a}는 같은 값이고, 순서로 갈리면 위 sort가 최상위에서
+// 하는 정규화가 한 겹 아래에서 무너진다. 순환 참조는 여기서 던지면 안 되므로(가드 하나가
+// 결정 루프를 죽인다) String(v)로 물러선다.
+function valueKey(v) {
+  if (v === undefined) return ['undefined'];
+  if (v === null) return ['null'];
+  if (typeof v !== 'object') return String(v);
+  try {
+    return ['json', JSON.stringify(v, (_, x) =>
+      x && typeof x === 'object' && !Array.isArray(x)
+        ? Object.fromEntries(Object.entries(x).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)))
+        : x)];
+  } catch {
+    return ['json', String(v)];
+  }
 }
 
 // 루프 가드 — 같은 쿼리를 같은 파라미터로 반복하는 퇴화한 결정을 걸러낸다.
@@ -94,8 +122,14 @@ export function normalizeChat(chat) {
 // 뒷조각을 보내면 맨 앞에 하위 서로게이트가 남는데(예: '\uDC00 재시작은 어떻게 해?'), 그쪽은
 // 검사를 통째로 비켜 가서 프롬프트에 그대로 실렸다. 한쪽 경계만 지키는 가드였던 셈이다.
 // stripLoneSurrogates는 양쪽 경계와 가운데를 같은 규칙으로 없앤다 — 규칙이 하나면 한쪽만 빠질 수 없다.
+// 앞뒤 공백은 여기서 뗀다. 위 isTurn이 '.trim()이 비었는가'로 빈 턴을 걸러내면서 정작 저장은
+// 원본을 그대로 했던 탓에, '  BATCH001 상태  '가 프롬프트에 '- 사용자:   BATCH001 상태  '로
+// 실리고 그 공백이 MAX_CHAT_LEN 예산까지 함께 먹었다 — 판정과 저장이 다른 문자열을 보고 있었다.
+// 현재 질문은 서버 입력 검증(server.js)이 같은 처리를 한다. 이력만 빠져 있었다.
+// 서로게이트를 걷어낸 '뒤에' 공백을 뗀다 — 순서가 반대면 클라이언트가 이모지 한가운데를 자른
+// 조각('\uDC00 재시작은 어떻게 해?')에서 코드유닛만 사라지고 그 자리의 공백이 그대로 남는다.
 function clipChatText(text) {
-  return clipText(stripLoneSurrogates(text), MAX_CHAT_LEN);
+  return clipText(stripLoneSurrogates(text).trim(), MAX_CHAT_LEN);
 }
 
 export async function handleQuestion(rawQuestion, rawChat = []) {
@@ -249,9 +283,13 @@ const LLM_FAILED_NOTE = '*LLM 응답을 받지 못해, 조회 결과와 등록�
 // 조회를 몇 번 성공해놓고 'LLM 호출 실패' 한 줄만 내보내면 그 요청이 실제로 한 일이 통째로
 // 사라지고, 반대로 표시 없이 조립해 내보내면 실패한 사실이 사라진다 — 둘 다 남긴다.
 // (테스트에서 쓰므로 export 한다 — 두 실패 모드 다 오류를 남기지 않아 회귀가 보이지 않는다)
+// 크기는 LLM의 답변과 같은 경계로 묶는다 (llm.js clipAnswer). 이 답은 llm.decide를 거치지 않아
+// sanitizeDecision의 상한 밖에 있었는데, 조립 재료가 조회 결과(스텝 × 행 × 컬럼)와 지식 본문
+// (TEXT 64KB)이라 정상 답변보다 오히려 커질 수 있다 — 실측 57만 자짜리 답변이 응답 본문과
+// chat_log.answer로 그대로 나갔다. MAX_ANSWER_LEN이 막겠다고 주석에 적어둔 바로 그 경로다.
 export function fallbackAnswer(ctx) {
   const rendered = renderAnswer(ctx);
-  return rendered ? `${LLM_FAILED_NOTE}\n\n${rendered}` : LLM_FAILED;
+  return rendered ? clipAnswer(`${LLM_FAILED_NOTE}\n\n${rendered}`) : LLM_FAILED;
 }
 
 // LLM 호출은 무엇이 실패하든 요청 전체를 500으로 만들지 않는다 — 함께 버려지는 것이

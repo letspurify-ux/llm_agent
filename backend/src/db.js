@@ -79,8 +79,11 @@ export async function releaseConnection(conn) {
   }
 }
 
+// 획득도 반납과 같은 단일 지점을 쓴다 (getConnection) — 여기서 getPool().getConnection()을
+// 다시 적으면 획득 경로가 둘이 되어, 나중에 붙일 것(획득 타임아웃·재시도·계측)이 getConnection에만
+// 들어가고 읽기 경로 전체가 조용히 빠진다. 반납만 한 곳으로 모여 있었다.
 export async function query(sql, params = []) {
-  const conn = await getPool().getConnection();
+  const conn = await getConnection();
   try {
     return await conn.query(sql, params);
   } finally {

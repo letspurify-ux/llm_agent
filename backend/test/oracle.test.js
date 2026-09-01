@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import oracledb from 'oracledb';
 import { runQuery, normalizeCells, numberFromString, oracleMock } from '../src/oracle.js';
+import { llmProvider } from '../src/llm.js';
 import { MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK } from '../src/constants.js';
 
 process.env.ORACLE_MOCK = '1';
@@ -34,6 +35,21 @@ test('값 없는 바인드는 실행 전에 safe 오류로 거부된다', async 
     runQuery(withBind(), {}),
     e => !/선택하라|되물어/.test(e.message) && /확인하고/.test(e.hint)
   );
+});
+
+test('바인드명 대소문자는 Oracle과 같이 무시한다', async () => {
+  // Oracle은 :job_id와 :JOB_ID를 같은 바인드로 다룬다. 여기서만 정확한 철자를 요구하면 모델이
+  // 값을 제대로 채워 보내고도 '값 없음'으로 실패한다 — 프롬프트는 SQL 원문의 대문자 컬럼명과
+  // 소문자 바인드명을 함께 보여주고 조회 결과 행의 키도 대문자라, {"JOB_ID": …}는 흔한 정상 응답이다.
+  // 실패하면 스텝 하나와 LLM 왕복 하나를 버리는데, 오류 문구는 '값을 안 줬다'고 말해
+  // 모델을 엉뚱한 수정으로 보낸다. llm.js valueFromHistory는 같은 이유로 이미 대소문자를 무시한다.
+  for (const params of [{ JOB_ID: 'BATCH001' }, { Job_Id: 'BATCH001' }, { job_id: 'BATCH001' }]) {
+    const { rows } = await runQuery(withBind(), params);
+    assert.equal(rows.length, 1, `바인드되지 않았다: ${JSON.stringify(params)}`);
+    assert.equal(rows[0].JOB_ID, 'BATCH001');
+  }
+  // 값이 정말 없으면 그대로 거부한다 — 관대해진 판정이 '값 없음'까지 삼키면 안 된다
+  await assert.rejects(runQuery(withBind(), { JOB: 'BATCH001' }), e => e.safe === true && /값 없음/.test(e.message));
 });
 
 test('잘린 표시가 붙은 바인드 값은 실행 전에 거부된다', async () => {
@@ -231,4 +247,33 @@ test('음수 scale NUMBER는 정밀도 가드를 우회하지 못한다', () => 
 
   // 위 판정이 실제 손실을 막고 있는지 — 17자리는 double 왕복에서 끝자리가 바뀐다
   assert.notStrictEqual(Number('12345678901234567').toString(), '12345678901234567');
+});
+
+test('설정 오타 둘이 겹쳐도 경고가 무한히 쌓이지 않는다', () => {
+  // LLM_PROVIDER와 ORACLE_MOCK은 .env의 같은 블록에 있어 함께 틀리는 일이 흔한데, 둘이 한
+  // warnOnce scope('setup')를 쓰면 서로 다른 두 문구가 번갈아 들어와 억제가 한 번도 걸리지 않는다.
+  // oracleMock은 조회마다, llmProvider는 결정마다 불리므로 요청당 두 줄씩 프로세스 수명 내내 쌓인다.
+  // 두 설정 다 폴백이 있어 기능은 도는 탓에 증상이 '로그가 터진다'뿐이라 원인이 보이지 않는다.
+  const savedMock = process.env.ORACLE_MOCK;
+  const savedProvider = process.env.LLM_PROVIDER;
+  const warned = [];
+  const origWarn = console.warn;
+  console.warn = m => warned.push(String(m));
+  try {
+    // 이 파일의 다른 테스트가 쓰지 않은 값을 쓴다 — warnOnce는 scope별 '마지막 문구'를 기억하므로
+    // 같은 값으로 이미 한 번 경고했다면 이 테스트가 재는 것이 억제인지 중복인지 구분되지 않는다.
+    process.env.ORACLE_MOCK = 'perhaps';
+    process.env.LLM_PROVIDER = 'vllm-typo';
+    for (let i = 0; i < 5; i++) {
+      oracleMock();
+      llmProvider();
+    }
+    assert.equal(warned.length, 2, `설정 항목마다 1회여야 한다: ${warned.length}줄`);
+    assert.ok(warned.some(m => /ORACLE_MOCK/.test(m)) && warned.some(m => /LLM_PROVIDER/.test(m)));
+  } finally {
+    console.warn = origWarn;
+    process.env.ORACLE_MOCK = savedMock;
+    if (savedProvider === undefined) delete process.env.LLM_PROVIDER;
+    else process.env.LLM_PROVIDER = savedProvider;
+  }
 });

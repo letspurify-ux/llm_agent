@@ -4,7 +4,7 @@
 import oracledb from 'oracledb';
 import { loadTargetDb } from './db.js';
 import { bindNames, assertReadOnly } from './sql.js';
-import { MAX_ROWS, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK, numEnv, nameKey, safeError, clipText, warnOnce, ownProp } from './constants.js';
+import { MAX_ROWS, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK, numEnv, nameKey, safeError, clipText, warnOnce, ownProp, bindValue } from './constants.js';
 
 // 드라이버 경계에서 타입을 확정한다. LOB은 기본값이 Lob 스트림 객체라 커넥션을 닫으면 무효가 되고
 // JSON 직렬화 시 순환 참조로 예외가 난다 — CLOB만이 아니라 NCLOB/BLOB도 같은 위험이므로 전부 다룬다.
@@ -129,7 +129,9 @@ export function oracleMock() {
   const v = nameKey(raw);
   if (MOCK_ON.includes(v)) return true;
   if (MOCK_OFF.includes(v)) return false;
-  warnOnce('setup', `unknown ORACLE_MOCK ${JSON.stringify(raw)} — treating it as off, so queries go to the real Oracle (valid: ${[...MOCK_ON, ...MOCK_OFF].join(', ')}). Check backend/.env.`);
+  // scope는 설정 항목마다 따로 둔다 — LLM_PROVIDER와 한 scope('setup')를 쓰면 둘 다 오타인
+  // 흔한 경우에 두 문구가 번갈아 들어와 warnOnce의 억제가 통째로 무력해진다 (llm.js 참고).
+  warnOnce('setup:oracle-mock', `unknown ORACLE_MOCK ${JSON.stringify(raw)} — treating it as off, so queries go to the real Oracle (valid: ${[...MOCK_ON, ...MOCK_OFF].join(', ')}). Check backend/.env.`);
   return false;
 }
 
@@ -144,9 +146,12 @@ export async function runQuery(registryRow, params = {}) {
   // SQL에 실제로 있는 바인드만 추려서 전달한다 — LLM이 여분 파라미터를 주면
   // 드라이버가 바인드 수 불일치(NJS-098)로 실패하므로 필터가 필요하다.
   const names = bindNames(registryRow.query_sql);
-  // 소유 키만 읽는다 (constants.ownProp) — 바인드명이 '__proto__' 같은 프로토타입 멤버와 겹치면
-  // Object.prototype이 돌아와 '값 없음'이어야 할 판정이 '값이 아닌 구조'로 어긋난다.
-  const val = n => ownProp(params, n);
+  // 값 조회는 constants.bindValue 하나로 한다 — 소유 키만 읽고(바인드명이 '__proto__' 같은
+  // 프로토타입 멤버와 겹치면 Object.prototype이 돌아와 '값 없음'이어야 할 판정이 '값이 아닌
+  // 구조'로 어긋난다), 대소문자는 Oracle과 같이 무시한다(:job_id와 :JOB_ID는 같은 바인드다).
+  // 대소문자를 가리면 모델이 값을 제대로 채워 보내도 '값 없음'으로 실패한다 — 프롬프트가
+  // 대문자 컬럼명과 소문자 바인드명을 함께 보여주므로 흔하게 일어나는 정상 경로다.
+  const val = n => bindValue(params, n);
   const bad = names.map(n => [n, bindProblem(val(n))]).filter(([, p]) => p);
   if (bad.length) {
     // 두 번째 인자(hint)는 모델 전용 지침 — 사용자 trace에는 message만 나간다 (constants.safeError 참고)

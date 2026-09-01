@@ -152,11 +152,45 @@ export function stripLoneSurrogates(s) {
 // 오류를 남기지 않는다. 그래서 nameKey와 같은 이유로 접근 방식 자체를 여기 하나로 모은다.
 export const ownProp = (obj, key) => (Object.hasOwn(obj ?? {}, key) ? obj[key] : undefined);
 
+// 바인드명 최대 길이 — Oracle 식별자 상한(12.2+ 기준 128자)이다.
+// 이 값을 보는 곳이 둘이고, 둘이 같은 값을 봐야 한다:
+//   등록 경계(sql.js assertReadOnly) — 이보다 긴 이름을 쓴 SQL은 실행 자체가 불가능하므로 거부한다.
+//   결정 경계(llm.js sanitizeDecision) — 이보다 긴 params 키는 어떤 바인드와도 대응할 수 없으므로 버린다.
+// 한쪽에만 있으면 '등록은 되는데 절대 실행되지 않는 쿼리'가 만들어진다: 등록 SQL이 129자짜리
+// 바인드를 쓰면 결정 경계가 그 키를 버리므로 매 실행이 '값 없음'으로 끝나는데, 모델은 값을
+// 제대로 채워 보냈으므로 오류만 보고는 무엇을 고쳐야 할지 알 수 없다 (실제로 그 상태였다).
+// 프롬프트에 이름을 싣는 쪽(llm-openai.js bindList)도 이 값까지는 자르지 않아야 한다 —
+// 100자로 자르면 101~128자짜리 적법한 이름을 모델이 철자대로 적을 방법이 사라진다.
+export const MAX_BIND_NAME_LEN = 128;
+
 // 쿼리 이름 비교 키. query_registry 조회는 MariaDB 기본 collation(대소문자·후행 공백 무시)이라
 // JS의 ===로 비교하면 'BATCH_JOB_STATUS'와 'batch_job_status'가 서로 다른 쿼리로 보인다.
 // 이름으로 무언가를 판정하는 곳(agent의 루프 가드, mock의 실행 계획과 stub 데이터 조회)은 전부 이 키를 쓴다 —
 // 한 곳이라도 ===로 남으면 그 경로에서만 가드가 조용히 무력화된다.
 export const nameKey = s => String(s ?? '').trim().toLowerCase();
+
+// 바인드명으로 값을 찾는 단일 지점 — Oracle의 바인드명은 대소문자를 구분하지 않는다.
+// (:job_id와 :JOB_ID는 같은 바인드이고, 드라이버도 그렇게 다룬다)
+// exact-case 읽기만 하면 모델이 값을 제대로 채워 보내도 '값 없음'이 된다: 프롬프트는 SQL 원문의
+// 컬럼명(JOB_ID)과 바인드명(:job_id)을 함께 보여주고 조회 결과 행의 키도 대문자라, 모델이
+// {"JOB_ID": "BATCH001"}로 답하는 것은 흔한 정상 경로다 — 그 실패는 스텝 하나와 LLM 왕복 하나를
+// 버리면서 오류 문구는 '값을 안 줬다'고 말해 모델을 엉뚱한 수정으로 보낸다.
+// llm.js valueFromHistory가 컬럼명을 같은 이유로 대소문자 무시하고 맞추는데, 실행 경계만
+// 엄격하게 남아 있었다. 판정(agent.js paramKey)과 실행(oracle.js runQuery)이 같은 함수를 쓴다 —
+// 한쪽만 관대하면 같은 바인드로 도는 반복을 루프 가드가 못 잡는다.
+//
+// 정확히 일치하는 키를 먼저 본다(ownProp) — 프로토타입 멤버와 겹치는 이름도 그쪽에서 막힌다.
+// 대소문자만 다른 키가 여럿이면 먼저 선언된 것을 쓴다. 값이 undefined인 항목은 건너뛴다 —
+// '키는 있는데 값이 없는' 항목이 실제 값을 가진 다른 표기를 가리면 안 된다.
+export function bindValue(params, name) {
+  const exact = ownProp(params, name);
+  if (exact !== undefined) return exact;
+  const key = nameKey(name);
+  for (const [k, v] of Object.entries(params ?? {})) {
+    if (v !== undefined && nameKey(k) === key) return v;
+  }
+  return undefined;
+}
 
 // 반복되는 경고의 단일 억제 지점.
 // 같은 오류가 매 주기·매 요청 반복될 때 로그를 도배하지 않되, 오류의 '성격'이 바뀌면 반드시 다시 알린다.

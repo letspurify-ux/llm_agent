@@ -9,7 +9,7 @@
 // agent.js는 provider가 바뀌어도 변경되지 않는다.
 import { openaiDecide } from './llm-openai.js';
 import { bindNames } from './sql.js';
-import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, clipText, nameKey, ownProp, warnOnce } from './constants.js';
+import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN, clipText, nameKey, ownProp, warnOnce } from './constants.js';
 import { rowCounts } from './result.js';
 
 // LLM provider 선택의 단일 해석 지점.
@@ -27,7 +27,12 @@ export function llmProvider() {
   if (raw === undefined || String(raw).trim() === '') return 'mock';
   const v = nameKey(raw);                       // 앞뒤 공백·대소문자는 흡수한다
   if (PROVIDERS.includes(v)) return v;
-  warnOnce('setup', `unknown LLM_PROVIDER ${JSON.stringify(raw)} — every answer will come from the rule-based mock (valid: ${PROVIDERS.join(', ')}). Check backend/.env.`);
+  // 억제 scope는 설정 항목마다 따로 둔다 — 'setup' 하나로 묶으면 LLM_PROVIDER와 ORACLE_MOCK이
+  // 동시에 오타인 흔한 경우(둘 다 .env의 같은 블록에 있다)에 두 문구가 번갈아 들어와
+  // warnOnce가 매번 '성격이 바뀌었다'고 보고 다시 찍는다 — 요청마다 두 줄씩 무한히 쌓인다.
+  // scope는 '무엇에 대한 경고인가'여야 하고, 그 안에서 메시지가 바뀔 때만 다시 알린다
+  // (search.js가 LIKE·벡터 실패를 테이블별로 나눠 잡는 것과 같은 기준).
+  warnOnce('setup:llm-provider', `unknown LLM_PROVIDER ${JSON.stringify(raw)} — every answer will come from the rule-based mock (valid: ${PROVIDERS.join(', ')}). Check backend/.env.`);
   return 'mock';
 }
 
@@ -42,8 +47,10 @@ export const llm = {
 // 초과분을 실어 나르면 history·chat_log·프롬프트가 함께 부푼다.
 const MAX_DECISION_PARAMS = 20;
 
-// 바인드명 상한은 Oracle 식별자 최대 길이(12.2+ 기준 128자)로 잡는다 — 그보다 짧게 자르면
-// 101~128자짜리 '적법한' 바인드명이 실행 단계에서 매칭되지 않아 반드시 '값 없음'으로 실패한다.
+// 바인드명 상한은 Oracle 식별자 최대 길이(12.2+ 기준 128자)다 — constants.MAX_BIND_NAME_LEN.
+// 등록 경계(sql.js assertReadOnly)가 같은 값으로 SQL 쪽을 거부하므로 상수를 공유한다:
+// 한쪽에만 있으면 '등록은 되는데 값이 절대 도달하지 않는 바인드'가 만들어진다.
+// 그보다 짧게 자르면 101~128자짜리 '적법한' 바인드명이 실행 단계에서 매칭되지 않아 반드시 '값 없음'으로 실패한다.
 // 상한을 넘는 이름은 '자르지 않고 버린다'. 자르는 쪽이 데이터를 지키는 것처럼 보이지만 실제로는
 // 아무것도 지키지 못한다: 128자를 넘는 이름은 어떤 등록 SQL의 바인드와도 대응할 수 없으므로
 // (Oracle 식별자가 거기서 끝난다) 잘라 실어 보낸 값은 어차피 어디에도 바인드되지 않는다.
@@ -54,11 +61,23 @@ const MAX_DECISION_PARAMS = 20;
 // (원본 params는 객체라 키가 이미 유일하고, 겹침은 오직 절단에서만 생겼다).
 // 버린 뒤에도 조용하지 않다: 진짜 바인드는 값을 못 받아 oracle.js bindProblem이 '값 없음'으로
 // 이름을 찍어 실패시키고, 그 문구가 hint와 함께 프롬프트로 돌아가 모델이 이름을 고쳐 잡는다.
-const MAX_PARAM_NAME_LEN = 128;
 
 // 상한을 넘겨 자른 답변에 붙이는 표시. 사용자에게 그대로 보이는 문구다 —
 // 조용히 자르면 끊긴 문장을 답변의 끝으로 읽는다 (프롬프트의 TRUNC_MARK와 같은 이유).
 const ANSWER_TRUNC_NOTE = '\n\n*(답변이 너무 길어 이후 내용을 생략했습니다.)*';
+
+// 답변 크기를 확정하는 단일 지점 (constants.MAX_ANSWER_LEN 주석 참고).
+// 함수로 떼어낸 이유: 답변이 시스템을 빠져나가는 경로가 둘인데 하나만 묶여 있었다.
+//   ① LLM의 결정 — 아래 sanitizeDecision
+//   ② LLM이 끝내 결정을 내지 못했을 때의 폴백 — agent.js fallbackAnswer가 renderAnswer로 직접 조립한다
+// ②는 sanitizeDecision을 거치지 않으므로 조회 결과와 지식 본문(TEXT 64KB)이 통째로 실린 채
+// 응답 본문과 chat_log.answer로 나갔다 — MAX_ANSWER_LEN이 존재하는 이유로 주석이 지목한
+// 바로 그 경로('64KB짜리 지식 본문을 그대로 실은 폴백 답변')가 정작 이 상한 밖에 있었다.
+// 상한을 아는 쪽이 자르는 함수도 갖고, 두 경로가 같은 함수를 부른다.
+export function clipAnswer(answer) {
+  const s = String(answer ?? '');
+  return s.length > MAX_ANSWER_LEN ? clipText(s, MAX_ANSWER_LEN) + ANSWER_TRUNC_NOTE : s;
+}
 
 // LLM 결정이 시스템에 들어오는 유일한 경계 — 여기서 크기를 확정한다. (테스트에서 쓰므로 export)
 // Oracle 값을 드라이버 경계(oracle.js normalizeValue)에서 한 번에 정규화하는 것과 같은 이유다:
@@ -74,10 +93,8 @@ export function sanitizeDecision(d) {
   // 상한을 요청의 max_tokens가 아니라 여기에 두는 이유: 완성을 토큰 수로 끊으면 JSON이 중간에서
   // 잘려 파싱 자체가 실패하고, 그 스텝의 결정이 통째로 버려진다 — 자를 곳은 파싱이 끝난 뒤다.
   if (d.action === 'answer') {
-    const answer = String(d.answer ?? '');
-    return answer.length > MAX_ANSWER_LEN
-      ? { ...d, answer: clipText(answer, MAX_ANSWER_LEN) + ANSWER_TRUNC_NOTE }
-      : d;
+    const clipped = clipAnswer(d.answer);
+    return clipped === d.answer ? d : { ...d, answer: clipped };
   }
   if (d.action !== 'run_query') return d;
   const clipVal = v => {
@@ -88,13 +105,13 @@ export function sanitizeDecision(d) {
     return s.length > MAX_BIND_LEN ? clipText(s, MAX_BIND_LEN) + TRUNC_MARK : v;
   };
   // Object.fromEntries로 다시 조립한다 — params[k] = v 대입은 '__proto__' 키에서 조용히 사라진다.
-  // 이름은 자르지 않고 상한을 넘으면 버린다 (MAX_PARAM_NAME_LEN 주석 참고) — 자르면 어떤 실제
+  // 이름은 자르지 않고 상한을 넘으면 버린다 (MAX_BIND_NAME_LEN 주석 참고) — 자르면 어떤 실제
   // 바인드와도 대응하지 못하는 이름을 만들면서 겹침 처리까지 떠안게 된다. 원본 키는 유일하므로
   // 자르지 않는 한 뭉개짐 자체가 생기지 않는다.
   const params = Object.fromEntries(
     Object.entries(d.params || {})
       .slice(0, MAX_DECISION_PARAMS)
-      .filter(([k]) => k.length <= MAX_PARAM_NAME_LEN)
+      .filter(([k]) => k.length <= MAX_BIND_NAME_LEN)
       .map(([k, v]) => [k, clipVal(v)])
   );
   // trim: 이름 앞뒤 공백은 등록 철자와의 비교(agent.js resolveQuery)를 어긋내는 것 외에 아무 역할이 없다

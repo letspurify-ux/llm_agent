@@ -10,7 +10,7 @@
 // 리터럴에 삼켜져 조회 전용 가드를 통과한다(가드 우회). 경계 판정은 정확해야 한다.
 // 다루는 어휘: 한 줄/블록 주석, q-quote(임의 구분자 + 괄호쌍), 일반 문자열('' 이스케이프),
 // 따옴표 식별자("..."). 이 중 하나라도 빠지면 그 뒤의 스캔이 통째로 어긋난다.
-import { safeError } from './constants.js';
+import { safeError, clipText, MAX_BIND_NAME_LEN, TRUNC_MARK } from './constants.js';
 
 const Q_CLOSER = { '[': ']', '{': '}', '(': ')', '<': '>' };
 const isIdentChar = c => c !== undefined && /[A-Za-z0-9_$#]/.test(c);
@@ -105,12 +105,20 @@ const BIND_CACHE_MAX = 500;
 const BIND_RE = /:([A-Za-z0-9_$#]+)/g;
 
 // 후보 중 '이 실행기가 실제로 바인드할 수 있는 이름'의 규칙 — Oracle 비인용 식별자와 같다:
-// 반드시 영문자로 시작한다. 이 판정이 없으면 위 후보 정규식이 위치 바인드(:1)까지 이름으로 잡아
+// 반드시 영문자로 시작하고, 길이가 식별자 상한(MAX_BIND_NAME_LEN) 이내다.
+//
+// 시작 문자: 이 판정이 없으면 위 후보 정규식이 위치 바인드(:1)까지 이름으로 잡아
 // bindNames가 '1'을 돌려주고, 프롬프트는 '바인드(:1)'을 보여주며, 모델은 params {"1": …}을 채운다.
 // 그런데 node-oracledb는 위치 바인드에 '객체'가 아니라 '배열'을 요구하므로 conn.execute가
 // NJS-098/ORA-01008로 죽는다 — 드라이버 원문이라 화면에는 '조회 중 오류' 한 줄만 나가고,
 // 그 쿼리는 등록된 채로 영원히 실행되지 않는다. (JDBC/PL-SQL 원본을 옮겨 적으면 자연히 나오는 표기다)
-const isExecutableBind = n => /^[A-Za-z]/.test(n);
+//
+// 길이: 상한을 넘는 이름은 Oracle 식별자가 될 수 없으므로 어떤 실행에서도 바인드되지 않는다.
+// 결정 경계(llm.js sanitizeDecision)는 이미 그 길이의 params 키를 버리고 있었는데 등록 경계에만
+// 판정이 없어서, 그런 SQL이 '바인드가 있는 정상 쿼리'로 통과한 뒤 매 실행이 '값 없음'으로 끝났다 —
+// 모델은 값을 제대로 채워 보내고도 무엇이 틀렸는지 알 수 없는 상태가 영구화된다.
+// 같은 상수를 양쪽이 본다 (constants.MAX_BIND_NAME_LEN).
+const isExecutableBind = n => /^[A-Za-z]/.test(n) && n.length <= MAX_BIND_NAME_LEN;
 const bindCandidates = text => [...new Set([...text.matchAll(BIND_RE)].map(m => m[1]))];
 
 export function bindNames(sql) {
@@ -171,16 +179,22 @@ export function assertReadOnly(sql) {
   if (/\bFOR\s+UPDATE\b/i.test(s)) {
     throw safeError('행 잠금을 거는 쿼리(FOR UPDATE)는 실행할 수 없습니다.');
   }
-  // (5) 이 실행기가 바인드할 수 없는 표기 금지 — 위치 바인드(:1)와 영문자로 시작하지 않는 이름.
+  // (5) 이 실행기가 바인드할 수 없는 표기 금지 — 위치 바인드(:1), 영문자로 시작하지 않는 이름,
+  // 그리고 식별자 상한(MAX_BIND_NAME_LEN)을 넘는 이름 (isExecutableBind 주석 참고).
   // bindNames가 걸러내기만 하면 그 쿼리는 '바인드가 없는 쿼리'로 보여 드라이버까지 내려가고,
   // 거기서 ORA-01008(값이 바인드되지 않음)로 죽는다 — 드라이버 원문은 화면에서 가려지므로
   // 사용자도 모델도 원인을 볼 수 없고, 그 쿼리는 등록된 채 영원히 실행되지 않는다.
   // FOR UPDATE와 같은 성격의 등록 실수이므로 같은 자리에서 같은 방식으로, 소리 나게 거부한다.
+  // 이름은 찍기 전에 자른다 — 후보는 SQL 원문(TEXT 64KB)에서 뽑으므로 그 자체로는 유계가 아니고,
+  // 이 문구는 화면·chat_log·프롬프트로 함께 나간다.
   const unsupported = bindCandidates(text).filter(n => !isExecutableBind(n));
   if (unsupported.length) {
+    const shown = unsupported
+      .map(n => `:${n.length > MAX_BIND_NAME_LEN ? clipText(n, MAX_BIND_NAME_LEN) + TRUNC_MARK : n}`)
+      .join(', ');
     throw safeError(
-      `실행할 수 없는 바인드 표기입니다: ${unsupported.map(n => `:${n}`).join(', ')} ` +
-      '— 바인드명은 영문자로 시작해야 합니다 (위치 바인드 :1은 지원하지 않습니다).'
+      `실행할 수 없는 바인드 표기입니다: ${shown} — 바인드명은 영문자로 시작하고 ` +
+      `${MAX_BIND_NAME_LEN}자 이하여야 합니다 (위치 바인드 :1은 지원하지 않습니다).`
     );
   }
   return executableSql(String(sql ?? ''), text);

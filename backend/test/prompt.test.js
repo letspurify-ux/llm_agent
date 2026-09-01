@@ -204,3 +204,18 @@ test('섹션 최소 몫 합계가 전체 예산을 넘지 않는다', () => {
   const sum = Object.values(PROMPT_FLOORS).reduce((a, b) => a + b, 0);
   assert.ok(sum <= MAX_PROMPT_TOTAL_LEN, `${sum} > ${MAX_PROMPT_TOTAL_LEN}`);
 });
+
+test('제목이 길어져도 지식·처리방법 줄이 예산을 뚫지 못한다', () => {
+  // renderItems는 예산과 무관하게 최소 1건을 싣는다 — 그래서 '한 줄의 크기'가 그 섹션의 실질
+  // 상한이 된다. 그 줄에서 본문(content/method)만 clip하고 제목은 원문 그대로 싣고 있었으므로,
+  // 유계라는 보장은 오직 schema.sql의 VARCHAR(200)에서 왔다. 프롬프트 예산과 아무 상관 없어
+  // 보이는 마이그레이션 한 줄(title을 TEXT로)이면 제목 하나가 전체 예산을 그대로 넘긴다 —
+  // 그 뒤 모든 질문이 컨텍스트 초과로 끝나는데 예산 어디에도 오류가 남지 않는다.
+  const p = buildPrompt(ctx({
+    knowledge: [{ title: big(MAX_PROMPT_TOTAL_LEN * 2), content: '내용' }],
+    qaMethods: [{ title: big(MAX_PROMPT_TOTAL_LEN * 2), method: '방법' }],
+  }));
+  assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN, `제목이 예산을 넘겼다: ${p.length}`);
+  // 잘렸다는 사실은 모델에게도 보여야 한다 (본문 절단과 같은 규칙)
+  assert.match(p, /…\(생략\)/);
+});

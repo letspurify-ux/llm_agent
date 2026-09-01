@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { loopGuard, paramKey, normalizeChat, fallbackAnswer } from '../src/agent.js';
-import { MAX_CHAT_TURNS, MAX_CHAT_LEN } from '../src/constants.js';
+import { MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_ANSWER_LEN, MAX_RESULT_ROWS, MAX_RESULT_COLS } from '../src/constants.js';
 
 const ran = (name, params, rows = [{ A: 1 }]) => ({ query_name: name, params, rows, totalRows: rows.length });
 const failed = (name, params) => ({ query_name: name, params, error: 'ORA-00942' });
@@ -69,6 +69,36 @@ test('프로토타입 멤버와 겹치는 바인드명이 실행 판정을 어�
   // 반대 방향 — 실제로 채워진 값은 '값 없음'과 구분되어야 한다
   assert.notEqual(paramKey(['__proto__'], Object.fromEntries([['__proto__', 'V1']])), paramKey(['__proto__'], {}));
   assert.notEqual(paramKey(['toString'], { toString: 'x' }), paramKey(['toString'], {}));
+});
+
+test('값이 아닌 구조는 서로 다른 실행으로 구분된다', () => {
+  // String(v)는 모든 객체를 '[object Object]'로 낮춘다 — 서로 다른 두 결정이 한 실행으로 뭉개져,
+  // 값이 아닌 구조를 두 번 준 응답의 두 번째가 '이미 실행했다'로 처리된다.
+  // 그러면 MAX_GUARD_HITS가 실제보다 한 스텝 일찍 차서 모델이 값을 고쳐 잡을 기회를 잃는다.
+  assert.notEqual(paramKey(['a'], { a: { x: 1 } }), paramKey(['a'], { a: { y: 2 } }));
+  assert.notEqual(paramKey(['a'], { a: [1] }), paramKey(['a'], { a: [2] }));
+  assert.notEqual(paramKey(['a'], { a: { x: 1 } }), paramKey(['a'], { a: '[object Object]' }));
+  // 같은 구조는 키 순서가 달라도 같은 실행이다 (최상위 키 순서를 정규화하는 것과 같은 이유)
+  assert.equal(paramKey(['a'], { a: { x: 1, y: 2 } }), paramKey(['a'], { a: { y: 2, x: 1 } }));
+  // 순환 참조가 가드를 죽이면 안 된다 — 판정 하나가 결정 루프 전체를 끊는다
+  const cyclic = { x: 1 };
+  cyclic.self = cyclic;
+  assert.doesNotThrow(() => paramKey(['a'], { a: cyclic }));
+});
+
+test('바인드명 대소문자가 실행 판정을 어긋내지 않는다', () => {
+  // Oracle의 바인드명은 대소문자를 구분하지 않아 실행 경계가 :job_id에 {"JOB_ID": …}를 바인드한다.
+  // 판정이 그 규칙을 따르지 않으면, 표기만 바꿔 같은 조회를 반복하는 퇴화가 매번 '다른 실행'으로
+  // 통과한다 — 조회는 성공하므로 오류도 남지 않는다.
+  assert.equal(paramKey(BINDS, { JOB_ID: 'B1' }), paramKey(BINDS, { job_id: 'B1' }));
+  assert.notEqual(paramKey(BINDS, { JOB_ID: 'B1' }), paramKey(BINDS, { job_id: 'B2' }));
+  // 미등록 쿼리(바인드를 알 수 없는 경우)도 같은 기준으로 본다
+  assert.equal(paramKey(null, { JOB_ID: 'B1' }), paramKey(null, { job_id: 'B1' }));
+  // 가드까지 이어져야 의미가 있다
+  assert.match(
+    loopGuard([ran('batch_job_status', { JOB_ID: 'B1' })], 'batch_job_status', BINDS, { job_id: 'B1' }),
+    /이미 같은 파라미터/
+  );
 });
 
 test('첫 실패는 재시도를 허용하고 반복 실패만 막는다', () => {
@@ -141,6 +171,16 @@ test('내용이 빈 대화 턴은 프롬프트에 실리지 않는다', () => {
     [{ role: 'user', text: '실제 질문' }]
   );
 
+  // 빈 판정은 trim으로 하면서 저장은 원본으로 하면, 공백이 그대로 프롬프트에 실리고
+  // ('- 사용자:   BATCH001 상태  ') 턴 길이 예산(MAX_CHAT_LEN)까지 함께 먹는다.
+  // 현재 질문은 서버 입력 검증이 같은 처리를 한다 — 이력만 빠져 있었다.
+  assert.deepStrictEqual(
+    normalizeChat([{ role: 'user', text: '  BATCH001 상태  ' }]),
+    [{ role: 'user', text: 'BATCH001 상태' }]
+  );
+  const [budget] = normalizeChat([{ role: 'user', text: `${' '.repeat(100)}${'x'.repeat(MAX_CHAT_LEN)}` }]);
+  assert.equal(budget.text, 'x'.repeat(MAX_CHAT_LEN), '공백이 본문 몫을 대신 먹었다');
+
   // 절단 뒤에 비는 경우도 걸러야 한다 — 짝 잃은 상위 서로게이트 하나뿐인 턴은
   // clipChatText가 그 코드유닛을 떼면서 빈 문자열이 된다 (앞에서만 거르면 이 경로로 남는다).
   assert.deepStrictEqual(normalizeChat([{ role: 'user', text: '\ud83d' }]), []);
@@ -173,6 +213,23 @@ test('조립할 것이 하나도 없으면 실패만 알린다', () => {
   const a = fallbackAnswer({ knowledge: [], history: [] });
   assert.match(a, /LLM 호출에 실패/);
   assert.ok(!a.includes('정리한 답변'), '조립한 것이 없는데 조립했다고 말하면 안 된다');
+});
+
+test('폴백 답변도 답변 상한 안에서 나간다', () => {
+  // 이 답은 llm.decide를 거치지 않아 sanitizeDecision(MAX_ANSWER_LEN) 밖에 있었다 — 조립 재료가
+  // 조회 결과(스텝 × 행 × 컬럼)와 지식 본문(TEXT 64KB)이라 정상 답변보다 오히려 커진다.
+  // 실측 57만 자짜리 답변이 응답 본문과 chat_log.answer로 그대로 나갔다: 상한이 존재하는 이유로
+  // constants.js가 지목한 바로 그 경로가 정작 그 상한 밖에 있었다.
+  const rows = Array.from({ length: MAX_RESULT_ROWS }, (_, i) =>
+    Object.fromEntries(Array.from({ length: MAX_RESULT_COLS }, (_, c) => [`C${c}`, `v${i}-${c}-`.repeat(20)]))
+  );
+  const a = fallbackAnswer({
+    knowledge: [{ title: 'K', content: 'ㄱ'.repeat(60_000) }],
+    history: Array.from({ length: 5 }, () => ({ query_name: 'q', rows, totalRows: rows.length })),
+  });
+  assert.ok(a.length <= MAX_ANSWER_LEN + 100, `상한을 넘겼다: ${a.length}`);
+  assert.match(a, /^\*LLM 응답을 받지 못해/, 'LLM 실패 표시는 잘려 나가면 안 된다');
+  assert.match(a, /생략했습니다/, '잘린 사실이 사용자에게 보여야 한다');
 });
 
 test('클라이언트가 쪼개 보낸 서로게이트 조각이 프롬프트로 새어 나가지 않는다', () => {

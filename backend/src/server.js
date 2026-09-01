@@ -195,19 +195,26 @@ const server = app.listen(port, () => {
   );
 });
 server.on('error', e => {
-  // 기동 실패(포트 충돌 등)는 이벤트로 오므로 uncaughtException 경로를 타지 않는다 — 명시 종료한다
+  // 기동 실패(포트 충돌 등)는 이벤트로 오므로 uncaughtException 경로를 타지 않는다 — 명시 종료한다.
+  // 종료 정리는 정상 종료와 같은 경로로 한다: listen에 실패한 시점에는 위 기동 작업(임베딩
+  // 동기화·chat_log 정리)이 이미 관리 DB 커넥션을 쥐고 돌고 있다. 그대로 process.exit하면 그
+  // 소켓들이 문장 도중에 끊겨 MariaDB 에러 로그에 'Aborted connection … Got an error reading
+  // communication packets'가 쌓인다 — embed-sync.js의 CLI가 closePool을 부르는 것과 같은 이유인데,
+  // 이 세 번째 종료 경로만 빠져 있었다. 포트 충돌은 재배포마다 나는 흔한 실패라 매번 반복된다.
   console.error('[listen] failed to start:', e.message);
-  process.exit(1);
+  shutdown('listen failed', 1);
 });
 
 // 정상 종료 — 진행 중인 요청을 끝내고 타이머·커넥션 풀을 정리한 뒤 빠진다.
 // 위 uncaughtException 핸들러는 '커넥션이 샌 채로 살아남는 것'을 막으려고 즉시 종료까지 하는데,
 // 정작 재배포마다 반드시 도는 정상 종료 경로가 비어 있으면 같은 누수를 매번 만들면서
 // 사용자에게는 '서버와 통신하지 못했습니다'로만 보인다(원인이 앱 오류처럼 읽힌다).
-async function shutdown(signal) {
+// code: 종료 코드. 시그널로 들어온 정상 종료는 0, 기동 실패는 1이다 — 정리 절차는 같고
+// '왜 나가는가'만 다르므로 경로를 나누지 않는다 (나누면 한쪽만 조용히 정리를 빼먹는다).
+async function shutdown(reason, code = 0) {
   if (shuttingDown) return; // 두 번째 시그널은 무시한다 — 종료 도중 다시 들어오는 일이 흔하다
   shuttingDown = true;
-  console.log(`[shutdown] received ${signal} — cleaning up and exiting.`);
+  console.log(`[shutdown] ${reason} — cleaning up and exiting.`);
   for (const t of timers) clearInterval(t);
   // 타이머 해제만으로는 '이미 시작된' 작업이 멈추지 않는다 — 접으라고 알린다.
   // 동기화는 해시 비교 기반이라 어디서 멈춰도 멱등하고, 남은 행은 다음 기동이 이어받는다.
@@ -240,6 +247,6 @@ async function shutdown(signal) {
   if (backgroundJobs.size) await Promise.all(backgroundJobs);
   await closePool().catch(e => console.warn('[shutdown] failed to close connection pool:', e.message));
   clearTimeout(force);
-  process.exit(0);
+  process.exit(code);
 }
-for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => shutdown(sig));
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => shutdown(`received ${sig}`));

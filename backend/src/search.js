@@ -49,10 +49,14 @@ async function hybrid(table, question) {
     // 관리 DB가 잠깐 흔들리는 것(조회 타임아웃·테이블 락·권한 상실)만으로 서비스가 통째로 멈추는
     // 셈인데, 이 시스템의 나머지 I/O 경계는 전부 degrade하도록 되어 있다. 여기만 예외였다.
     // 검색이 비면 답변이 부실해질 뿐이고, 그 사실은 chat_log의 search 적중 수에 남는다.
-    // 억제 범위(scope)를 벡터 경고와 나눈다 — 한 scope로 묶으면 두 실패가 번갈아 일어날 때
-    // warnOnce가 '성격이 바뀌었다'고 보고 매번 다시 찍어 로그를 도배한다.
+    // 억제 범위(scope)를 벡터 경고와 나누고, 테이블별로도 나눈다 — 한 scope로 묶으면 두 실패가
+    // 번갈아 일어날 때 warnOnce가 '성격이 바뀌었다'고 보고 매번 다시 찍어 로그를 도배한다.
+    // 테이블명을 문구에만 담고 scope를 공유하면 그 도배가 scope 안에서 그대로 되살아난다:
+    // 요청 하나가 세 테이블을 검색하므로, 관리 DB가 죽으면 테이블만 다른 문구가 번갈아 들어와
+    // 억제가 한 번도 걸리지 않는다(실측: 요청 4건에 8줄). scope는 '무엇에 대한 경고인가'여야 하고,
+    // 그 안에서 오류의 성격(메시지)이 바뀔 때만 다시 알린다.
     likeSearch(table, SEARCH_COLUMNS[table], question).catch(e => {
-      warnOnce('search-like', `LIKE search failed on ${table} — continuing without keyword matches: ${e.message}`);
+      warnOnce(`search-like:${table}`, `LIKE search failed on ${table} — continuing without keyword matches: ${e.message}`);
       return [];
     }),
     vecSearch(table, question),
@@ -82,8 +86,17 @@ const EMBED_CACHE_MAX = 100;
 function embedQuestion(question) {
   if (!isEmbeddingEnabled()) return null; // 설정상 LIKE-only — 오류 경로가 아니다
   const hit = embedCache.get(question);
-  if (hit) return hit;
-  // 가득 차면 통째로 비우지 않고 오래된 것부터 하나씩 밀어낸다 (Map은 삽입 순서를 지킨다).
+  if (hit) {
+    // 적중한 항목을 맨 뒤로 옮긴다 — 삽입 순서만 보고 밀어내면(FIFO) 가장 자주 묻는 질문이
+    // 한 번 들어간 뒤 스쳐 가는 질문 100건에 그대로 밀려난다. 캐시는 가득 찬 채로 적중률만
+    // 0에 수렴하고, 오류는 나지 않은 채 같은 질문마다 임베딩 왕복(최대 60초)이 되돌아온다.
+    // sql.js bindCache가 같은 이유로 같은 방식(delete 후 재삽입)을 쓴다 — 이쪽만 FIFO였다.
+    embedCache.delete(question);
+    embedCache.set(question, hit);
+    return hit;
+  }
+  // 가득 차면 통째로 비우지 않고 가장 오래 '안 쓴' 것부터 하나씩 밀어낸다 (Map은 삽입 순서를
+  // 지키고, 위에서 적중할 때마다 맨 뒤로 다시 넣으므로 그 순서가 곧 LRU다).
   // clear()는 아직 응답을 기다리는 최신 항목까지 버려서, 같은 질문의 다음 검색이
   // 진행 중인 요청에 합류하지 못하고 60초짜리 임베딩 호출을 한 번 더 만든다.
   while (embedCache.size >= EMBED_CACHE_MAX) {
@@ -113,7 +126,10 @@ async function vecSearch(table, question) {
     // 억제는 warnOnce에 맡긴다 — '한 번만 경고' 플래그를 쓰면 vec_store 미생성으로 한 번 알린 뒤
     // 차원 불일치·인덱스 손상 같은 전혀 다른 이유로 벡터 검색이 죽어도 로그가 남지 않는다.
     // 이 경로는 조용히 LIKE-only로 폴백하므로 로그가 유일한 단서다.
-    warnOnce('search', `vector search failed — falling back to LIKE-only search: ${e.message}`);
+    // scope를 테이블별로 나누는 이유는 LIKE 쪽과 같다 — 문구에 테이블명이 없어도 드라이버가
+    // 돌려주는 e.message에는 대상 테이블이 섞여 들어오므로, 한 scope로 묶으면 요청마다
+    // 세 문구가 번갈아 들어와 억제가 걸리지 않는다.
+    warnOnce(`search:${table}`, `vector search failed on ${table} — falling back to LIKE-only search: ${e.message}`);
     return null;
   });
 }

@@ -3,7 +3,7 @@
 // 함께 쓴다. 여기가 어긋나면 어긋난 티가 나지 않는 자리에서 조용히 갈라진다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { clipText, nameKey, stripLoneSurrogates, numEnv } from '../src/constants.js';
+import { clipText, nameKey, stripLoneSurrogates, numEnv, bindValue, warnOnce } from '../src/constants.js';
 
 test('절단이 서로게이트 쌍을 쪼개지 않는다', () => {
   // 쪼개면 짝 잃은 코드유닛이 남아 JSON은 통과하지만 유효한 UTF-8이 아니게 된다 —
@@ -76,5 +76,46 @@ test('정수 환경변수는 16진수·지수 표기를 통과시키지 않는�
   } finally {
     console.warn = origWarn;
     delete process.env.NUMENV_TEST;
+  }
+});
+
+test('바인드 값 조회는 소유 키만 보되 대소문자는 무시한다', () => {
+  // 판정(agent.js paramKey)·실행(oracle.js runQuery)이 공유하는 단일 지점이다.
+  // 대소문자를 가리면 모델이 값을 제대로 채워도 '값 없음'이 되고(Oracle은 :job_id와 :JOB_ID를
+  // 같은 바인드로 다룬다), 프로토타입 체인을 타면 '값 없음'이어야 할 자리가 다른 값으로 굳는다.
+  assert.equal(bindValue({ JOB_ID: 'B1' }, 'job_id'), 'B1');
+  assert.equal(bindValue({ job_id: 'B1' }, 'JOB_ID'), 'B1');
+  // 정확히 일치하는 키가 우선이다
+  assert.equal(bindValue({ JOB_ID: 'upper', job_id: 'exact' }, 'job_id'), 'exact');
+  // 없는 값은 없는 채로 남아야 한다 (관대해진 판정이 '값 없음'을 삼키면 안 된다)
+  assert.equal(bindValue({ other: 'x' }, 'job_id'), undefined);
+  assert.equal(bindValue(undefined, 'job_id'), undefined);
+  assert.equal(bindValue({ job_id: null }, 'job_id'), null, 'NULL은 값 없음과 구분된다');
+  // 프로토타입 멤버는 돌려주지 않는다
+  assert.equal(bindValue({}, '__proto__'), undefined);
+  assert.equal(bindValue({}, 'toString'), undefined);
+  assert.equal(bindValue(Object.fromEntries([['__proto__', 'V1']]), '__proto__'), 'V1');
+});
+
+test('경고 억제 scope에는 바뀌는 값을 담지 않는다', () => {
+  // warnOnce는 scope별로 '마지막 문구'만 기억한다 — 한 scope에 성격이 다른 경고 둘이 들어오면
+  // 문구가 번갈아 바뀌며 억제가 한 번도 걸리지 않는다. 실제로 두 곳이 그 상태였다:
+  //   setup — LLM_PROVIDER와 ORACLE_MOCK 오타가 겹치면 요청마다 두 줄씩 무한히 쌓였다.
+  //   search-like — 요청 하나가 세 테이블을 검색하므로 테이블명이 든 문구가 계속 번갈아 들어왔다.
+  // 어느 쪽도 기능은 폴백으로 정상 동작해서, 증상이 '로그가 터진다'뿐이라 원인이 보이지 않는다.
+  const warned = [];
+  const origWarn = console.warn;
+  console.warn = m => warned.push(String(m));
+  try {
+    for (let i = 0; i < 5; i++) {
+      warnOnce('a', 'A가 죽었다');
+      warnOnce('b', 'B가 죽었다');
+    }
+    assert.equal(warned.length, 2, `scope가 나뉘어 있으면 각각 1회여야 한다: ${warned.join(' / ')}`);
+    // 같은 scope 안에서 오류의 '성격'이 바뀌면 반드시 다시 알린다 (억제의 존재 이유가 아니다)
+    warnOnce('a', 'A가 다른 이유로 죽었다');
+    assert.equal(warned.length, 3);
+  } finally {
+    console.warn = origWarn;
   }
 });

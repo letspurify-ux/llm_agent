@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { assertReadOnly, bindNames } from '../src/sql.js';
+import { MAX_BIND_NAME_LEN } from '../src/constants.js';
 
 const rejects = sql => assert.throws(() => assertReadOnly(sql), Error, `허용되면 안 됨: ${sql}`);
 const accepts = sql => assert.doesNotThrow(() => assertReadOnly(sql), `거부되면 안 됨: ${sql}`);
@@ -168,4 +169,28 @@ test('실행할 수 없는 바인드 표기는 등록 단계에서 거부된다'
   assert.deepStrictEqual([...bindNames(ok)], ['job_id', 'emp$no', 'tab#id']);
   // 리터럴·주석 속의 콜론은 여전히 바인드가 아니다 (가드가 오탐하면 정상 쿼리가 막힌다)
   assert.doesNotThrow(() => assertReadOnly("SELECT TO_CHAR(d, 'HH24:MI') FROM t WHERE a = :x -- 12:30"));
+});
+
+test('식별자 상한을 넘는 바인드명은 등록 단계에서 거부된다', () => {
+  // 결정 경계(llm.js sanitizeDecision)는 MAX_BIND_NAME_LEN을 넘는 params 키를 이미 버리는데
+  // 등록 경계에만 같은 판정이 없었다 — 그런 SQL이 '바인드가 있는 정상 쿼리'로 통과한 뒤
+  // 매 실행이 '값 없음'으로 끝난다. 모델은 값을 제대로 채워 보내고도 무엇이 틀렸는지 알 수 없고,
+  // 프롬프트에 실린 이름조차 표시 상한에 잘려 철자를 되짚을 수도 없다.
+  // 위치 바인드(:1)와 같은 성격의 등록 실수이므로 같은 자리에서 소리 나게 거부한다.
+  const legal = 'b'.repeat(MAX_BIND_NAME_LEN);
+  const tooLong = 'b'.repeat(MAX_BIND_NAME_LEN + 1);
+  assert.throws(
+    () => assertReadOnly(`SELECT * FROM t WHERE a = :${tooLong}`),
+    e => e.safe === true && /실행할 수 없는 바인드 표기/.test(e.message)
+  );
+  // 상한 안의 긴 이름은 적법하다 — 여기서 자르면 반드시 '값 없음'으로 실패하는 쿼리가 된다
+  assert.doesNotThrow(() => assertReadOnly(`SELECT * FROM t WHERE a = :${legal}`));
+  assert.deepStrictEqual([...bindNames(`SELECT * FROM t WHERE a = :${legal}`)], [legal]);
+  assert.deepStrictEqual([...bindNames(`SELECT * FROM t WHERE a = :${tooLong}`)], []);
+  // 오류 문구는 SQL 원문(TEXT 64KB)의 크기를 그대로 옮기지 않는다 — 화면·chat_log·프롬프트로 함께 나간다
+  const huge = 'b'.repeat(5000);
+  assert.throws(
+    () => assertReadOnly(`SELECT * FROM t WHERE a = :${huge}`),
+    e => e.message.length < MAX_BIND_NAME_LEN + 200
+  );
 });

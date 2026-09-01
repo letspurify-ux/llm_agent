@@ -9,7 +9,7 @@ import {
   MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK,
   MAX_PROMPT_ITEM_LEN, MAX_PROMPT_SQL_LEN, MAX_PROMPT_STEP_LEN,
   MAX_PROMPT_PARAMS_LEN, MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS,
-  clipText, warnOnce,
+  MAX_BIND_NAME_LEN, clipText, warnOnce,
 } from './constants.js';
 import { bindNames } from './sql.js';
 import { rowCounts } from './result.js';
@@ -155,6 +155,16 @@ const clip = (v, max = MAX_PROMPT_ITEM_LEN) => {
   return s.length > max ? clipText(s, max) + TRUNC_MARK : s;
 };
 
+// 제목·쿼리명처럼 '항목을 지목하는 이름'의 상한. 본문보다 짧게 잡는다 — 라벨이라 길 이유가 없다.
+// 이름에도 상한이 필요한 이유: renderItems는 예산과 무관하게 최소 1건을 싣는다(그 보장이 없으면
+// 등록이 조금만 많아져도 섹션이 통째로 빈다). 그래서 '한 줄의 크기'가 곧 그 섹션의 실질 상한인데,
+// 지식·처리방법 줄은 본문(content/method)만 clip하고 제목은 원문 그대로 싣고 있었다.
+// 지금 그 줄이 유계인 것은 schema.sql이 title을 VARCHAR(200)으로 잡아준 덕분일 뿐이다 —
+// 프롬프트 예산과 아무 상관 없어 보이는 마이그레이션 한 줄(title을 TEXT로)이면 제목 하나가
+// 전체 예산(MAX_PROMPT_TOTAL_LEN)을 그대로 넘기고, 그 뒤 모든 질문이 컨텍스트 초과로 끝난다.
+// 예산은 다른 파일의 스키마 제약이 아니라 이 파일 안에서 확정되어야 한다.
+const MAX_PROMPT_NAME_LEN = 100;
+
 // 검색 결과는 관련도 순으로 정렬돼 있으므로 예산을 넘기면 뒤(덜 관련된 것)부터 버린다.
 // 최소 1건은 반드시 싣는다 — 항목별 clip이 이미 1건의 크기를 묶어두었으므로 그래도 예산을 크게 벗어나지 않는다.
 // 몇 건을 버렸는지 모델에게 알린다: '이게 전부'라고 읽으면 없는 것을 없다고 단정한다.
@@ -180,15 +190,19 @@ function renderItems(items, render, budget) {
 // 개짜리 SQL 하나가 등록되면 '최소 1건 보장'을 타고 그 한 항목이 예산을 뚫는다.
 // 정상 쿼리의 바인드는 한 자릿수다(llm.js MAX_DECISION_PARAMS와 같은 근거) — 20이면 개입하지 않는다.
 const MAX_PROMPT_BIND_NAMES = 20;
+// 이름 자체는 식별자 상한(MAX_BIND_NAME_LEN)까지 그대로 싣는다. 그보다 짧게 자르면 101~128자짜리
+// 적법한 바인드명을 모델이 철자대로 적을 방법이 사라져, 그 쿼리는 반드시 '값 없음'으로 실패한다 —
+// 결정 경계(llm.js)가 그 길이를 유효하다고 통과시키는 것과 어긋나면 안 된다.
+// 상한 자체는 등록 경계(sql.js assertReadOnly)가 강제하므로 여기 오는 이름은 이미 그 안에 있다.
 const bindList = q => {
   const binds = bindNames(q.query_sql);
-  const shown = binds.slice(0, MAX_PROMPT_BIND_NAMES).map(n => `:${clip(n, 100)}`).join(', ');
+  const shown = binds.slice(0, MAX_PROMPT_BIND_NAMES).map(n => `:${clip(n, MAX_BIND_NAME_LEN)}`).join(', ');
   const omitted = binds.length - Math.min(binds.length, MAX_PROMPT_BIND_NAMES);
   return `${shown || '없음'}${omitted ? ` 외 ${omitted}개` : ''}`;
 };
 
 const queryItem = q =>
-  `- ${clip(q.query_name, 100)}: ${clip(q.query_desc)}` +
+  `- ${clip(q.query_name, MAX_PROMPT_NAME_LEN)}: ${clip(q.query_desc)}` +
   ` / 입력(${clip(q.input_desc, 300)}) / 출력(${clip(q.output_desc, 300)})` +
   ` / 바인드(${bindList(q)})` +
   ` / SQL: ${clip(q.query_sql, MAX_PROMPT_SQL_LEN)}`;
@@ -200,7 +214,7 @@ const queryItem = q =>
 // 입출력 설명과 SQL 원문은 뺀다 — 있으면 좋지만, 없다고 그 쿼리를 못 쓰게 되지는 않는다.
 const MAX_PROMPT_SHORT_DESC_LEN = 120;
 const queryItemShort = q =>
-  `- ${clip(q.query_name, 100)}: ${clip(q.query_desc, MAX_PROMPT_SHORT_DESC_LEN)} / 바인드(${bindList(q)})`;
+  `- ${clip(q.query_name, MAX_PROMPT_NAME_LEN)}: ${clip(q.query_desc, MAX_PROMPT_SHORT_DESC_LEN)} / 바인드(${bindList(q)})`;
 
 // 짧은 형태로 실린 쿼리도 그대로 실행할 수 있다는 사실을 모델에게 알린다 —
 // 이 안내가 없으면 모델은 설명이 얇은 항목을 '정보가 부족한 쿼리'로 읽고 후보에서 뺀다.
@@ -375,8 +389,8 @@ function renderHistory(history, budget) {
 // 이 배분 덕에 어느 섹션이 얼마나 길어지든 합계는 MAX_PROMPT_TOTAL_LEN을 넘지 않는다.
 function renderSections(ctx) {
   const builders = {
-    knowledge: budget => renderItems(ctx.knowledge, k => `- [${k.title}] ${clip(k.content)}`, budget),
-    qaMethods: budget => renderItems(ctx.qaMethods, m => `- [${m.title}] ${clip(m.method)}`, budget),
+    knowledge: budget => renderItems(ctx.knowledge, k => `- [${clip(k.title, MAX_PROMPT_NAME_LEN)}] ${clip(k.content)}`, budget),
+    qaMethods: budget => renderItems(ctx.qaMethods, m => `- [${clip(m.title, MAX_PROMPT_NAME_LEN)}] ${clip(m.method)}`, budget),
     history: budget => renderHistory(ctx.history, budget),
     queries: budget => renderQueries(ctx.queries, budget),
   };
