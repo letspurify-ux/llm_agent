@@ -138,7 +138,12 @@ export function oracleMock() {
 // 반환: { rows, totalRows, capped } — rows는 MAX_ROWS까지, 셀은 MAX_CELL_LEN까지 정규화된 값.
 // capped는 "상한에 걸려 잘렸다"는 뜻이므로 MAX_ROWS+1건을 요청해 판정한다
 // (정확히 MAX_ROWS건인 완전한 결과를 "더 있을 수 있음"으로 잘못 알리지 않도록).
-export async function runQuery(registryRow, params = {}) {
+// isClippedCopy: '이 값이 우리가 잘라서 보여준 값의 앞부분인가'를 답하는 판정자 (agent.js가 만든다 —
+// clippedCopyDetector). 기본값은 '아니다' — 이 실행기를 직접 부르는 경로(테스트·CLI)에는
+// 잘린 값을 만들어낸 앞 단계가 없다.
+const NOT_CLIPPED_COPY = () => false;
+
+export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLIPPED_COPY) {
   // 가드가 '실행용 SQL'까지 함께 돌려준다 — 무엇을 허용했는지 아는 쪽이 무엇을 실행할지도 정한다.
   // 실행부가 따로 문자열을 손보면 둘의 판단이 갈라진다 (sql.js assertReadOnly 주석 참고).
   const sql = assertReadOnly(registryRow.query_sql);
@@ -152,7 +157,7 @@ export async function runQuery(registryRow, params = {}) {
   // 대소문자를 가리면 모델이 값을 제대로 채워 보내도 '값 없음'으로 실패한다 — 프롬프트가
   // 대문자 컬럼명과 소문자 바인드명을 함께 보여주므로 흔하게 일어나는 정상 경로다.
   const val = n => bindValue(params, n);
-  const bad = names.map(n => [n, bindProblem(val(n))]).filter(([, p]) => p);
+  const bad = names.map(n => [n, bindProblem(val(n), isClippedCopy)]).filter(([, p]) => p);
   if (bad.length) {
     // 두 번째 인자(hint)는 모델 전용 지침 — 사용자 trace에는 message만 나간다 (constants.safeError 참고)
     throw safeError(
@@ -165,7 +170,18 @@ export async function runQuery(registryRow, params = {}) {
   if (oracleMock()) return capResult(mockResult(registryRow.query_name, binds));
 
   const target = await loadTargetDb(registryRow.target_db_name);
-  if (!target) throw safeError(`조회대상 DB를 찾을 수 없음: ${registryRow.target_db_name}`);
+  if (!target) {
+    // 등록된 조회대상 DB 이름은 서버 내부 식별자다 — safe 표시를 달면 이 문구가 그대로 사용자
+    // trace 패널로 나간다(result.js clientTrace). 우리가 쓴 문구라는 사실이 그 안에 담긴 값까지
+    // 안전하게 만들어 주지는 않는다: 화면에서 가리기로 한 것은 '스키마명·호스트·계정' 같은
+    // 서버 쪽 이름 자체이고(constants.safeError), 등록 DB 이름이 정확히 그 부류다.
+    // 상세는 로그에만 남긴다 — 모델에게도 쓸모가 없다(이름을 안다고 고칠 수 있는 실패가 아니다).
+    warnOnce('oracle:target-db', `target_db row not found: ${registryRow.target_db_name}`);
+    throw safeError(
+      '조회대상 DB 접속 정보가 등록되어 있지 않습니다.',
+      '이 쿼리는 실행할 수 없다 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라'
+    );
+  }
   // 이름 비교는 nameKey로 한다 — target_db는 대소문자를 무시하는 collation이라 db_name 조회는
   // 'order_db'로도 'ORDER_DB' 행을 찾아준다. 그런데 db_type만 JS ===로 보면 'Oracle'로 등록한
   // 순간 그 DB의 모든 조회가 '지원하지 않는 db_type'으로 죽고, 화면에 나가는 문구는 등록 철자가
@@ -284,26 +300,21 @@ function localDateTime(d) {
 //   잘린 값    → normalizeValue가 MAX_CELL_LEN에서 자르고 TRUNC_MARK를 붙인 값이다. 그 값이 프롬프트를
 //              거쳐 다음 스텝의 바인드로 되돌아오면 원본과 다르므로 절대 매칭되지 않는다.
 //              (mock provider는 llm.js에서 아예 제안조차 하지 않게 막지만, 실제 LLM에는 그 가드가 없다)
-//              표시만 보고 TRUNC_MARK를 뗀 앞부분만 넣는 경우가 더 흔하다 — 그 앞부분의 길이는
-//              반드시 clipText가 남기는 절단 길이이므로, 이력을 대조하지 않아도 여기서 전부 걸린다.
-//              (이력을 훑어 원본과 대조하는 가드를 agent.js에 따로 두었었지만, 걸러내는 값이
-//               이 판정과 완전히 겹치면서 스텝마다 O(이력 × 행 × 컬럼) 스캔만 더하고 있었다.)
-//              길이는 isClippedLen이 정한다 — '이상'이 아니라 '그 길이들'만 본다.
-//              '이상'으로 잡으면 질문에서 온 정당한 긴 값(자유 검색어·경로·연결 키)까지 영구히 거부돼
-//              그 입력으로는 등록 쿼리를 아예 실행할 수 없게 된다.
+//              마크가 붙은 채로 오는 경우는 아래에서 바로 걸린다. 표시만 보고 TRUNC_MARK를 뗀
+//              앞부분만 넣는 경우가 더 흔한데, 그건 '우리가 실제로 자른 값'과 대조해야 알 수 있다 —
+//              그 대조를 하는 쪽이 isClippedCopy다 (agent.js clippedCopyDetector).
 // 주의: `WHERE (:opt IS NULL OR col = :opt)` 같은 선택적 필터 패턴은 이 가드에 걸린다 —
 // 그런 쿼리는 '전체'를 뜻하는 별도 센티널 값(예: 'ALL')을 쓰도록 등록할 것.
-// clipText가 남기는 절단 길이. 보통 MAX_CELL_LEN이지만, 절단 경계가 서로게이트 쌍(이모지 등)을
-// 가르면 짝 잃은 상위 서로게이트 하나를 더 떼므로 MAX_CELL_LEN-1이 된다.
-// 이 한 칸을 빼놓으면 그 셀에서만 가드가 조용히 빠진다 — 실측: 199자 + 이모지 셀의 잘린
-// 앞부분은 200자가 아니라 199자여서, 마크를 뗀 조각이 그대로 바인드되고 조회가 0건이 된다.
-// 모델은 그 0건을 "그런 데이터가 없다"로 읽으므로 오류 하나 없이 확신에 찬 오답이 나가고,
-// 하필 이모지가 든 셀에서만 재현되어 원인을 잡기 어렵다.
-// 늘어나는 오탐은 '정확히 MAX_CELL_LEN-1자인 정당한 값' 하나뿐이다 — MAX_CELL_LEN자를 이미
-// 거부하기로 한 것과 같은 성격·같은 크기의 대가라, 위 주석의 판단이 그대로 적용된다.
-const isClippedLen = n => n === MAX_CELL_LEN || n === MAX_CELL_LEN - 1;
+//
+// 마지막 판정이 한때 길이로 되어 있었다(정확히 MAX_CELL_LEN 또는 그 -1자면 잘린 조각으로 봤다).
+// 길이는 절단의 증거가 아니라 절단이 남기는 우연한 흔적일 뿐이다. 그래서 정확히 그 길이인 정당한
+// 값(사용자가 붙여넣은 200자짜리 자유 검색어·경로)까지 영구히 거부했고 — 그 입력으로는 어떤 등록
+// 쿼리도 실행할 수 없었다 — 문구는 '잘린 값이라 원본과 다름'이라 무엇을 고쳐야 하는지도 알려주지
+// 않았다. 반대 방향으로도 약했다: 절단 길이는 MAX_CELL_LEN이 바뀌거나 상류가 값을 한 번 더 자르면
+// 그대로 어긋나므로, 흔적이 달라지는 순간 가드가 조용히 비켜간다(서로게이트 경계가 그 예였다).
+// 잘린 값을 그대로 들고 있다가 대조하면 오탐도 누락도 없다 — 길이가 몇이든 상관이 없기 때문이다.
 
-function bindProblem(v) {
+function bindProblem(v, isClippedCopy) {
   if (v === undefined || v === null || v === '') return '값 없음';
   // boolean은 '값이 아닌 구조'와 다른 이유로 거부한다: 모양은 스칼라지만 node-oracledb가
   // Oracle 23ai 미만에 바인드할 수 없는 타입이다(DB_TYPE_BOOLEAN 바인딩은 23ai부터).
@@ -318,7 +329,7 @@ function bindProblem(v) {
   // DECODE(:flag,'Y',TRUE,FALSE) 같은 변환을 쓰거나, target_db에 서버 버전을 두고 여기서 갈라야 한다.
   if (typeof v === 'boolean') return "true/false는 바인드할 수 없음 — 컬럼에 저장된 값(예: 'Y'/'N', 1/0)으로 지정할 것";
   if (typeof v !== 'string' && typeof v !== 'number') return '값이 아닌 구조';
-  if (typeof v === 'string' && (v.endsWith(TRUNC_MARK) || isClippedLen(v.length))) {
+  if (typeof v === 'string' && (v.endsWith(TRUNC_MARK) || isClippedCopy(v))) {
     return '잘린 값이라 원본과 다름';
   }
   return null;
@@ -338,7 +349,15 @@ function resolvePassword(stored) {
   if (typeof stored === 'string' && ENV_PREFIX.test(stored)) {
     const name = stored.replace(ENV_PREFIX, '').trim();
     const value = process.env[name];
-    if (!value) throw safeError(`조회대상 DB 비밀번호 환경변수(${name})가 설정되지 않았습니다.`);
+    if (!value) {
+      // 환경변수 이름도 서버 내부 식별자다 — 위 target_db 이름과 같은 이유로 화면에 내보내지 않는다.
+      // 운영자가 필요로 하는 정보라 로그에는 반드시 남긴다(그게 이 실패의 유일한 단서다).
+      warnOnce('oracle:target-db-password', `target DB password env var is not set: ${name}`);
+      throw safeError(
+        '조회대상 DB 접속 정보가 서버에 설정되어 있지 않습니다.',
+        '설정 문제라 재시도해도 결과가 같다 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라'
+      );
+    }
     return value;
   }
   return stored;

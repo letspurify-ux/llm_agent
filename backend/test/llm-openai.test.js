@@ -613,3 +613,54 @@ test('긴 응답에서도 이스케이프 정규화가 선형으로 끝난다', 
   assert.ok(performance.now() - t0 < 2000);
   assert.ok(d.answer.includes(`${B}nabla`) && d.answer.includes(`${B}times`));
 });
+
+test('값이 백슬래시로 끝나는 답변이 통째로 버려지지 않는다', async () => {
+  // 모델은 백슬래시를 한 번만 쓴다 — 이 파일이 normalizeJsonEscapes를 두는 바로 그 이유다.
+  // 값이 백슬래시로 끝나면 닫는 따옴표가 '\"'가 되어, 엄격하게 읽으면 문자열이 영영 닫히지
+  // 않고 후보의 끝을 못 찾는다(-1). 그러면 정규화가 실행될 기회조차 없이 결정이 버려지고,
+  // temperature=0이라 재시도도 같은 텍스트를 받아 똑같이 실패한다 —
+  // 오류 하나 없이 모델의 진짜 답변이 사라지는, 이 파일이 가장 나쁘게 보는 형태다.
+  // 모델이 보낸 원문: {"action":"answer","answer":"경로는 C:\"}
+  assert.deepStrictEqual(
+    await decide('{"action":"answer","answer":"경로는 C:\\"}'),
+    { action: 'answer', answer: '경로는 C:\\' }
+  );
+  // 바인드 값에서도 같다 — 여기서 버려지면 그 조회가 통째로 사라진다.
+  // 원문: {"action":"run_query",…,"params":{"path":"\\share\"}}  (앞의 \\는 정상 이스케이프)
+  assert.deepStrictEqual(
+    await decide('{"action":"run_query","query_name":"q","params":{"path":"\\\\share\\"}}'),
+    { action: 'run_query', query_name: 'q', params: { path: '\\share\\' } }
+  );
+});
+
+test('정상적으로 이스케이프된 따옴표를 두 번째 읽기가 망치지 않는다', async () => {
+  // 엄격한 읽기가 먼저이고, 그 읽기로 후보가 닫히면 두 번째 읽기는 돌지 않는다.
+  // 순서가 뒤바뀌면 답변 속 인용부호가 문자열을 조기에 닫아 본문이 잘린 채 나간다.
+  assert.deepStrictEqual(
+    await decide('{"action":"answer","answer":"그는 \\"안녕\\"이라 했다"}'),
+    { action: 'answer', answer: '그는 "안녕"이라 했다' }
+  );
+  // 이스케이프된 따옴표 뒤에 '}'가 오는 경우 — 두 번째 읽기라면 여기서 객체가 닫힌 것으로 본다
+  assert.deepStrictEqual(
+    await decide('{"action":"answer","answer":"닫는 괄호는 \\"}\\" 입니다"}'),
+    { action: 'answer', answer: '닫는 괄호는 "}" 입니다' }
+  );
+});
+
+test('닫히지 않은 후보가 반복돼도 두 번째 읽기가 총 비용을 늘리지 않는다', async () => {
+  // 두 번째 읽기는 '\"'를 실제로 본 후보에만 돌지만, 그 조건만으로는 부족하다 —
+  // '{"a\"' 가 반복되면 조건이 매번 참이 되어 후보마다 두 번씩 훑는다(실측 2.4배).
+  // 그래서 예산(MAX_UNMATCHED_TOTAL)이 후보 수가 아니라 '훑은 횟수'를 센다.
+  // 이 스캔은 동기 작업이라 그 요청만이 아니라 동시에 처리 중인 모든 요청이 함께 멈춘다.
+  const plain = '</think>{"a'.repeat(6_000);
+  const withEscapedQuote = '</think>{"a\\"'.repeat(6_000);   // 두 번째 읽기를 매번 유발한다
+
+  const ms = async text => { const t0 = Date.now(); assert.equal(await decide(text), null); return Date.now() - t0; };
+  await ms(plain);                                    // 워밍업 (JIT 편차 제거)
+  const basePerKb = (await ms(plain)) / (plain.length / 1024);
+  const escPerKb = (await ms(withEscapedQuote)) / (withEscapedQuote.length / 1024);
+
+  // 길이당 비용이 같은 수준이어야 한다 — 예산이 스캔 횟수를 세지 않으면 여기서 2배가 된다.
+  assert.ok(escPerKb < basePerKb * 1.6,
+    `'\\"'가 섞인 입력의 길이당 비용이 크게 늘었다: ${escPerKb.toFixed(2)}ms/KB vs ${basePerKb.toFixed(2)}ms/KB`);
+});

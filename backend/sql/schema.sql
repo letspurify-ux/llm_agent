@@ -85,11 +85,16 @@ CREATE TABLE chat_log (
   answer     MEDIUMTEXT,           -- TEXT(65,535바이트)로는 부족하다: 20행×다컬럼 표에 셀당 200자면
                                    -- utf8mb4 한글 기준 100KB를 넘고, strict 모드에서 INSERT가 거부돼
                                    -- 하필 '결과가 큰 대화'만 로그에서 빠진다
-  trace      JSON,                -- {v: 스키마 버전, search: 검색 적중 수(queries는 라우팅 동작 시에만, 아니면 null),
+  trace      JSON,                -- {v: 스키마 버전, outcome: 이 요청이 무엇으로 끝났는가(v3+에는 반드시 있다),
+                                  --  search: 검색 적중 수(queries는 라우팅 동작 시에만, 아니면 null),
                                   --  steps: 실행 쿼리·바인드·결과. 실패는 steps[].error, 루프 가드 기록은 steps[].note,
                                   --  steps[].safe는 그 error 문구를 사용자 화면에 그대로 내보내도 되는지(우리가 쓴 안내문이면 true,
                                   --  드라이버·DB 원문이면 없음) — 화면에는 서버가 후자를 일반 문구로 바꿔 내보낸다.
                                   --  steps[].hint는 모델에게만 준 복구 지침(있을 때만) — 화면에는 나가지 않는다}
+                                  -- outcome = 'answered' | 'error'(서버 오류, trace.error에 원문) |
+                                  --           'rejected'(입력 거부, trace.reason에 사유: no_message/empty_message/
+                                  --                      too_long/body_too_large/bad_body)
+                                  -- 답하지 못한 요청도 반드시 한 행을 남긴다 — 그 행이 이 테이블의 존재 이유다 (server.js).
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_created (created_at)    -- 보존 기간 정리(DELETE)용
 );

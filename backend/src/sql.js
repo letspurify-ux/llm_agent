@@ -79,21 +79,33 @@ function isQuoteStart(s, i) {
   return (prev === 'n' || prev === 'N') ? !isIdentChar(s[i - 2]) : !isIdentChar(prev);
 }
 
-const stripNoise = sql => scanSql(sql).text;
-
-// query_sql에서 :bind 변수명 추출.
-// 리터럴의 TO_CHAR(D, 'HH24:MI')나 주석 속 ':name'이 바인드로 잡히면 안 되므로 둘 다 지운 뒤 찾는다.
+// query_sql 한 건의 분석 결과 캐시.
 //
-// 결과를 캐시한다: 같은 query_sql이 요청 하나 안에서 반복해 들어온다 —
-// 프롬프트 조립은 스텝마다 쿼리 목록 전체(최대 35건)에 대해 다시 부르므로 요청당 최대 175회이고,
-// 파싱은 SQL 전체를 도는 문자 단위 스캐너다. agent.js가 같은 이유로 '스텝당 1회만 파싱'이라고
-// 손으로 캐시해 두었는데, 캐시를 함수 안에 두면 호출부마다 그 요령을 반복할 필요가 없다.
-// 키가 외부에서 온 문자열이므로 상한을 두고 가장 오래 '안 쓴' 것부터 밀어낸다
-// (Map은 삽입 순서를 지키므로, 적중할 때마다 맨 뒤로 다시 넣으면 그 순서가 곧 LRU가 된다).
-// 돌려주는 배열은 freeze한다 — 캐시된 같은 배열을 여러 호출부가 나눠 쓰므로 한 곳의 변형이
-// 다른 곳으로 번지면 안 된다.
-const bindCache = new Map();
-const BIND_CACHE_MAX = 500;
+// 파싱(scanSql)은 SQL 전체를 도는 문자 단위 스캐너이고, 그 결과를 보는 곳이 둘이다:
+//   bindNames      — 프롬프트 조립이 스텝마다 쿼리 목록 전체(최대 35건)에 대해 부른다 (요청당 최대 175회)
+//   assertReadOnly — 실행 경계가 조회마다 부른다 (요청당 최대 MAX_STEPS회)
+// 캐시가 한쪽에만 있으면 나머지 한쪽이 같은 스캔을 매번 되풀이한다 — 실제로 그랬다.
+// assertReadOnly는 조회마다 scanSql과 바인드 후보 추출(BIND_RE matchAll)을 통째로 다시 돌면서
+// bindNames가 방금 계산해둔 것과 똑같은 값을 만들었고, 그 비용은 동기 작업이라 그동안
+// 이벤트 루프가 통째로 막힌다 (query_sql은 TEXT라 한 건이 64KB까지 간다).
+// 분석 결과는 등록 행의 순수 함수이므로 SQL 하나당 한 번만 계산하면 된다 — 가드 판정(guard)까지
+// 함께 담는다. 판정도 분석 결과만 보고 정해지므로 두 번 계산할 이유가 없다.
+//
+// 상한은 '항목 수'가 아니라 '보관하는 SQL 본문의 총 길이'로 잡는다. 키가 곧 query_sql(TEXT 64KB)이라
+// 항목 수로만 세면 최악 500 × 64KB = 32MB가 프로세스 수명 내내 상주하는데, 정작 캐시가 지키려는
+// 값은 짧은 바인드 이름 몇 개다 — 붙드는 것이 지키는 것의 수천 배인 캐시가 된다.
+// (search.js embedCache가 상한을 100으로 잡은 것도 '한 항목이 무엇을 붙들고 있는가'를 센 결과다.)
+// 세는 것은 원문 길이지만 한 항목이 실제로 붙드는 것은 그 두 배쯤이다 — 원문(raw)과 리터럴·주석을
+// 지운 사본(text)을 함께 들고 있기 때문이다. 아래 값은 그 배수를 감안해 고른 것이다
+// (실측: 64KB SQL 3,000건을 흘려보낸 뒤 상주 증가분 1.9MB).
+// 항목 수 상한도 함께 둔다 — 짧은 SQL만 들어오는 경우에 Map 자체가 무한히 커지지 않게.
+// 가장 오래 '안 쓴' 것부터 밀어낸다 (Map은 삽입 순서를 지키므로, 적중할 때마다 맨 뒤로 다시
+// 넣으면 그 순서가 곧 LRU가 된다). 돌려주는 배열은 freeze한다 — 캐시된 같은 배열을 여러
+// 호출부가 나눠 쓰므로 한 곳의 변형이 다른 곳으로 번지면 안 된다.
+const analysisCache = new Map();
+const ANALYSIS_CACHE_MAX = 500;
+const ANALYSIS_CACHE_MAX_SQL_CHARS = 1_000_000;
+let cachedSqlChars = 0;
 
 // 바인드 '후보' = ':' 뒤에 이어지는 Oracle 식별자 문자열.
 // \w+ 로 잡으면 안 된다: \w는 [A-Za-z0-9_]라 '$'·'#'이 든 이름(EMP$NO, TAB#ID — 둘 다 적법한
@@ -140,20 +152,43 @@ const dedupeByBindKey = names => {
   });
 };
 
-export function bindNames(sql) {
-  const hit = bindCache.get(sql);
+// SQL 한 건을 파싱해 두 소비자가 함께 보는 형태로 만든다 (캐시된다 — 위 주석 참고).
+function analyze(sql) {
+  const key = String(sql ?? '');
+  const hit = analysisCache.get(key);
   if (hit) {
     // 적중한 항목을 맨 뒤로 옮긴다 — 삽입 순서만 보고 밀어내면(FIFO) 활성 SQL이 상한을 넘는
     // 순간 '방금 쓴 항목'부터 차례로 밀려나, 캐시가 가득 찬 채로 적중률이 0에 수렴한다.
     // 오류는 나지 않고 요청마다 같은 SQL을 다시 파싱하는 비용만 조용히 되돌아온다.
-    bindCache.delete(sql);
-    bindCache.set(sql, hit);
+    analysisCache.delete(key);
+    analysisCache.set(key, hit);
     return hit;
   }
-  const names = Object.freeze(dedupeByBindKey(bindCandidates(stripNoise(sql)).filter(isExecutableBind)));
-  while (bindCache.size >= BIND_CACHE_MAX) bindCache.delete(bindCache.keys().next().value);
-  bindCache.set(sql, names);
-  return names;
+  const { text, unterminated } = scanSql(key);
+  const candidates = bindCandidates(text);
+  const a = {
+    raw: key,
+    text,
+    unterminated,
+    candidates,
+    names: Object.freeze(dedupeByBindKey(candidates.filter(isExecutableBind))),
+    guard: null,   // assertReadOnly가 처음 부를 때 채운다
+  };
+  analysisCache.set(key, a);
+  cachedSqlChars += key.length;
+  // 방금 넣은 항목이 맨 뒤이므로 밀려나지 않는다. 단 항목이 하나뿐이면(그 하나가 예산보다 큰
+  // SQL이면) 밀어낼 대상이 없다 — 그 경우는 그대로 둔다(비우면 매 호출이 다시 파싱한다).
+  while (analysisCache.size > ANALYSIS_CACHE_MAX ||
+         (cachedSqlChars > ANALYSIS_CACHE_MAX_SQL_CHARS && analysisCache.size > 1)) {
+    const oldest = analysisCache.keys().next().value;
+    analysisCache.delete(oldest);
+    cachedSqlChars -= oldest.length;
+  }
+  return a;
+}
+
+export function bindNames(sql) {
+  return analyze(sql).names;
 }
 
 // 조회 전용 가드: 의도치 않은 UPDATE/DELETE/DDL 실행 방지.
@@ -172,20 +207,34 @@ export function bindNames(sql) {
 // '조회 중 오류' 한 줄만 나가 원인이 보이지 않는다.
 // 승인한 쪽이 실행할 형태까지 함께 돌려주면 그 어긋남이 구조적으로 불가능해진다.
 export function assertReadOnly(sql) {
-  // 리터럴도 함께 지운다 — LISTAGG(name, '; ')처럼 값에 든 세미콜론을 다중 문장으로 오판하지 않도록
-  const { text, unterminated } = scanSql(sql);
+  // 판정은 분석 결과(순수 함수)만 보므로 SQL 하나당 한 번만 계산한다 — analysisCache 주석 참고.
+  const a = analyze(sql);
+  a.guard ??= guardVerdict(a);
+  if (a.guard.error) throw safeError(a.guard.error);
+  return a.guard.sql;
+}
+
+// 가드 판정 한 번. 통과면 { sql: 실행용 SQL }, 아니면 { error: 사용자에게 보일 문구 }를 돌려준다.
+// 오류를 '던지지 않고 돌려주는' 이유: 판정을 캐시하려면 값이어야 한다. Error 객체를 캐시해
+// 다시 던지면 스택이 첫 호출 지점에 고정돼, 두 번째부터는 어디서 거부됐는지가 로그에서 사라진다.
+// (판정 자체도 SQL 전체를 도는 문자열 연산 세 번이다 — 64KB SQL 5,000회 실측 97ms → 0.2ms.
+//  동작은 같으므로 회귀 테스트로는 드러나지 않는 몫이고, 근거를 남기지 않으면 다음 사람이
+//  '왜 값으로 돌려주나' 하고 되돌리게 된다.)
+function guardVerdict(a) {
+  // 리터럴도 함께 지운 텍스트를 본다 — LISTAGG(name, '; ')처럼 값에 든 세미콜론을 다중 문장으로 오판하지 않도록
+  const { text, unterminated } = a;
   if (unterminated) {
-    throw safeError('닫히지 않은 문자열 리터럴 또는 주석이 있어 실행할 수 없습니다.');
+    return { error: '닫히지 않은 문자열 리터럴 또는 주석이 있어 실행할 수 없습니다.' };
   }
   const s = text.trim();
   // 여는 괄호는 건너뛰고 첫 키워드를 본다 — `(SELECT …) FETCH FIRST n ROWS ONLY`처럼
   // 괄호로 시작하는 정상 조회 쿼리가 '조회가 아니다'로 거부되던 것을 막는다.
   // 괄호를 걷어낸 뒤에도 SELECT/WITH만 허용하므로 DML은 그대로 걸린다.
   if (!/^(SELECT|WITH)\b/i.test(s.replace(/^[(\s]+/, ''))) {
-    throw safeError('조회(SELECT) 쿼리만 실행할 수 있습니다.');
+    return { error: '조회(SELECT) 쿼리만 실행할 수 있습니다.' };
   }
   if (s.replace(/;\s*$/, '').includes(';')) {
-    throw safeError('다중 문장 쿼리는 실행할 수 없습니다.');
+    return { error: '다중 문장 쿼리는 실행할 수 없습니다.' };
   }
   // (4) SELECT … FOR UPDATE 금지 — 조회 문장이지만 조회대상 DB의 행에 잠금을 건다.
   // 위 (1)은 '첫 키워드가 SELECT인가'만 보므로 이 문장은 그대로 통과한다. LLM은 SQL을 만들지
@@ -196,7 +245,7 @@ export function assertReadOnly(sql) {
   // 리터럴·주석은 위에서 이미 지워졌고 FOR는 Oracle 예약어라 식별자로 쓸 수 없다 — 오탐 경로가 없다.
   // FOR UPDATE OF/NOWAIT/SKIP LOCKED는 전부 이 접두에서 걸린다.
   if (/\bFOR\s+UPDATE\b/i.test(s)) {
-    throw safeError('행 잠금을 거는 쿼리(FOR UPDATE)는 실행할 수 없습니다.');
+    return { error: '행 잠금을 거는 쿼리(FOR UPDATE)는 실행할 수 없습니다.' };
   }
   // (5) 이 실행기가 바인드할 수 없는 표기 금지 — 위치 바인드(:1), 영문자로 시작하지 않는 이름,
   // 그리고 식별자 상한(MAX_BIND_NAME_LEN)을 넘는 이름 (isExecutableBind 주석 참고).
@@ -206,17 +255,19 @@ export function assertReadOnly(sql) {
   // FOR UPDATE와 같은 성격의 등록 실수이므로 같은 자리에서 같은 방식으로, 소리 나게 거부한다.
   // 이름은 찍기 전에 자른다 — 후보는 SQL 원문(TEXT 64KB)에서 뽑으므로 그 자체로는 유계가 아니고,
   // 이 문구는 화면·chat_log·프롬프트로 함께 나간다.
-  const unsupported = bindCandidates(text).filter(n => !isExecutableBind(n));
+  // 후보는 analyze가 이미 뽑아두었다 — 여기서 다시 훑으면 조회마다 SQL 전체를 한 번 더 스캔한다.
+  const unsupported = a.candidates.filter(n => !isExecutableBind(n));
   if (unsupported.length) {
     const shown = unsupported
       .map(n => `:${n.length > MAX_BIND_NAME_LEN ? clipText(n, MAX_BIND_NAME_LEN) + TRUNC_MARK : n}`)
       .join(', ');
-    throw safeError(
-      `실행할 수 없는 바인드 표기입니다: ${shown} — 바인드명은 영문자로 시작하고 ` +
-      `${MAX_BIND_NAME_LEN}자 이하여야 합니다 (위치 바인드 :1은 지원하지 않습니다).`
-    );
+    return {
+      error:
+        `실행할 수 없는 바인드 표기입니다: ${shown} — 바인드명은 영문자로 시작하고 ` +
+        `${MAX_BIND_NAME_LEN}자 이하여야 합니다 (위치 바인드 :1은 지원하지 않습니다).`,
+    };
   }
-  return executableSql(String(sql ?? ''), text);
+  return { sql: executableSql(a.raw, text) };
 }
 
 // 가드가 허용한 후행 세미콜론을 원문에서 떼어낸다(공백으로 바꾼다).

@@ -165,20 +165,44 @@ const clip = (v, max = MAX_PROMPT_ITEM_LEN) => {
 // 예산은 다른 파일의 스키마 제약이 아니라 이 파일 안에서 확정되어야 한다.
 const MAX_PROMPT_NAME_LEN = 100;
 
+// 섹션 예산을 쓰는 모든 렌더가 공유하는 두 규칙.
+//
+// ① 줄 하나의 비용은 '길이 + 개행 한 칸'이다. 배분(renderSections)이 실제로 그렇게 세므로
+//    기준이 같아야 한다. 지식·처리방법·실행 이력은 개행을 세지 않고 있었다 — 줄 수만큼
+//    (지식 200건이면 200자) 자기 몫을 넘겨 썼고, 배분은 실제 길이를 빼므로 그 초과는
+//    뒤 섹션에서 나온다. 배분 순서상 마지막이 쿼리 목록이라, 결국 '버려지면 그 조회를 아예
+//    못 하는' 섹션이 다른 섹션의 계산 오차를 떠안았다.
+// ② 생략 안내 줄의 몫은 미리 떼어둔다. 예산을 다 쓴 뒤에 덧붙이면 그 줄이 통째로 섹션 예산
+//    밖으로 나간다. 이 몫이 실제로 전체 예산을 지키는 곳은 마지막에 배분받는 쿼리 목록이다 —
+//    그 초과를 흡수해 줄 뒤 섹션이 없기 때문이다(회귀 테스트가 그쪽만 잡아낸다).
+//    지식·처리방법·실행 이력에서는 그 초과(줄당 40자 남짓)를 쿼리 목록의 몫이 흡수하므로
+//    지금은 증상이 없다. 그래도 같은 규칙을 두는 이유는, 규칙이 섹션마다 다르면 '어느 섹션이
+//    자기 몫을 지키는가'가 그때그때 다른 값이 되어 ①처럼 조용히 어긋날 자리를 남기기 때문이다.
+const lineCost = line => line.length + 1;
+const omittedNote = n => `- (이하 ${n}건은 프롬프트 길이 제한으로 생략)`;
+const earlierOmittedNote = n => `- (앞선 ${n}건은 프롬프트 길이 제한으로 생략)`;
+
+// 안내 줄의 몫. 길이는 건수 표기 말고는 고정이라 유계다
+// (건수는 등록 건수 또는 MAX_PROMPT_QUERIES + MAX_STEPS 이하). 두 줄을 붙이는 renderQueries가
+// 가장 많이 쓰므로 그쪽 기준으로 넉넉히 잡고, 한 줄만 붙이는 쪽도 같은 값을 쓴다 —
+// 예산 밖으로 새지 않는 것이 목적이지 마지막 한 자를 아끼는 것이 목적이 아니다.
+const NOTES_RESERVE = 200;
+
 // 검색 결과는 관련도 순으로 정렬돼 있으므로 예산을 넘기면 뒤(덜 관련된 것)부터 버린다.
 // 최소 1건은 반드시 싣는다 — 항목별 clip이 이미 1건의 크기를 묶어두었으므로 그래도 예산을 크게 벗어나지 않는다.
 // 몇 건을 버렸는지 모델에게 알린다: '이게 전부'라고 읽으면 없는 것을 없다고 단정한다.
 function renderItems(items, render, budget) {
+  const usable = Math.max(0, budget - NOTES_RESERVE);
   const lines = [];
   let used = 0;
   for (const item of items) {
     const line = render(item);
-    if (lines.length > 0 && used + line.length > budget) break;
+    if (lines.length > 0 && used + lineCost(line) > usable) break;
     lines.push(line);
-    used += line.length;
+    used += lineCost(line);
   }
   if (lines.length < items.length) {
-    lines.push(`- (이하 ${items.length - lines.length}건은 프롬프트 길이 제한으로 생략)`);
+    lines.push(omittedNote(items.length - lines.length));
   }
   return lines;
 }
@@ -221,13 +245,6 @@ const queryItemShort = q =>
 const shortFormNote = n =>
   `- (위 ${n}건은 길이 제한으로 이름·용도·바인드만 표시했다 — 그대로 실행할 수 있고,` +
   ` 지목하면 전체 정의가 다음 단계에 실린다)`;
-const omittedNote = n => `- (이하 ${n}건은 프롬프트 길이 제한으로 생략)`;
-
-// 위 안내 두 줄의 몫. 예산을 다 쓴 뒤에 안내를 덧붙이면 그만큼이 섹션 예산 밖으로 나가는데,
-// 쿼리 목록은 '마지막에 배분받는' 섹션이라 그 초과를 흡수해 줄 뒤 섹션이 없다 —
-// 전체 예산(MAX_PROMPT_TOTAL_LEN)을 그대로 넘어가고, 넘긴 만큼이 컨텍스트 한도를 밀어낸다.
-// 두 줄의 길이는 건수 표기 말고는 고정이라 유계다 (건수는 MAX_PROMPT_QUERIES + MAX_STEPS 이하).
-const NOTES_RESERVE = 200;
 
 // 쿼리 목록만 renderItems와 다른 규칙으로 싣는다. 손해의 크기가 다르기 때문이다.
 //   지식·처리방법 — 꼬리를 버리면 '덜 관련된 근거'가 빠져 답이 부실해진다. 회복 경로가 필요 없다.
@@ -240,9 +257,8 @@ const NOTES_RESERVE = 200;
 // 짧은 줄로도 다 못 실을 만큼 예산이 모자라면 그때는 꼬리부터 버린다(기존 동작).
 function renderQueries(queries, budget) {
   const short = queries.map(queryItemShort);
-  // 줄마다 줄바꿈 한 칸을 함께 센다 — 배분(renderSections)이 그렇게 세므로 기준이 같아야 한다.
-  // 이 섹션은 다른 섹션보다 줄 수가 훨씬 많아질 수 있어(모든 쿼리가 한 줄씩) 그 한 칸이 쌓인다.
-  const cost = line => line.length + 1;
+  // 줄 비용과 안내 몫은 다른 섹션과 같은 규칙을 쓴다 (lineCost·NOTES_RESERVE 주석 참고).
+  const cost = lineCost;
   const usable = Math.max(0, budget - NOTES_RESERVE);
   let used = 0;
   // ① 짧은 줄만이라도 최대한 많이 — 첫 항목은 예산과 무관하게 싣는다(renderItems와 같은 보장).
@@ -306,7 +322,7 @@ function fitCols(row, budget) {
   let used = 2; // '{}'
   for (const [k0, v0] of cols) {
     const k = clip(k0, 100);
-    const v = clipVal(v0);
+    const v = clipDisplayValue(v0);
     const len = JSON.stringify(k).length + (JSON.stringify(v) ?? 'null').length + 2; // ':' + ','
     if (kept.length > 0 && used + len > budget) break;
     kept.push([k, v]);
@@ -316,7 +332,7 @@ function fitCols(row, budget) {
   if (omitted > 0 || upstream !== undefined) {
     const notes = [];
     if (omitted > 0) notes.push(`외 ${omitted}개 컬럼 생략 (프롬프트 길이 제한)`);
-    if (upstream !== undefined) notes.push(String(clipVal(upstream)));
+    if (upstream !== undefined) notes.push(String(clipDisplayValue(upstream)));
     kept.push([OMIT_KEY, notes.join(' / ')]);
   }
   return Object.fromEntries(kept);
@@ -329,16 +345,29 @@ function fitCols(row, budget) {
 // 값 단위로 먼저 잘라 JSON을 유효하게 유지하고(중간에서 자르면 모델이 조각을 값으로 되읽는다),
 // 여러 값의 합이 그래도 크면 전체를 한 번 더 자른다.
 function paramsJson(params) {
-  const entries = Object.entries(params || {}).map(([k, v]) => [clip(k, 100), clipVal(v)]);
+  const entries = Object.entries(params || {}).map(([k, v]) => [clip(k, 100), clipDisplayValue(v)]);
   return clip(JSON.stringify(Object.fromEntries(entries)), MAX_PROMPT_PARAMS_LEN);
 }
 
 // 표시용 값 절단 — params(위)와 컬럼 절단 행(fitCols)이 같은 규칙을 쓴다.
-// 문자열은 셀 상한으로, 스칼라는 그대로(수 리터럴은 짧다), 구조는 직렬화해 같은 상한으로.
-const clipVal = v =>
-  typeof v === 'string' ? clip(v, MAX_CELL_LEN)
+// 문자열은 아래 상한으로, 스칼라는 그대로(수 리터럴은 짧다), 구조는 직렬화해 같은 상한으로.
+//
+// 이름에 '표시용(Display)'을 박아 두는 이유: llm.js에도 값 절단 규칙이 하나 더 있는데 뜻이 다르다
+// (그쪽은 MAX_BIND_LEN으로 묶고 자른 값에 TRUNC_MARK를 붙여 실행 경계가 거부하게 만드는
+// '실행에 쓸 값'의 상한이다 — llm.js clipBindValue). 두 규칙이 한때 같은 이름을 쓰고 있었는데,
+// 이름이 같으면 '값을 어떻게 묶는가'를 바꾸는 변경이 한쪽에만 들어가도 아무 데서도 드러나지 않는다.
+//
+// 상한이 MAX_CELL_LEN이 아니라 그 + TRUNC_MARK 길이인 이유: 셀은 드라이버 경계
+// (oracle.js normalizeValue)에서 이미 MAX_CELL_LEN으로 묶여 있고, 잘린 셀에는 TRUNC_MARK가
+// 붙어 딱 그만큼 더 길다. 상한을 MAX_CELL_LEN으로 잡으면 '잘린 셀'만 여기서 한 번 더 잘려,
+// 모델이 보는 앞부분이 실제로 자른 앞부분과 달라진다. 그러면 그 앞부분을 옮겨 적은 바인드 값을
+// 실행 경계(oracle.js bindProblem)가 원본과 대조할 방법이 없어진다 —
+// 대조가 성립해야 '잘린 조각으로 조회해 0건을 얻고 그것을 없다고 단정하는' 실패를 막을 수 있다.
+const MAX_DISPLAY_VALUE_LEN = MAX_CELL_LEN + TRUNC_MARK.length;
+const clipDisplayValue = v =>
+  typeof v === 'string' ? clip(v, MAX_DISPLAY_VALUE_LEN)
     : v === null || typeof v === 'number' || typeof v === 'boolean' ? v
-      : clip(JSON.stringify(v) ?? String(v), MAX_CELL_LEN);
+      : clip(JSON.stringify(v) ?? String(v), MAX_DISPLAY_VALUE_LEN);
 
 function historyLine(h) {
   const head = `- ${clip(h.query_name, 100)} params=${paramsJson(h.params)}`;
@@ -368,17 +397,18 @@ function historyLine(h) {
 // 표시 순서는 시간순으로 되돌린다.
 function renderHistory(history, budget) {
   if (!history.length) return ['(없음)'];
+  const usable = Math.max(0, budget - NOTES_RESERVE);
   const lines = [];
   let used = 0;
   for (let i = history.length - 1; i >= 0; i--) {
     const line = historyLine(history[i]);
-    if (lines.length > 0 && used + line.length > budget) break;
+    if (lines.length > 0 && used + lineCost(line) > usable) break;
     lines.push(line);
-    used += line.length;
+    used += lineCost(line);
   }
   lines.reverse();
   const omitted = history.length - lines.length;
-  if (omitted > 0) lines.unshift(`- (앞선 ${omitted}건은 프롬프트 길이 제한으로 생략)`);
+  if (omitted > 0) lines.unshift(earlierOmittedNote(omitted));
   return lines;
 }
 
@@ -400,7 +430,7 @@ function renderSections(ctx) {
   keys.forEach((key, i) => {
     const reserved = keys.slice(i + 1).reduce((sum, k) => sum + PROMPT_FLOORS[k], 0);
     const lines = builders[key](Math.max(PROMPT_FLOORS[key], remaining - reserved));
-    remaining -= lines.reduce((sum, line) => sum + line.length + 1, 0); // +1 = 개행
+    remaining -= lines.reduce((sum, line) => sum + lineCost(line), 0); // 줄마다 개행 한 칸 (lineCost)
     out[key] = lines;
   });
   return out;
@@ -463,23 +493,93 @@ export function buildPrompt(ctx) {
 // 훑기가 한 번이라 구간 목록·병합·이분 탐색이 필요 없고, '후보를 먼저 파싱해야 마스킹할 수 있는데
 // 후보를 뽑으려면 구간이 필요하다'는 순환도 생기지 않는다.
 
-// text[start]가 '{'일 때 짝이 되는 '}'의 인덱스 (없으면 -1).
+// text[start]가 '{'일 때 짝이 되는 '}'를 찾는다.
 // 문자열 리터럴 안의 중괄호·따옴표는 세지 않는다 — answer 본문에 '{'가 들어갈 수 있다.
-function matchingBrace(text, start) {
-  let depth = 0, inStr = false, esc = false;
+//
+// 반환: { end, escapedQuote }
+//   end          — 짝이 되는 '}'의 인덱스 (닫히지 않으면 -1)
+//   escapedQuote — 스캔 중 '\"'를 이스케이프된 따옴표로 읽은 적이 있는가 (아래 두 번째 읽기의 조건)
+//
+// literalBackslashBeforeQuote: '\"'를 '이스케이프된 따옴표'가 아니라 '리터럴 백슬래시 + 닫는
+// 따옴표'로 읽는다. 두 가지 읽기가 필요한 이유는 이 파일이 normalizeJsonEscapes를 두는 이유와
+// 정확히 같다 — 모델은 백슬래시를 한 번만 쓴다. 값이 백슬래시로 끝나면(윈도우 경로 'C:\',
+// LaTeX의 행 바꿈 '\\') 그 값의 닫는 따옴표가 '\"'가 되어, 엄격하게 읽으면 문자열이 영영
+// 닫히지 않고 후보가 통째로 버려진다(-1). temperature=0이라 재시도도 같은 텍스트를 받아 똑같이
+// 실패하므로, 모델의 진짜 답변이 오류 하나 없이 사라진다 — 이 파일이 가장 나쁘게 보는 형태다.
+//
+// 정규화(normalizeJsonEscapes)가 이 문제를 대신 풀어줄 수는 없다. 그쪽은 '후보의 끝이 어디인가'가
+// 이미 정해진 뒤에 도는데, 여기서 -1이면 후보 자체가 없어 정규화가 실행될 기회가 없기 때문이다.
+// 그래서 같은 판단을 후보의 끝을 정하는 이 스캔에서도 할 수 있어야 하고, 두 함수가 반드시 같은
+// 해석을 써야 한다 — 한쪽만 관대하면 닫는 따옴표를 서로 다르게 세어 파싱이 반드시 실패한다.
+// 그 짝은 parseCandidate가 묶어 둔다.
+function matchingBrace(text, start, literalBackslashBeforeQuote = false) {
+  let depth = 0, inStr = false, esc = false, escapedQuote = false;
   for (let i = start; i < text.length; i++) {
     const c = text[i];
     if (inStr) {
-      if (esc) esc = false;
-      else if (c === '\\') esc = true;
-      else if (c === '"') inStr = false;
+      if (esc) { esc = false; continue; }
+      if (c === '\\') {
+        // 두 번째 읽기에서는 다음 글자를 소비하지 않는다 — 다음 회차의 '"'가 문자열을 닫는다
+        if (literalBackslashBeforeQuote && text[i + 1] === '"') continue;
+        if (text[i + 1] === '"') escapedQuote = true;
+        esc = true;
+        continue;
+      }
+      if (c === '"') inStr = false;
       continue;
     }
     if (c === '"') inStr = true;
     else if (c === '{') depth++;
-    else if (c === '}' && --depth === 0) return i;
+    else if (c === '}' && --depth === 0) return { end: i, escapedQuote };
   }
-  return -1;
+  return { end: -1, escapedQuote };
+}
+
+// 후보 하나를 읽는다 — 끝을 정하고(matchingBrace) 같은 해석으로 정규화해 파싱한다.
+// 두 단계를 한 함수에 묶어 두는 이유: 끝을 정하는 규칙과 파싱 직전 정규화 규칙이 갈라지면
+// 파싱이 반드시 실패하므로, 둘을 따로 부르는 자리를 남기지 않는다.
+//
+// 엄격한 읽기를 먼저 한다 — 정상적으로 이스케이프된 따옴표가 압도적으로 흔하다.
+// 두 번째 읽기는 ① 엄격한 읽기로 후보가 닫히지 않았고 ② 그 원인이 될 수 있는 '\"'를 실제로
+// 본 경우에만 돈다. 조건 ②가 대부분의 퇴화한 응답을 걸러낸다: 짝 없는 '{"'가 반복되는 입력
+// (MAX_UNMATCHED_* 주석의 그 입력)에는 '\"'가 없으므로 두 번째 스캔이 시작되지도 않는다.
+//
+// 그것만으로는 부족하다 — '{"a\"' 가 반복되면 조건 ②가 매번 참이 되어 후보마다 두 번씩 훑는다
+// (실측: 203KB에서 925ms로, 같은 크기의 '{"a' 반복보다 2.4배). 그래서 실제로 몇 번 훑었는지를
+// 함께 돌려주고, 호출부가 그 수를 전역 예산(MAX_UNMATCHED_TOTAL)에 청구한다.
+// 예산이 '후보 수'가 아니라 '훑은 횟수'를 세면 두 번째 읽기를 더해도 총량이 그대로 묶인다 —
+// 그 시간은 동기 작업이라 동시에 처리 중인 모든 요청이 함께 멈추므로, 상한은 유지되어야 한다.
+//
+// 조건 ①을 '엄격한 읽기가 실패했을 때'가 아니라 '문자열을 못 닫았을 때'로 좁혀 둔다.
+// 끝을 찾았는데 파싱만 실패한 경우는 텍스트가 어디서 망가졌는지 알 수 없어, 더 짧은 읽기를
+// 채택하는 것이 '값이 잘린 결정'을 만들어낼 수 있다 — 그건 이 파일이 2순위에서 run_query를
+// 받지 않는 것과 같은 이유로 피한다(초안을 실행하는 것보다 결정을 못 찾는 편이 낫다).
+// 반면 '문자열이 끝까지 안 닫혔다'는 백슬래시로 끝난 값이 내는 바로 그 증상이라 근거가 분명하다.
+// 실제 응답 형태(결정 뒤 산문·코드펜스·think 태그·한 겹 감싼 결정)는 전부 이 조건으로 복구된다.
+//
+// 반환: 성공이면 { value, end, scans }, 실패면 { scans } (value === undefined).
+function parseCandidate(text, start) {
+  const strict = matchingBrace(text, start);
+  if (strict.end > 0) {
+    const value = tryParse(text.slice(start, strict.end + 1), false);
+    if (value !== undefined) return { value, end: strict.end, scans: 1 };
+  }
+  if (strict.end < 0 && strict.escapedQuote) {
+    const lenient = matchingBrace(text, start, true);
+    if (lenient.end > 0) {
+      const value = tryParse(text.slice(start, lenient.end + 1), true);
+      if (value !== undefined) return { value, end: lenient.end, scans: 2 };
+    }
+    return { scans: 2 };
+  }
+  return { scans: 1 };
+}
+
+// JSON.parse는 undefined를 돌려주지 않으므로 undefined를 '파싱 실패'로 쓸 수 있다.
+function tryParse(slice, literalBackslashBeforeQuote) {
+  // 이스케이프 정규화를 거쳐 파싱한다 — LaTeX를 한 번만 이스케이프한 응답도 여기서 살아난다.
+  try { return JSON.parse(normalizeJsonEscapes(slice, literalBackslashBeforeQuote)); }
+  catch { return undefined; }  /* JSON이 아닌 중괄호 덩어리 */
 }
 
 // ===== 이스케이프 정규화 =====
@@ -532,7 +632,7 @@ function keepsControlMeaning(text, i, n) {
   return !N_COMMAND_TAILS.some(tail => text.startsWith(tail, i + 2) && !isLetter(text[i + 2 + tail.length]));
 }
 
-function normalizeJsonEscapes(text) {
+function normalizeJsonEscapes(text, literalBackslashBeforeQuote = false) {
   let out = '', inStr = false;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
@@ -541,6 +641,9 @@ function normalizeJsonEscapes(text) {
     if (c < ' ') { out += escapeControl(c); continue; }
     if (c !== '\\') { out += c; continue; }
     const n = text[i + 1];
+    // 후보의 끝을 그렇게 읽었으면 여기서도 그렇게 읽는다 (matchingBrace 주석 참고) —
+    // 백슬래시를 리터럴로 되돌리고 다음 글자('"')는 소비하지 않아 문자열이 거기서 닫힌다.
+    if (literalBackslashBeforeQuote && n === '"') { out += '\\\\'; continue; }
     // \uXXXX는 뜻이 분명하다 — 16진수 4자리가 붙어야 유효하고, 아니면 아래에서 \upsilon처럼 명령으로 산다.
     if (n === 'u' && /^[0-9a-fA-F]{4}$/.test(text.slice(i + 2, i + 6))) { out += c + n; i++; continue; }
     if (n !== undefined && UNAMBIGUOUS_ESCAPES.includes(n)) { out += c + n; i++; continue; }
@@ -646,8 +749,8 @@ const tokenRe = () => {
 //   전역 상한만 두면 → 앞의 시끄러운 사고 과정 하나가 상한을 다 먹어 뒤의 진짜 결정에 닿지 못한다.
 //                     ②(닫는 태그만)는 Qwen3·R1 기본 템플릿의 기본값이라 드문 조합이 아니다.
 // 그 시간은 동기 작업이라 그 요청만이 아니라 동시에 처리 중인 모든 요청이 함께 멈춘다.
-const MAX_UNMATCHED_CANDIDATES = 100;
-const MAX_UNMATCHED_TOTAL = 500;
+const MAX_UNMATCHED_CANDIDATES = 100;  // 구간별 — 후보 수로 센다
+const MAX_UNMATCHED_TOTAL = 500;       // 전역 — '훑은 횟수'로 센다 (parseCandidate 주석 참고)
 
 // 파싱된 후보 목록. 각 후보에 사고 과정과의 관계를 함께 단다:
 //   draft   — 여는 태그가 실제로 있는 블록 안(①③)이다. 초안이므로 어느 순위에도 넣지 않는다.
@@ -662,15 +765,13 @@ function scanCandidates(text) {
     const tok = m[0];
     if (tok[0] === '{') {
       if (unmatched >= MAX_UNMATCHED_CANDIDATES || spent >= MAX_UNMATCHED_TOTAL) continue;
-      const end = matchingBrace(text, m.index);
-      let value;
-      if (end > 0) {
-        // 이스케이프 정규화를 거쳐 파싱한다 — LaTeX를 한 번만 이스케이프한 응답도 여기서 살아난다.
-        try { value = JSON.parse(normalizeJsonEscapes(text.slice(m.index, end + 1))); } catch { /* JSON이 아닌 중괄호 덩어리 */ }
-      }
-      if (value === undefined) { unmatched++; spent++; continue; }
-      objects.push({ value, draft: depth > 0, assumed: false, start: m.index, end });
-      re.lastIndex = end + 1; // ⓐ 파싱된 객체 안의 태그는 answer 본문의 글자다
+      const parsed = parseCandidate(text, m.index);
+      // spent는 '훑은 횟수'다 — 후보 하나가 두 번 훑었으면 두 번으로 센다 (parseCandidate 주석 참고).
+      // unmatched(구간별)는 후보 수 그대로 센다: 그쪽은 비용이 아니라 '시끄러운 구간 하나가
+      // 뒤의 진짜 결정을 가리지 않게' 하는 몫이고, 총 비용은 spent가 이미 묶는다.
+      if (parsed.value === undefined) { unmatched++; spent += parsed.scans; continue; }
+      objects.push({ value: parsed.value, draft: depth > 0, assumed: false, start: m.index, end: parsed.end });
+      re.lastIndex = parsed.end + 1; // ⓐ 파싱된 객체 안의 태그는 answer 본문의 글자다
       continue;
     }
     const closing = tok[1] === '/';

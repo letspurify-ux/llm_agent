@@ -1,12 +1,12 @@
 import 'dotenv/config';
 import { writeSync } from 'node:fs';
 import express from 'express';
-import { handleQuestion } from './agent.js';
+import { handleQuestion, normalizeQuestion } from './agent.js';
 import { llmProvider } from './llm.js';
 import { oracleMock } from './oracle.js';
 import { syncEmbeddings, syncSummary, requestSyncStop } from './embed-sync.js';
 import { insertChatLog, cleanupChatLogs, closePool } from './db.js';
-import { numEnv, warnOnce, stripLoneSurrogates, MAX_QUESTION_LEN } from './constants.js';
+import { numEnv, warnOnce, clipText, MAX_QUESTION_LEN } from './constants.js';
 import { clientTrace } from './result.js';
 
 // 종료가 시작됐는지 — 새 주기 작업을 시작하지 않기 위해 아래 runJob이 함께 본다.
@@ -51,35 +51,68 @@ app.use(express.json({ limit: '1mb' }));
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
+// trace 스키마 버전. 형식이 바뀌어도 분석 SQL이 옛 행과 새 행을 구분할 수 있게 한다.
+// 3부터 outcome이 반드시 있다 (2에는 없다 — README의 대화 로그 절 참고).
+const TRACE_VERSION = 3;
+
 // 대화 로그 기록은 응답을 막지 않는다(await 하지 않는다) — 대신 진행 중인 기록을 붙잡아 두어
 // 종료 경로가 기다릴 수 있게 한다. 재배포의 SIGTERM이 res.json 직후에 닿으면 shutdown이
 // 커넥션 풀을 닫아버려 아직 날아가지 않은 INSERT가 통째로 사라지는데, 남는 것은
 // '[chat_log] failed to record' 한 줄뿐이다. chat_log는 '답하지 못한 질문' 분석의 유일한
 // 출처이므로(README) 그 손실은 정작 데이터에서는 보이지 않는다 — 배포 직전 질문만 조용히 빈다.
+//
+// 기록은 결과가 무엇이든 남긴다. 앞서는 성공 경로에만 붙어 있어서, 정작 이 로그가 찾아내야 할
+// 요청(서버 오류, 거부된 입력, 본문 크기 초과)만 데이터에 흔적 없이 사라졌다 — 관리 DB 장애나
+// 클라이언트의 체계적인 버그가 이어지는 동안 chat_log는 '질문이 줄었다'로만 보이고, 단서는
+// 콘솔 한 줄뿐이다. 무엇으로 끝났는지는 trace.outcome에 남긴다.
+//
+// 진행 중인 기록에 상한을 둔다. 거부된 요청까지 기록하게 되면서 이 집합의 유입 속도가 달라졌기
+// 때문이다 — 답변까지 가는 요청은 에이전트 루프(초 단위)가 스스로 속도를 묶어 주지만,
+// 400/413은 즉시 돌아가므로 클라이언트 하나가 초당 수천 건을 만들 수 있다. 관리 DB가 그보다
+// 느리면 아직 날아가지 않은 기록이 질문 본문째로 쌓이고, 그 집합은 종료 경로가 기다리는
+// 대상이기도 해서 정상 종료까지 함께 늘어진다.
+// 넘치면 기록을 포기한다 — 그 상황 자체는 아래 경고 한 줄로 드러나고, 로그가 목적이지
+// 로그 때문에 서버가 흔들리면 안 된다. 응답은 어느 쪽이든 영향받지 않는다.
+const MAX_PENDING_LOG_WRITES = 1000;
+
 const pendingLogWrites = new Set();
-function recordChatLog(question, answer, trace) {
+function recordChatLog(question, answer, extra) {
+  if (pendingLogWrites.size >= MAX_PENDING_LOG_WRITES) {
+    warnOnce('chat_log', `${MAX_PENDING_LOG_WRITES}건이 아직 기록 중이라 새 대화 로그를 건너뜁니다 — 관리 DB가 밀리고 있는지 확인할 것.`);
+    return;
+  }
   // 실패를 먼저 삼킨 promise를 담는다 — 그래야 종료 경로의 Promise.all이 기록 실패로 거부되지 않는다.
-  const p = insertChatLog(question, answer, trace)
+  const p = insertChatLog(question, answer, { v: TRACE_VERSION, ...extra })
     .catch(e => console.warn('[chat_log] failed to record:', e.message))
     .finally(() => pendingLogWrites.delete(p));
   pendingLogWrites.add(p);
 }
 
+// 답변까지 가지 못하고 거부된 요청의 기록. question은 NOT NULL이라 없으면 빈 문자열로 남긴다 —
+// '무엇을 물었는지조차 읽지 못한 요청'도 건수로는 보여야 한다.
+// 질문 본문은 상한 안으로 잘라 넣는다: 거부 사유가 '너무 김'인 요청은 본문이 1MB까지 올 수 있다.
+const recordRejected = (question, reason, extra) =>
+  recordChatLog(clipText(String(question ?? ''), MAX_QUESTION_LEN), null, { outcome: 'rejected', reason, ...extra });
+
 app.post('/api/chat', async (req, res) => {
   const raw = req.body?.message;
   if (typeof raw !== 'string') {
+    recordRejected('', 'no_message');
     return res.status(400).json({ error: 'message가 필요합니다.' });
   }
   // 짝 잃은 서로게이트를 여기서 걷어낸다 — 클라이언트가 이모지 한가운데를 자른 조각을 보내면
   // 그 문자열은 유효한 UTF-8이 아니라서 LLM 요청이 통째로 거부되거나 본문이 U+FFFD로 훼손되고,
   // chat_log INSERT도 같은 이유로 깨진다. 대화 턴이 normalizeChat에서 같은 처리를 받는 것과
-  // 같은 이유·같은 함수다 (agent.js clipChatText). 정리한 값을 답변·로그가 모두 함께 본다.
-  const message = stripLoneSurrogates(raw).trim();
+  // 같은 이유다 (agent.js clipChatText). 규칙 자체는 agent.js가 갖고 있고 여기서도 그 함수를
+  // 부른다 — 두 경계가 각자 적으면 어느 문으로 들어오느냐에 따라 질문이 달라진다.
+  const message = normalizeQuestion(raw);
   if (!message) {
+    recordRejected(raw, 'empty_message');
     return res.status(400).json({ error: 'message가 필요합니다.' });
   }
   // 상한은 constants.js가 정한다 — 프롬프트 예산 계산과 회귀 테스트가 같은 값을 본다.
   if (message.length > MAX_QUESTION_LEN) {
+    recordRejected(message, 'too_long', { length: message.length });
     return res.status(400).json({ error: `질문이 너무 깁니다 (최대 ${MAX_QUESTION_LEN.toLocaleString('ko-KR')}자).` });
   }
   try {
@@ -87,13 +120,16 @@ app.post('/api/chat', async (req, res) => {
     const { answer, trace, search } = await handleQuestion(message, req.body?.history);
     // 대화 로그 (비동기 — 기록 실패가 응답을 막지 않는다). search(검색 적중 수)를 함께 남겨
     // "검색 0건이라 못 답한 질문"을 SQL로 바로 찾을 수 있게 한다 (README의 chat_log 예시 참고).
-    // v는 trace 스키마 버전 — 형식이 바뀌어도 분석 SQL이 옛 행과 새 행을 구분할 수 있게 한다.
-    recordChatLog(message, answer, { v: 2, search, steps: trace });
+    recordChatLog(message, answer, { outcome: 'answered', search, steps: trace });
     // 화면용 정리(제어용 기록 제외, 원문 오류 가리기, 행 상한과 생략 건수)는 result.js가 한다 —
     // 건수 해석을 답변 본문·프롬프트와 한 곳에서 공유해야 하고, 여기 두면 테스트가 붙지 않는다.
     res.json({ answer, trace: clientTrace(trace) });
   } catch (e) {
     console.error('[chat error]', e);
+    // 답하지 못한 질문 중 가장 중요한 부류가 이것이다 — 반드시 기록한다.
+    // 오류 원문은 chat_log에만 남긴다(화면에는 아래 일반 문구만 나간다). trace.steps[].error가
+    // 이미 드라이버 원문을 담는 필드이므로 같은 기준이다.
+    recordChatLog(message, null, { outcome: 'error', error: e?.message ?? String(e) });
     // 실패는 400/413/500 어느 경로든 error 필드로 통일한다 — 여기만 answer로 보내면
     // error 유무로 실패를 판정하는 클라이언트가 서버 오류를 정상 답변으로 읽는다.
     res.status(500).json({ error: '처리 중 오류가 발생했습니다.' });
@@ -115,6 +151,14 @@ app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
   const tooLarge = err?.type === 'entity.too.large';
   if (tooLarge) console.warn('[chat] request body too large:', err.length);
+  // 본문을 읽지 못해 핸들러에 닿지도 못한 요청도 기록한다 — 그 요청이 바로 chat_log가 찾아야 할
+  // '답하지 못한 질문'이고, 이 경로만 빠지면 클라이언트가 계속 너무 큰 본문을 보내는 상황이
+  // 데이터에서는 '질문이 줄었다'로만 보인다. 질문 본문은 파싱 자체가 실패해 남길 것이 없다.
+  // /api/chat만 기록한다 — 다른 경로의 본문 오류는 이 로그의 관심사가 아니다
+  // (등록되지 않은 경로는 위 404 핸들러가 먼저 받으므로 여기까지 오지 않는다).
+  if (req.path === '/api/chat') {
+    recordRejected('', tooLarge ? 'body_too_large' : 'bad_body', tooLarge && err.length ? { length: err.length } : undefined);
+  }
   // 본문 파서 오류는 status를 채워 보낸다(400/413). status가 없으면 클라이언트 잘못이 아니라
   // 서버 버그이므로 500으로 둔다 — 전부 400으로 뭉개면 원인 분류가 뒤집힌다.
   const status = err?.status ?? err?.statusCode ?? 500;

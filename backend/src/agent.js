@@ -3,11 +3,11 @@
 // 루프의 유일한 상태는 history 배열이며, 매 반복 전체 컨텍스트를 LLM에 전달한다.
 // 대화 맥락(chat)은 서버가 저장하지 않고 클라이언트가 매 요청에 실어 보낸다 (stateless 유지).
 import { searchKnowledge, searchQaMethods, searchQueries } from './search.js';
-import { loadQueryRegistry, loadQueriesByNames } from './db.js';
+import { loadQueryRegistry, loadQueriesByNames, loadQueriesMentionedIn } from './db.js';
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
 import { llm, renderAnswer, clipAnswer } from './llm.js';
-import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, nameKey, clipText, stripLoneSurrogates, bindValue } from './constants.js';
+import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_CELL_LEN, TRUNC_MARK, nameKey, clipText, stripLoneSurrogates, bindValue } from './constants.js';
 
 const MAX_STEPS = 5;
 const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포함). 초과하면 남은 스텝을 포기하고 강제 답변으로 간다.
@@ -16,7 +16,12 @@ const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포�
                                // 프런트(App.jsx REQUEST_TIMEOUT_MS)가 이 계산에 맞춰져 있으니 함께 고칠 것.
 const MAX_PROMPT_QUERIES = 30; // 프롬프트에 싣는 쿼리 상한 (~2.2k토큰)
 const MAX_SAME_QUERY_TRIES = 2; // 같은 쿼리·파라미터의 최대 실행 시도 (1회 실패는 일시 오류일 수 있어 재시도 허용)
-const MAX_MENTIONED_TOKENS = 100; // qa_method 본문에서 뽑아 query_registry에 물어볼 토큰 상한
+// 경로A(qa_method 본문이 지목한 쿼리)에서 관리 DB로 보내는 본문 길이 상한.
+// qa_method.method는 TEXT(64KB)이고 검색은 최대 20건을 돌려주므로, 상한이 없으면 요청마다
+// 1MB가 넘는 문자열이 바인드로 나가고 등록 행마다 그 길이를 훑게 된다.
+// 앞쪽이 관련도가 높은 처리방법이고(검색 결과 순서) 절차의 첫 단계도 본문 앞쪽에 온다 —
+// 잘려도 다단계 절차의 시작은 남는다 (프롬프트 예산이 꼬리부터 버리는 것과 같은 전제다).
+const MAX_ROUTE_TEXT_LEN = 20_000;
 const MAX_GUARD_HITS = 2;       // 루프 가드가 '연속으로' 이만큼 걸리면 남은 스텝을 포기하고 강제 답변으로 간다.
                                 // (첫 1회는 LLM이 경로를 수정할 기회, 그래도 반복하면 LLM 왕복만 낭비된다.
                                 //  조회에 성공하면 진도가 나간 것이므로 카운터를 되돌린다 — 다단계 절차 도중
@@ -154,11 +159,20 @@ function clipChatText(text) {
   return clipText(stripLoneSurrogates(text).trim(), MAX_CHAT_LEN);
 }
 
+// 질문 정규화의 단일 지점.
+// 클라이언트가 이모지 한가운데를 자른 조각을 보내면 그 요청의 모든 LLM 호출이 인코딩 단계에서
+// 실패하거나 본문이 U+FFFD로 훼손되므로, 대화 턴과 같은 처리를 질문에도 한다(clipChatText 참고).
+//
+// 이 함수를 export 하는 이유: 이 정리를 서버 입력 검증(server.js)도 해야 한다 — 그쪽은 길이
+// 검증과 chat_log 기록에 같은 값을 써야 하기 때문이다. 두 곳이 각자 적으면 규칙이 갈라진다.
+// 실제로 갈라져 있었다: server.js는 정리 뒤 trim까지 했고 여기는 하지 않아, 같은 입력이
+// 어느 문으로 들어오느냐에 따라 다른 질문이 됐다.
+// 양쪽 경계에서 모두 부른다 — 멱등이라 두 번 불러도 값이 같고(두 번째는 서로게이트가 없어
+// 정규식 검사 한 번에 끝난다), 그래야 handleQuestion을 직접 부르는 경로도 같은 규칙을 받는다.
+export const normalizeQuestion = raw => stripLoneSurrogates(raw).trim();
+
 export async function handleQuestion(rawQuestion, rawChat = []) {
-  // 질문도 대화 턴과 같은 이유로 여기서 정리한다 — 클라이언트가 이모지 한가운데를 자른 조각을
-  // 보내면 그 요청의 모든 LLM 호출이 인코딩 단계에서 실패하거나 본문이 U+FFFD로 훼손된다.
-  // (서버 입력 검증도 같은 함수를 쓴다 — server.js. 그쪽은 chat_log까지 같은 값을 남긴다)
-  const question = stripLoneSurrogates(rawQuestion);
+  const question = normalizeQuestion(rawQuestion);
   const chat = normalizeChat(rawChat);
   // 예산은 요청 시작점에서 잡는다 — 검색 뒤에 잡으면 임베딩 타임아웃(최대 2회 × 60초)이
   // 예산 밖에 놓여, 문서화한 요청 상한과 프런트 abort 시각이 실제보다 낙관적이 된다.
@@ -214,6 +228,7 @@ export async function handleQuestion(rawQuestion, rawChat = []) {
   const history = [];
   const ctx = () => ({ question, chat, knowledge, qaMethods, queries, history });
   const resolveCache = new Map(); // 프롬프트 목록 밖 이름의 해석 결과 (미등록도 캐시한다)
+  const clippedCopy = clippedCopyDetector(chat);
   let guardHits = 0;
 
   for (let step = 0; step < MAX_STEPS; step++) {
@@ -223,7 +238,9 @@ export async function handleQuestion(rawQuestion, rawChat = []) {
     const decision = await decide(ctx());
     if (!decision) break; // 결정을 얻지 못했다 — 아래 강제 답변/폴백으로 간다
     if (decision.action === 'answer') {
-      return { answer: decision.answer, trace: history, search };
+      const answer = answerOf(decision);
+      if (answer) return { answer, trace: history, search };
+      break;   // 쓸 수 있는 답변이 아니다 — 아래 강제 답변/폴백으로 간다
     }
 
     // 예산은 스텝 진입에서만 보면 부족하다 — 239초에 시작한 스텝이 LLM 120초를 쓰고 나서
@@ -267,13 +284,13 @@ export async function handleQuestion(rawQuestion, rawChat = []) {
     // 전제로 꼬리부터 버린다. 방금 LLM이 이름을 대서 찾아낸 쿼리는 이번 스텝에서 가장 관련이 높은데,
     // 뒤에 붙이면 등록이 조금만 많아도 그 한 건이 먼저 잘려 나가 이 복구 경로 자체가 조용히 사라진다.
     if (!queries.includes(registryRow)) queries.unshift(registryRow);
-    // 이력의 잘린 셀에서 마크만 떼고 옮겨 적은 바인드 값을 여기서 다시 걸러내지 않는다 —
-    // 그 앞부분의 길이는 반드시 clipText가 남기는 절단 길이(MAX_CELL_LEN 또는 그 -1)이므로
-    // oracle.js bindProblem의 isClippedLen이 Oracle에 접속하기도 전에, 글자까지 같은 문구로
-    // 이미 거부한다. 이력을 훑는 별도 판정을 두면 스텝마다 O(이력 × 행 × 컬럼) 스캔만 늘고
-    // 걸러내는 값은 한 건도 늘지 않는다 (역할을 나눈 것처럼 보였지만 실제로는 겹쳐 있었다).
+    // 이력의 잘린 셀에서 마크만 떼고 옮겨 적은 바인드 값은 여기서 따로 훑지 않는다 —
+    // 판정은 실행 경계 한 곳(oracle.js bindProblem)에서 하고, 이 파일은 그 판정에 필요한
+    // '무엇을 잘랐는가'만 넘긴다(clippedCopy). 값을 모으는 비용은 조회 1회당 한 번이고,
+    // 스텝마다 이력 전체를 다시 훑지 않는다.
     try {
-      const { rows, totalRows, capped } = await runQuery(registryRow, decision.params);
+      const { rows, totalRows, capped } = await runQuery(registryRow, decision.params, clippedCopy.isCopy);
+      clippedCopy.record(rows);
       history.push({ query_name: canonicalName, params: decision.params, rows: capRows(rows), totalRows, capped });
       guardHits = 0; // 진도가 나갔다 — 가드는 '연속' 헛도는 경우만 센다
     } catch (e) {
@@ -288,9 +305,72 @@ export async function handleQuestion(rawQuestion, rawChat = []) {
   // 그마저 실패하면 fallbackAnswer가 손에 든 것으로 답을 조립한다.
   const finalCtx = { ...ctx(), forceAnswer: true };
   const final = await decide(finalCtx);
-  const answer = (final?.action === 'answer' && final.answer) || fallbackAnswer(finalCtx);
+  const answer = answerOf(final) || fallbackAnswer(finalCtx);
   return { answer, trace: history, search };
 }
+
+// '이 바인드 값이 우리가 잘라서 보여준 값의 앞부분인가'를 답하는 판정자.
+//
+// 모델은 잘린 셀을 보면 TRUNC_MARK를 뗀 앞부분만 옮겨 적는 일이 잦다. 그 값으로 조회하면 원본과
+// 다르므로 반드시 0건이 나오고, 모델은 그 0건을 "그런 데이터가 없다"로 읽는다 —
+// 오류가 한 줄도 남지 않는 오답이라 이 코드베이스가 가장 나쁘게 보는 형태다.
+//
+// 길이로 짐작하지 않고 '실제로 자른 앞부분'을 모아 두었다가 그대로 대조한다
+// (길이 판정의 대가는 oracle.js bindProblem 주석에 적혀 있다). 모델이 그 앞부분을 볼 수 있는
+// 곳이 정확히 둘이므로 둘 다 같은 집합에 넣는다:
+//   ① 이번 요청의 조회 결과 — 프롬프트의 실행 이력에 셀 값이 그대로 실린다.
+//      마크가 붙은 셀에서 마크를 떼어 넣는다 (조회 1회당 한 번, 행 × 컬럼).
+//   ② 지난 턴의 답변 — 대화 이력으로 되돌아온 텍스트 안에 '<앞부분>…(생략)'이 그대로 들어 있다.
+//      여기서는 앞부분이 어디서 시작하는지가 텍스트만 봐서는 안 보이지만, 알 필요가 없다:
+//      그 값을 자른 것이 우리고 clipText는 정확히 두 길이만 남긴다 — MAX_CELL_LEN, 그리고
+//      절단 경계가 서로게이트 쌍을 가른 경우의 MAX_CELL_LEN-1. 마크 앞에서 그 두 길이를
+//      떼어내면 화면에 실렸던 앞부분이 그대로 복원된다.
+//      (앞부분을 '마크에 붙어 있는 문자열'로 찾으면 안 된다 — 그러면 마크 바로 앞에 오는 짧고
+//       정당한 값까지 전부 잘린 조각으로 오판한다. 판정은 '값 전체가 그 앞부분과 같은가'여야 한다.)
+//      대화 턴이 MAX_CHAT_LEN으로 잘려 앞부분이 온전히 남지 않았으면 복원되지 않는다 —
+//      그 경우 모델도 온전한 앞부분을 보지 못했으므로 옮겨 적을 수도 없다.
+//
+// 그래서 판정은 집합 조회 한 번이다 — 검색도, 길이 분기도 없다.
+// (테스트에서 쓰므로 export 한다 — 양쪽으로 조용히 깨지는 판정이다: 느슨해지면 잘린 조각으로
+//  조회해 0건 오답이 나가고, 빡빡해지면 정당한 값으로 그 쿼리를 영영 실행할 수 없다.
+//  어느 쪽도 오류를 남기지 않으므로 테스트가 유일한 방어선이다 — loopGuard와 같은 이유다.)
+const CLIPPED_PREFIX_LENS = [MAX_CELL_LEN, MAX_CELL_LEN - 1];
+
+export function clippedCopyDetector(chat) {
+  const clipped = new Set();
+  const addFromMark = (text, markAt) => {
+    for (const len of CLIPPED_PREFIX_LENS) {
+      if (markAt >= len) clipped.add(text.slice(markAt - len, markAt));
+    }
+  };
+  for (const { text } of chat) {
+    for (let i = text.indexOf(TRUNC_MARK); i >= 0; i = text.indexOf(TRUNC_MARK, i + 1)) {
+      addFromMark(text, i);
+    }
+  }
+  return {
+    record(rows) {
+      for (const row of rows) {
+        for (const v of Object.values(row)) {
+          if (typeof v === 'string' && v.endsWith(TRUNC_MARK)) clipped.add(v.slice(0, -TRUNC_MARK.length));
+        }
+      }
+    },
+    // oracle.js가 그대로 호출하므로 this에 기대지 않는다 (메서드를 값으로 넘긴다)
+    isCopy: v => clipped.has(v),
+  };
+}
+
+// 결정에서 '쓸 수 있는 답변'만 꺼낸다 (없으면 null).
+// 답변이 이 함수를 통해서만 나가게 하는 이유: 답변 경로가 둘인데(루프 안에서 답한 결정, 그리고
+// 마지막 강제 답변) 한쪽만 판정을 갖고 있으면 나머지 한쪽이 조용히 그 보호 밖에 남는다.
+// 실제로 그랬다 — 강제 답변 쪽만 falsy 검사를 하고 루프 쪽은 결정의 answer를 그대로 돌려줬다.
+// 결정 경계(llm.js sanitizeDecision)는 answer의 타입을 일부러 정규화하지 않는다:
+// 'falsy한 answer는 폴백으로 간다'는 전제를 지키려고 그렇게 두었는데, 그 전제를 실제로 지키는
+// 곳이 한 곳뿐이면 전제가 반쪽만 참이 된다. 빈 답변이 나가면 화면에 빈 말풍선이 뜨고,
+// 그 빈 턴이 다음 질문의 맥락으로 서버에 되돌아온다.
+// (테스트에서 쓰므로 export 한다)
+export const answerOf = d => (d?.action === 'answer' && d.answer) || null;
 
 const LLM_FAILED = 'LLM 호출에 실패했습니다. 잠시 후 다시 시도해주세요.';
 
@@ -362,17 +442,31 @@ async function resolveQuery(name, queries, cache) {
 //          qa_method 등록 없이 등록된 쿼리도 질문만으로 찾는다
 // 지식·처리방법이 같은 hybrid()로 관련도 순을 만드는 것과 같은 순서 규칙이다.
 async function rankQueries(qaMethods, question) {
-  // 본문의 영문 토큰은 대부분 query_name이 아니다(상태값·명령어·영단어). 전부 IN 절에 실으면
-  // 매 요청이 수백 개짜리 플레이스홀더 목록을 보내게 된다 — 걸러지는 곳이 MariaDB라 이미 늦다.
-  // 등장 순서를 유지한 채 상한을 둔다: 앞쪽이 절차의 첫 단계이므로 잘려도 다단계 절차의 시작은 남는다.
-  // (likeSearch가 검색 토큰에 두는 상한과 같은 이유·같은 방식이다)
-  // method는 NOT NULL이지만 컬럼 하나가 완화되거나 임포터가 NULL을 넣는 순간 여기서 죽는다 —
-  // 이 값의 다른 소비자(llm-openai clip, embed-sync toText)는 전부 NULL을 견딘다.
-  const mentioned = [...new Set(
-    qaMethods.flatMap(m => String(m.method ?? '').match(/[A-Za-z_][A-Za-z0-9_]{2,}/g) || [])
-  )].slice(0, MAX_MENTIONED_TOKENS);
+  // 경로A는 '본문에서 이름처럼 보이는 토큰을 뽑아 IN 절로 묻는' 방식이었다. 그 추출식이
+  // /[A-Za-z_][A-Za-z0-9_]{2,}/ 라서 한글 query_name은 어떤 본문에서도 한 번도 뽑히지 않았다 —
+  // query_name은 VARCHAR(100)에 문자 제한이 없고 이 코드베이스는 다른 곳에 전부 한글을 쓴다.
+  // 그러면 '배치상태조회 를 실행한다'라고 적어도 경로A가 빈손이 되어, 이 경로가 존재하는 이유인
+  // 다단계 절차의 순서 보장('본문 등장 순서를 지킨다')이 통째로 사라진다. 경로B로 뒤늦게
+  // 올라오더라도 순서가 틀리고, 빠졌다는 사실은 어디에도 남지 않는다.
+  // 토큰화로는 고칠 수 없는 문제다: 한국어는 조사가 낱말에 붙어 '배치상태조회를'이 한 낱말이므로
+  // 이름의 끝을 공백으로 알 수 없고, 조사 변형을 다 만들면 본문의 평범한 낱말들이 상한을 채운다.
+  //
+  // 그래서 방향을 뒤집는다 — '등록된 이름이 본문에 들어 있는가'를 관리 DB가 직접 본다
+  // (db.js loadQueriesMentionedIn). 토큰화가 사라지므로 문자 종류에 좌우되지 않고, 이름 길이
+  // 제한(3자 이상)도 없어지며, 등장 위치를 DB가 함께 돌려주므로 순서 보장이 오히려 정확해진다.
+  // Mock provider가 같은 판정을 이미 이렇게 하고 있었다 (llm.js plannedQueries의 indexOf) —
+  // 두 곳이 '본문이 어떤 쿼리를 지목했는가'를 서로 다르게 답하고 있던 셈이다.
+  //
+  // 본문은 검색 결과 순서대로 이어 붙인다 — 위치 순서가 곧 '관련도 높은 처리방법 먼저,
+  // 그 안에서는 등장 순서대로'가 된다. method는 NOT NULL이지만 컬럼 하나가 완화되거나 임포터가
+  // NULL을 넣는 순간 여기서 죽는다 — 이 값의 다른 소비자(llm-openai clip, embed-sync toText)는
+  // 전부 NULL을 견딘다. 소문자화는 자르기 전에 한다 (자른 뒤에 하면 길이가 상한을 넘을 수 있다).
+  const routeText = clipText(
+    qaMethods.map(m => String(m.method ?? '')).join('\n').toLowerCase(),
+    MAX_ROUTE_TEXT_LEN
+  );
   const [named, direct] = await Promise.all([
-    loadQueriesByNames(mentioned),   // query_name이 아닌 토큰은 IN 절에서 자연히 걸러진다
+    loadQueriesMentionedIn(routeText),
     searchQueries(question),
   ]);
 

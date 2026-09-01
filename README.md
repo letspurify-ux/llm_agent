@@ -373,7 +373,8 @@ Windows: `setup/bge-m3/start.bat` 실행 (설치 확인·모델 다운로드·�
 
 ```sql
 SELECT question, created_at FROM chat_log
-WHERE answer LIKE '%일반 지식으로 답변%'
+WHERE JSON_VALUE(trace, '$.outcome') IN ('error', 'rejected')  -- 답변에 닿지도 못한 요청
+   OR answer LIKE '%일반 지식으로 답변%'
    OR JSON_EXTRACT(trace, '$.steps[*].error') IS NOT NULL
    OR JSON_EXTRACT(trace, '$[*].error') IS NOT NULL   -- v 표기 없는 옛 행 (steps 배열이 최상위였던 형식)
 ORDER BY created_at DESC;
@@ -383,13 +384,33 @@ ORDER BY created_at DESC;
 특정 문구(`실행 오류` 등)로 거르면 정작 실패한 경우를 놓친다.
 `trace.steps[].error`에는 실제 쿼리 실패만 들어간다. 루프 가드가 남기는 제어용 기록(같은 쿼리 반복 등)은
 `note` 필드라 이 집계에 섞이지 않는다 — 정상적으로 답한 턴이 실패로 잡히지 않게 하기 위함.
-`trace.v`는 스키마 버전이다 (현재 2 — `{v, search, steps}`. 이 필드가 없는 행은 trace가 steps 배열 자체였던 옛 형식).
+`trace.v`는 스키마 버전이다 (현재 3 — `{v, outcome, …}`. 이 필드가 없는 행은 trace가 steps 배열 자체였던 옛 형식).
+
+`trace.outcome`은 그 요청이 무엇으로 끝났는지다 (v3부터 반드시 있다). 답변까지 간 요청만이 아니라
+**답변에 닿지 못한 요청도 반드시 한 행을 남긴다** — 서버 오류·거부된 입력·본문 크기 초과가 기록되지
+않으면, 정작 이 로그가 찾아내야 할 요청만 데이터에서 사라지고 장애는 '질문이 줄었다'로만 보인다.
+
+| `outcome` | 뜻 | 함께 남는 것 |
+| --- | --- | --- |
+| `answered` | 답변까지 갔다 | `search`, `steps` |
+| `error` | 처리 중 서버 오류(500) | `error`(오류 원문 — 화면에는 나가지 않는다) |
+| `rejected` | 입력 단계에서 거부(400/413) | `reason` = `no_message` / `empty_message` / `too_long` / `body_too_large` / `bad_body` |
+
+```sql
+-- 거부·오류 추이 (클라이언트 버그나 장애를 건수로 본다)
+SELECT JSON_VALUE(trace, '$.outcome') AS outcome,
+       JSON_VALUE(trace, '$.reason')  AS reason,
+       COUNT(*)
+FROM chat_log
+WHERE JSON_VALUE(trace, '$.outcome') <> 'answered'
+GROUP BY outcome, reason ORDER BY COUNT(*) DESC;
+```
 
 검색이 아무것도 못 찾은 질문 (지식/쿼리 신규 등록 후보 — `trace.search`에 검색 적중 수가 남는다):
 
 ```sql
 SELECT question, created_at FROM chat_log
-WHERE JSON_VALUE(trace, '$.search.knowledge') = 0
+WHERE JSON_VALUE(trace, '$.search.knowledge') = 0   -- search는 답변까지 간 요청(outcome='answered')에만 있다
   AND JSON_VALUE(trace, '$.search.qaMethods') = 0
   -- 경로B(qa_method 없이 쿼리만 등록)로 답한 질문을 후보로 잡지 않도록 쿼리 적중도 함께 본다.
   -- 라우팅이 동작하지 않는 소규모에서는 null이므로 그때는 이 조건을 적용하지 않는다.

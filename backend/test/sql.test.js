@@ -207,3 +207,30 @@ test('대소문자만 다른 바인드는 한 개로 센다', () => {
   assert.deepStrictEqual([...bindNames('SELECT 1 FROM t WHERE a = :x AND b = :y')], ['x', 'y']);
   assert.deepStrictEqual([...bindNames('SELECT 1 FROM t WHERE a = :job_id AND b = :job_id2')], ['job_id', 'job_id2']);
 });
+
+test('분석 캐시는 SQL 본문을 무한정 붙들지 않는다', () => {
+  // 캐시 키가 곧 query_sql 본문(TEXT 64KB)이다 — 항목 수로만 상한을 두면 최악 32MB가 프로세스
+  // 수명 내내 상주하는데, 정작 캐시가 지키는 값은 짧은 바인드 이름 몇 개다.
+  // 상한은 '보관하는 키의 총 길이'로 잡는다. 이 회귀는 오류를 남기지 않고 메모리만 조용히 는다.
+  const big = i => `SELECT ${'a'.repeat(100_000)} FROM t${i} WHERE x = :b${i}`;
+  const first = bindNames(big(0));
+  assert.deepStrictEqual([...first], ['b0']);
+  for (let i = 1; i <= 30; i++) bindNames(big(i));   // 총 3MB 유입 — 키 예산(1MB)을 훌쩍 넘긴다
+  // 캐시된 배열은 freeze된 같은 객체이므로 동일성으로 적중 여부를 본다
+  assert.notStrictEqual(bindNames(big(0)), first, '오래된 대형 SQL은 밀려나야 한다');
+});
+
+test('가드와 바인드 추출이 같은 파싱을 나눠 쓴다', () => {
+  // 같은 SQL을 반복 실행해도 파싱은 한 번이어야 한다 — 파싱은 SQL 전체를 도는 문자 단위
+  // 스캐너이고 동기 작업이라, 되풀이되면 그동안 이벤트 루프가 통째로 막힌다.
+  // (bindNames만 캐시되고 assertReadOnly는 조회마다 다시 훑고 있었다.)
+  const sql = `SELECT ${'x'.repeat(400_000)} FROM t WHERE a = :job_id`;
+  bindNames(sql);                       // 첫 호출에서 파싱
+  const t0 = process.hrtime.bigint();
+  for (let i = 0; i < 200; i++) assertReadOnly(sql);
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  assert.ok(ms < 200, `가드가 매번 다시 파싱하고 있다: ${ms.toFixed(0)}ms / 200회`);
+  // 판정 자체는 그대로여야 한다 (캐시가 결과를 바꾸지 않는다)
+  assert.equal(assertReadOnly(sql), sql);
+  assert.throws(() => assertReadOnly('DELETE FROM t'), /조회\(SELECT\) 쿼리만/);
+});

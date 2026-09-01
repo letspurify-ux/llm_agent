@@ -54,3 +54,15 @@ test('LIKE 이스케이프는 sql_mode에 좌우되지 않는 문자를 쓴다',
   assert.equal(likePattern('C:\\share'), '%C:\\share%');
   assert.equal(likePattern('가상계측'), '%가상계측%');
 });
+
+test('2음절 명사에 붙은 2글자 조사도 어간까지 벗겨낸다', () => {
+  // '2음절 명사 + 2글자 조사'는 한국어 질문에서 가장 흔한 형태인데, 2글자를 떼는 임계값이 5라서
+  // 4자 낱말의 어간이 한 번도 검색되지 않았다 — 정작 title·query_name에 들어 있는 것이 그 어간이다.
+  // 노이즈 조각('배치에')이 제목 가중치를 그대로 받는 쪽이라 실패가 조용하다: 쿼리는 성공하고
+  // 엉뚱한 행이 정답 위로 올라올 뿐이다.
+  for (const [word, stem] of [['배치에서', '배치'], ['작업으로', '작업'], ['계정으로', '계정'], ['서버까지', '서버']]) {
+    assert.ok(searchTokens(word).includes(stem), `${word} → ${stem}이 검색어에 있어야 한다`);
+  }
+  // 3자 낱말에서 2글자를 떼면 1자가 되므로 검색어가 되지 않는다 (2자 미만은 버린다)
+  assert.deepStrictEqual(searchTokens('배치가'), ['배치가', '배치']);
+});

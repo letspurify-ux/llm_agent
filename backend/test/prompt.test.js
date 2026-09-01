@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { buildPrompt } from '../src/llm-openai.js';
-import { MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN } from '../src/constants.js';
+import { MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK } from '../src/constants.js';
 
 const big = n => 'ㄱ'.repeat(n);
 
@@ -218,4 +218,68 @@ test('제목이 길어져도 지식·처리방법 줄이 예산을 뚫지 못한
   assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN, `제목이 예산을 넘겼다: ${p.length}`);
   // 잘렸다는 사실은 모델에게도 보여야 한다 (본문 절단과 같은 규칙)
   assert.match(p, /…\(생략\)/);
+});
+
+test('모든 섹션이 같은 규칙으로 예산을 센다', () => {
+  // 배분(renderSections)은 줄마다 개행 한 칸을 함께 빼고, 생략 안내 줄도 그 몫에서 나간다.
+  // 지식·처리방법·실행 이력은 개행을 세지 않고 안내 몫도 떼지 않아, 줄 수만큼 자기 몫을 넘겨 썼다.
+  // 그 초과는 배분 순서상 마지막인 쿼리 목록에서 나온다 — 버려지면 그 조회를 아예 못 하는 섹션이
+  // 다른 섹션의 계산 오차를 떠안는 셈이라, 손해가 가장 큰 곳으로 정확히 흘러간다.
+  // 줄 수가 많을수록 어긋남이 커지므로 짧은 줄을 아주 많이 넣어 확인한다.
+  const many = n => Array.from({ length: n }, (_, i) => ({ title: `T${i}`, content: `c${i}`, method: `m${i}` }));
+  const prompt = buildPrompt({
+    question: 'q', chat: [],
+    knowledge: many(2000), qaMethods: many(2000),
+    queries: Array.from({ length: 200 }, (_, i) => ({
+      query_name: `q${i}`, query_desc: 'd'.repeat(400), input_desc: 'i', output_desc: 'o',
+      query_sql: `SELECT * FROM t${i} WHERE a = :a`,
+    })),
+    history: Array.from({ length: 500 }, (_, i) => ({ query_name: `h${i}`, params: { a: i }, rows: [{ A: i }], totalRows: 1 })),
+  });
+  assert.ok(prompt.length <= MAX_PROMPT_TOTAL_LEN, `프롬프트가 예산을 넘었다: ${prompt.length}`);
+  // 음성 대조 — 예산이 실제로 빡빡했는지 (위 단언이 공허하지 않음을 보장)
+  assert.ok(prompt.length > MAX_PROMPT_TOTAL_LEN * 0.8, `예산을 거의 안 썼다: ${prompt.length}`);
+  // 가장 중요한 섹션이 실제로 살아남았는지 — 초과분이 여기서 나오면 이 줄이 먼저 사라진다
+  assert.match(prompt, /## 실행 가능한 쿼리 목록\n- q0:/);
+});
+
+test('모든 섹션이 예산에 꽉 찬 상태에서도 전체 상한을 넘지 않는다', () => {
+  // 짧은 줄로 촘촘히 채우면 각 섹션이 자기 예산에 딱 붙어, 회계가 한 칸이라도 어긋나면
+  // 그대로 전체 상한을 넘는다 (여유가 40자 안팎만 남는 상태다).
+  // 잡아내는 어긋남이 둘이다: 줄마다 개행 한 칸을 세지 않는 것, 그리고 생략 안내 줄의 몫을
+  // 떼지 않는 것(마지막에 배분받는 쿼리 목록에는 그 초과를 흡수해 줄 뒤 섹션이 없다).
+  // 넘긴 만큼이 그대로 컨텍스트 한도를 밀어내 그 요청의 남은 LLM 호출이 전부 실패한다.
+  for (const len of [1, 8, 60]) {
+    const items = n => Array.from({ length: n }, () => ({ title: 'T', content: 'c'.repeat(len), method: 'm'.repeat(len) }));
+    const prompt = buildPrompt({
+      question: 'q', chat: [],
+      knowledge: items(4000), qaMethods: items(4000),
+      history: Array.from({ length: 3000 }, () => ({ query_name: 'h', params: {}, rows: [{ A: 'x'.repeat(len) }], totalRows: 1 })),
+      queries: Array.from({ length: 400 }, (_, i) => ({
+        query_name: `q${i}`, query_desc: 'd'.repeat(len), input_desc: 'i', output_desc: 'o',
+        query_sql: 'SELECT 1 FROM t WHERE a=:a',
+      })),
+    });
+    assert.ok(prompt.length <= MAX_PROMPT_TOTAL_LEN, `줄 길이 ${len}에서 예산 초과: ${prompt.length}`);
+    // 음성 대조 — 안내가 실제로 붙는 상황이어야 이 단언이 뜻을 갖는다
+    assert.match(prompt, /생략\)/, `줄 길이 ${len}: 생략 안내가 붙는 상황이어야 한다`);
+  }
+});
+
+test('잘린 셀은 프롬프트를 지나도 앞부분이 달라지지 않는다', () => {
+  // 잘린 셀에는 TRUNC_MARK가 붙어 셀 상한보다 딱 그만큼 길다. 표시 상한을 셀 상한으로 잡으면
+  // '잘린 셀'만 여기서 한 번 더 잘려, 모델이 보는 앞부분이 실제로 자른 앞부분과 달라진다.
+  // 그러면 그 앞부분을 옮겨 적은 바인드 값을 실행 경계(oracle.js bindProblem)가 대조할 수 없고,
+  // 잘린 조각으로 조회해 0건을 얻은 뒤 그것을 '없다'로 단정하는 오답이 오류 없이 나간다.
+  // 절단 경계가 서로게이트 쌍을 가른 셀(앞부분이 한 칸 짧다)에서만 드러나므로 그 형태로 확인한다.
+  const cell = 'a'.repeat(MAX_CELL_LEN - 1) + TRUNC_MARK;
+  // 한 행이 스텝 예산을 넘도록 컬럼을 채운다 — 그래야 컬럼 단위 절단(fitCols)이 돈다
+  const wide = Object.fromEntries(Array.from({ length: MAX_RESULT_COLS }, (_, i) => [`C${i}`, cell]));
+  const prompt = buildPrompt({
+    question: 'q', chat: [], knowledge: [], qaMethods: [], queries: [],
+    history: [{ query_name: 'q', params: {}, rows: [wide], totalRows: 1 }],
+  });
+  assert.match(prompt, /컬럼 생략/, '컬럼 단위 절단이 도는 상황이어야 한다');
+  assert.ok(prompt.includes(cell), '잘린 셀이 원형 그대로 실려야 한다');
+  assert.ok(!prompt.includes('…' + TRUNC_MARK), '표시가 겹쳐 붙으면 앞부분이 달라진 것이다');
 });

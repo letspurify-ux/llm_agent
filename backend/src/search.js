@@ -90,7 +90,7 @@ function embedQuestion(question) {
     // 적중한 항목을 맨 뒤로 옮긴다 — 삽입 순서만 보고 밀어내면(FIFO) 가장 자주 묻는 질문이
     // 한 번 들어간 뒤 스쳐 가는 질문 100건에 그대로 밀려난다. 캐시는 가득 찬 채로 적중률만
     // 0에 수렴하고, 오류는 나지 않은 채 같은 질문마다 임베딩 왕복(최대 60초)이 되돌아온다.
-    // sql.js bindCache가 같은 이유로 같은 방식(delete 후 재삽입)을 쓴다 — 이쪽만 FIFO였다.
+    // sql.js analysisCache가 같은 이유로 같은 방식(delete 후 재삽입)을 쓴다 — 이쪽만 FIFO였다.
     embedCache.delete(question);
     embedCache.set(question, hit);
     return hit;
@@ -223,12 +223,21 @@ export function searchTokens(question) {
 const stripPunctuation = t => t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
 
 // 한국어는 조사가 붙어("가상계측이") 원형("가상계측")과 LIKE 매칭이 되지 않는다.
-// 3자 이상 토큰은 끝 1~2글자를 뗀 형태도 함께 검색해 조사를 흡수한다.
+// 끝 1~2글자를 뗀 형태도 함께 검색해 조사를 흡수한다.
+//
+// 임계값의 근거는 하나다: 조사를 뗀 형태도 2자 이상이어야 검색어로 쓸모가 있다
+// (1자 토큰은 searchTokens가 어차피 버리고, 버리지 않더라도 어지간한 본문에 다 들어 있다).
+// 그래서 1글자를 떼는 데는 3자, 2글자를 떼는 데는 4자가 필요하다.
+// 2글자 조사 쪽 임계값이 5였던 탓에 '2음절 명사 + 2글자 조사'(배치에서, 작업으로, 계정으로 —
+// 한국어 질문에서 가장 흔한 형태다)의 어간이 한 번도 검색되지 않았다: '배치에서'는
+// ['배치에서', '배치에']로만 확장돼, 정작 title·query_name에 들어 있는 '배치'로는 점수가 0이고
+// 노이즈 조각인 '배치에'가 제목 가중치(TITLE_WEIGHT×3)를 그대로 받았다.
+// 쿼리는 성공하므로 오류가 남지 않는다 — 엉뚱한 행이 정답 위로 올라올 뿐이다.
 function expandToken(token) {
   const variants = [token];
   if (/[가-힣]$/.test(token)) {
     if (token.length >= 3) variants.push(token.slice(0, -1));
-    if (token.length >= 5) variants.push(token.slice(0, -2));
+    if (token.length >= 4) variants.push(token.slice(0, -2));
   }
   return variants;
 }

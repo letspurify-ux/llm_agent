@@ -101,7 +101,13 @@ export function sanitizeDecision(d) {
     return answer.length > MAX_ANSWER_LEN ? { ...d, answer: clipAnswer(answer) } : d;
   }
   if (d.action !== 'run_query') return d;
-  const clipVal = v => {
+  // 이름에 '바인드(Bind)'를 박아 두는 이유: llm-openai.js에도 값 절단 규칙이 하나 더 있는데
+  // 뜻이 다르다 (그쪽은 프롬프트 표시용이라 셀 상한 기준이고 항상 잘린 형태를 돌려준다 —
+  // clipDisplayValue). 여기 규칙은 '실행에 쓸 값'의 상한이다: 상한을 넘으면 TRUNC_MARK를 붙여
+  // 실행 경계(oracle.js bindProblem)가 소리 나게 거부하게 만든다.
+  // 두 규칙이 한때 같은 이름(clipVal)을 쓰고 있었는데, 이름이 같으면 '값을 어떻게 묶는가'를
+  // 바꾸는 변경이 한쪽에만 들어가도 아무 데서도 드러나지 않는다.
+  const clipBindValue = v => {
     if (typeof v === 'string') return v.length > MAX_BIND_LEN ? clipText(v, MAX_BIND_LEN) + TRUNC_MARK : v;
     if (v === null || typeof v === 'number' || typeof v === 'boolean') return v;
     // 구조(객체·배열)는 bindProblem이 어차피 거부한다 — 거대한 구조만 문자열로 확정해 크기를 묶는다
@@ -116,7 +122,7 @@ export function sanitizeDecision(d) {
     Object.entries(d.params || {})
       .slice(0, MAX_DECISION_PARAMS)
       .filter(([k]) => k.length <= MAX_BIND_NAME_LEN)
-      .map(([k, v]) => [k, clipVal(v)])
+      .map(([k, v]) => [k, clipBindValue(v)])
   );
   // trim: 이름 앞뒤 공백은 등록 철자와의 비교(agent.js resolveQuery)를 어긋내는 것 외에 아무 역할이 없다
   return { action: 'run_query', query_name: clipText(String(d.query_name).trim(), 200), params };

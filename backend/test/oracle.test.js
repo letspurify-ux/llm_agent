@@ -59,16 +59,20 @@ test('잘린 표시가 붙은 바인드 값은 실행 전에 거부된다', asyn
   );
 });
 
-test('정확히 절단 길이인 값만 잘린 조각으로 의심한다', async () => {
-  // 마크를 뗀 조각은 정확히 MAX_CELL_LEN자다 — 이력 밖(이전 턴 답변)에서 온 조각을 여기서 거른다.
+test('잘린 조각인지는 길이가 아니라 실제로 자른 값과의 대조로 판정한다', async () => {
+  // 마크를 뗀 조각은 '우리가 자른 값'과 글자까지 같다 — 그 대조로만 거른다.
+  const clipped = normalizeCells({ C: 'x'.repeat(MAX_CELL_LEN + 50) }).C;
+  const stripped = clipped.slice(0, -TRUNC_MARK.length);
   await assert.rejects(
-    runQuery(withBind(), { job_id: 'x'.repeat(MAX_CELL_LEN) }),
+    runQuery(withBind(), { job_id: stripped }, v => v === stripped),
     e => e.safe === true && /잘린 값/.test(e.message)
   );
-  // 그보다 긴 값은 질문에서 온 정당한 입력일 수 있다 — 통과해야 한다 (mock은 0건을 돌려줄 뿐).
-  // '이상'으로 잡으면 자유 검색어·경로 같은 긴 값으로는 등록 쿼리를 영영 실행할 수 없다.
-  const r = await runQuery(withBind(), { job_id: 'x'.repeat(MAX_CELL_LEN + 50) });
-  assert.deepStrictEqual(r.rows, []);
+  // 같은 길이라도 우리가 자른 적 없는 값은 정당한 입력이다 — 통과해야 한다 (mock은 0건을 돌려줄 뿐).
+  // 길이로 판정하면 사용자가 붙여넣은 200자짜리 검색어·경로로는 등록 쿼리를 영영 실행할 수 없다.
+  for (const len of [MAX_CELL_LEN - 1, MAX_CELL_LEN, MAX_CELL_LEN + 50]) {
+    const r = await runQuery(withBind(), { job_id: 'y'.repeat(len) });
+    assert.deepStrictEqual(r.rows, [], `${len}자 값은 잘린 조각이 아니다`);
+  }
 });
 
 test('ORACLE_MOCK 표기를 흡수하고 모르는 값은 실제 접속으로 두되 알린다', () => {
@@ -102,19 +106,20 @@ test('ORACLE_MOCK 표기를 흡수하고 모르는 값은 실제 접속으로 �
 test('서로게이트 경계에서 잘린 조각도 잘린 값으로 걸러진다', async () => {
   // clipText는 절단 경계가 서로게이트 쌍을 가르면 짝 잃은 상위 서로게이트를 하나 더 뗀다 —
   // 그 셀의 잘린 앞부분은 MAX_CELL_LEN자가 아니라 MAX_CELL_LEN-1자다.
-  // 길이 판정이 MAX_CELL_LEN 하나만 보면 이모지가 든 셀에서만 가드가 조용히 빠져,
-  // 마크를 뗀 조각이 그대로 바인드되고 0건이 나온다 — 모델은 그 0건을 "그런 데이터가 없다"로
-  // 읽으므로 오류 하나 없이 확신에 찬 오답이 나간다. (이력 밖에서 온 조각이라 이력 대조로는 잡을 수 없다)
+  // 길이로 판정하던 시절에는 이 한 칸 때문에 이모지가 든 셀에서만 가드가 조용히 빠졌다.
+  // 대조로 판정하면 절단 길이가 몇이든 상관이 없다 — 값이 같은지만 보기 때문이다.
   const clipped = normalizeCells({ C: 'a'.repeat(MAX_CELL_LEN - 1) + '\u{1F600}' + 'tail' }).C;
   const stripped = clipped.slice(0, -TRUNC_MARK.length);
   assert.equal(stripped.length, MAX_CELL_LEN - 1, '이 셀의 잘린 앞부분은 한 칸 짧다');
   await assert.rejects(
-    runQuery(withBind(), { job_id: stripped }),
+    runQuery(withBind(), { job_id: stripped }, v => v === stripped),
     e => e.safe === true && /잘린 값/.test(e.message)
   );
-  // 그보다 한 칸 더 짧은 값은 절단으로 생길 수 없다 — 정당한 입력이므로 통과해야 한다.
-  const r = await runQuery(withBind(), { job_id: 'x'.repeat(MAX_CELL_LEN - 2) });
-  assert.deepStrictEqual(r.rows, []);
+  // 마크가 그대로 붙어 온 값은 판정자 없이도 걸린다 (판정 경로가 둘인 것을 함께 확인한다).
+  await assert.rejects(
+    runQuery(withBind(), { job_id: clipped }),
+    e => e.safe === true && /잘린 값/.test(e.message)
+  );
 });
 
 test('컬럼 수가 상한을 넘는 행은 드라이버 경계에서 잘리고 표시가 남는다', () => {

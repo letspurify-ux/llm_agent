@@ -5,8 +5,8 @@
 // 어느 쪽도 오류를 남기지 않아 로그로는 알 수 없다. 테스트가 유일한 방어선이다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { loopGuard, paramKey, normalizeChat, fallbackAnswer } from '../src/agent.js';
-import { MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_ANSWER_LEN, MAX_RESULT_ROWS, MAX_RESULT_COLS } from '../src/constants.js';
+import { loopGuard, paramKey, normalizeChat, fallbackAnswer, normalizeQuestion, clippedCopyDetector, answerOf } from '../src/agent.js';
+import { MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_ANSWER_LEN, MAX_RESULT_ROWS, MAX_RESULT_COLS, MAX_CELL_LEN, TRUNC_MARK } from '../src/constants.js';
 
 const ran = (name, params, rows = [{ A: 1 }]) => ({ query_name: name, params, rows, totalRows: rows.length });
 const failed = (name, params) => ({ query_name: name, params, error: 'ORA-00942' });
@@ -169,9 +169,9 @@ test('이력 절단이 서로게이트 쌍을 쪼개지 않는다', () => {
   assert.equal(preSplit.text, 'ab');
 });
 
-// 이력의 잘린 셀에서 마크만 떼고 옮겨 적은 값에 대한 가드는 여기 없다 —
-// 그 앞부분의 길이는 반드시 clipText가 남기는 절단 길이이므로 oracle.js bindProblem이
-// Oracle 접속 전에 같은 문구로 이미 거부한다 (그쪽 isClippedLen 주석과 test/oracle.test.js 참고).
+// 이력의 잘린 셀에서 마크만 떼고 옮겨 적은 값을 거르는 판정 자체는 실행 경계에 있다
+// (oracle.js bindProblem). 이 파일이 검증하는 것은 그 판정에 넘겨줄 '무엇을 잘랐는가'를
+// 만드는 쪽이다 — 아래 clippedCopyDetector 테스트, 그리고 test/oracle.test.js.
 
 test('내용이 빈 대화 턴은 프롬프트에 실리지 않는다', () => {
   // 빈 턴은 '- 사용자: ' 한 줄로 실려 모델이 내용 없는 발화를 맥락으로 읽는다.
@@ -266,4 +266,82 @@ test('클라이언트가 쪼개 보낸 서로게이트 조각이 프롬프트로
   assert.equal(normalizeChat([{ role: 'user', text: '배포 완료 🎉' }])[0].text, '배포 완료 🎉');
   // 조각 하나뿐인 턴은 빈 턴이 되므로 걸러진다 (프롬프트에 '- 사용자: ' 한 줄만 남지 않게)
   assert.deepStrictEqual(normalizeChat([{ role: 'user', text: '\uDC00' }]), []);
+});
+
+test('질문 정규화는 서버 입력 검증과 같은 값을 만든다', () => {
+  // 규칙이 두 곳에 각자 적혀 있었다: server.js는 서로게이트를 걷어낸 뒤 trim까지 했고
+  // handleQuestion은 하지 않아, 같은 입력이 어느 문으로 들어오느냐에 따라 다른 질문이 됐다.
+  // 짝 잃은 코드유닛은 유효한 UTF-8이 아니라서 LLM·임베딩 요청이 통째로 거부되거나
+  // 본문이 U+FFFD로 조용히 훼손된다 (constants.stripLoneSurrogates 참고).
+  assert.equal(normalizeQuestion('  BATCH001 상태  '), 'BATCH001 상태');
+  assert.equal(normalizeQuestion('\uD83D 재시작은 어떻게 해?'), '재시작은 어떻게 해?');
+  assert.equal(normalizeQuestion('\uDC00'), '');
+  assert.equal(normalizeQuestion(undefined), '');
+  // 멱등이어야 두 경계에서 모두 불러도 값이 갈라지지 않는다
+  const once = normalizeQuestion(' a\uD83Db ');
+  assert.equal(normalizeQuestion(once), once);
+});
+
+test('잘린 셀의 앞부분만 옮겨 적은 바인드 값을 걸러낸다', () => {
+  // 모델은 잘린 셀을 보면 TRUNC_MARK를 뗀 앞부분만 옮겨 적는 일이 잦다. 그 값으로 조회하면
+  // 반드시 0건이 나오고, 모델은 그 0건을 "그런 데이터가 없다"로 읽는다 — 오류가 한 줄도
+  // 남지 않는 오답이다. 반대로 길이로 짐작하면 정당한 200자 입력을 영영 거부한다.
+  const clipped = 'a'.repeat(MAX_CELL_LEN) + TRUNC_MARK;
+  const prefix = 'a'.repeat(MAX_CELL_LEN);
+  // 절단 경계가 서로게이트 쌍을 가르면 앞부분이 한 칸 짧다 — 길이가 몇이든 대조는 성립해야 한다
+  const shortClipped = 'b'.repeat(MAX_CELL_LEN - 1) + TRUNC_MARK;
+  const shortPrefix = 'b'.repeat(MAX_CELL_LEN - 1);
+
+  const d = clippedCopyDetector([{ role: 'assistant', text: `| O-777 | ${shortClipped} |` }]);
+  assert.equal(d.isCopy(prefix), false, '아직 조회하지 않았으면 이번 요청의 값은 모른다');
+  assert.equal(d.isCopy(shortPrefix), true, '지난 턴 답변에 실렸던 앞부분은 대화 이력으로 잡는다');
+
+  // 마크에 '붙어 있는' 문자열을 찾는 방식이면 마크 바로 앞의 짧고 정당한 값이 전부 걸린다.
+  // 판정은 '값 전체가 우리가 자른 앞부분과 같은가'여야 한다 — 붙어 있는지가 아니라.
+  for (let n = 1; n <= 60; n++) {
+    const tail = shortPrefix.slice(-n);
+    assert.equal(d.isCopy(tail), false, `마크 앞 ${n}자 조각은 잘린 조각이 아니다`);
+  }
+  assert.equal(d.isCopy(''), false, '빈 문자열이 걸리면 안 된다 (값 없음과 문구가 뒤바뀐다)');
+
+  d.record([{ A: clipped, B: 'ok', C: null, D: 12345 }]);
+  assert.equal(d.isCopy(prefix), true, '이번 요청에서 자른 셀의 앞부분');
+  assert.equal(d.isCopy(clipped), false, '마크가 붙은 값은 bindProblem이 따로 본다');
+
+  // 길이가 같아도 우리가 자른 적 없는 값은 통과해야 한다 — 이것이 길이 판정의 오탐이었다
+  for (const v of ['x'.repeat(MAX_CELL_LEN), 'x'.repeat(MAX_CELL_LEN - 1), 'ok']) {
+    assert.equal(d.isCopy(v), false, `자른 적 없는 값은 통과해야 한다 (${v.length}자)`);
+  }
+});
+
+test('잘린 값 판정이 실행 경계와 이어져 있다', async () => {
+  // 판정자를 만드는 곳(agent)과 쓰는 곳(oracle)이 갈라지면 가드가 통째로 무력해지는데,
+  // 그 실패는 '조회가 0건'으로만 보여 오류를 남기지 않는다.
+  const { runQuery } = await import('../src/oracle.js');
+  process.env.ORACLE_MOCK = '1';
+  const row = { query_name: 'batch_job_status', query_sql: 'SELECT 1 FROM T WHERE A = :job_id', target_db_name: 'D' };
+  const clipped = 'a'.repeat(MAX_CELL_LEN) + TRUNC_MARK;
+  const d = clippedCopyDetector([]);
+  d.record([{ A: clipped }]);
+  await assert.rejects(
+    runQuery(row, { job_id: 'a'.repeat(MAX_CELL_LEN) }, d.isCopy),
+    e => e.safe === true && /잘린 값/.test(e.message)
+  );
+  // 같은 길이지만 자른 적 없는 값은 실행돼야 한다 (mock은 0건을 돌려줄 뿐)
+  const r = await runQuery(row, { job_id: 'z'.repeat(MAX_CELL_LEN) }, d.isCopy);
+  assert.deepStrictEqual(r.rows, []);
+});
+
+test('쓸 수 있는 답변인지는 두 답변 경로가 같은 함수로 판정한다', () => {
+  // 답변이 나가는 경로가 둘이다(루프 안에서 답한 결정, 마지막 강제 답변). 한쪽만 판정을 가지면
+  // 나머지 한쪽이 조용히 보호 밖에 남는다 — 실제로 그랬다. 결정 경계(llm.js sanitizeDecision)가
+  // answer의 타입을 일부러 정규화하지 않으므로 falsy한 answer가 그대로 도달할 수 있고,
+  // 그러면 빈 말풍선이 화면에 뜨고 그 빈 턴이 다음 질문의 맥락으로 되돌아온다.
+  assert.equal(answerOf({ action: 'answer', answer: '정상 답변' }), '정상 답변');
+  for (const bad of ['', 0, null, undefined, false, NaN]) {
+    assert.equal(answerOf({ action: 'answer', answer: bad }), null, `falsy answer는 폴백으로 (${JSON.stringify(bad)})`);
+  }
+  assert.equal(answerOf({ action: 'run_query', query_name: 'q' }), null, '조회 결정은 답변이 아니다');
+  assert.equal(answerOf(null), null);
+  assert.equal(answerOf(undefined), null);
 });
