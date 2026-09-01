@@ -42,20 +42,29 @@ export const MAX_RESULT_COLS = 30;
 //    컬럼 10개짜리 조회 한 번이면 한 스텝에 4만 자가 들어간다).
 // 전체 예산이 하나면 어느 섹션이 길어지든 합계는 반드시 이 값 안에 든다.
 //
-// 값은 128k 컨텍스트 모델을 기준으로 잡았다. 앞선 값(22k자)은 32k 모델(Qwen2.5-32B-Instruct)
-// 기준이었고, 그 상한에서는 정작 가장 값진 것이 잘리고 있었다 — 실측(모든 섹션이 각자 상한까지
-// 찬 요청): 지식 20/20·쿼리 35/35는 전부 실리는데 Q&A 처리 방법 10/20, 실행 이력 2/5.
-// 이력은 앞선 스텝이 Oracle 왕복을 태워 가져온 결과이자 답변의 근거 그 자체다.
+// 값은 128k 컨텍스트 모델을 기준으로 잡았다. 앞선 값들과 그때 잘리던 것:
+//   22k자 — 32k 모델(Qwen2.5-32B-Instruct) 기준. 지식 20/20·쿼리 35/35는 실리는데 Q&A 처리 방법
+//           10/20, 실행 이력 2/5. 이력은 앞선 스텝이 Oracle 왕복을 태워 가져온 결과이자 답변의 근거 그 자체다.
+//   40k자 — 최악 25k 토큰(128k의 20%)으로 안전했지만, 1000자짜리 항목이면 지식·처리 방법은 검색
+//           후보 20건 중 7건·9건만 실리고, 실행 이력은 5스텝이 각자 상한까지 차면 강제 답변 스텝에서
+//           1번 스텝이 빠졌다(이력 최소 몫 14k < 5 × 3k + 머리말). 100k 토큰이 놀면서 근거가 잘리고 있었다.
 //
 // 상한은 '천장'이지 '할당량'이 아니다. 항목마다 개별 상한(MAX_PROMPT_ITEM_LEN·SQL·STEP)이 이미
 // 걸려 있고 건수도 유한하므로, 평범한 요청은 이 값을 올려도 그대로다 (실측: 4,809자 요청은
 // 상한이 64k여도 4,809자). 커지는 것은 '원래 잘렸을 요청'뿐이고, 그때는 싣는 쪽이 낫다.
-// 한국어는 토큰 밀도가 높아 문자 수와 토큰 수가 거의 1:1까지 갈 수 있으므로 문자 기준으로 묶는다.
-// 이 예산 밖에 있는 몫: 최근 대화(MAX_CHAT_TURNS×MAX_CHAT_LEN = 3k)와 질문(MAX_QUESTION_LEN = 2k) =
-// 이미 다른 상한으로 묶여 있는 5k, 그리고 시스템 프롬프트 ~1.8k.
-// 최악 실측 36.4k자 ≈ 25k토큰(+시스템) → 128k 모델에서 20% 남짓, 답변 몫이 넉넉히 남는다.
-// 컨텍스트가 더 작은 모델로 바꾸면 이 값부터 되돌릴 것.
-export const MAX_PROMPT_TOTAL_LEN = 40_000;
+//
+// 문자 기준으로 묶는 이유: 토크나이저는 모델(서버)마다 다르고 이 프로세스에는 없다. 문자↔토큰 비율은
+// Qwen2.5 토크나이저로 실측했다 — 한국어 산문 1.5자/토큰, 쿼리 목록(SQL 섞임) 1.9, 결과 JSON 2.2,
+// 프롬프트 전체 1.8. 한국어에 덜 우호적인 토크나이저(cl100k류)는 각각 1.2 / 1.6 / 2.1 / 1.5.
+// 이 예산 밖에 있는 몫: 최근 대화(MAX_CHAT_TURNS×MAX_CHAT_LEN = 9k)와 질문(MAX_QUESTION_LEN = 2k) =
+// 이미 다른 상한으로 묶여 있는 11k, 그리고 시스템 프롬프트 ~1.8k.
+// 최악(네 섹션이 예산에 꽉 찬 요청 + 대화 + 질문 ≈ 75k자) ≈ 42k 토큰, 비우호적 토크나이저라도 ≈ 50k
+// (+시스템 1.1~1.4k) → 128k의 33~40%. 출력 가드(MAX_COMPLETION_TOKENS)를 더해도 절반 남짓이다.
+// 더 올리지 않는 이유: 32B급 모델의 판단 품질이 유지되는 구간(~40k 토큰)이고, 스텝마다 통째로
+// 다시 보내므로(prefix caching이 재사용하는 것은 앞부분뿐) prefill 비용이 스텝 수만큼 곱해진다.
+// 컨텍스트가 더 작은 모델로 바꾸면 이 값부터 되돌릴 것 (MAX_COMPLETION_TOKENS와 함께 — 둘의 합이
+// 컨텍스트 안에 들어야 한다).
+export const MAX_PROMPT_TOTAL_LEN = 64_000;
 
 // 섹션별 최소 몫 — 다른 섹션이 아무리 길어도 이만큼은 보장된다.
 // 배분 순서(= 이 객체의 선언 순서)는 우선순위의 '역순'이다: 배분할 때 뒤 섹션들의 최소 몫을
@@ -67,25 +76,36 @@ export const MAX_PROMPT_TOTAL_LEN = 40_000;
 // 합계는 반드시 MAX_PROMPT_TOTAL_LEN 이하여야 한다 (아래에서 검증한다 — 이 검증이 없어서
 // 섹션 상한과 전체 상한이 조용히 어긋났다).
 export const PROMPT_FLOORS = {
-  knowledge: 5_000,
-  qaMethods: 5_000,
-  history: 14_000,
-  queries: 14_000,
+  knowledge: 10_000, // 항목 상한(MAX_PROMPT_ITEM_LEN) 기준 10건 — 검색 후보(search.js LIMIT 20)의 절반
+  qaMethods: 10_000, // 같음
+  history: 20_000,   // MAX_STEPS 스텝이 각자 상한까지 차도 전부 실리는 크기 — llm-openai.js가 로드 시 검증한다
+  queries: 20_000,   // 등록 30건(agent.js MAX_PROMPT_QUERIES)이 자세한 형태로 ~600자씩 — 남는 여유도 전부 여기로
 };
 
-const FLOOR_SUM = Object.values(PROMPT_FLOORS).reduce((a, b) => a + b, 0);
+// 섹션 본문이 아닌 고정 틀의 몫 — 섹션 제목 줄(건수 포함)·블록 사이 빈 줄·질문 제목·지시 블록
+// (현재 시각 한 줄과 지시문). 실측 205자에 건수 자릿수 여유를 더해 잡았다 (llm-openai buildPrompt).
+// 이 몫을 떼지 않으면 네 섹션이 각자 예산에 꽉 찬 요청에서 정확히 이 길이만큼 전체 상한을
+// 넘는다 — 회귀 테스트가 그 상태를 만들어 잡아내지만, 값이 어긋나면 그 전까지는 조용하다.
+export const PROMPT_FRAME_RESERVE = 300;
+
+const FLOOR_SUM = Object.values(PROMPT_FLOORS).reduce((a, b) => a + b, 0) + PROMPT_FRAME_RESERVE;
 if (FLOOR_SUM > MAX_PROMPT_TOTAL_LEN) {
   // import 시점에 터뜨린다 — 예산이 어긋난 채로 뜨면 등록이 늘어난 뒤에야, 그것도
   // '모든 질문이 LLM 호출 실패'라는 원인이 안 보이는 형태로 드러난다.
   throw new Error(
-    `Sum of prompt section floors (${FLOOR_SUM}) exceeds the total budget (${MAX_PROMPT_TOTAL_LEN}) — check constants.js.`
+    `Sum of prompt section floors and frame reserve (${FLOOR_SUM}) exceeds the total budget (${MAX_PROMPT_TOTAL_LEN}) — check constants.js.`
   );
 }
 
 export const MAX_PROMPT_ITEM_LEN = 1000;  // 항목 본문 1건
 export const MAX_PROMPT_SQL_LEN = 2000;   // query_sql — 잘려도 바인드명은 프롬프트가 따로 싣는다
-// 실행 이력 1스텝의 상한. 스텝 하나가 이력 예산을 통째로 먹으면 나머지 스텝이 전부 밀려난다 —
+// 에이전트 루프의 스텝 상한(agent.js). 여기 두는 이유: 실행 이력의 최소 몫(PROMPT_FLOORS.history)은
+// 'MAX_STEPS 스텝이 각자 상한까지 차도 전부 실린다'가 근거인데, 그 검증(llm-openai.js)이 이 값을
+// 봐야 한다. agent.js 안의 리터럴이면 스텝 수를 올리는 변경이 이력 몫과 어긋나도 아무 데서도 드러나지 않는다.
+export const MAX_STEPS = 5;
+// 실행 이력 1스텝의 결과 JSON 상한. 스텝 하나가 이력 예산을 통째로 먹으면 나머지 스텝이 전부 밀려난다 —
 // 다단계 절차에서 앞 단계의 결과가 사라지면 모델이 그 단계를 다시 실행하려 든다.
+// (한 줄의 상한은 이 값 + 머리말이다 — 쿼리명·대상DB·params·건수 안내. 각각 이름 있는 상한으로 묶여 있다.)
 export const MAX_PROMPT_STEP_LEN = 3000;
 // 실행 이력 한 줄의 params 표시 상한 — rows와 달리 params는 LLM이 만든 값이라 그 자체로는 상한이
 // 없고, renderHistory는 최소 1줄을 반드시 실으므로 줄이 유계가 아니면 전체 예산이 그대로 뚫린다.
@@ -97,8 +117,12 @@ export const MAX_PROMPT_PARAMS_LEN = 500;
 export const MAX_EMBED_TEXT_LEN = 4000;
 
 // 서버가 클라이언트에서 받는 대화 이력 상한 — 프런트가 페이로드를 맞추는 기준이기도 하다.
-export const MAX_CHAT_TURNS = 6;  // LLM에 전달할 최근 대화 턴 수 (프롬프트 비대화 방지)
-export const MAX_CHAT_LEN = 500;  // 턴별 최대 길이
+// 프런트(App.jsx HISTORY_TURNS·HISTORY_LEN)가 같은 값으로 페이로드를 자른다 — 함께 고칠 것.
+export const MAX_CHAT_TURNS = 6;   // LLM에 전달할 최근 대화 턴 수 (프롬프트 비대화 방지)
+// 턴별 최대 길이. 에이전트 턴은 직전 답변이고 그 안의 표가 후속 질문("그럼 김철수는?")의 근거다 —
+// 500자에서는 표의 머리만 남아 모델이 방금 무엇을 보여줬는지 모른 채 답했다.
+// 6턴 × 1,500자 = 9k자 ≈ 5k 토큰, 128k 컨텍스트에서 가장 싼 품질 몫이다 (MAX_PROMPT_TOTAL_LEN 참고).
+export const MAX_CHAT_LEN = 1500;
 
 // 질문 한 건의 최대 길이 — 서버 입력 검증(server.js), 프롬프트 예산 계산(위 주석), 회귀 테스트가
 // 같은 값을 봐야 한다. 예산의 모든 항이 이름 있는 export인데 이 항만 리터럴로 흩어져 있으면
@@ -122,7 +146,23 @@ export const MAX_BIND_LEN = MAX_QUESTION_LEN;
 // 그보다 넉넉히 잡아 정당한 답변은 건드리지 않으면서 퇴화한 응답만 묶는다.
 // 총량과 연동된 값이므로 MAX_PROMPT_TOTAL_LEN을 고치면 여기도 함께 본다 —
 // 한쪽만 올리면 근거는 다 실렸는데 그것을 요약한 답변이 상한에 걸리는 조합이 생긴다.
-export const MAX_ANSWER_LEN = 45_000;
+// 실제로 이 값에 닿는 LLM 답변은 없다 — 모델 출력을 실질적으로 묶는 것은 시간(llm-openai.js
+// TIMEOUT_MS 120초, 30~50 tok/s면 4~6k 토큰)과 폭주 가드(MAX_COMPLETION_TOKENS)다. 이 값은 그 둘이
+// 못 보는 경로, 즉 조회 결과와 지식 본문을 그대로 싣는 폴백 답변(llm.js renderAnswer)의 천장이다.
+export const MAX_ANSWER_LEN = 70_000;
+
+// LLM 한 번 호출의 출력 토큰 상한(max_tokens) — 답변 길이 상한이 아니라 폭주 가드다.
+// 답변 길이는 위 MAX_ANSWER_LEN이 파싱 뒤에 묶는다(토큰에서 자른 JSON은 파싱 자체가 안 돼 답변을
+// 통째로 잃는다 — llm.js 참고). 이 값은 그보다 훨씬 위에 두어 정당한 결정은 건드리지 않고,
+// temperature=0의 반복 퇴화만 끊는다. 보내지 않으면 vLLM은 '남은 컨텍스트 전부'(≈ 100k 토큰)를
+// 상한으로 잡는다: 클라이언트 타임아웃의 abort가 프록시·OpenRouter를 넘어 서버의 생성을 멈춘다는
+// 보장이 없고, 유료 API는 그 토큰이 그대로 과금되며, 로그에는 원인 모를 타임아웃만 남는다
+// (finish_reason=length 로 남기면 '폭주'와 '느림'이 구분된다 — llm-openai.js chatCompletion).
+// 값의 근거: 정당한 결정 JSON은 근거의 요약이라 5k 토큰을 넘기 어렵고, 사고 과정을 쓰는 모델은
+// 그 토큰도 이 상한에 포함되므로(vLLM) reasoning_effort=low의 몫(수 k)을 더해도 16k는 넉넉하다.
+// 입력 최악 ≈ 50k 토큰(MAX_PROMPT_TOTAL_LEN 주석)에 이 값을 더해도 128k의 절반 남짓이다.
+// 컨텍스트가 더 작은 모델로 바꾸면 MAX_PROMPT_TOTAL_LEN과 함께 되돌릴 것.
+export const MAX_COMPLETION_TOKENS = 16_384;
 
 // 길이 상한으로 문자열을 자르는 단일 지점.
 // 단순 slice는 서로게이트 쌍(이모지 등 BMP 밖 문자)을 반으로 쪼개 짝 잃은 코드유닛을 남긴다.

@@ -114,14 +114,25 @@ export function sanitizeDecision(d) {
     const s = JSON.stringify(v) ?? String(v);
     return s.length > MAX_BIND_LEN ? clipText(s, MAX_BIND_LEN) + TRUNC_MARK : v;
   };
+  // 키 앞의 ':'는 뗀다. 프롬프트가 바인드를 SQL 표기 그대로(':job_id') 보여주므로 모델이 키를
+  // ":job_id"로 적는 일이 실제로 있는데, 실행 경계의 이름 대조(constants.bindValue)는 콜론을 모른다 —
+  // 값을 정확히 채워 보냈는데도 '값 없음'으로 실패하고, hint는 값을 확인하라고만 하므로 모델은
+  // 같은 키로 다시 시도한다. 이름의 뜻을 바꾸는 절단이 아니라 표기 차이의 정규화이므로 여기서
+  // 흡수한다 (반대로 콜론을 지식 삼아 SQL 쪽 바인드 이름을 바꾸는 일은 없다 — 바인드 이름에
+  // ':'가 올 수 없으므로 앞의 콜론은 언제나 표기다).
+  // 뗀 뒤 같은 이름이 둘이면(":a"와 "a") 먼저 온 것을 남긴다 — Object.fromEntries는 나중 것을
+  // 남기므로 명시적으로 걸러야 한다. 어느 쪽을 남기든 '모델이 적은 값'이긴 하지만, 먼저 적은
+  // 쪽이 그 쿼리를 고르며 채운 값이고 뒤의 것은 같은 값의 되풀이인 경우가 대부분이다.
   // Object.fromEntries로 다시 조립한다 — params[k] = v 대입은 '__proto__' 키에서 조용히 사라진다.
   // 이름은 자르지 않고 상한을 넘으면 버린다 (MAX_BIND_NAME_LEN 주석 참고) — 자르면 어떤 실제
   // 바인드와도 대응하지 못하는 이름을 만들면서 겹침 처리까지 떠안게 된다. 원본 키는 유일하므로
-  // 자르지 않는 한 뭉개짐 자체가 생기지 않는다.
+  // 자르지 않는 한 뭉개짐 자체가 생기지 않는다 (콜론 제거로 생기는 겹침만 위 규칙으로 거른다).
+  const seen = new Set();
   const params = Object.fromEntries(
     Object.entries(d.params || {})
       .slice(0, MAX_DECISION_PARAMS)
-      .filter(([k]) => k.length <= MAX_BIND_NAME_LEN)
+      .map(([k, v]) => [k.replace(/^:/, ''), v])
+      .filter(([k]) => k.length <= MAX_BIND_NAME_LEN && !seen.has(k) && seen.add(k))
       .map(([k, v]) => [k, clipBindValue(v)])
   );
   // 조회대상 DB 선택. 이 경계는 화이트리스트라 여기에 자리를 만들지 않으면 모델이 골라 보낸

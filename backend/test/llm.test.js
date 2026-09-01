@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { llm, renderAnswer, sanitizeDecision, llmProvider } from '../src/llm.js';
-import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN } from '../src/constants.js';
+import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN } from '../src/constants.js';
 
 const ok = (name, rows, extra = {}) => ({ query_name: name, params: {}, rows, totalRows: rows.length, ...extra });
 
@@ -134,6 +134,24 @@ test('바인드로 쓸 수 없는 긴 이름은 뭉개거나 개명하지 않고
   const legal = 'b'.repeat(128);
   const ok = sanitizeDecision({ action: 'run_query', query_name: 'q', params: { [legal]: 'v' } });
   assert.deepStrictEqual(Object.keys(ok.params), [legal]);
+});
+
+test('바인드 키 앞의 콜론은 표기로 보고 뗀다', () => {
+  // 프롬프트는 바인드를 SQL 표기 그대로(':job_id') 보여주므로 모델이 키를 ":job_id"로 적는 일이
+  // 실제로 있다. 실행 경계의 이름 대조(constants.bindValue)는 콜론을 모르므로 값을 정확히 채우고도
+  // '값 없음'으로 실패하고, hint는 값을 확인하라고만 해서 모델은 같은 키로 다시 시도한다.
+  const d = sanitizeDecision({ action: 'run_query', query_name: 'q', params: { ':job_id': 'BATCH001', ':n': 7 } });
+  assert.deepStrictEqual(d.params, { job_id: 'BATCH001', n: 7 });
+  // 뗀 뒤 겹치면 먼저 적은 값을 남긴다 — fromEntries에 맡기면 나중 것이 이긴다
+  const dup = sanitizeDecision({ action: 'run_query', query_name: 'q', params: { ':a': 'first', a: 'second' } });
+  assert.deepStrictEqual(dup.params, { a: 'first' });
+  // 콜론을 뗀 뒤의 길이로 상한을 재야 128자짜리 적법한 이름이 ':' 하나 때문에 버려지지 않는다
+  const legal = 'b'.repeat(MAX_BIND_NAME_LEN);
+  const ok = sanitizeDecision({ action: 'run_query', query_name: 'q', params: { [`:${legal}`]: 'v' } });
+  assert.deepStrictEqual(Object.keys(ok.params), [legal]);
+  // 앞의 콜론 하나만이다 — 이름 안의 콜론은 모델이 지어낸 이름이므로 손대지 않는다 (어차피 매칭되지 않는다)
+  const inner = sanitizeDecision({ action: 'run_query', query_name: 'q', params: { 'a:b': 1, '::c': 2 } });
+  assert.deepStrictEqual(inner.params, { 'a:b': 1, ':c': 2 });
 });
 
 test('정상 크기의 결정은 값이 그대로 통과한다', () => {

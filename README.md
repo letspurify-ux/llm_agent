@@ -17,7 +17,7 @@
 ## 대화 맥락
 
 "그럼 김철수는?", "재시작은 어떻게 해?" 같은 후속 질문을 해석한다. 서버는 세션을 저장하지 않고
-클라이언트가 최근 대화를 `POST /api/chat`의 `history`에 실어 보낸다 (최근 6턴, 턴당 500자로 제한).
+클라이언트가 최근 대화를 `POST /api/chat`의 `history`에 실어 보낸다 (최근 6턴, 턴당 1,500자로 제한).
 
 - LLM 프롬프트에 "최근 대화" 섹션으로 전달되어 지시대명사·생략된 대상을 해석한다
 - 현재 질문만으로 지식/처리방법이 **하나도 검색되지 않은 경우에만** 직전 질문을 덧붙여 재검색한다
@@ -231,7 +231,7 @@ LaTeX에서는 `\times`·`\cdot`을 쓰므로 실제로는 드물다.
 | 배치 재시작 방법 알려줘 | 쿼리 0회 — 지식만으로 답변 |
 | BATCH001 작업 상태 알려줘 | `batch_job_status` 1회 → FAILED 결과 + 재시작 지식 결합 답변 |
 | 홍길동 고객 주문 상태 알려줘 | 2단계 — `find_customer_id` 결과의 CUSTOMER_ID로 `order_status_by_customer` 실행 |
-| 오늘 며칠이야 | **실제 LLM 필요** — `today_date` 1회. 바인드 없는 쿼리로 조회대상 DB에서 KST 기준 오늘 날짜·현재 시각을 가져온다 (모델은 오늘 날짜를 알지 못하므로 반드시 조회해야 한다) |
+| 오늘 며칠이야 | **실제 LLM 필요** — 쿼리 0회. 프롬프트 끝에 실린 현재 시각(KST, 요일 포함)으로 바로 답한다. "어제", "이번 주" 같은 상대 날짜도 같은 값을 기준으로 절대 날짜로 바꾼다 (`today_date`는 DB 서버 시각 자체를 확인할 때만 실행된다) |
 | 실패한 배치 다 보여줘 | **실제 LLM 필요** — `batch_list_by_status` 1회. `qa_method` 없이 `query_desc`만으로 선택되는 경로B 데모 |
 | 쿠버네티스가 뭐야 (등록되지 않은 질문) | LLM의 일반 지식으로 답변 — "*등록된 지식에 없는 내용이라 일반 지식으로 답변합니다.*" 표시가 붙음 (Mock은 안내 문구만 표시) |
 | (위 질문에 이어) 그럼 BATCH002는? | 후속 질문 — 최근 대화에서 "배치 상태 조회"임을 파악해 BATCH002로 재조회 |
@@ -248,6 +248,8 @@ LaTeX에서는 `\times`·`\cdot`을 쓰므로 실제로는 드물다.
 > 두 행을 확인하려면 `LLM_PROVIDER=openai`로 바꿔서 실행한다.
 
 등록된 지식·쿼리 결과가 있으면 반드시 그것에 근거해 답하고, 전혀 없을 때만 LLM 일반 지식으로 답한다. 일반 지식 답변에서도 사내 시스템의 구체적 상태(수치·상태값 등)는 지어내지 않도록 프롬프트로 제한한다 (`llm-openai.js`의 SYSTEM_PROMPT).
+
+프롬프트(`llm-openai.js`의 `buildPrompt`)는 **자료 → 과제** 순서다: 관련 지식 → Q&A 처리 방법 → 실행 가능한 쿼리 목록 → 쿼리 실행 이력 → 최근 대화 → 사용자 질문 → 지시(현재 시각 KST + 다음 행동). 결정할 대상인 질문이 자료 뒤에 파묻히지 않게 하고, 요청마다 바뀌는 것(질문·대화·시각)을 뒤로 몰아 앞부분이 스텝 사이에 같은 토큰열로 남게(vLLM prefix caching) 한다. 같은 이유로 시스템 프롬프트에는 요청마다 달라지는 값을 싣지 않는다. 항목 한 건은 목록 한 줄이다 — 여러 줄짜리 본문은 들여쓰기로 항목 안에 묶고, SQL·오류처럼 줄바꿈이 뜻을 갖지 않는 것은 한 줄로 접는다.
 
 ```bash
 curl -s localhost:3001/api/chat -H 'Content-Type: application/json' -d '{"message":"홍길동 고객 주문 상태 알려줘"}'
@@ -270,6 +272,15 @@ LLM_BASE_URL=https://openrouter.ai/api/v1
 LLM_API_KEY=sk-or-...
 LLM_MODEL=anthropic/claude-sonnet-4.5
 ```
+
+프롬프트 예산(`backend/src/constants.js`의 `MAX_PROMPT_TOTAL_LEN`·`PROMPT_FLOORS`)과 출력 가드(`MAX_COMPLETION_TOKENS`)는 **128k 컨텍스트** 기준이다 — 입력 최악 ≈ 42~50k 토큰 + 출력 16k. 서버가 실제로 그 길이를 받는지는 코드가 알 수 없으니 연결 후 한 번 확인한다:
+
+```bash
+curl -s $LLM_BASE_URL/models | python3 -c 'import json,sys; print([m.get("max_model_len") for m in json.load(sys.stdin)["data"]])'   # vLLM: 131072 이어야 한다
+```
+
+- vLLM은 모델 config의 `max_position_embeddings`를 기본값으로 쓴다. `Qwen/Qwen2.5-32B-Instruct`는 그 값이 32,768이라 그대로 띄우면 **32k**다 — 128k는 YaRN을 켜야 나온다: `--max-model-len 131072 --hf-overrides '{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}}'` (정적 YaRN이라 짧은 입력의 품질이 조금 떨어진다는 것이 Qwen 쪽 안내다).
+- 컨텍스트가 더 작은 모델이면 `MAX_PROMPT_TOTAL_LEN`과 `MAX_COMPLETION_TOKENS`를 함께 줄인다 (둘의 합이 컨텍스트 안에 들어야 한다). 매 호출의 실제 토큰 수는 서버 로그의 `[llm] usage prompt=… completion=… finish=…` 한 줄로 확인할 수 있다 — `finish=length`면 출력 가드에서 끊긴 것이다.
 
 LLM 인터페이스는 `llm.js`의 `decide(ctx) → {action:'answer'|'run_query', ...}` 함수 하나다. 다른 provider가 필요하면 같은 시그니처의 함수를 추가하고 `llm.js`의 분기에 연결한다. `agent.js`는 변경되지 않는다.
 

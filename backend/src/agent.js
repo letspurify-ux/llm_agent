@@ -7,9 +7,9 @@ import { loadQueryRegistry, loadQueriesByNames, loadQueriesMentionedIn } from '.
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
 import { llm, renderAnswer, clipAnswer } from './llm.js';
-import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_CELL_LEN, TRUNC_MARK, nameKey, clipText, stripLoneSurrogates, bindValue, targetDbNames } from './constants.js';
+import { MAX_STEPS, MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_CELL_LEN, TRUNC_MARK, nameKey, clipText, stripLoneSurrogates, bindValue, targetDbNames } from './constants.js';
 
-const MAX_STEPS = 5;
+// MAX_STEPS는 constants.js에 있다 — 실행 이력의 프롬프트 몫이 그 값에 묶여 있다.
 const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포함). 초과하면 남은 스텝을 포기하고 강제 답변으로 간다.
                                // (스텝 상한과 별개로 필요하다 — 스텝 수는 LLM/조회가 얼마나 느린지를 모른다)
                                // 요청 전체 상한 = 이 값 + 마지막 LLM 호출(120초) + 강제 답변(120초) ≈ 420초.

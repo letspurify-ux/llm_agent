@@ -63,10 +63,12 @@ INSERT INTO query_registry (query_name, query_desc, input_desc, query_sql, outpu
 ON DUPLICATE KEY UPDATE query_desc = VALUES(query_desc), input_desc = VALUES(input_desc),
   query_sql = VALUES(query_sql), output_desc = VALUES(output_desc), target_db_name = VALUES(target_db_name);
 
--- 바인드 변수가 없는 쿼리 — "오늘 며칠이야" 같은 질문뿐 아니라, LLM이 상대 날짜("어제", "이번 달")를
--- 절대 날짜로 바꿔야 할 때 기준일을 얻는 용도로도 쓴다. 모델은 오늘 날짜를 알지 못하고
--- (학습 시점 이후의 시간은 프롬프트에 없다) 서버가 프롬프트에 날짜를 싣지도 않으므로,
--- 기준일이 필요하면 반드시 이 쿼리로 조회해야 한다.
+-- 바인드 변수가 없는 쿼리 — DB 서버의 현재 시각을 직접 확인하는 용도(바인드 없는 쿼리의 데모이기도 하다).
+-- 오늘 날짜·현재 시각(KST, 요일 포함)은 서버가 매 프롬프트 끝에 '현재 시각'으로 싣는다
+-- (llm-openai.js buildPrompt). 그래서 "오늘 며칠이야"와 상대 날짜("어제", "이번 달")의 기준일은
+-- 조회 없이 그 값으로 답하고, 이 쿼리는 DB 서버 시각 자체를 물을 때(프롬프트 시각과의 어긋남 점검 등)만 쓴다.
+-- 아래 query_desc가 그 순위를 모델에게 말한다 — "먼저 실행하라"고 적혀 있으면 모델은 매 질문마다
+-- LLM 왕복과 DB 조회를 한 번씩 더 쓴다.
 -- SYSDATE가 아니라 SYSTIMESTAMP AT TIME ZONE 'Asia/Seoul'을 쓰는 이유:
 --   SYSDATE는 DB 서버 로컬 시각이고, 로컬 Oracle 테스트 컨테이너는 UTC로 돈다(실측).
 --   그러면 KST 00:00~09:00 사이에는 매일 '어제' 날짜가 오늘로 답변된다 — 오류 없이, 조용히.
@@ -74,7 +76,7 @@ ON DUPLICATE KEY UPDATE query_desc = VALUES(query_desc), input_desc = VALUES(inp
 --   운영 DB가 KST로 돌더라도 이 식은 같은 값을 주므로, 타임존을 명시하는 쪽이 항상 안전하다.
 -- DUAL은 PUBLIC 시노님이라 VOC_READER에 별도 GRANT가 필요 없다 (oracle-init.sql 수정 불필요).
 INSERT INTO query_registry (query_name, query_desc, input_desc, query_sql, output_desc, target_db_name) VALUES
-('today_date', '오늘 날짜와 현재 시각(한국 시간)을 조회한다. "오늘 며칠이야", "지금 몇 시야" 같은 질문에 사용하고, "어제", "이번 주", "최근 3일" 처럼 상대 날짜가 섞인 질문에서 기준일을 확인할 때도 먼저 실행한다',
+('today_date', 'DB 서버의 현재 날짜와 시각(한국 시간)을 조회한다. 오늘 날짜·현재 시각·상대 날짜의 기준일은 프롬프트의 현재 시각으로 이미 알고 있으므로 조회하지 말고, DB 서버 시각 자체를 확인해야 할 때만 실행한다',
  '없음 — 바인드 변수를 받지 않는다 (params는 빈 객체로 둘 것)',
  'SELECT TO_CHAR(SYSTIMESTAMP AT TIME ZONE ''Asia/Seoul'', ''YYYY-MM-DD'') AS TODAY, TO_CHAR(SYSTIMESTAMP AT TIME ZONE ''Asia/Seoul'', ''HH24:MI:SS'') AS NOW_TIME FROM DUAL',
  'TODAY: 오늘 날짜(YYYY-MM-DD), NOW_TIME: 현재 시각(HH24:MI:SS). 둘 다 KST 기준이며 항상 1건', 'ORDER_DB')

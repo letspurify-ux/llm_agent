@@ -9,6 +9,7 @@ process.env.LLM_MODEL = 'test';
 delete process.env.LLM_API_KEY;
 
 const { openaiDecide } = await import('../src/llm-openai.js');
+const { TRUNC_MARK, MAX_COMPLETION_TOKENS } = await import('../src/constants.js');
 
 const CTX = { question: 'q', chat: [], knowledge: [], qaMethods: [], queries: [], history: [] };
 
@@ -663,4 +664,90 @@ test('닫히지 않은 후보가 반복돼도 두 번째 읽기가 총 비용을
   // 길이당 비용이 같은 수준이어야 한다 — 예산이 스캔 횟수를 세지 않으면 여기서 2배가 된다.
   assert.ok(escPerKb < basePerKb * 1.6,
     `'\\"'가 섞인 입력의 길이당 비용이 크게 늘었다: ${escPerKb.toFixed(2)}ms/KB vs ${basePerKb.toFixed(2)}ms/KB`);
+});
+
+// ===== 요청 본문 — 시스템 프롬프트 =====
+
+// 실제로 보낸 요청 본문을 잡는다 (응답은 아무 결정이나)
+async function capturedRequest(ctx = CTX) {
+  let body;
+  globalThis.fetch = async (_url, init) => {
+    body = JSON.parse(init.body);
+    return { ok: true, json: async () => ({ choices: [{ message: { content: '{"action":"answer","answer":"a"}' } }] }), text: async () => '' };
+  };
+  await openaiDecide(ctx);
+  return body;
+}
+
+test('시스템 프롬프트에는 요청마다 달라지는 것이 없다', async () => {
+  // vLLM prefix caching은 앞에서부터 같은 토큰열만 재사용한다 — 시스템 프롬프트에 시각 같은 값이
+  // 섞이면 모든 요청·모든 스텝이 첫 토큰부터 다시 계산한다. 현재 시각은 사용자 프롬프트 끝에 싣는다.
+  const a = await capturedRequest();
+  const b = await capturedRequest({ ...CTX, question: '다른 질문', history: [{ query_name: 'q', params: {}, rows: [{ A: 1 }], totalRows: 1 }] });
+  assert.equal(a.messages[0].role, 'system');
+  assert.equal(a.messages[0].content, b.messages[0].content, '시스템 프롬프트가 요청에 따라 달라졌다');
+  assert.doesNotMatch(a.messages[0].content, /현재 시각:|\d{4}-\d{2}-\d{2}/, '시스템 프롬프트에 시각이 들어갔다');
+  assert.match(a.messages[1].content, /현재 시각: \d{4}-\d{2}-\d{2} /, '현재 시각은 사용자 프롬프트에 있어야 한다');
+});
+
+test('시스템 프롬프트가 프롬프트 표기와 같은 규칙을 말한다', async () => {
+  // 규칙은 한 곳(코드)에서 나와야 한다: 잘린 값의 표시는 constants.TRUNC_MARK 그대로여야 모델이
+  // 이력에서 그 표시를 알아보고, 바인드 키는 프롬프트가 ':이름'으로 보여주므로 '콜론 없이'를 말해야
+  // 하며, 수식 표기는 frontend/src/math.js가 받는 네 가지와 같아야 한다 (README '대화 맥락' 참고 —
+  // 한쪽만 바꾸면 모델이 쓴 수식이 화면에서 그대로 글자로 보인다).
+  const sys = (await capturedRequest()).messages[0].content;
+  assert.ok(sys.includes(`${TRUNC_MARK} 으로 끝나는 값`), '잘린 값 표시가 상수와 어긋난다');
+  assert.match(sys, /콜론 없이/);
+  for (const notation of ['$E=mc^2$', '$$E=mc^2$$', '\\( \\)', '\\[ \\]']) {
+    assert.ok(sys.includes(notation), `수식 표기 안내가 빠졌다: ${notation}`);
+  }
+  // 백슬래시 두 번 예시는 모델이 그대로 따라 쓰는 문자열이다 — JSON 문자열 안에서 \\frac 이 되어야 한다
+  assert.ok(sys.includes('"$$x=\\\\frac{1}{2}$$"'), '이스케이프 예시가 두 번 쓴 백슬래시가 아니다');
+});
+
+test('요청에 출력 폭주 가드(max_tokens)를 싣는다', async () => {
+  // 보내지 않으면 vLLM은 남은 컨텍스트 전부(≈100k 토큰)를 상한으로 잡는다 — temperature=0의 반복 퇴화가
+  // 클라이언트 타임아웃까지 서버를 붙들고, 유료 API면 그 토큰이 과금된다. 답변 길이 상한은 아니다
+  // (그건 파싱 뒤 MAX_ANSWER_LEN) — 정당한 결정보다 훨씬 위여야 한다.
+  const body = await capturedRequest();
+  assert.equal(body.max_tokens, MAX_COMPLETION_TOKENS);
+  assert.ok(Number.isInteger(MAX_COMPLETION_TOKENS) && MAX_COMPLETION_TOKENS >= 8_000, '가드가 정당한 답변(수 k 토큰)을 자를 만큼 낮다');
+});
+
+// 로그를 잡아 본다 — 두 로그의 존재 이유가 '로그로 드러나는 것'이라 로그를 검증한다.
+async function decideCapturingLogs(response) {
+  const logs = [], warns = [];
+  const [origLog, origWarn] = [console.log, console.warn];
+  console.log = (...a) => logs.push(a.join(' '));
+  console.warn = (...a) => warns.push(a.join(' '));
+  try {
+    globalThis.fetch = async () => ({ ok: true, json: async () => response, text: async () => '' });
+    const decision = await openaiDecide(CTX);
+    return { decision, logs, warns };
+  } finally {
+    [console.log, console.warn] = [origLog, origWarn];
+  }
+}
+
+test('상한에서 끊긴 응답은 원인이 길이였음을 로그로 남긴다', async () => {
+  // 잘린 JSON은 파싱에 실패하고, 그 실패는 '모델이 형식을 안 지켰다'로 보인다 — 폭주였는지
+  // 정당하게 긴 답변이었는지(가드를 올려야 하는지)는 finish_reason 로그로만 가를 수 있다.
+  const { decision, warns } = await decideCapturingLogs({
+    choices: [{ finish_reason: 'length', message: { content: '{"action":"answer","answer":"긴 답변의 앞부' } }],
+  });
+  assert.equal(decision, null);
+  const cut = warns.filter(l => l.includes(`max_tokens=${MAX_COMPLETION_TOKENS}`));
+  assert.ok(cut.length >= 1, `길이에서 끊겼다는 경고가 없다: ${JSON.stringify(warns)}`);
+});
+
+test('서버가 알려준 토큰 실측을 로그로 남긴다', async () => {
+  // 프롬프트 예산(constants.js)은 문자 기준 추정이다 — 예산을 다시 잡을 실측은 이 로그로만 쌓인다.
+  const { logs } = await decideCapturingLogs({
+    usage: { prompt_tokens: 1234, completion_tokens: 56 },
+    choices: [{ finish_reason: 'stop', message: { content: '{"action":"answer","answer":"a"}' } }],
+  });
+  assert.ok(logs.some(l => l.includes('usage prompt=1234 completion=56 finish=stop')), JSON.stringify(logs));
+  // usage를 주지 않는 서버에서는 '?'만 남는 줄을 찍지 않는다
+  const { logs: none } = await decideCapturingLogs({ choices: [{ message: { content: '{"action":"answer","answer":"a"}' } }] });
+  assert.ok(!none.some(l => l.includes('usage')), '실측이 없는데 usage 줄을 남겼다');
 });

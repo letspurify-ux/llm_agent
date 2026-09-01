@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { buildPrompt } from '../src/llm-openai.js';
-import { MAX_PROMPT_TOTAL_LEN, MAX_PROMPT_STEP_LEN, PROMPT_FLOORS, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK } from '../src/constants.js';
+import { MAX_PROMPT_TOTAL_LEN, MAX_PROMPT_STEP_LEN, PROMPT_FLOORS, PROMPT_FRAME_RESERVE, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN, MAX_CELL_LEN, MAX_RESULT_COLS, MAX_ROWS, MAX_STEPS, TRUNC_MARK } from '../src/constants.js';
 
 const big = n => 'ㄱ'.repeat(n);
 
@@ -29,6 +29,13 @@ const queries = n => new Array(n).fill(0).map((_, i) => ({
 
 // 대화·질문은 이 예산 밖이다(각자 다른 상한으로 이미 묶여 있다) — 그 몫만큼 여유를 둔다.
 const OUTSIDE_BUDGET = MAX_CHAT_TURNS * MAX_CHAT_LEN + MAX_QUESTION_LEN;
+
+// 마지막 이력 줄의 행 JSON. 이력 뒤에 대화·질문·지시 블록이 오므로 줄 끝까지만 잘라 읽는다.
+const lastRowsJson = p => {
+  const start = p.lastIndexOf(': [') + 2;
+  const end = p.indexOf('\n', start);
+  return p.slice(start, end < 0 ? undefined : end);
+};
 
 test('한 섹션이 아무리 길어도 프롬프트 전체가 예산을 넘지 않는다', () => {
   // 네 섹션이 동시에 예산을 꽉 채우는 최악 — 예전에는 섹션마다 독립 상한이라 합계가 그대로 더해졌다
@@ -56,8 +63,7 @@ test('잘린 행은 유효한 JSON으로 남고 건수를 정직하게 알린다
   const p = buildPrompt(ctx({
     history: [{ query_name: 'wide', params: {}, rows: wideRows(20, 30), totalRows: 20 }],
   }));
-  const json = p.slice(p.lastIndexOf(': [') + 2); // 이력 줄의 마지막 조각이 행 JSON이다
-  const parsed = JSON.parse(json); // 조각이면 여기서 던진다
+  const parsed = JSON.parse(lastRowsJson(p)); // 조각이면 여기서 던진다
   assert.ok(parsed.length >= 1 && parsed.length < 20, `행이 줄어야 한다: ${parsed.length}`);
   assert.match(p, new RegExp(`총 20건 중 처음 ${parsed.length}건만 표시`));
 });
@@ -92,7 +98,7 @@ test('컬럼 수가 아무리 많은 행도 예산을 넘지 못한다', () => {
   assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN, `프롬프트가 예산을 넘었다: ${p.length}`);
   assert.ok(p.includes('컬럼 생략'), '컬럼을 버린 사실을 모델에게 알려야 한다');
   // 줄어든 행도 유효한 JSON이어야 한다 — 조각이면 모델이 값으로 되읽는다
-  JSON.parse(p.slice(p.lastIndexOf(': [') + 2));
+  JSON.parse(lastRowsJson(p));
 });
 
 test('바인드가 수백 개인 SQL 등록도 쿼리 목록 예산을 뚫지 못한다', () => {
@@ -209,8 +215,19 @@ test('두 단계의 컬럼 생략 안내가 서로를 덮어쓰지 않는다', (
 test('섹션 최소 몫 합계가 전체 예산을 넘지 않는다', () => {
   // constants.js가 import 시점에 던지므로 여기까지 왔다면 이미 참이지만, 그 검증 자체가
   // 사라지는 것을 막는다 — 이 불변식이 깨진 채로 배포된 것이 원래 버그였다.
-  const sum = Object.values(PROMPT_FLOORS).reduce((a, b) => a + b, 0);
+  // 고정 틀의 몫도 합에 넣는다 — 본문만 더하면 틀의 길이만큼 정확히 넘친다.
+  const sum = Object.values(PROMPT_FLOORS).reduce((a, b) => a + b, 0) + PROMPT_FRAME_RESERVE;
   assert.ok(sum <= MAX_PROMPT_TOTAL_LEN, `${sum} > ${MAX_PROMPT_TOTAL_LEN}`);
+});
+
+test('고정 틀(제목·빈 줄·지시 블록)이 자기 몫 안에 든다', () => {
+  // 섹션 본문은 배분이 세지만 제목 줄·블록 사이 빈 줄·질문 제목·지시 블록은 세지 않는다 —
+  // 그 몫을 미리 떼는데, 떼는 값이 실제 틀보다 작으면 꽉 찬 요청에서 그 차이만큼 넘친다.
+  // 틀이 가장 긴 형태(forceAnswer 지시문)로, 본문을 전부 비워 틀만 남긴 길이를 잰다.
+  const empty = { question: '', chat: [], knowledge: [], qaMethods: [], queries: [], history: [], forceAnswer: true };
+  const frame = buildPrompt(empty).length - 5 * '(없음)'.length;
+  // 건수 자릿수 여유(섹션 다섯 곳 × 4자리)까지 더해도 몫 안이어야 한다
+  assert.ok(frame + 20 <= PROMPT_FRAME_RESERVE, `틀이 몫을 넘는다: ${frame} + 20 > ${PROMPT_FRAME_RESERVE}`);
 });
 
 test('제목이 길어져도 지식·처리방법 줄이 예산을 뚫지 못한다', () => {
@@ -248,7 +265,7 @@ test('모든 섹션이 같은 규칙으로 예산을 센다', () => {
   // 음성 대조 — 예산이 실제로 빡빡했는지 (위 단언이 공허하지 않음을 보장)
   assert.ok(prompt.length > MAX_PROMPT_TOTAL_LEN * 0.8, `예산을 거의 안 썼다: ${prompt.length}`);
   // 가장 중요한 섹션이 실제로 살아남았는지 — 초과분이 여기서 나오면 이 줄이 먼저 사라진다
-  assert.match(prompt, /## 실행 가능한 쿼리 목록\n- q0:/);
+  assert.match(prompt, /## 실행 가능한 쿼리 목록 \(\d+건\)\n- q0:/);
 });
 
 test('모든 섹션이 예산에 꽉 찬 상태에서도 전체 상한을 넘지 않는다', () => {
@@ -290,4 +307,118 @@ test('잘린 셀은 프롬프트를 지나도 앞부분이 달라지지 않는�
   assert.match(prompt, /컬럼 생략/, '컬럼 단위 절단이 도는 상황이어야 한다');
   assert.ok(prompt.includes(cell), '잘린 셀이 원형 그대로 실려야 한다');
   assert.ok(!prompt.includes('…' + TRUNC_MARK), '표시가 겹쳐 붙으면 앞부분이 달라진 것이다');
+});
+
+// ===== 구조 — 모델이 읽는 형태 =====
+// 예산과 달리 이쪽은 '틀리면 티가 나는' 종류가 아니다. 항목 경계가 무너지거나 질문이 자료 뒤에
+// 파묻혀도 오류는 없고, 답의 품질만 조용히 떨어진다. 그래서 형태 자체를 고정해 둔다.
+
+test('본문에 든 개행이 목록 항목의 경계를 무너뜨리지 않는다', () => {
+  // '- [제목] 첫 줄' 다음 줄이 열(0)부터 시작하면 그 줄은 어느 항목에도 속하지 않는 문단이 되어,
+  // 지식 두 건이 어디서 갈리는지 모델이 알 수 없다. SQL은 더 나쁘다 — 여러 줄짜리 SQL이 목록
+  // 밖으로 흘러나오면 다음 '- 이름:' 줄이 SQL의 일부처럼 읽힌다.
+  const p = buildPrompt(ctx({
+    knowledge: [{ title: '재시작\n절차', content: '1) 콘솔 접속\r\n2) 작업 선택\n\n3) 재시작' }, { title: 'B', content: 'b' }],
+    qaMethods: [{ title: 'M', method: '1단계\n2단계' }],
+    queries: [{ query_name: 'q0', query_desc: '용도\n두 줄', input_desc: 'i', output_desc: 'o',
+      query_sql: 'SELECT A\n  FROM T\n WHERE B = :b', target_db_name: 'D' }],
+    history: [{ query_name: 'q0', params: { b: 1 }, error: 'ORA-00942: table or view does not exist\nHelp: https://docs.oracle.com/error-help/db/ora-00942/', hint: '다른 쿼리를\n선택하라' }],
+    chat: [{ role: 'assistant', text: '### 결과\n\n| A |\n|---|\n| 1 |' }],
+  }));
+  // 줄 구조가 근거인 본문(지식·처리방법·대화)은 이어지는 줄을 들여 같은 항목의 연속 줄로 싣는다
+  assert.ok(p.includes('- [재시작 절차] 1) 콘솔 접속\n  2) 작업 선택\n\n  3) 재시작\n- [B] b'), '지식 본문의 줄이 항목 밖으로 나갔다');
+  assert.ok(p.includes('- [M] 1단계\n  2단계'));
+  assert.ok(p.includes('- 에이전트: ### 결과\n\n  | A |\n  |---|\n  | 1 |'), '대화 턴의 표가 항목 밖으로 나갔다');
+  // 줄바꿈이 뜻을 갖지 않는 것(SQL·설명·오류·대응)은 한 줄로 접는다 — 쿼리 한 건은 반드시 한 줄이다
+  assert.match(p, /^- q0: 용도 두 줄 \/ .* \/ SQL: SELECT A FROM T WHERE B = :b$/m, '쿼리 줄이 여러 줄로 갈라졌다');
+  assert.match(p, /^1\. q0 params=\{"b":1\} → 오류: ORA-00942: table or view does not exist Help: \S+ \/ 대응: 다른 쿼리를 선택하라$/m);
+  // 열(0)에서 시작하는 줄은 제목·항목·안내·질문·지시뿐이어야 한다
+  const stray = p.split('\n').filter(l => l && !/^(## |- |\d+\. |\(|  |현재 시각: |위 자료를)/.test(l));
+  assert.deepStrictEqual(stray, ['질문'], `항목 밖으로 나간 줄: ${JSON.stringify(stray)}`);
+});
+
+test('자료가 먼저, 질문과 지시가 맨 끝에 온다', () => {
+  // 모델은 마지막에 읽은 것을 가장 강하게 붙든다. 결정할 대상은 현재 질문인데 그것이 자료 수천 자
+  // 앞에 있으면 후속 질문("그럼 김철수는?")처럼 짧은 것은 그대로 파묻힌다. 또 요청마다 바뀌는
+  // 것(질문·대화·시각)을 뒤로 몰아야 앞부분이 스텝마다 같은 토큰열로 남아 prefix caching이 산다.
+  const p = buildPrompt(ctx({
+    question: '그럼 김철수는?', chat: [{ role: 'user', text: '홍길동은?' }],
+    knowledge: [{ title: 'K', content: 'k' }], qaMethods: [{ title: 'M', method: 'm' }],
+    queries: [{ query_name: 'q0', query_desc: 'd', input_desc: 'i', output_desc: 'o', query_sql: 'SELECT 1 FROM t WHERE a=:a' }],
+    history: [{ query_name: 'q0', params: { a: 1 }, rows: [{ A: 1 }], totalRows: 1 }],
+  }));
+  const order = ['## 관련 지식', '## Q&A 처리 방법', '## 실행 가능한 쿼리 목록', '## 쿼리 실행 이력', '## 최근 대화', '## 사용자 질문 (현재)\n그럼 김철수는?', '## 지시'];
+  const at = order.map(h => p.indexOf(h));
+  assert.ok(at.every(i => i >= 0), `빠진 섹션: ${order.filter((_, i) => at[i] < 0)}`);
+  assert.deepStrictEqual([...at].sort((a, b) => a - b), at, '섹션 순서가 어긋났다');
+  // 지시는 마지막 스텝에만 붙는 것이 아니다 — 평소에도 무엇을 하라는지 프롬프트 끝에 있어야 한다
+  assert.match(p, /## 지시\n현재 시각: .+\n위 자료를 근거로 현재 질문에 대한 다음 행동 하나를 JSON으로 결정하라\.$/);
+  const last = buildPrompt(ctx({ forceAnswer: true }));
+  assert.match(last, /## 지시\n현재 시각: .+\n더 이상 쿼리를 실행할 수 없다\. .*action="answer".*$/);
+  assert.ok(!last.includes('위 자료를 근거로'), '마지막 스텝에 두 지시가 함께 실렸다');
+});
+
+test('현재 시각을 KST로, 요일과 함께 싣는다', () => {
+  // 모델에게는 시계가 없다. "어제", "이번 주"가 든 질문에서 기준일을 얻는 길이 today_date 조회뿐이면
+  // 질문마다 LLM 왕복과 DB 조회가 한 번씩 더 들고, 모델이 그 단계를 건너뛰면 학습 시점의 연도로
+  // 조용히 계산한다. 시간대는 seed.sql today_date와 같은 KST여야 한다 — UTC로 실으면
+  // KST 00:00~09:00 사이에 프롬프트의 오늘과 DB의 오늘이 하루 다르다.
+  const p = buildPrompt(ctx(), new Date('2026-09-02T05:05:00Z'));
+  assert.match(p, /^현재 시각: 2026-09-02 \(수\) 14:05 KST$/m);
+  // 자정 직후(UTC로는 전날 15:00)에도 오늘이 맞아야 한다
+  const midnight = buildPrompt(ctx(), new Date('2026-09-01T15:00:00Z'));
+  assert.match(midnight, /^현재 시각: 2026-09-02 \(수\) 00:00 KST$/m);
+  // 시각은 지시 블록(맨 끝)에만 있다 — 앞쪽에 있으면 매 분 바뀌는 값이 prefix caching을 깬다
+  assert.equal(p.indexOf('현재 시각:'), p.lastIndexOf('현재 시각:'));
+  assert.ok(p.indexOf('현재 시각:') > p.indexOf('## 지시'));
+});
+
+test('실행 이력의 스텝 번호는 앞선 스텝이 생략돼도 당겨지지 않는다', () => {
+  // 처리 방법의 "2단계"와 모델이 보는 번호가 같은 스텝을 가리켜야 하고, 화면 trace의 순번과도
+  // 같아야 한다. 생략 안내는 빠진 번호를 말해 남은 줄이 왜 3부터 시작하는지 알려준다.
+  const steps = Math.ceil(MAX_PROMPT_TOTAL_LEN / MAX_PROMPT_STEP_LEN) + 1;
+  const history = new Array(steps).fill(0).map((_, i) => ({
+    query_name: `step${i}`, params: {}, rows: wideRows(20, 20), totalRows: 20,
+  }));
+  const p = buildPrompt(ctx({ history }));
+  const shown = [...p.matchAll(/^(\d+)\. step(\d+) /gm)].map(m => [Number(m[1]), Number(m[2])]);
+  assert.ok(shown.length > 0 && shown.length < steps, '일부가 생략되는 상황이어야 한다 (전제 확인)');
+  assert.ok(shown.every(([n, i]) => n === i + 1), `번호가 당겨졌다: ${JSON.stringify(shown.slice(0, 3))}`);
+  const first = shown[0][0];
+  assert.match(p, new RegExp(`^\\(1~${first - 1}번 스텝은 프롬프트 길이 제한으로 생략\\)$`, 'm'));
+  // 생략이 없으면 1부터 빠짐없이
+  const all = buildPrompt(ctx({ history: history.slice(0, 3) }));
+  assert.deepStrictEqual([...all.matchAll(/^(\d+)\. step/gm)].map(m => m[1]), ['1', '2', '3']);
+});
+
+test('모든 섹션이 같은 형태로 건수를 달고, 비면 (없음)을 싣는다', () => {
+  // 제목마다 규칙이 다르면(어떤 것엔 건수가 있고 어떤 본문은 빈 채로 끝나면) 모델은 '비어 있음'과
+  // '누락됨'을 가를 수 없다. 건수는 생략 안내와 맞춰 볼 때 '몇 건 중 몇 건이 실렸는지'를 준다.
+  const p = buildPrompt(ctx());
+  for (const h of ['관련 지식 (0건)', 'Q&A 처리 방법 (0건)', '실행 가능한 쿼리 목록 (0건)', '쿼리 실행 이력 (0건)', '최근 대화 (0턴)']) {
+    assert.ok(p.includes(`## ${h}\n(없음)`), `${h} 형태가 다르다`);
+  }
+  const some = buildPrompt(ctx({ queries: queries(2), history: [{ query_name: 'q0', params: {}, rows: [], totalRows: 0 }] }));
+  assert.ok(some.includes('## 실행 가능한 쿼리 목록 (2건)\n- q0:'));
+  assert.ok(some.includes('## 쿼리 실행 이력 (1건)\n1. q0 '));
+});
+
+test('꽉 찬 MAX_STEPS 스텝의 실행 이력이 강제 답변 스텝에서도 전부 실린다', () => {
+  // 이력의 최소 몫은 'MAX_STEPS 스텝이 각자 상한까지 차도 전부 실린다'가 근거다. 예전 몫(14k)은
+  // 5 × 3k + 머리말에 못 미쳐, 이력이 MAX_STEPS건인 유일한 호출(강제 답변)에서 1번 스텝이 빠졌다 —
+  // 오류 없이 답변의 근거만 사라지는 실패라 다른 섹션이 예산을 꽉 채운 상태에서 확인한다.
+  const full = i => ({
+    query_name: `step${i}${big(150)}`, targetDb: big(150), params: { p: big(600) },
+    rows: wideRows(20, 30), totalRows: MAX_ROWS, capped: true,
+  });
+  const history = new Array(MAX_STEPS).fill(0).map((_, i) => full(i));
+  history[2] = { ...full(2), rows: undefined, error: big(1200), hint: big(1200) }; // 오류 줄도 같은 몫 안에 든다
+  const p = buildPrompt(ctx({
+    knowledge: knowledge(50), qaMethods: methods(50), queries: queries(35), history, forceAnswer: true,
+  }));
+  for (let i = 1; i <= MAX_STEPS; i++) {
+    assert.match(p, new RegExp(`^${i}\\. step${i - 1}`, 'm'), `${i}번 스텝이 빠졌다`);
+  }
+  assert.ok(!p.includes('스텝은 프롬프트 길이 제한으로 생략'), '이력이 생략됐다');
+  assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN, `프롬프트가 예산을 넘었다: ${p.length}`);
 });

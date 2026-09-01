@@ -8,8 +8,9 @@
 import {
   MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK,
   MAX_PROMPT_ITEM_LEN, MAX_PROMPT_SQL_LEN, MAX_PROMPT_STEP_LEN,
-  MAX_PROMPT_PARAMS_LEN, MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS,
-  MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, clipText, warnOnce, targetDbNames,
+  MAX_PROMPT_PARAMS_LEN, MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS, PROMPT_FRAME_RESERVE,
+  MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, MAX_COMPLETION_TOKENS, MAX_STEPS, MAX_RESULT_ROWS,
+  clipText, warnOnce, targetDbNames,
 } from './constants.js';
 import { bindNames } from './sql.js';
 import { rowCounts } from './result.js';
@@ -37,15 +38,20 @@ function resolveReasoningEffort() {
 // 지원하지 않는 엔드포인트에서 모든 질문이 실패하는 것보다, 한 번 배우고 빼는 편이 낫다.
 let effortAccepted = REASONING_EFFORT !== null;
 
+// 시스템 프롬프트에는 요청마다 달라지는 것을 하나도 싣지 않는다 (현재 시각도 아래 buildPrompt가
+// 사용자 프롬프트 끝에 싣는다) — vLLM의 prefix caching은 앞에서부터 같은 토큰열만 재사용하므로,
+// 여기 한 글자가 바뀌면 모든 요청·모든 스텝이 시스템 프롬프트부터 다시 계산한다.
 const SYSTEM_PROMPT = `당신은 사내 지식 관리 및 DB 조회 Q&A 에이전트다.
-사용자 질문과 함께 관련 지식, Q&A 처리 방법, 실행 가능한 쿼리 목록, 지금까지의 쿼리 실행 이력이 주어진다.
+관련 지식, Q&A 처리 방법, 실행 가능한 쿼리 목록, 지금까지의 쿼리 실행 이력, 최근 대화, 그리고 사용자의 현재 질문이 이 순서로 주어진다.
 반드시 아래 두 형식 중 하나의 JSON 객체 하나만으로 응답하라. 다른 텍스트를 붙이지 마라.
 생각을 적어야 한다면 <think> 와 </think> 사이에만 적어라. 그 블록 밖에는 위 JSON 하나만 남긴다.
 
 1. 답변 전에 DB 조회가 더 필요하면:
 {"action":"run_query","query_name":"<쿼리이름>","params":{"<바인드변수명>":"<값>"},"target_db":"<대상DB이름>"}
 - query_name은 반드시 쿼리 목록에 있는 이름이어야 한다.
-- params에는 해당 쿼리 SQL의 모든 :바인드 변수 값을 채워라. 값은 사용자 질문 또는 실행 이력의 결과에서 추출한다.
+- params에는 그 쿼리의 '바인드'에 적힌 변수를 전부 채워라. 키는 콜론 없이 쓴다 (:job_id → "job_id"). 값은 사용자 질문 또는 실행 이력의 결과에서 추출한다.
+- 실행 이력에서 ${TRUNC_MARK} 으로 끝나는 값은 길어서 잘린 값이다. 그 값은 앞부분만 옮겨 적더라도 바인드로 쓰지 마라 — 잘리지 않은 다른 컬럼(ID 등)으로 조회하거나 사용자에게 되물어라.
+- "어제", "이번 달", "최근 3일" 같은 상대 날짜는 질문 아래 '현재 시각'을 기준으로 절대 날짜로 바꿔 쓴다.
 - target_db: 같은 쿼리를 어느 DB에서 실행할지 정하는 값이다. 쿼리 목록의 '대상DB'에 후보가 둘 이상이면 반드시 그중 하나를 등록된 철자 그대로 골라라 (후보가 하나뿐이면 생략해도 된다). 무엇을 고를지는 그 쿼리의 용도 설명과 질문·Q&A 처리 방법을 근거로 판단한다.
 - 어느 후보를 골라야 할지 질문만으로 정할 수 없으면 지어내지 마라 — 어느 대상을 조회할지 사용자에게 되묻는 answer로 답하라.
 - Q&A 처리 방법에 여러 단계가 서술되어 있으면 그 순서대로 하나씩 실행한다.
@@ -57,12 +63,11 @@ const SYSTEM_PROMPT = `당신은 사내 지식 관리 및 DB 조회 Q&A 에이�
 - 일반 지식으로 답할 때도 사내 시스템의 구체적 상태(수치, 상태값, 일정 등)는 절대 지어내지 마라. 확인이 필요하면 확인 방법을 안내하라.
 - 실행 이력의 오류 원문에 든 내부 정보(호스트·포트·접속 주소, 스키마·테이블·계정명, SQL 원문)는 answer에 옮겨 적지 마라. 오류는 "조회에 실패했다"는 사실과 사용자가 할 수 있는 다음 행동만 전달하라.
 - answer는 markdown 형식으로 구조화하라: 조회 결과는 표(table)로, 항목 나열은 목록으로, 섹션 구분은 ### 제목으로 작성한다.
-- 수식은 LaTeX로 쓴다. 문장 안에 넣는 인라인 수식은 $E=mc^2$ 또는 $$E=mc^2$$, 넓은 수식은 $$ 를 앞뒤로 각각 '독립된 줄'에 두어 별행으로 써라 — 인라인 수식은 접히지 않아 넓으면 잘린다. \\( \\) 와 \\[ \\] 표기도 그대로 인식되므로 익숙한 쪽을 쓰면 된다.
-- 수식이 아닌 $ 기호(금액 $100, 환경변수 $ORACLE_HOME 등)는 이스케이프 없이 그냥 써라 — 화면에 그대로 나오고 수식으로 오인되지 않는다.
-- answer는 JSON 문자열이므로 그 안의 백슬래시는 두 번 쓰는 것이 정확하다: "$$x=\\\\frac{1}{2}$$", "$$a \\\\times b$$". (한 번만 써도 대부분 복구하지만, 두 번 쓰면 복구에 기대지 않는다.)
+- 수식은 LaTeX로 쓴다: 인라인은 $E=mc^2$ 또는 $$E=mc^2$$ (\\( \\), \\[ \\] 표기도 된다), 넓은 수식은 $$ 를 앞뒤 독립된 줄에 두어 별행으로 — 인라인은 접히지 않아 넓으면 잘린다. 금액 $100, 환경변수 $ORACLE_HOME 의 $는 그냥 쓴다.
+- answer는 JSON 문자열이므로 백슬래시는 두 번 쓴다: "$$x=\\\\frac{1}{2}$$".
 
 ## 대화 맥락
-최근 대화가 함께 주어진다. 현재 질문이 이전 대화를 가리키면(예: "그럼 김철수는?", "재시작은 어떻게 해?") 최근 대화를 참고해
+현재 질문이 이전 대화를 가리키면(예: "그럼 김철수는?", "재시작은 어떻게 해?") 최근 대화를 참고해
 무엇을 묻는지 해석한 뒤 판단하라. 단, 이미 조회한 값이라도 현재 질문의 대상이 다르면 반드시 쿼리를 다시 실행하라.`;
 
 // decide() 한 번이 쓸 수 있는 전체 시간(ms). 재시도도 이 예산을 나눠 쓴다 —
@@ -127,6 +132,8 @@ async function chatCompletion(userPrompt, timeoutMs) {
     body: JSON.stringify({
       model: process.env.LLM_MODEL,
       temperature: 0,
+      // 폭주 가드이지 답변 길이 상한이 아니다 — 답변은 파싱 뒤 MAX_ANSWER_LEN이 묶는다 (constants.js 참고).
+      max_tokens: MAX_COMPLETION_TOKENS,
       ...(effortAccepted && { reasoning_effort: REASONING_EFFORT }),
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
@@ -145,7 +152,17 @@ async function chatCompletion(userPrompt, timeoutMs) {
     throw new Error(`LLM API ${res.status}: ${detail}`);
   }
   const data = await res.json();
-  return data.choices?.[0]?.message?.content ?? '';
+  const choice = data.choices?.[0];
+  // 실측을 남긴다 — 프롬프트 예산(constants.js)은 문자 기준 추정이고 토큰 수는 서버만 안다.
+  // 예산을 다시 잡을 때 필요한 숫자가 이 한 줄이다 (usage를 주지 않는 서버에서는 남길 것이 없다).
+  const usage = data.usage;
+  if (usage) console.log(`[llm] usage prompt=${usage.prompt_tokens} completion=${usage.completion_tokens} finish=${choice?.finish_reason ?? '?'}`);
+  // 상한에서 끊긴 응답은 결정 JSON이 잘려 있어 아래 파싱이 실패한다. 그 실패는 '모델이 형식을 안 지켰다'
+  // 로 보이므로, 원인이 길이였다는 사실을 여기서 따로 남긴다 (폭주인지 정당하게 긴 것인지는 이 로그로 가른다).
+  if (choice?.finish_reason === 'length') {
+    console.warn(`[llm] completion cut at max_tokens=${MAX_COMPLETION_TOKENS} — runaway generation or an answer that needs a higher MAX_COMPLETION_TOKENS (constants.js).`);
+  }
+  return choice?.message?.content ?? '';
 }
 
 // 검색 결과 본문(knowledge.content / qa_method.method / query_sql)은 전부 TEXT라 그 자체로는 상한이 없다.
@@ -156,6 +173,16 @@ const clip = (v, max = MAX_PROMPT_ITEM_LEN) => {
   const s = String(v ?? '');
   return s.length > max ? clipText(s, max) + TRUNC_MARK : s;
 };
+
+// 항목 한 건 = 목록 한 줄('- '로 시작). 본문에 든 개행을 그대로 실으면 둘째 줄부터는 어느 항목에도
+// 속하지 않는 문단이 되어 항목의 경계가 사라진다 — 지식 2건이 다섯 줄로 보이면 모델은 어디까지가
+// 첫 건인지 모르고, 쿼리 줄에서는 '/ SQL:' 뒤 여러 줄짜리 SQL이 목록 밖으로 흘러나와 다음 '- 이름:'
+// 줄이 SQL의 일부처럼 읽힌다. 두 가지로 나눈다:
+//   oneLine — SQL·설명·오류처럼 줄바꿈이 뜻을 갖지 않는 것. 공백 연속을 한 칸으로 (길이도 준다).
+//   indent  — 지식 본문·대화처럼 줄 구조(번호 목록·표)가 근거인 것. 이어지는 줄을 두 칸 들여
+//             markdown 목록 항목의 연속 줄로 만든다. 들여쓰기 뒤에 clip하므로 결과는 상한 안이다.
+const oneLine = v => String(v ?? '').replace(/\s+/g, ' ').trim();
+const indent = v => String(v ?? '').trim().split(/\r\n?|\n/).map((l, i) => i && l ? `  ${l}` : l).join('\n');
 
 // 제목·쿼리명처럼 '항목을 지목하는 이름'의 상한. 본문보다 짧게 잡는다 — 라벨이라 길 이유가 없다.
 // 이름에도 상한이 필요한 이유: renderItems는 예산과 무관하게 최소 1건을 싣는다(그 보장이 없으면
@@ -182,7 +209,9 @@ const MAX_PROMPT_NAME_LEN = 100;
 //    자기 몫을 지키는가'가 그때그때 다른 값이 되어 ①처럼 조용히 어긋날 자리를 남기기 때문이다.
 const lineCost = line => line.length + 1;
 const omittedNote = n => `- (이하 ${n}건은 프롬프트 길이 제한으로 생략)`;
-const earlierOmittedNote = n => `- (앞선 ${n}건은 프롬프트 길이 제한으로 생략)`;
+// 실행 이력은 번호 목록이라 '앞선 N건'이 아니라 빠진 번호를 말한다 — 남은 줄의 번호가 3부터
+// 시작하는 이유를 모델이 이 한 줄로 알 수 있어야 한다.
+const earlierOmittedNote = n => `(${n === 1 ? '1번' : `1~${n}번`} 스텝은 프롬프트 길이 제한으로 생략)`;
 
 // 안내 줄의 몫. 길이는 건수 표기 말고는 고정이라 유계다
 // (건수는 등록 건수 또는 MAX_PROMPT_QUERIES + MAX_STEPS 이하). 두 줄을 붙이는 renderQueries가
@@ -245,10 +274,10 @@ const dbList = q => {
 const hasDbChoice = q => targetDbNames(q.target_db_name).length > 1;
 
 const queryItem = q =>
-  `- ${clip(q.query_name, MAX_PROMPT_NAME_LEN)}: ${clip(q.query_desc)}` +
-  ` / 입력(${clip(q.input_desc, 300)}) / 출력(${clip(q.output_desc, 300)})` +
+  `- ${clip(q.query_name, MAX_PROMPT_NAME_LEN)}: ${clip(oneLine(q.query_desc))}` +
+  ` / 입력(${clip(oneLine(q.input_desc), 300)}) / 출력(${clip(oneLine(q.output_desc), 300)})` +
   ` / 바인드(${bindList(q)}) / 대상DB(${dbList(q)})` +
-  ` / SQL: ${clip(q.query_sql, MAX_PROMPT_SQL_LEN)}`;
+  ` / SQL: ${clip(oneLine(q.query_sql), MAX_PROMPT_SQL_LEN)}`;
 
 // 예산이 모자랄 때 쓰는 짧은 형태 — 실행에 반드시 필요한 것만 남긴다.
 //   이름   : 이것이 없으면 그 쿼리를 지목할 방법 자체가 없다
@@ -259,7 +288,7 @@ const queryItem = q =>
 // 입출력 설명과 SQL 원문은 뺀다 — 있으면 좋지만, 없다고 그 쿼리를 못 쓰게 되지는 않는다.
 const MAX_PROMPT_SHORT_DESC_LEN = 120;
 const queryItemShort = q =>
-  `- ${clip(q.query_name, MAX_PROMPT_NAME_LEN)}: ${clip(q.query_desc, MAX_PROMPT_SHORT_DESC_LEN)} / 바인드(${bindList(q)})` +
+  `- ${clip(q.query_name, MAX_PROMPT_NAME_LEN)}: ${clip(oneLine(q.query_desc), MAX_PROMPT_SHORT_DESC_LEN)} / 바인드(${bindList(q)})` +
   (hasDbChoice(q) ? ` / 대상DB(${dbList(q)})` : '');
 
 // 짧은 형태로 실린 쿼리도 그대로 실행할 수 있다는 사실을 모델에게 알린다 —
@@ -391,20 +420,22 @@ const clipDisplayValue = v =>
     : v === null || typeof v === 'number' || typeof v === 'boolean' ? v
       : clip(JSON.stringify(v) ?? String(v), MAX_DISPLAY_VALUE_LEN);
 
-function historyLine(h) {
+// step은 이력 안의 절대 순번(1부터)이다. 앞선 스텝이 예산으로 생략돼도 번호가 당겨지지 않아야
+// 처리 방법의 "2단계"와 모델이 보는 스텝이 어긋나지 않고, 화면 trace의 순번과도 같은 값을 가리킨다.
+function historyLine(h, step) {
   // 어느 DB에서 돈 스텝인지 함께 싣는다 — 대상DB 후보가 여럿인 쿼리에서 이것이 없으면 모델은
   // 방금 무엇을 조회했는지 알 수 없어, 다음 스텝에서 다른 후보를 골라 놓고 같은 결과를 기대하거나
   // 이미 본 DB를 다시 조회한다 (루프 가드는 이름·바인드만 보므로 그 반복을 잡지 못한다).
   const at = h.targetDb ? `@${clip(h.targetDb, MAX_TARGET_DB_NAME_LEN)}` : '';
-  const head = `- ${clip(h.query_name, 100)}${at} params=${paramsJson(h.params)}`;
+  const head = `${step}. ${clip(h.query_name, 100)}${at} params=${paramsJson(h.params)}`;
   if (h.note) {
     // 루프 가드가 남긴 제어용 기록 — 실패가 아니므로 '오류'로 알리지 않는다 (모델이 실패로 오해해 불필요한 우회를 하지 않게)
-    return `${head} → 실행하지 않음: ${h.note}`;
+    return `${head} → 실행하지 않음: ${clip(oneLine(h.note))}`;
   }
   if (h.error) {
-    // 드라이버 오류 원문은 길 수 있다 — 항목 상한을 여기에도 건다.
+    // 드라이버 오류 원문은 길고 여러 줄이다(ORA 메시지 뒤에 Help 링크 줄이 붙는다) — 항목 상한과 한 줄 규칙을 여기에도 건다.
     // hint는 모델 전용 복구 지침이다 — 사용자 trace에는 나가지 않으므로 여기서만 붙인다 (constants.safeError 참고).
-    return `${head} → 오류: ${clip(h.error)}${h.hint ? ` / 대응: ${clip(h.hint)}` : ''}`;
+    return `${head} → 오류: ${clip(oneLine(h.error))}${h.hint ? ` / 대응: ${clip(oneLine(h.hint))}` : ''}`;
   }
   // 건수 해석은 rowCounts 한 곳에서만 한다 (사용자 답변·화면 trace도 같은 해석을 쓴다).
   // 여기서 더 줄이는 것은 '몇 건을 인쇄하는가'뿐이므로 해석이 갈라지지 않는다: printed ≤ shown ≤ totalRows.
@@ -422,12 +453,11 @@ function historyLine(h) {
 // 모델은 결과를 못 본 채 같은 쿼리를 다시 제안한다(그러면 루프 가드에 걸려 답변만 부실해진다).
 // 표시 순서는 시간순으로 되돌린다.
 function renderHistory(history, budget) {
-  if (!history.length) return ['(없음)'];
   const usable = Math.max(0, budget - NOTES_RESERVE);
   const lines = [];
   let used = 0;
   for (let i = history.length - 1; i >= 0; i--) {
-    const line = historyLine(history[i]);
+    const line = historyLine(history[i], i + 1);
     if (lines.length > 0 && used + lineCost(line) > usable) break;
     lines.push(line);
     used += lineCost(line);
@@ -443,16 +473,18 @@ function renderHistory(history, budget) {
 // 뒤 섹션들의 최소 몫을 미리 떼어놓으므로 앞 섹션이 뒤를 굶기지 못하고, 앞이 짧으면 그 여유가
 // 그대로 뒤로 넘어간다 — 그래서 가장 중요한 섹션(쿼리 목록)을 맨 뒤에 두었다(constants.js 참고).
 // 이 배분 덕에 어느 섹션이 얼마나 길어지든 합계는 MAX_PROMPT_TOTAL_LEN을 넘지 않는다.
+// 배분에 앞서 고정 틀의 몫(PROMPT_FRAME_RESERVE — 제목 줄·빈 줄·지시 블록)을 뗀다. 본문만 세면
+// 네 섹션이 각자 예산에 꽉 찬 요청에서 틀의 길이만큼 정확히 전체 상한을 넘는다.
 function renderSections(ctx) {
   const builders = {
-    knowledge: budget => renderItems(ctx.knowledge, k => `- [${clip(k.title, MAX_PROMPT_NAME_LEN)}] ${clip(k.content)}`, budget),
-    qaMethods: budget => renderItems(ctx.qaMethods, m => `- [${clip(m.title, MAX_PROMPT_NAME_LEN)}] ${clip(m.method)}`, budget),
+    knowledge: budget => renderItems(ctx.knowledge, k => `- [${clip(oneLine(k.title), MAX_PROMPT_NAME_LEN)}] ${clip(indent(k.content))}`, budget),
+    qaMethods: budget => renderItems(ctx.qaMethods, m => `- [${clip(oneLine(m.title), MAX_PROMPT_NAME_LEN)}] ${clip(indent(m.method))}`, budget),
     history: budget => renderHistory(ctx.history, budget),
     queries: budget => renderQueries(ctx.queries, budget),
   };
   const keys = Object.keys(PROMPT_FLOORS);
   const out = {};
-  let remaining = MAX_PROMPT_TOTAL_LEN;
+  let remaining = MAX_PROMPT_TOTAL_LEN - PROMPT_FRAME_RESERVE;
   keys.forEach((key, i) => {
     const reserved = keys.slice(i + 1).reduce((sum, k) => sum + PROMPT_FLOORS[k], 0);
     const lines = builders[key](Math.max(PROMPT_FLOORS[key], remaining - reserved));
@@ -462,30 +494,90 @@ function renderSections(ctx) {
   return out;
 }
 
+// 프롬프트에 싣는 '현재 시각'의 시간대. 조회대상 DB의 today_date 쿼리(seed.sql)와 같은 KST로
+// 고정한다 — 둘이 다르면 모델이 프롬프트의 날짜로 계산한 기준일과 DB가 돌려준 기준일이 자정
+// 전후 몇 시간 동안 하루 어긋나고, 그 차이는 오류 없이 답변의 날짜에만 나타난다.
+const PROMPT_TIME_ZONE = 'Asia/Seoul';
+const PROMPT_TIME_ZONE_LABEL = 'KST';
+// sv-SE 로케일은 ISO 형태(YYYY-MM-DD HH:MM)를 준다. 요일은 붙여 준다 — "이번 주", "지난 금요일"을
+// 절대 날짜로 바꾸려면 오늘이 무슨 요일인지도 알아야 하는데, 모델이 날짜에서 요일을 셈하는 것은
+// 틀리기 쉽고 틀려도 티가 나지 않는다.
+const DATE_TIME_FMT = new Intl.DateTimeFormat('sv-SE', {
+  timeZone: PROMPT_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+});
+const WEEKDAY_FMT = new Intl.DateTimeFormat('ko-KR', { timeZone: PROMPT_TIME_ZONE, weekday: 'short' });
+// (테스트에서 쓰므로 export 한다)
+export function formatNow(now) {
+  const [date, time] = DATE_TIME_FMT.format(now).split(' ');
+  return `${date} (${WEEKDAY_FMT.format(now)}) ${time} ${PROMPT_TIME_ZONE_LABEL}`;
+}
+
+// 섹션 하나 = 제목 줄 + 본문 줄들. 네 섹션 모두 제목에 건수를 달고, 비면 '(없음)'을 싣는다 —
+// 규칙이 섹션마다 다르면(어떤 제목엔 건수가 있고 어떤 본문은 빈 채로 끝나면) 모델은 '비어 있음'과
+// '누락됨'을 구분할 수 없고, 건수는 생략 안내와 맞춰 볼 때 '몇 건 중 몇 건이 실렸는지'를 준다.
+const section = (title, count, lines, unit = '건') =>
+  [`## ${title} (${count}${unit})`, ...(lines.length ? lines : ['(없음)'])].join('\n');
+
 // (테스트에서 쓰므로 export 한다 — 예산이 어긋나도 티가 나지 않는 종류의 실패라 회귀 테스트가 필요하다)
-export function buildPrompt(ctx) {
+// now를 인자로 받는 이유: 테스트가 시각을 고정할 수 있어야 한다 (기본값은 호출 시각).
+export function buildPrompt(ctx, now = new Date()) {
   // 배분 순서와 출력 순서는 별개다 — 배분은 우선순위대로, 출력은 모델이 읽기 좋은 고정 순서로.
   const s = renderSections(ctx);
-  const lines = [];
 
-  // 대화와 질문은 이 예산 밖이다: 각각 MAX_CHAT_TURNS×MAX_CHAT_LEN과 서버의 2,000자 제한으로
+  // 출력 순서는 '자료 → 과제' 다. 근거(지식·처리 방법·쿼리 목록·이력)를 먼저 보이고 질문과 지시를
+  // 맨 끝에 둔다. 두 가지 이유다.
+  //   ① 모델은 마지막에 읽은 것을 가장 강하게 붙든다(recency). 결정해야 할 것은 현재 질문이므로
+  //      그것이 자료 4천 자 앞에 묻혀 있으면 안 된다 — 특히 후속 질문("그럼 김철수는?")은 짧아서
+  //      앞에 두면 그대로 파묻힌다.
+  //   ② 한 요청 안에서 스텝마다 바뀌는 것은 실행 이력과 지시(forceAnswer)뿐이다(목록 밖 쿼리를
+  //      지목해 agent.js resolveQuery가 목록 앞에 끼워 넣는 드문 스텝은 예외). 요청마다 바뀌는 것
+  //      (질문·대화·시각)까지 뒤로 몰면, 앞부분(시스템 프롬프트·지식·처리 방법·쿼리 목록)이 스텝
+  //      사이에 같은 토큰열로 남아 vLLM prefix caching이 그만큼을 재사용한다.
+  // 대화와 질문은 예산 밖이다: 각각 MAX_CHAT_TURNS×MAX_CHAT_LEN과 서버의 2,000자 제한으로
   // 이미 묶여 있고, 둘 다 빠지면 질문 자체가 성립하지 않아 버릴 수 있는 대상이 아니다.
-  if (ctx.chat?.length) {
-    lines.push('## 최근 대화');
-    for (const m of ctx.chat) lines.push(`- ${m.role === 'user' ? '사용자' : '에이전트'}: ${m.text}`);
-    lines.push('');
-  }
-  lines.push(`## 사용자 질문 (현재)\n${ctx.question}`);
+  const chat = ctx.chat ?? [];
+  const blocks = [
+    section('관련 지식', ctx.knowledge.length, s.knowledge),
+    section('Q&A 처리 방법', ctx.qaMethods.length, s.qaMethods),
+    section('실행 가능한 쿼리 목록', ctx.queries.length, s.queries),
+    section('쿼리 실행 이력', ctx.history.length, s.history),
+    section('최근 대화', chat.length, chat.map(m => `- ${m.role === 'user' ? '사용자' : '에이전트'}: ${indent(m.text)}`), '턴'),
+    `## 사용자 질문 (현재)\n${ctx.question}`,
+    // 지시는 항상 싣는다 — 마지막 스텝에만 붙으면 모델은 그 전까지 '지시가 없는 프롬프트'를 받아
+    // 무엇을 하라는 것인지를 시스템 프롬프트에서 다시 찾아야 한다. 현재 시각도 여기 둔다: 질문과
+    // 함께 읽혀야 하는 값이고, 매 분 바뀌는 값이라 앞쪽에 두면 ②의 재사용을 스스로 깬다.
+    `## 지시\n현재 시각: ${formatNow(now)}\n` + (ctx.forceAnswer
+      ? '더 이상 쿼리를 실행할 수 없다. 지금까지의 정보만으로 action="answer"로 최종 답변하라.'
+      : '위 자료를 근거로 현재 질문에 대한 다음 행동 하나를 JSON으로 결정하라.'),
+  ];
+  return blocks.join('\n\n');
+}
 
-  lines.push(`\n## 관련 지식 (${ctx.knowledge.length}건)`, ...s.knowledge);
-  lines.push(`\n## Q&A 처리 방법 (${ctx.qaMethods.length}건)`, ...s.qaMethods);
-  lines.push('\n## 실행 가능한 쿼리 목록', ...s.queries);
-  lines.push('\n## 쿼리 실행 이력', ...s.history);
-
-  if (ctx.forceAnswer) {
-    lines.push('\n## 지시\n더 이상 쿼리를 실행할 수 없다. 지금까지의 정보만으로 action="answer"로 최종 답변하라.');
-  }
-  return lines.join('\n');
+// ===== 예산 불변식 — 모듈 로드 시 검증 =====
+// 실행 이력의 최소 몫(constants.js PROMPT_FLOORS.history)은 'MAX_STEPS 스텝이 각자 상한까지 차도 전부
+// 실린다'가 근거다. 그 근거가 성립하지 않으면 강제 답변 스텝(이력이 MAX_STEPS건인 유일한 호출)에서
+// 1번 스텝이 빠진다 — 실제로 그랬다(몫 14k < 5 × 3k + 머리말). 오류 없이 답변의 근거만 사라지는 종류라
+// 값을 바꾸는 순간 드러나야 한다.
+// 한 줄의 상한을 상수의 합으로 다시 적지 않고 잰다: 합을 적어두면 historyLine의 형식(머리말·건수 안내)이
+// 바뀔 때마다 두 곳을 맞춰야 하고 어긋나도 티가 나지 않는다. 모든 항이 상한에 닿은 스텝을 실제로
+// 렌더해 그 길이를 쓰되, 결과 JSON 몫은 fitRows가 보장하는 상한(MAX_PROMPT_STEP_LEN)으로 바꿔 넣는다.
+// 결과 줄과 오류 줄 중 긴 쪽이 한 줄의 상한이다.
+function maxHistoryLineLen() {
+  const over = n => 'x'.repeat(n + 1); // 상한을 넘겨 clip이 '상한 + TRUNC_MARK'까지 채우게 한다
+  const head = { query_name: over(MAX_PROMPT_NAME_LEN), targetDb: over(MAX_TARGET_DB_NAME_LEN), params: { p: over(MAX_PROMPT_PARAMS_LEN) } };
+  const rows = Array.from({ length: MAX_RESULT_ROWS }, () => ({ C: 'x'.repeat(MAX_CELL_LEN) }));
+  const resultLine = historyLine({ ...head, rows, totalRows: MAX_ROWS, capped: true }, MAX_STEPS);
+  const rowsLen = JSON.stringify(fitRows(rows, MAX_PROMPT_STEP_LEN)).length;
+  const errorLine = historyLine({ ...head, error: over(MAX_PROMPT_ITEM_LEN), hint: over(MAX_PROMPT_ITEM_LEN) }, MAX_STEPS);
+  return Math.max(resultLine.length - rowsLen + MAX_PROMPT_STEP_LEN, errorLine.length);
+}
+const HISTORY_FLOOR_NEEDED = MAX_STEPS * (maxHistoryLineLen() + 1) + NOTES_RESERVE; // +1: 줄마다 개행 (lineCost)
+if (PROMPT_FLOORS.history < HISTORY_FLOOR_NEEDED) {
+  throw new Error(
+    `PROMPT_FLOORS.history (${PROMPT_FLOORS.history}) cannot hold MAX_STEPS (${MAX_STEPS}) full history lines ` +
+    `(${HISTORY_FLOOR_NEEDED} needed) — raise the floor or lower MAX_PROMPT_STEP_LEN in constants.js.`
+  );
 }
 
 // ===== 응답 텍스트 → 결정 JSON =====
