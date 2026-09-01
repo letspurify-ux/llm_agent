@@ -73,6 +73,10 @@ export default function App() {
   const composingRef = useRef(false); // IME 조합 진행 중
   const pendingSendRef = useRef(false); // 조합 중에 눌린 Enter — 조합이 확정되면 그때 보낸다
   const sendingRef = useRef(false);   // 전송 진행 중 (loading state와 달리 같은 tick에도 즉시 보인다)
+  const abortRef = useRef(null);      // 진행 중인 요청 (홈으로 돌아갈 때 끊는다)
+  // 대화의 세대 번호. 홈으로 돌아갈 때마다 올라가고, ask는 시작 시점의 값을 들고 있다가
+  // 응답을 반영하기 전에 대조한다 — 끊긴 요청의 뒤늦은 응답이 새 대화에 끼어드는 것을 막는다.
+  const sessionRef = useRef(0);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -106,6 +110,24 @@ export default function App() {
   // loading은 state라 같은 tick에 두 번 호출되면 두 번 다 false로 읽힐 수 있다 —
   // 실제 중복 전송을 막는 것은 ref 쪽이다 (state는 버튼 비활성화 등 렌더에만 쓴다).
   const canSend = () => !loading && !sendingRef.current;
+
+  // 첫 화면(빈 상태)으로 되돌린다. 화면이 하나뿐이라 '홈으로 이동'은 곧 대화를 접는 것이다.
+  // 답을 기다리는 중에도 눌릴 수 있다 — 요청 상한이 450초라 그때까지 막아두면
+  // 사실상 되돌아갈 수 없는 시간이 생긴다. 그래서 진행 중인 요청은 여기서 끊는다.
+  function goHome() {
+    // 세대를 먼저 올린다. abort가 일으키는 ask의 finally가 이 값을 보고 자기 응답을 버린다
+    // (아래에서 내리는 loading·sendingRef를 그쪽이 다시 건드리지 않게 하는 것도 이 대조다).
+    sessionRef.current += 1;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    sendingRef.current = false;
+    pendingSendRef.current = false; // 조합 중에 눌려 대기하던 Enter도 함께 없앤다
+    historyRef.current = [];
+    setMessages([]);
+    setInput('');
+    setLoading(false);
+    inputRef.current?.focus();
+  }
 
   // 입력창에서 보내는 경로. setInput('')을 ask가 아니라 여기서 하는 이유:
   // ask는 예시 칩(ask(x))에서도 불리는데, 거기서 입력창을 비우면 사용자가 쓰던 초안이
@@ -156,6 +178,8 @@ export default function App() {
     // 플래그를 세우는 것까지 try 안에서 한다 — 세운 뒤 try 밖에서 무엇이든 던지면 finally가 돌지 않아
     // 플래그가 걸린 채 영구히 남는다. 그러면 화면은 멀쩡한데 전송만 막힌다
     // (loading은 false라 버튼도 활성으로 보인다). 바로 아래 AbortController가 없는 구형 브라우저가 그 경우다.
+    // 이 요청이 속한 대화. finally에서 아직 같은 대화인지 확인하는 데 쓴다 (goHome 참고).
+    const session = sessionRef.current;
     try {
       sendingRef.current = true;
       // AbortSignal.timeout()이 아니라 AbortController를 쓴다 — 전자는 Chrome 103/Safari 16 이상이고
@@ -163,6 +187,7 @@ export default function App() {
       // 구형 브라우저에서 fetch 호출 전에 TypeError가 나고, 그게 아래 catch에 삼켜져
       // 모든 질문이 "서버와 통신하지 못했습니다"로 보인다 — 백엔드 장애와 구분이 안 된다.
       const ctrl = new AbortController();
+      abortRef.current = ctrl; // 홈으로 돌아갈 때 끊을 수 있도록 내둔다
       timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
       // history는 현재 질문을 넣기 전에 확정한다 — 현재 질문은 message로 따로 가므로 중복 전송하지 않는다.
       // 서버가 쓰는 만큼만 보낸다 (턴 수·길이 모두). 더 보내도 서버가 버리고 본문만 커진다.
@@ -196,10 +221,16 @@ export default function App() {
       // 화면에는 항상 남기지만, 서버로 되돌려 보내는 이력에는 서버가 준 답만 넣는다 —
       // 타임아웃·네트워크 실패 문구를 이력에 남기면 다음 질문의 '## 최근 대화'에
       // "에이전트: 서버와 통신하지 못했습니다."로 실려, 모델이 자기가 한 말로 알고 사과하거나 그걸 근거로 추론한다.
-      if (answered) historyRef.current = [...historyRef.current, { role: 'assistant', text: answer }];
-      setMessages(m => [...m, { role: 'assistant', text: answer, trace }]);
-      setLoading(false);
-      sendingRef.current = false;
+      // 그사이 홈으로 돌아갔다면(세대가 다르면) 이 답은 이미 지난 대화의 것이다 — 비운 화면에
+      // 떨어뜨리지 않는다. loading·sendingRef도 goHome이 이미 정리했으므로 건드리지 않는다
+      // (여기서 내리면 그 뒤에 시작된 새 요청의 상태를 지우게 된다).
+      if (sessionRef.current === session) {
+        abortRef.current = null;
+        if (answered) historyRef.current = [...historyRef.current, { role: 'assistant', text: answer }];
+        setMessages(m => [...m, { role: 'assistant', text: answer, trace }]);
+        setLoading(false);
+        sendingRef.current = false;
+      }
     }
   }
 
@@ -211,6 +242,17 @@ export default function App() {
           <h1><span>SPACE</span> Assistant</h1>
           <p>지식 · 운영 DB 조회 기반</p>
         </div>
+        {/* 대화가 없고 기다리는 것도 없으면 되돌아갈 곳이 없다 — 그때는 눌리지 않게 둔다
+            (입력창의 초안은 홈이 아니어도 남는 것이므로 이 판단에 넣지 않는다). */}
+        <button
+          type="button"
+          className="home-btn"
+          onClick={goHome}
+          disabled={messages.length === 0 && !loading}
+          title="새 대화로 시작합니다"
+        >
+          <span aria-hidden="true">⌂</span><span className="home-label">홈</span>
+        </button>
       </header>
 
       <main className="chat">
