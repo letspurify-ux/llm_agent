@@ -1,5 +1,6 @@
 // 조회용 DB(Oracle) 쿼리 실행기.
-// node-oracledb Thin 모드(기본값) 사용 — Oracle Instant Client 설치 불필요.
+// 드라이버 모드는 ORACLE_DRIVER로 고른다 — thin(기본, Oracle Instant Client 불필요) 또는
+// oci(node-oracledb Thick 모드, 설치된 Oracle Client 라이브러리 경유). 아래 oracleDriver 참고.
 // ORACLE_MOCK=1 이면 실제 접속 없이 하단 MOCK_DATA의 stub 결과를 반환한다.
 import oracledb from 'oracledb';
 import { loadTargetDb } from './db.js';
@@ -135,6 +136,57 @@ export function oracleMock() {
   return false;
 }
 
+// ORACLE_DRIVER의 단일 해석 지점 — ORACLE_MOCK·LLM_PROVIDER와 같은 규칙으로 읽는다.
+//   thin (기본): 드라이버가 Oracle 프로토콜을 직접 말한다. Instant Client 설치가 필요 없다.
+//   oci: node-oracledb Thick 모드. 이 머신에 설치된 Oracle Client 라이브러리를 거쳐 붙는다 —
+//        사내 표준이 OCI이거나, thin이 지원하지 않는 접속(외부 인증, 일부 wallet/Kerberos 구성,
+//        구형 서버)을 써야 할 때 고른다.
+// 'thick'도 같은 것으로 받아준다 — node-oracledb 문서가 쓰는 이름이 그쪽이라 .env에 그렇게
+// 적는 쪽이 자연스럽고, 그 철자를 거부하면 '오타 아닌 오타'로 thin에 붙게 된다.
+// 모르는 값은 thin으로 두되 반드시 알린다. 이 폴백이 안전한 이유는 ORACLE_MOCK과 다르다 —
+// 여기서 어긋나도 붙는 DB는 같다(접속 경로만 다르다). 그래서 결과는 '그대로 동작하거나,
+// 접속이 안 돼 즉시 드러나거나' 둘 중 하나이고, stub이 실데이터 행세를 하는 종류의 조용한
+// 오답은 생기지 않는다. 반대로 모르는 값을 oci로 두면 Client가 없는 머신에서 모든 조회가 죽는다.
+// 값은 호출 시점에 읽는다 (테스트가 import 뒤에 설정한다).
+const DRIVERS = ['thin', 'oci'];
+
+export function oracleDriver() {
+  const raw = process.env.ORACLE_DRIVER;
+  if (raw === undefined || String(raw).trim() === '') return 'thin';
+  const v = nameKey(raw);
+  if (v === 'thick') return 'oci';
+  if (DRIVERS.includes(v)) return v;
+  // scope는 설정 항목마다 따로 둔다 (위 oracle-mock 주석 참고).
+  warnOnce('setup:oracle-driver', `unknown ORACLE_DRIVER ${JSON.stringify(raw)} — falling back to thin mode (valid: ${DRIVERS.join(', ')}). Check backend/.env.`);
+  return 'thin';
+}
+
+// Thick(OCI) 초기화는 프로세스 전체에 딱 한 번이고, 되돌릴 수 없으며, 첫 접속보다 먼저여야 한다 —
+// thin으로 커넥션이 한 번이라도 만들어진 뒤에 부르면 드라이버가 NJS-118로 거부한다.
+// 그래서 부르는 곳은 둘이다: 기동 시점(server.js — 설치 누락을 첫 질문이 아니라 기동 로그에서
+// 알기 위해)과 접속 직전(runQuery — 서버를 거치지 않는 테스트·CLI 경로도 같은 모드로 붙게).
+// 실제 초기화는 여기서 한 번만 한다.
+//
+// 실패해도 플래그를 세우지 않는다. 라이브러리 설치는 재기동 없이 고칠 수 없지만, 성공한 적 없는
+// 것을 '했다'고 기억하면 두 번째 조회부터는 예외 없이 thin으로 붙는다 — .env에는 oci라고 적혀
+// 있고 기동 로그에는 경고가 한 줄 있을 뿐인데 실제 접속 경로만 조용히 바뀌어 있는 상태가 된다.
+let clientInitialized = false;
+
+export function initOracleClient() {
+  if (clientInitialized || oracleDriver() !== 'oci') return;
+  // 두 경로 모두 비워 두는 것이 정상이다 — 비우면 드라이버가 OS의 기본 검색 경로를 따른다
+  // (라이브러리: Linux LD_LIBRARY_PATH·ldconfig / Windows PATH / macOS ~/lib,
+  //  설정 파일: TNS_ADMIN). 값이 있을 때만 넘긴다: 빈 문자열은 '설정하지 않음'이 아니라
+  // '빈 경로에서 찾아라'라는 지시가 되어, .env에 줄만 있고 값이 없는 흔한 상태에서
+  // 초기화가 통째로 실패한다.
+  const libDir = trimEnv('ORACLE_CLIENT_LIB_DIR');
+  const configDir = trimEnv('ORACLE_CLIENT_CONFIG_DIR');
+  oracledb.initOracleClient({ ...(libDir && { libDir }), ...(configDir && { configDir }) });
+  clientInitialized = true;
+}
+
+const trimEnv = name => String(process.env[name] ?? '').trim();
+
 // 반환: { rows, totalRows, capped } — rows는 MAX_ROWS까지, 셀은 MAX_CELL_LEN까지 정규화된 값.
 // capped는 "상한에 걸려 잘렸다"는 뜻이므로 MAX_ROWS+1건을 요청해 판정한다
 // (정확히 MAX_ROWS건인 완전한 결과를 "더 있을 수 있음"으로 잘못 알리지 않도록).
@@ -190,6 +242,20 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
     throw safeError(`지원하지 않는 db_type: ${target.db_type} (현재 oracle만 지원)`);
   }
 
+  // 드라이버 모드 확정은 첫 접속보다 먼저여야 한다 (initOracleClient 주석 참고).
+  // 기동 시점에 이미 했으면 여기서는 아무 일도 하지 않는다.
+  try {
+    initOracleClient();
+  } catch (e) {
+    // 상세(경로·DPI-1047 설치 안내)는 로그에만 남긴다 — 화면에 나갈 값이 아니고(constants.safeError),
+    // 모델에게도 쓸모가 없다: 다른 쿼리를 골라도 같은 이유로 실패한다.
+    warnOnce('oracle:client', `failed to initialize the Oracle Client for ORACLE_DRIVER=oci — install the Instant Client or set ORACLE_CLIENT_LIB_DIR in backend/.env: ${e.message}`);
+    throw safeError(
+      '조회대상 DB 드라이버를 초기화하지 못했습니다.',
+      '조회는 지금 불가능하다 — 다른 쿼리로 재시도하지 말고 지금까지의 정보로 답변하라'
+    );
+  }
+
   // 풀 없이 실행마다 접속/해제 — 사내 Q&A 트래픽 수준에 충분, 다중 target_db 관리 단순
   const conn = await oracledb.getConnection({
     user: target.db_user,
@@ -204,6 +270,12 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
     // 값을 작게 잡는 이유는 이 상한이 '주소마다' 적용되기 때문이다 — connect1이 주소 목록을
     // do/while로 돌며 시도마다 타이머를 새로 건다. 'localhost'는 ::1과 127.0.0.1 둘로 풀리므로
     // 실제 최악은 주소 수 × 값이다. 조회 타임아웃(ORACLE_TIMEOUT_MS)과 별개인 것도 그래서다.
+    //
+    // 이 두 값은 thin 모드에서만 쓰인다 — 이름은 검증되지만 실제로 읽는 곳이 thin의 sqlnet 계층뿐이라
+    // oci(Thick)에서는 조용히 무시된다. oci로 쓰면서 같은 상한이 필요하면 sqlnet.ora의
+    // SQLNET.OUTBOUND_CONNECT_TIMEOUT이나 접속 문자열의 (CONNECT_TIMEOUT=…)로 준다
+    // (ORACLE_CLIENT_CONFIG_DIR가 그 sqlnet.ora를 가리키는 자리다).
+    // 아래 callTimeout(조회 상한)은 두 모드 모두에 적용되므로 '예산 없는 조회'가 되지는 않는다.
     connectTimeout: CONNECT_TIMEOUT_S,
     transportConnectTimeout: TRANSPORT_CONNECT_TIMEOUT_S,
   });

@@ -3,7 +3,7 @@ import { writeSync } from 'node:fs';
 import express from 'express';
 import { handleQuestion, normalizeQuestion } from './agent.js';
 import { llmProvider } from './llm.js';
-import { oracleMock } from './oracle.js';
+import { oracleMock, oracleDriver, initOracleClient } from './oracle.js';
 import { syncEmbeddings, syncSummary, requestSyncStop } from './embed-sync.js';
 import { insertChatLog, cleanupChatLogs, closePool } from './db.js';
 import { numEnv, warnOnce, clipText, MAX_QUESTION_LEN } from './constants.js';
@@ -41,6 +41,18 @@ if (llmProvider() === 'openai') {
   const missing = ['LLM_BASE_URL', 'LLM_MODEL'].filter(k => !process.env[k]);
   if (missing.length) {
     console.warn(`[setup] LLM_PROVIDER=openai but ${missing.join(', ')} is empty — every question will end in "LLM call failed". Check backend/.env.`);
+  }
+}
+// Oracle 쪽 함정도 같은 모양이다: ORACLE_DRIVER=oci는 이 머신에 설치된 Oracle Client 라이브러리를
+// 요구하는데, 없으면 초기화가 실패하고 그 사실은 '첫 질문'에서야 드러난다(/api/health는 계속 ok).
+// 기동 시점에 한 번 초기화해 설치 누락을 기동 로그에서 알린다. 성공하면 이후 조회가 이 초기화를
+// 그대로 쓴다 — Thick 초기화는 프로세스에 한 번뿐이다 (oracle.js initOracleClient 주석 참고).
+// mock일 때는 하지 않는다: 접속 자체가 없으므로 Client도 필요 없다.
+if (!oracleMock() && oracleDriver() === 'oci') {
+  try {
+    initOracleClient();
+  } catch (e) {
+    console.warn(`[setup] ORACLE_DRIVER=oci but the Oracle Client could not be initialized — every DB query will fail. Install the Oracle Instant Client, or set ORACLE_CLIENT_LIB_DIR in backend/.env: ${e.message}`);
   }
 }
 
@@ -235,7 +247,7 @@ const server = app.listen(port, () => {
   // (llmProvider/oracleMock 주석 참고). 배너의 존재 이유가 이 확인이다.
   console.log(
     `agent server: http://localhost:${server.address().port} ` +
-    `(LLM=${llmProvider()}, ORACLE_MOCK=${oracleMock() ? '1' : '0'})`
+    `(LLM=${llmProvider()}, ORACLE_MOCK=${oracleMock() ? '1' : '0'}, ORACLE_DRIVER=${oracleDriver()})`
   );
 });
 server.on('error', e => {

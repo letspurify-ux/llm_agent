@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import oracledb from 'oracledb';
-import { runQuery, normalizeCells, numberFromString, oracleMock } from '../src/oracle.js';
+import { runQuery, normalizeCells, numberFromString, oracleMock, oracleDriver } from '../src/oracle.js';
 import { llmProvider } from '../src/llm.js';
 import { MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK } from '../src/constants.js';
 
@@ -100,6 +100,37 @@ test('ORACLE_MOCK 표기를 흡수하고 모르는 값은 실제 접속으로 �
   } finally {
     console.warn = origWarn;
     process.env.ORACLE_MOCK = saved ?? '1';   // 이 파일의 나머지 테스트가 mock 경로를 쓴다
+  }
+});
+
+test('ORACLE_DRIVER 표기를 흡수하고 모르는 값은 thin으로 두되 알린다', () => {
+  // 모드를 잘못 읽으면 배너가 'ORACLE_DRIVER=oci'라고 알리면서 실제로는 thin으로 붙는다 —
+  // ORACLE_MOCK과 같은 함정이라 같은 방식으로 막는다. 폴백이 thin인 이유는 붙는 DB가 같기
+  // 때문이다(접속 경로만 다르다): 어긋나도 그대로 동작하거나 즉시 접속 실패로 드러난다.
+  const saved = process.env.ORACLE_DRIVER;
+  const warned = [];
+  const origWarn = console.warn;
+  console.warn = m => warned.push(String(m));
+  try {
+    for (const v of ['thin', 'THIN', ' thin ', '']) {
+      process.env.ORACLE_DRIVER = v;
+      assert.equal(oracleDriver(), 'thin', v);
+    }
+    delete process.env.ORACLE_DRIVER;
+    assert.equal(oracleDriver(), 'thin', '미설정');
+    // 'thick'은 node-oracledb 문서가 쓰는 이름이다 — 그 철자로 적어도 oci로 읽는다.
+    for (const v of ['oci', 'OCI', 'thick', ' Thick ']) {
+      process.env.ORACLE_DRIVER = v;
+      assert.equal(oracleDriver(), 'oci', v);
+    }
+    warned.length = 0;
+    process.env.ORACLE_DRIVER = 'ocl';
+    assert.equal(oracleDriver(), 'thin');
+    assert.ok(warned.some(m => /ORACLE_DRIVER/.test(m)), '모르는 값에 경고가 없다');
+  } finally {
+    console.warn = origWarn;
+    if (saved === undefined) delete process.env.ORACLE_DRIVER;
+    else process.env.ORACLE_DRIVER = saved;
   }
 });
 

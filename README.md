@@ -10,7 +10,7 @@
 ```
 
 - **agent 관리 DB**: MariaDB — `knowledge`(지식), `qa_method`(Q&A 처리 방법), `query_registry`(쿼리 관리), `target_db`(조회대상 DB 접속 정보)
-- **조회용 DB**: Oracle (node-oracledb Thin 모드, Instant Client 불필요). 여러 개 등록 가능
+- **조회용 DB**: Oracle (node-oracledb — 기본은 Thin 모드라 Instant Client 불필요, `.env`의 `ORACLE_DRIVER=oci`로 Thick(OCI) 모드 전환 가능). 여러 개 등록 가능
 - **LLM**: vLLM / OpenRouter 등 OpenAI 호환 API. 개발용 규칙 기반 Mock 내장
 - **UI**: React(Vite) 채팅 화면. 답변은 markdown(표·제목·목록)으로 구조화되어 렌더링(react-markdown + remark-gfm), 수식은 KaTeX. 관리 데이터는 SQL로 직접 입력
 
@@ -275,9 +275,33 @@ LLM 인터페이스는 `llm.js`의 `decide(ctx) → {action:'answer'|'run_query'
 
 ## 실제 Oracle 연결
 
-1. `target_db` 테이블에 접속 정보 등록 — `connection_info`는 Thin connectString(`host:1521/SERVICE`), `db_password`는 `ENV:변수명` 형식 권장
+1. `target_db` 테이블에 접속 정보 등록 — `connection_info`는 Easy Connect 문자열(`host:1521/SERVICE`) 또는 tnsnames 별칭, `db_password`는 `ENV:변수명` 형식 권장
 2. `.env`에서 `ORACLE_MOCK=0`, 참조하는 비밀번호 환경변수(`ORDER_DB_PASSWORD`) 설정
 3. `query_registry`의 쿼리를 실제 테이블 구조에 맞게 등록
+
+### 드라이버 모드 (thin / oci)
+
+`.env`의 `ORACLE_DRIVER`로 고른다. 기본은 `thin`이고, 그대로 두면 설치할 것이 없다.
+
+| 값 | 설명 | 추가 설치 |
+|---|---|---|
+| `thin` (기본) | 드라이버가 Oracle 프로토콜을 직접 말한다 | 없음 |
+| `oci` (= `thick`) | 이 머신에 설치된 Oracle Client 라이브러리를 거쳐 붙는다 — 사내 표준이 OCI이거나 thin이 지원하지 않는 접속(외부 인증, 일부 wallet/Kerberos 구성, 구형 서버)이 필요할 때 | Oracle Instant Client |
+
+`oci`로 쓸 때 필요하면 함께 지정한다 (둘 다 비워 두는 것이 정상 경로다).
+
+- `ORACLE_CLIENT_LIB_DIR` — Instant Client(libclntsh) 디렉터리. 비우면 OS 기본 검색 경로(Linux `LD_LIBRARY_PATH`·ldconfig / Windows `PATH` / macOS `~/lib`)
+- `ORACLE_CLIENT_CONFIG_DIR` — `tnsnames.ora`·`sqlnet.ora` 디렉터리. 비우면 `TNS_ADMIN`
+
+Thick 초기화는 프로세스에 한 번뿐이고 첫 접속보다 먼저여야 하므로 기동 시점에 한다.
+Client 라이브러리를 찾지 못하면 기동 로그에 `[setup] ORACLE_DRIVER=oci but the Oracle Client
+could not be initialized …`가 남고 조회는 전부 실패한다 — 이 실패를 첫 질문이 아니라 기동
+로그에서 보라고 기동 시점에 확인한다. 실제로 어느 모드로 떴는지는 기동 배너의
+`ORACLE_DRIVER=…`가 알려준다(원본 환경변수가 아니라 해석된 값이다).
+
+접속 단계 타임아웃(`connectTimeout`/`transportConnectTimeout`)은 thin 전용이다 — `oci`에서 같은
+상한이 필요하면 `sqlnet.ora`의 `SQLNET.OUTBOUND_CONNECT_TIMEOUT`이나 접속 문자열의
+`(CONNECT_TIMEOUT=…)`로 준다. 조회 타임아웃(`ORACLE_TIMEOUT_MS`)은 두 모드 모두에 적용된다.
 
 로컬 테스트 컨테이너(위 1-2단계)를 쓰는 경우 접속 정보는 이미 `target_db`에 등록되어 있다.
 `.env`에서 `ORACLE_MOCK=0`으로 바꾸고, `ORDER_DB_PASSWORD`에 조회 계정 `VOC_READER`의 비밀번호
