@@ -194,3 +194,16 @@ test('식별자 상한을 넘는 바인드명은 등록 단계에서 거부된�
     e => e.message.length < MAX_BIND_NAME_LEN + 200
   );
 });
+
+test('대소문자만 다른 바인드는 한 개로 센다', () => {
+  // Oracle의 비인용 바인드명은 대소문자를 구분하지 않는다 — :job_id와 :JOB_ID는 placeholder 한 개다.
+  // 표기별로 세면 runQuery가 placeholder 하나에 바인드 두 개를 실어 보내 드라이버가
+  // ORA-01036/NJS-098로 죽는다. 그 원문은 화면에서 가려지므로(server.js) 사용자도 모델도 원인을
+  // 볼 수 없고, 그 쿼리는 등록된 채 영원히 실행되지 않는다 — 위치 바인드(:1)와 같은 부류의 실패다.
+  // 값을 찾는 쪽(constants.bindValue)이 대소문자를 무시하므로 세는 쪽만 구분하면 규칙이 반쪽만 남는다.
+  assert.deepStrictEqual([...bindNames('SELECT 1 FROM t WHERE a = :job_id AND b = :JOB_ID')], ['job_id']);
+  assert.deepStrictEqual([...bindNames('SELECT 1 FROM t WHERE a = :JOB_ID AND b = :job_id')], ['JOB_ID']);
+  // 서로 다른 바인드는 그대로 둔다 (중복 제거가 넓어져 진짜 바인드를 삼키면 안 된다)
+  assert.deepStrictEqual([...bindNames('SELECT 1 FROM t WHERE a = :x AND b = :y')], ['x', 'y']);
+  assert.deepStrictEqual([...bindNames('SELECT 1 FROM t WHERE a = :job_id AND b = :job_id2')], ['job_id', 'job_id2']);
+});

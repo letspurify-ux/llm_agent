@@ -80,10 +80,24 @@ test('값이 아닌 구조는 서로 다른 실행으로 구분된다', () => {
   assert.notEqual(paramKey(['a'], { a: { x: 1 } }), paramKey(['a'], { a: '[object Object]' }));
   // 같은 구조는 키 순서가 달라도 같은 실행이다 (최상위 키 순서를 정규화하는 것과 같은 이유)
   assert.equal(paramKey(['a'], { a: { x: 1, y: 2 } }), paramKey(['a'], { a: { y: 2, x: 1 } }));
-  // 순환 참조가 가드를 죽이면 안 된다 — 판정 하나가 결정 루프 전체를 끊는다
+  // 순환 참조가 가드를 죽이면 안 된다 — 판정 하나가 결정 루프 전체를 끊는다.
+  // '던지지 않는다'만으로는 부족하다: 정규화를 JSON.stringify의 replacer로 하면 매번 새 객체를
+  // 돌려주게 되어 순환 탐지가 통째로 비켜가고(원본이 직렬화 스택에 오르지 않는다), 스택이
+  // 바닥날 때까지 재귀한 뒤 RangeError가 catch에 잡힌다 — 겉으로는 통과하지만 그 자리에서
+  // 자바스크립트 스택을 전부 태우고 값은 '[object Object]'로 뭉개진다.
+  // 그래서 '순환 구조 둘이 여전히 구분되는가'로 잰다 — 뭉개지면 이 단언이 깨진다.
   const cyclic = { x: 1 };
   cyclic.self = cyclic;
+  const cyclic2 = { x: 2 };
+  cyclic2.self = cyclic2;
   assert.doesNotThrow(() => paramKey(['a'], { a: cyclic }));
+  assert.notEqual(paramKey(['a'], { a: cyclic }), paramKey(['a'], { a: cyclic2 }));
+  // 순환이 아닌 '공유 참조'를 순환으로 오판하면 안 된다 (seen에서 되빼지 않으면 그렇게 된다)
+  const shared = { s: 1 };
+  assert.equal(
+    paramKey(['a'], { a: { p: shared, q: shared } }),
+    paramKey(['a'], { a: { p: { s: 1 }, q: { s: 1 } } })
+  );
 });
 
 test('바인드명 대소문자가 실행 판정을 어긋내지 않는다', () => {

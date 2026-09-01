@@ -143,6 +143,13 @@ test('정상 크기의 결정은 값이 그대로 통과한다', () => {
   const a = { action: 'answer', answer: '답' };
   assert.strictEqual(sanitizeDecision(a), a);
   assert.strictEqual(sanitizeDecision(null), null);
+  // 상한 아래면 answer의 타입도 그대로 둔다. 이 경계의 일은 '크기 확정'이지 타입 정규화가 아니다 —
+  // 문자열로 굳히면 falsy였던 값(0·false)이 truthy가 되면서, 폴백으로 가야 할 결정이
+  // "0"이라는 답변으로 화면에 나간다 (agent.js는 answer의 truthy 여부로 폴백을 판단한다).
+  for (const v of [0, false, null, undefined, 42]) {
+    const d = { action: 'answer', answer: v };
+    assert.strictEqual(sanitizeDecision(d), d, `answer: ${JSON.stringify(v)}`);
+  }
 });
 
 test('provider 이름의 대소문자·공백을 흡수하고 모르는 값은 소리 나게 알린다', () => {
@@ -274,4 +281,28 @@ test('qa_method 본문이 NULL이어도 Mock 실행 계획이 죽지 않는다',
     history: [],
   });
   assert.equal(d.action, 'answer');
+});
+
+test('대문자로 등록된 바인드명도 Mock 규칙이 걸린다', async () => {
+  // 바인드명은 대소문자를 구분하지 않는데(constants.bindValue, sql.js bindNames) PARAM_RULES 조회만
+  // 정확한 철자를 요구하면, 컬럼명에 맞춰 `WHERE JOB_ID = :JOB_ID`로 등록한 쿼리에서 규칙이 걸리지
+  // 않는다. fillParams가 null을 돌려주고 mockDecide는 그 쿼리를 '무관한 쿼리'로 건너뛴다 —
+  // 조회 없이 답이 나가는데 왜 건너뛰었는지는 어디에도 남지 않는다. 가장 나쁜 부류의 실패다.
+  const saved = process.env.LLM_PROVIDER;
+  process.env.LLM_PROVIDER = 'mock';
+  try {
+    for (const bind of [':job_id', ':JOB_ID', ':Job_Id']) {
+      const d = await llm.decide({
+        question: 'BATCH001 상태 알려줘', chat: [], knowledge: [], history: [],
+        qaMethods: [{ title: 'm', method: 'batch_job_status 를 실행한다' }],
+        queries: [{ query_name: 'batch_job_status', query_sql: `SELECT * FROM T WHERE JOB_ID = ${bind}`,
+                    target_db_name: 'D', query_desc: '', input_desc: '', output_desc: '' }],
+      });
+      assert.equal(d.action, 'run_query', `${bind}: 조회가 조용히 생략됐다`);
+      assert.equal(Object.values(d.params)[0], 'BATCH001', bind);
+    }
+  } finally {
+    if (saved === undefined) delete process.env.LLM_PROVIDER;
+    else process.env.LLM_PROVIDER = saved;
+  }
 });

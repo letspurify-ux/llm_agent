@@ -421,5 +421,10 @@ function mockResult(queryName, params) {
   const key = nameKey(queryName);
   const gen = ownProp(MOCK_DATA, key);
   if (!gen) throw safeError(`mock 데이터가 정의되지 않은 쿼리: ${queryName}`);
-  return gen(params);
+  // 바인드명도 쿼리명과 같은 이유로 낮춰서 넘긴다. binds의 키는 등록 SQL의 철자 그대로인데
+  // (bindNames), Oracle은 대소문자를 가리지 않으므로 컬럼명에 맞춘 `:JOB_ID` 표기가 자연스럽게
+  // 들어온다 — 위 생성기들이 p.job_id로 읽으므로 그 표기에서만 조용히 0건이 된다.
+  // 실 Oracle은 정상 조회되는데 mock만 "결과가 없습니다"로 답하는 셈이라, 데모에서 등록 실수로
+  // 오인하기 딱 좋다. 생성기마다 표기를 방어하는 대신 경계에서 한 번 정규화한다.
+  return gen(Object.fromEntries(Object.entries(params ?? {}).map(([k, v]) => [nameKey(k), v])));
 }

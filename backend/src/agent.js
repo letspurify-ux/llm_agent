@@ -57,17 +57,39 @@ export function paramKey(bindNameList, params) {
 // 거부하므로 이력에는 '실패'로 남는데, 그 실패 둘이 한 실행으로 뭉개지면 MAX_GUARD_HITS가
 // 실제보다 한 스텝 일찍 차서 모델이 값을 고쳐 잡을 기회를 잃는다.
 // 키 순서까지 정규화한다 — {a,b}와 {b,a}는 같은 값이고, 순서로 갈리면 위 sort가 최상위에서
-// 하는 정규화가 한 겹 아래에서 무너진다. 순환 참조는 여기서 던지면 안 되므로(가드 하나가
-// 결정 루프를 죽인다) String(v)로 물러선다.
+// 하는 정규화가 한 겹 아래에서 무너진다.
+// 정규화는 JSON.stringify의 replacer가 아니라 '먼저 한 번' 훑어서 한다. replacer로 하면
+// 매번 새 객체를 돌려주게 되는데, JSON.stringify의 순환 참조 탐지는 '지금 직렬화 중인 값'들의
+// 스택을 보므로 원본이 그 스택에 한 번도 올라가지 않는다 — 깔끔한 TypeError 대신 스택이
+// 바닥날 때까지 재귀한다(실측: RangeError). catch가 받아내긴 하지만, 결정 루프 한가운데서
+// 자바스크립트 스택을 통째로 소진하는 경로를 남길 이유가 없다.
+// 순환은 마커로 끊는다. seen에서 되빼는 것이 중요하다 — 빼지 않으면 같은 객체를 두 번 가리키는
+// (순환이 아닌) 정상 구조까지 순환으로 오판한다.
+// BigInt는 JSON.stringify가 던지므로 그때만 String(v)로 물러선다 — 여기서 던지면 가드 하나가
+// 결정 루프를 통째로 죽인다.
+const CYCLE_MARK = '[순환]';
+
+function canonical(v, seen) {
+  if (!v || typeof v !== 'object') return v;
+  if (seen.has(v)) return CYCLE_MARK;
+  seen.add(v);
+  const out = Array.isArray(v)
+    ? v.map(x => canonical(x, seen))
+    : Object.fromEntries(
+        Object.entries(v)
+          .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+          .map(([k, x]) => [k, canonical(x, seen)])
+      );
+  seen.delete(v);
+  return out;
+}
+
 function valueKey(v) {
   if (v === undefined) return ['undefined'];
   if (v === null) return ['null'];
   if (typeof v !== 'object') return String(v);
   try {
-    return ['json', JSON.stringify(v, (_, x) =>
-      x && typeof x === 'object' && !Array.isArray(x)
-        ? Object.fromEntries(Object.entries(x).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)))
-        : x)];
+    return ['json', JSON.stringify(canonical(v, new Set()))];
   } catch {
     return ['json', String(v)];
   }

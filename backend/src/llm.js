@@ -93,8 +93,12 @@ export function sanitizeDecision(d) {
   // 상한을 요청의 max_tokens가 아니라 여기에 두는 이유: 완성을 토큰 수로 끊으면 JSON이 중간에서
   // 잘려 파싱 자체가 실패하고, 그 스텝의 결정이 통째로 버려진다 — 자를 곳은 파싱이 끝난 뒤다.
   if (d.action === 'answer') {
-    const clipped = clipAnswer(d.answer);
-    return clipped === d.answer ? d : { ...d, answer: clipped };
+    // 상한을 넘을 때만 다시 만든다. clipAnswer가 돌려준 값과 비교하는 방식은 쓰지 않는다 —
+    // 그러면 문자열이 아닌 answer가 조용히 문자열로 굳어, answer: 0처럼 falsy였던 값이
+    // '0'(truthy)이 되면서 폴백으로 가야 할 결정이 "0"이라는 답변으로 화면에 나간다.
+    // 이 경계의 일은 '크기 확정'이지 타입 정규화가 아니다 (형식 검증은 llm-openai toDecision).
+    const answer = String(d.answer ?? '');
+    return answer.length > MAX_ANSWER_LEN ? { ...d, answer: clipAnswer(answer) } : d;
   }
   if (d.action !== 'run_query') return d;
   const clipVal = v => {
@@ -201,7 +205,13 @@ function fillParams(registryRow, ctx) {
     let value = valueFromHistory(name, ctx.history);
     // 소유 키만 본다 (constants.ownProp) — 바인드명이 '__proto__' 같은 프로토타입 멤버와 겹치면
     // 함수가 아닌 값을 호출하다 결정 루프 전체가 죽는다 (oracle.js mockResult와 같은 이유·같은 방식).
-    const rule = ownProp(PARAM_RULES, name);
+    // 이름 비교는 nameKey로 한다 — 바인드명은 대소문자를 구분하지 않는데(constants.bindValue,
+    // sql.js bindNames) 이 조회만 정확한 철자를 요구하면, 컬럼명에 맞춰 `WHERE JOB_ID = :JOB_ID`로
+    // 등록한 쿼리에서 규칙이 걸리지 않는다. 그러면 fillParams가 null을 돌려주고 mockDecide는
+    // 그 쿼리를 '이 질문과 무관한 쿼리'로 건너뛴다 — 조회 없이 답이 나가는데 왜 건너뛰었는지는
+    // 어디에도 남지 않는다(실측). 바로 아래 valueFromHistory는 같은 이유로 이미 대소문자를 무시한다.
+    // (PARAM_RULES 키는 전부 소문자다)
+    const rule = ownProp(PARAM_RULES, nameKey(name));
     if (value === undefined && rule) {
       for (const t of texts) {
         value = rule(t);

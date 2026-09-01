@@ -202,7 +202,11 @@ server.on('error', e => {
   // communication packets'가 쌓인다 — embed-sync.js의 CLI가 closePool을 부르는 것과 같은 이유인데,
   // 이 세 번째 종료 경로만 빠져 있었다. 포트 충돌은 재배포마다 나는 흔한 실패라 매번 반복된다.
   console.error('[listen] failed to start:', e.message);
-  shutdown('listen failed', 1);
+  // 종료 코드 보장은 정리보다 우선한다. shutdown은 async라 여기서 거부되면 unhandledRejection
+  // 핸들러가 로그만 남기고 넘어가는데, 강제 타이머는 unref라 이벤트 루프를 붙잡지 않는다 —
+  // 기동에 실패한 프로세스가 종료 코드 0으로 조용히 빠져나가고 supervisor는 정상 종료로 읽는다.
+  // 정리를 못 하더라도 '실패로 나간다'는 사실만은 반드시 남긴다.
+  shutdown('listen failed', 1).catch(() => process.exit(1));
 });
 
 // 정상 종료 — 진행 중인 요청을 끝내고 타이머·커넥션 풀을 정리한 뒤 빠진다.
@@ -249,4 +253,11 @@ async function shutdown(reason, code = 0) {
   clearTimeout(force);
   process.exit(code);
 }
-for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => shutdown(`received ${sig}`));
+// 시그널 경로도 같은 이유로 거부를 받는다 — 여기서 새면 종료가 통째로 멈춘 채 프로세스만 남고
+// (강제 타이머는 unref라 붙잡지 않는다) supervisor의 SIGKILL을 기다리게 된다.
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () => shutdown(`received ${sig}`).catch(e => {
+    console.error('[shutdown] cleanup failed:', e);
+    process.exit(1);
+  }));
+}

@@ -277,3 +277,15 @@ test('설정 오타 둘이 겹쳐도 경고가 무한히 쌓이지 않는다', (
     else process.env.LLM_PROVIDER = savedProvider;
   }
 });
+
+test('mock 생성기도 바인드명 표기에 좌우되지 않는다', async () => {
+  // binds의 키는 등록 SQL의 철자 그대로다(bindNames). MOCK_DATA 생성기가 p.job_id로 읽으므로
+  // `:JOB_ID`로 등록하면 mock만 0건이 되어, 실 Oracle에서는 되는 조회가 데모에서만 빈 결과가 된다 —
+  // 등록 실수로 오인하기 딱 좋은 형태다 (query_name을 nameKey로 낮추는 것과 같은 이유).
+  for (const bind of ['job_id', 'JOB_ID', 'Job_Id']) {
+    const sql = `SELECT 1 FROM T WHERE A = :${bind}`;
+    const { rows } = await runQuery(reg('batch_job_status', sql), { [bind]: 'BATCH001' });
+    assert.equal(rows.length, 1, `${bind}: mock이 0건을 돌려줬다`);
+    assert.equal(rows[0].JOB_ID, 'BATCH001');
+  }
+});

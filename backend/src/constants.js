@@ -182,6 +182,11 @@ export const nameKey = s => String(s ?? '').trim().toLowerCase();
 // 정확히 일치하는 키를 먼저 본다(ownProp) — 프로토타입 멤버와 겹치는 이름도 그쪽에서 막힌다.
 // 대소문자만 다른 키가 여럿이면 먼저 선언된 것을 쓴다. 값이 undefined인 항목은 건너뛴다 —
 // '키는 있는데 값이 없는' 항목이 실제 값을 가진 다른 표기를 가리면 안 된다.
+// 비교 키가 nameKey라 앞뒤 공백도 함께 흡수한다 ({" job_id": …}도 :job_id에 바인드된다).
+// Oracle 식별자에는 공백이 들어갈 수 없으므로 ' job_id'가 별개의 정당한 바인드일 수는 없다 —
+// 거부해봐야 값은 맞는데 스텝 하나를 버릴 뿐이다. query_name을 trim하는 것과 같은 판단이다.
+// 세는 쪽(sql.js bindNames)도 같은 nameKey로 중복을 제거한다 — 한쪽만 관대하면 "같은 바인드인가"를
+// 두 곳이 다르게 판정하게 되고, 그 차이가 곧 드라이버까지 내려가는 실패가 된다.
 export function bindValue(params, name) {
   const exact = ownProp(params, name);
   if (exact !== undefined) return exact;

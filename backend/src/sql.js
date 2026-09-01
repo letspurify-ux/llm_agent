@@ -10,7 +10,7 @@
 // 리터럴에 삼켜져 조회 전용 가드를 통과한다(가드 우회). 경계 판정은 정확해야 한다.
 // 다루는 어휘: 한 줄/블록 주석, q-quote(임의 구분자 + 괄호쌍), 일반 문자열('' 이스케이프),
 // 따옴표 식별자("..."). 이 중 하나라도 빠지면 그 뒤의 스캔이 통째로 어긋난다.
-import { safeError, clipText, MAX_BIND_NAME_LEN, TRUNC_MARK } from './constants.js';
+import { safeError, clipText, nameKey, MAX_BIND_NAME_LEN, TRUNC_MARK } from './constants.js';
 
 const Q_CLOSER = { '[': ']', '{': '}', '(': ')', '<': '>' };
 const isIdentChar = c => c !== undefined && /[A-Za-z0-9_$#]/.test(c);
@@ -121,6 +121,25 @@ const BIND_RE = /:([A-Za-z0-9_$#]+)/g;
 const isExecutableBind = n => /^[A-Za-z]/.test(n) && n.length <= MAX_BIND_NAME_LEN;
 const bindCandidates = text => [...new Set([...text.matchAll(BIND_RE)].map(m => m[1]))];
 
+// 중복 제거는 Oracle과 같은 기준으로 — 비인용 바인드명은 대소문자를 구분하지 않으므로
+// `WHERE a = :job_id AND b = :JOB_ID`의 placeholder는 두 개가 아니라 한 개다.
+// 표기별로 세면 runQuery가 placeholder 하나에 바인드 두 개를 실어 보내고 드라이버가
+// ORA-01036/NJS-098로 죽는다 — 드라이버 원문은 화면에서 가려지므로(server.js) 사용자도 모델도
+// 원인을 볼 수 없고, 그 쿼리는 등록된 채 영원히 실행되지 않는다. 위치 바인드(:1)를 거부하는 것과
+// 같은 부류의 실패다.
+// 값을 찾는 쪽(constants.bindValue)이 이미 대소문자를 무시하므로, 세는 쪽만 구분하면 규칙이
+// 반쪽만 적용된다 — 한쪽은 "같은 바인드"라 하고 다른 쪽은 "다른 바인드"라 하는 상태가 된다.
+// 남기는 표기는 SQL에 처음 나온 것이다 (Oracle이 대소문자를 가리지 않으므로 어느 쪽이든 바인드된다).
+const dedupeByBindKey = names => {
+  const seen = new Set();
+  return names.filter(n => {
+    const k = nameKey(n);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+};
+
 export function bindNames(sql) {
   const hit = bindCache.get(sql);
   if (hit) {
@@ -131,7 +150,7 @@ export function bindNames(sql) {
     bindCache.set(sql, hit);
     return hit;
   }
-  const names = Object.freeze(bindCandidates(stripNoise(sql)).filter(isExecutableBind));
+  const names = Object.freeze(dedupeByBindKey(bindCandidates(stripNoise(sql)).filter(isExecutableBind)));
   while (bindCache.size >= BIND_CACHE_MAX) bindCache.delete(bindCache.keys().next().value);
   bindCache.set(sql, names);
   return names;
