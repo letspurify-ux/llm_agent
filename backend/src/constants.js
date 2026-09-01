@@ -169,6 +169,39 @@ export const MAX_BIND_NAME_LEN = 128;
 // 한 곳이라도 ===로 남으면 그 경로에서만 가드가 조용히 무력화된다.
 export const nameKey = s => String(s ?? '').trim().toLowerCase();
 
+// 조회대상 DB 이름 상한. target_db.db_name이 VARCHAR(100)이므로 그보다 긴 이름은 어떤 등록 DB와도
+// 대응할 수 없다. 바인드명(MAX_BIND_NAME_LEN)은 상한을 넘으면 자르지 않고 버리는데, 여기서는 자른다 —
+// 두 실패가 모델에게 보이는 모습이 다르기 때문이다. 버리면 '고르지 않았다'가 되어 모델은 자기가
+// 이름을 적었다는 사실과 어긋나는 오류를 받지만, 자르면 '등록되지 않은 대상 DB: xxx (후보: …)'가
+// 되어 무엇을 어떻게 고칠지가 그 문구 안에 다 들어 있다 (DB 후보는 목록이 있어 자가 교정이 된다).
+export const MAX_TARGET_DB_NAME_LEN = 100;
+
+// 조회대상 DB 목록의 단일 해석 지점.
+// query_registry.target_db_name은 ';'로 구분한 목록이다 — 'ORDER_DB' 하나면 지금까지와 똑같고,
+// 'STOCK_SEOUL;STOCK_BUSAN'처럼 둘 이상이면 LLM이 그중 하나를 골라 실행한다.
+// 프롬프트(llm-openai.js dbList)와 실행 경계(oracle.js resolveTargetDb)가 반드시 같은 목록을 봐야 한다:
+// 한쪽만 규칙이 달라지면 '프롬프트에 보였는데 실행이 모르는 이름이라고 거부하는' 후보가 생기고,
+// 그 실패는 모델이 목록대로 답했는데도 나므로 고칠 방법이 없다. 그래서 규칙을 여기 하나로 둔다
+// (sql.js assertReadOnly가 가드와 실행용 SQL을 함께 돌려주는 것과 같은 이유).
+//
+// 빈 조각은 버린다 — 'ORDER_DB;'나 'A;;B' 같은 흔한 표기에서 빈 이름이 후보로 올라오면
+// loadTargetDb가 0건을 돌려주고, 그 실패는 '접속 정보가 등록되어 있지 않다'로 보고되어
+// 원인이 등록 문자열의 세미콜론 하나라는 사실을 어디에서도 가리키지 않는다.
+// 중복은 첫 철자만 남긴다 — target_db 조회는 대소문자를 무시하는 collation이라 'A;a'는 한 개이고,
+// 둘로 세면 프롬프트가 같은 DB를 두 번 보여주면서 모델에게 '고를 것이 둘'이라고 말하게 된다.
+export function targetDbNames(raw) {
+  const seen = new Set();
+  const names = [];
+  for (const part of String(raw ?? '').split(';')) {
+    const name = part.trim();
+    const key = nameKey(name);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    names.push(name);
+  }
+  return names;
+}
+
 // 바인드명으로 값을 찾는 단일 지점 — Oracle의 바인드명은 대소문자를 구분하지 않는다.
 // (:job_id와 :JOB_ID는 같은 바인드이고, 드라이버도 그렇게 다룬다)
 // exact-case 읽기만 하면 모델이 값을 제대로 채워 보내도 '값 없음'이 된다: 프롬프트는 SQL 원문의

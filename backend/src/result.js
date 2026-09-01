@@ -41,6 +41,12 @@ export function clientTrace(trace) {
     return {
       query_name: h.query_name,
       params: h.params,
+      // 어느 DB를 조회했는지 화면에도 보여준다. 대상 DB가 여럿인 쿼리에서는 '무엇을 조회했나'의
+      // 절반이 이 이름이다 — 같은 쿼리·같은 파라미터라도 DB가 다르면 다른 답이므로, 빼면
+      // 사용자는 서울 재고와 부산 재고를 구분할 수 없는 trace를 보게 된다.
+      // 등록 철자 그대로 나가므로 db_name에는 계정·호스트가 아니라 사람이 읽을 이름을 등록할 것
+      // (접속 주소·계정은 target_db의 다른 컬럼이고 화면에 나가지 않는다).
+      ...(h.targetDb && { targetDb: h.targetDb }),
       rowCount: capped ? `${totalRows}+` : totalRows,
       rows: shown,
       // 실린 행보다 조회된 건수가 많을 때만 붙인다 (평소 패널은 지금과 똑같이 조용하다).

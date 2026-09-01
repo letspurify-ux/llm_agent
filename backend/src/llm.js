@@ -9,7 +9,7 @@
 // agent.js는 provider가 바뀌어도 변경되지 않는다.
 import { openaiDecide } from './llm-openai.js';
 import { bindNames } from './sql.js';
-import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN, clipText, nameKey, ownProp, warnOnce } from './constants.js';
+import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, clipText, nameKey, ownProp, warnOnce, targetDbNames } from './constants.js';
 import { rowCounts } from './result.js';
 
 // LLM provider 선택의 단일 해석 지점.
@@ -124,8 +124,23 @@ export function sanitizeDecision(d) {
       .filter(([k]) => k.length <= MAX_BIND_NAME_LEN)
       .map(([k, v]) => [k, clipBindValue(v)])
   );
+  // 조회대상 DB 선택. 이 경계는 화이트리스트라 여기에 자리를 만들지 않으면 모델이 골라 보낸
+  // target_db가 조용히 사라진다 — 실행 경계는 '고르지 않았다'고 보고하고, 모델은 자기가 이름을
+  // 적었다는 사실과 어긋나는 오류를 받아 같은 시도를 반복한다.
+  // 문자열이 아니면 버린다(형식 검증은 llm-openai toDecision) — 여기 일은 크기 확정이다.
+  // 상한을 넘으면 자르되 실행 경계가 후보 목록과 함께 거부한다 (constants.MAX_TARGET_DB_NAME_LEN 참고).
+  const targetDb = typeof d.target_db === 'string'
+    ? clipText(d.target_db.trim(), MAX_TARGET_DB_NAME_LEN)
+    : '';
   // trim: 이름 앞뒤 공백은 등록 철자와의 비교(agent.js resolveQuery)를 어긋내는 것 외에 아무 역할이 없다
-  return { action: 'run_query', query_name: clipText(String(d.query_name).trim(), 200), params };
+  return {
+    action: 'run_query',
+    query_name: clipText(String(d.query_name).trim(), 200),
+    params,
+    // 빈 값은 키 자체를 두지 않는다 — 실행 경계가 '고르지 않음'을 undefined 하나로만 판정하게
+    // 해서, ''와 없음이 서로 다른 경로를 타는 일이 생기지 않게 한다.
+    ...(targetDb && { target_db: targetDb }),
+  };
 }
 
 // ===== MockLLM: 규칙 기반 구현 (개발용) =====
@@ -144,7 +159,13 @@ async function mockDecide(ctx) {
       // ===로 보면 철자만 다른 같은 쿼리를 '아직 실행 안 함'으로 읽고 매 스텝 다시 제안한다.
       if (history.some(h => nameKey(h.query_name) === nameKey(q.query_name) && h.rows)) continue;
       const params = fillParams(q, ctx);
-      if (params) return { action: 'run_query', query_name: q.query_name, params };
+      if (params) {
+        // Mock은 규칙 기반이라 '어느 DB를 볼지'를 판단할 근거가 없다 — 등록 목록의 첫 후보를 쓴다.
+        // 고르는 것 자체를 건너뛰지는 않는다: 실행 경계는 후보가 둘 이상인데 고르지 않으면
+        // 거부하므로, 비워 두면 목록형으로 등록한 쿼리가 mock에서만 한 번도 실행되지 않는다.
+        const targetDb = targetDbNames(q.target_db_name)[0];
+        return { action: 'run_query', query_name: q.query_name, params, ...(targetDb && { target_db: targetDb }) };
+      }
       // 바인드 값을 채울 수 없는 쿼리는 건너뛴다 (이 질문과 무관한 쿼리로 간주)
     }
   }

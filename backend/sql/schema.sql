@@ -62,7 +62,12 @@ CREATE TABLE query_registry (
   input_desc     TEXT,
   query_sql      TEXT NOT NULL,
   output_desc    TEXT,
-  target_db_name VARCHAR(100) NOT NULL
+  -- 조회대상 DB. ';'로 구분해 여러 개를 등록하면 LLM이 그중 하나를 골라 실행한다
+  -- (예: 'STOCK_SEOUL;STOCK_BUSAN'). 하나만 적으면 지금까지와 같이 그 DB로 고정된다.
+  -- 목록형으로 쓸 때는 query_desc에 '어느 질문일 때 어느 DB를 고르는가'를 함께 적을 것 —
+  -- 모델에게 주어지는 것은 이 이름들과 설명뿐이고, 이름만으로는 무엇을 골라야 할지 알 수 없다.
+  -- VARCHAR(500)인 이유: db_name이 VARCHAR(100)이라 100자짜리 후보 다섯 개까지는 들어간다.
+  target_db_name VARCHAR(500) NOT NULL
 );
 
 -- 조회대상 DB 접속 정보.

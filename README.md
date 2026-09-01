@@ -279,6 +279,31 @@ LLM 인터페이스는 `llm.js`의 `decide(ctx) → {action:'answer'|'run_query'
 2. `.env`에서 `ORACLE_MOCK=0`, 참조하는 비밀번호 환경변수(`ORDER_DB_PASSWORD`) 설정
 3. `query_registry`의 쿼리를 실제 테이블 구조에 맞게 등록
 
+### 같은 쿼리를 여러 DB 중 하나에서 실행하기
+
+`target_db_name`에 `;`로 후보를 나열하면 LLM이 그중 하나를 골라 실행한다. 하나만 적으면 지금까지와 같이 그 DB로 고정된다.
+
+```sql
+INSERT INTO query_registry (query_name, query_desc, input_desc, query_sql, output_desc, target_db_name) VALUES
+('재고조회', '공장별 재고 DB에서 품목 재고를 조회한다. 질문에 "서울"이 있으면 STOCK_SEOUL, "부산"이면 STOCK_BUSAN을 고른다',
+ ':item_cd = 품목코드', 'SELECT ITEM_CD, QTY FROM STOCK WHERE ITEM_CD = :item_cd', '품목별 재고량',
+ 'STOCK_SEOUL;STOCK_BUSAN');
+```
+
+**`query_desc`에 "어느 질문일 때 어느 DB를 고르는가"를 반드시 적을 것.** 모델에게 주어지는 것은 후보 이름과 이 설명뿐이라, `STOCK_BUSAN`이라는 이름만으로는 "부산 재고"를 그 후보와 연결하지 못한다. 여러 단계라면 `qa_method`에 절차로 적어도 된다.
+
+동작 규칙은 이렇다.
+
+- 후보가 **하나**면 모델이 고르지 않아도 그대로 실행된다 — 목록형을 쓰지 않는 기존 등록은 전부 그대로 동작한다.
+- 후보가 **여럿인데 고르지 않으면** 실행하지 않고 후보 목록과 함께 되묻는다. 첫 후보로 폴백하지 않는 이유는, 그러면 엉뚱한 DB의 결과가 정답 행세를 하면서 답변·trace·`chat_log` 어디에도 흔적을 남기지 않기 때문이다.
+- 후보 **밖의 이름**을 고르면 거부한다. 오류 문구가 후보 목록을 함께 주므로 모델이 다음 스텝에서 스스로 고친다.
+- 한 질문 안에서 **여러 DB를 차례로** 조회할 수 있다 (예: 서울·부산 재고 비교). 루프 가드는 이름·바인드에 더해 대상 DB까지 보고 '같은 실행'을 판정하므로 두 번째 DB 조회가 중복으로 막히지 않는다.
+- 어느 후보인지 질문만으로 정할 수 없으면 모델은 조회하지 않고 사용자에게 되묻는다.
+
+조회한 DB 이름은 화면의 실행 trace에 `쿼리이름@DB이름`으로 나오고 프롬프트의 실행 이력에도 같은 형태로 실린다. 그러므로 `target_db.db_name`에는 **사람이 읽을 이름**을 등록할 것 (접속 주소·계정은 `target_db`의 다른 컬럼이고 화면에 나가지 않는다).
+
+구 스키마(`target_db_name VARCHAR(100)`)에 목록을 넣으면 뒤가 잘린 채 저장되어 후보가 조용히 사라진다 — `sql/seed.sql`이 재실행 시 `VARCHAR(500)`으로 넓힌다.
+
 ### 드라이버 모드 (thin / oci)
 
 `.env`의 `ORACLE_DRIVER`로 고른다. 기본은 `thin`이고, 그대로 두면 설치할 것이 없다.

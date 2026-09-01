@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import oracledb from 'oracledb';
-import { runQuery, normalizeCells, numberFromString, oracleMock, oracleDriver } from '../src/oracle.js';
+import { runQuery, normalizeCells, numberFromString, oracleMock, oracleDriver, resolveTargetDb } from '../src/oracle.js';
 import { llmProvider } from '../src/llm.js';
 import { MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK } from '../src/constants.js';
 
@@ -324,4 +324,62 @@ test('mock 생성기도 바인드명 표기에 좌우되지 않는다', async ()
     assert.equal(rows.length, 1, `${bind}: mock이 0건을 돌려줬다`);
     assert.equal(rows[0].JOB_ID, 'BATCH001');
   }
+});
+
+// --- 조회대상 DB 선택 (target_db_name의 ';' 목록) ---------------------------------
+const multi = list => ({ query_name: 'batch_job_status', query_sql: 'SELECT 1 FROM DUAL', target_db_name: list });
+
+test('후보가 하나면 고르지 않아도 그 DB로 실행된다', () => {
+  // 목록형을 쓰지 않는 기존 등록은 전부 지금까지와 똑같이 돌아야 한다 —
+  // 여기가 깨지면 이 기능과 무관한 모든 쿼리가 '대상 DB를 고르지 않았다'로 죽는다.
+  assert.equal(resolveTargetDb(multi('ORDER_DB'), null), 'ORDER_DB');
+  assert.equal(resolveTargetDb(multi(' ORDER_DB ; '), undefined), 'ORDER_DB');
+});
+
+test('후보가 여럿인데 고르지 않으면 후보를 들고 되묻는다', () => {
+  // 첫 후보로 조용히 폴백하면 '엉뚱한 DB의 결과'가 정답 행세를 하며 답변·trace·chat_log
+  // 어디에도 흔적을 남기지 않는다 — 이 코드베이스가 막기로 한 조용한 오답 그 자체다.
+  assert.throws(() => resolveTargetDb(multi('SEOUL;BUSAN'), ''), e => {
+    assert.ok(e.safe, '사용자 화면에 나갈 수 있는 문구여야 한다');
+    assert.match(e.message, /고르지 않았습니다/);
+    assert.match(e.message, /SEOUL, BUSAN/);      // 무엇 중에서 고를지 문구가 알려준다
+    assert.match(e.hint, /target_db/);            // 모델에게는 고치는 방법을 준다
+    return true;
+  });
+});
+
+test('후보 밖의 이름은 거부하고, 대소문자만 다르면 등록 철자로 돌려준다', () => {
+  // 모델이 만든 문자열을 그대로 loadTargetDb에 넘기면 '접속 정보 미등록'으로 보고되어,
+  // 모델이 고칠 수 있는 실패(이름 오타)가 고칠 수 없는 실패(운영자 미등록)로 읽힌다.
+  assert.throws(() => resolveTargetDb(multi('SEOUL;BUSAN'), 'DAEGU'), e => {
+    assert.ok(e.safe);
+    assert.match(e.message, /등록되지 않은 대상 DB/);
+    assert.match(e.message, /DAEGU/);
+    assert.match(e.message, /SEOUL, BUSAN/);
+    return true;
+  });
+  // 돌려주는 것은 모델이 적은 철자가 아니라 등록 철자다 — 이력·trace·접속이 같은 이름을 본다.
+  assert.equal(resolveTargetDb(multi('SEOUL;BUSAN'), 'busan'), 'BUSAN');
+  assert.equal(resolveTargetDb(multi('SEOUL;BUSAN'), ' Seoul '), 'SEOUL');
+});
+
+test('대상 DB가 비어 있으면 되묻지 않고 실행 불가로 끝낸다', () => {
+  // 운영자의 등록 실수다 — 모델이 무엇을 골라도 달라지지 않으므로 후보를 되물어봐야
+  // 스텝과 LLM 왕복만 소진한다.
+  assert.throws(() => resolveTargetDb(multi(' ; '), 'SEOUL'), e => {
+    assert.ok(e.safe);
+    assert.match(e.message, /등록되어 있지 않습니다/);
+    assert.doesNotMatch(e.hint, /target_db/);
+    return true;
+  });
+});
+
+test('조회 결과에 어느 DB에서 돌았는지가 함께 실린다', async () => {
+  // 이력·trace·화면이 '어느 DB의 결과인가'를 알 수 있는 유일한 경로다. mock 경로에서도
+  // 같은 판정을 지나야 한다 — mock만 건너뛰면 'mock에서는 되는데 실제로는 죽는' 조합이 생긴다.
+  const one = await runQuery(multi('ORDER_DB'), { job_id: 'B1' });
+  assert.equal(one.targetDb, 'ORDER_DB');
+  const picked = await runQuery(multi('SEOUL;BUSAN'), { job_id: 'B1' }, undefined, 'busan');
+  assert.equal(picked.targetDb, 'BUSAN', '등록 철자로 돌아와야 한다');
+  await assert.rejects(runQuery(multi('SEOUL;BUSAN'), { job_id: 'B1' }), /고르지 않았습니다/);
 });

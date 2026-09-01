@@ -48,7 +48,11 @@ const Message = memo(function Message({ role, text, trace }) {
             <summary>⚡ 실행된 쿼리 {trace.length}건</summary>
             {trace.map((t, j) => (
               <pre key={j}>
-                {t.query_name} {JSON.stringify(t.params)}
+                {/* 대상 DB가 여럿인 쿼리는 쿼리 이름만으로 무엇을 조회했는지 알 수 없다.
+                    대상이 하나인 등록에서도 함께 보여준다 — 있고 없고가 등록 형태에 따라 갈리면
+                    같은 화면이 어떤 줄에서만 DB를 밝히게 되어 그 차이가 뜻으로 읽힌다.
+                    실행되지 않은 스텝(오류·미등록)에는 서버가 값을 주지 않을 수 있다. */}
+                {t.query_name}{t.targetDb ? `@${t.targetDb}` : ''} {JSON.stringify(t.params)}
                 {/* 조회 건수와 여기 실린 행 수는 다를 수 있다 — 몇 건을 보고 있는지 밝히지 않으면
                     사용자가 이 표본을 전부로 읽는다 (서버 result.js clientTrace가 omittedRows를 준다) */}
                 {'\n'}{t.error

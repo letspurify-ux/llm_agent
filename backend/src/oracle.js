@@ -5,7 +5,7 @@
 import oracledb from 'oracledb';
 import { loadTargetDb } from './db.js';
 import { bindNames, assertReadOnly } from './sql.js';
-import { MAX_ROWS, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK, numEnv, nameKey, safeError, clipText, warnOnce, ownProp, bindValue } from './constants.js';
+import { MAX_ROWS, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK, MAX_TARGET_DB_NAME_LEN, numEnv, nameKey, safeError, clipText, warnOnce, ownProp, bindValue, targetDbNames } from './constants.js';
 
 // 드라이버 경계에서 타입을 확정한다. LOB은 기본값이 Lob 스트림 객체라 커넥션을 닫으면 무효가 되고
 // JSON 직렬화 시 순환 참조로 예외가 난다 — CLOB만이 아니라 NCLOB/BLOB도 같은 위험이므로 전부 다룬다.
@@ -193,9 +193,59 @@ const trimEnv = name => String(process.env[name] ?? '').trim();
 // isClippedCopy: '이 값이 우리가 잘라서 보여준 값의 앞부분인가'를 답하는 판정자 (agent.js가 만든다 —
 // clippedCopyDetector). 기본값은 '아니다' — 이 실행기를 직접 부르는 경로(테스트·CLI)에는
 // 잘린 값을 만들어낸 앞 단계가 없다.
+// 후보 목록에 보여줄 이름들의 표시 상한. 목록은 오류 문구를 타고 프롬프트와 사용자 trace 양쪽으로
+// 나가므로, 등록 문자열이 길어져도 그 문구가 함께 커지지 않게 여기서 묶는다.
+const MAX_DB_LIST_LEN = 200;
+const dbListText = names => clipText(names.join(', '), MAX_DB_LIST_LEN);
+
+// 등록된 후보 중 실제로 접속할 DB 하나를 정한다. (프롬프트를 만드는 쪽은 같은 목록을 dbList로 본다)
+// 판정을 실행 경계에 두는 이유는 두 가지다:
+//  ① chosen은 모델이 만든 문자열이라 등록 목록 밖일 수 있다. 그대로 loadTargetDb에 넘기면 조회가
+//     0건이 되고 실패 문구는 '접속 정보가 등록되어 있지 않습니다'가 된다 — 운영자가 등록을 빠뜨린
+//     경우와 모델이 이름을 잘못 적은 경우가 같은 문구로 보고되어, 모델은 고칠 수 있는 실패를
+//     고칠 수 없는 실패로 읽고 다른 쿼리로 우회한다.
+//  ② 이 실행기를 직접 부르는 경로(테스트·CLI)에도 같은 판정이 걸려야 한다 — 가드는 실행 경계 한
+//     곳에서만 판정한다는 이 파일의 규칙 그대로다 (bindProblem·assertReadOnly와 같은 자리).
+// 돌려주는 것은 모델이 적은 철자가 아니라 '등록된 철자'다 — 이력·trace·접속이 모두 같은 이름을
+// 보게 한다 (agent.js가 query_name을 canonicalName으로 통일하는 것과 같은 이유).
+// (테스트에서 쓰므로 export)
+export function resolveTargetDb(registryRow, chosen) {
+  const names = targetDbNames(registryRow.target_db_name);
+  if (!names.length) {
+    // 운영자의 등록 실수다 — 모델이 무엇을 골라도 달라지지 않으므로 후보를 되묻지 않는다.
+    warnOnce('oracle:target-db', `query_registry.target_db_name is empty for ${registryRow.query_name}`);
+    throw safeError(
+      '이 쿼리에는 조회대상 DB가 등록되어 있지 않습니다.',
+      '이 쿼리는 실행할 수 없다 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라'
+    );
+  }
+  // 이름이 길어도 자르고 계속한다 — 아래 '등록되지 않은 대상 DB' 문구가 후보 목록과 함께
+  // 나가므로 모델이 스스로 고칠 수 있다 (constants.MAX_TARGET_DB_NAME_LEN 주석 참고).
+  const want = nameKey(clipText(String(chosen ?? ''), MAX_TARGET_DB_NAME_LEN));
+  if (!want) {
+    // 후보가 하나뿐이면 고를 것이 없다 — 목록형을 쓰지 않는 기존 등록은 전부 지금까지와 같이 돈다.
+    if (names.length === 1) return names[0];
+    // 여럿인데 고르지 않았을 때 첫 후보로 폴백하지 않는다. 그러면 '엉뚱한 DB의 결과'가 정답
+    // 행세를 하며 답변·trace·chat_log 어디에도 흔적을 남기지 않는다 — 이 코드베이스가 막기로 한
+    // 조용한 오답 그 자체다. 바인드 값이 빠졌을 때와 같이 소리를 내고 모델에게 되돌린다.
+    throw safeError(
+      `조회할 대상 DB를 고르지 않았습니다 (후보: ${dbListText(names)}).`,
+      'target_db에 후보 중 하나를 등록된 철자 그대로 적어 같은 쿼리를 다시 실행하라'
+    );
+  }
+  const hit = names.find(n => nameKey(n) === want);
+  if (!hit) {
+    throw safeError(
+      `등록되지 않은 대상 DB입니다: ${clipText(String(chosen), MAX_TARGET_DB_NAME_LEN)} (후보: ${dbListText(names)}).`,
+      'target_db는 후보 목록에 있는 이름이어야 한다 — 그중 하나를 골라 다시 실행하라'
+    );
+  }
+  return hit;
+}
+
 const NOT_CLIPPED_COPY = () => false;
 
-export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLIPPED_COPY) {
+export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLIPPED_COPY, chosenDb = null) {
   // 가드가 '실행용 SQL'까지 함께 돌려준다 — 무엇을 허용했는지 아는 쪽이 무엇을 실행할지도 정한다.
   // 실행부가 따로 문자열을 손보면 둘의 판단이 갈라진다 (sql.js assertReadOnly 주석 참고).
   const sql = assertReadOnly(registryRow.query_sql);
@@ -219,16 +269,22 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
   }
   const binds = Object.fromEntries(names.map(n => [n, val(n)]));
 
-  if (oracleMock()) return capResult(mockResult(registryRow.query_name, binds));
+  // 대상 DB 확정은 mock 판정보다 먼저 한다. 등록 문자열만 보는 순수 판정이라 관리 DB를 건드리지
+  // 않고, 여기서 갈라 두면 mock으로 검증한 시나리오가 실 접속에서 그대로 재현된다 —
+  // mock만 후보 검증을 건너뛰면 'mock에서는 되는데 실제로는 대상 DB 오류로 죽는' 조합이 생긴다
+  // (MOCK_DATA 주석과 같은 원칙: 두 경로가 같은 판정을 지나야 한다).
+  const targetDbName = resolveTargetDb(registryRow, chosenDb);
 
-  const target = await loadTargetDb(registryRow.target_db_name);
+  if (oracleMock()) return capResult(mockResult(registryRow.query_name, binds), targetDbName);
+
+  const target = await loadTargetDb(targetDbName);
   if (!target) {
     // 등록된 조회대상 DB 이름은 서버 내부 식별자다 — safe 표시를 달면 이 문구가 그대로 사용자
     // trace 패널로 나간다(result.js clientTrace). 우리가 쓴 문구라는 사실이 그 안에 담긴 값까지
     // 안전하게 만들어 주지는 않는다: 화면에서 가리기로 한 것은 '스키마명·호스트·계정' 같은
     // 서버 쪽 이름 자체이고(constants.safeError), 등록 DB 이름이 정확히 그 부류다.
     // 상세는 로그에만 남긴다 — 모델에게도 쓸모가 없다(이름을 안다고 고칠 수 있는 실패가 아니다).
-    warnOnce('oracle:target-db', `target_db row not found: ${registryRow.target_db_name}`);
+    warnOnce('oracle:target-db', `target_db row not found: ${targetDbName} (registered for ${registryRow.query_name})`);
     throw safeError(
       '조회대상 DB 접속 정보가 등록되어 있지 않습니다.',
       '이 쿼리는 실행할 수 없다 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라'
@@ -291,7 +347,7 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
       outFormat: oracledb.OUT_FORMAT_OBJECT,
       maxRows: MAX_ROWS + 1,
     });
-    return capResult(result.rows ?? []);
+    return capResult(result.rows ?? [], targetDbName);
   } finally {
     await conn.close().catch(() => {}); // close 실패가 원본 쿼리 오류를 덮어쓰지 않게
   }
@@ -311,10 +367,14 @@ async function setSessionFormats(conn) {
   }
 }
 
-function capResult(allRows) {
+// targetDb를 결과에 함께 실어 보낸다 — 호출부(agent.js)가 '어느 DB의 결과인가'를 이력·trace에
+// 남길 수 있어야 한다. 등록 철자로 돌려주므로 화면과 프롬프트가 같은 이름을 본다.
+// 후보가 하나뿐인 쿼리도 채워 보낸다: 목록형인지 아닌지에 따라 이력의 모양이 달라지면
+// 프롬프트를 읽는 모델이 '이 스텝만 DB가 다르다'로 읽을 여지가 생긴다.
+function capResult(allRows, targetDb) {
   const capped = allRows.length > MAX_ROWS;
   const rows = allRows.slice(0, MAX_ROWS).map(normalizeCells);
-  return { rows, totalRows: rows.length, capped };
+  return { rows, totalRows: rows.length, capped, targetDb };
 }
 
 // 셀 값 정규화 + 컬럼 수 상한 — LOB/이진 값이 그대로 history와 chat_log(JSON)로 흘러가지 않게

@@ -9,7 +9,7 @@ import {
   MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK,
   MAX_PROMPT_ITEM_LEN, MAX_PROMPT_SQL_LEN, MAX_PROMPT_STEP_LEN,
   MAX_PROMPT_PARAMS_LEN, MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS,
-  MAX_BIND_NAME_LEN, clipText, warnOnce,
+  MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, clipText, warnOnce, targetDbNames,
 } from './constants.js';
 import { bindNames } from './sql.js';
 import { rowCounts } from './result.js';
@@ -43,9 +43,11 @@ const SYSTEM_PROMPT = `당신은 사내 지식 관리 및 DB 조회 Q&A 에이�
 생각을 적어야 한다면 <think> 와 </think> 사이에만 적어라. 그 블록 밖에는 위 JSON 하나만 남긴다.
 
 1. 답변 전에 DB 조회가 더 필요하면:
-{"action":"run_query","query_name":"<쿼리이름>","params":{"<바인드변수명>":"<값>"}}
+{"action":"run_query","query_name":"<쿼리이름>","params":{"<바인드변수명>":"<값>"},"target_db":"<대상DB이름>"}
 - query_name은 반드시 쿼리 목록에 있는 이름이어야 한다.
 - params에는 해당 쿼리 SQL의 모든 :바인드 변수 값을 채워라. 값은 사용자 질문 또는 실행 이력의 결과에서 추출한다.
+- target_db: 같은 쿼리를 어느 DB에서 실행할지 정하는 값이다. 쿼리 목록의 '대상DB'에 후보가 둘 이상이면 반드시 그중 하나를 등록된 철자 그대로 골라라 (후보가 하나뿐이면 생략해도 된다). 무엇을 고를지는 그 쿼리의 용도 설명과 질문·Q&A 처리 방법을 근거로 판단한다.
+- 어느 후보를 골라야 할지 질문만으로 정할 수 없으면 지어내지 마라 — 어느 대상을 조회할지 사용자에게 되묻는 answer로 답하라.
 - Q&A 처리 방법에 여러 단계가 서술되어 있으면 그 순서대로 하나씩 실행한다.
 
 2. 답변이 가능하면:
@@ -225,20 +227,40 @@ const bindList = q => {
   return `${shown || '없음'}${omitted ? ` 외 ${omitted}개` : ''}`;
 };
 
+// 대상 DB 후보. 목록은 실행 경계와 같은 파서로 만든다 (constants.targetDbNames) — 두 곳이
+// 다르게 읽으면 '프롬프트에 보였는데 실행이 거부하는' 후보가 생기고, 그 실패는 모델이 보인 대로
+// 답했는데도 나므로 고칠 방법이 없다.
+// bindList와 같은 이유로 표시 개수에 상한을 둔다: 후보가 아주 많은 등록 하나가 목록 전체의
+// 예산을 먹어 다른 쿼리를 밀어내지 않게 한다. 보이지 않은 후보를 모델이 지목할 수는 없지만,
+// 실행 경계는 등록된 후보면 무엇이든 받으므로 정확성이 깨지지는 않는다.
+const MAX_PROMPT_TARGET_DBS = 10;
+const dbList = q => {
+  const names = targetDbNames(q.target_db_name);
+  const shown = names.slice(0, MAX_PROMPT_TARGET_DBS).map(n => clip(n, MAX_TARGET_DB_NAME_LEN)).join(' | ');
+  const omitted = names.length - Math.min(names.length, MAX_PROMPT_TARGET_DBS);
+  return `${shown || '미등록'}${omitted ? ` 외 ${omitted}개` : ''}`;
+};
+
+// 후보가 둘 이상인지 — 짧은 형태에 대상DB를 실을지 가르는 기준이다 (아래 queryItemShort 주석).
+const hasDbChoice = q => targetDbNames(q.target_db_name).length > 1;
+
 const queryItem = q =>
   `- ${clip(q.query_name, MAX_PROMPT_NAME_LEN)}: ${clip(q.query_desc)}` +
   ` / 입력(${clip(q.input_desc, 300)}) / 출력(${clip(q.output_desc, 300)})` +
-  ` / 바인드(${bindList(q)})` +
+  ` / 바인드(${bindList(q)}) / 대상DB(${dbList(q)})` +
   ` / SQL: ${clip(q.query_sql, MAX_PROMPT_SQL_LEN)}`;
 
 // 예산이 모자랄 때 쓰는 짧은 형태 — 실행에 반드시 필요한 것만 남긴다.
 //   이름   : 이것이 없으면 그 쿼리를 지목할 방법 자체가 없다
 //   용도   : 어떤 질문에 쓰는 쿼리인지 고르는 근거
 //   바인드 : 무엇을 채워야 하는지 (없으면 첫 실행이 반드시 '값 없음'으로 실패한다)
+//   대상DB : 후보가 둘 이상일 때만. 고르지 않으면 실행 경계가 거부하므로 바인드와 같은 부류다 —
+//            후보가 하나뿐인 쿼리에는 붙이지 않는다 (고를 것이 없으면 실행에 필요하지 않다).
 // 입출력 설명과 SQL 원문은 뺀다 — 있으면 좋지만, 없다고 그 쿼리를 못 쓰게 되지는 않는다.
 const MAX_PROMPT_SHORT_DESC_LEN = 120;
 const queryItemShort = q =>
-  `- ${clip(q.query_name, MAX_PROMPT_NAME_LEN)}: ${clip(q.query_desc, MAX_PROMPT_SHORT_DESC_LEN)} / 바인드(${bindList(q)})`;
+  `- ${clip(q.query_name, MAX_PROMPT_NAME_LEN)}: ${clip(q.query_desc, MAX_PROMPT_SHORT_DESC_LEN)} / 바인드(${bindList(q)})` +
+  (hasDbChoice(q) ? ` / 대상DB(${dbList(q)})` : '');
 
 // 짧은 형태로 실린 쿼리도 그대로 실행할 수 있다는 사실을 모델에게 알린다 —
 // 이 안내가 없으면 모델은 설명이 얇은 항목을 '정보가 부족한 쿼리'로 읽고 후보에서 뺀다.
@@ -370,7 +392,11 @@ const clipDisplayValue = v =>
       : clip(JSON.stringify(v) ?? String(v), MAX_DISPLAY_VALUE_LEN);
 
 function historyLine(h) {
-  const head = `- ${clip(h.query_name, 100)} params=${paramsJson(h.params)}`;
+  // 어느 DB에서 돈 스텝인지 함께 싣는다 — 대상DB 후보가 여럿인 쿼리에서 이것이 없으면 모델은
+  // 방금 무엇을 조회했는지 알 수 없어, 다음 스텝에서 다른 후보를 골라 놓고 같은 결과를 기대하거나
+  // 이미 본 DB를 다시 조회한다 (루프 가드는 이름·바인드만 보므로 그 반복을 잡지 못한다).
+  const at = h.targetDb ? `@${clip(h.targetDb, MAX_TARGET_DB_NAME_LEN)}` : '';
+  const head = `- ${clip(h.query_name, 100)}${at} params=${paramsJson(h.params)}`;
   if (h.note) {
     // 루프 가드가 남긴 제어용 기록 — 실패가 아니므로 '오류'로 알리지 않는다 (모델이 실패로 오해해 불필요한 우회를 하지 않게)
     return `${head} → 실행하지 않음: ${h.note}`;
@@ -823,7 +849,11 @@ function toDecision(d, answerOnly) {
   if (!d || typeof d !== 'object') return null;
   if (d.action === 'answer' && typeof d.answer === 'string' && d.answer.trim()) return d;
   if (!answerOnly && d.action === 'run_query' && typeof d.query_name === 'string' && d.query_name.trim()) {
-    return { action: 'run_query', query_name: d.query_name, params: d.params || {} };
+    // target_db는 문자열일 때만 싣는다 — 크기 확정은 결정 경계(llm.js sanitizeDecision)가 한다.
+    // 여기 일은 형식 검증이고, 없거나 형식이 아니면 '고르지 않음'으로 두면 된다:
+    // 후보가 하나뿐인 쿼리는 그대로 실행되고, 여럿이면 실행 경계가 후보를 들고 되묻는다.
+    const targetDb = typeof d.target_db === 'string' && d.target_db.trim() ? d.target_db : undefined;
+    return { action: 'run_query', query_name: d.query_name, params: d.params || {}, ...(targetDb && { target_db: targetDb }) };
   }
   return null;
 }

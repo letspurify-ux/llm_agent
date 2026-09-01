@@ -345,3 +345,23 @@ test('쓸 수 있는 답변인지는 두 답변 경로가 같은 함수로 판�
   assert.equal(answerOf(null), null);
   assert.equal(answerOf(undefined), null);
 });
+
+test('대상 DB가 다르면 같은 쿼리·같은 파라미터라도 다른 실행이다', () => {
+  // 대상 DB가 여럿인 쿼리에서 이 구분이 없으면 '서울 재고를 보고 이어서 부산 재고를 본다'는
+  // 정상 흐름이 '이미 같은 파라미터로 실행된 쿼리'로 끊긴다 — 이름도 바인드도 같고 다른 것은
+  // DB뿐이기 때문이다. 두 번째 DB는 영영 조회되지 않는데 남는 기록은 note 한 줄뿐이라,
+  // 모델은 조회한 적 없는 DB에 대해 '이미 실행됨'이라는 안내를 받는다.
+  const seoul = { ...ran('stock', { item: 'A' }), targetDb: 'SEOUL' };
+  assert.equal(loopGuard([seoul], 'stock', ['item'], { item: 'A' }, 'BUSAN'), null);
+  assert.match(loopGuard([seoul], 'stock', ['item'], { item: 'A' }, 'SEOUL'), /이미 같은 파라미터/);
+  // 이력에는 성공 기록의 등록 철자와 실패 기록의 요청 철자가 섞인다 — 비교는 nameKey로 한다.
+  assert.match(loopGuard([seoul], 'stock', ['item'], { item: 'A' }, ' seoul '), /이미 같은 파라미터/);
+});
+
+test('반복 실패 판정도 대상 DB별로 따로 센다', () => {
+  // DB를 보지 않으면 서울에서 두 번 실패한 것만으로 부산 조회가 '반복 실패'로 막힌다.
+  const fail = db => ({ ...failed('stock', { item: 'A' }), targetDb: db });
+  const history = [fail('SEOUL'), fail('SEOUL')];
+  assert.match(loopGuard(history, 'stock', ['item'], { item: 'A' }, 'SEOUL'), /반복 실패/);
+  assert.equal(loopGuard(history, 'stock', ['item'], { item: 'A' }, 'BUSAN'), null);
+});

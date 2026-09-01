@@ -7,7 +7,7 @@ import { loadQueryRegistry, loadQueriesByNames, loadQueriesMentionedIn } from '.
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
 import { llm, renderAnswer, clipAnswer } from './llm.js';
-import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_CELL_LEN, TRUNC_MARK, nameKey, clipText, stripLoneSurrogates, bindValue } from './constants.js';
+import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_CELL_LEN, TRUNC_MARK, nameKey, clipText, stripLoneSurrogates, bindValue, targetDbNames } from './constants.js';
 
 const MAX_STEPS = 5;
 const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포함). 초과하면 남은 스텝을 포기하고 강제 답변으로 간다.
@@ -100,6 +100,20 @@ function valueKey(v) {
   }
 }
 
+// 이 스텝이 실제로 향하는 대상 DB — '모델이 고른 값'이 아니라 '실행될 값'이다.
+// 고른 값을 그대로만 쓰면 후보가 하나뿐이라 target_db를 생략한 경우(기존 등록 전부가 그렇다)
+// 빈 값이 되는데, 이력에는 실행 경계가 채운 등록 철자가 남아 있어 루프 가드의 동일 실행 판정이
+// 한 번도 성립하지 않는다 — 목록형과 무관한 기존 쿼리에서 가드가 통째로 조용히 꺼지는 셈이다.
+// 그래서 실행 경계(oracle.js resolveTargetDb)와 같은 규칙으로 맞춘다: 고른 값이 있으면 그것,
+// 없고 후보가 하나뿐이면 그 하나, 여럿이면 빈 값(실행 경계가 후보를 들고 되묻는다).
+// 목록 해석은 같은 파서를 쓴다 (constants.targetDbNames) — 두 곳이 다르게 세면 가드가 보는
+// '같은 실행'과 실행기가 보는 '같은 실행'이 갈라진다.
+function effectiveTargetDb(registryRow, chosen) {
+  if (chosen) return chosen;
+  const names = registryRow ? targetDbNames(registryRow.target_db_name) : [];
+  return names.length === 1 ? names[0] : '';
+}
+
 // 루프 가드 — 같은 쿼리를 같은 파라미터로 반복하는 퇴화한 결정을 걸러낸다.
 // 진행해도 되면 null, 아니면 모델에게 남길 안내 문구를 돌려준다 (호출부가 note로 기록한다).
 //
@@ -108,9 +122,18 @@ function valueKey(v) {
 //   빡빡해지면 — 다단계 절차의 정상 흐름이 '이미 실행된 쿼리'로 끊겨 답변만 부실해진다.
 // 둘 다 오류를 남기지 않아 배포 뒤에도 원인이 보이지 않는다. 그래서 DB 없이 돌릴 수 있게 분리해
 // 회귀 테스트를 붙인다 (test/agent.test.js).
-export function loopGuard(history, canonicalName, binds, params) {
+// targetDb까지 보는 이유: 대상 DB가 여럿인 쿼리에서 이것을 빼면 '서울 재고를 보고 이어서 부산
+// 재고를 본다'는 정상 흐름이 '이미 같은 파라미터로 실행된 쿼리'로 끊긴다 — 이름도 바인드도 같고
+// 다른 것은 DB뿐이기 때문이다. 두 번째 DB는 영영 조회되지 않는데 남는 기록은 note 한 줄뿐이라,
+// 모델은 조회한 적 없는 DB에 대해 '이미 실행됨'이라는 안내를 받는다.
+// 비교는 nameKey로 한다 — 이력에는 성공 기록의 등록 철자와 실패 기록의 요청 철자가 섞여 있다.
+export function loopGuard(history, canonicalName, binds, params, targetDb) {
   const key = paramKey(binds, params);
-  const isSame = h => nameKey(h.query_name) === nameKey(canonicalName) && paramKey(binds, h.params) === key;
+  const dbKey = nameKey(targetDb);
+  const isSame = h =>
+    nameKey(h.query_name) === nameKey(canonicalName) &&
+    nameKey(h.targetDb) === dbKey &&
+    paramKey(binds, h.params) === key;
   // 미등록 이름의 반복도 같은 가드로 걸리도록 '등록되지 않은 쿼리' 처리보다 앞에서 부른다
   // (가장 흔한 퇴화 패턴이 그것이다).
   if (history.some(h => h.rows && isSame(h))) {
@@ -253,13 +276,23 @@ export async function handleQuestion(rawQuestion, rawChat = []) {
     // 이력에는 항상 정규 이름(등록된 철자)을 남긴다 — 가드와 프롬프트가 같은 이름을 보게.
     const canonicalName = registryRow?.query_name ?? decision.query_name;
     const binds = registryRow ? bindNames(registryRow.query_sql) : null;
+    // 이 스텝이 실제로 향하는 대상 DB. 가드·이력·실행이 같은 값을 봐야 한다.
+    const dbChoice = effectiveTargetDb(registryRow, decision.target_db);
     // note는 LLM에게 경로를 바꾸라고 알리는 제어용 기록이다. 실제 쿼리 실패(error)와 필드를 나눈다 —
     // 같은 필드에 넣으면 사용자 trace 패널과 chat_log의 '실패한 질문' 집계에 정상 턴이 섞인다.
     // extra.safe = 이 문구를 사용자 화면(trace 패널)에 그대로 내보내도 되는가.
     // 우리가 문구를 만든 오류만 true다 — 드라이버·DB 원문은 스키마명·호스트를 담고 있다(server.js가 이 표시를 본다).
-    const push = (field, msg, extra) => history.push({ query_name: canonicalName, params: decision.params, [field]: msg, ...extra });
+    // targetDb는 실패 기록에 dbChoice를 그대로 남긴다 — 성공 기록(아래)은 실행 경계가 돌려준
+    // 등록 철자다. 실패의 흔한 원인이 '요청한 이름이 후보에 없다'인데, 그때 등록 철자로 바꿔
+    // 적으면 모델은 자기가 무엇을 잘못 적었는지 볼 수 없고 오류 문구와 이력이 서로 다른 이름을
+    // 가리키게 된다.
+    const push = (field, msg, extra) => history.push({
+      query_name: canonicalName, params: decision.params,
+      ...(dbChoice && { targetDb: dbChoice }),
+      [field]: msg, ...extra,
+    });
 
-    const guardNote = loopGuard(history, canonicalName, binds, decision.params);
+    const guardNote = loopGuard(history, canonicalName, binds, decision.params, dbChoice);
     if (guardNote) {
       push('note', guardNote);
       if (++guardHits >= MAX_GUARD_HITS) break;
@@ -289,9 +322,13 @@ export async function handleQuestion(rawQuestion, rawChat = []) {
     // '무엇을 잘랐는가'만 넘긴다(clippedCopy). 값을 모으는 비용은 조회 1회당 한 번이고,
     // 스텝마다 이력 전체를 다시 훑지 않는다.
     try {
-      const { rows, totalRows, capped } = await runQuery(registryRow, decision.params, clippedCopy.isCopy);
+      // 대상 DB 선택은 실행 경계가 판정한다 (oracle.js resolveTargetDb) — 여기서 미리 고르거나
+      // 검증하지 않는다. 돌려받은 targetDb는 등록 철자이므로 이력·trace·프롬프트가 같은 이름을 본다.
+      const { rows, totalRows, capped, targetDb } = await runQuery(
+        registryRow, decision.params, clippedCopy.isCopy, dbChoice
+      );
       clippedCopy.record(rows);
-      history.push({ query_name: canonicalName, params: decision.params, rows: capRows(rows), totalRows, capped });
+      history.push({ query_name: canonicalName, params: decision.params, targetDb, rows: capRows(rows), totalRows, capped });
       guardHits = 0; // 진도가 나갔다 — 가드는 '연속' 헛도는 경우만 센다
     } catch (e) {
       // 실패도 이력에 남기고 루프를 계속한다 — LLM이 에러를 보고 재시도/우회/답변을 판단.

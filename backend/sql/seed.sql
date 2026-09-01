@@ -19,6 +19,12 @@ USE llm_agent;
 ALTER TABLE knowledge  ADD UNIQUE KEY IF NOT EXISTS uk_title (title);
 ALTER TABLE qa_method ADD UNIQUE KEY IF NOT EXISTS uk_title (title);
 
+-- target_db_name은 ';'로 구분한 목록을 담을 수 있다(여러 DB 중 하나를 LLM이 고른다).
+-- 구 스키마의 VARCHAR(100)에 목록을 넣으면 MariaDB 기본 모드에서 뒤가 잘린 채 저장되고,
+-- 잘려 나간 후보는 '등록한 적 없는 DB'가 되어 프롬프트에도 실행에도 나타나지 않는다 —
+-- 오류 없이 후보만 사라지므로 여기서 폭을 보장한다. 이미 넓으면 아무 일도 하지 않는다.
+ALTER TABLE query_registry MODIFY COLUMN target_db_name VARCHAR(500) NOT NULL;
+
 INSERT INTO knowledge (title, content) VALUES
 ('배치 재시작 방법', '배치 작업이 FAILED 상태이면 배치 서버(batch01)에 접속 후 restart_batch.sh <JOB_ID> 를 실행하여 재시작한다. 실행 전 반드시 로그를 백업한다.'),
 ('시스템 점검 일정', '매월 첫째 주 일요일 02:00~04:00 정기 점검. 점검 중 조회 서비스는 중단된다.')

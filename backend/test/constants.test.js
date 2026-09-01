@@ -3,7 +3,7 @@
 // 함께 쓴다. 여기가 어긋나면 어긋난 티가 나지 않는 자리에서 조용히 갈라진다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { clipText, nameKey, stripLoneSurrogates, numEnv, bindValue, warnOnce } from '../src/constants.js';
+import { clipText, nameKey, stripLoneSurrogates, numEnv, bindValue, warnOnce, targetDbNames } from '../src/constants.js';
 
 test('절단이 서로게이트 쌍을 쪼개지 않는다', () => {
   // 쪼개면 짝 잃은 코드유닛이 남아 JSON은 통과하지만 유효한 UTF-8이 아니게 된다 —
@@ -118,4 +118,24 @@ test('경고 억제 scope에는 바뀌는 값을 담지 않는다', () => {
   } finally {
     console.warn = origWarn;
   }
+});
+
+test('조회대상 DB 목록을 프롬프트와 실행기가 같게 읽는다', () => {
+  // 이 파서가 유일한 해석 지점이다 — 프롬프트(llm-openai dbList)와 실행 경계(oracle resolveTargetDb)가
+  // 다르게 읽으면 '목록에 보였는데 실행이 모르는 이름이라고 거부하는' 후보가 생기고,
+  // 그 실패는 모델이 보인 대로 답했는데도 나므로 고칠 방법이 없다.
+  assert.deepStrictEqual(targetDbNames('ORDER_DB'), ['ORDER_DB']);
+  assert.deepStrictEqual(targetDbNames('A;B;C'), ['A', 'B', 'C']);
+  // 사람이 손으로 적는 값이다 — 공백과 빈 조각은 흔하고, 뜻이 달라지지 않는다.
+  assert.deepStrictEqual(targetDbNames(' A ; B '), ['A', 'B']);
+  assert.deepStrictEqual(targetDbNames('A;;B;'), ['A', 'B']);
+  // 빈 이름이 후보로 올라가면 loadTargetDb가 0건을 돌려주고, 실패는 '접속 정보 미등록'으로
+  // 보고되어 원인이 세미콜론 하나라는 사실을 어디에서도 가리키지 않는다.
+  assert.deepStrictEqual(targetDbNames(''), []);
+  assert.deepStrictEqual(targetDbNames(null), []);
+  assert.deepStrictEqual(targetDbNames(';;'), []);
+  // target_db 조회는 대소문자를 무시하는 collation이라 'A;a'는 한 개다 —
+  // 둘로 세면 프롬프트가 같은 DB를 두 번 보여주며 모델에게 '고를 것이 둘'이라고 말한다.
+  assert.deepStrictEqual(targetDbNames('A;a;A'), ['A']);
+  assert.deepStrictEqual(targetDbNames('DB1;db1'), ['DB1']);
 });
