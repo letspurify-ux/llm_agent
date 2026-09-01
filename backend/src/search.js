@@ -134,6 +134,23 @@ function vecQuery(table, vector) {
 // 점수 = Σ (컬럼 가중치 × 토큰 길이)
 //   - 여러 토큰이 맞을수록, 첫 컬럼(제목/이름)에 맞을수록, 긴(구체적인) 토큰이 맞을수록 높다
 //   - 조사를 뗀 변형 토큰은 원형보다 짧으므로 자연히 낮게 반영된다
+
+// LIKE 와일드카드('%', '_')의 이스케이프 문자. 역슬래시가 아니라 '!'를 쓰고, ESCAPE 절로 명시한다.
+// 역슬래시는 서버 설정에 따라 뜻이 바뀐다: sql_mode에 NO_BACKSLASH_ESCAPES가 있으면 LIKE의
+// 암묵 기본 이스케이프 문자가 사라져, 이스케이프한 줄 알았던 '\_'가 '역슬래시 + 아무 글자 하나'가 된다.
+// 검색 토큰에 '_'는 아주 흔하다 — query_name이 snake_case이고(batch_job_status,
+// order_status_by_customer) 질문과 qa_method 본문에 그대로 등장한다. 그러면 '_'가 와일드카드로
+// 살아나 무관한 행이 점수를 받고, 정답 지식이 LIMIT 20 밖으로 밀린다 — 오류는 어디에도 없다.
+// ESCAPE 절에 '\\'를 적어 넣는 것도 답이 아니다. 그 리터럴 자체가 같은 sql_mode에서 뜻이 바뀌어
+// '문자 두 개'가 되고 ESCAPE 인자로 거부된다. 두 모드에서 뜻이 같은 문자를 골라야 한다.
+// (embed-sync.js hashExpr이 리터럴 '\n' 대신 CHAR(10)을 쓰는 것과 같은 이유·같은 방식이다.)
+// 이 상수와 아래 SQL의 ESCAPE 절은 반드시 같은 문자를 봐야 한다 — 갈라지면 이스케이프가
+// 무효가 되고, 그 실패는 '무관한 행이 조금 더 섞인다'로만 나타나 오류를 남기지 않는다.
+// (테스트에서 쓰므로 export 한다 — 회귀가 보이지 않는 종류의 실패라 테스트가 유일한 방어선이다)
+export const LIKE_ESCAPE = '!';
+const LIKE_META_RE = /[!%_]/g;   // 이스케이프 문자 자신도 이스케이프해야 한다
+export const likePattern = tok => `%${String(tok).replace(LIKE_META_RE, `${LIKE_ESCAPE}$&`)}%`;
+
 async function likeSearch(table, columns, question) {
   // 상한은 searchTokens가 '확장 전 낱말'에 건다 (그 주석 참고) — 여기서 확장된 토큰 목록을
   // 다시 자르면 상한이 앞쪽 낱말의 조사 변형들로 소진되어 질문 뒤쪽 낱말이 통째로 빠진다.
@@ -145,8 +162,8 @@ async function likeSearch(table, columns, question) {
   for (const tok of tokens) {
     columns.forEach((col, i) => {
       const weight = (i === 0 ? TITLE_WEIGHT : 1) * tok.length;
-      scoreParts.push(`CASE WHEN ${col} LIKE ? THEN ${weight} ELSE 0 END`);
-      params.push(`%${tok.replace(/[\\%_]/g, '\\$&')}%`); // %와 _는 LIKE 와일드카드이므로 이스케이프
+      scoreParts.push(`CASE WHEN ${col} LIKE ? ESCAPE '${LIKE_ESCAPE}' THEN ${weight} ELSE 0 END`);
+      params.push(likePattern(tok));
     });
   }
 

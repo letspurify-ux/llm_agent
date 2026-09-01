@@ -97,13 +97,54 @@ test('바인드가 수백 개인 SQL 등록도 쿼리 목록 예산을 뚫지 �
   assert.match(p, /외 \d+개/, '바인드를 버린 사실을 모델에게 알려야 한다');
 });
 
+// 목록에 실린 줄 수(짧은 형태 포함)와, 그중 SQL·입출력 설명까지 실린 '자세한' 줄 수.
+const countQueryLines = s => (s.match(/^- q\d+: /gm) || []).length;
+const countDetailed = s => (s.match(/^- q\d+: .* \/ SQL: /gm) || []).length;
+
 test('앞 섹션이 짧으면 그 여유가 쿼리 목록으로 넘어간다', () => {
   // 배분이 '섹션마다 고정'이면 지식이 비어 있어도 쿼리 목록은 최소 몫에 묶인다.
   const only = buildPrompt(ctx({ queries: queries(35) }));
   const withNoise = buildPrompt(ctx({ queries: queries(35), knowledge: knowledge(30), qaMethods: methods(30) }));
-  const countQueries = s => (s.match(/^- q\d+: /gm) || []).length;
-  assert.ok(countQueries(only) > PROMPT_FLOORS.queries / 12_000, '여유를 못 쓰고 있다');
-  assert.ok(countQueries(only) > countQueries(withNoise), '앞 섹션이 비면 쿼리를 더 실어야 한다');
+  assert.ok(countDetailed(only) > PROMPT_FLOORS.queries / 12_000, '여유를 못 쓰고 있다');
+  assert.ok(countDetailed(only) > countDetailed(withNoise), '앞 섹션이 비면 쿼리를 더 자세히 실어야 한다');
+});
+
+test('예산이 모자라도 쿼리 이름은 한 건도 버리지 않는다', () => {
+  // 목록에서 빠진 쿼리는 모델이 지목할 방법이 없어 그 조회를 아예 못 한다 — 지식이 빠지면
+  // 답이 부실해질 뿐인 것과 손해의 크기가 다르다. 게다가 어디에도 오류가 남지 않아
+  // chat_log에는 '조회 없이 지식으로만 답한 요청'으로만 보인다.
+  // 그래서 자세한 줄을 버리기 '전에' 이름·용도·바인드만 남긴 짧은 줄로 줄인다.
+  const p = buildPrompt(ctx({
+    queries: queries(35), knowledge: knowledge(30), qaMethods: methods(30),
+    history: new Array(5).fill(0).map((_, i) => ({
+      query_name: `h${i}`, params: { a: 1 }, rows: wideRows(20, 30), totalRows: 100, capped: true,
+    })),
+  }));
+  assert.equal(countQueryLines(p), 35, '등록된 쿼리 이름이 프롬프트에서 사라졌다');
+  assert.ok(countDetailed(p) < 35, '이 예산에서 전부 자세히 실릴 수는 없다 (전제 확인)');
+  assert.match(p, /이름·용도·바인드만 표시/, '짧은 형태로 실린 사실을 모델에게 알려야 한다');
+  // 짧은 줄에도 바인드는 남는다 — 없으면 첫 실행이 반드시 '값 없음'으로 실패한다
+  assert.match(p, /^- q34: .* \/ 바인드\(:a\)$/m);
+  assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN, `프롬프트가 예산을 넘었다: ${p.length}`);
+});
+
+test('쿼리 줄이 아무리 많아져도 섹션 합계가 예산을 넘지 않는다', () => {
+  // 쿼리 목록은 '마지막에 배분받는' 섹션이라 여기서 새는 몫을 흡수해 줄 뒤 섹션이 없다 —
+  // 안내 줄과 줄마다의 줄바꿈을 예산에서 빼먹으면 그대로 전체 예산 밖으로 나간다.
+  // 짧은 줄로 실리는 쿼리가 많을수록 그 한 칸이 쌓이므로, 짧은 설명 다수가 최악이다.
+  const short = n => new Array(n).fill(0).map((_, i) => ({
+    seq: i, query_name: `q${i}`, query_desc: big(120), input_desc: big(10),
+    output_desc: big(10), query_sql: 'SELECT 1 FROM t WHERE a = :a', target_db_name: 'D',
+  }));
+  for (const n of [35, 60, 200]) {
+    const p = buildPrompt(ctx({
+      knowledge: knowledge(30), qaMethods: methods(30), queries: short(n),
+      history: new Array(5).fill(0).map((_, i) => ({
+        query_name: `h${i}`, params: { a: big(2000) }, rows: wideRows(20, 30), totalRows: 100, capped: true,
+      })),
+    }));
+    assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN, `쿼리 ${n}건에서 예산을 넘었다: ${p.length}`);
+  }
 });
 
 test('어떤 섹션도 최소 몫 아래로 굶지 않는다', () => {

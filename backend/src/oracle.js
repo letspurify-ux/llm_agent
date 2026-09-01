@@ -43,10 +43,54 @@ oracledb.fetchTypeHandler = md => {
 // 전부 문자열로 두면 mock(숫자 리터럴)과 실제가 JSON 표기부터 달라져, mock으로 검증한 시나리오가
 // 실제 배포에서 재현되지 않는다(MOCK_DATA 주석과 같은 원칙). 왕복이 어긋나는 값(16자리+)만
 // 문자열 그대로 남아 정확한 자릿수를 지킨다. (테스트에서 쓰므로 export)
+//
+// 판정 기준은 '값이 보존되는가'이지 '표기가 같은가'가 아니다. 앞선 구현(String(n) === v)은 표기를
+// 물었고, 그래서 Oracle의 지극히 정상적인 표기를 전부 손실로 오판했다 — 실측: '.5'(앞의 0을 생략),
+// '1.0'·'0.10'(선언된 scale만큼 0을 유지)이 모두 문자열로 남았다. 그런데 이 변환기를 타는 열은
+// '선언된 precision이 없는 NUMBER', 즉 SUM()·AVG()·비율 같은 모든 식의 결과다. 결과적으로 집계값이
+// {"AVG_AMOUNT":".5"}처럼 따옴표 붙은 채로 프롬프트·답변·chat_log에 들어가, 모델은 mock(숫자
+// 리터럴)에서와 다른 타입을 놓고 추론하게 된다 — 이 함수가 막겠다고 적어둔 바로 그 어긋남이다.
+//
+// 무손실 여부를 자릿수로 어림하지 않고 직접 증명한다. 두 표기를 같은 정규형으로 바꿔 비교하면
+// '표기는 달라도 값이 같은가'라는, 이 함수가 원래 물었어야 할 질문에 정확히 답할 수 있다.
+//
+// "유효숫자 15자리 이하면 배정밀도를 왕복해도 안전하다"는 어림은 정규수(normal)에서만 성립한다.
+// 2^-1022(약 2.2e-308) 아래의 비정규수(subnormal)는 가수 비트가 점점 줄어 5e-324에서는 한 비트만
+// 남으므로, 유효숫자가 몇 자리든 값이 뭉개진다 (실측: '20980e-326' → 2.08e-322,
+// '7765e-327' → 1e-323). 자릿수만 세는 판정은 이 구간을 통째로 놓친다.
+// (Oracle NUMBER의 범위는 1e-130~9.99e125라 실무에서 이 구간에 닿지는 않지만, 이 함수의 존재
+//  이유가 '왕복이 정확한 값만 숫자로'이므로 어림이 아니라 증명으로 판정한다.)
+//
+// 정규형은 (부호, 앞뒤 0을 뗀 유효숫자, 10의 지수)다 — '1.0'·'1'·'0.1e1'·'10e-1'이 모두 '1e0'이 된다.
+// String(n)은 그 double로 되돌아오는 '가장 짧은 표기'이므로, 두 정규형이 같다는 것은
+// JSON으로 나가는 값도 다음 스텝의 바인드로 되돌린 값도 원본과 같은 값이라는 뜻이다.
+const DECIMAL_RE = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/;
+
+function decimalParts(s) {
+  const m = DECIMAL_RE.exec(s);
+  if (!m) return null;
+  const frac = m[3] ?? '';
+  let digits = (m[2] ?? '') + frac;
+  if (!digits) return null;                     // 숫자가 한 자리도 없다 ('', '+', '.', 'e5')
+  let exp = Number(m[4] || 0) - frac.length;
+  digits = digits.replace(/^0+/, '');           // 앞의 0은 유효숫자가 아니다
+  const trimmed = digits.replace(/0+$/, '');    // 뒤의 0은 지수로 옮긴다
+  exp += digits.length - trimmed.length;
+  // 값이 0이면 부호·지수와 무관하게 정규형이 하나다 ('0', '-0', '0.000', '0e10')
+  return trimmed ? `${m[1] === '-' ? '-' : ''}${trimmed}e${exp}` : '0';
+}
+
 export function numberFromString(v) {
-  if (v === null) return null;
-  const n = Number(v);
-  return String(n) === v ? n : v;
+  if (v === null || typeof v !== 'string') return v;
+  const s = v.trim();
+  const want = decimalParts(s);
+  // 숫자 표기가 아니면 손대지 않는다 (빈 문자열, 'Infinity', 서버 로케일이 넣은 구분기호 등)
+  if (want === null) return v;
+  const n = Number(s);
+  // 표현 범위를 벗어나면 값을 통째로 잃는다 (1e400 → Infinity). 아래 비교로도 걸리지만,
+  // String(Infinity)는 정규형을 갖지 않으므로 뜻이 분명한 자리에서 먼저 갈라둔다.
+  if (!Number.isFinite(n)) return v;
+  return decimalParts(String(n)) === want ? n : v;
 }
 
 // 날짜/시각은 JS Date로 받지 않고 DB가 직접 포맷한 문자열로 받는다.
@@ -225,11 +269,14 @@ function localDateTime(d) {
 }
 
 // 바인드로 쓸 수 없는 값이면 그 이유를 돌려준다 (쓸 수 있으면 null).
-// 세 경우 모두 실패시키지 않으면 조용히 0건이 나오고, LLM은 그 0건을 "그런 데이터가 없다"로 읽어
-// 확신에 찬 오답을 만든다. 실패시켜야 LLM이 되묻거나 다른 경로를 잡는다.
-//   값 없음  → Oracle에서 `WHERE col = NULL`은 영원히 참이 아니다 (빈 문자열도 NULL로 취급된다)
-//   구조     → node-oracledb가 객체/배열을 바인드 서술자로 해석해 val 없이 NULL을 바인드한다
-//   잘린 값  → normalizeValue가 MAX_CELL_LEN에서 자르고 TRUNC_MARK를 붙인 값이다. 그 값이 프롬프트를
+// 앞의 세 경우는 실패시키지 않으면 조용히 0건이 나오고, LLM은 그 0건을 "그런 데이터가 없다"로 읽어
+// 확신에 찬 오답을 만든다. 마지막 하나(true/false)는 조용하지 않게 실패하지만, 실패하는 곳이
+// 드라이버 안이라 원문이 화면에서 가려지고(server.js) 모델에게도 단서가 남지 않는다.
+// 넷 다 여기서, 접속하기 전에 실패시켜야 LLM이 되묻거나 다른 경로를 잡는다.
+//   값 없음    → Oracle에서 `WHERE col = NULL`은 영원히 참이 아니다 (빈 문자열도 NULL로 취급된다)
+//   true/false → node-oracledb가 23ai 미만 서버에 boolean을 바인드하지 못한다 (아래 상세 참고)
+//   구조       → node-oracledb가 객체/배열을 바인드 서술자로 해석해 val 없이 NULL을 바인드한다
+//   잘린 값    → normalizeValue가 MAX_CELL_LEN에서 자르고 TRUNC_MARK를 붙인 값이다. 그 값이 프롬프트를
 //              거쳐 다음 스텝의 바인드로 되돌아오면 원본과 다르므로 절대 매칭되지 않는다.
 //              (mock provider는 llm.js에서 아예 제안조차 하지 않게 막지만, 실제 LLM에는 그 가드가 없다)
 //              표시만 보고 TRUNC_MARK를 뗀 앞부분만 넣는 경우가 더 흔하다 — 그 앞부분의 길이는
@@ -253,7 +300,19 @@ const isClippedLen = n => n === MAX_CELL_LEN || n === MAX_CELL_LEN - 1;
 
 function bindProblem(v) {
   if (v === undefined || v === null || v === '') return '값 없음';
-  if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') return '값이 아닌 구조';
+  // boolean은 '값이 아닌 구조'와 다른 이유로 거부한다: 모양은 스칼라지만 node-oracledb가
+  // Oracle 23ai 미만에 바인드할 수 없는 타입이다(DB_TYPE_BOOLEAN 바인딩은 23ai부터).
+  // 통과시키면 접속을 열고 세션 포맷까지 건 뒤 conn.execute 안에서 드라이버 원문 오류로 죽는데,
+  // safeError가 아니라 사용자에게는 '조회 중 오류가 발생했습니다'만 나가고 모델에게도 단서가 없다 —
+  // 스텝 하나와 Oracle 접속 왕복 한 번을 매번 버린다. ':active = 활성 여부'처럼 설명된 바인드에
+  // 모델이 true/false를 채우는 것은 지극히 자연스러운 완성이라 실제로 들어온다.
+  // 여기서 소리 나게 실패시켜야 모델이 컬럼에 실제로 저장된 값('Y'/'N', 1/0)으로 고쳐 잡는다.
+  // 대가: Oracle 23ai의 진짜 BOOLEAN 컬럼에 true/false를 바인드하는 등록도 함께 막힌다.
+  // 서버 버전은 이 시점에 알 수 없고(가드는 접속 전에 돈다), 압도적으로 흔한 쪽은 'Y'/'N' 컬럼에
+  // 모델이 true를 지어내는 경우다. 23ai 전용 BOOLEAN 바인드가 필요해지면 등록 SQL에서
+  // DECODE(:flag,'Y',TRUE,FALSE) 같은 변환을 쓰거나, target_db에 서버 버전을 두고 여기서 갈라야 한다.
+  if (typeof v === 'boolean') return "true/false는 바인드할 수 없음 — 컬럼에 저장된 값(예: 'Y'/'N', 1/0)으로 지정할 것";
+  if (typeof v !== 'string' && typeof v !== 'number') return '값이 아닌 구조';
   if (typeof v === 'string' && (v.endsWith(TRUNC_MARK) || isClippedLen(v.length))) {
     return '잘린 값이라 원본과 다름';
   }

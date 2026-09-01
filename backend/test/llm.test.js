@@ -114,16 +114,26 @@ test('결정 경계가 거대한 answer도 자르고 잘렸음을 알린다', ()
   assert.match(d.answer, /생략했습니다/, '잘린 사실이 사용자에게 보여야 한다');
 });
 
-test('앞부분이 같은 긴 바인드명이 서로를 지우지 않는다', () => {
-  // 이름을 자른 뒤 fromEntries로 조립하면 겹친 키가 하나로 뭉개져 다른 바인드의 값이 통째로
-  // 사라진다 — 크기를 확정해야 할 경계가 데이터를 버리는 셈이고, 사라진 쪽은 실행 단계에서
-  // '값 없음'으로 실패해 원인이 엉뚱한 곳(모델이 값을 안 줬다)으로 읽힌다.
+test('바인드로 쓸 수 없는 긴 이름은 뭉개거나 개명하지 않고 버린다', () => {
+  // 이름을 자르면 두 방향 모두로 깨진다. 그냥 자르면 앞부분이 같은 두 이름이 한 키로 뭉개져
+  // 다른 바인드의 값이 사라지고, 뭉개짐을 피하려 순번을 붙이면(base~2) 그 이름은 ① '~'가
+  // 바인드명 문자가 아니라 어떤 실제 바인드와도 매칭되지 않고 ② 130자라 이 경계가 지키기로 한
+  // 128자 상한을 스스로 넘는다 — 어느 쪽이든 값은 실행 단계에서 똑같이 사라진다.
+  // 애초에 128자(Oracle 식별자 상한)를 넘는 이름은 어떤 등록 SQL의 바인드와도 대응할 수 없다.
+  // 자르지 않고 버리는 것이 정직하고, 그러면 뭉개짐이 생길 여지 자체가 없어진다.
   const head = 'a'.repeat(200);
   const d = sanitizeDecision({
-    action: 'run_query', query_name: 'q', params: { [`${head}X`]: 'v1', [`${head}Y`]: 'v2' },
+    action: 'run_query',
+    query_name: 'q',
+    params: { [`${head}X`]: 'v1', [`${head}Y`]: 'v2', job_id: 'BATCH001' },
   });
-  assert.equal(Object.keys(d.params).length, 2, '서로 다른 바인드가 한 키로 뭉개졌다');
-  assert.deepStrictEqual(Object.values(d.params).sort(), ['v1', 'v2']);
+  assert.deepStrictEqual(d.params, { job_id: 'BATCH001' }, '실행 가능한 바인드만 남아야 한다');
+  // 경계가 스스로 불법인 이름을 만들어내지 않는다 — 남은 키는 전부 상한 이하다
+  assert.ok(Object.keys(d.params).every(k => k.length <= 128), '경계가 상한을 넘는 이름을 만들었다');
+  // 128자짜리 '적법한' 이름은 손대지 않는다 (그보다 짧게 자르면 반드시 '값 없음'으로 실패한다)
+  const legal = 'b'.repeat(128);
+  const ok = sanitizeDecision({ action: 'run_query', query_name: 'q', params: { [legal]: 'v' } });
+  assert.deepStrictEqual(Object.keys(ok.params), [legal]);
 });
 
 test('정상 크기의 결정은 값이 그대로 통과한다', () => {
@@ -169,18 +179,21 @@ test('provider 이름의 대소문자·공백을 흡수하고 모르는 값은 �
 test('프로토타입 멤버와 겹치는 바인드명이 Mock 결정을 죽이지 않는다', async () => {
   // PARAM_RULES[name]·params[name] 접근이 프로토타입 체인을 타면 결정 루프 전체가 죽어
   // 매 스텝 무결정 → 사용자는 'LLM 호출 실패'만 본다. 소유 키 기준으로 무해해야 한다.
+  // 이름은 'constructor'로 잡는다 — '__proto__'는 영문자로 시작하지 않아 Oracle이 바인드로
+  // 받지 않고(ORA-01745) sql.js 가드가 등록 단계에서 먼저 거부하므로 이 경로에 닿지 못한다.
+  // 실제로 이 판정이 필요한 이름은 constructor·toString·valueOf처럼 전부 적법한 식별자다.
   delete process.env.LLM_PROVIDER; // mock 경로
   const d = await llm.decide({
     question: '"V1" 값으로 조회',
     chat: [],
     knowledge: [],
     qaMethods: [{ seq: 1, title: 't', method: 'proto_query 실행' }],
-    queries: [{ seq: 1, query_name: 'proto_query', query_sql: 'SELECT 1 FROM t WHERE a = :__proto__' }],
+    queries: [{ seq: 1, query_name: 'proto_query', query_sql: 'SELECT 1 FROM t WHERE a = :constructor' }],
     history: [],
   });
   assert.equal(d.action, 'run_query');
-  assert.ok(Object.hasOwn(d.params, '__proto__'), '값이 소유 키로 채워져야 한다 (대입은 setter를 타고 사라진다)');
-  assert.equal(d.params['__proto__'], 'V1'); // 따옴표 fallback으로 채워진 값
+  assert.ok(Object.hasOwn(d.params, 'constructor'), '값이 소유 키로 채워져야 한다 (대입은 setter를 타고 사라진다)');
+  assert.equal(d.params.constructor, 'V1'); // 따옴표 fallback으로 채워진 값
 });
 
 // ===== Mock provider의 후속 질문 처리 (fillParams / PARAM_RULES) =====
@@ -230,4 +243,35 @@ test('현재 질문이 대상을 말하지 않을 때만 직전 질문에서 가
     chat: [{ role: 'user', text: '그럼 BATCH002는?' }, { role: 'assistant', text: '(표)' }],
   });
   assert.equal(d.params.job_id, 'BATCH002');
+});
+
+test('본문이 NULL이어도 폴백 답변이 죽지 않는다', () => {
+  // renderAnswer는 agent.js의 fallbackAnswer이기도 하다 — 여기서 던지면 handleQuestion을
+  // 빠져나가 /api/chat의 catch가 잡고 500이 나가면서, 이미 성공한 Oracle 조회 결과까지 통째로
+  // 버려진다. 이 폴백이 존재하는 이유('그 요청이 실제로 한 일이 통째로 사라지고')를 정확히
+  // 뒤집는 결과다. 지금은 schema.sql의 NOT NULL만이 유일한 방어막이라, 컬럼 하나가 완화되거나
+  // 임포터가 NULL 행을 넣는 것만으로 그 경로가 열린다 — 다른 소비자는 전부 NULL을 견딘다.
+  const a = renderAnswer({
+    knowledge: [{ title: null, content: null }],
+    history: [{ query_name: 'q', params: {}, rows: [{ A: 'FAILED' }], totalRows: 1 }],
+  });
+  assert.match(a, /FAILED/, '조회 결과가 남아야 한다');
+
+  // 조회가 하나도 없으면 지식을 무조건 첨부하는 경로도 같은 값을 지나간다
+  assert.doesNotThrow(() => renderAnswer({ knowledge: [{ title: null, content: null }], history: [] }));
+});
+
+test('qa_method 본문이 NULL이어도 Mock 실행 계획이 죽지 않는다', async () => {
+  // plannedQueries의 m.method.toLowerCase()가 던지면 결정 루프가 통째로 죽어
+  // 사용자는 'LLM 호출 실패'만 본다 (renderAnswer와 같은 이유·같은 방어).
+  delete process.env.LLM_PROVIDER; // mock 경로
+  const d = await llm.decide({
+    question: '상태 알려줘',
+    chat: [],
+    knowledge: [],
+    qaMethods: [{ seq: 1, title: 't', method: null }],
+    queries: [{ seq: 1, query_name: 'q', query_sql: 'SELECT 1 FROM t' }],
+    history: [],
+  });
+  assert.equal(d.action, 'answer');
 });

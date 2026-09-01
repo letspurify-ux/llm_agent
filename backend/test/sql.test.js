@@ -147,3 +147,25 @@ test('바인드 캐시는 가장 오래 "안 쓴" 것부터 밀어낸다', () =>
   assert.notStrictEqual(bindNames(cold), cold0, '안 쓰는 SQL은 상한을 넘기면 밀려나야 한다');
   assert.strictEqual(bindNames(hot), hot0, '계속 쓰는 SQL은 남아야 한다 (FIFO면 밀려난다)');
 });
+
+test('실행할 수 없는 바인드 표기는 등록 단계에서 거부된다', () => {
+  // 위치 바인드(:1)는 Oracle 문법으로는 적법하지만 node-oracledb가 '객체'가 아니라 '배열'을
+  // 요구하므로 이 실행기로는 실행할 수 없다. bindNames가 걸러내기만 하면 그 쿼리는 '바인드 없는
+  // 쿼리'로 보여 드라이버까지 내려가 ORA-01008로 죽는데, 드라이버 원문은 화면에서 가려지므로
+  // (server.js) 사용자도 모델도 원인을 볼 수 없고 그 쿼리는 등록된 채 영원히 실행되지 않는다.
+  // JDBC/PL-SQL 원본을 옮겨 적으면 자연히 나오는 표기라 등록 실수로 실제로 들어온다.
+  for (const sql of [
+    'SELECT * FROM t WHERE JOB_ID = :1',
+    'SELECT * FROM t WHERE a = :1 AND b = :2',
+    'SELECT * FROM t WHERE a = :_private',
+    'SELECT * FROM t WHERE a = :$x',
+  ]) {
+    assert.throws(() => assertReadOnly(sql), e => e.safe === true && /실행할 수 없는 바인드 표기/.test(e.message), sql);
+  }
+  // 적법한 이름은 그대로 통과한다 — '$'·'#'이 이름 '가운데' 오는 것은 Oracle 식별자로 유효하다
+  const ok = 'SELECT * FROM t WHERE a = :job_id AND b = :emp$no AND c = :tab#id';
+  assert.doesNotThrow(() => assertReadOnly(ok));
+  assert.deepStrictEqual([...bindNames(ok)], ['job_id', 'emp$no', 'tab#id']);
+  // 리터럴·주석 속의 콜론은 여전히 바인드가 아니다 (가드가 오탐하면 정상 쿼리가 막힌다)
+  assert.doesNotThrow(() => assertReadOnly("SELECT TO_CHAR(d, 'HH24:MI') FROM t WHERE a = :x -- 12:30"));
+});

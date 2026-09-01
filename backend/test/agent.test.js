@@ -174,3 +174,25 @@ test('조립할 것이 하나도 없으면 실패만 알린다', () => {
   assert.match(a, /LLM 호출에 실패/);
   assert.ok(!a.includes('정리한 답변'), '조립한 것이 없는데 조립했다고 말하면 안 된다');
 });
+
+test('클라이언트가 쪼개 보낸 서로게이트 조각이 프롬프트로 새어 나가지 않는다', () => {
+  // 프런트(App.jsx)도 자기 쪽에서 턴을 자른다. 이모지 한가운데가 잘리면 '앞조각'은 끝에 상위
+  // 서로게이트가, '뒷조각'은 앞에 하위 서로게이트가 남는다. 끝만 검사하던 가드는 뒷조각을
+  // 통째로 지나쳤다 — 그 문자열은 JSON.stringify를 통과하지만(\udc00) 유효한 UTF-8이 아니라서
+  // LLM 엔드포인트가 요청을 거부하고, 그 대화의 이후 질문이 전부 'LLM 호출 실패'로 끝난다.
+  const cases = [
+    '\uDC00 재시작은 어떻게 해?',   // 뒷조각 (앞의 하위 서로게이트)
+    '재시작은 어떻게 해? \uD83D',   // 앞조각 (뒤의 상위 서로게이트)
+    '앞\uD800가운데\uDC00뒤',        // 조각 둘을 이어 붙인 입력
+  ];
+  for (const text of cases) {
+    const [turn] = normalizeChat([{ role: 'user', text }]);
+    assert.ok(turn, `내용이 있는 턴이 사라졌다: ${JSON.stringify(text)}`);
+    assert.ok(turn.text.isWellFormed(), `짝 잃은 서로게이트가 남았다: ${JSON.stringify(turn.text)}`);
+    JSON.parse(JSON.stringify({ t: turn.text })); // 직렬화·역직렬화가 훼손 없이 왕복해야 한다
+  }
+  // 온전한 이모지는 그대로 남는다 — 가드가 넓어져 정상 입력을 갉아먹으면 안 된다
+  assert.equal(normalizeChat([{ role: 'user', text: '배포 완료 🎉' }])[0].text, '배포 완료 🎉');
+  // 조각 하나뿐인 턴은 빈 턴이 되므로 걸러진다 (프롬프트에 '- 사용자: ' 한 줄만 남지 않게)
+  assert.deepStrictEqual(normalizeChat([{ role: 'user', text: '\uDC00' }]), []);
+});

@@ -4,7 +4,7 @@
 // 검색이 통째로 비는 것을 아무도 이상하게 보지 않는다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { searchTokens } from '../src/search.js';
+import { searchTokens, likePattern, LIKE_ESCAPE } from '../src/search.js';
 
 test('앞뒤 문장부호를 떼고 조사 변형을 만든다', () => {
   assert.deepStrictEqual(searchTokens('가상계측이란?'), ['가상계측이란', '가상계측이', '가상계측']);
@@ -36,4 +36,21 @@ test('2자 미만과 중복은 버린다', () => {
   assert.deepStrictEqual(searchTokens('a ? !! 배치 배치'), ['배치']);
   assert.deepStrictEqual(searchTokens(''), []);
   assert.deepStrictEqual(searchTokens('???'), []);
+});
+
+test('LIKE 이스케이프는 sql_mode에 좌우되지 않는 문자를 쓴다', () => {
+  // 역슬래시는 서버 설정에 따라 뜻이 바뀐다: sql_mode에 NO_BACKSLASH_ESCAPES가 있으면 LIKE의
+  // 암묵 기본 이스케이프 문자가 사라져, 이스케이프한 줄 알았던 '\\_'가 '역슬래시 + 아무 글자'가 된다.
+  // 검색 토큰의 '_'는 아주 흔하다 — query_name이 snake_case이고 질문·qa_method 본문에 그대로
+  // 등장한다. 그러면 무관한 행이 점수를 받아 정답 지식이 LIMIT 밖으로 밀리는데 오류는 없다.
+  // ESCAPE 절에 '\\\\'를 적는 것도 답이 아니다 — 그 리터럴 자체가 같은 모드에서 두 글자가 된다.
+  assert.notEqual(LIKE_ESCAPE, '\\', '역슬래시는 sql_mode에 따라 뜻이 바뀐다');
+  assert.equal(LIKE_ESCAPE.length, 1, 'ESCAPE 인자는 한 글자여야 한다');
+
+  assert.equal(likePattern('batch_job_status'), '%batch!_job!_status%');
+  assert.equal(likePattern('50%'), '%50!%%');
+  assert.equal(likePattern('a!b'), '%a!!b%', '이스케이프 문자 자신도 이스케이프해야 한다');
+  // 역슬래시는 더 이상 특별하지 않다 — 그대로 지나가야 한다 (건드리면 두 모드에서 뜻이 갈린다)
+  assert.equal(likePattern('C:\\share'), '%C:\\share%');
+  assert.equal(likePattern('가상계측'), '%가상계측%');
 });

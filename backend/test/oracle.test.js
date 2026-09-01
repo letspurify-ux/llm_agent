@@ -121,14 +121,93 @@ test('NUMBER 문자열은 정밀도가 보존될 때만 숫자로 되돌린다',
   assert.strictEqual(numberFromString(null), null);
   // 배정밀도로 반올림되는 18자리 채번 키 — 숫자로 바꾸면 끝자리가 달라진다
   assert.strictEqual(numberFromString('123456789012345678'), '123456789012345678');
+  // 손실 판정은 자릿수가 아니라 왕복이 정한다: 2^53(약 9.0e15)을 넘어 표현되지 않는 값만 문자열로 남는다.
+  assert.strictEqual(numberFromString('9999999999999999'), '9999999999999999', '2^53을 넘어 반올림된다');
+  assert.strictEqual(numberFromString('123456789012345'), 123456789012345, '15자리는 왕복이 정확하다');
+  assert.strictEqual(numberFromString('1234567890123456'), 1234567890123456, '16자리여도 2^53 아래는 정확하다');
+});
+
+test('Oracle의 정상 표기를 손실로 오판하지 않는다', () => {
+  // 판정 기준은 '값이 보존되는가'이지 '표기가 같은가'가 아니다. String(n) === v로 재면
+  // Oracle이 실제로 주는 표기가 전부 문자열로 남는다 — 앞의 0을 생략한 '.5', 선언된 scale만큼
+  // 0을 유지하는 '1.0'·'0.10'. 이 변환기를 타는 열은 '선언된 precision이 없는 NUMBER',
+  // 즉 SUM()·AVG()·비율 같은 모든 식의 결과라 집계값 전부가 해당된다.
+  // 그러면 {"AVG_AMOUNT":".5"}처럼 따옴표 붙은 채로 프롬프트·답변·chat_log에 들어가,
+  // 모델은 mock(숫자 리터럴)과 다른 타입을 놓고 추론한다 — 이 함수가 막겠다고 한 그 어긋남이다.
+  assert.strictEqual(numberFromString('.5'), 0.5);
+  assert.strictEqual(numberFromString('1.0'), 1);
+  assert.strictEqual(numberFromString('0.10'), 0.1);
+  assert.strictEqual(numberFromString('-.5'), -0.5);
+  assert.strictEqual(numberFromString('1000'), 1000);
+  // 표현 범위를 벗어나면 값을 통째로 잃는다 — 그때는 문자열로 남긴다
+  assert.strictEqual(numberFromString('1e400'), '1e400');
+  assert.strictEqual(numberFromString('1e-400'), '1e-400');
+  // 숫자 표기가 아닌 값은 손대지 않는다
+  assert.strictEqual(numberFromString('abc'), 'abc');
+  assert.strictEqual(numberFromString(''), '');
+  for (const junk of ['+', '-', '.', 'e5', '1e', '1.2.3', '1,234', 'Infinity', '0x10']) {
+    assert.strictEqual(numberFromString(junk), junk, junk);
+  }
+});
+
+test('비정규수 구간에서도 값을 잃지 않는다', () => {
+  // "유효숫자 15자리 이하면 배정밀도 왕복이 안전하다"는 어림은 정규수에서만 성립한다.
+  // 2^-1022(약 2.2e-308) 아래는 가수 비트가 줄어들어 5e-324에서는 한 비트만 남으므로,
+  // 유효숫자가 네 자리여도 값이 뭉개진다 — 자릿수만 세는 판정은 이 구간을 통째로 놓친다.
+  // (퍼징으로 잡은 회귀다: 자릿수 어림 판정이 '20980e-326'을 2.08e-322로 바꿔 내보냈다)
+  for (const v of ['20980e-326', '7765e-327', '5e-324', '1.5e-323']) {
+    const out = numberFromString(v);
+    if (typeof out === 'number') {
+      // 숫자로 돌렸다면 그 값이 원본과 같은 값이어야 한다 (가장 짧은 표기가 곧 그 증거다)
+      assert.strictEqual(Number(String(out)), Number(v), v);
+      assert.strictEqual(String(out).replace(/[+]/g, ''), String(Number(v)).replace(/[+]/g, ''), v);
+    }
+    assert.notStrictEqual(out, 2.08e-322, `${v}이 다른 값으로 바뀌었다`);
+  }
+  assert.strictEqual(numberFromString('20980e-326'), '20980e-326', '값이 뭉개지는 구간은 문자열로 남아야 한다');
+});
+
+test('표기가 달라도 값이 같으면 숫자로 되돌린다', () => {
+  // 판정 기준은 표기 일치(String(n) === v)가 아니라 값 동일성이다 — 그 어림이 Oracle의
+  // 정상 표기를 전부 손실로 오판했고, 반대로 자릿수 어림은 비정규수를 놓쳤다.
+  // 유효숫자 16~17자리여도 왕복이 정확하면 숫자로 돌린다.
+  assert.strictEqual(numberFromString('.8896558657424347'), 0.8896558657424347);
+  assert.strictEqual(numberFromString('29387210.7049420140'), 29387210.704942014);
+  assert.strictEqual(numberFromString('003368761374974852'), 3368761374974852);
+  assert.strictEqual(numberFromString('0.1e1'), 1);
+  assert.strictEqual(numberFromString('10e-1'), 1);
+  // 왕복이 어긋나면 자릿수와 무관하게 문자열로 남는다
+  assert.strictEqual(numberFromString('12345678901234567'), '12345678901234567');
+  assert.strictEqual(numberFromString('10000000000000001'), '10000000000000001');
+});
+
+test('boolean 바인드는 드라이버까지 내려가기 전에 거부된다', async () => {
+  // node-oracledb는 Oracle 23ai 미만에 JS boolean을 바인드할 수 없다. 통과시키면 접속을 열고
+  // 세션 포맷까지 건 뒤 conn.execute 안에서 드라이버 원문 오류로 죽는데, 그 원문은 화면에서
+  // 가려지므로(server.js) 사용자에게는 '조회 중 오류' 한 줄, 모델에게는 아무 단서도 남지 않는다.
+  // ':active = 활성 여부'처럼 설명된 바인드에 모델이 true를 채우는 건 자연스러운 완성이라 실제로 온다.
+  for (const v of [true, false]) {
+    await assert.rejects(
+      runQuery(withBind(), { job_id: v }),
+      e => e.safe === true && /true\/false는 바인드할 수 없음/.test(e.message),
+      String(v)
+    );
+  }
+  // 숫자·문자열은 그대로 통과한다 (mock은 0건을 돌려줄 뿐)
+  assert.deepStrictEqual((await runQuery(withBind(), { job_id: 1 })).rows, []);
 });
 
 test('바인드명이 프로토타입 멤버와 겹쳐도 판정이 어긋나지 않는다', async () => {
-  // params?.['__proto__']가 Object.prototype을 돌려주면 '값 없음'이 '값이 아닌 구조'로 둔갑한다
-  await assert.rejects(
-    runQuery(reg('batch_job_status', 'SELECT 1 FROM T WHERE A = :__proto__'), {}),
-    e => e.safe === true && /값 없음/.test(e.message)
-  );
+  // params?.['constructor']가 Object.prototype의 함수를 돌려주면 '값 없음'이 '값이 아닌 구조'로 둔갑한다.
+  // ('__proto__'가 아니라 'constructor'로 재는 이유: '__proto__'는 영문자로 시작하지 않아 Oracle이
+  //  바인드로 받지 않고 sql.js 가드가 그 앞에서 거부한다 — 이 판정에 닿는 이름은 전부 적법한 식별자다)
+  for (const name of ['constructor', 'toString', 'valueOf']) {
+    await assert.rejects(
+      runQuery(reg('batch_job_status', `SELECT 1 FROM T WHERE A = :${name}`), {}),
+      e => e.safe === true && /값 없음/.test(e.message),
+      name
+    );
+  }
 });
 
 test('음수 scale NUMBER는 정밀도 가드를 우회하지 못한다', () => {

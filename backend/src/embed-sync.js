@@ -55,6 +55,7 @@ export const SKIP = {
   BUSY: 'busy',                 // 다른 동기화가 진행 중 (이번 회차만 건너뜀)
   UNCONFIGURED: 'unconfigured', // EMBEDDING_URL 미설정 — LIKE-only 정상 구성
   UNAVAILABLE: 'unavailable',   // 임베딩 서버가 설정돼 있으나 응답하지 않음
+  STOPPED: 'stopped',           // 정상 종료 요청으로 도중에 접음 (다음 실행이 이어받는다)
 };
 
 // 결과 문구는 SKIP 바로 옆에 둔다 — 서버 로그와 CLI가 각자 SKIP 키 맵을 들고 있으면
@@ -65,6 +66,7 @@ const SKIP_NOTE = {
   [SKIP.BUSY]: 'skipped — another sync is already in progress',
   [SKIP.UNCONFIGURED]: 'EMBEDDING_URL not set — LIKE-only setup, embedding skipped',
   [SKIP.UNAVAILABLE]: 'could not reach the embedding server — some rows skipped, continuing LIKE-only',
+  [SKIP.STOPPED]: 'stopped early for shutdown — the remaining rows are picked up on the next run',
 };
 
 // 건너뛴 행은 사람이 원인을 없애기 전까지 매 주기 다시 실패하므로 반드시 눈에 띄어야 한다
@@ -87,6 +89,26 @@ export function syncSummary(r) {
 //  커넥션이 닫히며 서버가 락을 자동 해제한다.)
 let running = false;
 const LOCK_NAME = 'space_voc_embed_sync';
+
+// 정상 종료 신호. 초기 대량 동기화는 수 분이 걸릴 수 있고, 그동안 GET_LOCK 전용 커넥션을 계속
+// 쥐고 있다 — 종료 경로가 이 작업을 '기다리기만' 하면 closePool()의 pool.end()가 커넥션 반납을
+// 기다리다 10초 강제 타이머에 걸려, 정상 재배포가 매번 종료 코드 1로 기록된다(server.js shutdown).
+// 그래서 기다리기 전에 접으라고 알린다. 접는 지점이 둘이어야 한다:
+//   ① 테이블·배치 경계의 플래그 확인 — 동기화는 해시 비교 기반이라 어디서 멈춰도 멱등하고,
+//      남은 행은 다음 실행이 그대로 이어받는다.
+//   ② 진행 중인 embed() 호출의 중단(AbortController) — 경계 확인만 두면 SIGTERM이 호출 도중에
+//      닿았을 때 그 호출의 자체 타임아웃(60초)까지 기다려야 하고, 그동안 락 커넥션을 쥔 채라
+//      종료가 그대로 강제 타이머로 밀린다. 임베딩 서버가 응답하지 않는 상태가 정확히 그 경우다.
+// 신호는 프로세스 수명 동안 한 번만 켜진다(되돌리지 않는다) — 켜졌다는 것은 종료 중이라는 뜻이다.
+// 요청 경로의 임베딩(search.js)에는 이 신호를 주지 않는다: 처리 중인 질문은 server.close()가
+// 끝까지 기다리므로, 그쪽 호출까지 끊으면 아직 응답하지 않은 요청의 검색이 무너진다.
+let stopRequested = false;
+const stopSignal = new AbortController();
+
+export function requestSyncStop() {
+  stopRequested = true;
+  stopSignal.abort();
+}
 
 export async function syncEmbeddings() {
   if (running) return { embedded: 0, deleted: 0, failed: 0, skipped: SKIP.BUSY };
@@ -123,8 +145,11 @@ async function doSync() {
   // 여기서 return하면 뒤쪽 테이블의 고아 벡터 정리가 통째로 빠지는데, 그 정리는 이 함수에만 있어
   // 삭제된 qa_method/query_registry의 벡터가 다음 성공 동기화까지 검색에 남는다.
   let unavailable = false;
+  let stopped = false;
 
   for (const [src, cols] of Object.entries(SEARCH_COLUMNS)) {
+    // 종료 중이면 다음 테이블로 넘어가지 않는다 — 해시 스캔 한 번이 전 행을 훑는 작업이다.
+    if (stopRequested) { stopped = true; break; }
     // 임베딩 서버가 이미 끊긴 뒤라면 해시 스캔도 걸지 않는다 — 어차피 임베딩하지 않을 변경분을
     // 찾느라 DB가 매 주기 전 행을 해싱하는 일이 서버가 죽어 있는 내내 반복된다.
     const checkContent = enabled && !unavailable;
@@ -170,11 +195,16 @@ async function doSync() {
     }
 
     for (let i = 0; i < stale.length; i += BATCH) {
+      // 배치 경계에서 접는다 — 해시가 갱신되지 않은 행은 다음 실행에서 그대로 다시 잡힌다(멱등).
+      if (stopRequested) { stopped = true; break; }
       const batch = stale.slice(i, i + BATCH);
       let vectors;
       try {
-        vectors = await embed(batch.map(b => b.text));
+        vectors = await embed(batch.map(b => b.text), stopSignal.signal);
       } catch (e) {
+        // 종료 신호로 끊긴 호출은 실패가 아니다 — 경고를 남기면 정상 재배포마다
+        // '임베딩 서버에 닿지 못했다'는 오해를 부르는 줄이 로그에 쌓인다.
+        if (stopRequested) { stopped = true; break; }
         warnEmbeddingFailure(e);
         // 서버에 닿지 못한 것이면 이번 회차는 여기서 접는다 (다음 주기에 그대로 재시도된다).
         if (e.retriable) { unavailable = true; break; }
@@ -192,7 +222,7 @@ async function doSync() {
       failed += r.failed;
     }
   }
-  return { embedded, deleted, failed, skipped: unavailable ? SKIP.UNAVAILABLE : skipped };
+  return { embedded, deleted, failed, skipped: stopped ? SKIP.STOPPED : unavailable ? SKIP.UNAVAILABLE : skipped };
 }
 
 // 내용 때문에 거부된 배치를 행 단위로 갈라 성한 행만 저장한다.
@@ -201,11 +231,13 @@ async function doSync() {
 async function embedRows(src, batch) {
   let embedded = 0, failed = 0;
   for (const b of batch) {
+    if (stopRequested) break;   // 종료 중에는 남은 행을 붙잡지 않는다 (다음 실행이 그대로 이어받는다)
     try {
-      const r = await storeBatch(src, [b], await embed([b.text]));
+      const r = await storeBatch(src, [b], await embed([b.text], stopSignal.signal));
       embedded += r.stored;
       failed += r.failed;   // 저장에 실패한 행도 다음 주기에 그대로 되돌아온다 (storeBatch 주석)
     } catch (e) {
+      if (stopRequested) break;
       warnEmbeddingFailure(e);
       if (e.retriable) return { embedded, failed, unavailable: true };
       failed++;

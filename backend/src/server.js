@@ -4,10 +4,14 @@ import express from 'express';
 import { handleQuestion } from './agent.js';
 import { llmProvider } from './llm.js';
 import { oracleMock } from './oracle.js';
-import { syncEmbeddings, syncSummary } from './embed-sync.js';
+import { syncEmbeddings, syncSummary, requestSyncStop } from './embed-sync.js';
 import { insertChatLog, cleanupChatLogs, closePool } from './db.js';
-import { numEnv, warnOnce, MAX_QUESTION_LEN } from './constants.js';
+import { numEnv, warnOnce, stripLoneSurrogates, MAX_QUESTION_LEN } from './constants.js';
 import { clientTrace } from './result.js';
+
+// 종료가 시작됐는지 — 새 주기 작업을 시작하지 않기 위해 아래 runJob이 함께 본다.
+// (선언을 shutdown 옆이 아니라 여기 두는 이유는 그 참조가 정의보다 먼저 평가되기 때문이다)
+let shuttingDown = false;
 
 // 놓친 promise 거부는 기록만 하고 계속 진행한다 (요청 단위 오류는 각 경로에서 이미 처리한다).
 process.on('unhandledRejection', e => console.error('[unhandledRejection]', e));
@@ -62,8 +66,16 @@ function recordChatLog(question, answer, trace) {
 }
 
 app.post('/api/chat', async (req, res) => {
-  const message = req.body?.message;
-  if (typeof message !== 'string' || !message.trim()) {
+  const raw = req.body?.message;
+  if (typeof raw !== 'string') {
+    return res.status(400).json({ error: 'message가 필요합니다.' });
+  }
+  // 짝 잃은 서로게이트를 여기서 걷어낸다 — 클라이언트가 이모지 한가운데를 자른 조각을 보내면
+  // 그 문자열은 유효한 UTF-8이 아니라서 LLM 요청이 통째로 거부되거나 본문이 U+FFFD로 훼손되고,
+  // chat_log INSERT도 같은 이유로 깨진다. 대화 턴이 normalizeChat에서 같은 처리를 받는 것과
+  // 같은 이유·같은 함수다 (agent.js clipChatText). 정리한 값을 답변·로그가 모두 함께 본다.
+  const message = stripLoneSurrogates(raw).trim();
+  if (!message) {
     return res.status(400).json({ error: 'message가 필요합니다.' });
   }
   // 상한은 constants.js가 정한다 — 프롬프트 예산 계산과 회귀 테스트가 같은 값을 본다.
@@ -72,11 +84,11 @@ app.post('/api/chat', async (req, res) => {
   }
   try {
     // history: 클라이언트가 보내는 최근 대화 [{role:'user'|'assistant', text}] (서버는 상태를 저장하지 않는다)
-    const { answer, trace, search } = await handleQuestion(message.trim(), req.body?.history);
+    const { answer, trace, search } = await handleQuestion(message, req.body?.history);
     // 대화 로그 (비동기 — 기록 실패가 응답을 막지 않는다). search(검색 적중 수)를 함께 남겨
     // "검색 0건이라 못 답한 질문"을 SQL로 바로 찾을 수 있게 한다 (README의 chat_log 예시 참고).
     // v는 trace 스키마 버전 — 형식이 바뀌어도 분석 SQL이 옛 행과 새 행을 구분할 수 있게 한다.
-    recordChatLog(message.trim(), answer, { v: 2, search, steps: trace });
+    recordChatLog(message, answer, { v: 2, search, steps: trace });
     // 화면용 정리(제어용 기록 제외, 원문 오류 가리기, 행 상한과 생략 건수)는 result.js가 한다 —
     // 건수 해석을 답변 본문·프롬프트와 한 곳에서 공유해야 하고, 여기 두면 테스트가 붙지 않는다.
     res.json({ answer, trace: clientTrace(trace) });
@@ -118,18 +130,37 @@ app.use((err, req, res, next) => {
 const timers = [];
 const everyMs = (fn, ms) => timers.push(setInterval(fn, ms));
 
+// 응답 경로 밖에서 도는 작업(임베딩 동기화·chat_log 정리)도 커넥션 풀을 쓴다.
+// 타이머만 멈추고 closePool()을 부르면 '이미 시작된' 작업이 커넥션을 쥔 채 남아 pool.end()가
+// 끝나지 않는다 — 기동 직후 재배포하면 초기 대량 동기화(수 분)가 정확히 그 상태이고,
+// 10초 강제 타이머가 터져 정상 종료가 매번 종료 코드 1로 기록된다. 그러면 supervisor의 재시작
+// 판정이 어긋나고, 이 경로가 하려던 일(풀 정리)도 실행되지 않는다 — shutdown 주석이 막겠다고
+// 적어둔 바로 그 결과다. chat_log 기록(pendingLogWrites)만 그렇게 다뤄지고 있었다.
+// 시작한 자리에서 붙잡아 두고, 종료 경로가 접으라고 알린 뒤(requestSyncStop) 기다린다.
+const backgroundJobs = new Set();
+function runJob(fn) {
+  if (shuttingDown) return;   // 종료 중에는 새 작업을 시작하지 않는다 (타이머가 방금 해제됐어도)
+  const p = Promise.resolve()
+    .then(fn)
+    // 실패를 먼저 삼킨다 — 종료 경로의 Promise.all이 작업 실패로 거부되지 않게
+    // (각 작업은 자기 오류를 이미 처리하지만, 동기 예외까지 여기서 받는다)
+    .catch(e => console.warn('[job] background task failed:', e?.message ?? e))
+    .finally(() => backgroundJobs.delete(p));
+  backgroundJobs.add(p);
+}
+
 // 임베딩 diff 동기화: 기동 시 1회 + 주기 실행 (SQL로 직접 등록한 데이터도 자동 반영).
 // 결과 문구는 embed-sync.js가 SKIP 옆에서 만든다 — 여기서 SKIP 키 맵을 다시 들면
 // 값이 하나 늘 때 CLI와 손으로 맞춰야 하고, 한쪽만 고치면 그 경로에서만 안내가 사라진다.
-syncEmbeddings()
+runJob(() => syncEmbeddings()
   .then(r => console.log(`[embed] sync: ${syncSummary(r)}`))
-  .catch(e => console.warn('[embed] sync failed:', e.message));
+  .catch(e => console.warn('[embed] sync failed:', e.message)));
 // 0은 "주기 동기화 끔"이라는 의도된 값이므로 허용하되, 빈 값·오타는 기본값으로 되돌린다
 // (검증이 없으면 EMBED_SYNC_INTERVAL= 한 줄로 주기 동기화가 로그 없이 사라진다).
 const syncInterval = numEnv('EMBED_SYNC_INTERVAL', 60, { allowZero: true });
 if (syncInterval > 0) {
-  everyMs(() => {
-    syncEmbeddings()
+  everyMs(() => runJob(() => {
+    return syncEmbeddings()
       .then(r => { if (r.embedded || r.deleted || r.failed) console.log(`[embed] sync: ${syncSummary(r)}`); })
       // 삼키면 안 된다 — 임베딩 서버 쪽 실패는 embed-sync가 스스로 알리지만, 관리 DB 오류
       // (vec_store 권한 상실·테이블 유실 등)로 query()가 던지면 그 실패는 여기로만 온다.
@@ -137,7 +168,7 @@ if (syncInterval > 0) {
       // 단서가 없다 — 바로 위 기동 시 1회 실행은 이 실패를 알리고 있었고 주기 실행만 빠져 있었다.
       // warnOnce로 억제해 매 주기 도배는 막되, 오류의 성격이 바뀌면 반드시 다시 알린다.
       .catch(e => warnOnce('embed', `periodic sync failed: ${e.message}`));
-  }, syncInterval * 1000);
+  }), syncInterval * 1000);
 } else {
   console.log('[embed] periodic sync disabled (EMBED_SYNC_INTERVAL=0) — run `npm run embed` to sync manually');
 }
@@ -148,8 +179,8 @@ const cleanupLogs = () =>
   cleanupChatLogs(CHAT_LOG_RETENTION_DAYS)
     .then(r => { if (r.affectedRows) console.log(`[chat_log] cleaned up ${r.affectedRows} rows (older than ${CHAT_LOG_RETENTION_DAYS} days)`); })
     .catch(e => console.warn('[chat_log] cleanup failed:', e.message));
-cleanupLogs();
-everyMs(cleanupLogs, 3600 * 1000);
+runJob(cleanupLogs);
+everyMs(() => runJob(cleanupLogs), 3600 * 1000);
 
 // PORT=0은 '빈 포트를 아무거나'라는 의도된 값이므로 허용한다 (빈 값·오타만 기본값으로)
 const port = numEnv('PORT', 3001, { allowZero: true });
@@ -173,12 +204,14 @@ server.on('error', e => {
 // 위 uncaughtException 핸들러는 '커넥션이 샌 채로 살아남는 것'을 막으려고 즉시 종료까지 하는데,
 // 정작 재배포마다 반드시 도는 정상 종료 경로가 비어 있으면 같은 누수를 매번 만들면서
 // 사용자에게는 '서버와 통신하지 못했습니다'로만 보인다(원인이 앱 오류처럼 읽힌다).
-let shuttingDown = false;
 async function shutdown(signal) {
   if (shuttingDown) return; // 두 번째 시그널은 무시한다 — 종료 도중 다시 들어오는 일이 흔하다
   shuttingDown = true;
   console.log(`[shutdown] received ${signal} — cleaning up and exiting.`);
   for (const t of timers) clearInterval(t);
+  // 타이머 해제만으로는 '이미 시작된' 작업이 멈추지 않는다 — 접으라고 알린다.
+  // 동기화는 해시 비교 기반이라 어디서 멈춰도 멱등하고, 남은 행은 다음 기동이 이어받는다.
+  requestSyncStop();
   // 안전장치: keep-alive 연결이 남아 close가 끝나지 않을 수 있다. supervisor의 SIGKILL을
   // 기다리지 않고 우리가 먼저 접는다. unref로 이 타이머 자체가 종료를 붙잡지 않게 한다.
   const force = setTimeout(() => {
@@ -201,6 +234,10 @@ async function shutdown(signal) {
   // 아직 날아가는 중일 수 있다 (recordChatLog 주석 참고). 무한정 기다리지는 않는다:
   // 위 10초 강제 타이머가 상한이고, 각 promise는 자기 실패를 이미 삼켰다.
   if (pendingLogWrites.size) await Promise.all(pendingLogWrites);
+  // 주기 작업도 같은 이유로 기다린다 — 이쪽은 커넥션을 '쥐고 있는' 몫이라 기다리지 않으면
+  // pool.end()가 끝나지 않는다 (backgroundJobs 주석 참고). 위 requestSyncStop이 이미
+  // 접으라고 알렸으므로 여기서 오래 매달리지 않는다. 상한은 아래 10초 강제 타이머다.
+  if (backgroundJobs.size) await Promise.all(backgroundJobs);
   await closePool().catch(e => console.warn('[shutdown] failed to close connection pool:', e.message));
   clearTimeout(force);
   process.exit(0);

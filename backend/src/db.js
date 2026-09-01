@@ -7,8 +7,15 @@ import { numEnv, nameKey } from './constants.js';
 // 풀 크기의 근거. 셋을 따로 두는 이유는 성격이 다르기 때문이다 — 앞의 둘은 곱해지는 양이고,
 // 마지막 하나는 '짧게 빌려 쓰는' 나머지와 달리 동기화가 끝날 때까지 계속 쥐고 있는 몫이라
 // 곱셈 밖에서 더해야 한다. 이전 값(10)은 실질 동시 처리가 2건이었다.
-const CONNS_PER_REQUEST = 4;   // 요청 1건의 동시 점유 최대치 — 지식·처리방법 검색이 병렬이고
-                               // 각각 LIKE+벡터가 다시 병렬이다 (search.js hybrid).
+const CONNS_PER_REQUEST = 4;   // 요청 1건의 동시 점유 최대치. 요청 하나가 커넥션을 겹쳐 쓰는 구간이 둘이다:
+                               //   ① 지식·처리방법 검색 — 둘이 병렬이고 각각 LIKE+벡터가 다시 병렬이다
+                               //      (search.js hybrid). 벡터 쪽은 임베딩 응답을 먼저 기다리므로
+                               //      실측 피크는 4가 아니라 2다(LIKE 2 → 벡터 2 순).
+                               //   ② 쿼리 목록의 관련도 정렬 — 이름 조회 + LIKE + 벡터가 병렬이다
+                               //      (agent.js rankQueries). 실측 피크 3으로, 여기가 최대다.
+                               //   ①과 ②는 순차라 겹치지 않는다 (②는 ①의 결과를 받아 돈다).
+                               // 값은 실측 피크(3)에 여유 한 칸을 더해 잡는다 — 임베딩 캐시 적중 여부에
+                               // 따라 ①의 순서가 달라질 수 있고, 모자라면 증상이 '질문이 어렵다'처럼 보인다.
 const CONCURRENT_REQUESTS = 4; // 이 크기로 감당하려는 동시 질문 수 (사내 Q&A 트래픽 기준).
 const RESERVED_FOR_SYNC = 1;   // embed-sync가 동기화 내내 쥐는 GET_LOCK 전용 커넥션.
 const POOL_SIZE = CONNS_PER_REQUEST * CONCURRENT_REQUESTS + RESERVED_FOR_SYNC;
@@ -101,10 +108,18 @@ export async function closePool() {
 // limit은 호출부가 "임계치+1"을 넣어 규모 판정까지 겸한다 (agent.js selectQueries 참고).
 // limit === undefined로 판정한다 — truthy로 보면 limit=0이 "0건"이 아니라 "전체 로드"가 되어,
 // 남은 자리를 계산해 넘기는 호출부가 생기는 순간 조용히 대형 SELECT가 프롬프트 경로로 들어온다.
+//
+// ORDER BY가 반드시 있어야 한다. LIMIT만 걸면 '어떤 행이 오는가'도 '어떤 순서로 오는가'도
+// SQL이 보장하지 않는다 — 실행계획이 바뀌는 것만으로(query_name 인덱스 추가, ANALYZE, 온라인 ALTER)
+// 같은 코드가 다른 표본을 돌려준다. 규모 판정(31건 중 몇 건인가)은 그래도 성립하지만, 임계치
+// 이하에서는 이 결과가 곧 프롬프트에 실리는 목록이라 '에이전트가 도달할 수 있는 쿼리 집합'이
+// 재시작마다 달라지면서 아무 로그도 남기지 않는다.
+// 형제 로더(loadQueriesByNames)가 호출부 순서를 복원하는 것과 같은 이유다 — 그쪽만 고쳐져 있었다.
+// 정렬 키는 PK(seq) = 등록 순서다. 관련도 순서는 호출부가 검색 결과로 따로 만든다(agent.js rankQueries).
 export function loadQueryRegistry(limit) {
   return limit === undefined
-    ? query('SELECT * FROM query_registry')
-    : query('SELECT * FROM query_registry LIMIT ?', [limit]);
+    ? query('SELECT * FROM query_registry ORDER BY seq')
+    : query('SELECT * FROM query_registry ORDER BY seq LIMIT ?', [limit]);
 }
 
 // qa_method 본문이 지목한 query_name들을 로드 (라우팅 경로A).

@@ -36,15 +36,27 @@ export function warnEmbeddingFailure(e) {
 }
 
 // 성공하면 texts와 같은 길이·순서의 벡터 배열, 실패하면 EmbeddingError를 던진다.
-export async function embed(texts) {
+//
+// signal(선택)은 호출부가 이 호출을 '먼저 끊을' 수 있는 통로다. 정상 종료가 그것을 쓴다:
+// 타임아웃만 있으면 종료 시각과 무관하게 최대 60초를 더 기다려야 하는데, 그동안 embed-sync가
+// GET_LOCK 전용 커넥션을 쥐고 있어 closePool()이 끝나지 않고 종료가 강제 타이머로 밀린다
+// (server.js shutdown, embed-sync requestSyncStop 주석).
+// AbortSignal.any는 Node 20.3+에만 있어 쓰지 않는다 — 이 저장소는 engines 제약이 없어
+// Node 18에서도 뜨고, 거기서는 그 한 줄이 모든 임베딩을 TypeError로 죽인다.
+export async function embed(texts, signal) {
   const base = process.env.EMBEDDING_URL;
   if (!base) throw new EmbeddingError('EMBEDDING_URL이 설정되지 않았습니다', false);
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+  const onAbort = () => ctl.abort();
+  if (signal?.aborted) ctl.abort();
+  else signal?.addEventListener('abort', onAbort, { once: true });
   try {
     const res = await fetch(`${base}/embeddings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: EMBEDDING_MODEL, input: texts }),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      signal: ctl.signal,
     });
     if (!res.ok) {
       // 5xx·429는 서버 사정이라 재시도 가치가 있고, 4xx는 이 입력을 거부한 것이라 없다.
@@ -69,5 +81,10 @@ export async function embed(texts) {
     if (e instanceof EmbeddingError) throw e;
     // fetch 자체가 던진 것 — 접속 실패·타임아웃·중단. 서버에 닿지 못했으므로 재시도 대상이다.
     throw new EmbeddingError(e.message, true);
+  } finally {
+    // 타이머와 리스너를 반드시 건다 — 남겨두면 타이머가 이벤트 루프를 붙잡아 CLI(npm run embed)의
+    // 종료가 최대 60초 늦어지고, 리스너는 signal이 살아 있는 동안 호출 수만큼 쌓인다.
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
   }
 }

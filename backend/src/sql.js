@@ -95,7 +95,7 @@ const stripNoise = sql => scanSql(sql).text;
 const bindCache = new Map();
 const BIND_CACHE_MAX = 500;
 
-// 바인드명에 쓰이는 문자 = Oracle 식별자 문자(위 isIdentChar와 같은 집합이어야 한다).
+// 바인드 '후보' = ':' 뒤에 이어지는 Oracle 식별자 문자열.
 // \w+ 로 잡으면 안 된다: \w는 [A-Za-z0-9_]라 '$'·'#'이 든 이름(EMP$NO, TAB#ID — 둘 다 적법한
 // Oracle 식별자다)을 앞에서 잘라 ':emp'로 만든다. 그 잘린 이름이 프롬프트에 실리고 모델은 그것으로
 // params를 채우므로, 실행 단계에서 드라이버가 진짜 바인드(:emp$no)의 값을 찾지 못해
@@ -103,6 +103,15 @@ const BIND_CACHE_MAX = 500;
 // (server.js가 원문을 숨긴다) 그 쿼리는 등록된 채로 영원히 실행되지 않는다.
 // 같은 파일 안에서 식별자 판정이 두 갈래로 갈라져 있던 것이 원인이다.
 const BIND_RE = /:([A-Za-z0-9_$#]+)/g;
+
+// 후보 중 '이 실행기가 실제로 바인드할 수 있는 이름'의 규칙 — Oracle 비인용 식별자와 같다:
+// 반드시 영문자로 시작한다. 이 판정이 없으면 위 후보 정규식이 위치 바인드(:1)까지 이름으로 잡아
+// bindNames가 '1'을 돌려주고, 프롬프트는 '바인드(:1)'을 보여주며, 모델은 params {"1": …}을 채운다.
+// 그런데 node-oracledb는 위치 바인드에 '객체'가 아니라 '배열'을 요구하므로 conn.execute가
+// NJS-098/ORA-01008로 죽는다 — 드라이버 원문이라 화면에는 '조회 중 오류' 한 줄만 나가고,
+// 그 쿼리는 등록된 채로 영원히 실행되지 않는다. (JDBC/PL-SQL 원본을 옮겨 적으면 자연히 나오는 표기다)
+const isExecutableBind = n => /^[A-Za-z]/.test(n);
+const bindCandidates = text => [...new Set([...text.matchAll(BIND_RE)].map(m => m[1]))];
 
 export function bindNames(sql) {
   const hit = bindCache.get(sql);
@@ -114,7 +123,7 @@ export function bindNames(sql) {
     bindCache.set(sql, hit);
     return hit;
   }
-  const names = Object.freeze([...new Set([...stripNoise(sql).matchAll(BIND_RE)].map(m => m[1]))]);
+  const names = Object.freeze(bindCandidates(stripNoise(sql)).filter(isExecutableBind));
   while (bindCache.size >= BIND_CACHE_MAX) bindCache.delete(bindCache.keys().next().value);
   bindCache.set(sql, names);
   return names;
@@ -161,6 +170,18 @@ export function assertReadOnly(sql) {
   // FOR UPDATE OF/NOWAIT/SKIP LOCKED는 전부 이 접두에서 걸린다.
   if (/\bFOR\s+UPDATE\b/i.test(s)) {
     throw safeError('행 잠금을 거는 쿼리(FOR UPDATE)는 실행할 수 없습니다.');
+  }
+  // (5) 이 실행기가 바인드할 수 없는 표기 금지 — 위치 바인드(:1)와 영문자로 시작하지 않는 이름.
+  // bindNames가 걸러내기만 하면 그 쿼리는 '바인드가 없는 쿼리'로 보여 드라이버까지 내려가고,
+  // 거기서 ORA-01008(값이 바인드되지 않음)로 죽는다 — 드라이버 원문은 화면에서 가려지므로
+  // 사용자도 모델도 원인을 볼 수 없고, 그 쿼리는 등록된 채 영원히 실행되지 않는다.
+  // FOR UPDATE와 같은 성격의 등록 실수이므로 같은 자리에서 같은 방식으로, 소리 나게 거부한다.
+  const unsupported = bindCandidates(text).filter(n => !isExecutableBind(n));
+  if (unsupported.length) {
+    throw safeError(
+      `실행할 수 없는 바인드 표기입니다: ${unsupported.map(n => `:${n}`).join(', ')} ` +
+      '— 바인드명은 영문자로 시작해야 합니다 (위치 바인드 :1은 지원하지 않습니다).'
+    );
   }
   return executableSql(String(sql ?? ''), text);
 }

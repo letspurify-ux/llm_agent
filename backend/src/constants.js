@@ -127,6 +127,22 @@ export function clipText(s, max) {
   return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
 }
 
+// 짝 잃은 서로게이트를 제거한다 — clipText가 '우리가 자른 경계'를 지키는 것과 같은 이유를,
+// '남이 잘라서 보낸 문자열'에 적용한다.
+// clipText만으로는 절반만 막힌다: 그쪽은 절단면(끝)의 상위 서로게이트 하나만 보므로, 클라이언트가
+// 이모지 한가운데를 자르고 '뒷조각'을 보내면 맨 앞의 하위 서로게이트가 그대로 통과한다. 그 문자열은
+// JSON.stringify를 지나(\udc00으로 이스케이프된다) 유효한 UTF-8이 아닌 채로 LLM·임베딩 서버까지 가서,
+// 요청이 통째로 거부되거나(그 대화의 이후 질문이 전부 실패한다) 본문이 U+FFFD로 조용히 훼손된다.
+// 양쪽 경계만 다루는 대신 문자열 전체에서 짝 없는 코드유닛을 없앤다 — 가운데에 끼어 있는 경우
+// (조각 두 개를 이어 붙인 입력)까지 같은 규칙으로 덮이고, 규칙이 하나면 한쪽만 빠질 수 없다.
+const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+export function stripLoneSurrogates(s) {
+  const str = String(s ?? '');
+  // 서로게이트가 아예 없는 문자열(대부분의 입력)은 정규식 치환 없이 그대로 돌려준다
+  return /[\uD800-\uDFFF]/.test(str) ? str.replace(LONE_SURROGATE_RE, '') : str;
+}
+
 // 소유 키만 읽는 프로퍼티 접근.
 // 바인드명·쿼리명이 '__proto__'·'toString' 같은 프로토타입 멤버와 겹치면 obj[key]가 값 대신
 // Object.prototype의 멤버를 돌려준다. 그러면 '값 없음'이어야 할 자리가 다른 문자열·함수로 굳어
@@ -170,11 +186,21 @@ export const safeError = (msg, hint) => Object.assign(new Error(msg), { safe: tr
 // node-oracledb의 callTimeout 세터는 정수가 아니면 던지고(모든 조회 실패), listen()의 포트도 마찬가지다.
 // 검증한다고 해놓고 소수를 흘려보내면 '검증했다'는 착각만 남는다.
 // allowZero: 0을 유효한 값(끄기)으로 허용할지. 기본은 양수만 허용.
+// 값이 아니라 '표기'를 먼저 본다. Number()는 16진수('0x50' → 80)와 지수 표기('1e10' → 10000000000)를
+// 조용히 받아주는데, 그 결과는 정수라 Number.isInteger 검사를 그대로 통과한다 — 오타 하나가 경고 없이
+// 전혀 다른 설정이 된다. ORACLE_TIMEOUT_MS=1e10은 callTimeout을 약 116일로 만들어 사실상 '타임아웃 없음'이
+// 되고(바로 위 주석이 막겠다고 한 그 결과가 다른 오타로 되살아난다), MARIADB_POOL_SIZE=1e5는
+// 커넥션 10만 개를 요청하며, PORT=0x50은 .env 어디에도 적혀 있지 않은 80번 포트에 바인드한다.
+// 셋 다 남는 증상이 '멈춤' 또는 '접속 폭주'뿐이고 설정을 가리키는 단서는 없다.
+// 안전 정수 범위도 함께 본다 — 그 밖의 값은 Number()가 근사해 적어둔 표기와 실제 값이 갈라진다.
+const INT_RE = /^[+-]?\d+$/;
+
 export function numEnv(name, fallback, { allowZero = false } = {}) {
   const raw = process.env[name];
-  if (raw === undefined || String(raw).trim() === '') return fallback;
-  const v = Number(raw);
-  if (Number.isInteger(v) && (v > 0 || (allowZero && v === 0))) return v;
+  const s = raw === undefined ? '' : String(raw).trim();
+  if (s === '') return fallback;
+  const v = Number(s);
+  if (INT_RE.test(s) && Number.isSafeInteger(v) && (v > 0 || (allowZero && v === 0))) return v;
   console.warn(`[env] invalid value for ${name}, falling back to default (${fallback}): ${JSON.stringify(raw)}`);
   return fallback;
 }

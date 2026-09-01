@@ -177,18 +177,82 @@ function renderItems(items, render, budget) {
 // 사라지면 모델이 params를 비우고, runQuery가 '바인드 변수를 쓸 수 없습니다'로 실패한다.
 // 개수·이름 길이에 상한을 둔다 — bindNames는 표시용 절단(MAX_PROMPT_SQL_LEN) 전의 SQL 원문
 // (TEXT 64KB)을 파싱하므로, 이 목록이 이 줄에서 유일하게 유계가 아닌 부분이었다. 바인드 수백
-// 개짜리 SQL 하나가 등록되면 renderItems의 '최소 1건 보장'을 타고 그 한 항목이 예산을 뚫는다.
+// 개짜리 SQL 하나가 등록되면 '최소 1건 보장'을 타고 그 한 항목이 예산을 뚫는다.
 // 정상 쿼리의 바인드는 한 자릿수다(llm.js MAX_DECISION_PARAMS와 같은 근거) — 20이면 개입하지 않는다.
 const MAX_PROMPT_BIND_NAMES = 20;
-const queryItem = q => {
+const bindList = q => {
   const binds = bindNames(q.query_sql);
   const shown = binds.slice(0, MAX_PROMPT_BIND_NAMES).map(n => `:${clip(n, 100)}`).join(', ');
   const omitted = binds.length - Math.min(binds.length, MAX_PROMPT_BIND_NAMES);
-  return `- ${clip(q.query_name, 100)}: ${clip(q.query_desc)}` +
-    ` / 입력(${clip(q.input_desc, 300)}) / 출력(${clip(q.output_desc, 300)})` +
-    ` / 바인드(${shown || '없음'}${omitted ? ` 외 ${omitted}개` : ''})` +
-    ` / SQL: ${clip(q.query_sql, MAX_PROMPT_SQL_LEN)}`;
+  return `${shown || '없음'}${omitted ? ` 외 ${omitted}개` : ''}`;
 };
+
+const queryItem = q =>
+  `- ${clip(q.query_name, 100)}: ${clip(q.query_desc)}` +
+  ` / 입력(${clip(q.input_desc, 300)}) / 출력(${clip(q.output_desc, 300)})` +
+  ` / 바인드(${bindList(q)})` +
+  ` / SQL: ${clip(q.query_sql, MAX_PROMPT_SQL_LEN)}`;
+
+// 예산이 모자랄 때 쓰는 짧은 형태 — 실행에 반드시 필요한 것만 남긴다.
+//   이름   : 이것이 없으면 그 쿼리를 지목할 방법 자체가 없다
+//   용도   : 어떤 질문에 쓰는 쿼리인지 고르는 근거
+//   바인드 : 무엇을 채워야 하는지 (없으면 첫 실행이 반드시 '값 없음'으로 실패한다)
+// 입출력 설명과 SQL 원문은 뺀다 — 있으면 좋지만, 없다고 그 쿼리를 못 쓰게 되지는 않는다.
+const MAX_PROMPT_SHORT_DESC_LEN = 120;
+const queryItemShort = q =>
+  `- ${clip(q.query_name, 100)}: ${clip(q.query_desc, MAX_PROMPT_SHORT_DESC_LEN)} / 바인드(${bindList(q)})`;
+
+// 짧은 형태로 실린 쿼리도 그대로 실행할 수 있다는 사실을 모델에게 알린다 —
+// 이 안내가 없으면 모델은 설명이 얇은 항목을 '정보가 부족한 쿼리'로 읽고 후보에서 뺀다.
+const shortFormNote = n =>
+  `- (위 ${n}건은 길이 제한으로 이름·용도·바인드만 표시했다 — 그대로 실행할 수 있고,` +
+  ` 지목하면 전체 정의가 다음 단계에 실린다)`;
+const omittedNote = n => `- (이하 ${n}건은 프롬프트 길이 제한으로 생략)`;
+
+// 위 안내 두 줄의 몫. 예산을 다 쓴 뒤에 안내를 덧붙이면 그만큼이 섹션 예산 밖으로 나가는데,
+// 쿼리 목록은 '마지막에 배분받는' 섹션이라 그 초과를 흡수해 줄 뒤 섹션이 없다 —
+// 전체 예산(MAX_PROMPT_TOTAL_LEN)을 그대로 넘어가고, 넘긴 만큼이 컨텍스트 한도를 밀어낸다.
+// 두 줄의 길이는 건수 표기 말고는 고정이라 유계다 (건수는 MAX_PROMPT_QUERIES + MAX_STEPS 이하).
+const NOTES_RESERVE = 200;
+
+// 쿼리 목록만 renderItems와 다른 규칙으로 싣는다. 손해의 크기가 다르기 때문이다.
+//   지식·처리방법 — 꼬리를 버리면 '덜 관련된 근거'가 빠져 답이 부실해진다. 회복 경로가 필요 없다.
+//   쿼리 목록     — 버려진 쿼리는 모델이 이름을 댈 수 없으므로 그 조회를 아예 못 한다.
+//                   오류도 남지 않아 chat_log에는 '조회 없이 지식으로만 답한 요청'으로만 보인다.
+// 그래서 '버리기 전에 줄인다': 먼저 모든 쿼리의 짧은 줄을 확보하고, 남는 여유만큼만 앞에서부터
+// 자세한 줄로 올린다(목록은 관련도 순이다 — agent.js selectQueries). 짧은 줄만 있어도 모델은 이름을
+// 지목할 수 있고, 지목하면 agent.js resolveQuery가 등록 원문을 다시 찾아 다음 스텝의 목록 맨 앞에
+// 자세한 형태로 넣어준다 — 복구 경로가 이미 있고, 이 렌더가 그 입구를 열어둔다.
+// 짧은 줄로도 다 못 실을 만큼 예산이 모자라면 그때는 꼬리부터 버린다(기존 동작).
+function renderQueries(queries, budget) {
+  const short = queries.map(queryItemShort);
+  // 줄마다 줄바꿈 한 칸을 함께 센다 — 배분(renderSections)이 그렇게 세므로 기준이 같아야 한다.
+  // 이 섹션은 다른 섹션보다 줄 수가 훨씬 많아질 수 있어(모든 쿼리가 한 줄씩) 그 한 칸이 쌓인다.
+  const cost = line => line.length + 1;
+  const usable = Math.max(0, budget - NOTES_RESERVE);
+  let used = 0;
+  // ① 짧은 줄만이라도 최대한 많이 — 첫 항목은 예산과 무관하게 싣는다(renderItems와 같은 보장).
+  let kept = 0;
+  for (; kept < short.length; kept++) {
+    if (kept > 0 && used + cost(short[kept]) > usable) break;
+    used += cost(short[kept]);
+  }
+  // ② 남는 여유만큼 앞에서부터 자세한 줄로 승격. 여기서는 강제 보장을 두지 않는다 —
+  //    ①이 이미 '모든 항목이 최소 한 줄'을 보장했으므로, 예산을 넘겨서까지 올릴 이유가 없다.
+  const lines = [];
+  let full = 0;
+  for (; full < kept; full++) {
+    const line = queryItem(queries[full]);
+    const extra = line.length - short[full].length;
+    if (used + extra > usable) break;
+    used += extra;
+    lines.push(line);
+  }
+  for (let i = full; i < kept; i++) lines.push(short[i]);
+  if (full < kept) lines.push(shortFormNote(kept - full));
+  if (kept < queries.length) lines.push(omittedNote(queries.length - kept));
+  return lines;
+}
 
 // 예산 안에 들어가는 가장 긴 앞부분을 돌려준다. 행 단위로 줄이는 이유: JSON 문자열을 중간에서
 // 자르면 모델이 파싱할 수 없는 조각이 남고, 그 조각을 값으로 읽어 바인드로 되돌린다.
@@ -314,7 +378,7 @@ function renderSections(ctx) {
     knowledge: budget => renderItems(ctx.knowledge, k => `- [${k.title}] ${clip(k.content)}`, budget),
     qaMethods: budget => renderItems(ctx.qaMethods, m => `- [${m.title}] ${clip(m.method)}`, budget),
     history: budget => renderHistory(ctx.history, budget),
-    queries: budget => renderItems(ctx.queries, queryItem, budget),
+    queries: budget => renderQueries(ctx.queries, budget),
   };
   const keys = Object.keys(PROMPT_FLOORS);
   const out = {};

@@ -7,7 +7,7 @@ import { loadQueryRegistry, loadQueriesByNames } from './db.js';
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
 import { llm, renderAnswer } from './llm.js';
-import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, nameKey, clipText, ownProp } from './constants.js';
+import { MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, nameKey, clipText, stripLoneSurrogates, ownProp } from './constants.js';
 
 const MAX_STEPS = 5;
 const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포함). 초과하면 남은 스텝을 포기하고 강제 답변으로 간다.
@@ -88,16 +88,21 @@ export function normalizeChat(chat) {
 // 턴 본문은 단순 slice가 아니라 clipText로 자른다 — 경계의 서로게이트 쌍(이모지 등)을 반으로
 // 쪼개면 짝 잃은 코드유닛이 프롬프트에 실려, LLM API로 보내는 인코딩 단계에서 U+FFFD로
 // 조용히 훼손된다 (constants.clipText 주석 참고).
-// clipText는 상한 이하 문자열에는 손대지 않으므로, 클라이언트가 자기 쪽 절단(App.jsx)에서
-// 이미 쪼개 보낸 문자열은 그대로 통과한다 — 끝이 상위 서로게이트인 문자열은 절단 여부와
-// 무관하게 항상 손상된 문자열이므로, 여기서 마지막 코드유닛을 마저 뗀다.
+// 자르기 '전에' 짝 잃은 코드유닛을 걷어낸다. clipText는 상한 이하 문자열에 손대지 않으므로,
+// 클라이언트가 자기 쪽 절단(App.jsx)에서 이미 쪼개 보낸 조각은 그대로 통과한다 —
+// 그런데 앞선 구현은 '끝'의 상위 서로게이트 하나만 봤다. 클라이언트가 이모지 한가운데를 자르고
+// 뒷조각을 보내면 맨 앞에 하위 서로게이트가 남는데(예: '\uDC00 재시작은 어떻게 해?'), 그쪽은
+// 검사를 통째로 비켜 가서 프롬프트에 그대로 실렸다. 한쪽 경계만 지키는 가드였던 셈이다.
+// stripLoneSurrogates는 양쪽 경계와 가운데를 같은 규칙으로 없앤다 — 규칙이 하나면 한쪽만 빠질 수 없다.
 function clipChatText(text) {
-  const t = clipText(text, MAX_CHAT_LEN);
-  const last = t.charCodeAt(t.length - 1);
-  return last >= 0xd800 && last <= 0xdbff ? t.slice(0, -1) : t;
+  return clipText(stripLoneSurrogates(text), MAX_CHAT_LEN);
 }
 
-export async function handleQuestion(question, rawChat = []) {
+export async function handleQuestion(rawQuestion, rawChat = []) {
+  // 질문도 대화 턴과 같은 이유로 여기서 정리한다 — 클라이언트가 이모지 한가운데를 자른 조각을
+  // 보내면 그 요청의 모든 LLM 호출이 인코딩 단계에서 실패하거나 본문이 U+FFFD로 훼손된다.
+  // (서버 입력 검증도 같은 함수를 쓴다 — server.js. 그쪽은 chat_log까지 같은 값을 남긴다)
+  const question = stripLoneSurrogates(rawQuestion);
   const chat = normalizeChat(rawChat);
   // 예산은 요청 시작점에서 잡는다 — 검색 뒤에 잡으면 임베딩 타임아웃(최대 2회 × 60초)이
   // 예산 밖에 놓여, 문서화한 요청 상한과 프런트 abort 시각이 실제보다 낙관적이 된다.
@@ -291,10 +296,48 @@ async function resolveQuery(name, queries, cache) {
   }
 }
 
-// 프롬프트에 실을 쿼리 선정. 등록 수가 적으면 전체(가장 정확), 많으면 두 경로의 합집합:
-//   경로A: 매칭된 qa_method 본문이 지목한 query_name (다단계 절차 보장)
-//   경로B: 질문으로 query_registry 자체를 하이브리드 검색 — qa_method 등록 없는 쿼리도 찾는다
-// 반환: { list, routed } — routed=false면 전체를 실은 것이므로 '적중 수' 개념이 없다.
+// 프롬프트에 실을 쿼리를 관련도 순으로 정렬한다. 두 경로의 합집합이다:
+//   경로A: 매칭된 qa_method 본문이 지목한 query_name (다단계 절차 보장 — 본문 등장 순서를 지킨다)
+//   경로B: 질문으로 query_registry 자체를 하이브리드 검색(LIKE 관련도 + 벡터 RRF) —
+//          qa_method 등록 없이 등록된 쿼리도 질문만으로 찾는다
+// 지식·처리방법이 같은 hybrid()로 관련도 순을 만드는 것과 같은 순서 규칙이다.
+async function rankQueries(qaMethods, question) {
+  // 본문의 영문 토큰은 대부분 query_name이 아니다(상태값·명령어·영단어). 전부 IN 절에 실으면
+  // 매 요청이 수백 개짜리 플레이스홀더 목록을 보내게 된다 — 걸러지는 곳이 MariaDB라 이미 늦다.
+  // 등장 순서를 유지한 채 상한을 둔다: 앞쪽이 절차의 첫 단계이므로 잘려도 다단계 절차의 시작은 남는다.
+  // (likeSearch가 검색 토큰에 두는 상한과 같은 이유·같은 방식이다)
+  // method는 NOT NULL이지만 컬럼 하나가 완화되거나 임포터가 NULL을 넣는 순간 여기서 죽는다 —
+  // 이 값의 다른 소비자(llm-openai clip, embed-sync toText)는 전부 NULL을 견딘다.
+  const mentioned = [...new Set(
+    qaMethods.flatMap(m => String(m.method ?? '').match(/[A-Za-z_][A-Za-z0-9_]{2,}/g) || [])
+  )].slice(0, MAX_MENTIONED_TOKENS);
+  const [named, direct] = await Promise.all([
+    loadQueriesByNames(mentioned),   // query_name이 아닌 토큰은 IN 절에서 자연히 걸러진다
+    searchQueries(question),
+  ]);
+
+  const seen = new Set();
+  const ranked = [];
+  for (const q of [...named, ...direct]) {       // 절차용(경로A)을 우선 포함
+    if (seen.has(q.seq)) continue;
+    seen.add(q.seq);
+    ranked.push(q);
+  }
+  return ranked;
+}
+
+// 프롬프트에 실을 쿼리 선정.
+// 반환: { list, routed } — routed=false면 등록 전체를 실은 것이므로 '적중 수' 개념이 없다.
+//
+// 규모와 무관하게 목록은 반드시 '관련도 순'이어야 한다. 프롬프트 예산(llm-openai.js renderQueries)이
+// 뒤쪽일수록 덜 관련됐다는 전제로 뒤에서부터 줄이기 때문이다. 등록 30건 이하에서는 관련도 검색을
+// 아예 돌리지 않고 저장 순서 그대로 넘기고 있었는데, 그러면 예산이 버리는 것이 '덜 관련된 쿼리'가
+// 아니라 '나중에 등록한 쿼리'가 된다 — 하필 방금 등록한 쿼리부터 프롬프트에서 사라지고,
+// 로그·trace·chat_log 어디에도 그 사실이 남지 않는다.
+// 전체를 싣는 규모에서도 순서를 만들어 그 전제를 참으로 만든다. 추가 비용은 관리 DB 왕복이
+// 요청당 최대 3회(이름 조회 + LIKE + 벡터, 실측 평균 +2.75회) 늘어나는 것뿐이다 —
+// 질문 임베딩은 지식·처리방법 검색이 이미 계산해 두었고 search.js가 캐시하므로 다시 부르지 않는다.
+// 동시 점유는 3으로 CONNS_PER_REQUEST(4) 안이다(db.js 풀 산식 주석에 실측이 적혀 있다).
 async function selectQueries(qaMethods, question) {
   // 상한+1건만 읽어 "전체를 실어도 되는 규모인지"를 같은 왕복에서 판정한다.
   // COUNT 후 다시 SELECT하면 매 요청이 왕복 2회 + 풀 점유 2회가 되고, 그렇다고 무조건
@@ -304,27 +347,34 @@ async function selectQueries(qaMethods, question) {
   // 등록이 크게 늘고 설명 컬럼이 길어져 이 전송이 부담이 되면
   // 규모 판정만 `SELECT seq … LIMIT 31`로 떼고 전체 로드를 조건부로 되돌릴 것.
   const head = await loadQueryRegistry(MAX_PROMPT_QUERIES + 1);
-  if (head.length <= MAX_PROMPT_QUERIES) return { list: head, routed: false };
+  // 등록이 하나도 없으면 순서를 만들 대상이 없다 — 관리 DB 왕복 2회를 태우지 않는다
+  if (!head.length) return { list: [], routed: false };
+  const routed = head.length > MAX_PROMPT_QUERIES;
 
-  // 본문의 영문 토큰은 대부분 query_name이 아니다(상태값·명령어·영단어). 전부 IN 절에 실으면
-  // 매 요청이 수백 개짜리 플레이스홀더 목록을 보내게 된다 — 걸러지는 곳이 MariaDB라 이미 늦다.
-  // 등장 순서를 유지한 채 상한을 둔다: 앞쪽이 절차의 첫 단계이므로 잘려도 다단계 절차의 시작은 남는다.
-  // (likeSearch가 검색 토큰에 두는 상한과 같은 이유·같은 방식이다)
-  const mentioned = [...new Set(
-    qaMethods.flatMap(m => m.method.match(/[A-Za-z_][A-Za-z0-9_]{2,}/g) || [])
-  )].slice(0, MAX_MENTIONED_TOKENS);
-  const [named, direct] = await Promise.all([
-    loadQueriesByNames(mentioned),   // query_name이 아닌 토큰은 IN 절에서 자연히 걸러진다
-    searchQueries(question),
-  ]);
+  // 관련도 검색이 실패했을 때 무엇을 할지가 규모에 따라 다르다 — 손에 쥔 폴백이 다르기 때문이다.
+  //   라우팅 규모: 검색 결과가 곧 목록이다. 폴백이 없으므로 삼키지 않고 호출부로 올린다 —
+  //     그래야 chat_log에 queriesFailed로 남아 '등록이 없어서 못 답한 질문'과 구분된다.
+  //     여기서 읽어둔 31건으로 대신 채우면 목록은 그럴듯한데 순서는 등록 순서라, 실패가
+  //     '정상 라우팅 30건 적중'으로 기록되면서 조용히 사라진다.
+  //   전체를 싣는 규모: 등록 목록 전체(head)를 이미 손에 쥐고 있다. 순서만 잃고 계속한다 —
+  //     여기서 던지면 이 규모에서는 원래 없던 실패 경로가 새로 생긴다.
+  const ranked = routed
+    ? await rankQueries(qaMethods, question)
+    : await rankQueries(qaMethods, question).catch(e => {
+        console.warn('[agent] failed to rank the query list — falling back to registration order:', e.message);
+        return [];
+      });
 
   const seen = new Set();
-  const picked = [];
-  for (const q of [...named, ...direct]) {       // 절차용(경로A)을 우선 포함
+  const list = [];
+  // 관련도 순이 먼저, 그다음이 검색에 걸리지 않은 나머지(등록 순서).
+  // 라우팅 규모에서는 head가 표본일 뿐이므로 뒤쪽을 붙이지 않는다 — 관련도 없는 31건 중 일부를
+  // 채워 넣으면 상한 자리만 차지하고 정작 관련 있는 쿼리를 밀어낸다.
+  for (const q of routed ? ranked : [...ranked, ...head]) {
     if (seen.has(q.seq)) continue;
     seen.add(q.seq);
-    picked.push(q);
-    if (picked.length >= MAX_PROMPT_QUERIES) break;
+    list.push(q);
+    if (list.length >= MAX_PROMPT_QUERIES) break;
   }
-  return { list: picked, routed: true };
+  return { list, routed };
 }

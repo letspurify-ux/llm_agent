@@ -44,6 +44,16 @@ const MAX_DECISION_PARAMS = 20;
 
 // 바인드명 상한은 Oracle 식별자 최대 길이(12.2+ 기준 128자)로 잡는다 — 그보다 짧게 자르면
 // 101~128자짜리 '적법한' 바인드명이 실행 단계에서 매칭되지 않아 반드시 '값 없음'으로 실패한다.
+// 상한을 넘는 이름은 '자르지 않고 버린다'. 자르는 쪽이 데이터를 지키는 것처럼 보이지만 실제로는
+// 아무것도 지키지 못한다: 128자를 넘는 이름은 어떤 등록 SQL의 바인드와도 대응할 수 없으므로
+// (Oracle 식별자가 거기서 끝난다) 잘라 실어 보낸 값은 어차피 어디에도 바인드되지 않는다.
+// 게다가 자르면 서로 다른 두 이름이 같은 키로 뭉개져 순번(base~2)을 붙여 구분해야 했는데,
+// 그 이름은 ① BIND_RE가 '~'를 이름 문자로 보지 않아 어떤 실제 바인드와도 매칭되지 않고
+// ② 130자라 이 상수가 지키기로 한 128자 경계를 스스로 넘었다 — 크기를 확정하는 경계가
+// 스스로 불법인 이름을 만들어낸 셈이다. 버리면 겹침이 생길 여지 자체가 없어진다
+// (원본 params는 객체라 키가 이미 유일하고, 겹침은 오직 절단에서만 생겼다).
+// 버린 뒤에도 조용하지 않다: 진짜 바인드는 값을 못 받아 oracle.js bindProblem이 '값 없음'으로
+// 이름을 찍어 실패시키고, 그 문구가 hint와 함께 프롬프트로 돌아가 모델이 이름을 고쳐 잡는다.
 const MAX_PARAM_NAME_LEN = 128;
 
 // 상한을 넘겨 자른 답변에 붙이는 표시. 사용자에게 그대로 보이는 문구다 —
@@ -78,21 +88,14 @@ export function sanitizeDecision(d) {
     return s.length > MAX_BIND_LEN ? clipText(s, MAX_BIND_LEN) + TRUNC_MARK : v;
   };
   // Object.fromEntries로 다시 조립한다 — params[k] = v 대입은 '__proto__' 키에서 조용히 사라진다.
-  // 이름을 자를 때는 겹침까지 확인한다: 앞부분이 같은 두 이름이 같은 키로 뭉개지면 fromEntries가
-  // 나중 것만 남겨 다른 바인드의 값이 통째로 사라지고, 그 바인드는 실행 단계에서 '값 없음'으로
-  // 실패한다 — 크기를 확정해야 할 경계가 데이터를 버리는 셈이다. 겹치면 순번을 붙여 구분한다
-  // (원본 params는 객체이므로 키가 이미 유일하다 — 겹침은 오직 절단에서만 생긴다).
-  const seenNames = new Set();
+  // 이름은 자르지 않고 상한을 넘으면 버린다 (MAX_PARAM_NAME_LEN 주석 참고) — 자르면 어떤 실제
+  // 바인드와도 대응하지 못하는 이름을 만들면서 겹침 처리까지 떠안게 된다. 원본 키는 유일하므로
+  // 자르지 않는 한 뭉개짐 자체가 생기지 않는다.
   const params = Object.fromEntries(
     Object.entries(d.params || {})
       .slice(0, MAX_DECISION_PARAMS)
-      .map(([k0, v]) => {
-        const base = k0.length > MAX_PARAM_NAME_LEN ? clipText(k0, MAX_PARAM_NAME_LEN) : k0;
-        let k = base;
-        for (let i = 2; seenNames.has(k); i++) k = `${base}~${i}`;
-        seenNames.add(k);
-        return [k, clipVal(v)];
-      })
+      .filter(([k]) => k.length <= MAX_PARAM_NAME_LEN)
+      .map(([k, v]) => [k, clipVal(v)])
   );
   // trim: 이름 앞뒤 공백은 등록 철자와의 비교(agent.js resolveQuery)를 어긋내는 것 외에 아무 역할이 없다
   return { action: 'run_query', query_name: clipText(String(d.query_name).trim(), 200), params };
@@ -130,8 +133,11 @@ const MOCK_NO_KNOWLEDGE =
 function plannedQueries(qaMethods, queries) {
   const planned = [];
   for (const m of qaMethods) {
-    // 본문의 표기와 등록 철자가 대소문자만 다를 수 있으므로 양쪽을 같은 기준으로 낮춰 찾는다
-    const method = m.method.toLowerCase();
+    // 본문의 표기와 등록 철자가 대소문자만 다를 수 있으므로 양쪽을 같은 기준으로 낮춰 찾는다.
+    // NULL을 견딘다 — schema.sql의 NOT NULL이 유일한 방어막이라 컬럼 하나가 완화되거나 임포터가
+    // NULL 행을 넣는 순간 여기서 죽는다. 이 값의 다른 소비자(llm-openai clip, embed-sync toText,
+    // LIKE/벡터 SQL)는 전부 NULL을 견디는데 이 한 곳만 raw로 역참조하고 있었다.
+    const method = String(m.method ?? '').toLowerCase();
     const found = queries
       .map(q => ({ q, pos: method.indexOf(nameKey(q.query_name)) }))
       .filter(x => x.pos >= 0)
@@ -255,9 +261,15 @@ export function renderAnswer({ knowledge, history }) {
     ? [...new Set(history.flatMap(h => (h.rows || []).flatMap(row =>
         Object.values(row).map(v => String(v ?? '')).filter(s => s.length >= MIN_MATCH_LEN))))]
     : null;
-  const attach = knowledge.find(k => !cellValues || cellValues.some(s => k.content.includes(s)));
+  // content는 NOT NULL이지만 여기서 그 전제에 기대면 안 된다 — renderAnswer는 agent.js의
+  // fallbackAnswer이기도 하다. 여기서 던지면 handleQuestion을 빠져나가 /api/chat의 catch가 잡고
+  // 500이 나가면서, 이미 성공한 Oracle 조회 결과까지 통째로 버려진다 —
+  // 이 폴백이 존재하는 이유('그 요청이 실제로 한 일이 통째로 사라지고')를 정확히 뒤집는 결과다.
+  // 컬럼 하나가 완화되거나 임포터가 NULL 행을 넣는 것만으로 그 경로가 열린다.
+  const content = k => String(k.content ?? '');
+  const attach = knowledge.find(k => !cellValues || cellValues.some(s => content(k).includes(s)));
   if (attach) {
-    parts.push(`### 관련 지식: ${attach.title}\n\n${attach.content}`);
+    parts.push(`### 관련 지식: ${attach.title ?? ''}\n\n${content(attach)}`);
   }
   return parts.length ? parts.join('\n\n') : null;
 }
