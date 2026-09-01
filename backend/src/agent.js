@@ -335,6 +335,14 @@ export async function handleQuestion(rawQuestion, rawChat = []) {
       // 메시지가 비면 안 된다: error가 falsy면 프롬프트·답변 조립이 이 기록을 '오류'로 보지 않고
       // rows가 있는 정상 결과로 취급해 들어간다.
       push('error', e?.message || String(e), { safe: e?.safe === true, ...(e?.hint && { hint: e.hint }) });
+      // 조회를 시작하지도 못하고 거부된 실패(oracle.js wastedStep — 대상 DB를 후보에서 못 골랐다)는
+      // 미등록 쿼리 이름과 같은 부류다: DB를 건드리지 않았고, 고를 수 있는 값은 오류 문구가 이미
+      // 열거해 줬다. 그래서 같은 연속 카운터로 센다.
+      // 이 카운터가 없으면 모델이 매번 다른 틀린 이름을 대는 동안 loopGuard의 동일 실행 판정
+      // (이름·대상DB·바인드가 모두 같아야 한다)에 한 번도 걸리지 않아 MAX_STEPS를 전부 소진한다 —
+      // 실측: 왕복 5회 + 강제 답변 1회. 조회 성공은 아래에서 카운터를 0으로 되돌리므로,
+      // 여러 DB를 차례로 도는 정상 흐름은 이 상한에 걸리지 않는다.
+      if (e?.wastedStep && ++guardHits >= MAX_GUARD_HITS) break;
     }
   }
 

@@ -42,12 +42,20 @@ export const MAX_RESULT_COLS = 30;
 //    컬럼 10개짜리 조회 한 번이면 한 스텝에 4만 자가 들어간다).
 // 전체 예산이 하나면 어느 섹션이 길어지든 합계는 반드시 이 값 안에 든다.
 //
-// 값은 32k 컨텍스트 모델(예: Qwen2.5-32B-Instruct)을 기준으로 잡았다. 한국어는 토큰 밀도가 높아
-// 문자 수와 토큰 수가 거의 1:1까지 갈 수 있으므로 문자 기준으로 보수적으로 묶는다.
+// 값은 128k 컨텍스트 모델을 기준으로 잡았다. 앞선 값(22k자)은 32k 모델(Qwen2.5-32B-Instruct)
+// 기준이었고, 그 상한에서는 정작 가장 값진 것이 잘리고 있었다 — 실측(모든 섹션이 각자 상한까지
+// 찬 요청): 지식 20/20·쿼리 35/35는 전부 실리는데 Q&A 처리 방법 10/20, 실행 이력 2/5.
+// 이력은 앞선 스텝이 Oracle 왕복을 태워 가져온 결과이자 답변의 근거 그 자체다.
+//
+// 상한은 '천장'이지 '할당량'이 아니다. 항목마다 개별 상한(MAX_PROMPT_ITEM_LEN·SQL·STEP)이 이미
+// 걸려 있고 건수도 유한하므로, 평범한 요청은 이 값을 올려도 그대로다 (실측: 4,809자 요청은
+// 상한이 64k여도 4,809자). 커지는 것은 '원래 잘렸을 요청'뿐이고, 그때는 싣는 쪽이 낫다.
+// 한국어는 토큰 밀도가 높아 문자 수와 토큰 수가 거의 1:1까지 갈 수 있으므로 문자 기준으로 묶는다.
 // 이 예산 밖에 있는 몫: 최근 대화(MAX_CHAT_TURNS×MAX_CHAT_LEN = 3k)와 질문(MAX_QUESTION_LEN = 2k) =
-// 이미 다른 상한으로 묶여 있는 5k, 그리고 시스템 프롬프트 ~1.5k.
-// 합계 ≈ 28.5k자 → 32k 모델에서 답변 몫으로 3.5k가 남는다.
-export const MAX_PROMPT_TOTAL_LEN = 22_000;
+// 이미 다른 상한으로 묶여 있는 5k, 그리고 시스템 프롬프트 ~1.8k.
+// 최악 실측 36.4k자 ≈ 25k토큰(+시스템) → 128k 모델에서 20% 남짓, 답변 몫이 넉넉히 남는다.
+// 컨텍스트가 더 작은 모델로 바꾸면 이 값부터 되돌릴 것.
+export const MAX_PROMPT_TOTAL_LEN = 40_000;
 
 // 섹션별 최소 몫 — 다른 섹션이 아무리 길어도 이만큼은 보장된다.
 // 배분 순서(= 이 객체의 선언 순서)는 우선순위의 '역순'이다: 배분할 때 뒤 섹션들의 최소 몫을
@@ -59,10 +67,10 @@ export const MAX_PROMPT_TOTAL_LEN = 22_000;
 // 합계는 반드시 MAX_PROMPT_TOTAL_LEN 이하여야 한다 (아래에서 검증한다 — 이 검증이 없어서
 // 섹션 상한과 전체 상한이 조용히 어긋났다).
 export const PROMPT_FLOORS = {
-  knowledge: 2_000,
-  qaMethods: 2_000,
-  history: 6_000,
-  queries: 8_000,
+  knowledge: 5_000,
+  qaMethods: 5_000,
+  history: 14_000,
+  queries: 14_000,
 };
 
 const FLOOR_SUM = Object.values(PROMPT_FLOORS).reduce((a, b) => a + b, 0);
@@ -78,7 +86,7 @@ export const MAX_PROMPT_ITEM_LEN = 1000;  // 항목 본문 1건
 export const MAX_PROMPT_SQL_LEN = 2000;   // query_sql — 잘려도 바인드명은 프롬프트가 따로 싣는다
 // 실행 이력 1스텝의 상한. 스텝 하나가 이력 예산을 통째로 먹으면 나머지 스텝이 전부 밀려난다 —
 // 다단계 절차에서 앞 단계의 결과가 사라지면 모델이 그 단계를 다시 실행하려 든다.
-export const MAX_PROMPT_STEP_LEN = 2500;
+export const MAX_PROMPT_STEP_LEN = 3000;
 // 실행 이력 한 줄의 params 표시 상한 — rows와 달리 params는 LLM이 만든 값이라 그 자체로는 상한이
 // 없고, renderHistory는 최소 1줄을 반드시 실으므로 줄이 유계가 아니면 전체 예산이 그대로 뚫린다.
 // 표시용으로만 자른다 (실행에 쓰는 값은 MAX_BIND_LEN이 결정 경계에서 따로 묶는다).
@@ -110,9 +118,11 @@ export const MAX_BIND_LEN = MAX_QUESTION_LEN;
 // 묶으면서 정작 가장 큰 값이 그대로 통과했다. answer는 응답 JSON·chat_log.answer·화면으로 나가며
 // JSON 직렬화를 두 번 지난다 — 퇴화한 응답(temperature=0의 반복)이나 64KB짜리 지식 본문을 그대로
 // 실은 폴백 답변(llm.js renderAnswer) 하나가 응답과 로그를 통째로 부풀린다.
-// 값의 근거: 정상 답변은 프롬프트에 실린 근거(MAX_PROMPT_TOTAL_LEN = 22k자)보다 길 수 없다.
+// 값의 근거: 정상 답변은 프롬프트에 실린 근거(MAX_PROMPT_TOTAL_LEN)보다 길 수 없다.
 // 그보다 넉넉히 잡아 정당한 답변은 건드리지 않으면서 퇴화한 응답만 묶는다.
-export const MAX_ANSWER_LEN = 30_000;
+// 총량과 연동된 값이므로 MAX_PROMPT_TOTAL_LEN을 고치면 여기도 함께 본다 —
+// 한쪽만 올리면 근거는 다 실렸는데 그것을 요약한 답변이 상한에 걸리는 조합이 생긴다.
+export const MAX_ANSWER_LEN = 45_000;
 
 // 길이 상한으로 문자열을 자르는 단일 지점.
 // 단순 slice는 서로게이트 쌍(이모지 등 BMP 밖 문자)을 반으로 쪼개 짝 잃은 코드유닛을 남긴다.

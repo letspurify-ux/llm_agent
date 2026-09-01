@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import oracledb from 'oracledb';
 import { runQuery, normalizeCells, numberFromString, oracleMock, oracleDriver, resolveTargetDb } from '../src/oracle.js';
+import { targetDbNames } from '../src/constants.js';
 import { llmProvider } from '../src/llm.js';
 import { MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK } from '../src/constants.js';
 
@@ -341,6 +342,9 @@ test('후보가 여럿인데 고르지 않으면 후보를 들고 되묻는다',
   // 어디에도 흔적을 남기지 않는다 — 이 코드베이스가 막기로 한 조용한 오답 그 자체다.
   assert.throws(() => resolveTargetDb(multi('SEOUL;BUSAN'), ''), e => {
     assert.ok(e.safe, '사용자 화면에 나갈 수 있는 문구여야 한다');
+    // 조회를 시작하지도 못한 스텝이라는 표시 — agent.js가 이것으로 연속 낭비를 끊는다.
+    // 없으면 모델이 매번 다른 틀린 이름을 대는 동안 MAX_STEPS를 전부 소진한다.
+    assert.equal(e.wastedStep, true, 'wastedStep 표시가 없다');
     assert.match(e.message, /고르지 않았습니다/);
     assert.match(e.message, /SEOUL, BUSAN/);      // 무엇 중에서 고를지 문구가 알려준다
     assert.match(e.hint, /target_db/);            // 모델에게는 고치는 방법을 준다
@@ -353,6 +357,7 @@ test('후보 밖의 이름은 거부하고, 대소문자만 다르면 등록 철
   // 모델이 고칠 수 있는 실패(이름 오타)가 고칠 수 없는 실패(운영자 미등록)로 읽힌다.
   assert.throws(() => resolveTargetDb(multi('SEOUL;BUSAN'), 'DAEGU'), e => {
     assert.ok(e.safe);
+    assert.equal(e.wastedStep, true, 'wastedStep 표시가 없다');
     assert.match(e.message, /등록되지 않은 대상 DB/);
     assert.match(e.message, /DAEGU/);
     assert.match(e.message, /SEOUL, BUSAN/);
@@ -368,6 +373,7 @@ test('대상 DB가 비어 있으면 되묻지 않고 실행 불가로 끝낸다'
   // 스텝과 LLM 왕복만 소진한다.
   assert.throws(() => resolveTargetDb(multi(' ; '), 'SEOUL'), e => {
     assert.ok(e.safe);
+    assert.equal(e.wastedStep, true, 'wastedStep 표시가 없다');
     assert.match(e.message, /등록되어 있지 않습니다/);
     assert.doesNotMatch(e.hint, /target_db/);
     return true;
@@ -382,4 +388,37 @@ test('조회 결과에 어느 DB에서 돌았는지가 함께 실린다', async 
   const picked = await runQuery(multi('SEOUL;BUSAN'), { job_id: 'B1' }, undefined, 'busan');
   assert.equal(picked.targetDb, 'BUSAN', '등록 철자로 돌아와야 한다');
   await assert.rejects(runQuery(multi('SEOUL;BUSAN'), { job_id: 'B1' }), /고르지 않았습니다/);
+});
+
+test('대상 DB 선택은 어떤 입력에도 후보 하나로만 확정된다', () => {
+  // 이 판정이 뚫리는 방향은 둘이고 둘 다 조용하다.
+  //   ① 목록이 통째로 넘어가면 loadTargetDb가 'A;B'라는 이름을 찾다 0건을 돌려주고,
+  //      실패는 '접속 정보 미등록'으로 보고되어 원인이 세미콜론이라는 사실을 가리지 못한다.
+  //   ② 고르지 않았는데 통과하면 엉뚱한 DB의 결과가 정답 행세를 한다.
+  // 문자열이 아닌 값도 함께 훑는다 — String(['A'])가 'A'가 되는 탓에 단일 원소 배열이
+  // 후보에 그대로 매칭됐다(실측). 결정 경계가 이미 걸러내지만, 가드는 실행 경계 한 곳에서
+  // 성립해야 하고 그 경계에는 결정 경계를 지나지 않는 호출(테스트·CLI)도 들어온다.
+  const reg = list => ({ query_name: 'q', query_sql: 'SELECT 1 FROM DUAL', target_db_name: list });
+  const lists = ['A;B;C', 'A;B', ' A ; B ; ', 'A;;B', 'A;a;B', 'ORDER_DB', '', ';', 'A;B'.repeat(50)];
+  const choices = [undefined, null, '', '  ', 'A', 'a', ' A ', 'A;B', 'A;', ';A', 'Z', 0, 1, true,
+                   [], {}, ['A'], 'A'.repeat(200), '__proto__', 'constructor'];
+  for (const list of lists) {
+    const names = targetDbNames(list);
+    for (const c of choices) {
+      let got;
+      try {
+        got = resolveTargetDb(reg(list), c);
+      } catch (e) {
+        assert.ok(e.safe, `사용자에게 보일 수 없는 오류: ${list} / ${JSON.stringify(c)}`);
+        continue;
+      }
+      assert.ok(!String(got).includes(';'), `목록이 통째로 넘어갔다: ${list} / ${JSON.stringify(c)} → ${got}`);
+      assert.ok(names.includes(got), `후보 밖을 돌려줬다: ${list} / ${JSON.stringify(c)} → ${got}`);
+      // 후보가 여럿이면 '문자열로 고른' 경우에만 통과해야 한다
+      if (names.length > 1) {
+        assert.equal(typeof c, 'string', `고르지 않았는데 통과했다: ${list} / ${JSON.stringify(c)} → ${got}`);
+        assert.ok(c.trim(), `빈 선택이 통과했다: ${list} / ${JSON.stringify(c)} → ${got}`);
+      }
+    }
+  }
 });

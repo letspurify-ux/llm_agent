@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { buildPrompt } from '../src/llm-openai.js';
-import { MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK } from '../src/constants.js';
+import { MAX_PROMPT_TOTAL_LEN, MAX_PROMPT_STEP_LEN, PROMPT_FLOORS, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK } from '../src/constants.js';
 
 const big = n => 'ㄱ'.repeat(n);
 
@@ -65,14 +65,22 @@ test('잘린 행은 유효한 JSON으로 남고 건수를 정직하게 알린다
 test('최신 스텝을 남기고 오래된 스텝부터 버린다', () => {
   // 꼬리부터 버리면 방금 조회한 결과가 먼저 사라져 그 스텝이 통째로 헛수고가 된다.
   // (스텝 한 줄은 fitCols가 스텝 예산 안으로 줄이므로, 이력 예산을 넘기려면 스텝 수로 채운다)
-  const history = new Array(8).fill(0).map((_, i) => ({
+  //
+  // 스텝 수를 상수로 박아두지 않는다. 이력이 받는 예산은 floor가 아니라 '다른 섹션이 쓰고 남은
+  // 것'이라(llm-openai renderSections), 이 ctx처럼 다른 섹션이 비면 총 상한 가까이까지 커진다.
+  // 8로 박아둔 앞선 판은 예산을 22k→40k로 올리자 그대로 다 실려버려, '버린 사실을 알리는가'를
+  // 검증하던 테스트가 아무것도 넘치지 않는 테스트로 조용히 바뀌었다(실측). 한 줄이 스텝 예산을
+  // 넘지 못하므로, 총 상한을 스텝 예산으로 나눈 수보다 많으면 어떤 배분에서도 반드시 넘친다.
+  const steps = Math.ceil(MAX_PROMPT_TOTAL_LEN / MAX_PROMPT_STEP_LEN) + 1;
+  const history = new Array(steps).fill(0).map((_, i) => ({
     query_name: `step${i}`, params: {}, rows: wideRows(20, 20), totalRows: 20,
   }));
   const p = buildPrompt(ctx({ history }));
-  assert.ok(p.includes('step7'), '가장 최신 스텝이 남아야 한다');
+  const last = `step${steps - 1}`, prev = `step${steps - 2}`;
+  assert.ok(p.includes(last), '가장 최신 스텝이 남아야 한다');
   assert.ok(p.includes('프롬프트 길이 제한으로 생략'), '버린 사실을 모델에게 알려야 한다');
   // 시간순 표시는 유지된다
-  assert.ok(p.indexOf('step6') < p.indexOf('step7') || !p.includes('step6'));
+  assert.ok(p.indexOf(prev) < p.indexOf(last) || !p.includes(prev));
 });
 
 test('컬럼 수가 아무리 많은 행도 예산을 넘지 못한다', () => {

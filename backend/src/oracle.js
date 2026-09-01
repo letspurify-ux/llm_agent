@@ -193,6 +193,14 @@ const trimEnv = name => String(process.env[name] ?? '').trim();
 // isClippedCopy: '이 값이 우리가 잘라서 보여준 값의 앞부분인가'를 답하는 판정자 (agent.js가 만든다 —
 // clippedCopyDetector). 기본값은 '아니다' — 이 실행기를 직접 부르는 경로(테스트·CLI)에는
 // 잘린 값을 만들어낸 앞 단계가 없다.
+// 이 파일이 던지는 '실행 없이 헛돈' 실패의 표시.
+// 대상 DB를 후보에서 못 고른 실패는 loadTargetDb도 접속도 없이 끝난다 — 스텝 하나와 LLM 왕복
+// 하나만 태운 셈이다. agent.js가 이 표시를 보고 미등록 쿼리 이름과 같은 연속 카운터로 센다
+// (agent.js MAX_GUARD_HITS). 표시가 없으면 모델이 매번 다른 틀린 이름을 대는 동안 loopGuard의
+// 동일 실행 판정에 한 번도 걸리지 않아 MAX_STEPS를 전부 소진한다 — 미등록 쿼리 이름에서
+// 이미 겪은 퇴화 패턴이고, 대상 DB에도 같은 카운터가 필요한 이유가 그것이다.
+const wasted = e => Object.assign(e, { wastedStep: true });
+
 // 후보 목록에 보여줄 이름들의 표시 상한. 목록은 오류 문구를 타고 프롬프트와 사용자 trace 양쪽으로
 // 나가므로, 등록 문자열이 길어져도 그 문구가 함께 커지지 않게 여기서 묶는다.
 const MAX_DB_LIST_LEN = 200;
@@ -214,31 +222,39 @@ export function resolveTargetDb(registryRow, chosen) {
   if (!names.length) {
     // 운영자의 등록 실수다 — 모델이 무엇을 골라도 달라지지 않으므로 후보를 되묻지 않는다.
     warnOnce('oracle:target-db', `query_registry.target_db_name is empty for ${registryRow.query_name}`);
-    throw safeError(
+    throw wasted(safeError(
       '이 쿼리에는 조회대상 DB가 등록되어 있지 않습니다.',
       '이 쿼리는 실행할 수 없다 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라'
-    );
+    ));
   }
-  // 이름이 길어도 자르고 계속한다 — 아래 '등록되지 않은 대상 DB' 문구가 후보 목록과 함께
-  // 나가므로 모델이 스스로 고칠 수 있다 (constants.MAX_TARGET_DB_NAME_LEN 주석 참고).
-  const want = nameKey(clipText(String(chosen ?? ''), MAX_TARGET_DB_NAME_LEN));
+  // 문자열만 선택으로 인정한다. String()으로 강제 변환하면 배열 하나가 이름이 된다 —
+  // JS는 String(['A'])를 'A'로 만들기 때문에 ['A']가 후보 A에 그대로 매칭됐다(실측).
+  // 결정 경계(llm.js sanitizeDecision)가 이미 문자열만 통과시키므로 프로덕션 경로로는 닿지
+  // 않지만, 이 가드가 서 있는 이유는 '실행 경계 한 곳에서만 판정한다'이고 그 경계에는 결정
+  // 경계를 지나지 않는 호출(테스트·CLI)도 들어온다 — 값이 아니라 구조가 오면 바인드 쪽
+  // (bindProblem)이 그러듯 여기서도 받아주지 않아야 한다.
+  // 문자열이 아니면 '고르지 않음'으로 둔다: 후보가 하나면 그대로 실행되고(고를 것이 없다),
+  // 여럿이면 아래에서 후보 목록과 함께 되묻는다 — 어느 쪽도 조용히 엉뚱한 DB로 가지 않는다.
+  // 이름이 길면 자르고 계속한다 — '등록되지 않은 대상 DB' 문구가 후보 목록과 함께 나가므로
+  // 모델이 스스로 고칠 수 있다 (constants.MAX_TARGET_DB_NAME_LEN 주석 참고).
+  const want = typeof chosen === 'string' ? nameKey(clipText(chosen, MAX_TARGET_DB_NAME_LEN)) : '';
   if (!want) {
     // 후보가 하나뿐이면 고를 것이 없다 — 목록형을 쓰지 않는 기존 등록은 전부 지금까지와 같이 돈다.
     if (names.length === 1) return names[0];
     // 여럿인데 고르지 않았을 때 첫 후보로 폴백하지 않는다. 그러면 '엉뚱한 DB의 결과'가 정답
     // 행세를 하며 답변·trace·chat_log 어디에도 흔적을 남기지 않는다 — 이 코드베이스가 막기로 한
     // 조용한 오답 그 자체다. 바인드 값이 빠졌을 때와 같이 소리를 내고 모델에게 되돌린다.
-    throw safeError(
+    throw wasted(safeError(
       `조회할 대상 DB를 고르지 않았습니다 (후보: ${dbListText(names)}).`,
       'target_db에 후보 중 하나를 등록된 철자 그대로 적어 같은 쿼리를 다시 실행하라'
-    );
+    ));
   }
   const hit = names.find(n => nameKey(n) === want);
   if (!hit) {
-    throw safeError(
+    throw wasted(safeError(
       `등록되지 않은 대상 DB입니다: ${clipText(String(chosen), MAX_TARGET_DB_NAME_LEN)} (후보: ${dbListText(names)}).`,
       'target_db는 후보 목록에 있는 이름이어야 한다 — 그중 하나를 골라 다시 실행하라'
-    );
+    ));
   }
   return hit;
 }
