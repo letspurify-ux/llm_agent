@@ -6,6 +6,7 @@ import {
   ResponsiveContainer, ComposedChart, PieChart, ScatterChart,
   Bar, Line, Area, Pie, Scatter, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
 } from 'recharts';
+import { pieSlices } from './chart.js';
 
 // 첫 색은 앱의 강조색(index.html --accent)을 따라가고, 나머지는 서로 구별되는 고정 팔레트다.
 // 강조색은 이 모듈이 처음 실행될 때 한 번 읽는다 — 차트가 나올 시점에는 문서가 이미 그려져 있다.
@@ -16,8 +17,6 @@ const color = i => PALETTE[i % PALETTE.length];
 
 // 범주가 이보다 많으면 가로 막대로 눕힌다 — 세로 막대의 x 라벨은 열둘을 넘기면 서로를 덮는다.
 const HORIZONTAL_FROM = 13;
-// 원그래프 조각 수. 그 뒤는 '기타' 한 조각으로 모은다(작은 조각 스무 개는 범례도 색도 읽히지 않는다).
-const MAX_SLICES = 12;
 const HEIGHT = 260;
 
 const fmtNum = v => (typeof v === 'number' && Number.isFinite(v) ? v.toLocaleString('ko-KR', { maximumFractionDigits: 2 }) : '');
@@ -121,13 +120,8 @@ const sliceLabel = ({ x, y, textAnchor, name, percent }) => (
 );
 
 function PieView({ spec }) {
-  const { rows, series } = spec;
-  let data = rows.map(r => ({ name: r.label, full: r.full, value: r.values[0] }));
-  if (data.length > MAX_SLICES) {
-    const head = data.slice(0, MAX_SLICES - 1);
-    const rest = data.slice(MAX_SLICES - 1).reduce((a, d) => a + d.value, 0);
-    data = [...head, { name: `기타 (${data.length - head.length})`, full: '기타', value: rest }];
-  }
+  // 조각 고르기(큰 것 남기고 나머지는 '기타')는 chart.js pieSlices — 표 순서와 무관하게 값으로 고른다.
+  const data = pieSlices(spec.rows);
   const total = data.reduce((a, d) => a + d.value, 0);
   const pct = v => (total > 0 ? `${((v / total) * 100).toFixed(1)}%` : '');
   return (
@@ -174,6 +168,8 @@ export default function Chart({ spec }) {
       {spec.title && <figcaption id={id}>{spec.title}</figcaption>}
       <View spec={spec} />
       {spec.clipped && <div className="chart-note">처음 {spec.rows.length}행만 그렸습니다 (전체 {spec.total}행).</div>}
+      {/* 명시한 xtype으로 읽지 못해 뺀 행 — '합계' 행이나 다른 꼴의 날짜가 조용히 사라지지 않게 밝힌다. */}
+      {spec.skipped > 0 && <div className="chart-note">x를 {spec.xKind === 'time' ? '시간' : '숫자'}으로 읽지 못한 {spec.skipped}행은 그리지 않았습니다.</div>}
     </figure>
   );
 }

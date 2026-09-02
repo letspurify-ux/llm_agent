@@ -4,8 +4,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import {
-  parseChartBlock, chartBlocksToTables, chartTableMarkdown, toNumber, toTime,
-  MAX_CHART_ROWS, MAX_SERIES, MAX_LABEL_LEN,
+  parseChartBlock, chartBlocksToTables, chartTableMarkdown, toNumber, toTime, pieSlices,
+  MAX_CHART_ROWS, MAX_SERIES, MAX_LABEL_LEN, MAX_PIE_SLICES,
 } from '../src/chart.js';
 
 const TABLE = '| 월 | 건수 | 금액 |\n|---|---|---|\n| 2024-01 | 120 | 1,000 |\n| 2024-02 | 80 | 2,500 |';
@@ -28,8 +28,13 @@ test('x·y·y2로 열을 고른다 — 이름은 대소문자·공백을 가리�
   const s = spec(`type: bar\nx: name\ny: CNT, nope\ny2: rate\n${t}`);
   assert.deepStrictEqual(s.series, [{ name: 'Cnt', axis: 'left' }, { name: 'Rate', axis: 'right' }]);
   assert.deepStrictEqual(s.rows.map(r => r.values), [[1, 0.5], [2, 0.7]]);
-  // y가 전부 틀리면 숫자 열 전부로 되돌아간다 (열 이름 하나로 차트 전체를 잃지 않는다)
+  // y가 전부 틀리면(표에 없는 이름) 숫자 열 전부로 되돌아간다 (열 이름 하나로 차트 전체를 잃지 않는다)
   assert.deepStrictEqual(spec(`type: bar\ny: nothing\n${t}`).series.map(x => x.name), ['Cnt', 'Rate']);
+  // 그러나 이름이 표에 있는 글자 열이면 다른 열로 바꿔 그리지 않는다 — 제목은 그 열인데 그래프는 딴 열이 된다
+  assert.strictEqual(parseChartBlock(`type: bar\nx: name\ny: note\n${t}`).ok, false);
+  assert.strictEqual(parseChartBlock(`type: bar\nx: name\ny: cnt\ny2: note\n${t}`).ok, false);
+  // 하나라도 숫자 열이면 그것만 그린다
+  assert.deepStrictEqual(spec(`type: bar\nx: name\ny: note, cnt\n${t}`).series.map(x => x.name), ['Cnt']);
   // 글자가 섞인 열(Note)은 y를 비워도 시리즈가 되지 않는다
   assert.deepStrictEqual(spec(`type: bar\n${t}`).series.map(x => x.name), ['Cnt', 'Rate']);
   // y2만 적었고 왼쪽에 그릴 것이 없으면 그 열을 왼쪽에 그린다
@@ -54,7 +59,18 @@ test('숫자로 읽히지 않는 값은 0이 아니라 빈칸이고, 숫자 열�
 test('toNumber / toTime 의 경계', () => {
   assert.strictEqual(toNumber(' 1,234.5 '), 1234.5);
   assert.strictEqual(toNumber('12%'), 12);
+  assert.strictEqual(toNumber('12 %'), 12);
   assert.strictEqual(toNumber('₩3,000'), 3000);
+  assert.strictEqual(toNumber('-₩1,000'), -1000);
+  assert.strictEqual(toNumber('$ 5'), 5);
+  assert.strictEqual(toNumber('1,000,000.25'), 1000000.25);
+  // 세 자리 묶음일 때만 구분자다 — '2024 01'·'1,2'가 숫자로 둔갑하면 글자 열이 숫자 열이 된다
+  assert.strictEqual(toNumber('10 000'), 10000);
+  assert.strictEqual(toNumber('2024 01'), null);
+  assert.strictEqual(toNumber('1 2'), null);
+  assert.strictEqual(toNumber('1,2'), null);
+  assert.strictEqual(toNumber('1,0000'), null);
+  assert.strictEqual(toNumber('1.234,56'), null);
   assert.strictEqual(toNumber('-7'), -7);
   assert.strictEqual(toNumber('1e3'), 1000);
   assert.strictEqual(toNumber(''), null);
@@ -94,6 +110,23 @@ test('선·영역 그래프의 날짜 x는 시간축이 되고 시간순으로 �
   assert.strictEqual(spec(`type: line\nxtype: category\n${t}`).xKind, 'category');
   // 날짜가 하나라도 아니면 시간축을 추론하지 않는다
   assert.strictEqual(spec('type: line\n| d | v |\n|---|---|\n| 2024-01-01 | 1 |\n| 합계 | 1 |').xKind, 'category');
+  // xtype 을 명시해 시간축이 되면 읽지 못한 행은 빠지되 몇 행인지 남는다(차트 아래에 밝힌다); 추론한 축은 0
+  const forced = spec('type: line\nxtype: time\n| d | v |\n|---|---|\n| 2024-01-01 | 1 |\n| 2024-01-02 | 2 |\n| 합계 | 3 |');
+  assert.deepStrictEqual([forced.xKind, forced.rows.length, forced.skipped], ['time', 2, 1]);
+  assert.strictEqual(line.skipped, 0);
+  assert.strictEqual(bar.skipped, 0);
+});
+
+test('선·영역은 같은 x에 행이 여럿이면 그리지 않는다 — 막대와 산점도는 그린다', () => {
+  // 피벗되지 않은 결과(일자×상태×건수)를 x: 일자 로 그리면 선이 같은 시각에서 오르내린다
+  const t = '| 일자 | 상태 | 건수 |\n|---|---|---|\n| 2024-01-01 | A | 3 |\n| 2024-01-01 | B | 4 |\n| 2024-01-02 | A | 5 |';
+  assert.strictEqual(parseChartBlock(`type: line\nx: 일자\ny: 건수\n${t}`).ok, false);
+  assert.strictEqual(parseChartBlock(`type: area\nx: 일자\ny: 건수\n${t}`).ok, false);
+  assert.strictEqual(parseChartBlock(`type: bar\nx: 일자\ny: 건수\n${t}`).ok, true);
+  assert.strictEqual(parseChartBlock(`type: scatter\nx: 일자\ny: 건수\n${t}`).ok, true);
+  // 범주 축의 선도 마찬가지다(같은 라벨이 두 눈금으로 선다)
+  assert.strictEqual(parseChartBlock('type: line\n| 구분 | v |\n|---|---|\n| 가 | 1 |\n| 가 | 2 |').ok, false);
+  assert.strictEqual(parseChartBlock('type: line\n| 구분 | v |\n|---|---|\n| 가 | 1 |\n| 나 | 2 |').ok, true);
 });
 
 test('산점도는 x가 수치여야 한다', () => {
@@ -110,6 +143,25 @@ test('원그래프는 첫 숫자 열 하나만, 0 이하와 결측 조각은 뺀
   assert.deepStrictEqual(s.series, [{ name: '건수', axis: 'left' }]);
   assert.deepStrictEqual(s.rows.map(r => [r.x, r.values[0]]), [['완료', 30], ['진행', 20]]);
   assert.strictEqual(spec('type: donut\n| a | b |\n|---|---|\n| x | 1 |').type, 'pie');
+});
+
+test('pieSlices: 조각이 많으면 값이 큰 것을 남기고 나머지를 기타로 모은다 — 표 순서의 꼬리가 아니다', () => {
+  const rows = n => Array.from({ length: n }, (_, i) => ({ label: `c${i}`, full: `C${i}`, values: [i + 1] }));
+  // 상한 이하는 그대로
+  assert.deepStrictEqual(pieSlices(rows(MAX_PIE_SLICES)).map(d => d.name), rows(MAX_PIE_SLICES).map(r => r.label));
+  assert.deepStrictEqual(pieSlices(rows(2))[0], { name: 'c0', full: 'C0', value: 1 });
+  // 15조각, 값은 1..15 — 큰 11개(5..15)를 표 순서대로 남기고 1..4(합 10)가 기타
+  const out = pieSlices(rows(15));
+  assert.strictEqual(out.length, MAX_PIE_SLICES);
+  assert.deepStrictEqual(out.slice(0, -1).map(d => d.name), ['c4', 'c5', 'c6', 'c7', 'c8', 'c9', 'c10', 'c11', 'c12', 'c13', 'c14']);
+  assert.deepStrictEqual(out.at(-1), { name: '기타 (4)', full: '기타', value: 10 });
+  // 이름순 결과에서 큰 조각이 뒤에 있어도 조각으로 남는다
+  const mixed = rows(15).map((r, i) => ({ ...r, values: [i === 14 ? 500 : i === 0 ? 400 : 1] }));
+  const names = pieSlices(mixed).map(d => d.name);
+  assert.ok(names.includes('c14') && names.includes('c0'));
+  assert.strictEqual(pieSlices(mixed).at(-1).value, 4);
+  // max 를 넘겨 조각 수를 바꿀 수 있다
+  assert.deepStrictEqual(pieSlices(rows(5), 3).map(d => [d.name, d.value]), [['c3', 4], ['c4', 5], ['기타 (3)', 6]]);
 });
 
 test('모르는 type은 막대, 별칭은 정규화, 상한(행·시리즈·라벨)을 지킨다', () => {
@@ -142,6 +194,9 @@ test('표 안의 \\| 와 구분 줄 생략, 표 뒤의 설명 줄을 받아들�
   const s = spec('type: bar\n| a | b |\n| x\\|y | 1 |\n| z | 2 |\n위 표는 예시다\ntype: 이건 설정이 아니다');
   assert.deepStrictEqual(s.rows.map(r => r.x), ['x|y', 'z']);
   assert.strictEqual(s.type, 'bar');
+  // GFM 규칙대로 `\\` 는 역슬래시 하나, `\\\|` 는 역슬래시 + 파이프(서버 cell()이 이렇게 적는다); 홀로 선 역슬래시는 글자
+  const bs = spec('type: bar\n| a | b |\n| C:\\\\dir | 1 |\n| a\\\\\\|b | 2 |\n| x\\y | 3 |');
+  assert.deepStrictEqual(bs.rows.map(r => r.x), ['C:\\dir', 'a\\|b', 'x\\y']);
   // 서버가 채우지 못한 data 참조만 남았으면 차트가 아니다
   assert.strictEqual(parseChartBlock('type: bar\ndata: step 2').ok, false);
   // 이미 표가 있으면 data 줄은 무시한다

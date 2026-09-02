@@ -42,6 +42,9 @@ const EXAMPLES = [
 
 // 차트 블록 안의 표만 렌더할 때의 파이프라인. 값은 조회 결과 그대로라 수식 처리는 필요 없다.
 const TABLE_PLUGINS = [remarkGfm];
+// '표로 보기'의 표도 본문과 같은 링크 규칙이다(NewTabLink, 아래) — 셀의 URL은 GFM이 자동 링크로 만들고,
+// 그것이 같은 탭에서 열리면 대화가 사라진다.
+const TABLE_COMPONENTS = { a: NewTabLink };
 
 // 차트 블록의 표를 평범한 표로. 차트를 그리지 못할 때·내려받는 동안·'표로 보기'가 모두 이것이다.
 // 차트를 그리지 않을 때(파싱 실패·예산 초과)는 제목까지 표 위에 남긴다 — 차트 밑 '표로 보기'에서는 제목이 이미 보인다.
@@ -60,7 +63,7 @@ function ChartTable({ text, withTitle = false }) {
   return (
     <>
       {withTitle && title && <p><strong>{title}</strong></p>}
-      <ReactMarkdown remarkPlugins={TABLE_PLUGINS}>{md}</ReactMarkdown>
+      <ReactMarkdown remarkPlugins={TABLE_PLUGINS} components={TABLE_COMPONENTS}>{md}</ReactMarkdown>
     </>
   );
 }

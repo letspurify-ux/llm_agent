@@ -25,13 +25,17 @@
 // 차트를 포기한다.
 
 // 그리기 상한. 서버는 한 조회에서 1000행(MAX_ROWS)까지 가져오지만 그리는 것은 100행까지다 — 가로 막대는
-// 행마다 22px씩 키가 자라(Chart.jsx) 1000행이면 2만 px이고, 세로 막대 1000개는 1px 조각이 된다. 넘는 행은
-// 차트 아래에 '처음 100행만 그렸습니다'로 밝히고 '표로 보기'에는 전부 있다.
+// 행마다 22px씩 키가 자라(Chart.jsx) 1000행이면 2만 px이고, 세로 막대 1000개는 1px 조각이 된다. 서버가
+// `data: step N`으로 채우는 표도 같은 수까지만 싣는다(backend chart.js MAX_CHART_BLOCK_ROWS — 그 위는 그려지지
+// 않는 채 답변만 키우고 다른 차트의 몫을 먹는다). 넘는 행은 차트 아래에 '처음 100행만 그렸습니다'로 밝히고,
+// 조회된 행 전부는 trace 패널에 있다.
 // 시리즈 6개는 범례가 한 줄에 읽히는 한계, 라벨 30자는 축 눈금이 서로를 덮지 않는 한계.
 export const MAX_CHART_ROWS = 100;
 export const MAX_SERIES = 6;
 export const MAX_LABEL_LEN = 30;
 export const MAX_TITLE_LEN = 80;
+// 원그래프 조각 수. 그 뒤는 '기타' 한 조각으로 모은다(작은 조각 스무 개는 범례도 색도 읽히지 않는다).
+export const MAX_PIE_SLICES = 12;
 // 메시지 하나에 그릴 차트 수. 모델이 열 개를 내놓으면 열 개의 ResponsiveContainer가 리사이즈
 // 관찰자를 달고 돌아간다 — 그 뒤는 표로 보여준다.
 export const MAX_CHARTS_PER_MESSAGE = 4;
@@ -57,13 +61,15 @@ const CONFIG_RE = /^\s*(type|title|x|y|y2|xtype|data)\s*:\s*(.*?)\s*$/i;
 // 우리에게 필요한 것은 머리글과 값뿐이다.
 const SEP_ROW_RE = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
 
-// 표 한 줄을 칸으로 쪼갠다. GFM처럼 `\|` 는 칸 안의 글자다. 양끝 파이프는 벗긴다.
+// 표 한 줄을 칸으로 쪼갠다. GFM처럼 `\|` 는 칸 안의 파이프, `\\` 는 역슬래시 하나다 — 둘 다 되돌려야
+// '표로 보기'(GFM이 그린다)와 차트의 라벨이 같은 글자가 된다(서버 cell()이 이 두 글자를 이렇게 적는다).
+// 그 밖의 역슬래시는 글자다(`C:\dir`). 양끝 파이프는 벗긴다.
 function splitRow(line) {
   const cells = [];
   let cur = '';
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
-    if (ch === '\\' && line[i + 1] === '|') { cur += '|'; i++; continue; }
+    if (ch === '\\' && (line[i + 1] === '|' || line[i + 1] === '\\')) { cur += line[i + 1]; i++; continue; }
     if (ch === '|') { cells.push(cur.trim()); cur = ''; continue; }
     cur += ch;
   }
@@ -77,16 +83,22 @@ function splitRow(line) {
 const nameKey = s => String(s ?? '').trim().toLowerCase();
 const splitNames = v => String(v ?? '').split(/[,;]/).map(s => s.trim()).filter(Boolean);
 
-// 셀 하나를 숫자로. 조회 결과가 표에 실리는 동안 붙는 것들 — 천 단위 쉼표, %, 통화 기호, 단위 앞뒤의
-// 공백 — 은 벗긴다. 그 밖의 글자가 남으면 숫자가 아니다('12건'은 12가 아니라 빈칸이다 — 단위를 떼기
+// 셀 하나를 숫자로. 조회 결과가 표에 실리는 동안 붙는 것들 — 앞의 통화 기호, 뒤의 %, 세 자리씩 묶는
+// 쉼표·공백 — 은 벗긴다. 그 밖의 글자가 남으면 숫자가 아니다('12건'은 12가 아니라 빈칸이다 — 단위를 떼기
 // 시작하면 '1.2k'와 '2024-01'을 어디서 멈출지 정할 수 없다). 빈칸과 대시는 결측이다.
+// 구분자는 자리가 맞을 때만 벗긴다: 공백·쉼표를 무조건 지우면 '2024 01'이 202401, '1,2'가 12로 읽혀
+// 글자 열이 숫자 열로 둔갑한다(실측). '1 000'·'1,000,000'은 묶음이고 '10 20'·'1,2'는 아니다.
 const isMissing = s => s === '' || s === '-' || s === '–' || s === '—' || s === 'null' || /^n\/?a$/i.test(s);
+const CURRENCY_RE = /^([-+]?)\s*[₩$€¥]\s*/;
+const GROUPED_RE = /^[-+]?\d{1,3}(?:([, ])\d{3})+(?:\.\d*)?$/;
+const PLAIN_RE = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?$/i;
 export function toNumber(cell) {
-  const s = String(cell ?? '').trim();
+  let s = String(cell ?? '').trim();
   if (isMissing(s)) return null;
-  const t = s.replace(/[\s,₩$€¥%]/g, '');
-  if (!/^[-+]?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(t)) return null;
-  const n = Number(t);
+  s = s.replace(CURRENCY_RE, '$1').replace(/\s*%$/, '');
+  if (GROUPED_RE.test(s)) s = s.replace(/[, ]/g, '');
+  if (!PLAIN_RE.test(s)) return null;
+  const n = Number(s);
   return Number.isFinite(n) ? n : null;
 }
 
@@ -187,11 +199,16 @@ export function parseChartBlock(text) {
   // 시리즈: y가 있으면 그 열들(숫자 열만), 없거나 하나도 못 찾으면 x 밖의 숫자 열 전부. y2는 오른쪽 축.
   // y2로 적힌 열은 그리지 못하는 것(숫자 아님·셋째 이후)까지 전부 '쓴 열'로 표시한다 — 그러지 않으면
   // y가 비었을 때의 채움(아래)이 그 열을 왼쪽 축에 그린다(오른쪽 축에 두라던 열이 왼쪽에 서는 조용한 오답).
+  // 이름이 표에 있는데 그 열을 하나도 그릴 수 없으면(전부 결측이거나 글자) 차트를 포기한다 — 다른 숫자 열로
+  // 바꿔 그리면 제목은 '매출'인데 그래프는 건수다(실측). 채움은 이름이 표에 없을 때(오타)만이다.
   const used = new Set([xi]);
   const y2Named = config.y2 ? resolveColumns(splitNames(config.y2), header, used) : [];
   y2Named.forEach(i => used.add(i));
-  const y2 = y2Named.filter(i => isNumericColumn(rows, i)).slice(0, 2);
-  let y = (config.y ? resolveColumns(splitNames(config.y), header, used) : []).filter(i => isNumericColumn(rows, i));
+  const y2Numeric = y2Named.filter(i => isNumericColumn(rows, i));
+  const yNamed = config.y ? resolveColumns(splitNames(config.y), header, used) : [];
+  let y = yNamed.filter(i => isNumericColumn(rows, i));
+  if ((yNamed.length && !y.length) || (y2Named.length && !y2Numeric.length)) return { ok: false, reason: '지정한 열이 숫자 열이 아님' };
+  const y2 = y2Numeric.slice(0, 2);
   if (!y.length) y = header.map((_, i) => i).filter(i => !used.has(i) && isNumericColumn(rows, i));
   // 왼쪽에 그릴 것이 없고 오른쪽만 있으면(y2만 적은 블록) 그것을 왼쪽에 그린다 — 축 하나면 오른쪽일 이유가 없다.
   if (!y.length && y2.length) { y = y2.splice(0); }
@@ -222,12 +239,15 @@ export function parseChartBlock(text) {
   ];
 
   const data = [];
+  // 시간·숫자 축인데 x를 읽지 못한 행 수. 추론한 축에서는 0이고(전부 읽혀야 추론한다) 명시한 xtype에서만
+  // 생긴다 — 조용히 빠지면 '합계' 행이나 '2024-Q1' 라벨이 없어진 것을 알 길이 없어 차트 아래에 밝힌다.
+  let skipped = 0;
   for (const r of rows) {
     let label = String(r[xi] ?? '').trim();
     const t = sortByTime ? toTime(label, explicit === 'time') : null;
     let x = label;
-    if (xKind === 'time') { if (t === null) continue; x = t; }
-    else if (xKind === 'number') { x = toNumber(label); if (x === null) continue; }
+    if (xKind === 'time') { if (t === null) { skipped++; continue; } x = t; }
+    else if (xKind === 'number') { x = toNumber(label); if (x === null) { skipped++; continue; } }
     // 범주가 비어 있는 행(GROUP BY의 NULL 그룹 등)도 그린다 — 표에는 있는 행이 그래프에서만 빠지면 합계가 어긋나 보인다.
     else if (!label) label = x = EMPTY_LABEL;
     const values = series.map(s => toNumber(r[s.col]));
@@ -237,6 +257,10 @@ export function parseChartBlock(text) {
     data.push({ x, label: clip(label, MAX_LABEL_LEN), full: label, values, t });
   }
   if (!data.length) return { ok: false, reason: '그릴 행 없음' };
+  // 선·영역은 x 하나에 값이 하나여야 한다. 피벗되지 않은 결과(일자×상태×건수)를 `x: 일자`로 그리면 같은
+  // 시각에 점이 여럿 서서 선이 수직으로 오르내리고, 그것이 추세로 읽힌다(실측) — 그리지 않고 표를 보인다.
+  // 산점도는 같은 x의 점 여럿이 정상이고, 범주 축의 막대는 행마다 자기 자리가 있다.
+  if (continuous && type !== 'scatter' && new Set(data.map(d => d.x)).size < data.length) return { ok: false, reason: '같은 x에 행이 여럿' };
   // 시간·숫자 축은 정렬돼 있어야 선이 되돌아가지 않는다. 시간순 막대는 날짜를 전부 읽었을 때만 세운다.
   if (xKind === 'number' || xKind === 'time') data.sort((a, b) => a.x - b.x);
   else if (sortByTime && data.every(d => d.t !== null)) data.sort((a, b) => a.t - b.t);
@@ -252,8 +276,21 @@ export function parseChartBlock(text) {
       rows: clipped ? data.slice(0, MAX_CHART_ROWS) : data,
       clipped,
       total: data.length,
+      skipped,
     },
   };
+}
+
+// 원그래프의 조각. MAX_PIE_SLICES를 넘으면 '값이 큰' 것들을 남기고 나머지를 '기타' 하나로 모은다 — 표 순서의
+// 꼬리를 모으면 `data: step N`(쿼리 정렬 그대로, 이름순일 때가 많다)에서 큰 조각이 기타에 묻히고 1짜리가
+// 조각으로 남는다(실측). 남긴 조각은 표 순서를 지키고 기타는 맨 뒤다. Chart.jsx가 아니라 여기 있는 이유는
+// 순수 함수라 테스트가 붙기 때문이다.
+export function pieSlices(rows, max = MAX_PIE_SLICES) {
+  const data = rows.map(r => ({ name: r.label, full: r.full, value: r.values[0] }));
+  if (data.length <= max) return data;
+  const keep = new Set(data.map((d, i) => i).sort((a, b) => data[b].value - data[a].value).slice(0, max - 1));
+  const rest = data.filter((_, i) => !keep.has(i));
+  return [...data.filter((_, i) => keep.has(i)), { name: `기타 (${rest.length})`, full: '기타', value: rest.reduce((a, d) => a + d.value, 0) }];
 }
 
 // 블록 안의 표만 markdown으로. 차트를 그리지 못할 때·그리기 전에·'표로 보기'에 그대로 렌더한다.

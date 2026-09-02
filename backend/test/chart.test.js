@@ -3,7 +3,7 @@
 // 번호를 어긋나게 읽으면 다른 조회의 표가 '그 질문의 답'으로 그려진다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { resolveChartData, MAX_CHART_COLS, MAX_CHART_CELL_LEN, MAX_CHART_INJECT_LEN } from '../src/chart.js';
+import { resolveChartData, MAX_CHART_COLS, MAX_CHART_CELL_LEN, MAX_CHART_INJECT_LEN, MAX_CHART_BLOCK_ROWS } from '../src/chart.js';
 
 const rows = [
   { MONTH: '2024-01', CNT: 120, AMT: 1000.5, NOTE: 'a|b' },
@@ -86,13 +86,53 @@ test('긴 셀과 총량 예산을 지키고, 다 싣지 못하면 차트 아래�
   const cellLen = out.split('\n')[4].split('|')[2].trim().length;
   assert.ok(cellLen <= MAX_CHART_CELL_LEN, `${cellLen}`);
 
+  // 예산은 채울 블록 수로 나눈다 — 넓은 표 셋이면 셋 다 몫만큼 실리고(앞 블록이 뒤를 굶기지 않는다), 합은 예산 안이다
   const many = Array.from({ length: 100 }, (_, i) => ({ K: `k${i}`, V: 'v'.repeat(MAX_CHART_CELL_LEN), W: 'w'.repeat(MAX_CHART_CELL_LEN), X: 'x'.repeat(MAX_CHART_CELL_LEN) }));
-  const two = resolveChartData(`${block('type: bar\ndata: step 1')}\n${block('type: bar\ndata: step 1')}\n${block('type: bar\ndata: step 1')}`, [many]);
-  const injected = two.length - 3 * block('type: bar\ndata: step 1').length;
+  const three = resolveChartData(`${block('type: bar\ndata: step 1')}\n${block('type: bar\ndata: step 1')}\n${block('type: bar\ndata: step 1')}`, [many]);
+  const injected = three.length - 3 * block('type: bar\ndata: step 1').length;
   assert.ok(injected <= MAX_CHART_INJECT_LEN + 3 * 200, `${injected}`); // 안내 문장 몫만큼만 넘을 수 있다
-  assert.match(two, /_\(표는 100행 중 처음 \d+행까지만 실었습니다\)_/);
-  // 예산이 바닥난 뒤의 블록은 표 없이 안내만
-  assert.ok(two.split('```chart').length - 1 < 3);
+  assert.strictEqual(three.split('```chart').length - 1, 3);
+  const notes = [...three.matchAll(/_\(표는 100행 중 처음 (\d+)행까지만 실었습니다\)_/g)].map(m => Number(m[1]));
+  assert.strictEqual(notes.length, 3);
+  assert.ok(notes.every(n => n > 0 && Math.abs(n - notes[0]) <= 1), notes.join(','));
+  // 덜 쓴 몫은 뒤로 넘어간다 — 좁은 표가 앞이면 뒤의 넓은 표가 그 여유를 받는다
+  const narrow = Array.from({ length: 5 }, (_, i) => ({ K: `k${i}`, V: i }));
+  const mixed = resolveChartData(`${block('type: bar\ndata: step 1')}\n${block('type: bar\ndata: step 2')}`, [narrow, many]);
+  assert.strictEqual(mixed.split('\n').filter(l => /^\| k\d+ \| v/.test(l)).length, 100);
+  assert.ok(!mixed.includes('행까지만'));
+  // 채우지 못한 블록(없는 번호)은 몫을 쓰지 않는다
+  const skipped = resolveChartData(`${block('type: bar\ndata: step 9')}\n${block('type: bar\ndata: step 1')}`, [many]);
+  assert.strictEqual(skipped.split('\n').filter(l => /^\| k\d+ \| v/.test(l)).length, 100);
+});
+
+test('블록 하나에 싣는 행은 MAX_CHART_BLOCK_ROWS까지 — 프런트가 그리는 행 수와 같고, 나머지는 trace 패널의 몫이다', () => {
+  const big = Array.from({ length: MAX_CHART_BLOCK_ROWS + 50 }, (_, i) => ({ K: `k${i}`, V: i }));
+  const out = resolveChartData(block('type: bar\ndata: step 1'), [big]);
+  assert.strictEqual(out.split('\n').filter(l => /^\| k\d+ \|/.test(l)).length, MAX_CHART_BLOCK_ROWS);
+  assert.ok(out.endsWith(`_(표는 ${MAX_CHART_BLOCK_ROWS + 50}행 중 처음 ${MAX_CHART_BLOCK_ROWS}행까지만 실었습니다)_`), out.slice(-80));
+  // 행 순서는 조회 순서다 — 앞의 100행
+  assert.match(out, /\| k0 \| 0 \|\n/);
+  assert.ok(!out.includes(`| k${MAX_CHART_BLOCK_ROWS} |`));
+  // 같은 스텝을 두 번 참조해도(막대 + 원) 둘 다 표를 받는다 — 예전에는 첫 블록이 예산을 다 써 둘째가 안내 문장이 됐다
+  const twice = resolveChartData(`${block('type: bar\ndata: step 1')}\n${block('type: pie\ndata: step 1')}`, [Array.from({ length: 1000 }, (_, i) => ({ K: `k${i}`, V: i, W: 'x'.repeat(40) }))]);
+  assert.strictEqual(twice.split('```chart').length - 1, 2);
+  assert.ok(!twice.includes('양을 넘었습니다'));
+});
+
+test('역슬래시는 GFM 규칙대로 두 개로 적는다 — 값 속의 \\| 가 열을 밀지 않게', () => {
+  const out = resolveChartData(block('type: bar\ndata: step 1'), [[{ K: 'a\\|b', V: 1 }, { K: 'C:\\dir\\', V: 2 }]]);
+  assert.match(out, /\| a\\\\\\\|b \| 1 \|\n/);
+  assert.match(out, /\| C:\\\\dir\\\\ \| 2 \|\n/);
+});
+
+test('표는 파이프 줄이 둘 이상일 때다 — 파이프 하나 든 설명 줄은 표가 아니고, 채울 때는 설정 줄만 남긴다', () => {
+  const out = resolveChartData(block('type: bar\ndata: step 1\n1월 | 2월 비교입니다\n설명 문장'), [rows]);
+  assert.match(out, /^```chart\ntype: bar\n\| MONTH \| CNT \| AMT \| NOTE \|\n/);
+  assert.ok(!out.includes('비교입니다') && !out.includes('설명 문장'));
+  // 머리글 한 줄뿐인 표도 표가 아니다(프런트가 '행 없음'으로 버린다) — 참조로 채운다
+  assert.match(resolveChartData(block('type: bar\ndata: step 1\n| a | b |'), [rows]), /\| MONTH \| CNT \|/);
+  // 파이프 줄이 둘이면 표다 — 표가 이긴다
+  assert.strictEqual(resolveChartData(block('type: bar\ndata: step 1\n| a | b |\n| x | 1 |'), [rows]), block('type: bar\n| a | b |\n| x | 1 |'));
 });
 
 test('들여쓴 펜스(목록 안)는 같은 들여쓰기로 채운다 — 안내 문장도', () => {
