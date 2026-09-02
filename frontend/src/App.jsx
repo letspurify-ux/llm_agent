@@ -282,9 +282,10 @@ export default function App() {
         if (stuckRef.current) bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
       });
     }
-    // 크기를 보는 것은 목록의 자식(말풍선 행)들이다 — 스크롤 상자 자신은 내용이 늘어도 크기가 그대로다.
-    // 이미 보고 있는 요소를 다시 넣는 것은 무해하다(첫 보고가 한 번 더 올 뿐이고, 그 처리는 바닥으로 내리는 것이다).
-    for (const child of el.children) growRef.current.observe(child);
+    // 크기를 보는 것은 말풍선 행들을 담은 안쪽 열(.chat-inner)이다 — 어느 말풍선이 커져도 열이 그만큼
+    // 자라고, 스크롤 상자 자신은 내용이 늘어도 크기가 그대로다. 이미 보고 있는 요소를 다시 넣는 것은
+    // 무해하다(첫 보고가 한 번 더 올 뿐이고, 그 처리는 바닥으로 내리는 것이다).
+    growRef.current.observe(el.firstElementChild);
   }, [messages, loading]);
   useEffect(() => {
     // 사용자가 '표로 보기'·실행 과정을 직접 펼치거나 접은 것은 따라가지 않는다 — 펼친 것은 위(머리글)부터
@@ -482,29 +483,31 @@ export default function App() {
       </header>
 
       <main className="chat" ref={chatRef} onScroll={onChatScroll}>
-        {messages.length === 0 && !loading && (
-          <div className="empty">
-            <div className="empty-icon">S</div>
-            <h2>무엇을 도와드릴까요?</h2>
-            <p>저장된 지식과 운영 DB 조회를 결합해 답변합니다.</p>
-            <div className="chips">
-              {EXAMPLES.map(x => (
-                <button key={x} className="chip" onClick={() => ask(x)}>{x}</button>
-              ))}
+        <div className="chat-inner">
+          {messages.length === 0 && !loading && (
+            <div className="empty">
+              <div className="empty-icon">S</div>
+              <h2>무엇을 도와드릴까요?</h2>
+              <p>저장된 지식과 운영 DB 조회를 결합해 답변합니다.</p>
+              <div className="chips">
+                {EXAMPLES.map(x => (
+                  <button key={x} className="chip" onClick={() => ask(x)}>{x}</button>
+                ))}
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {messages.map((m, i) => <Message key={i} {...m} />)}
+          {messages.map((m, i) => <Message key={i} {...m} />)}
 
-        {loading && (
-          <div className="row assistant">
-            <div className="bubble assistant">
-              <div className="typing"><i /><i /><i /></div>
+          {loading && (
+            <div className="row assistant">
+              <div className="bubble assistant">
+                <div className="typing"><i /><i /><i /></div>
+              </div>
             </div>
-          </div>
-        )}
-        <div ref={bottomRef} />
+          )}
+          <div ref={bottomRef} />
+        </div>
       </main>
 
       <div className="composer-wrap">
