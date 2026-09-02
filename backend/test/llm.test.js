@@ -112,6 +112,17 @@ test('결정 경계가 거대한 answer도 자르고 잘렸음을 알린다', ()
   const d = sanitizeDecision({ action: 'answer', answer: 'ㄱ'.repeat(MAX_ANSWER_LEN + 1000) });
   assert.ok(d.answer.length < MAX_ANSWER_LEN + 100, `상한을 넘겼다: ${d.answer.length}`);
   assert.match(d.answer, /생략했습니다/, '잘린 사실이 사용자에게 보여야 한다');
+  // 줄 중간·코드펜스 안에서 자르지 않는다 — 반 토막 난 표 행은 잘린 숫자가 값으로 읽히고(차트는 그것을 그린다),
+  // 열린 펜스는 안내 문장까지 코드로 삼킨다
+  const row = i => `| 2024-${String(i % 12 + 1).padStart(2, '0')} | ${100000 + i} |`;
+  const rows = Array.from({ length: Math.ceil(MAX_ANSWER_LEN / 20) }, (_, i) => row(i)).join('\n');
+  const t = sanitizeDecision({ action: 'answer', answer: `앞 문장\n\n\`\`\`chart\ntype: line\ntitle: 월별\n| 월 | 건수 |\n|---|---|\n${rows}\n\`\`\`\n\n뒤 문장` }).answer;
+  const lines = t.split('\n');
+  const note = lines.length - 1; // 마지막 줄이 안내 문장, 그 앞은 빈 줄, 그 앞이 닫는 펜스
+  assert.match(lines[note], /생략했습니다/);
+  assert.strictEqual(lines[note - 2], '```');
+  assert.ok(lines.slice(7, note - 2).every(l => /^\| 2024-\d\d \| 1\d{5} \|$/.test(l)), '표 행은 모두 온전해야 한다');
+  assert.ok(t.length <= MAX_ANSWER_LEN + 100);
 });
 
 test('바인드로 쓸 수 없는 긴 이름은 뭉개거나 개명하지 않고 버린다', () => {

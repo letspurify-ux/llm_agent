@@ -7,6 +7,7 @@ import { loadQueryRegistry, loadQueriesByNames, loadQueriesMentionedIn } from '.
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
 import { llm, renderAnswer, clipAnswer } from './llm.js';
+import { resolveChartData } from './chart.js';
 import { MAX_STEPS, MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_CELL_LEN, TRUNC_MARK, nameKey, clipText, stripLoneSurrogates, bindValue, targetDbNames } from './constants.js';
 
 // MAX_STEPS는 constants.js에 있다 — 실행 이력의 프롬프트 몫이 그 값에 묶여 있다.
@@ -250,6 +251,13 @@ export async function handleQuestion(rawQuestion, rawChat = []) {
 
   const history = [];
   const ctx = () => ({ question, chat, knowledge, qaMethods, queries, history });
+  // 성공한 조회의 전체 행(≤MAX_ROWS). history에는 capRows로 자른 20행만 싣는다 — history는 프롬프트·
+  // chat_log(steps)·화면 trace 세 곳으로 흘러가므로 거기에 전체를 실으면 셋이 함께 다섯 배 커진다.
+  // 전체 행이 필요한 곳은 답변의 차트 참조(`data: step N`) 하나뿐이라 이 요청 안에서만 곁에 들고 있는다.
+  const fullRows = new Map();
+  // 답변이 나가는 두 출구(모델의 answer, 강제 답변)가 같은 마무리를 지난다 — 차트 참조를 실제 표로 채운다.
+  // 스텝 번호는 history의 1-based 절대 인덱스(프롬프트의 '실행 N'과 같다, chart.js 주석 참고).
+  const finish = answer => resolveChartData(answer, history.map(h => fullRows.get(h) ?? null));
   const resolveCache = new Map(); // 프롬프트 목록 밖 이름의 해석 결과 (미등록도 캐시한다)
   const clippedCopy = clippedCopyDetector(chat);
   let guardHits = 0;
@@ -262,7 +270,7 @@ export async function handleQuestion(rawQuestion, rawChat = []) {
     if (!decision) break; // 결정을 얻지 못했다 — 아래 강제 답변/폴백으로 간다
     if (decision.action === 'answer') {
       const answer = answerOf(decision);
-      if (answer) return { answer, trace: history, search };
+      if (answer) return { answer: finish(answer), trace: history, search };
       break;   // 쓸 수 있는 답변이 아니다 — 아래 강제 답변/폴백으로 간다
     }
 
@@ -329,6 +337,7 @@ export async function handleQuestion(rawQuestion, rawChat = []) {
       );
       clippedCopy.record(rows);
       history.push({ query_name: canonicalName, params: decision.params, targetDb, rows: capRows(rows), totalRows, capped });
+      fullRows.set(history[history.length - 1], rows);
       guardHits = 0; // 진도가 나갔다 — 가드는 '연속' 헛도는 경우만 센다
     } catch (e) {
       // 실패도 이력에 남기고 루프를 계속한다 — LLM이 에러를 보고 재시도/우회/답변을 판단.
@@ -351,7 +360,7 @@ export async function handleQuestion(rawQuestion, rawChat = []) {
   const finalCtx = { ...ctx(), forceAnswer: true };
   const final = await decide(finalCtx);
   const answer = answerOf(final) || fallbackAnswer(finalCtx);
-  return { answer, trace: history, search };
+  return { answer: finish(answer), trace: history, search };
 }
 
 // '이 바인드 값이 우리가 잘라서 보여준 값의 앞부분인가'를 답하는 판정자.

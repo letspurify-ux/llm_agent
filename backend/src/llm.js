@@ -76,7 +76,17 @@ const ANSWER_TRUNC_NOTE = '\n\n*(답변이 너무 길어 이후 내용을 생략
 // 상한을 아는 쪽이 자르는 함수도 갖고, 두 경로가 같은 함수를 부른다.
 export function clipAnswer(answer) {
   const s = String(answer ?? '');
-  return s.length > MAX_ANSWER_LEN ? clipText(s, MAX_ANSWER_LEN) + ANSWER_TRUNC_NOTE : s;
+  if (s.length <= MAX_ANSWER_LEN) return s;
+  let cut = clipText(s, MAX_ANSWER_LEN);
+  // 줄 중간에서 자르지 않는다 — 표의 행이 반만 남으면 '| 2024-03 | 1' 의 1이 값으로 읽히고, 차트 블록
+  // 안이면 프런트가 그 값을 그린다(조용한 오답). 한 줄이 상한의 절반을 넘는 글(줄바꿈 없는 덩어리)은 그냥 자른다.
+  const nl = cut.lastIndexOf('\n');
+  if (nl > MAX_ANSWER_LEN / 2) cut = cut.slice(0, nl);
+  // 코드펜스 안에서 잘렸으면 닫는다 — 열린 채 두면 아래 안내 문장까지 코드블록의 글자로 읽힌다
+  // (차트 블록이면 표 아래 설명 줄로 버려져 잘린 사실이 화면에서 사라진다).
+  const fences = cut.match(/^[ \t]*```/gm)?.length ?? 0;
+  if (fences % 2) cut += '\n```';
+  return cut + ANSWER_TRUNC_NOTE;
 }
 
 // LLM 결정이 시스템에 들어오는 유일한 경계 — 여기서 크기를 확정한다. (테스트에서 쓰므로 export)

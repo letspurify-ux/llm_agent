@@ -150,6 +150,24 @@
       .md pre code { background: none; padding: 0; border-radius: 0; font-size: inherit; }
       .md img { max-width: 100%; }
 
+      /* ===== 차트·흐름도 (App.jsx ChartBlock / MermaidBlock) ===== */
+      /* 폭을 고정값으로 두는 이유: 말풍선은 내용 폭으로 크기가 정해지는데(shrink-to-fit) 차트는 스스로
+         폭이 없다(ResponsiveContainer는 부모를 채울 뿐이다). 글 한 줄 아래 놓인 차트가 그 한 줄 폭으로
+         쪼그라드는 것을 막는다. max-width: 100%는 실제 배치 때 말풍선 폭(78% 상한)에 맞춰 다시 줄인다. */
+      .md .chart { width: 640px; max-width: 100%; margin: 10px 0 6px; min-width: 0; }
+      .md .chart figcaption { font-size: 13px; font-weight: 600; color: var(--text); margin: 0 0 6px 4px; }
+      .md .chart-note { font-size: 12px; color: var(--muted); margin: 2px 0 0 4px; }
+      /* 차트 아래 '표로 보기'. 접힌 줄은 눈에 띄지 않게, 펼치면 표는 원래 규칙(.md table)대로 */
+      .md .chart-table { margin: 0 0 8px; font-size: 12.5px; }
+      .md .chart-table summary { cursor: pointer; color: var(--muted); user-select: none; }
+      .md .chart-table[open] summary { margin-bottom: 4px; }
+      /* recharts 툴팁 등은 자기 스타일을 인라인으로 갖는다. 글자 줄바꿈 규칙만 말풍선 것을 되돌린다 —
+         축 눈금은 SVG 글자라 영향이 없지만 범례·툴팁은 HTML이다. */
+      .md .chart .recharts-wrapper { word-break: normal; overflow-wrap: normal; }
+      /* mermaid는 SVG에 자기 폭(max-width: NNNpx)을 인라인으로 쓴다 — 말풍선보다 넓으면 줄인다 */
+      .md .mermaid { margin: 8px 0; overflow-x: auto; }
+      .md .mermaid svg { max-width: 100%; height: auto; }
+
       /* ===== 수식 (KaTeX) ===== */
       /* .bubble의 줄바꿈 규칙(overflow-wrap: anywhere)이 여기까지 상속되면, KaTeX가 span으로
          조립한 수식을 기호 한가운데서 끊어 분수·근호가 어긋난 채 렌더된다 — 수식 안에서만 되돌린다. */

@@ -778,3 +778,11 @@ test('서버가 알려준 토큰 실측을 로그로 남긴다', async () => {
   const { logs: none } = await decideCapturingLogs({ choices: [{ message: { content: '{"action":"answer","answer":"a"}' } }] });
   assert.ok(!none.some(l => l.includes('usage')), '실측이 없는데 usage 줄을 남겼다');
 });
+
+test('answer 안의 차트·mermaid 코드블록이 파싱을 그대로 통과한다', async () => {
+  // 차트 블록은 따옴표 없는 '이름: 값' 줄과 GFM 표로만 이뤄져 JSON 문자열 안에서 이스케이프할 것이 없다 —
+  // 그 성질이 깨지면(예: 블록 문법에 따옴표가 들어가면) 답변 전체가 파싱에서 떨어진다.
+  const md = '### 월별\n\n```chart\ntype: bar\ntitle: 월별 처리\nx: 월\ny: 건수\n| 월 | 건수 |\n|---|---|\n| 2024-01 | 120 |\n```\n\n```chart\ntype: line\ndata: step 2\n```\n\n```mermaid\nflowchart TD\n  A[시작] --> B[끝]\n```';
+  const d = await decide(JSON.stringify({ action: 'answer', answer: md }));
+  assert.deepStrictEqual(d, { action: 'answer', answer: md });
+});

@@ -1,7 +1,15 @@
-import { useState, useRef, useEffect, useLayoutEffect, memo } from 'react';
+import { useState, useRef, useEffect, useLayoutEffect, memo, lazy, Suspense, Component, createContext, useContext } from 'react';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 // 수식 표기의 계약(무엇이 수식인가 + 그것을 어떻게 그리는가)은 전부 math.js에 있다.
 import { REMARK_PLUGINS, REHYPE_PLUGINS } from './math.js';
+// 차트 블록의 계약(무엇을 차트로 받는가 + 이력으로 되돌릴 때의 모양)은 chart.js에 있다.
+import { parseChartBlock, splitBlock, chartTableMarkdown, chartBlocksToTables, MAX_CHARTS_PER_MESSAGE } from './chart.js';
+
+// 그리는 쪽(recharts·mermaid)은 첫 차트·흐름도가 나올 때 내려받는다 — 둘을 합치면 앱 본체의 몇 배라,
+// 글과 표뿐인 대부분의 대화가 그 값을 치를 이유가 없다. 내려받는 동안과 실패했을 때는 표·코드가 보인다.
+const Chart = lazy(() => import('./Chart.jsx'));
+const Mermaid = lazy(() => import('./Mermaid.jsx'));
 
 // 서버(agent.js normalizeChat)가 실제로 쓰는 상한과 같은 값. 서버 쪽 제한은 본문을 파싱한 뒤에
 // 적용되므로 요청 크기를 실제로 묶어두는 것은 이쪽뿐이다 — 넘기면 express의 본문 크기 제한에 걸려
@@ -30,6 +38,95 @@ const EXAMPLES = [
   '너는 어떤 일을 할 수 있어?',
 ];
 
+// 차트 블록 안의 표만 렌더할 때의 파이프라인. 값은 조회 결과 그대로라 수식 처리는 필요 없다.
+const TABLE_PLUGINS = [remarkGfm];
+
+// 차트 블록의 표를 평범한 표로. 차트를 그리지 못할 때·내려받는 동안·'표로 보기'가 모두 이것이다.
+// 차트를 그리지 않을 때(파싱 실패·예산 초과)는 제목까지 표 위에 남긴다 — 차트 밑 '표로 보기'에서는 제목이 이미 보인다.
+// 제목은 markdown에 섞지 않고 글자 그대로 놓는다 — 모델이 쓴 제목의 `*`·`_`·`[`가 강조·링크로 읽히면 안 된다.
+// 표가 없는 블록: `data:` 참조가 남아 있으면 서버가 채우지 못한 것이다(서버가 못 알아본 펜스 등) —
+// 설정 줄을 코드로 보여줘 봐야 사용자는 읽을 수 없으니 서버가 쓰는 것과 같은 안내 문장으로 바꾼다.
+// 참조도 표도 없는 블록은 무엇인지 모르므로(모델이 펜스를 다른 용도로 썼을 수 있다) 원문 그대로 둔다.
+function ChartTable({ text, withTitle = false }) {
+  const md = chartTableMarkdown(text);
+  const { config } = splitBlock(text);
+  const title = String(config.title ?? '').trim();
+  if (!md) {
+    if (config.data === undefined) return <pre><code>{text}</code></pre>;
+    return <p><em>{title ? `'${title}' ` : ''}차트를 그리지 못했습니다: 조회 결과를 채우지 못했습니다</em></p>;
+  }
+  return (
+    <>
+      {withTitle && title && <p><strong>{title}</strong></p>}
+      <ReactMarkdown remarkPlugins={TABLE_PLUGINS}>{md}</ReactMarkdown>
+    </>
+  );
+}
+
+// 그리는 쪽이 렌더 중에 던지면(모델이 만든 값이라 무엇이 올지 모른다) React는 앱 전체를 내린다 —
+// 대화가 통째로 사라진다. 그 블록 하나만 폴백으로 바꾼다.
+class BlockBoundary extends Component {
+  state = { failed: false };
+  static getDerivedStateFromError() { return { failed: true }; }
+  componentDidCatch(e) { console.warn('[chart] render failed:', e?.message ?? e); }
+  render() { return this.state.failed ? this.props.fallback : this.props.children; }
+}
+
+// 메시지 하나에 그리는 차트 수의 예산. 블록은 자기가 몇 번째인지 모르므로 메시지가 렌더될 때마다
+// 새 카운터를 내려 주고 블록이 차례로 가져간다. 렌더 순서가 곧 문서 순서라 앞의 넷이 차트가 된다.
+// (Message는 memo라 본문이 그대로면 다시 렌더되지 않고, 다시 렌더되면 카운터도 새것이다.)
+const ChartBudget = createContext(null);
+
+function ChartBlock({ text }) {
+  const budget = useContext(ChartBudget);
+  const parsed = parseChartBlock(text);
+  const draw = parsed.ok && budget && budget.n++ < MAX_CHARTS_PER_MESSAGE;
+  const titled = <ChartTable text={text} withTitle />;
+  if (!draw) return titled;
+  const table = <ChartTable text={text} />;
+  // 그리다 던지면 '그리지 않은 블록'과 같은 모양(제목 + 표)으로 — '표로 보기'까지 경계 안에 두어 표가 두 번 남지 않게 한다.
+  return (
+    <BlockBoundary fallback={titled}>
+      <Suspense fallback={table}>
+        <Chart spec={parsed.spec} />
+      </Suspense>
+      {/* 차트는 값을 읽는 데 한계가 있다(정확한 수치·잘린 라벨·그리지 않은 열). 표는 늘 곁에 둔다. */}
+      <details className="chart-table"><summary>표로 보기</summary>{table}</details>
+    </BlockBoundary>
+  );
+}
+
+function MermaidBlock({ text }) {
+  const code = <pre><code>{text}</code></pre>;
+  return (
+    <BlockBoundary fallback={code}>
+      <Suspense fallback={code}>
+        <Mermaid text={text} />
+      </Suspense>
+    </BlockBoundary>
+  );
+}
+
+// 코드펜스의 언어 표시(```chart → class="language-chart")를 hast 노드에서 읽는다. react-markdown은
+// <pre> 컴포넌트에 node를 넘겨 주고, 그 첫 자식이 <code>다. 언어가 chart·mermaid면 우리가 그리고,
+// 그 밖은 원래대로 코드블록이다. 대소문자는 가리지 않는다(```Chart 도 온다).
+const codeOf = node => {
+  const code = node?.children?.[0];
+  if (code?.type !== 'element' || code.tagName !== 'code') return null;
+  const cls = code.properties?.className;
+  const lang = (Array.isArray(cls) ? cls : [cls]).map(c => /^language-(.+)$/i.exec(String(c ?? ''))?.[1]).find(Boolean);
+  const text = (code.children ?? []).map(c => (c.type === 'text' ? c.value : '')).join('').replace(/\n$/, '');
+  return { lang: lang?.toLowerCase(), text };
+};
+function PreOrBlock({ node, children, ...props }) {
+  const code = codeOf(node);
+  if (code?.lang === 'chart') return <ChartBlock text={code.text} />;
+  if (code?.lang === 'mermaid') return <MermaidBlock text={code.text} />;
+  return <pre {...props}>{children}</pre>;
+}
+// 플러그인 배열과 마찬가지로 모듈 상수여야 한다 — 새 객체를 넘기면 매 렌더가 파이프라인 재구축이다.
+const MD_COMPONENTS = { pre: PreOrBlock };
+
 // 입력창 타이핑마다 전체 대화가 다시 렌더되지 않도록 메시지 하나를 분리해 memo한다
 // (assistant 답변은 markdown 파싱 비용이 있어 대화가 길어질수록 체감된다)
 const Message = memo(function Message({ role, text, trace }) {
@@ -40,7 +137,9 @@ const Message = memo(function Message({ role, text, trace }) {
           ? <div className="md">
               {/* 플러그인 배열은 math.js의 상수를 그대로 쓴다 — react-markdown은 렌더마다 options로
                   파이프라인을 다시 조립하므로, 여기서 새 배열 리터럴을 만들면 매 렌더가 프로세서 재구축이 된다. */}
-              <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS}>{text}</ReactMarkdown>
+              <ChartBudget.Provider value={{ n: 0 }}>
+                <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS} components={MD_COMPONENTS}>{text}</ReactMarkdown>
+              </ChartBudget.Provider>
             </div>
           : text}
         {trace?.length > 0 && (
@@ -81,10 +180,50 @@ export default function App() {
   // 대화의 세대 번호. 홈으로 돌아갈 때마다 올라가고, ask는 시작 시점의 값을 들고 있다가
   // 응답을 반영하기 전에 대조한다 — 끊긴 요청의 뒤늦은 응답이 새 대화에 끼어드는 것을 막는다.
   const sessionRef = useRef(0);
+  const chatRef = useRef(null);
+  // 화면이 대화의 바닥에 붙어 있는가. 말풍선이 뒤늦게 커질 때 따라 내려갈지를 이것으로 정한다.
+  const stuckRef = useRef(true);
+  const lastTopRef = useRef(0);
+  const growRef = useRef(null); // 말풍선 크기 변화를 보는 ResizeObserver (아래 효과가 처음 필요할 때 만든다)
 
+  // 새 말풍선이 붙으면 바닥으로 내린다. 그런데 답변은 그려진 뒤에도 더 커진다 — 차트는 모듈을 내려받은
+  // 뒤에, 흐름도는 그린 뒤에 자리를 잡고 그 전에는 표·코드가 대신 서 있다. 이 스크롤은 그 전에 일어나므로
+  // 그대로 두면 답의 끝(차트)이 화면 밖으로 밀려나 사용자가 직접 내려야 한다. 그래서 말풍선의 크기가
+  // 변할 때 바닥에 붙어 있었으면 다시 바닥으로 따라간다. 위로 올려 옛 답을 읽는 중이면 두는데 —
+  // 그때 커지는 것은 사용자가 편 '표로 보기'이지 우리가 따라갈 일이 아니다(붙어 있는지는 onScroll이 판정한다).
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    stuckRef.current = true; // 새 말풍선은 바닥으로 내려가 보는 것이 뜻이다 — 내려가는 동안 커지는 것도 따라간다
+    const el = chatRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    if (!growRef.current) {
+      growRef.current = new ResizeObserver(() => {
+        if (stuckRef.current) bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+      });
+    }
+    // 크기를 보는 것은 목록의 자식(말풍선 행)들이다 — 스크롤 상자 자신은 내용이 늘어도 크기가 그대로다.
+    // 이미 보고 있는 요소를 다시 넣는 것은 무해하다(첫 보고가 한 번 더 올 뿐이고, 그 처리는 바닥으로 내리는 것이다).
+    for (const child of el.children) growRef.current.observe(child);
   }, [messages, loading]);
+  useEffect(() => {
+    // 사용자가 '표로 보기'·실행 과정을 직접 펼치거나 접은 것은 따라가지 않는다 — 펼친 것은 위(머리글)부터
+    // 읽으려는 것인데 바닥으로 내리면 그 끝이 보인다. 뗐다가 스크롤이 바닥에 닿으면 다시 붙는다.
+    // toggle은 버블링하지 않으므로 목록에서 capture로 듣는다.
+    const el = chatRef.current;
+    const unstick = () => { stuckRef.current = false; };
+    el?.addEventListener('toggle', unstick, true);
+    return () => { el?.removeEventListener('toggle', unstick, true); growRef.current?.disconnect(); };
+  }, []);
+
+  // 바닥에 닿으면 붙고, 위로 올리면 뗀다. 아래로 내려가는 중에는 바꾸지 않는다 — 우리가 건 smooth 스크롤이
+  // 바닥에 닿기 전에 차트가 자리를 잡아도 계속 따라가야 하고, 그 사이의 스크롤 이벤트는 전부 '아래로'다.
+  // 내용이 줄어 브라우저가 scrollTop을 깎은 경우는 바닥에 닿은 것이라 앞 조건에서 붙은 채로 남는다.
+  function onChatScroll(e) {
+    const el = e.currentTarget;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 8) stuckRef.current = true;
+    else if (el.scrollTop < lastTopRef.current) stuckRef.current = false;
+    lastTopRef.current = el.scrollTop;
+  }
 
   // textarea는 내용이 늘어도 스스로 커지지 않는다 — 줄 수에 맞춰 높이를 직접 맞춘다.
   // 최대 높이는 CSS(max-height)가 잡고, 그 뒤로는 입력창 안에서 스크롤된다.
@@ -195,9 +334,11 @@ export default function App() {
       timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
       // history는 현재 질문을 넣기 전에 확정한다 — 현재 질문은 message로 따로 가므로 중복 전송하지 않는다.
       // 서버가 쓰는 만큼만 보낸다 (턴 수·길이 모두). 더 보내도 서버가 버리고 본문만 커진다.
+      // 답변의 차트 블록은 표로 되돌려 보낸다 — 길이 상한 안에서 값이 남아야지 그리기 설정이 남을 이유가 없다
+      // (chart.js chartBlocksToTables). 잘라내기(clipTurn)는 그 뒤에 한다.
       const history = historyRef.current
         .slice(-HISTORY_TURNS)
-        .map(m => ({ role: m.role, text: clipTurn(m.text) }));
+        .map(m => ({ role: m.role, text: clipTurn(m.role === 'assistant' ? chartBlocksToTables(m.text) : m.text) }));
       historyRef.current = [...historyRef.current, { role: 'user', text: message }];
       setMessages(m => [...m, { role: 'user', text: message }]);
       setLoading(true);
@@ -259,7 +400,7 @@ export default function App() {
         </button>
       </header>
 
-      <main className="chat">
+      <main className="chat" ref={chatRef} onScroll={onChatScroll}>
         {messages.length === 0 && !loading && (
           <div className="empty">
             <div className="empty-icon">S</div>
