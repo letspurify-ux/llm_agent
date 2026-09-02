@@ -17,6 +17,11 @@
       }
       * { box-sizing: border-box; }
       html, body, #root { height: 100%; }
+      /* 뷰포트 자체는 스크롤되지 않지만 스크롤 사슬의 끝은 늘 뷰포트다. 표·대화가 더 못 가는 방향으로
+         트랙패드를 밀면(가로로 스치듯, 또는 맨 위에서 더 위로) 브라우저는 그것을 뒤로 가기·새로고침
+         제스처로 받아 대화를 통째로 잃게 한다 — 여기서 끊는다. Chrome은 예전엔 body, 지금은 html의 값을
+         뷰포트에 옮기므로 둘 다에 둔다. */
+      html, body { overscroll-behavior: none; }
       body {
         margin: 0;
         font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, 'Segoe UI', sans-serif;
@@ -30,10 +35,14 @@
       .header {
         display: flex; align-items: center; gap: 12px;
         padding: 14px 24px;
-        background: rgba(255, 255, 255, 0.72);
-        /* backdrop-filter를 두지 않는다: 헤더 뒤에는 스크롤되는 내용이 없어(대화는 헤더 아래 .chat 안에서
+        /* 불투명한 단색이다. 반투명(rgba)이었을 때와 보이는 색은 같다 — 뒤에 있는 것이 body의 단색뿐이라
+           섞인 결과가 거의 흰색이다. 불투명해야 하는 이유는 .chat과 같다: 헤더는 스크롤 상자 위에 겹쳐
+           자기 합성 레이어가 되는데, 비치는 레이어의 글자는 Windows에서 서브픽셀 렌더링을 잃어 본문과
+           다르게(회색 계단으로) 보인다.
+           backdrop-filter도 두지 않는다: 헤더 뒤에는 스크롤되는 내용이 없어(대화는 헤더 아래 .chat 안에서
            스크롤된다) 흐릴 것이 body의 단색뿐인데, 브라우저는 그래도 매 프레임 그 영역을 별도 패스로
            처리한다 — Windows 내장 GPU에서는 스크롤 프레임마다 내는 순수한 비용이다. */
+        background: var(--surface);
         border-bottom: 1px solid var(--border);
         position: sticky; top: 0; z-index: 10;
       }
@@ -91,6 +100,11 @@
           radial-gradient(900px 400px at -10% 120px, #dceafe 0%, transparent 55%),
           var(--bg);
         background-attachment: local;
+        /* 스크롤바 자리를 양쪽에 늘 비워 둔다(고전 스크롤바인 Windows에서). 없으면 첫 답변이 와서 스크롤바가
+           생기는 순간 열이 스크롤바 폭의 반만큼 왼쪽으로 밀리고(차트도 다시 그려진다), 그 뒤로는 열이
+           '창 폭 - 스크롤바'의 가운데에 서서 창 폭의 가운데에 있는 입력창과 어긋난다. both-edges로 양쪽을
+           비우면 열은 언제나 창의 가운데다. 겹쳐 그리는(overlay) 스크롤바인 macOS에서는 비울 것이 없다. */
+        scrollbar-gutter: stable both-edges;
         /* 이 스크롤 상자를 쌓임 맥락(stacking context)으로 만든다. 없으면 안의 position: relative 요소
            (recharts가 차트 wrapper에 준다)는 페이지 루트의 쌓임 순서로 빠져나가 스크롤 내용과 '겹치는'
            별도 요소가 되고, Chrome은 그런 것을 차트마다 자기 합성 레이어로 떼어 낸다(compositing reason:

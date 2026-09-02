@@ -193,8 +193,28 @@ function TraceStep({ step: t, showGrid }) {
 
 function TraceGrid({ rows }) {
   const cols = columnsOf(rows);
+  const ref = useRef(null);
+  // 세로 스크롤바가 실제로 생긴 표는 휠을 붙잡는다(overscroll-behavior: contain) — 표 위에서 굴린 휠은
+  // 표만 움직이고, 끝에 닿아도 대화로 번지지 않는다. 그냥 두면 Chrome은 휠 제스처를 표에 걸어(latching)
+  // 끝에 닿은 뒤로는 멈춘 듯하다가 잠깐 쉬면 그때부터 대화가 움직여, 같은 자리에서 굴려도 표가 움직일지
+  // 대화가 움직일지 매번 다르다. 대화를 내리려면 표 밖(말풍선 옆 여백)에서 굴린다.
+  // 스크롤바가 없는 표에 걸면 안 된다 — Chrome은 contain인 상자를 굴릴 것이 없어도 경계로 삼아,
+  // 몇 줄짜리 표가 휠이 죽는 자리가 된다. 그래서 CSS가 아니라 여기서 실제로 넘치는지 재어 건다.
+  // 숨은 부분이 보이는 높이의 절반도 안 되는 표도 걸지 않는다 — 몇 px 움직이고 멎는 표는 읽을 것이
+  // 있는 스크롤 상자가 아니라 휠이 죽는 자리다. 그런 표는 원래 규칙대로 잠깐 쉬면 대화로 넘어간다.
+  // 높이 상한이 55vh라 창 높이에 따라 넘치고 안 넘치고가 달라지므로 크기가 바뀔 때마다 다시 잰다
+  // (패널이 접혀 있으면 높이가 0이라 걸리지 않고, 펼치면 크기가 바뀌어 다시 잰다).
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const mark = () => { el.style.overscrollBehavior = el.scrollHeight - el.clientHeight > el.clientHeight / 2 ? 'contain' : ''; };
+    mark();
+    const ro = new ResizeObserver(mark);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [rows]);
   return (
-    <div className="trace-grid">
+    <div className="trace-grid" ref={ref}>
       <table>
         <thead>
           <tr><th className="idx">#</th>{cols.map(c => <th key={c}>{c}</th>)}</tr>
@@ -251,7 +271,6 @@ export default function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const bottomRef = useRef(null);
   const inputRef = useRef(null);
   const historyRef = useRef([]);      // 서버로 보낼 대화 이력 (setState 비동기와 무관하게 즉시 반영)
   const composingRef = useRef(false); // IME 조합 진행 중
@@ -266,6 +285,29 @@ export default function App() {
   const stuckRef = useRef(true);
   const lastTopRef = useRef(0);
   const growRef = useRef(null); // 말풍선 크기 변화를 보는 ResizeObserver (아래 효과가 처음 필요할 때 만든다)
+  const glideRef = useRef(null); // 진행 중인 미끄러짐 { raf, expect } (아래 glide 참고)
+
+  // 대화를 목표까지 미끄러뜨린다. 브라우저의 smooth 스크롤(scrollIntoView·scrollBy)을 쓰지 않는 이유:
+  // 그 애니메이션이 도는 동안(1000px에 1초쯤) 사용자의 휠은 통째로 버려진다 — Chrome은 진행 중인 프로그램
+  // 스크롤 애니메이션에 휠을 얹지 못한다. 답이 온 순간 위로 굴려도 화면은 끝까지 내려가고 만다.
+  // 여기서는 매 프레임 scrollTop을 직접 놓고, 우리가 놓은 값과 다른 scrollTop이 보이면(휠·썸 드래그·키보드,
+  // onChatScroll이 본다) 그 자리에서 멈춘다 — 사용자가 언제나 이긴다. 목표는 매 프레임 다시 재므로
+  // '바닥'은 내려가는 동안 더 자라도(차트가 늦게 서도) 그 바닥이다.
+  const stopGlide = () => { if (glideRef.current) cancelAnimationFrame(glideRef.current.raf); glideRef.current = null; };
+  function glide(el, target, instant) {
+    stopGlide();
+    if (instant) { el.scrollTop = target(); return; }
+    const t0 = performance.now(); const from = el.scrollTop; const D = 350;
+    const g = glideRef.current = { raf: 0, expect: from };
+    const step = now => {
+      const p = Math.min(1, (now - t0) / D);
+      el.scrollTop = from + (target() - from) * (1 - (1 - p) ** 3);
+      g.expect = el.scrollTop; // 실제로 놓인 값(반올림·경계에 걸린 값)과 비교해야 한다
+      if (p < 1) g.raf = requestAnimationFrame(step); else glideRef.current = null;
+    };
+    g.raf = requestAnimationFrame(step);
+  }
+  const bottomOf = el => () => el.scrollHeight - el.clientHeight;
 
   // 새 말풍선이 붙으면 바닥으로 내린다. 그런데 답변은 그려진 뒤에도 더 커진다 — 차트는 모듈을 내려받은
   // 뒤에, 흐름도는 그린 뒤에 자리를 잡고 그 전에는 표·코드가 대신 서 있다. 이 스크롤은 그 전에 일어나므로
@@ -273,28 +315,58 @@ export default function App() {
   // 변할 때 바닥에 붙어 있었으면 다시 바닥으로 따라간다. 위로 올려 옛 답을 읽는 중이면 두는데 —
   // 그때 커지는 것은 사용자가 편 '표로 보기'이지 우리가 따라갈 일이 아니다(붙어 있는지는 onScroll이 판정한다).
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-    stuckRef.current = true; // 새 말풍선은 바닥으로 내려가 보는 것이 뜻이다 — 내려가는 동안 커지는 것도 따라간다
+    // 내가 보낸 말은 언제나 바닥으로 — 보려고 보낸 것이다. 답이 온 것은 붙어 있을 때만 따라간다: 답을
+    // 기다리는 동안(조회가 길면 몇 분) 위로 올려 옛 답을 읽고 있는데 도착했다고 바닥으로 끌어내리면
+    // 읽던 자리를 잃는다. 내려가 보면 답은 거기 있고, 바닥에 닿으면 다시 붙는다.
+    const last = messages[messages.length - 1];
     const el = chatRef.current;
-    if (!el || typeof ResizeObserver === 'undefined') return;
+    if (!el) return;
+    if (!last || last.role === 'user' || stuckRef.current) {
+      glide(el, bottomOf(el));
+      stuckRef.current = true; // 새 말풍선은 바닥으로 내려가 보는 것이 뜻이다 — 내려가는 동안 커지는 것도 따라간다
+    }
+    if (typeof ResizeObserver === 'undefined') return;
     if (!growRef.current) {
-      growRef.current = new ResizeObserver(() => {
-        if (stuckRef.current) bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+      growRef.current = new ResizeObserver(entries => {
+        if (!stuckRef.current) return;
+        // 스크롤 상자 자신이 변한 것(입력창이 여러 줄로 커짐, 창 크기 조정)은 즉시 붙인다 — 부드럽게 하면
+        // 창을 끄는 동안 바닥이 한 박자 뒤에서 따라와 흔들린다. 내용이 자란 것은 부드럽게 내려간다.
+        const boxResized = entries.some(x => x.target === el);
+        glide(el, bottomOf(el), boxResized);
       });
     }
-    // 크기를 보는 것은 말풍선 행들을 담은 안쪽 열(.chat-inner)이다 — 어느 말풍선이 커져도 열이 그만큼
-    // 자라고, 스크롤 상자 자신은 내용이 늘어도 크기가 그대로다. 이미 보고 있는 요소를 다시 넣는 것은
+    // 둘을 본다. 안쪽 열(.chat-inner)은 어느 말풍선이 커져도 그만큼 자란다 — 내용의 변화. 스크롤 상자
+    // (.chat) 자신은 내용이 늘어도 그대로지만 입력창이 여러 줄로 커지거나 창 높이가 줄면 작아진다 —
+    // 그때 브라우저는 scrollTop을 두므로 바닥에 붙어 있던 화면의 끝이 입력창 뒤로 숨는다(폭이 바뀌면
+    // 열도 함께 변해 잡히지만, 높이만 바뀌면 열은 그대로다). 이미 보고 있는 요소를 다시 넣는 것은
     // 무해하다(첫 보고가 한 번 더 올 뿐이고, 그 처리는 바닥으로 내리는 것이다).
+    growRef.current.observe(el);
     growRef.current.observe(el.firstElementChild);
   }, [messages, loading]);
   useEffect(() => {
     // 사용자가 '표로 보기'·실행 과정을 직접 펼치거나 접은 것은 따라가지 않는다 — 펼친 것은 위(머리글)부터
     // 읽으려는 것인데 바닥으로 내리면 그 끝이 보인다. 뗐다가 스크롤이 바닥에 닿으면 다시 붙는다.
     // toggle은 버블링하지 않으므로 목록에서 capture로 듣는다.
+    // summary의 click도 듣는 이유: toggle은 open이 바뀐 뒤 과제(task)로 뒤늦게 오는데, '표로 보기'처럼
+    // 내용이 미리 그려져 있는 패널은 클릭한 그 프레임에 열이 자라고 ResizeObserver는 같은 프레임의
+    // 렌더링 단계에서 그것을 본다 — toggle보다 먼저. 그러면 아직 붙어 있는 줄 알고 바닥으로 내려
+    // 표의 끝이 보인다. click은 열리기 전에 오므로 여기서 먼저 뗀다(키보드 Enter·Space도 click을 낸다).
+    // toggle은 그 밖의 경로(페이지 내 찾기가 접힌 내용을 스스로 펼치는 것)를 위해 남긴다.
+    // 떼는 것은 '펼침'뿐이다. 접는 것은 내용을 줄일 뿐이라 바닥에 붙어 있던 화면은 그대로 바닥이다 —
+    // 여기서도 떼 버리면 답을 기다리며 패널을 접은 사람은 바닥에 있으면서도 도착한 답을 못 본다
+    // (답은 붙어 있을 때만 따라가므로 화면 밑에 놓인다).
     const el = chatRef.current;
     const unstick = () => { stuckRef.current = false; };
-    el?.addEventListener('toggle', unstick, true);
-    return () => { el?.removeEventListener('toggle', unstick, true); growRef.current?.disconnect(); };
+    const onSummaryClick = e => { const d = e.target.closest?.('summary')?.parentElement; if (d && !d.open) unstick(); };
+    const onToggle = e => { if (e.target.open) unstick(); };
+    el?.addEventListener('click', onSummaryClick, true);
+    el?.addEventListener('toggle', onToggle, true);
+    return () => {
+      el?.removeEventListener('click', onSummaryClick, true);
+      el?.removeEventListener('toggle', onToggle, true);
+      growRef.current?.disconnect();
+      stopGlide();
+    };
   }, []);
 
   // 바닥에 닿으면 붙고, 위로 올리면 뗀다. 아래로 내려가는 중에는 바꾸지 않는다 — 우리가 건 smooth 스크롤이
@@ -302,6 +374,8 @@ export default function App() {
   // 내용이 줄어 브라우저가 scrollTop을 깎은 경우는 바닥에 닿은 것이라 앞 조건에서 붙은 채로 남는다.
   function onChatScroll(e) {
     const el = e.currentTarget;
+    // 미끄러지는 중에 우리가 놓지 않은 값이 보이면 사용자가 움직인 것 — 거기서 멈춘다 (glide 참고)
+    if (glideRef.current && Math.abs(el.scrollTop - glideRef.current.expect) > 2) stopGlide(); // 2px: 배율 화면의 반올림 차이는 1px 미만, 휠 한 칸·화살표 키는 40px 이상
     if (el.scrollHeight - el.scrollTop - el.clientHeight < 8) stuckRef.current = true;
     else if (el.scrollTop < lastTopRef.current) stuckRef.current = false;
     lastTopRef.current = el.scrollTop;
@@ -310,7 +384,7 @@ export default function App() {
   // textarea는 내용이 늘어도 스스로 커지지 않는다 — 줄 수에 맞춰 높이를 직접 맞춘다.
   // 최대 높이는 CSS(max-height)가 잡고, 그 뒤로는 입력창 안에서 스크롤된다.
   // useEffect가 아니라 useLayoutEffect인 이유: 그리기 전에 높이가 정해져야 한 프레임 깜빡이지 않는다.
-  useLayoutEffect(() => {
+  function fitInput() {
     const el = inputRef.current;
     if (!el) return;
     // 지금 높이를 먼저 풀어야 한다 — 그러지 않으면 scrollHeight가 이미 늘어난 높이에 갇혀
@@ -319,7 +393,7 @@ export default function App() {
     // 빈 입력창은 재지 않고 rows=1이 정한 높이를 그대로 쓴다. 잴 내용이 없기도 하지만,
     // 무엇보다 mount 직후의 첫 측정은 레이아웃이 아직 서지 않아 엉뚱한 값(수백 px)을 준다 —
     // 그 값이 인라인 높이로 굳으면 빈 입력창이 처음부터 세 배 크기로 열린다.
-    if (input) el.style.height = `${el.scrollHeight}px`;
+    if (el.value) el.style.height = `${el.scrollHeight}px`;
     // 스크롤은 높이가 max-height에 걸려 내용이 남을 때만 켠다. 늘 켜 두면 스크롤할 것이 없어도
     // 세로 스크롤바가 자리를 차지해 입력창이 좁아 보인다 (브라우저·OS 설정에 따라 늘 보인다).
     el.style.overflowY = el.scrollHeight > el.clientHeight ? 'auto' : 'hidden';
@@ -330,7 +404,14 @@ export default function App() {
     if (el.scrollHeight > el.clientHeight && el.selectionStart === el.value.length) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [input]);
+  }
+  useLayoutEffect(fitInput, [input]);
+  // 창 폭이 바뀌면 같은 글이 다른 줄 수로 감기는데 높이는 글이 바뀔 때만 재므로 그대로 남는다 —
+  // 창을 좁히면 마지막 줄이 입력창 밑으로 잘려 보이지 않고(스크롤은 꺼져 있다), 넓히면 빈 줄이 남는다.
+  useEffect(() => {
+    addEventListener('resize', fitInput);
+    return () => removeEventListener('resize', fitInput);
+  }, []);
 
   // loading은 state라 같은 tick에 두 번 호출되면 두 번 다 false로 읽힐 수 있다 —
   // 실제 중복 전송을 막는 것은 ref 쪽이다 (state는 버튼 비활성화 등 렌더에만 쓴다).
@@ -506,7 +587,6 @@ export default function App() {
               </div>
             </div>
           )}
-          <div ref={bottomRef} />
         </div>
       </main>
 
@@ -533,6 +613,18 @@ export default function App() {
             onKeyDown={e => {
               if (e.key !== 'Enter') {
                 pendingSendRef.current = false; // 위와 같은 이유 (계속 타이핑하면 그 Enter는 없던 일이다)
+                // PageUp·PageDown은 대화를 넘긴다. 보낸 뒤에는 초점이 여기 남는데, 브라우저는 초점 잡힌
+                // 요소의 스크롤 상자만 넘기므로 입력창 밖을 한 번 클릭하기 전엔 키보드로 답변을 읽어
+                // 내려갈 길이 없다. 입력창 자신이 넘쳐 스크롤되는 동안은 입력창 몫으로 둔다.
+                if ((e.key === 'PageDown' || e.key === 'PageUp') && chatRef.current) {
+                  const el = e.currentTarget;
+                  if (el.scrollHeight <= el.clientHeight + 1) {
+                    e.preventDefault();
+                    const chat = chatRef.current;
+                    const to = chat.scrollTop + (e.key === 'PageDown' ? 1 : -1) * chat.clientHeight * 0.875; // 브라우저와 같은 한 화면 분량
+                    glide(chat, () => to);
+                  }
+                }
                 return;
               }
               const el = e.currentTarget;
