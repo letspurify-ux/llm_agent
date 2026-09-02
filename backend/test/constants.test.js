@@ -3,7 +3,7 @@
 // 함께 쓴다. 여기가 어긋나면 어긋난 티가 나지 않는 자리에서 조용히 갈라진다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { clipText, nameKey, stripLoneSurrogates, numEnv, bindValue, warnOnce, targetDbNames } from '../src/constants.js';
+import { clipText, nameKey, stripLoneSurrogates, numEnv, bindValue, warnOnce, targetDbNames, joinUrl, isPlainObject } from '../src/constants.js';
 
 test('절단이 서로게이트 쌍을 쪼개지 않는다', () => {
   // 쪼개면 짝 잃은 코드유닛이 남아 JSON은 통과하지만 유효한 UTF-8이 아니게 된다 —
@@ -138,4 +138,20 @@ test('조회대상 DB 목록을 프롬프트와 실행기가 같게 읽는다', 
   // 둘로 세면 프롬프트가 같은 DB를 두 번 보여주며 모델에게 '고를 것이 둘'이라고 말한다.
   assert.deepStrictEqual(targetDbNames('A;a;A'), ['A']);
   assert.deepStrictEqual(targetDbNames('DB1;db1'), ['DB1']);
+});
+
+test('base URL 끝의 슬래시 유무가 요청 경로를 바꾸지 않는다', () => {
+  // .env.example은 `…/v1`이지만 `…/v1/`로 적는 사람도 많다 — 그대로 이으면 `//chat/completions`가
+  // 되어 경로를 엄격히 대조하는 프록시에서 404가 나고, 화면에는 'LLM 호출 실패'만 남는다.
+  assert.equal(joinUrl('http://h/v1', 'chat/completions'), 'http://h/v1/chat/completions');
+  assert.equal(joinUrl('http://h/v1/', 'chat/completions'), 'http://h/v1/chat/completions');
+  assert.equal(joinUrl('http://h/v1//', 'embeddings'), 'http://h/v1/embeddings');
+  // 미설정은 그대로 흘려보낸다 — 여기서 던지지 않고 fetch의 URL 파싱 오류로 실패하게 둔다
+  assert.equal(joinUrl(undefined, 'chat/completions'), '/chat/completions');
+});
+
+test('키-값 객체 판정은 배열·null·문자열을 통과시키지 않는다', () => {
+  assert.equal(isPlainObject({}), true);
+  assert.equal(isPlainObject({ a: 1 }), true);
+  for (const v of [[], ['a'], null, undefined, 'a=b', 7, true]) assert.equal(isPlainObject(v), false, String(v));
 });

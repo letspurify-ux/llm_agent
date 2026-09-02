@@ -154,6 +154,15 @@ test('바인드 키 앞의 콜론은 표기로 보고 뗀다', () => {
   assert.deepStrictEqual(inner.params, { 'a:b': 1, ':c': 2 });
 });
 
+test('결정 경계는 객체가 아닌 params를 빈 것으로 본다', () => {
+  // Object.entries는 문자열도 받는다 — 'job_id=1'이 {0:'j',1:'o',…}가 되어 그대로 history·프롬프트에
+  // 실리고, 모델은 자기가 낸 적 없는 params를 보게 된다. 배열도 같은 경로로 {0:'…'}가 된다.
+  for (const params of ['job_id=1', ['BATCH001'], 7, true, null, undefined]) {
+    const d = sanitizeDecision({ action: 'run_query', query_name: 'q', params });
+    assert.deepStrictEqual(d.params, {}, JSON.stringify(params));
+  }
+});
+
 test('정상 크기의 결정은 값이 그대로 통과한다', () => {
   const d = { action: 'run_query', query_name: 'batch_job_status', params: { job_id: 'BATCH001' } };
   assert.deepStrictEqual(sanitizeDecision(d), d);

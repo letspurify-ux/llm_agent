@@ -10,7 +10,7 @@ import {
   MAX_PROMPT_ITEM_LEN, MAX_PROMPT_SQL_LEN, MAX_PROMPT_STEP_LEN,
   MAX_PROMPT_PARAMS_LEN, MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS, PROMPT_FRAME_RESERVE,
   MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, MAX_COMPLETION_TOKENS, MAX_STEPS, MAX_RESULT_ROWS,
-  clipText, warnOnce, targetDbNames,
+  clipText, warnOnce, targetDbNames, isPlainObject, joinUrl,
 } from './constants.js';
 import { bindNames } from './sql.js';
 import { rowCounts } from './result.js';
@@ -125,7 +125,7 @@ async function chatCompletion(userPrompt, timeoutMs) {
   const headers = { 'Content-Type': 'application/json' };
   if (process.env.LLM_API_KEY) headers.Authorization = `Bearer ${process.env.LLM_API_KEY}`;
 
-  const res = await fetch(`${process.env.LLM_BASE_URL}/chat/completions`, {
+  const res = await fetch(joinUrl(process.env.LLM_BASE_URL, 'chat/completions'), {
     method: 'POST',
     headers,
     signal: AbortSignal.timeout(timeoutMs),
@@ -945,7 +945,13 @@ function toDecision(d, answerOnly) {
     // 여기 일은 형식 검증이고, 없거나 형식이 아니면 '고르지 않음'으로 두면 된다:
     // 후보가 하나뿐인 쿼리는 그대로 실행되고, 여럿이면 실행 경계가 후보를 들고 되묻는다.
     const targetDb = typeof d.target_db === 'string' && d.target_db.trim() ? d.target_db : undefined;
-    return { action: 'run_query', query_name: d.query_name, params: d.params || {}, ...(targetDb && { target_db: targetDb }) };
+    // params는 키-값 객체일 때만 싣고, 아니면(배열·문자열·숫자·null) '없음'으로 둔다. 결정 자체를
+    // 버리지 않는 이유: 버리면 같은 프롬프트로 재시도해 같은 응답을 받고(temperature=0) 폴백으로
+    // 끝나는데, 모델은 무엇이 틀렸는지 듣지 못한다. 빈 params로 실행 경계까지 보내면 바인드가 있는
+    // 쿼리는 '값 없음'과 hint가 다음 프롬프트의 이력에 남아 모델이 형식을 고칠 기회가 생기고,
+    // 바인드가 없는 쿼리는 그냥 실행된다 — 어느 쪽도 잡키('0','1')를 프롬프트에 싣지 않는다.
+    const params = isPlainObject(d.params) ? d.params : {};
+    return { action: 'run_query', query_name: d.query_name, params, ...(targetDb && { target_db: targetDb }) };
   }
   return null;
 }

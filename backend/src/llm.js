@@ -9,7 +9,7 @@
 // agent.js는 provider가 바뀌어도 변경되지 않는다.
 import { openaiDecide } from './llm-openai.js';
 import { bindNames } from './sql.js';
-import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, clipText, nameKey, ownProp, warnOnce, targetDbNames } from './constants.js';
+import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, clipText, nameKey, ownProp, warnOnce, targetDbNames, isPlainObject } from './constants.js';
 import { rowCounts } from './result.js';
 
 // LLM provider 선택의 단일 해석 지점.
@@ -127,9 +127,12 @@ export function sanitizeDecision(d) {
   // 이름은 자르지 않고 상한을 넘으면 버린다 (MAX_BIND_NAME_LEN 주석 참고) — 자르면 어떤 실제
   // 바인드와도 대응하지 못하는 이름을 만들면서 겹침 처리까지 떠안게 된다. 원본 키는 유일하므로
   // 자르지 않는 한 뭉개짐 자체가 생기지 않는다 (콜론 제거로 생기는 겹침만 위 규칙으로 거른다).
+  // 키-값 객체가 아니면(배열·문자열) 빈 것으로 본다 — 형식 검증은 llm-openai toDecision이 하지만
+  // 이 경계는 provider와 무관하게 history·프롬프트로 가는 마지막 문이라 같은 판정을 한 번 더 한다.
+  // Object.entries는 문자열도 받아 글자마다 '0','1' 키를 만들고, 그것이 그대로 trace에 실린다.
   const seen = new Set();
   const params = Object.fromEntries(
-    Object.entries(d.params || {})
+    Object.entries(isPlainObject(d.params) ? d.params : {})
       .slice(0, MAX_DECISION_PARAMS)
       .map(([k, v]) => [k.replace(/^:/, ''), v])
       .filter(([k]) => k.length <= MAX_BIND_NAME_LEN && !seen.has(k) && seen.add(k))

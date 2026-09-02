@@ -4,7 +4,7 @@
 // 실패 시 EmbeddingError를 던진다 — 호출부가 '재시도할 실패'와 '입력이 거부된 실패'를 구분해야 하기 때문이다.
 // 미설정(LIKE-only)은 실패가 아니므로 호출부가 isEmbeddingEnabled()로 먼저 갈라낸다.
 // 모델명은 embed-sync의 embed_hash에도 들어간다(모델 교체 시 자동 재임베딩) — 한 곳에서만 정의한다
-import { warnOnce } from './constants.js';
+import { warnOnce, joinUrl } from './constants.js';
 
 export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'bge-m3';
 
@@ -52,7 +52,7 @@ export async function embed(texts, signal) {
   if (signal?.aborted) ctl.abort();
   else signal?.addEventListener('abort', onAbort, { once: true });
   try {
-    const res = await fetch(`${base}/embeddings`, {
+    const res = await fetch(joinUrl(base, 'embeddings'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: EMBEDDING_MODEL, input: texts }),

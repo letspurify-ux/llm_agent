@@ -202,6 +202,13 @@ export function stripLoneSurrogates(s) {
 // 오류를 남기지 않는다. 그래서 nameKey와 같은 이유로 접근 방식 자체를 여기 하나로 모은다.
 export const ownProp = (obj, key) => (Object.hasOwn(obj ?? {}, key) ? obj[key] : undefined);
 
+// '키-값 객체인가' — 결정의 params처럼 JSON에서 온 값이 배열·문자열·숫자로도 올 수 있는 자리의 판정.
+// typeof만 보면 배열과 null이 통과하고, Object.entries는 문자열까지 받아 글자마다 '0','1' 키를 만든다 —
+// 그 잡키는 어느 바인드와도 맞지 않아 '값 없음'으로 끝나지만, 프롬프트·trace·chat_log에 그대로 실려
+// 모델이 자기가 낸 적 없는 params를 보게 된다. 형식 경계(llm-openai.js toDecision)와 크기 경계
+// (llm.js sanitizeDecision)가 같은 판정을 쓴다 — 한쪽만 고치면 다른 문으로 들어온 값이 그대로 샌다.
+export const isPlainObject = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+
 // 바인드명 최대 길이 — Oracle 식별자 상한(12.2+ 기준 128자)이다.
 // 이 값을 보는 곳이 둘이고, 둘이 같은 값을 봐야 한다:
 //   등록 경계(sql.js assertReadOnly) — 이보다 긴 이름을 쓴 SQL은 실행 자체가 불가능하므로 거부한다.
@@ -326,3 +333,11 @@ export function numEnv(name, fallback, { allowZero = false } = {}) {
   console.warn(`[env] invalid value for ${name}, falling back to default (${fallback}): ${JSON.stringify(raw)}`);
   return fallback;
 }
+
+// base URL 뒤에 경로를 붙인다. 끝의 '/' 유무는 설정하는 사람마다 다르고(`…/v1`과 `…/v1/`), 그대로
+// 이으면 `…/v1//chat/completions`가 된다 — 대부분의 서버는 받아주지만 경로를 엄격히 대조하는
+// 프록시는 404를 내고, 화면에는 'LLM 호출 실패'만 남아 .env의 슬래시 하나를 의심하기 어렵다.
+// LLM(llm-openai.js)과 임베딩(embedding.js)이 같은 함수를 쓴다. path는 앞에 '/' 없이 적는다.
+// 미설정(undefined)은 그대로 통과시킨다 — '/chat/completions'는 fetch가 URL 파싱 오류로 거부하고,
+// 그 상황은 기동 시점 경고(server.js)가 이미 가리킨다.
+export const joinUrl = (base, path) => `${String(base ?? '').replace(/\/+$/, '')}/${path}`;

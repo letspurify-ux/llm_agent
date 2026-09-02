@@ -499,6 +499,33 @@ async function sentBody(envValue) {
   return body;
 }
 
+test('객체가 아닌 params는 빈 params로 읽되 결정은 버리지 않는다', async () => {
+  // 결정을 버리면 같은 프롬프트로 재시도해 같은 응답을 받고(temperature=0) 폴백으로 끝난다 — 모델은
+  // 무엇이 틀렸는지 듣지 못한다. 빈 params로 실행 경계까지 보내면 '값 없음'과 hint가 다음 프롬프트의
+  // 이력에 남아 형식을 고칠 기회가 생기고, 바인드가 없는 쿼리는 그냥 실행된다.
+  for (const raw of ['["BATCH001"]', '"job_id=BATCH001"', '7', 'null']) {
+    assert.deepStrictEqual(
+      await decide(`{"action":"run_query","query_name":"q","params":${raw}}`),
+      { action: 'run_query', query_name: 'q', params: {} }, raw);
+  }
+});
+
+test('LLM_BASE_URL 끝의 슬래시가 요청 경로에 //를 만들지 않는다', async () => {
+  const saved = process.env.LLM_BASE_URL;
+  process.env.LLM_BASE_URL = 'http://test.invalid/v1/';
+  let url;
+  globalThis.fetch = async (u) => {
+    url = u;
+    return { ok: true, json: async () => ({ choices: [{ message: { content: '{"action":"answer","answer":"ok"}' } }] }), text: async () => '' };
+  };
+  try {
+    await openaiDecide(CTX);
+  } finally {
+    process.env.LLM_BASE_URL = saved;
+  }
+  assert.equal(url, 'http://test.invalid/v1/chat/completions');
+});
+
 test('reasoning_effort 기본값은 low다', async () => {
   // 매 스텝 결정 JSON 하나만 받는 구조라 추론을 길게 돌릴수록 왕복만 길어진다 (실측 5.4초 → 1.9초)
   assert.equal((await sentBody(undefined)).reasoning_effort, 'low');
