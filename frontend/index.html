@@ -75,6 +75,13 @@
         width: 100%; max-width: 820px; margin: 0 auto;
         padding: 24px 20px 8px;
         display: flex; flex-direction: column; gap: 16px;
+        /* 이 스크롤 상자를 쌓임 맥락(stacking context)으로 만든다. 없으면 안의 position: relative 요소
+           (recharts가 차트 wrapper에 준다)는 페이지 루트의 쌓임 순서로 빠져나가 스크롤 내용과 '겹치는'
+           별도 요소가 되고, Chrome은 그런 것을 차트마다 자기 합성 레이어로 떼어 낸다(compositing reason:
+           Overlap). 떼어진 레이어는 스크롤 내용과 따로 래스터되어 빠르게 스크롤하면 글은 보이는데
+           차트 자리만 비었다가 늦게 나타난다 — Retina에서는 픽셀이 넷이라 더 늦다. isolate는 레이아웃·
+           position: fixed·이벤트에 아무 영향이 없고 z-index의 범위만 이 상자 안으로 가둔다. */
+        isolation: isolate;
       }
 
       .empty { margin: auto; text-align: center; padding: 40px 0; }
@@ -205,15 +212,25 @@
         padding: 4px 10px; border-radius: 999px; background: #f1f3fb;
       }
       .trace summary:hover { color: var(--accent); }
-      .trace-step { margin-top: 6px; }
+      /* 스텝 하나(머리띠 + 표)를 한 상자로 묶어 테두리와 둥근 모서리를 여기서 그리고, 여기서 자른다.
+         둥근 모서리를 표(.trace-grid) 자신에게 주면 안 된다 — 표는 스크롤 상자이고 그 안의 sticky
+         머리글·행번호는 Chrome이 합성 레이어로 떼어 내는데, 아래만 둥근(모서리가 서로 다른) 상자로
+         합성 레이어를 자르려면 Chrome은 레이어마다 상자 크기의 마스크 레이어를 하나씩 더 만든다
+         (1000행 표 다섯이면 25장, Retina에서 각 4MB). 스크롤하는 매 프레임 그것을 다시 합성하느라
+         차트·표가 늦게 그려진다. 네 모서리가 같은 둥근 상자는 마스크 없이 자른다(fast rounded corner).
+         hidden인 이유: 잘라야 할 것이 없어 스크롤 상자가 되어도 실제로 스크롤될 일이 없고(표는 자기
+         높이 안에서 스크롤한다), clip과 달리 모든 브라우저가 안다. */
+      .trace-step {
+        margin-top: 6px;
+        border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+      }
       /* 쿼리 이름·바인드 한 줄은 코드처럼 어두운 띠로, 그 아래 행은 밝은 표로 — 무엇을 실행했는지와
-         무엇이 나왔는지를 한눈에 가른다. */
+         무엇이 나왔는지를 한눈에 가른다. 모서리는 .trace-step이 자른다. */
       .trace-head {
         display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px;
-        padding: 7px 10px; border-radius: 10px;
+        padding: 7px 10px;
         background: #0f172a; color: #c7d2fe; font-size: 11.5px; line-height: 1.5;
       }
-      .trace-head.with-grid { border-radius: 10px 10px 0 0; }
       .trace-head code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
       .trace-head .trace-count { color: #a5b4fc; }
       .trace-head .trace-csv {
@@ -225,9 +242,9 @@
          말풍선을 세로로 끝없이 늘이거나(스크롤 따라가기가 그 아래 답변을 놓친다) 가로로 뚫지 않게.
          머리글은 스크롤해도 붙어 있다(sticky) — 열이 많으면 몇 행만 내려가도 무슨 열인지 잊는다. */
       .trace-grid {
-        /* 높이는 화면에 비례하되 상한을 둔다 — 큰 모니터에서도 표 하나가 대화를 밀어내지 않게. */
-        max-height: min(55vh, 520px); overflow: auto;
-        border: 1px solid var(--border); border-top: 0; border-radius: 0 0 10px 10px; background: var(--surface);
+        /* 높이는 화면에 비례하되 상한을 둔다 — 큰 모니터에서도 표 하나가 대화를 밀어내지 않게.
+           테두리·둥근 모서리는 없다 — .trace-step이 그린다(그 주석 참고). */
+        max-height: min(55vh, 520px); overflow: auto; background: var(--surface);
       }
       /* 스크롤바를 늘 보이게 그린다. macOS의 기본(overlay) 스크롤바는 손대기 전까지 숨어 있어서, 잘린 열·행이
          '더 있다'는 것을 알 길이 없다 — 세로·가로 둘 다. (표준 scrollbar-width/color를 함께 쓰면 Chrome이

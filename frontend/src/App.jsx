@@ -126,8 +126,18 @@ function PreOrBlock({ node, children, ...props }) {
   if (code?.lang === 'mermaid') return <MermaidBlock text={code.text} />;
   return <pre {...props}>{children}</pre>;
 }
+// 답변 속 링크는 새 탭에서 연다 — 같은 탭에서 열리면 대화가 통째로 사라진다(이력은 서버에 없다).
+// 페이지 안 앵커(#…)만 제자리에서 연다. noopener는 새 탭이 이 창(window.opener)을 만지지 못하게,
+// noreferrer는 사내 URL이 링크 대상에 referer로 새지 않게 한다.
+// javascript: 같은 위험한 주소는 react-markdown이 걸러 href=""로 넘기는데, 빈 href는 '현재 문서'라
+// 누르면 페이지가 다시 읽혀 대화가 사라진다 — 그런 것은 href 없는 글자로만 남긴다.
+function NewTabLink({ node, href, children, ...props }) {
+  if (typeof href !== 'string' || href === '') return <a {...props}>{children}</a>;
+  const inPage = href.startsWith('#');
+  return <a href={href} {...props} {...(inPage ? {} : { target: '_blank', rel: 'noopener noreferrer' })}>{children}</a>;
+}
 // 플러그인 배열과 마찬가지로 모듈 상수여야 한다 — 새 객체를 넘기면 매 렌더가 파이프라인 재구축이다.
-const MD_COMPONENTS = { pre: PreOrBlock };
+const MD_COMPONENTS = { pre: PreOrBlock, a: NewTabLink };
 
 // 입력창 타이핑마다 전체 대화가 다시 렌더되지 않도록 메시지 하나를 분리해 memo한다
 // (assistant 답변은 markdown 파싱 비용이 있어 대화가 길어질수록 체감된다)
@@ -138,7 +148,10 @@ function downloadCsv(step) {
   const a = document.createElement('a');
   a.href = url;
   a.download = csvFileName(step.query_name, step.targetDb);
+  // 문서에 붙였다 뗀다 — 떠 있는 앵커의 click()은 브라우저에 따라 내려받기를 시작하지 않는다(구형 Firefox).
+  document.body.appendChild(a);
   a.click();
+  a.remove();
   // 즉시 해제하면 일부 브라우저가 내려받기를 시작하기 전에 URL을 잃는다 — 한 틱 뒤에 해제한다.
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
@@ -161,7 +174,7 @@ function TraceStep({ step: t, showGrid }) {
   const rows = t.rows ?? [];
   return (
     <div className="trace-step">
-      <div className={`trace-head${rows.length > 0 ? ' with-grid' : ''}`}>
+      <div className="trace-head">
         {/* 대상 DB가 여럿인 쿼리는 쿼리 이름만으로 무엇을 조회했는지 알 수 없다.
             대상이 하나인 등록에서도 함께 보여준다 — 있고 없고가 등록 형태에 따라 갈리면
             같은 화면이 어떤 줄에서만 DB를 밝히게 되어 그 차이가 뜻으로 읽힌다.
