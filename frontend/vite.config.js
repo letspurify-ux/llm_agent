@@ -29,6 +29,12 @@ const server = {
 export default defineConfig({
   plugins: [react()],
   server,
+  // 빌드 타깃을 적어 둔다. vite 6부터 기본값이 'baseline-widely-available'(chrome107·safari16 등)로
+  // 올라가, 올리는 것만으로 구형 브라우저가 조용히 떨어져 나간다 — 이 화면은 사내 PC에서 열리고
+  // 코드·CSS도 옛 Safari를 염두에 두고 쓰여 있다(App.jsx의 fetch 주석, index.html의 overflow-wrap·
+  // overflow: clip 주석). 그래서 vite 5까지의 기본값을 그대로 명시해 폭을 유지한다.
+  // 넓히거나 좁히려면 여기만 고치면 되고, 그 결정이 눈에 보인다.
+  build: { target: ['es2020', 'edge88', 'firefox78', 'chrome87', 'safari14'] },
   // `npm run build` 결과를 확인하는 preview 서버도 같은 규칙으로 연다 — 한쪽만 열어두면
   // dev에서 되던 외부 접속이 preview에서만 안 되는 이유를 찾느라 시간을 버린다.
   // 같은 객체를 그대로 넘기지 않고 복사한다: 두 모드가 한 객체를 공유하면 vite가 설정을

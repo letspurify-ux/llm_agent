@@ -75,6 +75,11 @@
         .home-btn { padding: 8px 11px; }
         .home-btn .home-label { display: none; }
       }
+      /* 좁은 화면에서 말풍선 78%는 낭비다 — 320px 창에서 답변 안의 표는 159px, 열 두 개도 못 담는
+         세로 띠가 된다. 답변은 폭을 다 쓰게 하고(누구의 말인지는 색·모서리·정렬이 이미 말한다),
+         내가 한 말은 오른쪽에 붙은 것이 보이도록 조금 남긴다. 바깥 여백도 함께 줄여 글이 들어갈
+         자리를 실제로 만든다. .bubble 정의보다 아래에 두어야 하므로 규칙은 파일 끝에 있다
+         (여기 480px 블록은 헤더 것이다) — 아래 '좁은 화면' 절 참고. */
 
       /* ===== 채팅 영역 ===== */
       /* .chat이 페이지의 스크롤 상자다(문서 자체는 스크롤되지 않는다). 창 너비 전체를 차지해 스크롤바가
@@ -313,6 +318,8 @@
       }
       .trace-grid th.idx { z-index: 2; background: #f1f3fb; }
       .trace-grid td.num { text-align: right; font-variant-numeric: tabular-nums; }
+      /* 종이에서만 보이는 한 줄 — 인쇄된 표가 잘려 보이는 이유와 전체를 가져가는 길을 알려 준다 */
+      .trace-print-note { display: none; font-size: 11px; color: var(--muted); margin: 4px 0 0; }
 
       /* ===== 타이핑 인디케이터 ===== */
       .typing { display: flex; gap: 5px; padding: 6px 2px; }
@@ -358,6 +365,52 @@
       }
       .send:hover:not(:disabled) { transform: scale(1.06); }
       .send:disabled { opacity: 0.35; cursor: default; box-shadow: none; }
+
+      /* ===== 동작 줄이기 =====
+         OS에서 '동작 줄이기'를 켠 사람에게 움직임은 취향이 아니라 멀미다(전정 장애). 여기서는 자리를
+         옮기는 것만 걷어낸다 — 새 말풍선이 아래에서 밀려 올라오는 것, 점이 튀는 것, 버튼이 들리는 것.
+         기다리는 중이라는 깜빡임은 투명도만 남겨 둔다: 아예 멈추면 멈춘 화면과 구별되지 않는다.
+         대화를 따라가는 스크롤은 CSS가 아니라 App.jsx의 glide가 같은 질문을 하고 한 번에 놓는다. */
+      @media (prefers-reduced-motion: reduce) {
+        .bubble { animation: none; }
+        .typing i { animation-name: blink-fade; }
+        .home-btn:hover:not(:disabled), .chip:hover { transform: none; }
+        .send:hover:not(:disabled) { transform: none; }
+      }
+      @keyframes blink-fade { 0%, 70%, 100% { opacity: 0.25; } 35% { opacity: 1; } }
+
+      /* ===== 인쇄 =====
+         이 화면은 창 높이에 붙박인 껍데기고 대화는 그 안에서만 스크롤된다 — 그대로 인쇄하면 브라우저는
+         껍데기 한 장, 곧 지금 보이는 한 화면만 찍고 나머지(8,000px짜리 대화가 A4 한 장이 된다) 버린다.
+         인쇄할 때만 껍데기를 풀어 문서가 제 길이를 갖게 한다. 입력창·홈 단추는 종이에서 할 일이 없고,
+         표의 높이 상한(55vh)도 종이에서는 행을 자르는 일만 하므로 푼다. 접어 둔 것은 접힌 채로 둔다 —
+         보이는 대로 찍히는 것이 인쇄다. */
+      @media print {
+        html, body, #root, .app { height: auto; overflow: visible; }
+        .app { display: block; }
+        .chat { overflow: visible; flex: none; isolation: auto; scrollbar-gutter: auto; }
+        .chat-inner { max-width: 100%; padding: 0; }
+        .composer-wrap, .home-btn, .trace-csv { display: none; }
+        .header { position: static; }
+        .bubble { max-width: 100%; box-shadow: none; animation: none; }
+        /* 표만은 상한을 그대로 둔다. 조회 결과는 200행·1000행이 예사라, 상한을 풀면 대화 하나가 수십
+           쪽이 되고 Chrome의 쪽 나누기가 1,000행을 넘기면서 몇 분씩 멎는다(2답=800행 1.3초, 3답=1,200행
+           40초에도 못 끝냄). 그래서 표는 화면에 보이는 만큼만 찍고, 전체는 CSV로 가져가라고 적어 준다
+           (.trace-print-note). overflow만 hidden으로 바꾸는 것은 종이에 스크롤바를 그리지 않기 위함이다. */
+        .trace-grid { overflow: hidden; }
+        .trace-print-note { display: block; }
+        .md .chart { break-inside: avoid; }
+        /* 종이에는 가로 스크롤이 없다 — 코드는 접어서 보여 준다(표·차트는 원래 폭을 지킨다) */
+        .md pre { white-space: pre-wrap; overflow: visible; }
+      }
+
+      /* ===== 좁은 화면 ===== (앞의 .bubble·.chat-inner를 덮으므로 그 뒤에 온다) */
+      @media (max-width: 480px) {
+        .chat-inner { padding: 16px 12px 8px; }
+        .bubble { padding: 12px 13px; }
+        .bubble.assistant { max-width: 100%; }
+        .bubble.user { max-width: 88%; }
+      }
     </style>
   </head>
   <body>

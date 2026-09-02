@@ -194,6 +194,9 @@ function TraceStep({ step: t, showGrid }) {
 function TraceGrid({ rows }) {
   const cols = columnsOf(rows);
   const ref = useRef(null);
+  // 이 표가 상자 밖으로 나가 있는가(세로든 가로든). 종이에는 스크롤이 없어 그만큼이 그냥 잘리므로,
+  // 잘리는 표에만 인쇄용 안내를 붙인다 — 다 들어가는 표에까지 붙이면 거짓말이 된다.
+  const [clipped, setClipped] = useState(false);
   // 세로 스크롤바가 실제로 생긴 표는 휠을 붙잡는다(overscroll-behavior: contain) — 표 위에서 굴린 휠은
   // 표만 움직이고, 끝에 닿아도 대화로 번지지 않는다. 그냥 두면 Chrome은 휠 제스처를 표에 걸어(latching)
   // 끝에 닿은 뒤로는 멈춘 듯하다가 잠깐 쉬면 그때부터 대화가 움직여, 같은 자리에서 굴려도 표가 움직일지
@@ -207,13 +210,17 @@ function TraceGrid({ rows }) {
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el || typeof ResizeObserver === 'undefined') return;
-    const mark = () => { el.style.overscrollBehavior = el.scrollHeight - el.clientHeight > el.clientHeight / 2 ? 'contain' : ''; };
+    const mark = () => {
+      el.style.overscrollBehavior = el.scrollHeight - el.clientHeight > el.clientHeight / 2 ? 'contain' : '';
+      setClipped(el.scrollHeight - el.clientHeight > 1 || el.scrollWidth - el.clientWidth > 1);
+    };
     mark();
     const ro = new ResizeObserver(mark);
     ro.observe(el);
     return () => ro.disconnect();
   }, [rows]);
   return (
+    <>
     <div className="trace-grid" ref={ref}>
       <table>
         <thead>
@@ -232,6 +239,9 @@ function TraceGrid({ rows }) {
         </tbody>
       </table>
     </div>
+    {/* 화면에서는 감춰 두고 인쇄에서만 보인다 (index.html의 @media print) */}
+    {clipped && <p className="trace-print-note">인쇄물에는 이 표의 화면에 보이던 부분만 담깁니다 — 전체 {rows.length}행은 ‘CSV 내려받기’로 저장하세요.</p>}
+    </>
   );
 }
 
@@ -267,6 +277,11 @@ const Message = memo(function Message({ role, text, trace }) {
   );
 });
 
+// '동작 줄이기' 설정. MediaQueryList를 한 번 만들어 두고 쓸 때마다 .matches를 읽는다 — 값이 아니라
+// 창을 들고 있는 셈이라 설정이 바뀌면 다음 스크롤부터 바로 따른다. 오래된 환경(matchMedia 없음)에서는
+// undefined가 되고, 쓰는 쪽의 ?.가 '줄이지 않음'으로 읽는다.
+const REDUCED = typeof matchMedia === 'function' ? matchMedia('(prefers-reduced-motion: reduce)') : null;
+
 export default function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -296,7 +311,10 @@ export default function App() {
   const stopGlide = () => { if (glideRef.current) cancelAnimationFrame(glideRef.current.raf); glideRef.current = null; };
   function glide(el, target, instant) {
     stopGlide();
-    if (instant) { el.scrollTop = target(); return; }
+    // '동작 줄이기'를 켠 사람에게는 한 번에 놓는다. 브라우저의 smooth 스크롤은 이 설정을 스스로 지켰지만
+    // 우리가 프레임을 직접 놓기 시작한 이상 지키는 것도 우리 몫이다 — 화면이 흐르는 것 자체가 어지러운
+    // 사람들이 있다. 매번 다시 묻는 이유는 설정이 대화 도중에도 바뀌기 때문이다.
+    if (instant || REDUCED?.matches) { el.scrollTop = target(); return; }
     const t0 = performance.now(); const from = el.scrollTop; const D = 350;
     const g = glideRef.current = { raf: 0, expect: from };
     const step = now => {
@@ -361,9 +379,35 @@ export default function App() {
     const onToggle = e => { if (e.target.open) unstick(); };
     el?.addEventListener('click', onSummaryClick, true);
     el?.addEventListener('toggle', onToggle, true);
+
+    // 헤더와 입력창 위에서 굴린 휠은 아무 일도 하지 않는다 — 이 화면에서 스크롤되는 것은 대화뿐인데
+    // 그 둘은 대화 밖에 있고, 사슬의 끝인 뷰포트는 움직이지 않기 때문이다. 창이 낮으면 그 죽은 자리가
+    // 화면의 1/3이다(높이 360px에서 헤더 69 + 입력창 88). 대화로 넘긴다 — PageUp·PageDown과 같은 규칙으로,
+    // 입력창이 그 방향으로 더 갈 수 있으면 입력창 몫으로 둔다. 대화 안에서 굴린 것은 손대지 않는다:
+    // 브라우저가 이미 처리했고(표 안이면 표가 받는다) 여기서 더하면 두 번 움직인다.
+    const app = el?.parentElement;
+    const onOutsideWheel = e => {
+      if (!el || el.contains(e.target)) return;
+      // 확대 제스처(트랙패드 핀치, Ctrl+휠)는 휠 이벤트로 오지만 스크롤이 아니다 — 확대만 하고 지나간다.
+      // 가로로만 스친 것(deltaY 0)도 여기서 할 일이 없다: 아래에서 0을 더하면 스크롤 이벤트조차 나지
+      // 않아, 따라가던 미끄러짐만 소리 없이 끊기고 답의 끝이 화면 밑에 남는다.
+      if (e.ctrlKey || !e.deltaY) return;
+      const ta = e.target.closest?.('textarea');
+      if (ta) {
+        const room = e.deltaY < 0 ? ta.scrollTop : ta.scrollHeight - ta.clientHeight - ta.scrollTop;
+        if (room > 1) return;
+      }
+      // deltaMode: 픽셀(0)이 보통이지만 줄(1)·쪽(2)으로 오는 환경이 있다 — 픽셀로 환산한다.
+      const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? el.clientHeight : 1;
+      stopGlide();
+      el.scrollTop += e.deltaY * unit;
+    };
+    app?.addEventListener('wheel', onOutsideWheel, { passive: true });
+
     return () => {
       el?.removeEventListener('click', onSummaryClick, true);
       el?.removeEventListener('toggle', onToggle, true);
+      app?.removeEventListener('wheel', onOutsideWheel);
       growRef.current?.disconnect();
       stopGlide();
     };
