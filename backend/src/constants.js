@@ -2,17 +2,15 @@
 // 별도 모듈로 둔 이유: 이 값들이 oracle.js/agent.js/llm*.js에 걸쳐 있어 어느 한쪽에 두면
 // 프롬프트 조립 모듈이 DB 드라이버(oracledb)를 import하게 되고, 정의와 사용 방향이 엇갈린다.
 
-// 조회 결과 상한 — capped 판정(oracle.js)과 사용자 안내 문구(llm*.js)가 같은 값을 봐야 한다
-export const MAX_ROWS = 100;
+// 조회 결과 상한 — capped 판정(oracle.js)과 사용자 안내 문구(llm*.js)가 같은 값을 봐야 한다.
+// 이 행 전부가 가는 곳은 화면 trace 패널(result.js clientTrace)과 답변의 차트 참조(chart.js, 글자 예산으로
+// 따로 묶인다)뿐이다 — 프롬프트·chat_log는 MAX_RESULT_ROWS(20)만 본다. 한 스텝의 최악 크기는
+// MAX_ROWS × MAX_RESULT_COLS × MAX_CELL_LEN(1000 × 30 × 200자 ≈ 6MB)이고 스텝 수(MAX_STEPS)만큼 곱해진다 —
+// 응답 하나가 그만큼 커질 수 있음을 알고 잡은 값이다(보통의 결과는 열 10개·셀 20자 안팎이라 수백 KB).
+export const MAX_ROWS = 1000;
 
 // LLM 컨텍스트/답변에 전달할 최대 행 수 (총 건수는 totalRows로 보존)
 export const MAX_RESULT_ROWS = 20;
-
-// 화면 trace 패널 한 스텝에 싣는 행 수. 답변 본문(MAX_RESULT_ROWS)보다 적게 잡는다 — 패널은
-// '무엇을 근거로 답했는지' 확인하는 곳이라 표본이면 충분하고, 이 크기가 스텝 수만큼 곱해진다.
-// 리터럴로 두면 안 되는 값이다: 몇 건을 감췄는지 함께 알리려면 표시 쪽과 계산 쪽이 같은 수를
-// 봐야 하는데, 서버 파일 안의 숫자 하나는 그것을 보장하지 못한다 (result.js clientTrace).
-export const MAX_TRACE_ROWS = 10;
 
 // 셀 값 최대 길이 (CLOB 등 대형 텍스트 방어). 드라이버 경계(oracle.js)에서 바로 적용해
 // 대형 LOB 문자열이 history·chat_log까지 흘러가지 않게 한다.

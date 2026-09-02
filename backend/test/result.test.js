@@ -4,7 +4,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { rowCounts, clientTrace } from '../src/result.js';
-import { MAX_TRACE_ROWS } from '../src/constants.js';
 
 // rows 배열 자체는 비교 대상이 아니므로 건수만 본다
 const counts = h => { const { rows, ...rest } = rowCounts(h); return rest; };
@@ -35,22 +34,38 @@ test('totalRows가 없으면 실린 건수로 폴백한다', () => {
 });
 
 // ===== 화면 trace 패널 (clientTrace) =====
-// 같은 기록의 세 번째 대상. 여기서 조용히 깨지는 것이 둘이다 —
-//   ① 총 건수는 말하면서 행은 말없이 잘라 보내면 사용자가 그 표본을 전부로 읽는다.
-//   ② 드라이버 원문을 가리는 판정이 뚫리면 스키마명·접속 주소가 화면으로 나간다.
-// 둘 다 오류를 남기지 않으므로 회귀 테스트가 유일한 방어선이다.
+// 같은 기록의 세 번째 대상. 여기서 조용히 깨지는 것이 셋이다 —
+//   ① 조회된 행 전부를 볼 수 있는 자리가 이 패널뿐인데, history의 20행으로 물러나 버리면 사용자는
+//      그 표본을 전부로 읽는다(모델은 그중 몇 행만 답변에 옮겨 적는다).
+//   ② 총 건수는 말하면서 행은 말없이 잘라 보내도 같은 일이 일어난다.
+//   ③ 드라이버 원문을 가리는 판정이 뚫리면 스키마명·접속 주소가 화면으로 나간다.
+// 셋 다 오류를 남기지 않으므로 회귀 테스트가 유일한 방어선이다.
 
-test('trace 패널은 감춘 행 수를 함께 알린다', () => {
-  const [t] = clientTrace([{ query_name: 'q', params: { a: 1 }, rows: nRows(20), totalRows: 100, capped: true }]);
+test('trace 패널에는 history의 20행이 아니라 조회된 행 전부가 실린다', () => {
+  const h = { query_name: 'q', params: { a: 1 }, rows: nRows(20), totalRows: 100, capped: true };
+  const full = Array.from({ length: 100 }, (_, i) => ({ a: i }));
+  const [t] = clientTrace([h], new Map([[h, full]]));
   assert.equal(t.rowCount, '100+');
-  assert.equal(t.rows.length, MAX_TRACE_ROWS);
-  assert.equal(t.omittedRows, 100 - MAX_TRACE_ROWS, '몇 건을 감췄는지 화면이 알 수 있어야 한다');
+  assert.equal(t.capped, true, "'+'의 뜻(상한에 걸려 더 있을 수 있음)을 화면이 문구로 풀 수 있어야 한다");
+  assert.strictEqual(t.rows, full);
+  assert.ok(!('omittedRows' in t), '전부 실었으면 생략 표시가 없어야 한다');
+  // 오류 기록은 fullRows에 없다 — rows가 undefined로 남아야 한다(빈 배열이면 0건 성공으로 읽힌다)
+  const e = { query_name: 'q', params: {}, error: 'x', safe: true };
+  assert.equal(clientTrace([e], new Map([[h, full]]))[0].rows, undefined);
 });
 
-test('다 실은 결과에는 생략 표시를 붙이지 않는다', () => {
-  const [t] = clientTrace([{ query_name: 'q', params: {}, rows: nRows(3), totalRows: 3 }]);
+test('전체 행이 없는 기록은 history의 행으로 물러나되 감춘 행 수를 함께 알린다', () => {
+  const [t] = clientTrace([{ query_name: 'q', params: { a: 1 }, rows: nRows(20), totalRows: 100, capped: true }]);
+  assert.equal(t.rowCount, '100+');
+  assert.equal(t.rows.length, 20);
+  assert.equal(t.omittedRows, 80, '몇 건을 감췄는지 화면이 알 수 있어야 한다');
+});
+
+test('다 실은 결과에는 생략·상한 표시를 붙이지 않는다', () => {
+  const h = { query_name: 'q', params: {}, rows: nRows(3), totalRows: 3 };
+  const [t] = clientTrace([h], new Map([[h, h.rows]]));
   assert.equal(t.rowCount, 3);
-  assert.ok(!('omittedRows' in t), '평소 패널은 지금과 똑같이 조용해야 한다');
+  assert.ok(!('omittedRows' in t) && !('capped' in t), '평소 패널은 조용해야 한다');
 });
 
 test('제어용 note 기록은 실행된 쿼리 목록에서 빠진다', () => {

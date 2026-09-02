@@ -140,7 +140,7 @@
       .md code { background: #eef0fa; padding: 1px 6px; border-radius: 5px; font-size: 12.5px; }
       /* 코드블록(```). 이 규칙이 없으면 <pre> 기본값(white-space: pre)대로 한 줄을 끝까지 늘여
          말풍선 밖으로 수백 px 삐져나간다 — 위의 줄바꿈 규칙은 pre에 닿지 않으므로
-         (줄바꿈을 막는 것이 pre의 정의다) 대신 가로 스크롤로 가둔다. .trace pre와 같은 처방이다. */
+         (줄바꿈을 막는 것이 pre의 정의다) 대신 가로 스크롤로 가둔다. .trace-grid와 같은 처방이다. */
       .md pre {
         margin: 8px 0; padding: 10px 12px; border-radius: 10px;
         background: #f1f3fb; border: 1px solid var(--border);
@@ -205,11 +205,60 @@
         padding: 4px 10px; border-radius: 999px; background: #f1f3fb;
       }
       .trace summary:hover { color: var(--accent); }
-      .trace pre {
-        margin: 6px 0 0; padding: 8px 10px; border-radius: 10px;
-        background: #0f172a; color: #c7d2fe; overflow-x: auto;
-        font-size: 11.5px; line-height: 1.5;
+      .trace-step { margin-top: 6px; }
+      /* 쿼리 이름·바인드 한 줄은 코드처럼 어두운 띠로, 그 아래 행은 밝은 표로 — 무엇을 실행했는지와
+         무엇이 나왔는지를 한눈에 가른다. */
+      .trace-head {
+        display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px;
+        padding: 7px 10px; border-radius: 10px;
+        background: #0f172a; color: #c7d2fe; font-size: 11.5px; line-height: 1.5;
       }
+      .trace-head.with-grid { border-radius: 10px 10px 0 0; }
+      .trace-head code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+      .trace-head .trace-count { color: #a5b4fc; }
+      .trace-head .trace-csv {
+        margin-left: auto; padding: 2px 10px; border-radius: 999px; cursor: pointer;
+        border: 1px solid #3b4a6b; background: transparent; color: #c7d2fe; font-size: 11px;
+      }
+      .trace-head .trace-csv:hover { border-color: #a5b4fc; color: #fff; }
+      /* 조회된 행 전부를 싣는 표. 세로는 이 높이 안에서, 가로는 표 너비만큼 스크롤한다 — 1000행 × 30열이
+         말풍선을 세로로 끝없이 늘이거나(스크롤 따라가기가 그 아래 답변을 놓친다) 가로로 뚫지 않게.
+         머리글은 스크롤해도 붙어 있다(sticky) — 열이 많으면 몇 행만 내려가도 무슨 열인지 잊는다. */
+      .trace-grid {
+        /* 높이는 화면에 비례하되 상한을 둔다 — 큰 모니터에서도 표 하나가 대화를 밀어내지 않게. */
+        max-height: min(55vh, 520px); overflow: auto;
+        border: 1px solid var(--border); border-top: 0; border-radius: 0 0 10px 10px; background: var(--surface);
+      }
+      /* 스크롤바를 늘 보이게 그린다. macOS의 기본(overlay) 스크롤바는 손대기 전까지 숨어 있어서, 잘린 열·행이
+         '더 있다'는 것을 알 길이 없다 — 세로·가로 둘 다. (표준 scrollbar-width/color를 함께 쓰면 Chrome이
+         이 규칙을 무시하고 overlay로 돌아가므로 여기서는 -webkit- 규칙만 쓴다. Firefox는 시스템 설정을 따른다.) */
+      .trace-grid::-webkit-scrollbar { width: 11px; height: 11px; }
+      .trace-grid::-webkit-scrollbar-track, .trace-grid::-webkit-scrollbar-corner { background: #f1f3fb; }
+      .trace-grid::-webkit-scrollbar-thumb { background: #b9c0ec; border-radius: 999px; border: 2px solid #f1f3fb; }
+      .trace-grid::-webkit-scrollbar-thumb:hover { background: #8f99e0; }
+      /* 표는 내용 폭대로 자란다(max-content). 그냥 두면 표가 상자 폭에 맞춰 열을 줄이는데, .bubble에서
+         물려받은 overflow-wrap: anywhere 때문에 글자 단위로 접혀 텍스트 열 하나가 한 글자 폭의 세로 띠가 된다. */
+      .trace-grid table { width: max-content; border-collapse: separate; border-spacing: 0; font-size: 12px; line-height: 1.45; }
+      .trace-grid th, .trace-grid td {
+        padding: 4px 10px; text-align: left; vertical-align: top; white-space: nowrap;
+        border-bottom: 1px solid var(--border); border-right: 1px solid var(--border);
+      }
+      /* 셀 값은 줄바꿈을 살려 보이되(pre-wrap) 한 셀이 표 전체를 끌고 가지 않게 폭을 묶는다 —
+         200자짜리 텍스트 열 하나가 나머지 열을 화면 밖으로 밀어내지 않도록. 폭 제한이 td가 아니라
+         안쪽 상자에 있는 이유: 자동 표 배치는 셀의 max-width를 지킨다는 보장이 없다.
+         anywhere가 아니라 break-word인 이유는 위와 같다 — break-word는 열의 최소 폭 계산에 끼어들지 않아
+         긴 단어가 있을 때만 그 자리에서 접힌다. */
+      .trace-grid .cell { max-width: 24rem; white-space: pre-wrap; word-break: normal; overflow-wrap: break-word; }
+      .trace-grid th { position: sticky; top: 0; z-index: 1; background: #f1f3fb; font-weight: 600; color: var(--text); }
+      .trace-grid tr > :last-child { border-right: 0; }
+      .trace-grid tbody tr:last-child td { border-bottom: 0; }
+      /* 행 번호 열은 가로로 스크롤해도 붙어 있다 — 열이 많은 표에서 몇 번째 행을 보고 있는지 놓치지 않게. */
+      .trace-grid .idx {
+        position: sticky; left: 0; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums;
+        background: var(--surface);
+      }
+      .trace-grid th.idx { z-index: 2; background: #f1f3fb; }
+      .trace-grid td.num { text-align: right; font-variant-numeric: tabular-nums; }
 
       /* ===== 타이핑 인디케이터 ===== */
       .typing { display: flex; gap: 5px; padding: 6px 2px; }

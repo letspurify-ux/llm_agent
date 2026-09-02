@@ -129,13 +129,15 @@ app.post('/api/chat', async (req, res) => {
   }
   try {
     // history: 클라이언트가 보내는 최근 대화 [{role:'user'|'assistant', text}] (서버는 상태를 저장하지 않는다)
-    const { answer, trace, search } = await handleQuestion(message, req.body?.history);
+    const { answer, trace, search, fullRows } = await handleQuestion(message, req.body?.history);
     // 대화 로그 (비동기 — 기록 실패가 응답을 막지 않는다). search(검색 적중 수)를 함께 남겨
     // "검색 0건이라 못 답한 질문"을 SQL로 바로 찾을 수 있게 한다 (README의 chat_log 예시 참고).
     recordChatLog(message, answer, { outcome: 'answered', search, steps: trace });
-    // 화면용 정리(제어용 기록 제외, 원문 오류 가리기, 행 상한과 생략 건수)는 result.js가 한다 —
+    // 화면용 정리(제어용 기록 제외, 원문 오류 가리기, 조회된 행 전부 싣기)는 result.js가 한다 —
     // 건수 해석을 답변 본문·프롬프트와 한 곳에서 공유해야 하고, 여기 두면 테스트가 붙지 않는다.
-    res.json({ answer, trace: clientTrace(trace) });
+    // chat_log(위 steps)에는 20행짜리 trace가 남고 화면에만 전체 행이 간다 — 로그는 분석용 표본이면 되고,
+    // 행 전부가 필요한 사람은 화면에 있다.
+    res.json({ answer, trace: clientTrace(trace, fullRows) });
   } catch (e) {
     console.error('[chat error]', e);
     // 답하지 못한 질문 중 가장 중요한 부류가 이것이다 — 반드시 기록한다.

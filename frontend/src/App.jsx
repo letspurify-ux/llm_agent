@@ -5,6 +5,8 @@ import remarkGfm from 'remark-gfm';
 import { REMARK_PLUGINS, REHYPE_PLUGINS } from './math.js';
 // 차트 블록의 계약(무엇을 차트로 받는가 + 이력으로 되돌릴 때의 모양)은 chart.js에 있다.
 import { parseChartBlock, splitBlock, chartTableMarkdown, chartBlocksToTables, MAX_CHARTS_PER_MESSAGE } from './chart.js';
+// trace 패널의 계약(열·셀 표기·CSV)은 trace.js에 있다.
+import { columnsOf, cellText, toCsv, csvFileName } from './trace.js';
 
 // 그리는 쪽(recharts·mermaid)은 첫 차트·흐름도가 나올 때 내려받는다 — 둘을 합치면 앱 본체의 몇 배라,
 // 글과 표뿐인 대부분의 대화가 그 값을 치를 이유가 없다. 내려받는 동안과 실패했을 때는 표·코드가 보인다.
@@ -129,6 +131,87 @@ const MD_COMPONENTS = { pre: PreOrBlock };
 
 // 입력창 타이핑마다 전체 대화가 다시 렌더되지 않도록 메시지 하나를 분리해 memo한다
 // (assistant 답변은 markdown 파싱 비용이 있어 대화가 길어질수록 체감된다)
+// 조회된 행을 CSV 파일로 내려준다. 클립보드가 아닌 파일인 이유: navigator.clipboard는 https·localhost
+// 밖(사내망의 http 배포)에서는 없고, 수백 행짜리 결과는 어차피 다른 도구로 가져가 쓰는 것이다.
+function downloadCsv(step) {
+  const url = URL.createObjectURL(new Blob([toCsv(step.rows)], { type: 'text/csv;charset=utf-8' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = csvFileName(step.query_name, step.targetDb);
+  a.click();
+  // 즉시 해제하면 일부 브라우저가 내려받기를 시작하기 전에 URL을 잃는다 — 한 틱 뒤에 해제한다.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// 조회 건수 문구. 조회 건수와 실린 행 수는 다를 수 있다 — 몇 건을 보고 있는지 밝히지 않으면
+// 사용자가 실린 것을 전부로 읽는다 (서버 result.js clientTrace가 omittedRows·capped를 준다).
+function countLabel(t) {
+  const n = t.rows?.length ?? 0;
+  if (t.omittedRows) return `${t.rowCount}건 (아래는 그중 ${n}건)`;
+  if (t.capped) return `${n}건 이상 — 조회 상한에 걸려 처음 ${n}건만 가져왔습니다`;
+  return `${t.rowCount}건`;
+}
+
+// 실행된 쿼리 한 건: 이름·대상 DB·바인드 한 줄 + 조회된 행 전부의 표.
+// 모델은 결과를 20행까지만 보고 그중 몇 행만 답변에 옮겨 적으므로, 사용자가 조회 결과 전체를 보는
+// 자리는 이 표뿐이다. 그래서 여기서는 행을 자르지 않는다(서버도 자르지 않는다 — result.js).
+// showGrid: 표는 패널이 한 번 펼쳐진 뒤에만 만든다(Message가 준다). 한 스텝이 1000행 × 30열이면 셀
+// 6만 개다 — 답변마다 펼치지도 않은 표를 DOM에 올리면 대화가 길어질수록 화면 전체가 무거워진다.
+function TraceStep({ step: t, showGrid }) {
+  const rows = t.rows ?? [];
+  return (
+    <div className="trace-step">
+      <div className={`trace-head${rows.length > 0 ? ' with-grid' : ''}`}>
+        {/* 대상 DB가 여럿인 쿼리는 쿼리 이름만으로 무엇을 조회했는지 알 수 없다.
+            대상이 하나인 등록에서도 함께 보여준다 — 있고 없고가 등록 형태에 따라 갈리면
+            같은 화면이 어떤 줄에서만 DB를 밝히게 되어 그 차이가 뜻으로 읽힌다.
+            실행되지 않은 스텝(오류·미등록)에는 서버가 값을 주지 않을 수 있다. */}
+        <code>{t.query_name}{t.targetDb ? `@${t.targetDb}` : ''} {JSON.stringify(t.params)}</code>
+        <span className="trace-count">{t.error ? `오류: ${t.error}` : countLabel(t)}</span>
+        {rows.length > 0 && <button type="button" className="trace-csv" onClick={() => downloadCsv(t)}>CSV 내려받기</button>}
+      </div>
+      {showGrid && rows.length > 0 && <TraceGrid rows={rows} />}
+    </div>
+  );
+}
+
+function TraceGrid({ rows }) {
+  const cols = columnsOf(rows);
+  return (
+    <div className="trace-grid">
+      <table>
+        <thead>
+          <tr><th className="idx">#</th>{cols.map(c => <th key={c}>{c}</th>)}</tr>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={i}>
+              <td className="idx">{i + 1}</td>
+              {cols.map(c => {
+                const v = r?.[c];
+                return <td key={c} className={typeof v === 'number' ? 'num' : v == null ? 'null' : undefined}><div className="cell">{cellText(v)}</div></td>;
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// '⚡ 실행된 쿼리' 패널. 펼침 상태를 Message가 아니라 여기 두는 이유: Message가 다시 렌더되면 markdown을
+// 다시 파싱하고 차트를 다시 그린다 — 패널을 여닫는 일이 그 비용을 내서는 안 된다.
+function TracePanel({ trace }) {
+  // 한 번이라도 펼쳤는가 — 그 뒤로는 접어도 표를 지우지 않는다(다시 펼칠 때 재생성 비용을 내지 않게).
+  const [opened, setOpened] = useState(false);
+  return (
+    <details className="trace" onToggle={e => { if (e.currentTarget.open) setOpened(true); }}>
+      <summary>⚡ 실행된 쿼리 {trace.length}건</summary>
+      {trace.map((t, j) => <TraceStep key={j} step={t} showGrid={opened} />)}
+    </details>
+  );
+}
+
 const Message = memo(function Message({ role, text, trace }) {
   return (
     <div className={`row ${role}`}>
@@ -142,25 +225,7 @@ const Message = memo(function Message({ role, text, trace }) {
               </ChartBudget.Provider>
             </div>
           : text}
-        {trace?.length > 0 && (
-          <details className="trace">
-            <summary>⚡ 실행된 쿼리 {trace.length}건</summary>
-            {trace.map((t, j) => (
-              <pre key={j}>
-                {/* 대상 DB가 여럿인 쿼리는 쿼리 이름만으로 무엇을 조회했는지 알 수 없다.
-                    대상이 하나인 등록에서도 함께 보여준다 — 있고 없고가 등록 형태에 따라 갈리면
-                    같은 화면이 어떤 줄에서만 DB를 밝히게 되어 그 차이가 뜻으로 읽힌다.
-                    실행되지 않은 스텝(오류·미등록)에는 서버가 값을 주지 않을 수 있다. */}
-                {t.query_name}{t.targetDb ? `@${t.targetDb}` : ''} {JSON.stringify(t.params)}
-                {/* 조회 건수와 여기 실린 행 수는 다를 수 있다 — 몇 건을 보고 있는지 밝히지 않으면
-                    사용자가 이 표본을 전부로 읽는다 (서버 result.js clientTrace가 omittedRows를 준다) */}
-                {'\n'}{t.error
-                  ? `오류: ${t.error}`
-                  : `${t.rowCount}건${t.omittedRows ? ` (아래는 그중 ${t.rows.length}건)` : ''}: ${JSON.stringify(t.rows)}`}
-              </pre>
-            ))}
-          </details>
-        )}
+        {trace?.length > 0 && <TracePanel trace={trace} />}
       </div>
     </div>
   );
