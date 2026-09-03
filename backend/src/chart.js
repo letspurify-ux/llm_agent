@@ -34,8 +34,11 @@ export const MAX_CHART_BLOCK_ROWS = 100;
 export const MAX_CHART_INJECT_LEN = 30_000;
 
 // frontend/src/chart.js CHART_FENCE_RE와 같은 모양(왜 이렇게 너그러운지도 거기 적혀 있다). 여기서 놓친 블록은
-// 채워지지 않은 `data:` 참조로 화면에 간다. 들여쓰기(목록 안의 펜스)는 m[1]로 받아 채워 넣는 줄에도 붙인다.
-const FENCE_RE = /^([ \t]*)```[ \t]*chart(?:[ \t]+[^\r\n]*)?\r?\n([\s\S]*?)\r?\n[ \t]*`{3,}[ \t]*\r?$/gim;
+// 채워지지 않은 `data:` 참조로 화면에 간다 — 프런트는 markdown이 펜스로 읽는 것을 다 차트로 그리므로, 백틱 셋만
+// 받던 때에는 ~~~chart·````chart로 적힌 참조가 '조회 결과를 채우지 못했습니다'로 화면에 갔다(실측).
+// 들여쓰기(목록 안의 펜스)는 m[1]로 받아 채워 넣는 줄에도 붙이고, 펜스(m[2])는 다시 쓸 때 그대로 쓴다.
+// 닫는 펜스는 markdown과 같이 여는 펜스에 그 글자(m[3])가 더 붙은 것까지다 — 글자가 섞인 줄은 끝이 아니다. 본문은 m[4].
+const FENCE_RE = /^([ \t]*)((`|~)\3{2,})[ \t]*chart(?:[ \t]+[^\r\n]*)?\r?\n([\s\S]*?)\r?\n[ \t]*\2\3*[ \t]*\r?$/gim;
 const CONFIG_RE = /^\s*(type|title|x|y|y2|xtype|data)\s*:\s*(.*?)\s*$/i;
 
 // 셀 값을 표의 칸으로. 숫자는 천 단위 구분 없이 그대로(프런트가 숫자로 읽는다), 파이프와 줄바꿈은
@@ -103,16 +106,16 @@ const note = (config, why, indent = '') => {
 // 표를 통째로 잃지는 않는다.
 export function resolveChartData(answer, steps) {
   const text = String(answer ?? '');
-  if (!/```[ \t]*chart/i.test(text)) return text;
+  if (!/(?:```|~~~)[ \t]*chart/i.test(text)) return text;
   const needsFill = body => { const b = splitBlock(body); return b.config.data !== undefined && !b.hasTable; };
-  let blocksLeft = [...text.matchAll(FENCE_RE)].filter(m => needsFill(m[2])).length;
+  let blocksLeft = [...text.matchAll(FENCE_RE)].filter(m => needsFill(m[4])).length;
   let budget = MAX_CHART_INJECT_LEN;
-  return text.replace(FENCE_RE, (whole, indent, body) => {
+  return text.replace(FENCE_RE, (whole, indent, fence, _ch, body) => {
     const { config, lines, hasTable } = splitBlock(body);
     if (config.data === undefined) return whole;
     // 표가 함께 있으면 표가 우선이다 — data 줄만 지운다 (프런트는 어차피 무시하지만, 이력으로
     // 되돌아갈 때 남을 이유가 없다).
-    if (hasTable) return `${indent}\`\`\`chart\n${lines.filter(l => l.key !== 'data').map(l => l.raw).join('\n')}\n${indent}\`\`\``;
+    if (hasTable) return `${indent}${fence}chart\n${lines.filter(l => l.key !== 'data').map(l => l.raw).join('\n')}\n${indent}${fence}`;
     // 채울 때는 설정 줄만 남긴다 — 그 밖의 줄(설명 문장, 파이프 하나 든 줄)은 프런트가 표로 오인하거나 버린다.
     const kept = lines.filter(l => l.key && l.key !== 'data').map(l => l.raw);
     const allow = Math.floor(budget / Math.max(1, blocksLeft--));
@@ -140,7 +143,7 @@ export function resolveChartData(answer, steps) {
     }
     budget -= used;
     if (!taken) return note(config, '답변에 실을 수 있는 표의 양을 넘었습니다', indent);
-    const block = `${indent}\`\`\`chart\n${[...kept, ...table].join('\n')}\n${indent}\`\`\``;
+    const block = `${indent}${fence}chart\n${[...kept, ...table].join('\n')}\n${indent}${fence}`;
     // 행 상한이나 예산에 걸려 다 싣지 못한 표는 그 사실을 차트 아래 밝힌다 — 그래프만 보면 그것이 전부로 읽힌다.
     return taken < rows.length ? `${block}\n${indent}_(표는 ${rows.length}행 중 처음 ${taken}행까지만 실었습니다)_` : block;
   });

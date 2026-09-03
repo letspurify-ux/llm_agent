@@ -84,9 +84,25 @@ export function clipAnswer(answer) {
   if (nl > MAX_ANSWER_LEN / 2) cut = cut.slice(0, nl);
   // 코드펜스 안에서 잘렸으면 닫는다 — 열린 채 두면 아래 안내 문장까지 코드블록의 글자로 읽힌다
   // (차트 블록이면 표 아래 설명 줄로 버려져 잘린 사실이 화면에서 사라진다).
-  const fences = cut.match(/^[ \t]*```/gm)?.length ?? 0;
-  if (fences % 2) cut += '\n```';
+  const open = openFence(cut);
+  if (open) cut += `\n${open}`;
   return cut + ANSWER_TRUNC_NOTE;
+}
+
+// 글의 끝에서 아직 열려 있는 코드펜스를 닫는 데 필요한 글자열 — 열린 것이 없으면 null.
+// ``` 줄의 짝만 세면 안 된다(그렇게 세던 때에는 ~~~ 펜스와 ```` 안의 ``` 줄이 어긋나 잘린 답변의 안내 문장이
+// 차트 본문으로 들어갔다 — 실측). markdown과 같이 여는 펜스의 글자와 수를 기억하고, 같은 글자가 그 수 이상 놓인
+// 빈 줄에서만 닫힌 것으로 본다. 백틱 펜스의 여는 줄에 백틱이 더 있으면(```a``` 같은 인라인 코드) 펜스가 아니다.
+// 들여쓰기는 chart.js FENCE_RE와 같이 칸 수를 따지지 않는다(목록 안의 펜스).
+function openFence(text) {
+  let open = null;
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^[ \t]*((`|~)\2{2,})(.*)$/.exec(line);
+    if (!m) continue;
+    if (open) { if (m[2] === open.ch && m[1].length >= open.len && !m[3].trim()) open = null; }
+    else if (m[2] === '~' || !m[3].includes('`')) open = { ch: m[2], len: m[1].length };
+  }
+  return open ? open.ch.repeat(open.len) : null;
 }
 
 // LLM 결정이 시스템에 들어오는 유일한 경계 — 여기서 크기를 확정한다. (테스트에서 쓰므로 export)

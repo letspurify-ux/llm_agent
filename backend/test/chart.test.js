@@ -23,6 +23,23 @@ test('data: step N 을 그 스텝의 전체 행으로 만든 표로 바꾼다', 
   ].join('\n'));
 });
 
+test('물결·백틱 넷 펜스의 data 참조도 채운다 — 프런트가 차트로 그리는 펜스는 다 같은 규칙이다', () => {
+  // 실측: 백틱 셋만 받던 때에는 ~~~chart·````chart로 적힌 data: 참조가 그대로 남아 화면에 '채우지 못했습니다'로 갔다.
+  // 다시 쓸 때 펜스 글자도 그대로 써야 markdown이 같은 블록으로 읽는다.
+  const table = ['| MONTH | CNT | AMT | NOTE |', '| --- | --- | --- | --- |', '| 2024-01 | 120 | 1000.5 | a\\|b |', '| 2024-02 |  | 2500 | x y |'];
+  assert.strictEqual(resolveChartData('~~~chart\ntype: bar\ndata: step 1\n~~~', [rows]),
+    ['~~~chart', 'type: bar', ...table, '~~~'].join('\n'));
+  assert.strictEqual(resolveChartData('````chart\ndata: step 1\n````', [rows]),
+    ['````chart', ...table, '````'].join('\n'));
+  // 표가 이미 있으면 data 줄만 빼고 펜스는 그대로 (닫는 펜스가 더 길어도 여는 것에 맞춰 다시 쓴다)
+  assert.strictEqual(resolveChartData('~~~chart\ndata: step 1\n| a | b |\n| x | 1 |\n~~~~', [rows]),
+    '~~~chart\n| a | b |\n| x | 1 |\n~~~');
+  // markdown 규칙대로 닫는 펜스는 여는 것과 같은 글자·같은 수 이상이어야 한다 — 아니면 블록이 아니니 손대지 않는다
+  for (const md of ['````chart\ndata: step 1\n```', '~~~chart\ndata: step 1\n```', '```chart\ndata: step 1\n~~~', '```chart\ndata: step 1\n```~']) {
+    assert.strictEqual(resolveChartData(md, [rows]), md);
+  }
+});
+
 test('스텝 번호는 이력의 1-based 절대 인덱스다 — 오류·메모 항목도 번호를 차지한다', () => {
   const steps = [null, rows, null]; // 1: 오류, 2: 성공, 3: 메모
   assert.match(resolveChartData(block('type: bar\ndata: step 2'), steps), /\| 2024-01 \| 120 \|/);

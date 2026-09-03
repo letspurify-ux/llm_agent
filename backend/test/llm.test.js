@@ -138,6 +138,24 @@ test('결정 경계가 거대한 answer도 자르고 잘렸음을 알린다', ()
   assert.ok(t.length <= MAX_ANSWER_LEN + 100);
 });
 
+test('잘린 답변의 펜스 닫기는 markdown 규칙을 따른다 — ~~~ 펜스, ```` 안의 ``` 줄, 인라인 코드', () => {
+  // ``` 줄의 짝만 세던 때에는(실측) ~~~chart 블록과 ````chart 안에 ``` 줄이 든 블록이 잘리면 닫히지 않아
+  // 안내 문장이 차트 본문으로 들어갔고(프런트는 표가 아닌 줄을 버리므로 잘린 사실이 화면에서 사라진다),
+  // ```a``` 같은 인라인 코드 줄은 펜스로 세어져 멀쩡한 답변 끝에 빈 펜스를 열었다.
+  const rows = Array.from({ length: Math.ceil(MAX_ANSWER_LEN / 20) }, (_, i) => `| 2024-01 | ${100000 + i} |`).join('\n');
+  const cut = answer => sanitizeDecision({ action: 'answer', answer }).answer.split('\n').slice(-3);
+  const note = /생략했습니다/;
+  let t = cut(`~~~chart\ntype: line\n| 월 | 건수 |\n|---|---|\n${rows}\n~~~\n\n뒤`);
+  assert.strictEqual(t[0], '~~~'); assert.match(t[2], note);
+  t = cut(`\`\`\`\`chart\ntype: line\n\`\`\`\n| 월 | 건수 |\n|---|---|\n${rows}\n\`\`\`\`\n\n뒤`);
+  assert.strictEqual(t[0], '````'); assert.match(t[2], note);
+  t = cut(`~~~chart\r\ntype: line\r\n${rows.replaceAll('\n', '\r\n')}\r\n~~~\r\n`); // CRLF도 chart.js와 같이 받는다
+  assert.strictEqual(t[0], '~~~'); assert.match(t[2], note);
+  // 닫힌 블록 뒤·인라인 코드 뒤에서 잘리면 펜스를 덧붙이지 않는다
+  t = cut(`\`\`\`sql\nselect 1\n\`\`\`\n\n\`\`\`a\`\`\` 인라인\n\n${'글\n'.repeat(MAX_ANSWER_LEN)}`);
+  assert.strictEqual(t[0], '글'); assert.match(t[2], note);
+});
+
 test('바인드로 쓸 수 없는 긴 이름은 뭉개거나 개명하지 않고 버린다', () => {
   // 이름을 자르면 두 방향 모두로 깨진다. 그냥 자르면 앞부분이 같은 두 이름이 한 키로 뭉개져
   // 다른 바인드의 값이 사라지고, 뭉개짐을 피하려 순번을 붙이면(base~2) 그 이름은 ① '~'가

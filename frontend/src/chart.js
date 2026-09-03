@@ -375,14 +375,18 @@ export const chartTableMarkdown = text => chartTableMarkdownFrom(splitBlock(text
 // 같은 정규식이 놓치면 `data:` 참조가 채워지지 않은 채 화면에 온다. 그래서 들여쓰기는 칸 수를 따지지 않고
 // (목록 안의 펜스는 항목 번호 폭만큼 들여 온다 — `10. `이면 4칸), 언어 뒤의 덧말(```chart 월별)과
 // 3개 넘는 백틱으로 닫는 펜스, CRLF도 받는다. 닫는 펜스가 없는 블록(토큰 한도로 잘린 응답)은 잡히지 않고 그대로 남는다.
-export const CHART_FENCE_RE = /^[ \t]*```[ \t]*chart(?:[ \t]+[^\r\n]*)?\r?\n([\s\S]*?)\r?\n[ \t]*`{3,}[ \t]*\r?$/gim;
+// 펜스 글자도 markdown이 받는 대로 — 백틱이든 물결(~~~chart)이든 셋 이상 몇 개든 받는다. 백틱 셋만 받던 때에는
+// ~~~chart·````chart 블록이 화면에서는 차트인데 이력에는 설정 줄째 그대로 실려 갔다(실측). 닫는 펜스는 markdown과
+// 같이 여는 펜스(\1)에 그 글자(\2)가 더 붙은 것까지다 — ````chart 안의 ``` 줄은 끝이 아니라 내용이고, ```~처럼
+// 글자가 섞인 줄도 끝이 아니다. 그룹 1이 펜스, 2가 펜스 글자, 본문은 그룹 3이다.
+export const CHART_FENCE_RE = /^[ \t]*((`|~)\2{2,})[ \t]*chart(?:[ \t]+[^\r\n]*)?\r?\n([\s\S]*?)\r?\n[ \t]*\1\2*[ \t]*\r?$/gim;
 
 // 대화 이력으로 보낼 때 차트 블록을 평범한 표로 되돌린다. 모델의 다음 턴에 필요한 것은 '무슨 값을
 // 보여줬는가'이지 그것을 어떻게 그렸는가가 아니다 — 펜스와 설정 줄을 그대로 돌려보내면 이력
 // 상한(HISTORY_LEN)의 일부를 그 글자가 먹고, 모델은 그 모양을 답변마다 흉내 낸다.
 // 표는 20행까지만 남기고 나머지는 건수로 적는다.
 export function chartBlocksToTables(md) {
-  return String(md ?? '').replace(CHART_FENCE_RE, (_, body) => {
+  return String(md ?? '').replace(CHART_FENCE_RE, (_, _fence, _ch, body) => {
     const { config, table } = splitBlock(body);
     const title = String(config.title ?? '').trim();
     const out = [];

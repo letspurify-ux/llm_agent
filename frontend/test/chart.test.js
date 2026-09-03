@@ -234,6 +234,14 @@ test('chartBlocksToTables: 이력으로 보낼 때 펜스·설정을 벗기고 �
   assert.strictEqual(chartBlocksToTables('10. 항목\n    ```chart\n    | a | b |\n    | x | 1 |\n    ```'), '10. 항목\n    | a | b |\n    | --- | --- |\n    | x | 1 |');
   assert.strictEqual(chartBlocksToTables('```chart 월별\n| a | b |\n| x | 1 |\n````'), '| a | b |\n| --- | --- |\n| x | 1 |');
   assert.strictEqual(chartBlocksToTables('```charts\n| a | b |\n```'), '```charts\n| a | b |\n```');
+  // 물결 펜스(~~~chart)와 백틱 넷 펜스도 markdown은 펜스로 읽어 화면에 차트가 선다 — 이력에서도 표여야 한다
+  // (실측: 이 둘이 이력에는 설정 줄째 그대로 실려 갔다). 닫는 펜스는 여는 것과 같은 글자·같은 수 이상이다:
+  // ````chart 안의 ``` 줄은 markdown에게 끝이 아니라 내용이고, ~~~를 ```로는 닫지 못한다.
+  assert.strictEqual(chartBlocksToTables('~~~chart\ntitle: 물결\n| a | b |\n| x | 1 |\n~~~'), '물결\n| a | b |\n| --- | --- |\n| x | 1 |');
+  assert.strictEqual(chartBlocksToTables('````chart\n| a | b |\n```\n| x | 1 |\n````'), '| a | b |\n| --- | --- |\n| x | 1 |');
+  assert.strictEqual(chartBlocksToTables('````chart\n| a | b |\n```'), '````chart\n| a | b |\n```');
+  assert.strictEqual(chartBlocksToTables('~~~chart\n| a | b |\n```'), '~~~chart\n| a | b |\n```');
+    assert.strictEqual(chartBlocksToTables('```chart\n| a | b |\n```~'), '```chart\n| a | b |\n```~'); // 섞인 글자는 닫는 펜스가 아니다
   // 긴 표는 20행 + 건수
   const rows = Array.from({ length: 25 }, (_, i) => `| r${i} | ${i} |`);
   const out = chartBlocksToTables(`\`\`\`chart\n| a | b |\n|---|---|\n${rows.join('\n')}\n\`\`\``);
