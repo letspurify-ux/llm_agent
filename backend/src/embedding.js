@@ -4,7 +4,7 @@
 // 실패 시 EmbeddingError를 던진다 — 호출부가 '재시도할 실패'와 '입력이 거부된 실패'를 구분해야 하기 때문이다.
 // 미설정(LIKE-only)은 실패가 아니므로 호출부가 isEmbeddingEnabled()로 먼저 갈라낸다.
 // 모델명은 embed-sync의 embed_hash에도 들어간다(모델 교체 시 자동 재임베딩) — 한 곳에서만 정의한다
-import { warnOnce, joinUrl } from './constants.js';
+import { warnOnce, joinUrl, readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_UPSTREAM_ERROR_BYTES } from './constants.js';
 
 export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'bge-m3';
 
@@ -61,9 +61,11 @@ export async function embed(texts, signal) {
     if (!res.ok) {
       // 5xx·429는 서버 사정이라 재시도 가치가 있고, 4xx는 이 입력을 거부한 것이라 없다.
       const retriable = res.status >= 500 || res.status === 429;
-      throw new EmbeddingError(`embeddings API ${res.status}: ${(await res.text()).slice(0, 200)}`, retriable);
+      throw new EmbeddingError(`embeddings API ${res.status}: ${(await readCapped(res, MAX_UPSTREAM_ERROR_BYTES, '임베딩 오류')).slice(0, 200)}`, retriable);
     }
-    const data = await res.json();
+    // LLM 쪽과 같은 이유로 상한을 건다 (constants.readCapped) — 한 번에 BATCH(32)건 × 1024차원이라
+    // 정상 응답은 1MB 이하다. 넘는 응답은 우리가 요청한 것이 아니다.
+    const data = JSON.parse(await readCapped(res, MAX_UPSTREAM_JSON_BYTES, '임베딩'));
     // 응답 항목에 index가 있는 이유가 순서를 보장하지 않기 때문이다 (vLLM/TEI의 continuous batching은
     // 실제로 순서를 바꾼다). 위치로 짝지으면 텍스트와 벡터가 어긋난 채 올바른 해시와 함께 저장돼
     // 이후 동기화가 영영 고치지 못한다 — 반드시 index로 정렬하고 개수도 확인한다.
@@ -80,7 +82,9 @@ export async function embed(texts, signal) {
   } catch (e) {
     if (e instanceof EmbeddingError) throw e;
     // fetch 자체가 던진 것 — 접속 실패·타임아웃·중단. 서버에 닿지 못했으므로 재시도 대상이다.
-    throw new EmbeddingError(e.message, true);
+    // 본문이 상한을 넘어 끊은 것(tooLarge)만 예외다: 같은 입력에 같은 응답이 돌아오므로
+    // 재시도해도 결과가 같고, 호출부(embed-sync)는 그 행을 갈라내야 한다.
+    throw new EmbeddingError(e.message, !e.tooLarge);
   } finally {
     // 타이머와 리스너를 반드시 건다 — 남겨두면 타이머가 이벤트 루프를 붙잡아 CLI(npm run embed)의
     // 종료가 최대 60초 늦어지고, 리스너는 signal이 살아 있는 동안 호출 수만큼 쌓인다.

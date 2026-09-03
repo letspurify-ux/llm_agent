@@ -13,9 +13,12 @@ const { TRUNC_MARK, MAX_COMPLETION_TOKENS } = await import('../src/constants.js'
 
 const CTX = { question: 'q', chat: [], knowledge: [], qaMethods: [], queries: [], history: [] };
 
-// fetch를 스텁해 모델 응답 문자열만 갈아끼운다
+// fetch를 스텁해 모델 응답 문자열만 갈아끼운다.
+// 진짜 Response를 돌려준다 — 본문을 상한 안에서 스트림으로 읽으므로(constants.readCapped),
+// json()만 흉내 낸 더블은 실제와 다른 길을 타고 그 상한을 한 번도 지나지 않는다.
+const 응답 = (obj, status = 200) => new Response(JSON.stringify(obj), { status });
 function reply(content) {
-  globalThis.fetch = async () => ({ ok: true, json: async () => ({ choices: [{ message: { content } }] }), text: async () => '' });
+  globalThis.fetch = async () => 응답({ choices: [{ message: { content } }] });
 }
 
 const decide = async (content, ctx = CTX) => {
@@ -492,7 +495,7 @@ async function sentBody(envValue) {
   let body;
   globalThis.fetch = async (_url, init) => {
     body = JSON.parse(init.body);
-    return { ok: true, json: async () => ({ choices: [{ message: { content: '{"action":"answer","answer":"ok"}' } }] }), text: async () => '' };
+    return 응답({ choices: [{ message: { content: '{"action":"answer","answer":"ok"}' } }] });
   };
   await mod.openaiDecide(CTX);
   delete process.env.LLM_REASONING_EFFORT;
@@ -516,7 +519,7 @@ test('LLM_BASE_URL 끝의 슬래시가 요청 경로에 //를 만들지 않는�
   let url;
   globalThis.fetch = async (u) => {
     url = u;
-    return { ok: true, json: async () => ({ choices: [{ message: { content: '{"action":"answer","answer":"ok"}' } }] }), text: async () => '' };
+    return 응답({ choices: [{ message: { content: '{"action":"answer","answer":"ok"}' } }] });
   };
   try {
     await openaiDecide(CTX);
@@ -700,7 +703,7 @@ async function capturedRequest(ctx = CTX) {
   let body;
   globalThis.fetch = async (_url, init) => {
     body = JSON.parse(init.body);
-    return { ok: true, json: async () => ({ choices: [{ message: { content: '{"action":"answer","answer":"a"}' } }] }), text: async () => '' };
+    return 응답({ choices: [{ message: { content: '{"action":"answer","answer":"a"}' } }] });
   };
   await openaiDecide(ctx);
   return body;
@@ -748,7 +751,7 @@ async function decideCapturingLogs(response) {
   console.log = (...a) => logs.push(a.join(' '));
   console.warn = (...a) => warns.push(a.join(' '));
   try {
-    globalThis.fetch = async () => ({ ok: true, json: async () => response, text: async () => '' });
+    globalThis.fetch = async () => 응답(response);
     const decision = await openaiDecide(CTX);
     return { decision, logs, warns };
   } finally {
@@ -785,4 +788,29 @@ test('answer 안의 차트·mermaid 코드블록이 파싱을 그대로 통과�
   const md = '### 월별\n\n```chart\ntype: bar\ntitle: 월별 처리\nx: 월\ny: 건수\n| 월 | 건수 |\n|---|---|\n| 2024-01 | 120 |\n```\n\n```chart\ntype: line\ndata: step 2\n```\n\n```mermaid\nflowchart TD\n  A[시작] --> B[끝]\n```';
   const d = await decide(JSON.stringify({ action: 'answer', answer: md }));
   assert.deepStrictEqual(d, { action: 'answer', answer: md });
+});
+
+test('상류가 끝없이 쏟아내도 응답을 통째로 받지 않는다', async () => {
+  // 이 자리가 이 시스템에서 유일하게 예산 없는 I/O였다 — 다른 경계에는 전부 상한이 있는데
+  // (질문 1MB, 행 수·셀 길이·컬럼 수, 프롬프트 총량, 조회·LLM·임베딩의 시간 상한) 상류가
+  // 돌려주는 본문만 res.json()으로 통째로 받았다. 확인: 64MB 응답 한 건에 RSS 86MB → 365MB.
+  // 폭주하는 엔드포인트나 잘못 가리킨 주소(LLM_BASE_URL의 오타 하나면 된다) 하나가
+  // 워커의 메모리를 그대로 가져간다.
+  let 보낸MB = 0;
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    pull(c) { 보낸MB++; c.enqueue(new Uint8Array(1024 * 1024)); },   // 끝나지 않는 본문
+  }), { status: 200 });
+  const 경고 = [];
+  const 원래 = console.warn;
+  console.warn = (...a) => 경고.push(a.join(' '));
+  try {
+    // 결정을 얻지 못한다 — 호출부(agent.js)는 강제 답변/폴백으로 간다. 여기서 중요한 것은
+    // '실패했다'가 아니라 '실패하면서 메모리를 다 쓰지는 않았다'이다.
+    assert.equal(await openaiDecide(CTX), null);
+  } finally {
+    console.warn = 원래;
+  }
+  // 두 번 시도하므로 상한(8MB) × 2가 최악이다. 상한이 없으면 여기서 멈추는 것이 없다.
+  assert.ok(보낸MB < 32, `본문을 통째로 받았다: ${보낸MB}MB`);
+  assert.ok(경고.some(l => /상한/.test(l)), `상한에 걸린 사실이 로그에 남지 않았다: ${JSON.stringify(경고)}`);
 });

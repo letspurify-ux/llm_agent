@@ -11,6 +11,7 @@ import {
   MAX_PROMPT_PARAMS_LEN, MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS, PROMPT_FRAME_RESERVE,
   MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, MAX_COMPLETION_TOKENS, MAX_STEPS, MAX_RESULT_ROWS,
   clipText, warnOnce, targetDbNames, isPlainObject, joinUrl,
+  readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_UPSTREAM_ERROR_BYTES,
 } from './constants.js';
 import { bindNames } from './sql.js';
 import { rowCounts } from './result.js';
@@ -157,7 +158,9 @@ async function chatCompletion(userPrompt, timeoutMs) {
     }),
   });
   if (!res.ok) {
-    const detail = (await res.text()).slice(0, 300);
+    // 오류 본문도 상한 안에서만 받는다 — 아래에서 300자만 쓰는데 전부 받아 놓고 자르면
+    // 실패한 요청이 오히려 성공한 요청보다 메모리를 더 쓴다 (constants.readCapped 주석).
+    const detail = (await readCapped(res, MAX_UPSTREAM_ERROR_BYTES, 'LLM 오류')).slice(0, 300);
     // 이 파라미터를 모르는 서버는 400으로 거절한다. 한 번 겪으면 빼고 가도록 표시해두면
     // 바로 이어지는 재시도가 성공한다 (설정 하나 때문에 모든 질문이 실패하지 않게).
     if (res.status === 400 && effortAccepted && /reasoning/i.test(detail)) {
@@ -166,7 +169,9 @@ async function chatCompletion(userPrompt, timeoutMs) {
     }
     throw new Error(`LLM API ${res.status}: ${detail}`);
   }
-  const data = await res.json();
+  // res.json()이 아니라 상한을 건 읽기다 — 이 자리가 이 시스템에서 유일하게 예산 없는 I/O였다
+  // (확인: 64MB 응답 한 건에 RSS 86MB → 365MB). 상한과 근거는 constants.MAX_UPSTREAM_JSON_BYTES.
+  const data = JSON.parse(await readCapped(res, MAX_UPSTREAM_JSON_BYTES, 'LLM'));
   const choice = data.choices?.[0];
   // 실측을 남긴다 — 프롬프트 예산(constants.js)은 문자 기준 추정이고 토큰 수는 서버만 안다.
   // 예산을 다시 잡을 때 필요한 숫자가 이 한 줄이다 (usage를 주지 않는 서버에서는 남길 것이 없다).

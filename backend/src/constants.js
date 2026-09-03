@@ -339,3 +339,50 @@ export function numEnv(name, fallback, { allowZero = false } = {}) {
 // 미설정(undefined)은 그대로 통과시킨다 — '/chat/completions'는 fetch가 URL 파싱 오류로 거부하고,
 // 그 상황은 기동 시점 경고(server.js)가 이미 가리킨다.
 export const joinUrl = (base, path) => `${String(base ?? '').replace(/\/+$/, '')}/${path}`;
+
+// 상류(LLM·임베딩) 응답 본문의 상한.
+// 이 시스템의 다른 I/O 경계에는 모두 예산이 있다 — 질문 1MB(server.js express.json), 행 수·셀
+// 길이·컬럼 수(oracle.js), 프롬프트 총량(MAX_PROMPT_TOTAL_LEN), 조회·LLM·임베딩·관리 DB의 시간
+// 상한. 상류가 돌려주는 본문만 res.json()으로 통째로 받고 있었다. 그 한 자리가 예산 밖이면
+// 상한을 정하는 것은 우리가 아니라 상대다: 폭주하는 엔드포인트나 잘못 가리킨 주소
+// (LLM_BASE_URL의 오타 하나면 큰 파일을 가리킬 수 있다) 하나가 워커의 메모리를 그대로 가져간다.
+// 확인: 64MB짜리 응답 한 건에 백엔드 RSS가 86MB → 365MB로 올랐다(버퍼·문자열·파싱 결과가 겹친다).
+//
+// 값의 근거. 완성은 MAX_COMPLETION_TOKENS(16,384)로 이미 묶여 있다 — 한 토큰이 최악으로 길고
+// (한글은 토큰당 3바이트 남짓) JSON 이스케이프까지 겹쳐도 1MB 안쪽이고, 사고 과정 블록과
+// usage·id 같은 껍데기를 넉넉히 얹어도 이 값에 닿지 않는다. 임베딩도 같은 값을 쓴다: 한 번에
+// BATCH(32)건 × 1024차원이라 실측 1MB 이하다. 즉 이 상한에 걸리는 응답은 우리가 요청한 것이 아니다.
+export const MAX_UPSTREAM_JSON_BYTES = 8 * 1024 * 1024;
+// 오류 응답은 앞부분만 로그에 남긴다(LLM 300자·임베딩 200자) — 그 이상은 받을 이유가 없다.
+export const MAX_UPSTREAM_ERROR_BYTES = 64 * 1024;
+
+// 상류 응답 본문을 상한 안에서만 읽는다. 다 받아 놓고 자르면 이미 메모리는 다 쓴 뒤다 —
+// 넘는 순간 거기서 끊고 스트림을 취소한다(연결도 함께 놓는다).
+// what은 오류 문구에 들어갈 이름이다: 이 실패는 'LLM 호출 실패' 한 줄로 뭉개지면 원인을 알 수 없다.
+// 넘쳤다는 사실은 tooLarge로 표시해 둔다 — 같은 입력을 다시 보내도 결과가 같으므로 재시도 대상이
+// 아니고, 그 판정을 부르는 쪽이 해야 한다(embedding.js의 retriable).
+// body가 없는 응답은 text()로 물러선다. 실제 fetch는 언제나 본문 스트림을 주므로 이 길은
+// 스텁(테스트 더블)을 위한 것이다.
+export async function readCapped(res, maxBytes, what) {
+  if (!res?.body?.getReader) return String(await res.text());
+  const reader = res.body.getReader();
+  const 조각 = [];
+  let 크기 = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      크기 += value.byteLength;
+      if (크기 > maxBytes) {
+        const e = new Error(`${what} 응답이 상한(${maxBytes.toLocaleString('en-US')} bytes)을 넘었습니다`);
+        e.tooLarge = true;
+        throw e;
+      }
+      조각.push(value);
+    }
+  } finally {
+    // 끝까지 읽었으면 아무 일도 하지 않고, 도중에 끊었으면 남은 본문을 버리고 연결을 놓는다.
+    await reader.cancel().catch(() => { /* 이미 닫혔다 */ });
+  }
+  return Buffer.concat(조각).toString('utf8');
+}

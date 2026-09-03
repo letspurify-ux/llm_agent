@@ -3,7 +3,8 @@
 // 함께 쓴다. 여기가 어긋나면 어긋난 티가 나지 않는 자리에서 조용히 갈라진다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { clipText, nameKey, stripLoneSurrogates, numEnv, bindValue, warnOnce, targetDbNames, joinUrl, isPlainObject } from '../src/constants.js';
+import { clipText, nameKey, stripLoneSurrogates, numEnv, bindValue, warnOnce, targetDbNames, joinUrl, isPlainObject,
+  readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_COMPLETION_TOKENS } from '../src/constants.js';
 
 test('절단이 서로게이트 쌍을 쪼개지 않는다', () => {
   // 쪼개면 짝 잃은 코드유닛이 남아 JSON은 통과하지만 유효한 UTF-8이 아니게 된다 —
@@ -154,4 +155,53 @@ test('키-값 객체 판정은 배열·null·문자열을 통과시키지 않는
   assert.equal(isPlainObject({}), true);
   assert.equal(isPlainObject({ a: 1 }), true);
   for (const v of [[], ['a'], null, undefined, 'a=b', 7, true]) assert.equal(isPlainObject(v), false, String(v));
+});
+
+// 끝없이 쏟아내는 상대. 몇 조각까지 실제로 받아갔는지 세어 둔다 — '상한을 넘으면 던진다'만으로는
+// 다 받아 놓고 던지는 것과 구분되지 않는데, 자원의 관점에서는 그 둘이 정반대다.
+function 쏟아내는_응답(조각크기, 최대조각 = Infinity) {
+  const 센것 = { 보낸조각: 0 };
+  const body = new ReadableStream({
+    pull(c) {
+      if (센것.보낸조각 >= 최대조각) { c.close(); return; }
+      센것.보낸조각++;
+      c.enqueue(new Uint8Array(조각크기));
+    },
+  });
+  return { res: { body }, 센것 };
+}
+
+test('상류 응답은 상한 안에서만 읽고, 넘으면 그 자리에서 끊는다', async () => {
+  // 이 시스템의 다른 I/O 경계에는 전부 예산이 있다(질문 1MB·행 수·셀 길이·프롬프트 총량·시간 상한).
+  // 상류가 돌려주는 본문만 res.json()으로 통째로 받고 있었다 — 그러면 상한을 정하는 것은 우리가
+  // 아니라 상대다 (확인: 64MB 응답 한 건에 백엔드 RSS가 86MB → 365MB로 올랐다).
+  assert.equal(await readCapped(new Response('{"a":1}'), 1024, 'LLM'), '{"a":1}');
+  // 정확히 상한까지는 받는다 (경계에서 멀쩡한 응답을 버리지 않게)
+  assert.equal((await readCapped(new Response('abcde'), 5, 'LLM')).length, 5);
+
+  const { res, 센것 } = 쏟아내는_응답(64 * 1024);   // 끝나지 않는 본문
+  await assert.rejects(() => readCapped(res, 256 * 1024, 'LLM'), e => {
+    assert.match(e.message, /LLM 응답이 상한/);
+    // 같은 입력에 같은 응답이 돌아오므로 재시도 대상이 아니다 — 부르는 쪽이 이 표시로 가른다
+    // (embedding.js의 retriable).
+    assert.equal(e.tooLarge, true);
+    return true;
+  });
+  // 다 받아 놓고 던진 것이 아니라 넘긴 그 자리에서 끊었는가. 상한 256KB / 조각 64KB이므로
+  // 다섯 조각이면 넘고, 스트림이 한 조각 앞서 당겨 오는 몫까지 봐도 여섯이다.
+  assert.ok(센것.보낸조각 <= 6, `상한을 넘긴 뒤에도 계속 받았다: ${센것.보낸조각}조각`);
+});
+
+test('본문 스트림이 없는 응답은 text()로 물러선다', async () => {
+  // 실제 fetch는 언제나 본문 스트림을 준다 — 이 길은 스텁(테스트 더블)을 위한 것이고,
+  // 그 더블이 상한을 지나지 않는다는 사실이 여기 적혀 있어야 한다.
+  assert.equal(await readCapped({ text: async () => 'x' }, 1, 'LLM'), 'x');
+});
+
+test('상류 응답 상한은 완성 토큰 상한보다 넉넉하다', () => {
+  // 상한에 걸리는 응답은 '우리가 요청한 것이 아니다'가 이 값의 근거다. 한 토큰이 최악으로 길고
+  // (한글 3바이트 남짓) JSON 이스케이프까지 겹쳐도 요청한 완성은 이 값 안에 들어야 한다 —
+  // 그러지 않으면 정상 답변이 상한에 걸려 모든 질문이 'LLM 호출 실패'로 끝난다.
+  assert.ok(MAX_UPSTREAM_JSON_BYTES > MAX_COMPLETION_TOKENS * 3 * 6,
+    `완성 상한(${MAX_COMPLETION_TOKENS}토큰)에 비해 응답 상한이 빠듯하다: ${MAX_UPSTREAM_JSON_BYTES}`);
 });
