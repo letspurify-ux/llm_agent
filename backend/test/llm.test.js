@@ -5,7 +5,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { llm, renderAnswer, sanitizeDecision, llmProvider } from '../src/llm.js';
-import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN } from '../src/constants.js';
+import { normalizeCells } from '../src/oracle.js';
+import { MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN } from '../src/constants.js';
 
 const ok = (name, rows, extra = {}) => ({ query_name: name, params: {}, rows, totalRows: rows.length, ...extra });
 
@@ -27,6 +28,18 @@ test('셀 안의 파이프·개행·역슬래시가 표를 무너뜨리지 않�
   assert.ok(a.includes('C:\\\\\\|share'), a);
   assert.ok(!a.split('\n').some(l => l.includes('한') && l.includes('줄') === false));
   assert.ok(a.includes('한 줄'), '개행은 공백으로 바뀌어야 한다');
+});
+
+test('홀로 선 CR도 개행이다 — 잘린 CRLF 셀이 표의 행을 가르지 않는다', () => {
+  // CommonMark는 \r 하나도 줄 끝으로 읽는다(remark-gfm로 실측: `| x\ry | b1 |`이 두 행으로 갈라져
+  // 'y'가 다음 행의 첫 칸이 되고 뒤 칸의 값이 밀렸다). `\r?\n`만 바꾸면 이 CR이 그대로 나간다.
+  // 실제 경로: CRLF를 담은 텍스트 셀을 oracle.js normalizeCells가 MAX_CELL_LEN에서 자르면 \r만 남는다.
+  const clipped = normalizeCells({ A: 'a'.repeat(MAX_CELL_LEN - 1) + '\r\nb' }).A;
+  assert.ok(clipped.endsWith('\r' + TRUNC_MARK), '전제: 드라이버 경계가 CRLF 한가운데를 자를 수 있다');
+  const a = renderAnswer({ knowledge: [], history: [ok('q', [{ A: clipped, B: 'b1' }, { A: 'x\ry', B: 'b2' }])] });
+  assert.ok(!a.includes('\r'), '표에 CR이 남으면 그 행이 둘로 갈라진다');
+  assert.ok(a.split('\n').some(l => l.includes(TRUNC_MARK) && l.endsWith('| b1 |')), a);
+  assert.match(a, /\| x y \| b2 \|/);
 });
 
 test('행마다 컬럼이 달라도 값이 표에서 사라지지 않는다', () => {
