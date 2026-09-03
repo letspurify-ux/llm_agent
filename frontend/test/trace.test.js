@@ -2,7 +2,7 @@
 // CSV는 조용히 깨진다: 쉼표가 든 값 하나가 옆 열로 밀려도 파일은 열리고, 한글이 깨진 파일도 열린다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { columnsOf, cellText, toCsv, csvFileName } from '../src/trace.js';
+import { columnsOf, cellText, toCsv, csvFileName, countLabel } from '../src/trace.js';
 
 test('열은 첫 등장 순서의 합집합이다', () => {
   assert.deepStrictEqual(columnsOf([{ B: 1, A: 2 }, { A: 3, C: 4 }, null, 'x']), ['B', 'A', 'C']);
@@ -43,4 +43,21 @@ test('파일 이름은 쿼리 이름@DB에서 파일에 못 쓰는 글자를 바
   assert.strictEqual(csvFileName('a/b:c?', undefined), 'a_b_c_.csv');
   assert.strictEqual(csvFileName('', ''), 'result.csv');
   assert.strictEqual(csvFileName(undefined), 'result.csv');
+});
+
+// 건수 문구는 '실린 것을 전부로 읽는 것'을 막는 유일한 자리다 — 서버가 주는 모양(capped·omittedRows·
+// '1000+'꼴 rowCount)마다 무엇을 말하는지 못박아 둔다.
+test('건수 문구: 상한·생략·둘 다·근거 없음을 각각 말한다', () => {
+  const rows = n => Array.from({ length: n }, (_, i) => ({ a: i }));
+  assert.strictEqual(countLabel({ rowCount: 30, rows: rows(30) }), '30건');
+  assert.strictEqual(countLabel({ rowCount: 100, omittedRows: 80, rows: rows(20) }), '100건 (아래는 그중 20건)');
+  assert.match(countLabel({ rowCount: '1000+', capped: true, rows: rows(1000) }), /^1000건 이상 — 조회 상한에 걸려/);
+  // 상한에 걸리고 실린 행도 일부면 둘 다 말한다. '1000+건'과 '1000건 이상'이 한 패널에 섞이지 않게
+  // 표기도 하나로 (서버는 capped일 때 rowCount를 '1000+'로 준다).
+  assert.strictEqual(countLabel({ rowCount: '1000+', capped: true, omittedRows: 980, rows: rows(20) }),
+    '1000건 이상 — 조회 상한에 걸렸고, 아래는 그중 20건입니다');
+  // rowCount가 없으면 '몇 건 중 몇 건'을 말할 근거가 없다 — 'undefined건'도, 스스로 어긋난 말도 안 된다
+  assert.strictEqual(countLabel({ rows: rows(12) }), '12건');
+  assert.strictEqual(countLabel({ omittedRows: 8, rows: rows(12) }), '12건');
+  assert.strictEqual(countLabel({ rows: [] }), '0건');
 });

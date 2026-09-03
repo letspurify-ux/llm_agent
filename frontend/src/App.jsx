@@ -6,7 +6,9 @@ import { REMARK_PLUGINS, REHYPE_PLUGINS } from './math.js';
 // 차트 블록의 계약(무엇을 차트로 받는가 + 이력으로 되돌릴 때의 모양)은 chart.js에 있다.
 import { parseChartBlock, splitBlock, chartTableMarkdownFrom, chartBlocksToTables, sliceSafe, clip, MAX_CHARTS_PER_MESSAGE } from './chart.js';
 // trace 패널의 계약(열·셀 표기·CSV)은 trace.js에 있다.
-import { columnsOf, cellText, toCsv, csvFileName } from './trace.js';
+import { columnsOf, cellText, toCsv, csvFileName, countLabel } from './trace.js';
+// 답변 속 주소를 어떻게 다룰지의 판정은 markdown.js에 있다 (순수 함수라 회귀 테스트가 붙는다).
+import { linkAttrs, imageKind } from './markdown.js';
 
 // 그리는 쪽(recharts·mermaid)은 첫 차트·흐름도가 나올 때 내려받는다 — 둘을 합치면 앱 본체의 몇 배라,
 // 글과 표뿐인 대부분의 대화가 그 값을 치를 이유가 없다. 내려받는 동안과 실패했을 때는 표·코드가 보인다.
@@ -137,10 +139,9 @@ function PreOrBlock({ node, children, ...props }) {
 // 내며 그대로 그린다) 바깥 링크가 눌리지 않게 된다. 그림(AltImage)이 이것을 보고 글자로만 남는다.
 const InLink = createContext(false);
 function NewTabLink({ node, href, children, ...props }) {
-  const inPage = typeof href === 'string' && href.startsWith('#');
   const link = typeof href !== 'string' || href === ''
     ? <a {...props}>{children}</a>
-    : <a href={href} {...props} {...(inPage ? {} : { target: '_blank', rel: 'noopener noreferrer' })}>{children}</a>;
+    : <a href={href} {...props} {...linkAttrs(href)}>{children}</a>;
   return <InLink.Provider value={true}>{link}</InLink.Provider>;
 }
 // 답변 속 그림(![글자](주소))은 자동으로 불러오지 않는다. 그 주소는 모델이 쓴 것이고, 모델이 보는
@@ -151,31 +152,20 @@ function NewTabLink({ node, href, children, ...props }) {
 // 무엇을 가리키는지 보이고, 열지 말지는 사람이 정한다. (그림을 정말 띄워야 하는 날이 오면 여기만 되돌린다)
 function AltImage({ node, src, alt, title }) {
   const label = String(alt || title || '').trim();
-  const inLink = useContext(InLink);
-  // 링크로 남기는 것은 http(s)와 주소만 적힌 상대 경로(chart.png, /img/a.png, ?id=3)뿐이다.
-  // 그 밖의 방식(mailto:·tel:·data: 등)은 그림 자리에 올 것이 아니고, 눌러서 좋을 것도 없다.
-  // 라이브러리가 위험한 주소를 걸러 주는 것에 기대지 않고 여기서도 한 번 더 좁힌다.
-  // 링크 안이면(inLink) <a>를 또 열 수 없으므로 글자로만 — 누를 자리는 바깥 링크가 이미 만들어 두었다.
-  // '//호스트/…'는 콜론이 없어 상대 주소처럼 보이지만 바깥으로 나가는 주소다 — 함께 막는다.
-  const scheme = typeof src === 'string' && /^[a-z][a-z0-9+.-]*:/i.exec(src);
-  if (typeof src !== 'string' || src === '' || inLink || src.startsWith('//')
-      || (scheme && !/^https?:$/i.test(scheme[0]))) {
+  const kind = imageKind(src, useContext(InLink));
+  if (kind === 'text') {
     // 열어 주지 않더라도 무엇을 가리키는지는 보여야 한다 — 링크 안의 그림처럼 주소가 아예 닿을 수
     // 없는 자리에서는 이것이 유일한 단서다. 아주 긴 주소(data: 등)는 끝을 줄인다.
     const where = typeof src === 'string' && src ? ` (${clip(src, 60)})` : '';
     return <em>🖼 {label || '이미지'}{where}</em>;
   }
-  // 페이지 안 앵커는 제자리에서 연다 — 링크와 같은 규칙이다(NewTabLink). 새 탭으로 열면 대화가
-  // 없는 앱이 한 벌 더 뜬다.
-  const inPage = src.startsWith('#');
   return (
-    <a href={src} title={title || undefined} {...(inPage ? {} : { target: '_blank', rel: 'noopener noreferrer' })}>
-      🖼 {label || src}
-    </a>
+    <a href={src} title={title || undefined} {...linkAttrs(src)}>🖼 {label || src}</a>
   );
 }
+
 // 플러그인 배열과 마찬가지로 모듈 상수여야 한다 — 새 객체를 넘기면 매 렌더가 파이프라인 재구축이다.
-const MD_COMPONENTS = { pre: PreOrBlock, a: NewTabLink, img: AltImage };
+export const MD_COMPONENTS = { pre: PreOrBlock, a: NewTabLink, img: AltImage };
 
 // 입력창 타이핑마다 전체 대화가 다시 렌더되지 않도록 메시지 하나를 분리해 memo한다
 // (assistant 답변은 markdown 파싱 비용이 있어 대화가 길어질수록 체감된다)
@@ -192,23 +182,6 @@ function downloadCsv(step) {
   a.remove();
   // 즉시 해제하면 일부 브라우저가 내려받기를 시작하기 전에 URL을 잃는다 — 한 틱 뒤에 해제한다.
   setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-// 조회 건수 문구. 조회 건수와 실린 행 수는 다를 수 있다 — 몇 건을 보고 있는지 밝히지 않으면
-// 사용자가 실린 것을 전부로 읽는다 (서버 result.js clientTrace가 omittedRows·capped를 준다).
-function countLabel(t) {
-  const n = t.rows?.length ?? 0;
-  // rowCount는 서버가 늘 준다(result.js clientTrace). 없으면 실린 행 수로 말한다 — 'undefined건'은
-  // 화면에 나가서는 안 되는 글자이고, 이 패널의 다른 값들도 모두 없을 때를 정해 두고 있다.
-  if (t.rowCount === undefined) return `${n}건`; // 몇 건 중 몇 건인지 말할 근거가 없다
-  // 상한에 걸린 것과 실린 행이 일부인 것은 함께 올 수 있다(서버 result.js) — 그때 둘 중 하나만
-  // 말하면 '왜 이만큼뿐인가'의 절반이 사라진다.
-  // 상한에 걸린 rowCount는 서버가 '1000+'처럼 준다(result.js) — 같은 패널에서 '건 이상'과 '+건'이
-  // 섞이지 않게 여기서도 같은 말로 푼다.
-  if (t.capped && t.omittedRows) return `${String(t.rowCount).replace(/\+$/, '')}건 이상 — 조회 상한에 걸렸고, 아래는 그중 ${n}건입니다`;
-  if (t.omittedRows) return `${t.rowCount}건 (아래는 그중 ${n}건)`;
-  if (t.capped) return `${n}건 이상 — 조회 상한에 걸려 처음 ${n}건만 가져왔습니다`;
-  return `${t.rowCount}건`;
 }
 
 // 실행된 쿼리 한 건: 이름·대상 DB·바인드 한 줄 + 조회된 행 전부의 표.

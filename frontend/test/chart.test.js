@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import {
-  parseChartBlock, chartBlocksToTables, chartTableMarkdown, toNumber, toTime, pieSlices,
+  parseChartBlock, chartBlocksToTables, chartTableMarkdown, toNumber, toTime, pieSlices, clip, sliceSafe,
   MAX_CHART_ROWS, MAX_SERIES, MAX_LABEL_LEN, MAX_PIE_SLICES,
 } from '../src/chart.js';
 
@@ -245,4 +245,48 @@ test('chartBlocksToTables: 이력으로 보낼 때 펜스·설정을 벗기고 �
   // 표 없이 제목만 남은 블록은 제목 한 줄, 아무것도 없으면 빈 줄
   assert.strictEqual(chartBlocksToTables('```chart\ntitle: 제목\ndata: step 1\n```'), '제목');
   assert.strictEqual(chartBlocksToTables('```chart\ntype: bar\n```'), '');
+});
+
+// 값 읽기의 실패 방향은 한쪽으로만 열려 있어야 한다: 읽지 못하면 빈칸(그리지 않음)이지, 그럴듯한
+// 숫자로 읽어 없는 값을 그려서는 안 된다. 아래 두 가지는 실제로 그렇게 새던 자리다.
+test('구분자가 섞인 표기는 숫자가 아니다 — 묶음은 자리가 맞을 때만 벗긴다', () => {
+  assert.strictEqual(toNumber('1 234,567'), null);   // 섞였다 (되참조가 없으면 1234567로 읽혔다)
+  assert.strictEqual(toNumber('1,234 567'), null);
+  assert.strictEqual(toNumber('1,234,567'), 1234567); // 같은 구분자로 자리가 맞는다
+  assert.strictEqual(toNumber('1 234 567'), 1234567);
+  assert.strictEqual(toNumber('1,2'), null);          // 자리가 안 맞는다
+  assert.strictEqual(toNumber('2024 01'), null);
+});
+
+test('시각도 범위를 넘으면 날짜가 아니다 — 넘긴 값은 조용히 다른 시각이 된다', () => {
+  assert.strictEqual(toTime('2024-01-01 12:99'), null);  // Date는 13:39로 넘겨 버린다
+  assert.strictEqual(toTime('2024-01-01 24:00'), null);
+  assert.strictEqual(toTime('2024-01-01 12:30:99'), null);
+  assert.strictEqual(new Date(toTime('2024-01-01 23:59:59')).getHours(), 23);
+  assert.strictEqual(new Date(toTime('2024-01-01 12:30')).getMinutes(), 30);
+});
+
+test('pie·scatter는 y2를 그리지 않으므로 그 설정 때문에 차트를 포기하지 않는다', () => {
+  const t = '| 상태 | 건수 | 비고 |\n|---|---|---|\n| 가 | 3 | 좋음 |\n| 나 | 4 | 나쁨 |';
+  // y2가 글자 열이어도 원그래프는 그린다 (그 설정은 원그래프가 쓰지 않는다)
+  const pie = spec(`type: pie\ny2: 비고\n${t}`);
+  assert.deepStrictEqual(pie.series, [{ name: '건수', axis: 'left' }]);
+  // y2만 적었으면 그 열을 왼쪽에 그린다 — 축이 하나뿐인 그래프에서 '오른쪽'은 없다
+  assert.deepStrictEqual(spec(`type: pie\ny2: 건수\n${t}`).series, [{ name: '건수', axis: 'left' }]);
+  assert.deepStrictEqual(spec(`type: bar\ny2: 건수\n${t}`).series, [{ name: '건수', axis: 'left' }]);
+  // 막대에서는 y2가 글자 열이면 그대로 포기한다 (오른쪽 축에 두라던 열을 왼쪽에 그리면 조용한 오답이다)
+  assert.strictEqual(parseChartBlock(`type: bar\ny2: 비고\n${t}`).ok, false);
+});
+
+test('자르기는 상한을 넘지 않고 서로게이트 쌍을 쪼개지 않는다', () => {
+  assert.strictEqual(clip('abcd', 4), 'abcd');
+  assert.strictEqual(clip('abcd', 3), 'ab…');
+  assert.strictEqual(clip('abcd', 1), 'a');   // …를 붙일 자리가 없다
+  assert.strictEqual(clip('abcd', 0), '');
+  assert.strictEqual(sliceSafe('ab', -1), '');
+  // 이모지가 경계에 걸리면 짝 잃은 코드유닛이 남아 화면에서 U+FFFD가 된다
+  const emoji = `${'가'.repeat(58)}🙂꼬리`;
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(clip(emoji, 60)));
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(sliceSafe(emoji, 59)));
+  assert.ok(clip(emoji, 60).length <= 60);
 });

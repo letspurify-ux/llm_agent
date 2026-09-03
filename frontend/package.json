@@ -6,7 +6,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "test:ui": "node --test --test-concurrency=1 test/ui/ui.test.mjs"
   },
   "dependencies": {
     "katex": "^0.16.47",

@@ -1,6 +1,8 @@
 node_modules/
 .env
 dist/
+# UI 검사가 index.html에서 만들어 쓰고 지우는 진입점 (test/ui/ui.test.mjs)
+ui-probe.html
 .DS_Store
 
 # start.sh/stop.sh(백엔드·프론트엔드)가 남기는 실행 상태

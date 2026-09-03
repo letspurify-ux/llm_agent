@@ -3,6 +3,23 @@
 // CSV는 사용자가 결과를 다른 도구로 가져가는 출구다 — 셀 하나가 조용히 옆 열로 밀리면 그 파일로
 // 한 일이 전부 틀어지고, 그것을 알려 주는 오류는 없다.
 
+// 조회 건수 문구. 조회 건수와 실린 행 수는 다를 수 있다 — 몇 건을 보고 있는지 밝히지 않으면
+// 사용자가 실린 것을 전부로 읽는다 (서버 result.js clientTrace가 omittedRows·capped를 준다).
+export function countLabel(t) {
+  const n = t.rows?.length ?? 0;
+  // rowCount는 서버가 늘 준다(result.js clientTrace). 없으면 실린 행 수로 말한다 — 'undefined건'은
+  // 화면에 나가서는 안 되는 글자이고, 이 패널의 다른 값들도 모두 없을 때를 정해 두고 있다.
+  if (t.rowCount === undefined) return `${n}건`; // 몇 건 중 몇 건인지 말할 근거가 없다
+  // 상한에 걸린 것과 실린 행이 일부인 것은 함께 올 수 있다(서버 result.js) — 그때 둘 중 하나만
+  // 말하면 '왜 이만큼뿐인가'의 절반이 사라진다.
+  // 상한에 걸린 rowCount는 서버가 '1000+'처럼 준다(result.js) — 같은 패널에서 '건 이상'과 '+건'이
+  // 섞이지 않게 여기서도 같은 말로 푼다.
+  if (t.capped && t.omittedRows) return `${String(t.rowCount).replace(/\+$/, '')}건 이상 — 조회 상한에 걸렸고, 아래는 그중 ${n}건입니다`;
+  if (t.omittedRows) return `${t.rowCount}건 (아래는 그중 ${n}건)`;
+  if (t.capped) return `${n}건 이상 — 조회 상한에 걸려 처음 ${n}건만 가져왔습니다`;
+  return `${t.rowCount}건`;
+}
+
 // 행들의 열 이름 — 첫 등장 순서. 드라이버가 준 행은 열이 모두 같지만(oracle.js normalizeCells),
 // 다른 출처의 trace가 섞여도 한 행에만 있는 열이 빠지지 않게 합집합으로 모은다.
 export function columnsOf(rows) {
