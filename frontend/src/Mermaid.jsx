@@ -57,13 +57,16 @@ export default function Mermaid({ text }) {
       // 제 크기(이 이상 넓혀도 더 커지지 않는다). mermaid가 인라인으로 적어 두지만(useMaxWidth),
       // 그 설정을 끄면 없다 — 그때는 viewBox의 폭이 같은 뜻이다. 둘 다 없을 때만 상한이 없다.
       const natural = parseFloat(el.style.maxWidth) || el.viewBox?.baseVal?.width || Infinity;
-      // 눈에 보이는 첫 라벨의 글자 높이. 그림 안의 모든 라벨을 재어 가장 작은 것을 고르지는 않는다 —
-      // 라벨이 수백 개인 흐름도에서 창을 끄는 동안 매 프레임 전부를 재게 되고, 화살표에 붙는 작은 글자
-      // 하나 때문에 이미 읽히던 그림을 통째로 넓히게 된다. 여러 줄로 감긴 라벨은 상자 높이가 줄 수만큼
-      // 이므로 한 줄(tspan)로 잰다.
+      // 가장 작은 글자의 높이. 라벨 목록은 한 번만 모으고(넓힐 때마다 다시 찾지 않는다), 재는 것은
+      // 한 줄이다 — 여러 줄로 감긴 라벨은 상자 높이가 줄 수만큼이라 그것을 글자 크기로 삼으면 배율이
+      // 줄 수만큼 모자란다. 0으로 나오는 것(빈 줄, 감춰진 라벨)은 세지 않는다: 하나라도 0을 그대로
+      // 받으면 넓히기를 아예 포기하게 되어 그림 전체가 못 읽는 크기로 남는다.
+      // 첫 라벨이 아니라 가장 작은 것을 쓰는 이유는, 크기가 섞인 그림에서 큰 라벨 하나가 기준을
+      // 넘겼다고 멈추면 그보다 작은 글자가 못 읽는 채 남기 때문이다.
+      const labels = [...el.querySelectorAll('.nodeLabel, text')];
       const lineHeight = () => {
-        const label = [...el.querySelectorAll('.nodeLabel, text')].find(n => n.getBoundingClientRect().height > 0);
-        return ((label?.querySelector?.('tspan') ?? label)?.getBoundingClientRect().height) ?? 0;
+        const hs = labels.map(n => (n.querySelector?.('tspan') ?? n).getBoundingClientRect().height).filter(v => v > 0);
+        return hs.length ? Math.min(...hs) : 0;
       };
       // 넓힌 뒤 다시 재서 모자라면 한 번 더 넓힌다. '폭을 두 배로 하면 글자도 두 배'가 아니기 때문이다 —
       // 브라우저는 아주 작은 글자를 어느 선 아래로는 줄이지 않아, 줄어든 그림에서 잰 글자는 실제보다

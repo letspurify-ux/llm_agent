@@ -151,15 +151,17 @@ function NewTabLink({ node, href, children, ...props }) {
 // 링크에 noreferrer까지 붙여 사내 주소가 새지 않게 하는 이 화면에서, 저절로 나가는 요청은 앞뒤가 맞지 않는다.
 // 이 앱의 답변에 그림이 실릴 자리도 없다 — 차트도 흐름도도 우리가 그린다. 그래서 주소는 링크로만 남긴다:
 // 무엇을 가리키는지 보이고, 열지 말지는 사람이 정한다. (그림을 정말 띄워야 하는 날이 오면 여기만 되돌린다)
-function AltImage({ node, src, alt, title, ...props }) {
+function AltImage({ node, src, alt, title }) {
   const label = String(alt || title || '').trim();
   const inLink = useContext(InLink);
   // 링크로 남기는 것은 http(s)와 주소만 적힌 상대 경로(chart.png, /img/a.png, ?id=3)뿐이다.
   // 그 밖의 방식(mailto:·tel:·data: 등)은 그림 자리에 올 것이 아니고, 눌러서 좋을 것도 없다.
   // 라이브러리가 위험한 주소를 걸러 주는 것에 기대지 않고 여기서도 한 번 더 좁힌다.
   // 링크 안이면(inLink) <a>를 또 열 수 없으므로 글자로만 — 누를 자리는 바깥 링크가 이미 만들어 두었다.
+  // '//호스트/…'는 콜론이 없어 상대 주소처럼 보이지만 바깥으로 나가는 주소다 — 함께 막는다.
   const scheme = typeof src === 'string' && /^[a-z][a-z0-9+.-]*:/i.exec(src);
-  if (typeof src !== 'string' || src === '' || inLink || (scheme && !/^https?:$/i.test(scheme[0]))) {
+  if (typeof src !== 'string' || src === '' || inLink || src.startsWith('//')
+      || (scheme && !/^https?:$/i.test(scheme[0]))) {
     return <em>🖼 {label || '이미지'}</em>;
   }
   return <a href={src} target="_blank" rel="noopener noreferrer" title={title || undefined}>🖼 {label || src}</a>;
@@ -332,6 +334,7 @@ export default function App() {
   const stuckRef = useRef(true);
   const lastTopRef = useRef(0);
   const inputAtRef = useRef(0);   // 사용자가 마지막으로 화면을 만진 시각 (아래 byUser 참고)
+  const lastHeightRef = useRef(0); // 마지막으로 본 내용 높이 — 관찰자와 onChatScroll이 함께 갱신한다
   const growRef = useRef(null); // 말풍선 크기 변화를 보는 ResizeObserver (아래 효과가 처음 필요할 때 만든다)
   const glideRef = useRef(null); // 진행 중인 미끄러짐 { raf, expect } (아래 glide 참고)
   const dragRef = useRef(null); // 대화 안에서 끌고 있는 중인가 { x, y, moved, vertical } (아래 holding 참고)
@@ -386,6 +389,13 @@ export default function App() {
   const INPUT_MS = 400; // 입력 하나가 일으키는 스크롤이 이 안에 온다 (관성·부드러운 스크롤 포함)
   const noteInput = () => { inputAtRef.current = performance.now(); };
   const byUser = () => performance.now() - inputAtRef.current < INPUT_MS;
+  // 브라우저가 스스로 자리를 옮기는 것은 내용의 크기가 변할 때뿐이다(위가 자라면 보던 것을 붙잡으려
+  // 밀어 내리고, 줄면 바닥 너머로 나간 자리를 깎는다). 그래서 '지금 크기가 막 변했는가'를 함께 본다.
+  // 시각(타임스탬프)이 아니라 높이로 재는 이유: 한 프레임 안에서 스크롤 이벤트가 ResizeObserver보다
+  // 먼저 온다(HTML 명세의 렌더링 갱신 순서). 시각으로 재면 그 첫 스크롤이 늘 '크기 변화 밖'으로 보인다.
+  // 크기가 변하지 않았는데 우리가 놓지도 않은 움직임이면 그것은 사용자다 — 입력 신호가 오지 않는
+  // 길들(파이어폭스의 스크롤바 끌기, 페이지 내 찾기, 가운데 단추 자동 스크롤)이 여기로 걸린다.
+  const resizing = el => el.scrollHeight !== lastHeightRef.current;
   // 여기에 '방금 전까지 만지던 동안'을 더한 것. 손을 뗀 화면은 관성으로 더 미끄러지고, 표 위의 휠은
   // 이어서 온다 — 그 틈을 비워 두면 그 사이에 자란 차트가 읽던 자리를 끌어내린다. 뒤늦게 커지는 것을
   // 따라갈지는 이것으로 정하고, 새 말풍선은 이 여운까지 기다리지 않는다(holding만 본다).
@@ -428,6 +438,10 @@ export default function App() {
     if (typeof ResizeObserver === 'undefined') return;
     if (!growRef.current) {
       growRef.current = new ResizeObserver(entries => {
+        // 건너뛰든 따라가든 '크기가 여기까지 변했다'는 것은 남긴다 — 그러지 않으면 onChatScroll의
+        // 기준이 낡아, 한참 뒤의 평범한 스크롤까지 크기 변화 중인 것으로 보인다.
+        lastHeightRef.current = el.scrollHeight;
+
         // 비어 있는 첫 화면에는 따라갈 것이 없다. 그 '쉬는 자리'는 맨 위인데(restOf), 크기가 바뀔 때마다
         // 그것을 다시 놓으면 낮은 창에서 예시 칩을 보려고 내려 둔 화면이 입력창이 한 줄 자랄 때마다,
         // 창을 조금 줄일 때마다 맨 위로 튕긴다 — 맨 위로 되돌리는 것은 홈으로 돌아갈 때 한 번이면 된다.
@@ -515,7 +529,9 @@ export default function App() {
     addEventListener('pointercancel', endDrag);
     // 창이 초점을 잃으면(다른 창으로 넘어감, 오른쪽 클릭 메뉴) 놓았다는 소식이 오지 않는다.
     // 잡고 있던 표시가 그대로 남으면 그 뒤로 이 대화가 끝날 때까지 따라가기가 죽는다 — 여기서 다 푼다.
-    const onWindowBlur = () => { endDrag(); panRef.current = false; };
+    // 창이 초점을 잃으면 손가락을 떼는 소식(touchend)이 오지 않는다 — 밀던 것을 여기서 끝내되,
+    // 끝냈다는 것을 markBusy로 알려야 그동안 미뤄 둔 크기 변화(pendingRef)를 갚는 타이머가 선다.
+    const onWindowBlur = () => { endDrag(); if (panRef.current) { panRef.current = false; markBusy(); } };
     addEventListener('blur', onWindowBlur);
 
     // 손가락으로 미는 중인가는 pointer 이벤트로 알 수 없다 — 브라우저가 스크롤을 가져가는 순간
@@ -527,10 +543,18 @@ export default function App() {
     // 브라우저가 옮긴 값도 스크롤 이벤트로 오기 때문에, 화면에 손만 얹고 답을 기다린 사람이 미는 중으로
     // 잡혀 뒤늦게 서는 차트를 놓쳤다(실측: 답의 끝 115~148px이 남았다).
     const onTouchMove = () => { panRef.current = true; noteInput(); };
-    // 사용자가 화면을 만졌다는 신호(byUser 참고). 스크롤바를 끄는 동안은 onMove가 이어서 갱신한다.
-    el?.addEventListener('wheel', noteInput, { passive: true });
-    el?.addEventListener('keydown', noteInput);
-    el?.addEventListener('pointerdown', noteInput);
+    // 사용자가 화면을 움직이려 했다는 신호(byUser 참고)는 문서 전체에서 듣는다. 대화 상자에만 걸면
+    // 놓치는 길이 많다 — 대화는 초점을 받지 못하는 <main>이라 키보드 스크롤의 keydown은 body에
+    // 떨어지고(대화를 거치지 않는다), 헤더·입력창 위에서 굴린 휠도 대화 밖에서 온다.
+    // capture로 듣는 이유는 중간에서 멈추는 이벤트도 우리에게는 '사용자가 만졌다'이기 때문이다.
+    // 입력창에서 글을 쓰는 키는 뺀다 — 그것은 대화를 움직이려는 뜻이 아니다(PageUp·PageDown은
+    // 그쪽에서 직접 다룬다). 누름은 스크롤바를 잡은 것만 센다: 대화 안을 그냥 누른 것(클릭)까지
+    // 세면, 답이 도착한 찰나에 아무 데나 누른 사람이 그 뒤의 브라우저 보정에 따라가기를 잃는다.
+    const onKeyInput = e => { if (!inputRef.current?.contains(e.target)) noteInput(); };
+    const onScrollbarDown = e => { if (e.target === el && e.offsetX >= el.clientWidth) noteInput(); };
+    addEventListener('keydown', onKeyInput, true);
+    addEventListener('wheel', noteInput, { capture: true, passive: true });
+    el?.addEventListener('pointerdown', onScrollbarDown);
     const onTouchEnd = e => {
       if (e.touches.length > 0) return; // 아직 다른 손가락이 닿아 있다
       if (panRef.current) markBusy(); // 뗀 뒤에도 관성으로 더 미끄러진다 — 그동안도 만지는 중이다
@@ -567,7 +591,6 @@ export default function App() {
       }
       // deltaMode: 픽셀(0)이 보통이지만 줄(1)·쪽(2)으로 오는 환경이 있다 — 픽셀로 환산한다.
       const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? el.clientHeight : 1;
-      noteInput(); // 대화 밖에서 굴린 것이지만 대화를 움직이는 것은 사용자다
       stopGlide();
       el.scrollTop += e.deltaY * unit;
     };
@@ -578,9 +601,9 @@ export default function App() {
       el?.removeEventListener('toggle', onToggle, true);
       el?.removeEventListener('pointerdown', onDown);
       removeEventListener('pointermove', onMove);
-      el?.removeEventListener('wheel', noteInput);
-      el?.removeEventListener('keydown', noteInput);
-      el?.removeEventListener('pointerdown', noteInput);
+      removeEventListener('keydown', onKeyInput, true);
+      removeEventListener('wheel', noteInput, true);
+      el?.removeEventListener('pointerdown', onScrollbarDown);
       removeEventListener('pointerup', endDrag);
       removeEventListener('pointercancel', endDrag);
       removeEventListener('blur', onWindowBlur);
@@ -611,8 +634,9 @@ export default function App() {
     // 위로 올라간 것을 '떨어지겠다는 뜻'으로 읽는 것은 사용자가 방금 만졌을 때뿐이다(byUser).
     // 우리가 놓은 값(ours)도, 브라우저가 스스로 옮긴 값도 아니어야 한다 — 그 둘을 뜻으로 읽으면
     // 차트·흐름도가 자리를 잡는 순간에 따라가기가 끊겨 답의 끝이 입력창 뒤에 남는다(실측 25~110px).
-    else if (!ours && byUser() && el.scrollTop < lastTopRef.current) stuckRef.current = false;
+    else if (!ours && (byUser() || !resizing(el)) && el.scrollTop < lastTopRef.current) stuckRef.current = false;
     lastTopRef.current = el.scrollTop;
+    lastHeightRef.current = el.scrollHeight;
   }
 
   // textarea는 내용이 늘어도 스스로 커지지 않는다 — 줄 수에 맞춰 높이를 직접 맞춘다.

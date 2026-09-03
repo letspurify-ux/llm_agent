@@ -6,7 +6,7 @@ import {
   ResponsiveContainer, ComposedChart, PieChart, ScatterChart,
   Bar, Line, Area, Pie, Scatter, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
 } from 'recharts';
-import { pieSlices } from './chart.js';
+import { pieSlices, clip } from './chart.js';
 
 // 첫 색은 앱의 강조색(index.html --accent)을 따라가고, 나머지는 서로 구별되는 고정 팔레트다.
 // 강조색은 이 모듈이 처음 실행될 때 한 번 읽는다 — 차트가 나올 시점에는 문서가 이미 그려져 있다.
@@ -45,7 +45,6 @@ const HEIGHT = 260;
 // 조회 결과의 셀 값 그대로라(chart.js는 full에 길이를 두지 않는다) 자유 텍스트 한 문단이 올 수 있고,
 // 그러면 열두 개가 답변을 덮는 글자 벽이 된다.
 const MAX_LEGEND_LEN = 60;
-const clipLegend = s => (s.length > MAX_LEGEND_LEN ? `${s.slice(0, MAX_LEGEND_LEN - 1)}…` : s);
 
 const fmtNum = v => (typeof v === 'number' && Number.isFinite(v) ? v.toLocaleString('ko-KR', { maximumFractionDigits: 2 }) : '');
 const pad2 = n => String(n).padStart(2, '0');
@@ -167,19 +166,20 @@ const insideLabel = ({ cx, cy, midAngle, outerRadius, percent, index }) => {
 // 상자 폭에서만 나온다(높이는 260px로 고정이다). 380px 아래에서 잘리기 시작한다 — 실측값이다.
 // 재는 자리는 figure 하나다(아래 Chart). 그리는 쪽마다 따로 재면 같은 폭을 여러 번 재게 되고,
 // 그 값이 필요한 곳도 한 군데씩 늘어난다 — 지금 쓰는 것은 원그래프뿐이다.
-function useNarrow(limit = 380) {
+function useNarrow(enabled, limit = 380) {
   const ref = useRef(null);
   const [narrow, setNarrow] = useState(false);
   useLayoutEffect(() => {
     const el = ref.current;
-    if (!el) return;
+    // 쓰지 않는 그래프에서는 재지 않는다 — 관찰자 하나와 렌더 한 번이 매 차트마다 헛돈다.
+    if (!el || !enabled) return;
     const mark = () => setNarrow(el.clientWidth > 0 && el.clientWidth < limit);
     mark();
     if (typeof ResizeObserver === 'undefined') return;
     const ro = new ResizeObserver(mark);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [limit]);
+  }, [enabled, limit]);
   return [ref, narrow];
 }
 
@@ -211,7 +211,7 @@ function PieView({ spec, narrow }) {
     {narrow && (
       <ul className="chart-legend">
         {data.map((d, i) => (
-          <li key={i}><i style={{ background: color(i) }} />{clipLegend(String(d.full ?? d.name))}</li>
+          <li key={i}><i style={{ background: color(i) }} />{clip(String(d.full ?? d.name), MAX_LEGEND_LEN)}</li>
         ))}
       </ul>
     )}
@@ -242,7 +242,8 @@ function ScatterView({ spec }) {
 // 제목 + 그래프. 표는 App.jsx가 <details>로 아래에 붙인다 — 이 컴포넌트는 그리는 것만 안다.
 export default function Chart({ spec }) {
   const id = useId();
-  const [boxRef, narrow] = useNarrow();
+  // 폭을 재는 것은 원그래프뿐이다 (아래 useNarrow) — 나머지는 관찰자를 달지 않는다.
+  const [boxRef, narrow] = useNarrow(spec.type === 'pie');
   const View = spec.type === 'pie' ? PieView : spec.type === 'scatter' ? ScatterView : Cartesian;
   return (
     <figure className="chart" ref={boxRef} aria-labelledby={spec.title ? id : undefined}>

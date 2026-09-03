@@ -122,7 +122,14 @@ export function toTime(cell, explicit = false) {
   return t.getMonth() === +mo - 1 && t.getDate() === +(d ?? 1) && +mo >= 1 && +mo <= 12 ? t.getTime() : null;
 }
 
-const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+// 글자를 n자까지만. 경계에서 서로게이트 쌍(이모지 등)을 반으로 쪼개지 않는다 — 짝 잃은 코드유닛은
+// 화면에 U+FFFD로 남는다(App.jsx clipTurn이 이력에서 같은 일을 막는다).
+export const clip = (s, n) => {
+  if (s.length <= n) return s;
+  const cut = s.slice(0, n - 1);
+  const last = cut.charCodeAt(cut.length - 1);
+  return `${last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut}…`;
+};
 const EMPTY_LABEL = '(빈값)';
 
 // 블록 본문(펜스 안의 글자)을 설정과 표 줄로 가른다. 설정은 표가 시작되기 전까지만 읽는다 —
