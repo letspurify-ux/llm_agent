@@ -1,7 +1,7 @@
 // 차트 블록 하나를 그린다. 무엇을 그릴지는 chart.js parseChartBlock이 이미 정했고, 여기는 그 명세를
 // Recharts 요소로 옮기는 일만 한다. App.jsx가 React.lazy로 부르므로 이 파일과 recharts는 첫 차트가
 // 나올 때까지 내려받지 않는다 — 대부분의 답변은 글과 표뿐이다.
-import { useId } from 'react';
+import { useId, useLayoutEffect, useRef, useState } from 'react';
 import {
   ResponsiveContainer, ComposedChart, PieChart, ScatterChart,
   Bar, Line, Area, Pie, Scatter, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
@@ -14,6 +14,27 @@ const accent = (typeof getComputedStyle === 'function' && typeof document !== 'u
   && getComputedStyle(document.documentElement).getPropertyValue('--accent').trim()) || '#4f46e5';
 const PALETTE = [accent, '#0ea5e9', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#14b8a6', '#f97316', '#64748b'];
 const color = i => PALETTE[i % PALETTE.length];
+
+// 조각 위에 얹는 글자의 색. 팔레트에는 밝은 색(황색 #f59e0b, 주황 #f97316)이 있어 흰 글자를 얹으면
+// 대비가 2:1도 되지 않는다 — 11px 글자는 그 위에서 사실상 보이지 않는다(잘린 라벨을 고치려다
+// 있으나 마나 한 라벨을 얻는다). 바탕의 밝기를 재어 흰 글자와 진한 글자 중 잘 보이는 쪽을 쓴다.
+// 색을 읽지 못하면(강조색이 hex가 아닐 수 있다) 밝기 0으로 보아 흰 글자 — 지금까지의 모습 그대로다.
+// 진한 쪽이 순검정인 이유: 검정과 흰색 중 잘 보이는 쪽을 고르면 어떤 바탕에서도 대비가 4.58:1
+// 아래로 내려가지 않는다(두 대비가 같아지는 밝기에서의 값). 덜 검은 회색으로 하면 붉은색·보라색
+// 조각이 4.5:1을 넘지 못한다 — 11px 글자는 큰 글자로 쳐 주지 않는다.
+const HEX_RE = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i;
+const luminance = c => {
+  const m = HEX_RE.exec(String(c).trim());
+  if (!m) return 0;
+  const h = m[1].length === 3 ? [...m[1]].map(x => x + x).join('') : m[1];
+  const [r, g, b] = [0, 2, 4].map(i => {
+    const v = parseInt(h.slice(i, i + 2), 16) / 255;
+    return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+};
+// 0.179: 흰 글자와 검은 글자의 대비가 뒤집히는 밝기다 (WCAG 대비식을 두 색에 대해 풀면 나온다).
+const inkOn = c => (luminance(c) > 0.179 ? '#000' : '#fff');
 
 // 범주가 이보다 많으면 가로 막대로 눕힌다 — 세로 막대의 x 라벨은 열둘을 넘기면 서로를 덮는다.
 const HORIZONTAL_FROM = 13;
@@ -119,16 +140,53 @@ const sliceLabel = ({ x, y, textAnchor, name, percent }) => (
   </text>
 );
 
-function PieView({ spec }) {
+// 좁은 상자에서 쓰는 라벨. 원 밖에 이름을 적으면 SVG 경계에 그대로 잘린다 — 창을 좁히면 소리 없이
+// 글자가 사라진다(실측: 창 360px에서 이름이 최대 37px, 320px에서 50px 잘렸다). 그래서 좁아지면
+// 비율만 조각 안에 적고 이름은 범례로 내린다. 글자가 들어갈 수 없는 얇은 조각은 비운다 — 그 조각의
+// 이름과 값은 범례와 툴팁에 그대로 있다.
+const insideLabel = ({ cx, cy, midAngle, outerRadius, percent, index }) => {
+  if (percent < 0.06) return null;
+  const rad = (-midAngle * Math.PI) / 180; // Recharts의 각도는 도(°)이고 화면 y는 아래로 자란다
+  const r = outerRadius * 0.62;
+  return (
+    <text x={cx + r * Math.cos(rad)} y={cy + r * Math.sin(rad)} textAnchor="middle"
+          dominantBaseline="central" fontSize={11} fontWeight="600" fill={inkOn(color(index))}>
+      {`${(percent * 100).toFixed(0)}%`}
+    </text>
+  );
+};
+
+// 상자가 좁은가. 라벨을 밖에 두려면 원 좌우로 이름이 들어갈 자리가 있어야 하는데, 그 여백은
+// 상자 폭에서만 나온다(높이는 260px로 고정이다). 380px 아래에서 잘리기 시작한다 — 실측값이다.
+// 재는 자리는 figure 하나다(아래 Chart). 그리는 쪽마다 따로 재면 같은 폭을 여러 번 재게 되고,
+// 그 값이 필요한 곳도 한 군데씩 늘어난다 — 지금 쓰는 것은 원그래프뿐이다.
+function useNarrow(limit = 380) {
+  const ref = useRef(null);
+  const [narrow, setNarrow] = useState(false);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const mark = () => setNarrow(el.clientWidth > 0 && el.clientWidth < limit);
+    mark();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(mark);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [limit]);
+  return [ref, narrow];
+}
+
+function PieView({ spec, narrow }) {
   // 조각 고르기(큰 것 남기고 나머지는 '기타')는 chart.js pieSlices — 표 순서와 무관하게 값으로 고른다.
   const data = pieSlices(spec.rows);
   const total = data.reduce((a, d) => a + d.value, 0);
   const pct = v => (total > 0 ? `${((v / total) * 100).toFixed(1)}%` : '');
   return (
+    <>
     <ResponsiveContainer width="100%" height={HEIGHT}>
       <PieChart margin={{ top: 4, right: 4, bottom: 4, left: 4 }}>
-        <Pie data={data} dataKey="value" nameKey="name" outerRadius="72%" isAnimationActive={false}
-             label={sliceLabel} labelLine={{ stroke: '#9ca3af' }}>
+        <Pie data={data} dataKey="value" nameKey="name" outerRadius={narrow ? '62%' : '72%'} isAnimationActive={false}
+             label={narrow ? insideLabel : sliceLabel} labelLine={narrow ? false : { stroke: '#9ca3af' }}>
           {data.map((d, i) => <Cell key={i} fill={color(i)} />)}
         </Pie>
         {/* 이름은 조각(범주)의 것이다 — 시리즈 이름은 제목이 이미 말하고, 툴팁이 답해야 할 것은 '어느 조각인가'다.
@@ -136,6 +194,19 @@ function PieView({ spec }) {
         <Tooltip contentStyle={tooltipStyle} formatter={(v, name, item) => [`${fmtNum(v)} (${pct(v)})`, item?.payload?.full ?? name]} />
       </PieChart>
     </ResponsiveContainer>
+    {/* 이름이 조각 밖으로 나가지 못하는 폭에서만 범례를 단다 — 넓은 화면에서는 라벨이 이미 이름을 말한다.
+        recharts의 <Legend>가 아니라 평범한 목록인 이유: 그 범례는 260px 상자 '안'에 들어가 그래프 몫의
+        높이를 가져간다. 이름이 길고 조각이 많으면(최대 12개 × 30자) 좁은 폭에서 열 줄 넘게 감겨 남는
+        높이가 0 아래로 내려가고, 그러면 원의 중심과 반지름이 엉뚱한 값이 되어 그래프가 상자 밖으로
+        밀려 잘린다. 밖에 두면 그냥 아래로 자란다 — 잘리는 것도, 그래프를 먹는 것도 없다. */}
+    {narrow && (
+      <ul className="chart-legend">
+        {data.map((d, i) => (
+          <li key={i}><i style={{ background: color(i) }} />{d.name}</li>
+        ))}
+      </ul>
+    )}
+    </>
   );
 }
 
@@ -162,14 +233,18 @@ function ScatterView({ spec }) {
 // 제목 + 그래프. 표는 App.jsx가 <details>로 아래에 붙인다 — 이 컴포넌트는 그리는 것만 안다.
 export default function Chart({ spec }) {
   const id = useId();
+  const [boxRef, narrow] = useNarrow();
   const View = spec.type === 'pie' ? PieView : spec.type === 'scatter' ? ScatterView : Cartesian;
   return (
-    <figure className="chart" aria-labelledby={spec.title ? id : undefined}>
+    <figure className="chart" ref={boxRef} aria-labelledby={spec.title ? id : undefined}>
       {spec.title && <figcaption id={id}>{spec.title}</figcaption>}
-      <View spec={spec} />
+      <View spec={spec} narrow={narrow} />
       {spec.clipped && <div className="chart-note">처음 {spec.rows.length}행만 그렸습니다 (전체 {spec.total}행).</div>}
       {/* 명시한 xtype으로 읽지 못해 뺀 행 — '합계' 행이나 다른 꼴의 날짜가 조용히 사라지지 않게 밝힌다. */}
       {spec.skipped > 0 && <div className="chart-note">x를 {spec.xKind === 'time' ? '시간' : '숫자'}으로 읽지 못한 {spec.skipped}행은 그리지 않았습니다.</div>}
+      {/* 원그래프가 조각으로 만들 수 없어 뺀 행(값이 0 이하). 표에는 있는 행이라 밝히지 않으면
+          비율의 분모가 달라진 것을 사용자가 알 수 없다. */}
+      {spec.dropped > 0 && <div className="chart-note">값이 0 이하인 {spec.dropped}행은 조각으로 그리지 않았습니다.</div>}
     </figure>
   );
 }

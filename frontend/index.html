@@ -206,6 +206,11 @@
       .md .chart { width: 640px; max-width: 100%; margin: 10px 0 6px; min-width: 0; }
       .md .chart figcaption { font-size: 13px; font-weight: 600; color: var(--text); margin: 0 0 6px 4px; }
       .md .chart-note { font-size: 12px; color: var(--muted); margin: 2px 0 0 4px; }
+      /* 좁은 화면의 원그래프 범례 (Chart.jsx PieView). 조각 안에는 비율만 적고 이름은 여기서 말한다 —
+         그래프 상자 밖이라 몇 줄로 감기든 그래프가 설 자리를 뺏지 않는다. */
+      .md .chart-legend { display: flex; flex-wrap: wrap; gap: 3px 12px; margin: 3px 0 0; padding: 0 4px; list-style: none; font-size: 12px; }
+      .md .chart-legend li { display: flex; align-items: center; gap: 5px; min-width: 0; overflow-wrap: anywhere; }
+      .md .chart-legend i { width: 9px; height: 9px; border-radius: 2px; flex: none; }
       /* 차트 아래 '표로 보기'. 접힌 줄은 눈에 띄지 않게, 펼치면 표는 원래 규칙(.md table)대로 */
       .md .chart-table { margin: 0 0 8px; font-size: 12.5px; }
       .md .chart-table summary { cursor: pointer; color: var(--muted); user-select: none; }
@@ -351,7 +356,14 @@
         /* 높이는 App.jsx가 내용에 맞춰 직접 준다. 여기서 정하는 것은 한 줄일 때의 크기(padding+line-height로
            보내기 단추와 같은 42px)와 여기까지만 자란다는 한계뿐이다. 그 뒤로는 안에서 스크롤된다. */
         /* overflow-y는 App.jsx가 max-height에 걸렸을 때만 auto로 바꾼다 — 여기서는 꺼 둔다. */
-        line-height: 1.5; padding: 10px 0; max-height: 160px; overflow-y: hidden;
+        /* 여러 줄 초안이 창을 잠식하지 못하게 한다. 160px은 큰 창에서의 상한이고, 낮은 창에서는
+           40vh가 먼저 걸린다 — 그러지 않으면 높이 260px 창에서 입력창(206px)과 헤더(69px)가 창보다
+           높아져 대화가 0px으로 눌리고, 220px에서는 전송 단추가 창 밖으로 나가 보낼 수조차 없었다.
+           휴대폰에서는 dvh를 쓴다: vh는 주소창이 보일 때도 '숨겨졌을 때의 높이'라, 실제로 보이는
+           높이보다 크게 잡혀 낮은 화면에서 상한 노릇을 하지 못한다. dvh를 모르는 브라우저는 앞 줄의
+           vh를 그대로 쓴다(뒷 줄을 통째로 버린다). */
+        line-height: 1.5; padding: 10px 0; max-height: min(160px, 40vh); overflow-y: hidden;
+        max-height: min(160px, 40dvh);
         /* 높이가 자동이므로 사용자가 끄트머리를 끌어 늘리는 손잡이는 거짓말이 된다 — 없앤다. */
         resize: none;
       }
@@ -402,6 +414,11 @@
         .md .chart { break-inside: avoid; }
         /* 종이에는 가로 스크롤이 없다 — 코드는 접어서 보여 준다(표·차트는 원래 폭을 지킨다) */
         .md pre { white-space: pre-wrap; overflow: visible; }
+        /* 흐름도도 마찬가지다. 좁은 창에서는 글자가 읽히도록 SVG에 최소 폭을 인라인으로 걸어 두는데
+           (Mermaid.jsx), 인쇄에는 ResizeObserver가 돌지 않아 그 값이 그대로 남는다 — 종이에서는
+           스크롤로 볼 수 없으니 오른쪽이 그냥 잘린다. 인라인 값을 덮으려면 !important여야 한다. */
+        .md .mermaid { overflow: visible; }
+        .md .mermaid svg { min-width: 0 !important; }
       }
 
       /* ===== 좁은 화면 ===== (앞의 .bubble·.chat-inner를 덮으므로 그 뒤에 온다) */
@@ -410,6 +427,13 @@
         .bubble { padding: 12px 13px; }
         .bubble.assistant { max-width: 100%; }
         .bubble.user { max-width: 88%; }
+      }
+      /* 이보다 좁아지면 입력창 안내문이 두 줄로 감긴다(실측: 창 344px까지는 한 줄, 340px부터 두 줄).
+         상자 높이는 '들어 있는 글'로 정해지는데 안내문은 글이 아니라서 한 줄 높이에 잘린다 —
+         폭 320px에서 아랫줄 22px이 잘려 '줄바꿈)'만 반쯤 보였다. 빈 상자만 두 줄로 열어 둔다
+         (글을 넣으면 App.jsx의 fitInput이 그때부터 재고, min-height는 그 위에서 바닥만 잡는다). */
+      @media (max-width: 343px) {
+        .composer textarea { min-height: 64px; }
       }
     </style>
   </head>

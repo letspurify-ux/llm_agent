@@ -242,6 +242,8 @@ export function parseChartBlock(text) {
   // 시간·숫자 축인데 x를 읽지 못한 행 수. 추론한 축에서는 0이고(전부 읽혀야 추론한다) 명시한 xtype에서만
   // 생긴다 — 조용히 빠지면 '합계' 행이나 '2024-Q1' 라벨이 없어진 것을 알 길이 없어 차트 아래에 밝힌다.
   let skipped = 0;
+  // 원그래프가 그리지 못해 뺀 행 수(값이 0 이하) — 아래 dropped 참고.
+  let dropped = 0;
   for (const r of rows) {
     let label = String(r[xi] ?? '').trim();
     const t = sortByTime ? toTime(label, explicit === 'time') : null;
@@ -253,7 +255,9 @@ export function parseChartBlock(text) {
     const values = series.map(s => toNumber(r[s.col]));
     // 원그래프에서 값이 없거나 음수인 조각은 그릴 수 없다(Recharts는 음수 조각을 0으로 뭉갠다).
     // 다른 그래프에서는 값이 전부 빈 행도 남긴다 — 그 범주가 축에 있어야 '값이 없다'가 보인다.
-    if (type === 'pie' && !(values[0] > 0)) continue;
+    // 뺀 행은 세어 둔다: 표에는 있는 행이 그림에서만 없어지면 비율의 분모가 달라진 것을 알 길이 없다
+    // (x를 읽지 못해 뺀 행을 skipped로 밝히는 것과 같은 이유다 — 조용히 빠지는 행이 있어서는 안 된다).
+    if (type === 'pie' && !(values[0] > 0)) { dropped++; continue; }
     data.push({ x, label: clip(label, MAX_LABEL_LEN), full: label, values, t });
   }
   if (!data.length) return { ok: false, reason: '그릴 행 없음' };
@@ -277,6 +281,7 @@ export function parseChartBlock(text) {
       clipped,
       total: data.length,
       skipped,
+      dropped,
     },
   };
 }

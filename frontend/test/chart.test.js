@@ -142,6 +142,10 @@ test('원그래프는 첫 숫자 열 하나만, 0 이하와 결측 조각은 뺀
   const s = spec('type: pie\n| 상태 | 건수 | 비율 |\n|---|---|---|\n| 완료 | 30 | 60 |\n| 대기 | 0 | 0 |\n| 실패 | -1 | 0 |\n| 진행 | 20 | 40 |');
   assert.deepStrictEqual(s.series, [{ name: '건수', axis: 'left' }]);
   assert.deepStrictEqual(s.rows.map(r => [r.x, r.values[0]]), [['완료', 30], ['진행', 20]]);
+  // 뺀 행은 세어서 내보낸다 — 표에는 네 행인데 그림은 두 조각이라, 밝히지 않으면 비율의 분모가
+  // 달라진 것을 사용자가 알 수 없다 (Chart.jsx가 이 수로 안내를 붙인다).
+  assert.strictEqual(s.dropped, 2);
+  assert.strictEqual(spec('type: bar\n| a | b |\n|---|---|\n| x | 0 |\n| y | 1 |').dropped, 0);
   assert.strictEqual(spec('type: donut\n| a | b |\n|---|---|\n| x | 1 |').type, 'pie');
 });
 

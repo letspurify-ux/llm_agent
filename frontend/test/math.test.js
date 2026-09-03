@@ -64,6 +64,14 @@ test('환경변수·경로의 $는 수식이 아니다', () => {
 test('$$ 인라인·별행 표기는 그대로 동작한다', () => {
   assert.deepStrictEqual(formulas('계산식은 $$E = mc^2$$ 이다.'), ['E = mc^2']);
   assert.ok(!isDisplay('계산식은 $$E = mc^2$$ 이다.'));
+  // 한 줄로 쓴 $$…$$가 문단을 혼자 차지하면 별행이다. remark-math는 이것을 인라인으로 보지만
+  // (별행은 $$가 제 줄에 홀로 설 때뿐이다) 모델은 별행 수식을 거의 언제나 이렇게 쓴다 —
+  // 인라인으로 두면 넓은 수식이 말풍선에 잘려 오른쪽을 볼 방법이 없다.
+  assert.ok(isDisplay('$$E = mc^2$$'), '한 줄 $$…$$가 문단을 혼자 차지하면 별행으로');
+  assert.deepStrictEqual(formulas('$$E = mc^2$$'), ['E = mc^2']);
+  assert.ok(isDisplay('계산식:\n\n$$E = mc^2$$\n'), '앞 문단이 있어도 마찬가지');
+  assert.ok(!isDisplay('$v = d/t$'), '홑 $ 한 줄은 문장 속 표기 그대로 인라인');
+  assert.ok(isDisplay('- 항목\n\n  $$E = mc^2$$'), '목록 안 단독 줄에서도');
   assert.deepStrictEqual(formulas('계산식:\n\n$$\nE = mc^2\n$$\n'), ['E = mc^2']);
   assert.ok(isDisplay('계산식:\n\n$$\nE = mc^2\n$$\n'));
   // 인용문·목록 안의 별행 수식 (줄마다 붙는 '>'가 수식 안으로 들어가면 안 된다)
@@ -90,6 +98,15 @@ test('닫히지 않은 $$가 남은 답변을 통째로 삼키지 않는다', ()
   const md = '$$\nE = mc^2\n\n이어지는 설명 문단이다.';
   assert.deepStrictEqual(formulas(md), []);
   assert.ok(visible(md).includes('이어지는 설명 문단이다.'));
+  // 여는 줄에 이어 쓰다 끊긴 것도 글자로 남아야 한다. remark-math는 '$$' 뒤의 나머지를 코드펜스의
+  // 언어처럼 meta에 담으므로, 되돌릴 때 그것을 빠뜨리면 수식이 통째로 사라지고 '$$'만 남는다 —
+  // 토큰 한도로 잘린 답변에서 가장 흔한 모양이다.
+  const cut = '평균은 다음과 같습니다.\n\n$$ \\bar{x} = \\frac{1}{n}\\sum x_i';
+  assert.deepStrictEqual(formulas(cut), []);
+  assert.ok(visible(cut).includes('\\bar{x}'), visible(cut));
+  assert.ok(visible(cut).includes('\\sum x_i'), visible(cut));
+  const tail = '$$ \\alpha + \\beta\n\n이어지는 설명이다.';
+  assert.ok(visible(tail).includes('\\alpha + \\beta') && visible(tail).includes('이어지는 설명이다.'), visible(tail));
 });
 
 test('코드 안의 $와 \\(는 글자 그대로 남는다', () => {

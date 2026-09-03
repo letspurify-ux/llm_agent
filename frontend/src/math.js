@@ -107,14 +107,26 @@ function splitText(node, source) {
   return parts;
 }
 
-// \[ … \] 가 문단 하나를 통째로 차지하면 별행 수식으로 만든다(가운데 정렬 + 가로 스크롤).
-// 문장 안에 있으면 위의 splitText가 인라인으로 처리한다.
+// 수식이 문단 하나를 통째로 차지하면 별행 수식으로 만든다(가운데 정렬 + 넘칠 때 가로 스크롤).
+// 문장 안에 있으면 인라인 그대로다 — 그쪽은 위의 splitText와 remark-math가 이미 맡는다.
+// 두 가지가 여기로 온다:
+//   \[ … \]        markdown이 백슬래시를 떼어 remark-math에는 보이지도 않는다(원문에서 알아본다)
+//   $$ … $$ 한 줄   remark-math의 '별행'은 $$가 제 줄에 홀로 설 때뿐이라, 한 줄로 쓴 것은 인라인이 된다.
+//                   모델은 별행 수식을 거의 언제나 한 줄로 쓴다 — 그대로 두면 가운데 정렬도, 넘칠 때의
+//                   가로 스크롤(.katex-display)도 없이 말풍선의 overflow-x: clip에 잘려 오른쪽이 통째로
+//                   닿을 수 없게 된다(실측: 폭 574px 말풍선에 2,069px짜리 수식, 1,478px이 잘렸다).
 const BRACKET_BLOCK_RE = /^\\\[([\s\S]+)\\\]$/;
 function displayParagraph(node, source) {
   if (node.type !== 'paragraph' || node.children.length !== 1) return null;
   const child = node.children[0];
   const from = child.position?.start?.offset;
-  if (child.type !== 'text' || from === undefined) return null;
+  if (from === undefined) return null;
+  // remark-math가 만든 한 줄짜리 $$…$$. 지금의 계약(아래 REMARK_PLUGINS의 singleDollarTextMath: false)
+  // 아래에서 inlineMath로 오는 것은 $$뿐이라 이 확인은 늘 참이다 — 계약이 풀렸을 때를 위해 남겨 둔다.
+  // 홑 $ 하나짜리($v=d/t$ 한 줄)는 그때에도 별행으로 올리지 않는다: 그것을 쓴 사람은 문장 속 표기를
+  // 쓴 것이고, 우리 판정(splitText)도 인라인으로 내놓는다.
+  if (child.type === 'inlineMath') return source.startsWith('$$', from) ? mathNode(child.value, true) : null;
+  if (child.type !== 'text') return null;
   const m = BRACKET_BLOCK_RE.exec(source.slice(from, child.position.end.offset).trim());
   return m && m[1].trim() ? mathNode(m[1].trim(), true) : null;
 }
@@ -128,7 +140,11 @@ function unclosedMath(node, source) {
   if (from === undefined) return null;
   if (source.slice(from, node.position.end.offset).trimEnd().endsWith('$$')) return null;
   // 원문이 아니라 파서가 뽑아 준 내용을 쓴다 — 인용문·목록 안이면 원문에는 줄마다 '>'가 붙어 있다.
-  return { type: 'paragraph', children: [{ type: 'text', value: `$$\n${node.value}` }] };
+  // 여는 줄에 이어 쓴 글자는 value가 아니라 meta에 담긴다 — remark-math는 별행 수식을 코드펜스처럼
+  // 읽어서 '$$' 뒤의 나머지를 펜스의 언어 자리로 본다. 그것을 빠뜨리면 잘린 답변에서 가장 흔한 모양
+  // ($$ 뒤에 수식을 이어 쓰다 끊긴 것)이 화면에 '$$' 한 줄만 남기고 통째로 사라진다(실측).
+  const head = node.meta ? `$$ ${node.meta}` : '$$';
+  return { type: 'paragraph', children: [{ type: 'text', value: node.value ? `${head}\n${node.value}` : head }] };
 }
 
 // 대괄호로 직접 쓴 링크인가([글자](주소)). GFM은 맨 URL과 <꺾쇠>도 링크로 만드는데, 그 둘은
