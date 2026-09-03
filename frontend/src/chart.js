@@ -295,7 +295,9 @@ export function pieSlices(rows, max = MAX_PIE_SLICES) {
   if (data.length <= max) return data;
   const keep = new Set(data.map((d, i) => i).sort((a, b) => data[b].value - data[a].value).slice(0, max - 1));
   const rest = data.filter((_, i) => !keep.has(i));
-  return [...data.filter((_, i) => keep.has(i)), { name: `기타 (${rest.length})`, full: '기타', value: rest.reduce((a, d) => a + d.value, 0) }];
+  // full은 '잘리지 않은 이름'이고 범례·툴팁이 그것을 쓴다 — 모아 놓은 조각에서는 개수까지가 이름이다.
+  const other = `기타 (${rest.length})`;
+  return [...data.filter((_, i) => keep.has(i)), { name: other, full: other, value: rest.reduce((a, d) => a + d.value, 0) }];
 }
 
 // 블록 안의 표만 markdown으로. 차트를 그리지 못할 때·그리기 전에·'표로 보기'에 그대로 렌더한다.

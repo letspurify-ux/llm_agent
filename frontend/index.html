@@ -433,7 +433,9 @@
          폭 320px에서 아랫줄 22px이 잘려 '줄바꿈)'만 반쯤 보였다. 빈 상자만 두 줄로 열어 둔다
          (글을 넣으면 App.jsx의 fitInput이 그때부터 재고, min-height는 그 위에서 바닥만 잡는다). */
       @media (max-width: 343px) {
-        .composer textarea { min-height: 64px; }
+        /* 창이 아주 낮으면 이 바닥이 위의 max-height(40dvh)를 밀어낸다 — min-height가 늘 이긴다.
+           두 줄을 여는 것은 안내문이 감기기 때문이지 자리를 뺏자는 것이 아니므로 상한에 맞춰 접는다. */
+        .composer textarea { min-height: 64px; min-height: min(64px, 40dvh); }
       }
     </style>
   </head>

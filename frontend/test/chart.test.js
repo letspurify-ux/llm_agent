@@ -158,7 +158,8 @@ test('pieSlices: 조각이 많으면 값이 큰 것을 남기고 나머지를 �
   const out = pieSlices(rows(15));
   assert.strictEqual(out.length, MAX_PIE_SLICES);
   assert.deepStrictEqual(out.slice(0, -1).map(d => d.name), ['c4', 'c5', 'c6', 'c7', 'c8', 'c9', 'c10', 'c11', 'c12', 'c13', 'c14']);
-  assert.deepStrictEqual(out.at(-1), { name: '기타 (4)', full: '기타', value: 10 });
+  // 모아 놓은 조각은 full에도 개수가 남는다 — 좁은 화면 범례와 툴팁이 full을 이름으로 쓰기 때문이다
+  assert.deepStrictEqual(out.at(-1), { name: '기타 (4)', full: '기타 (4)', value: 10 });
   // 이름순 결과에서 큰 조각이 뒤에 있어도 조각으로 남는다
   const mixed = rows(15).map((r, i) => ({ ...r, values: [i === 14 ? 500 : i === 0 ? 400 : 1] }));
   const names = pieSlices(mixed).map(d => d.name);

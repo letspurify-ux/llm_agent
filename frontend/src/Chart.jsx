@@ -198,11 +198,13 @@ function PieView({ spec, narrow }) {
         recharts의 <Legend>가 아니라 평범한 목록인 이유: 그 범례는 260px 상자 '안'에 들어가 그래프 몫의
         높이를 가져간다. 이름이 길고 조각이 많으면(최대 12개 × 30자) 좁은 폭에서 열 줄 넘게 감겨 남는
         높이가 0 아래로 내려가고, 그러면 원의 중심과 반지름이 엉뚱한 값이 되어 그래프가 상자 밖으로
-        밀려 잘린다. 밖에 두면 그냥 아래로 자란다 — 잘리는 것도, 그래프를 먹는 것도 없다. */}
+        밀려 잘린다. 밖에 두면 그냥 아래로 자란다 — 잘리는 것도, 그래프를 먹는 것도 없다.
+        이름은 잘리지 않은 것(full)으로 적는다 — 축 눈금과 달리 이 목록은 아래로 감기므로 줄일 이유가
+        없고, 이름이 잘려 사라지는 것을 막으려 단 범례가 다시 잘린 이름을 보여줄 수는 없다. */}
     {narrow && (
       <ul className="chart-legend">
         {data.map((d, i) => (
-          <li key={i}><i style={{ background: color(i) }} />{d.name}</li>
+          <li key={i}><i style={{ background: color(i) }} />{d.full ?? d.name}</li>
         ))}
       </ul>
     )}
@@ -244,7 +246,7 @@ export default function Chart({ spec }) {
       {spec.skipped > 0 && <div className="chart-note">x를 {spec.xKind === 'time' ? '시간' : '숫자'}으로 읽지 못한 {spec.skipped}행은 그리지 않았습니다.</div>}
       {/* 원그래프가 조각으로 만들 수 없어 뺀 행(값이 0 이하). 표에는 있는 행이라 밝히지 않으면
           비율의 분모가 달라진 것을 사용자가 알 수 없다. */}
-      {spec.dropped > 0 && <div className="chart-note">값이 0 이하인 {spec.dropped}행은 조각으로 그리지 않았습니다.</div>}
+      {spec.dropped > 0 && <div className="chart-note">값이 없거나 0 이하인 {spec.dropped}행은 조각으로 그리지 않았습니다.</div>}
     </figure>
   );
 }

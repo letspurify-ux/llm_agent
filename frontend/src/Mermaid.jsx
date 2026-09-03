@@ -12,8 +12,9 @@ mermaid.initialize({
   // 모델이 쓴 주소를 사용자가 누르기도 전에 부른다(실측: 라벨 하나가 외부 요청 한 건을 냈다).
   // 답변의 글자에는 조회 결과가 섞여 있으므로 그 통로 자체를 닫는다 — 라벨은 SVG 글자로 그린다.
   // (<br/>로 줄을 바꾸는 것은 글자 라벨에서도 그대로 된다)
+  // 루트의 이 값이 모든 그림 종류를 덮는다 — mermaid 11에서 flowchart.htmlLabels 같은 종류별 설정은
+  // 폐기됐고 루트가 우선한다. 종류마다 따로 적으면 새 그림이 늘 때마다 빠뜨릴 자리만 늘어난다.
   htmlLabels: false,
-  flowchart: { htmlLabels: false },
   // 문법이 틀린 그림에 mermaid가 '폭탄' 오류 SVG를 문서에 직접 끼워 넣는 것을 막는다 —
   // 그 경우는 아래에서 원문 코드로 되돌린다.
   suppressErrorRendering: true,
@@ -53,11 +54,29 @@ export default function Mermaid({ text }) {
       const el = box.querySelector('svg');
       if (!el) return;
       el.style.minWidth = '';
-      const label = [...el.querySelectorAll('.nodeLabel, text')].find(n => n.getBoundingClientRect().height > 0);
-      const h = label?.getBoundingClientRect().height ?? 0;
-      if (!h || h >= MIN_LABEL_PX) return;
       const natural = parseFloat(el.style.maxWidth) || Infinity; // mermaid가 인라인으로 적어 둔 제 크기
-      el.style.minWidth = `${Math.min(natural, Math.ceil(el.getBoundingClientRect().width * (MIN_LABEL_PX / h)))}px`;
+      // 글자 높이는 가장 작은 것으로 잰다. 한 그림 안에서도 크기는 자리마다 다르고(노드 이름, 화살표에
+      // 붙는 말, 묶음 제목), 처음 만난 라벨 하나로 정하면 그보다 작은 글자가 기준 아래에 남는다.
+      // 여러 줄로 감긴 라벨은 상자 높이가 줄 수만큼이므로 한 줄(tspan)로 잰다.
+      const smallest = () => {
+        const hs = [...el.querySelectorAll('.nodeLabel, text')]
+          .map(n => (n.querySelector?.('tspan') ?? n).getBoundingClientRect().height)
+          .filter(v => v > 0);
+        return hs.length ? Math.min(...hs) : 0;
+      };
+      // 넓힌 뒤 다시 재서 모자라면 한 번 더 넓힌다. '폭을 두 배로 하면 글자도 두 배'가 아니기 때문이다 —
+      // 브라우저는 아주 작은 글자를 어느 선 아래로는 줄이지 않아, 줄어든 그림에서 잰 글자는 실제보다
+      // 크게 나온다(실측: 폭 268px에서 4px로 보이던 글자가 2.25배 넓힌 603px에서 9px이 아니라 7px).
+      // 그 어긋남을 한 번의 계산으로 맞출 수는 없으므로 실제 결과를 보고 좁힌다. 늘 몇 번 안에 끝난다:
+      // 글자가 커질수록 비례에 가까워지고, 제 크기(natural)에 닿으면 더 넓힐 것이 없다.
+      for (let i = 0; i < 4; i++) {
+        const h = smallest();
+        if (!h || h >= MIN_LABEL_PX) break;
+        const now = el.getBoundingClientRect().width;
+        const want = Math.min(natural, Math.ceil(now * (MIN_LABEL_PX / h)));
+        if (want <= now) break; // 제 크기까지 넓혀도 모자란다 — 여기까지가 최선이다
+        el.style.minWidth = `${want}px`;
+      }
     };
     fit();
     if (typeof ResizeObserver === 'undefined') return;
