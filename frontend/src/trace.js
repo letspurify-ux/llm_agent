@@ -5,6 +5,11 @@
 
 // 조회 건수 문구. 조회 건수와 실린 행 수는 다를 수 있다 — 몇 건을 보고 있는지 밝히지 않으면
 // 사용자가 실린 것을 전부로 읽는다 (서버 result.js clientTrace가 omittedRows·capped를 준다).
+// 한 스텝의 '건수' 자리에 놓을 문구. 실행되지 못한 스텝은 건수가 아니라 오류를 말한다 —
+// 그 갈래를 화면에서 가르면 오류 줄만 임자 없는 글자로 남아, 검사도 픽스처도 그것을 베껴 적게 된다
+// (그러면 문구를 다듬은 날 앱은 맞는데 검사가 깨지거나, 앱이 내지도 않는 글자를 검사가 보증한다).
+export const stepLabel = t => (t?.error ? `오류: ${t.error}` : countLabel(t));
+
 export function countLabel(t) {
   const n = t.rows?.length ?? 0;
   // rowCount는 서버가 늘 준다(result.js clientTrace). 없으면 실린 행 수로 말한다 — 'undefined건'은

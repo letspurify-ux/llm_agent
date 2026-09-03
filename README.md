@@ -134,6 +134,20 @@ cd frontend && npm install && npm run dev
 
 `http://localhost:5173` 접속 (`/api`는 vite proxy로 백엔드에 전달).
 
+#### 회귀 검증
+
+```bash
+npm test          # 순수 함수의 계약(수식 판정·차트 파싱·trace/CSV·주소 규칙)과 띄운 것을 내리는 규칙 — 몇 초
+npm run test:ui   # 화면 동작의 계약 — 진짜 Chrome을 headless로 띄운다 (1분 남짓)
+npm run test:all  # 위 둘을 차례로
+```
+
+`npm run test:ui`는 단위 테스트가 닿지 못하는 것을 지킨다: 답이 길어질 때 대화가 언제 따라 내려가고
+언제 가만히 있는가, 좁은 화면에서 원그래프 조각과 흐름도 글자가 어떻게 남는가, 인쇄에서 무엇이
+풀리는가, 모델이 쓴 주소가 저절로 불려 나가지 않는가. 실제 진입점(`src/main.jsx`)을 그대로 띄우고
+`/api/chat`만 가로채므로 서버도 모델도 필요 없다. Chrome이 없으면(`CHROME_PATH`로 지정할 수 있다)
+조용히 건너뛰고, 검사가 끝나면 띄운 브라우저를 확인하고 내린다.
+
 #### 다른 PC에서 접속하기
 
 dev 서버는 모든 인터페이스에 바인딩되므로, 기동 로그(`logs/frontend.log`)의 `Network:` 줄에 찍힌

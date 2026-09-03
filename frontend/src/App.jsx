@@ -6,9 +6,9 @@ import { REMARK_PLUGINS, REHYPE_PLUGINS } from './math.js';
 // 차트 블록의 계약(무엇을 차트로 받는가 + 이력으로 되돌릴 때의 모양)은 chart.js에 있다.
 import { parseChartBlock, splitBlock, chartTableMarkdownFrom, chartBlocksToTables, sliceSafe, clip, MAX_CHARTS_PER_MESSAGE } from './chart.js';
 // trace 패널의 계약(열·셀 표기·CSV)은 trace.js에 있다.
-import { columnsOf, cellText, toCsv, csvFileName, countLabel } from './trace.js';
+import { columnsOf, cellText, toCsv, csvFileName, stepLabel } from './trace.js';
 // 답변 속 주소를 어떻게 다룰지의 판정은 markdown.js에 있다 (순수 함수라 회귀 테스트가 붙는다).
-import { linkAttrs, imageKind } from './markdown.js';
+import { linkTarget, imageTarget, mdUrlTransform } from './markdown.js';
 
 // 그리는 쪽(recharts·mermaid)은 첫 차트·흐름도가 나올 때 내려받는다 — 둘을 합치면 앱 본체의 몇 배라,
 // 글과 표뿐인 대부분의 대화가 그 값을 치를 이유가 없다. 내려받는 동안과 실패했을 때는 표·코드가 보인다.
@@ -63,7 +63,7 @@ function ChartTable({ text, block, withTitle = false }) {
   return (
     <>
       {withTitle && title && <p><strong>{title}</strong></p>}
-      <ReactMarkdown remarkPlugins={TABLE_PLUGINS} components={TABLE_COMPONENTS}>{md}</ReactMarkdown>
+      <ReactMarkdown remarkPlugins={TABLE_PLUGINS} components={TABLE_COMPONENTS} urlTransform={mdUrlTransform}>{md}</ReactMarkdown>
     </>
   );
 }
@@ -139,9 +139,13 @@ function PreOrBlock({ node, children, ...props }) {
 // 내며 그대로 그린다) 바깥 링크가 눌리지 않게 된다. 그림(AltImage)이 이것을 보고 글자로만 남는다.
 const InLink = createContext(false);
 function NewTabLink({ node, href, children, ...props }) {
-  const link = typeof href !== 'string' || href === ''
+  // 열 주소와 얹을 속성을 한 번에 받는다(markdown.js linkTarget) — 걷어낸 값으로 판정해 놓고
+  // 걷어내기 전 주소를 href에 쓰는 어긋남을 만들 수 없게. 걷어내면 아무것도 남지 않는 주소는
+  // 글자로만 남긴다: 빈 href는 '현재 문서'라 누르면 페이지가 다시 읽혀 대화가 사라진다.
+  const { url, attrs } = linkTarget(href);
+  const link = url === ''
     ? <a {...props}>{children}</a>
-    : <a href={href} {...props} {...linkAttrs(href)}>{children}</a>;
+    : <a href={url} {...props} {...attrs}>{children}</a>;
   return <InLink.Provider value={true}>{link}</InLink.Provider>;
 }
 // 답변 속 그림(![글자](주소))은 자동으로 불러오지 않는다. 그 주소는 모델이 쓴 것이고, 모델이 보는
@@ -152,20 +156,23 @@ function NewTabLink({ node, href, children, ...props }) {
 // 무엇을 가리키는지 보이고, 열지 말지는 사람이 정한다. (그림을 정말 띄워야 하는 날이 오면 여기만 되돌린다)
 function AltImage({ node, src, alt, title }) {
   const label = String(alt || title || '').trim();
-  const kind = imageKind(src, useContext(InLink));
+  // 판정(kind)과 열 주소(url)·속성(attrs)을 한 번에 받는다 — 셋이 같은 값에서 나온다.
+  const { url, kind, attrs } = imageTarget(src, useContext(InLink));
   if (kind === 'text') {
     // 열어 주지 않더라도 무엇을 가리키는지는 보여야 한다 — 링크 안의 그림처럼 주소가 아예 닿을 수
     // 없는 자리에서는 이것이 유일한 단서다. 아주 긴 주소(data: 등)는 끝을 줄인다.
-    const where = typeof src === 'string' && src ? ` (${clip(src, 60)})` : '';
+    const where = url ? ` (${clip(url, 60)})` : '';
     return <em>🖼 {label || '이미지'}{where}</em>;
   }
+  // 글자가 없으면 주소로 대신하되 여기서도 끝을 줄인다 — 조회 결과가 섞여 들어간 주소는 수천 자가
+  // 되기도 하고, 그대로 두면 답변 한 줄이 주소의 벽에 묻힌다(주소 전부는 href에 그대로 남는다).
   return (
-    <a href={src} title={title || undefined} {...linkAttrs(src)}>🖼 {label || src}</a>
+    <a href={url} title={title || undefined} {...attrs}>🖼 {label || clip(url, 60)}</a>
   );
 }
 
 // 플러그인 배열과 마찬가지로 모듈 상수여야 한다 — 새 객체를 넘기면 매 렌더가 파이프라인 재구축이다.
-export const MD_COMPONENTS = { pre: PreOrBlock, a: NewTabLink, img: AltImage };
+const MD_COMPONENTS = { pre: PreOrBlock, a: NewTabLink, img: AltImage };
 
 // 입력창 타이핑마다 전체 대화가 다시 렌더되지 않도록 메시지 하나를 분리해 memo한다
 // (assistant 답변은 markdown 파싱 비용이 있어 대화가 길어질수록 체감된다)
@@ -199,7 +206,7 @@ function TraceStep({ step: t, showGrid }) {
             같은 화면이 어떤 줄에서만 DB를 밝히게 되어 그 차이가 뜻으로 읽힌다.
             실행되지 않은 스텝(오류·미등록)에는 서버가 값을 주지 않을 수 있다. */}
         <code>{t.query_name}{t.targetDb ? `@${t.targetDb}` : ''} {JSON.stringify(t.params)}</code>
-        <span className="trace-count">{t.error ? `오류: ${t.error}` : countLabel(t)}</span>
+        <span className="trace-count">{stepLabel(t)}</span>
         {rows.length > 0 && <button type="button" className="trace-csv" onClick={() => downloadCsv(t)}>CSV 내려받기</button>}
       </div>
       {showGrid && rows.length > 0 && <TraceGrid rows={rows} />}
@@ -286,7 +293,8 @@ const Message = memo(function Message({ role, text, trace }) {
               {/* 플러그인 배열은 math.js의 상수를 그대로 쓴다 — react-markdown은 렌더마다 options로
                   파이프라인을 다시 조립하므로, 여기서 새 배열 리터럴을 만들면 매 렌더가 프로세서 재구축이 된다. */}
               <ChartBudget.Provider value={{ n: 0 }}>
-                <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS} components={MD_COMPONENTS}>{text}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS} components={MD_COMPONENTS}
+                               urlTransform={mdUrlTransform}>{text}</ReactMarkdown>
               </ChartBudget.Provider>
             </div>
           : text}

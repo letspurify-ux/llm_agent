@@ -2,7 +2,7 @@
 // CSV는 조용히 깨진다: 쉼표가 든 값 하나가 옆 열로 밀려도 파일은 열리고, 한글이 깨진 파일도 열린다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { columnsOf, cellText, toCsv, csvFileName, countLabel } from '../src/trace.js';
+import { columnsOf, cellText, toCsv, csvFileName, countLabel, stepLabel } from '../src/trace.js';
 
 test('열은 첫 등장 순서의 합집합이다', () => {
   assert.deepStrictEqual(columnsOf([{ B: 1, A: 2 }, { A: 3, C: 4 }, null, 'x']), ['B', 'A', 'C']);
@@ -60,4 +60,13 @@ test('건수 문구: 상한·생략·둘 다·근거 없음을 각각 말한다'
   assert.strictEqual(countLabel({ rows: rows(12) }), '12건');
   assert.strictEqual(countLabel({ omittedRows: 8, rows: rows(12) }), '12건');
   assert.strictEqual(countLabel({ rows: [] }), '0건');
+});
+
+test('스텝의 문구: 실행되지 못한 스텝은 건수 대신 오류를 말한다', () => {
+  // 화면(App.jsx TraceStep)도 픽스처도 이 함수를 부른다 — 오류 줄을 화면에서 따로 지으면 그 글자에
+  // 임자가 없어, 문구를 다듬은 날 앱은 맞는데 검사가 깨지거나 앱이 내지 않는 글자를 검사가 보증한다.
+  assert.strictEqual(stepLabel({ rowCount: 0, error: '조회 중 오류가 발생했습니다.' }), '오류: 조회 중 오류가 발생했습니다.');
+  // 오류가 없으면 건수 문구 그대로다 (rows까지 온 스텝은 오류가 있어도 건수를 말하지 않는다)
+  assert.strictEqual(stepLabel({ rowCount: 30, rows: Array.from({ length: 30 }, () => ({ a: 1 })) }), '30건');
+  assert.strictEqual(stepLabel({ rows: [] }), '0건');
 });
