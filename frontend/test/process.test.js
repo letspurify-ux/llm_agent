@@ -7,13 +7,15 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { stopProcess, killOnExit, sleep } from './ui/driver.mjs';
+// killOnExit은 아래 아이 프로세스가 제 안에서 직접 불러 쓴다(그 소스의 import를 보라) — 여기서는
+// 부르지 않는다. 살아 있는가의 판정은 드라이버의 것을 그대로 쓴다: 내리는 쪽과 재는 쪽이 같은
+// 판정이어야 그중 하나를 고친 날 둘이 다른 것을 보지 않는다.
+import { stopProcess, sleep, alive as 살아있나, aliveGroup as 그룹이_남았나 } from './ui/driver.mjs';
 
 const DRIVER = join(dirname(fileURLToPath(import.meta.url)), 'ui', 'driver.mjs');
-const 그룹이_남았나 = pid => { try { process.kill(-pid, 0); return true; } catch { return false; } };
-const 살아있나 = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const 윈도우 = process.platform === 'win32';   // 프로세스 그룹·신호가 이 모양으로 있지 않다
 
 // 우두머리는 먼저 끝나고 도우미 하나가 TERM을 무시한 채 남는다 — Chrome이 남던 그 모양이다
@@ -112,6 +114,68 @@ test('열리지 않는 연결은 시간 안에 포기하고, 붙잡던 소켓도
       sleep(6000).then(() => false),
     ]);
     assert.match(말, /거절:/, `시간 제한에 걸려 거절하지 않았다: ${JSON.stringify(말)}`);
+    assert.ok(끝났나, '거절한 뒤에도 소켓을 놓지 않아 node가 끝나지 못했다');
+  } finally {
+    아이.kill('SIGKILL');
+    for (const c of 소켓들) c.destroy();
+    서버.close();
+  }
+});
+
+// 손짓(WebSocket 업그레이드)까지는 제대로 끝내는 상대. 그 뒤 CDP에 무엇으로 답할지는 부르는 쪽이 정한다.
+// close 프레임에는 close로 답한다 — 진짜 브라우저가 그렇고, 그래야 '놓았는가'를 상대가 아니라
+// 놓는 쪽의 문제로 잴 수 있다.
+function 손짓까지_받아주는_서버(답하기) {
+  const 소켓들 = new Set();
+  const 서버 = createServer();
+  서버.on('upgrade', (req, socket) => {
+    소켓들.add(socket);
+    socket.on('close', () => 소켓들.delete(socket));
+    socket.on('error', () => { /* 상대가 먼저 끊는 것은 이 서버의 일이 아니다 */ });
+    const accept = createHash('sha1')
+      .update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
+      .digest('base64');
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+      + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
+    socket.on('data', buf => {
+      if ((buf[0] & 0x0f) === 0x8) { socket.end(Buffer.from([0x88, 0x00])); return; } // close에는 close로
+      답하기(socket);
+    });
+  });
+  return { 서버, 소켓들 };
+}
+
+// 마스크 없는 텍스트 프레임 한 장 (125바이트 이하 — 아래 답은 그 안에 든다)
+const 텍스트프레임 = obj => {
+  const body = Buffer.from(JSON.stringify(obj));
+  return Buffer.concat([Buffer.from([0x81, body.length]), body]);
+};
+
+test('손짓 뒤 CDP가 거절해도 붙잡던 소켓을 놓는다', async () => {
+  // 위 시험이 막는 것은 '손짓이 끝나지 않는' 길이고, 이쪽은 그 다음 칸이다: 포트도 손짓도 끝냈는데
+  // Page.enable에 오류로 답하는 상대(탭이 방금 닫혔거나 죽어 가는 브라우저)를 만나는 길.
+  // 이 자리에서 소켓을 놓지 않으면 결과는 앞의 것과 똑같다 — 거절은 곧바로 오는데 그 손잡이 하나가
+  // node를 끝나지 못하게 붙잡아, 검사가 실패도 아니고 끝나지도 않는다. 부르는 쪽(ui.test.mjs)의
+  // after()는 page를 받지 못했으므로 닫아 줄 소켓을 알지 못한다.
+  // (확인: 놓지 않던 때 아이 프로세스는 30초 뒤에도 끝나지 않았고, 놓은 뒤로는 83ms에 끝났다.)
+  const { 서버, 소켓들 } = 손짓까지_받아주는_서버(
+    socket => socket.write(텍스트프레임({ id: 1, error: { code: -32000, message: 'Page.enable을 받을 수 없다' } })));
+  await new Promise(res => 서버.listen(0, '127.0.0.1', res));
+  const { port } = 서버.address();
+  // 아이는 소켓 하나만 들고 있다 — 그것을 놓으면 스스로 끝나고, 놓지 않으면 끝나지 못한다.
+  const 아이 = spawn(process.execPath, ['--input-type=module', '-e', `
+    import { Page } from ${JSON.stringify(DRIVER)};
+    try { await Page.open('ws://127.0.0.1:${port}/x'); process.stdout.write('열렸다\\n'); }
+    catch (e) { process.stdout.write('거절: ' + e.message + '\\n'); }
+  `], { stdio: ['ignore', 'pipe', 'ignore'] });
+  let 말 = '';
+  아이.stdout.on('data', d => { 말 += d; });
+  try {
+    const 끝났나 = await Promise.race([
+      new Promise(res => 아이.once('exit', () => res(true))),
+      sleep(6000).then(() => false),
+    ]);
+    assert.match(말, /거절:/, `거절하지 않았다: ${JSON.stringify(말)}`);
     assert.ok(끝났나, '거절한 뒤에도 소켓을 놓지 않아 node가 끝나지 못했다');
   } finally {
     아이.kill('SIGKILL');

@@ -2,17 +2,21 @@
 <html lang="ko">
   <head>
     <meta charset="UTF-8" />
+    <!-- 그림은 이 화면 안의 것과 data: 만. 답변의 글자는 모델이 쓴 것이고 그 재료에는 조회 결과가
+         섞이므로, 주소 하나가 사용자가 누르기도 전에 바깥으로 나가는 요청이 되어서는 안 된다.
+         markdown의 ![](주소)는 App.jsx(AltImage)가, 흐름도 라벨의 <img>는 Mermaid.jsx(htmlLabels:false)가
+         이미 막는다 — 여기서 한 번 더 막는 이유는 그 둘이 '자리마다 하나씩'이라 새 자리가 생기면
+         (그림 노드 같은 새 문법) 다시 뚫리기 때문이다. 이 줄은 자리와 무관하게 걸린다.
+         자리는 <head>의 맨 앞(charset 다음)이어야 한다: meta로 거는 정책은 브라우저가 이 줄을 읽은
+         뒤에 시작되는 요청부터 다스리므로, 자원을 부르는 요소(link·img·preload)를 위에 두면 그것만
+         정책 밖에 서게 된다 — 그러고도 아무 오류가 나지 않는다. charset만 위에 둔다(인코딩은 문서를
+         읽기 시작할 때 정해진다). -->
+    <meta http-equiv="Content-Security-Policy" content="img-src 'self' data:" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <!-- 아이콘을 두지 않으면 브라우저가 /favicon.ico를 스스로 찾아가 404를 받고 콘솔에 오류를 남긴다 —
          사용자의 창에서도, '콘솔이 조용한가'를 보는 검사에서도. 빈 data:로 그 요청 자체를 없앤다
          (위 CSP의 img-src가 data:를 허용한다). 진짜 아이콘이 생기면 이 줄만 바꾸면 된다. -->
     <link rel="icon" href="data:," />
-    <!-- 그림은 이 화면 안의 것과 data: 만. 답변의 글자는 모델이 쓴 것이고 그 재료에는 조회 결과가
-         섞이므로, 주소 하나가 사용자가 누르기도 전에 바깥으로 나가는 요청이 되어서는 안 된다.
-         markdown의 ![](주소)는 App.jsx(AltImage)가, 흐름도 라벨의 <img>는 Mermaid.jsx(htmlLabels:false)가
-         이미 막는다 — 여기서 한 번 더 막는 이유는 그 둘이 '자리마다 하나씩'이라 새 자리가 생기면
-         (그림 노드 같은 새 문법) 다시 뚫리기 때문이다. 이 줄은 자리와 무관하게 걸린다. -->
-    <meta http-equiv="Content-Security-Policy" content="img-src 'self' data:" />
     <title>SPACE Assistant</title>
     <style>
       :root {

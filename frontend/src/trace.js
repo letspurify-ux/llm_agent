@@ -3,13 +3,19 @@
 // CSV는 사용자가 결과를 다른 도구로 가져가는 출구다 — 셀 하나가 조용히 옆 열로 밀리면 그 파일로
 // 한 일이 전부 틀어지고, 그것을 알려 주는 오류는 없다.
 
-// 조회 건수 문구. 조회 건수와 실린 행 수는 다를 수 있다 — 몇 건을 보고 있는지 밝히지 않으면
-// 사용자가 실린 것을 전부로 읽는다 (서버 result.js clientTrace가 omittedRows·capped를 준다).
 // 한 스텝의 '건수' 자리에 놓을 문구. 실행되지 못한 스텝은 건수가 아니라 오류를 말한다 —
 // 그 갈래를 화면에서 가르면 오류 줄만 임자 없는 글자로 남아, 검사도 픽스처도 그것을 베껴 적게 된다
 // (그러면 문구를 다듬은 날 앱은 맞는데 검사가 깨지거나, 앱이 내지도 않는 글자를 검사가 보증한다).
-export const stepLabel = t => (t?.error ? `오류: ${t.error}` : countLabel(t));
+// 스텝은 있어야 한다. 없는 것을 받으면 여기서 무슨 말인지 밝히고 멈춘다 — 조용히 넘기면 아래
+// countLabel이 없는 값을 만지다 'rows를 읽을 수 없다'로 죽고, 그 말은 임자(없는 스텝을 집은 부르는
+// 쪽)가 아니라 이 파일을 가리킨다. 실제로 픽스처가 스텝 하나를 find로 집어 온다(test/ui/fixtures.js).
+export const stepLabel = t => {
+  if (!t) throw new TypeError('stepLabel: 스텝이 없습니다 — 부르는 쪽이 없는 스텝을 집었습니다');
+  return t.error ? `오류: ${t.error}` : countLabel(t);
+};
 
+// 조회 건수 문구. 조회 건수와 실린 행 수는 다를 수 있다 — 몇 건을 보고 있는지 밝히지 않으면
+// 사용자가 실린 것을 전부로 읽는다 (서버 result.js clientTrace가 omittedRows·capped를 준다).
 export function countLabel(t) {
   const n = t.rows?.length ?? 0;
   // rowCount는 서버가 늘 준다(result.js clientTrace). 없으면 실린 행 수로 말한다 — 'undefined건'은

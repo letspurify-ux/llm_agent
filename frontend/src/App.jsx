@@ -8,7 +8,7 @@ import { parseChartBlock, splitBlock, chartTableMarkdownFrom, chartBlocksToTable
 // trace 패널의 계약(열·셀 표기·CSV)은 trace.js에 있다.
 import { columnsOf, cellText, toCsv, csvFileName, stepLabel } from './trace.js';
 // 답변 속 주소를 어떻게 다룰지의 판정은 markdown.js에 있다 (순수 함수라 회귀 테스트가 붙는다).
-import { linkTarget, imageTarget, mdUrlTransform } from './markdown.js';
+import { linkTarget, imageTarget, mdProps } from './markdown.js';
 
 // 그리는 쪽(recharts·mermaid)은 첫 차트·흐름도가 나올 때 내려받는다 — 둘을 합치면 앱 본체의 몇 배라,
 // 글과 표뿐인 대부분의 대화가 그 값을 치를 이유가 없다. 내려받는 동안과 실패했을 때는 표·코드가 보인다.
@@ -43,7 +43,9 @@ const TABLE_PLUGINS = [remarkGfm];
 // '표로 보기'의 표도 본문과 같은 링크 규칙이다(NewTabLink, 아래) — 셀의 URL은 GFM이 자동 링크로 만들고,
 // 그것이 같은 탭에서 열리면 대화가 사라진다.
 // 그림도 본문과 같은 규칙이다 (AltImage, 아래) — 셀 안의 ![](주소)도 저절로 불려 나가서는 안 된다.
-const TABLE_COMPONENTS = { a: NewTabLink, img: AltImage };
+// urlTransform과 img는 한 벌로 받는다(markdown.js mdProps) — 그림 src의 기본 검사를 걷어내는 쪽과
+// 그 값을 <img>로 만들지 않는 쪽이라, 새 <ReactMarkdown> 하나가 둘 중 하나를 잊으면 조용히 뚫린다.
+const TABLE_MD = mdProps({ a: NewTabLink, img: AltImage });
 
 // 차트 블록의 표를 평범한 표로. 차트를 그리지 못할 때·내려받는 동안·'표로 보기'가 모두 이것이다.
 // 차트를 그리지 않을 때(파싱 실패·예산 초과)는 제목까지 표 위에 남긴다 — 차트 밑 '표로 보기'에서는 제목이 이미 보인다.
@@ -63,7 +65,7 @@ function ChartTable({ text, block, withTitle = false }) {
   return (
     <>
       {withTitle && title && <p><strong>{title}</strong></p>}
-      <ReactMarkdown remarkPlugins={TABLE_PLUGINS} components={TABLE_COMPONENTS} urlTransform={mdUrlTransform}>{md}</ReactMarkdown>
+      <ReactMarkdown remarkPlugins={TABLE_PLUGINS} {...TABLE_MD}>{md}</ReactMarkdown>
     </>
   );
 }
@@ -172,7 +174,8 @@ function AltImage({ node, src, alt, title }) {
 }
 
 // 플러그인 배열과 마찬가지로 모듈 상수여야 한다 — 새 객체를 넘기면 매 렌더가 파이프라인 재구축이다.
-const MD_COMPONENTS = { pre: PreOrBlock, a: NewTabLink, img: AltImage };
+// (urlTransform과 img를 한 벌로 묶는 이유는 위 TABLE_MD 참고)
+const MAIN_MD = mdProps({ pre: PreOrBlock, a: NewTabLink, img: AltImage });
 
 // 입력창 타이핑마다 전체 대화가 다시 렌더되지 않도록 메시지 하나를 분리해 memo한다
 // (assistant 답변은 markdown 파싱 비용이 있어 대화가 길어질수록 체감된다)
@@ -293,8 +296,8 @@ const Message = memo(function Message({ role, text, trace }) {
               {/* 플러그인 배열은 math.js의 상수를 그대로 쓴다 — react-markdown은 렌더마다 options로
                   파이프라인을 다시 조립하므로, 여기서 새 배열 리터럴을 만들면 매 렌더가 프로세서 재구축이 된다. */}
               <ChartBudget.Provider value={{ n: 0 }}>
-                <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS} components={MD_COMPONENTS}
-                               urlTransform={mdUrlTransform}>{text}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS}
+                               {...MAIN_MD}>{text}</ReactMarkdown>
               </ChartBudget.Provider>
             </div>
           : text}
@@ -647,6 +650,14 @@ export default function App() {
       removeEventListener('touchcancel', onTouchEnd);
       el?.removeEventListener('scroll', onInnerScroll, true);
       app?.removeEventListener('wheel', onOutsideWheel);
+      // 위 효과가 만든 관찰자를 여기서 놓는다. 시작과 끝이 다른 효과에 있는 자원은 이 파일에서
+      // 이것뿐이고(Chart.jsx·Mermaid.jsx는 한 효과가 만들고 놓는다), 그것이 성립하는 조건은 하나다:
+      // 이 효과의 deps가 []여서 다시 돌지 않는 것. 여기에 의존성을 하나라도 더하면 다시 돌 때마다
+      // 관찰자가 끊기는데 다시 붙이는 것은 messages·loading이 바뀔 때만 도는 위 효과라, 그사이 늦게
+      // 서는 차트·흐름도를 따라가지 못한다 — 오류는 나지 않고 답의 끝만 입력창 뒤에 남는다(실측 25~316px).
+      // 만드는 쪽으로 옮겨 관찰자를 매번 새로 달아 보았으나 '펼침은 보던 화면을 그대로 둔다'가 깨졌다
+      // (ui.test.mjs) — 관찰자를 갈아 끼우는 것 자체가 이 화면에서는 눈에 보이는 동작이다. 옮기려면
+      // 그 시험까지 함께 통과시킬 것.
       growRef.current?.disconnect();
       clearTimeout(busyTimerRef.current);
       stopGlide();

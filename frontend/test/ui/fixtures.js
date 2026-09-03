@@ -1,7 +1,7 @@
 // UI 회귀 테스트가 화면에 흘려 넣는 답변과 trace. probe.jsx(그리는 쪽)와 ui.test.mjs(재는 쪽)가
 // 같은 것을 봐야 하므로 JSX가 없는 이 파일에 둔다 — 재는 쪽이 픽스처를 눈대중으로 베껴 적으면,
 // 픽스처를 고친 날 검사는 조용히 다른 것을 재게 된다.
-import { MAX_PIE_SLICES, MAX_CHARTS_PER_MESSAGE } from '../../src/chart.js';
+import { MAX_PIE_SLICES, MAX_CHARTS_PER_MESSAGE, CHART_FENCE_RE } from '../../src/chart.js';
 import { stepLabel } from '../../src/trace.js';
 
 // 원그래프 조각 수의 상한을 늘 넘겨 둔다 — '기타'로 모으는 길이 실제로 밟힌다. 정해진 목록을
@@ -55,7 +55,7 @@ export const CASES = {
     `[${ANCHOR_TEXT}](${ANCHOR_URL})`, '', `![${ANCHOR_IMG_TEXT}](${ANCHOR_URL})`, '',
     `[![링크안](/__probe-pixel.png?c=3)](${NESTED_LINK})`].join('\n'),
   // 차트 블록의 표도 본문과 같은 그림 규칙인가. 이쪽 파이프라인(App.jsx ChartTable)은 그림 주소를
-  // 원문 그대로 넘기므로 TABLE_COMPONENTS의 img 하나가 유일한 관문이다 — 그 자리가 비면 조회 결과가
+  // 원문 그대로 넘기므로 TABLE_MD의 img 하나가 유일한 관문이다 — 그 자리가 비면 조회 결과가
   // 섞인 셀의 ![](주소)가 사용자가 누르기도 전에 바깥으로 나가는 요청이 된다.
   tableimg: ['```chart', 'type: bar', 'title: 셀 안의 그림',
     '| 이름 | 값 |', '| --- | --- |',
@@ -89,7 +89,10 @@ export const ERROR_LABEL = stepLabel(TRACE.find(t => t.error));
 // 검사는 반쯤 그려진 화면을 재게 되므로, 답변을 가진 이 파일이 직접 낸다.
 // 그리는 차트 수는 블록 수가 아니라 한 답변의 예산까지 본다(App.jsx ChartBlock) — 예산을 넘겨
 // 픽스처를 늘린 날, 오지 않을 다섯 번째 차트를 기다리다 검사가 통째로 시간 초과로 죽지 않게.
-const 그릴차트수 = Math.min((CASES.rich.match(/^```chart$/gm) ?? []).length, MAX_CHARTS_PER_MESSAGE);
+// 차트 블록은 앱이 쓰는 그 정규식으로 센다(CHART_FENCE_RE) — 여기서 '```chart' 한 줄로 다시 적으면
+// 앱이 차트로 받는 것(들여쓴 펜스, ```chart 뒤의 덧말)을 검사만 못 알아본다. 그러면 마지막 차트가
+// 아직 서는 중에 '다 그려졌다'가 되어, 뒤의 검사들이 자라는 화면을 6px로 재며 애먼 자리를 탓한다.
+const 그릴차트수 = Math.min((CASES.rich.match(CHART_FENCE_RE) ?? []).length, MAX_CHARTS_PER_MESSAGE);
 // 주소로 찾는 선택자. 따옴표를 직접 붙이면 주소에 따옴표가 하나만 섞여도 페이지 안에서 문법 오류가
 // 되어, 기다리는 대신 낯선 SyntaxError로 죽는다 (driver.mjs goto·ui.test.mjs seen과 같은 규칙).
 export const 주소를_가리키는_링크 = url => JSON.stringify(`.md a[href=${JSON.stringify(url)}]`);

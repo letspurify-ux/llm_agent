@@ -5,7 +5,8 @@
 // 그 재료에는 조회 결과(자유 텍스트)가 섞이므로, 그 통로는 열려 있어서는 안 된다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { isInPage, linkAttrs, imageKind, mdUrlTransform, cleanUrl, imageTarget, linkTarget } from '../src/markdown.js';
+import { readFileSync } from 'node:fs';
+import { isInPage, linkAttrs, imageKind, mdUrlTransform, cleanUrl, imageTarget, linkTarget, mdProps } from '../src/markdown.js';
 
 test('링크는 새 탭에서, 페이지 안 앵커만 제자리에서 연다', () => {
   // 같은 탭에서 열리면 대화가 사라진다. noreferrer까지 붙여 사내 주소가 referer로 새지 않게 한다.
@@ -102,4 +103,41 @@ test('그리는 자리는 판정과 주소를 함께 받는다 — 어긋난 짝
   // 어느 주소를 주어도 판정은 늘 함께 나온 url에서 나온 것이다
   for (const src of ['  #s', ' https://ex.test/a', '\tdata:image/png;base64,AA', '//host.example/a.png', ''])
     assert.strictEqual(imageTarget(src).kind, imageKind(imageTarget(src).url), JSON.stringify(src));
+});
+
+test('urlTransform과 img는 한 벌로만 나온다 (한쪽만 걸린 자리를 만들 수 없게)', () => {
+  // urlTransform은 그림 src의 기본 검사를 걷어낸다 — 그 값을 <img>로 만들지 않는 img 컴포넌트가
+  // 함께 있어야만 안전하다. 둘을 따로 넘기던 때에는 그 짝을 <ReactMarkdown> 자리마다 사람이
+  // 기억해야 했고, 한 자리가 그것을 잊으면 모델이 쓴 주소가 사용자가 누르기도 전에 불려 나간다
+  // (오류도, 콘솔 한 줄도 남지 않는다).
+  const img = () => null;
+  const 한벌 = mdProps({ a: () => null, img });
+  assert.strictEqual(한벌.urlTransform, mdUrlTransform);
+  assert.strictEqual(한벌.components.img, img);
+  // img 없이는 만들어 주지 않는다 — 그 자리가 바로 뚫리는 자리다
+  assert.throws(() => mdProps({ a: () => null }), /img/);
+  assert.throws(() => mdProps({}), /img/);
+  assert.throws(() => mdProps(), /img/);
+  // 부르는 쪽이 뒤에서 img만 갈아 끼우지 못하게 얼려 둔다(모듈 상수로 한 번만 만든다)
+  assert.ok(Object.isFrozen(한벌) && Object.isFrozen(한벌.components));
+});
+
+test('화면의 모든 <ReactMarkdown>이 그 한 벌을 받는다 (App.jsx)', () => {
+  // 이 계약은 한 자리만 어긋나도 조용히 뚫리는데, 그 자리는 렌더된 화면에서만 보인다 — 새로 생긴
+  // <ReactMarkdown> 하나를 UI 검사가 마침 지나가지 않으면 아무도 보지 못한다. 그래서 자리 자체를 센다.
+  // 주석은 걷어내고 본다 — 이 규칙을 설명하는 글에도 <ReactMarkdown>이 나오고, 그것까지 세면
+  // 검사가 코드가 아니라 설명을 탓한다.
+  const src = readFileSync(new URL('../src/App.jsx', import.meta.url), 'utf8')
+    .replace(/^[ \t]*\/\/.*$/gm, '')
+    .replace(/\{\s*\/\*[\s\S]*?\*\/\s*\}/g, '');
+  const 한벌들 = [...src.matchAll(/const\s+([A-Z0-9_]+)\s*=\s*mdProps\(/g)].map(m => m[1]);
+  assert.ok(한벌들.length > 0, 'mdProps로 묶은 한 벌이 하나도 없다');
+  const 자리들 = [...src.matchAll(/<ReactMarkdown\b[^>]*>/g)].map(m => m[0]);
+  assert.ok(자리들.length > 0, '<ReactMarkdown>을 찾지 못했다 — 이 검사가 헛것을 보고 있다');
+  for (const 자리 of 자리들)
+    assert.ok(한벌들.some(n => 자리.includes(`{...${n}}`)),
+      `한 벌(mdProps)을 받지 않는 <ReactMarkdown>이 있다 — 그림 주소가 곧바로 <img src>가 된다: ${자리}`);
+  // 풀어서 따로 넘기는 자리도 없어야 한다 — 그러면 짝을 맞추는 일이 다시 사람의 기억이 된다
+  assert.ok(!/urlTransform=/.test(src), 'urlTransform을 따로 넘기는 자리가 있다 (mdProps로 묶어야 한다)');
+  assert.ok(!/components=/.test(src), 'components를 따로 넘기는 자리가 있다 (mdProps로 묶어야 한다)');
 });

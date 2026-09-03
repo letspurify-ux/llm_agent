@@ -69,4 +69,10 @@ test('스텝의 문구: 실행되지 못한 스텝은 건수 대신 오류를 �
   // 오류가 없으면 건수 문구 그대로다 (rows까지 온 스텝은 오류가 있어도 건수를 말하지 않는다)
   assert.strictEqual(stepLabel({ rowCount: 30, rows: Array.from({ length: 30 }, () => ({ a: 1 })) }), '30건');
   assert.strictEqual(stepLabel({ rows: [] }), '0건');
+  // 스텝은 있어야 한다. 없는 것을 받으면 그 자리에서 무슨 일인지 밝힌다 — 조용히 '0건'으로 답하면
+  // 없는 스텝이 화면에 조회 성공으로 남고, 그대로 넘기면 countLabel이 'rows를 읽을 수 없다'로 죽어
+  // 임자(없는 스텝을 집은 부르는 쪽)가 아니라 trace.js를 가리킨다.
+  // 실제로 픽스처가 스텝을 find로 집어 온다(test/ui/fixtures.js) — 그 find가 빗나가는 날이 이 길이다.
+  assert.throws(() => stepLabel(undefined), /스텝이 없습니다/);
+  assert.throws(() => stepLabel(null), /스텝이 없습니다/);
 });

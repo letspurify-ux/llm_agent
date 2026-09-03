@@ -14,7 +14,8 @@ import { readFile, writeFile, rm, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { findChrome, launchChrome, chromePort, stopProcess, killOnExit, freePort, oneTab, Page, sleep, STATE } from './driver.mjs';
+import { findChrome, launchChrome, chromePort, stopProcess, killOnExit, freePort, oneTab, Page, sleep, STATE,
+  alive, aliveGroup } from './driver.mjs';
 import { pieSlices, parseChartBlock } from '../../src/chart.js';
 import { TRACE, READY, PIE_BLOCK, LONG_URL, DATA_URL, MAIL_URL, CAPPED_LABEL, ERROR_LABEL,
   ANCHOR_URL, ANCHOR_TEXT, ANCHOR_IMG_TEXT, NESTED_LINK, 주소를_가리키는_링크 } from './fixtures.js';
@@ -27,9 +28,6 @@ const PROBE = join(ROOT, 'ui-probe.html');
 // 고른 뒤 프로필에 적어 주는 값을 읽는다 — driver.mjs chromePort).
 let port; let vite; let chromeBin; let chrome; let profile; let page; let skip = null;
 const url = (c = 'rich') => `http://localhost:${port}/ui-probe.html?case=${c}`;
-const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
-// 프로세스 그룹이 아직 있는가 — 우두머리가 죽어도 렌더러 하나가 남으면 그룹은 남는다.
-const aliveGroup = pid => { try { process.kill(-pid, 0); return true; } catch { return false; } };
 
 before(async () => {
   chromeBin = await findChrome();
@@ -88,11 +86,16 @@ after(async () => {
   if (!서버_내려감) throw new Error(`개발 서버(pid ${vite?.pid})가 끝내 내려가지 않았습니다 — 포트 ${port}를 쥔 채 남았습니다`);
 });
 
+// 시험이 일부러 낸 줄(귀가 열려 있는지 확인하는 자리)만 아래 afterEach가 걷어낸다. 낸 뒤에 로그를
+// 비우는 것으로는 모자라다 — 브라우저는 막힌 그림 하나에 '정책 위반'과 '불러오지 못했다'를 따로,
+// 순서도 정해지지 않은 채 내므로 비운 뒤에 온 한 줄이 애먼 시험의 실패가 된다.
+let 일부러_낸_줄 = null;
 // 콘솔에 오른 오류는 그것을 낸 시험의 이름과 함께 말한다. 마지막 시험 하나가 파일 전체의 로그를
 // 몰아 보게 하면 어느 시험이 낸 것인지 말하지 못하고, 그 시험이 로그를 비우고 시작하면 앞의
 // 시험들이 낸 것은 아무도 보지 않는다(React는 렌더의 문제를 예외가 아니라 console.error로 말한다).
 afterEach(() => {
-  const 남은 = page?.logs?.splice(0) ?? [];
+  const 남은 = (page?.logs?.splice(0) ?? []).filter(l => !일부러_낸_줄?.test(l));
+  일부러_낸_줄 = null;
   assert.deepStrictEqual(남은, [], `콘솔에 오류가 올랐다: ${JSON.stringify(남은)}`);
 });
 
@@ -126,6 +129,17 @@ async function settled({ everyMs = 120, 연속 = 2, timeoutMs = 12_000 } = {}) {
   throw new Error(`화면이 ${timeoutMs}ms 안에 잠잠해지지 않았습니다 (마지막으로 본 자리: ${last})`);
 }
 const state = () => page.eval(STATE);
+// 콘솔에 이런 줄이 오를 때까지 기다린다. 정해진 시간을 자면 느린 컴퓨터에서는 아직 오지 않은 것을
+// '듣지 못했다'고 하고(로그는 evaluate의 답과 따로 오는 CDP 이벤트다) 빠른 곳에서는 남는 시간을
+// 버린다 — 이 파일의 다른 기다림이 모두 page.until인 것과 같은 이유로 여기서도 기다린다.
+async function 콘솔에_오를때까지(re, { timeoutMs = 8000, everyMs = 50 } = {}) {
+  for (const t0 = Date.now(); ;) {
+    if (page.logs.some(l => re.test(l))) return;
+    if (Date.now() - t0 > timeoutMs)
+      throw new Error(`시간 안에 콘솔에 오르지 않았습니다: ${re} (그동안 들은 것: ${JSON.stringify(page.logs)})`);
+    await sleep(everyMs);
+  }
+}
 // 뒤늦게 자리를 잡는 차트·흐름도를 흉내 낸다 (내용이 그만큼 자란다).
 const grow = (px = 300) => page.eval(`(() => { const d = document.createElement('div');
   d.style.cssText = 'height:${px}px'; document.querySelector('.chat-inner').appendChild(d); return true; })()`);
@@ -141,6 +155,25 @@ const it = (name, fn) => test(name, async t => { if (skip) return t.skip(skip); 
 it('답이 오면 차트·흐름도가 뒤늦게 서도 끝까지 따라간다', async () => {
   await answered();
   assert.ok((await state()).rest < 8, '답의 끝이 입력창 뒤에 남았다');
+});
+
+it('두 번째 답을 받은 뒤에도 뒤늦게 커지는 것을 따라간다 (관찰자를 다시 다는 자리)', async () => {
+  await answered();
+  // 말풍선의 크기 변화를 보는 관찰자는 대화가 늘 때마다 다시 단다(App.jsx). 그 자리에서 관찰자가
+  // 끊긴 채 남으면 첫 답만 보는 위 시험들은 그대로 통과하고, 두 번째 답부터 조용히 따라가기가
+  // 멎는다 — 오류는 나지 않고 답의 끝이 입력창 뒤에 남을 뿐이다(실측 25~316px).
+  // 앞서는 만드는 곳과 놓는 곳이 서로 다른 효과에 있어, 놓는 쪽 효과에 의존성이 하나 붙기만 해도
+  // 그 상태가 되었다.
+  await page.eval(`document.querySelector('.composer textarea').focus()`);
+  await page.send('Input.insertText', { text: '두 번째 질문' });   // 키 입력이 아닌 글자 넣기(IME·붙여넣기와 같은 길)
+  await page.key('Enter', 'Enter', 13);
+  await page.until(`document.querySelectorAll('.row.user').length === 2 && !document.querySelector('.typing')`,
+    { what: '두 번째 답이 도착하기' });
+  await settled();
+  assert.ok((await state()).rest < 8, '두 번째 답의 끝이 입력창 뒤에 남았다');
+  // 차트·흐름도가 그린 뒤에 자리를 잡는 것과 같은 모양 — 관찰자가 살아 있어야 여기를 따라간다.
+  await grow(); await sleep(900);
+  assert.ok((await state()).rest < 8, '두 번째 답 뒤로는 뒤늦게 커지는 것을 따라가지 못했다');
 });
 
 it('휠로 올려 읽는 중에는 뒤늦게 커져도 따라가지 않는다', async () => {
@@ -269,9 +302,13 @@ it('⚡ 패널은 상한에 걸린 건수와 오류를 문구로 밝힌다', asy
   assert.ok(got.건수.includes(CAPPED_LABEL), `상한에 걸린 결과를 그대로 전부로 보여준다: ${JSON.stringify(got.건수)}`);
   assert.ok(got.건수.includes(ERROR_LABEL), `실행되지 못한 스텝이 오류를 밝히지 않는다: ${JSON.stringify(got.건수)}`);
   assert.ok(!got.건수.some(t => /undefined|NaN/.test(t)), `건수 문구에 값이 새어 나왔다: ${JSON.stringify(got.건수)}`);
-  // 행이 없는(오류) 스텝에는 표도 내려받기도 없다 — 빈 표는 '0건 조회 성공'으로 읽힌다
-  assert.strictEqual(got.표, TRACE.length - 1, '오류 스텝에 빈 표가 생겼다');
-  assert.strictEqual(got.내려받기, TRACE.length - 1, '오류 스텝에 CSV 단추가 생겼다');
+  // 행이 없는(오류) 스텝에는 표도 내려받기도 없다 — 빈 표는 '0건 조회 성공'으로 읽힌다.
+  // 몇 개여야 하는지는 픽스처에 묻는다: '하나만 빼고'라고 적어 두면 오류 스텝을 하나 더한 날
+  // 맞게 그린 화면을 두고 검사가 깨진다(그러면 임자는 앱이 아니라 이 줄이다).
+  const 행있는스텝 = TRACE.filter(t => t.rows?.length > 0).length;
+  assert.ok(행있는스텝 < TRACE.length, '행 없는 스텝이 픽스처에 없다 (검사의 전제)');
+  assert.strictEqual(got.표, 행있는스텝, '행 없는 스텝에 빈 표가 생겼다');
+  assert.strictEqual(got.내려받기, 행있는스텝, '행 없는 스텝에 CSV 단추가 생겼다');
 });
 
 it('좁은 화면: 원그래프 조각이 잘리지 않고 이름은 그래프 밖 범례에 온전히 남는다', async () => {
@@ -339,7 +376,7 @@ it('낮은 화면에서 긴 초안이 대화를 잡아먹지 않는다', async (
 
 it('모델이 쓴 주소는 저절로 불려 나가지 않는다 (그림·흐름도 라벨·차트 표의 셀)', async () => {
   // tableimg는 차트 블록의 표다. 그쪽 파이프라인은 그림 주소를 원문 그대로 넘기므로(App.jsx
-  // mdUrlTransform) TABLE_COMPONENTS의 img 하나가 유일한 관문이다 — 본문과 따로 확인해야 한다.
+  // mdProps의 urlTransform) TABLE_MD의 img 하나가 유일한 관문이다 — 본문과 따로 확인해야 한다.
   for (const c of ['images', 'mermaidhtml', 'tableimg']) {
     await answered(900, 760, { c });
     const got = await page.eval(`(() => ({
@@ -445,24 +482,43 @@ it('화면을 옮겨 가는 기다림은 새 화면이 실제로 설 때까지 �
   assert.ok(걸린 >= 늦게 * 0.8, `앱이 서기도 전에 돌아왔다 (${걸린}ms < ${늦게}ms)`);
 });
 
+it('기다림은 오타를 곧바로 알리고, 지나가는 오류는 그 글자에 속지 않는다', async () => {
+  // 못 읽는 식·없는 이름은 기다린다고 달라지지 않지만(검사를 쓴 사람의 오타), 화면이 서는 중의
+  // TypeError는 다음 폴링에서 풀린다(아직 없는 요소를 만지는 일). 그 둘을 오류 메시지 전체로
+  // 가르던 때에는 'ReferenceError'라는 글자가 스택이나 앱이 낸 문자열에 섞이기만 해도 지나가는
+  // 오류가 치명이 되어, 통과했을 검사가 애먼 말과 함께 죽었다 — 이름으로 가른다(driver.mjs errorName).
+  일부러_낸_줄 = /ReferenceError|TypeError/;   // 여기서 내는 오류가 afterEach의 것으로 읽히지 않게
+  await page.goto(url(), '.chip');
+  const t0 = Date.now();
+  await assert.rejects(page.until('__없는이름__()', { timeoutMs: 6000 }), /ReferenceError/,
+    '없는 이름(오타)을 시간 끝까지 기다렸다');
+  assert.ok(Date.now() - t0 < 3000, `오타를 ${Date.now() - t0}ms나 기다렸다 — 그 말은 늦게 나오는 만큼 흐려진다`);
+  // 이름은 TypeError인데 메시지에 'ReferenceError'가 섞인 오류. 지나가는 것으로 보고 기다려야 하므로,
+  // 여기서는 그 오류가 아니라 '시간 안에 이루어지지 않았다'로 끝나는 것이 맞다.
+  const t1 = Date.now();
+  await assert.rejects(
+    page.until(`(() => { throw new TypeError('ReferenceError: 흉내') })()`, { timeoutMs: 1200, what: '오지 않을 조건' }),
+    /시간 안에 이루어지지 않았습니다/, '지나가는 TypeError를 그 글자만 보고 치명으로 읽었다');
+  assert.ok(Date.now() - t1 >= 1000, '기다리지 않고 곧바로 나왔다');
+});
+
 it('렌더링 중 콘솔에 예외도 오류도 오르지 않는다', async () => {
   // 로그는 시험마다 afterEach가 확인하고 비운다 — 이 시험이 보는 것은 아래 네 화면이 낸 것뿐이다.
   for (const c of ['rich', 'images', 'mermaidhtml', 'tableimg']) await answered(1000, 760, { c });
   assert.deepStrictEqual(page.logs, []);
   // 듣고 있다는 것까지 확인한다 — 귀를 닫은 검사는 무엇이 나가도 늘 통과한다(React는 렌더의
   // 문제를 예외가 아니라 console.error로 말하므로, 그 귀가 이 검사의 전부다).
+  // 이 아래로는 일부러 오류를 낸다 — 그 줄까지 afterEach가 '아무도 내지 않은 오류'로 읽지 않게 밝혀 둔다.
+  일부러_낸_줄 = /들려야 하는 줄|__csp-probe/;
   await page.eval(`console.error('들려야 하는 줄')`);
-  await sleep(300);
-  assert.ok(page.logs.some(l => l.includes('들려야 하는 줄')), '콘솔에 오른 오류를 듣지 못한다 — 이 검사는 아무것도 보지 않는다');
+  await 콘솔에_오를때까지(/들려야 하는 줄/)
+    .catch(() => assert.fail('콘솔에 오른 오류를 듣지 못한다 — 이 검사는 아무것도 보지 않는다'));
   // 브라우저가 스스로 내는 오류(CSP 위반·불러오지 못한 자원)는 console API를 거치지 않으므로 그
   // 귀는 따로 있다(driver.mjs의 Log 도메인). 닫아 두면 index.html의 img-src 방어선이 실제로 걸려도
   // 이 검사는 아무것도 보지 못한다 — 확인해 보니 그때 page.logs는 비어 있었다.
   // 그 귀와 방어선을 한 번에 확인한다: 화면 밖 주소의 그림은 막히고, 막혔다는 말이 들려야 한다.
-  page.logs.length = 0;
   await page.eval(`(() => { const i = document.createElement('img');
     i.src = 'https://ex.test/__csp-probe.png'; document.body.appendChild(i); return true; })()`);
-  await sleep(600);
-  assert.ok(page.logs.some(l => /Content Security Policy/.test(l)),
-    `브라우저가 낸 오류를 듣지 못한다 — 그림 정책이 걸려도 이 검사는 보지 못한다: ${JSON.stringify(page.logs)}`);
-  page.logs.length = 0;
+  await 콘솔에_오를때까지(/Content Security Policy/)
+    .catch(e => assert.fail(`브라우저가 낸 오류를 듣지 못한다 — 그림 정책이 걸려도 이 검사는 보지 못한다: ${e.message}`));
 });

@@ -9,6 +9,18 @@ import { createServer } from 'node:net';
 
 export const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// 이 프로세스가(그룹이) 아직 있는가. 신호 0은 보내지 않고 존재만 묻는다.
+// 한 곳에 둔다 — 내리는 쪽(아래 stopProcess)과 '정말 내려갔나'를 재는 쪽(ui.test.mjs·process.test.js)이
+// 같은 판정을 써야, 그중 하나를 고친 날 검사와 드라이버가 다른 것을 보지 않는다.
+// EPERM은 '없다'가 아니다: 프로세스는 있는데 우리 것이 아니라는 답이다(macOS에서 Chrome의 도우미가
+// 다른 주인에게 넘어가면 이 답이 온다). 그것을 '없다'로 읽으면 남은 브라우저를 내려갔다고 답하게 된다.
+export const alive = pid => {
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return e?.code === 'EPERM'; }
+};
+// 우두머리가 죽어도 렌더러 하나가 남으면 그룹은 남는다 — 음수 pid가 그룹이다.
+export const aliveGroup = pid => alive(-pid);
+
 // 설치 위치는 OS마다 다르다. 없으면 UI 검사는 건너뛴다(단위 테스트는 그것과 무관하게 돈다).
 const CHROME_PATHS = [
   process.env.CHROME_PATH,
@@ -77,7 +89,7 @@ export async function chromePort(profile, { timeoutMs = 30_000 } = {}) {
 export function stopProcess(proc, { graceMs = 2000, group = false } = {}) {
   if (!proc?.pid) return Promise.resolve(true);
   const pid = proc.pid;
-  const 그룹이_남았나 = () => { try { process.kill(-pid, 0); return true; } catch { return false; } };
+  const 그룹이_남았나 = () => aliveGroup(pid);
   // 우두머리가 '수확'되었는가(exitCode가 채워진다)와, group이면 그룹이 비었는가 — 둘 다여야 끝난
   // 것이다. 그룹만 보면, 우두머리가 죽었으나 아직 좀비로 남은 사이에 '끝났다'고 답하게 되어
   // 부르는 쪽의 process.kill(pid, 0)은 여전히 성공한다(좀비에게도 신호는 보내진다).
@@ -91,10 +103,14 @@ export function stopProcess(proc, { graceMs = 2000, group = false } = {}) {
   return new Promise(resolve => {
     const timers = [];
     let watch;
-    const done = ok => { timers.forEach(clearTimeout); clearInterval(watch); resolve(ok); };
+    // 걸어 둔 것은 여기서 전부 걷는다 — 리스너를 남기면 이미 답을 낸 뒤에 그 콜백이 한 번 더 돌고,
+    // 그동안 proc이 그 클로저에 붙들린다. '시작한 것을 남김없이 정리한다'가 이 함수의 일 전부인데,
+    // 그 정리가 한 가지 모자란 채로 다음에 여기 붙일 자원의 본보기가 된다.
+    const onExit = () => { if (끝났나()) done(true); };
+    const done = ok => { timers.forEach(clearTimeout); clearInterval(watch); proc.off('exit', onExit); resolve(ok); };
     // exit 이벤트는 우두머리의 것뿐이라 그룹이 비었다는 뜻이 아니다 — 직접 들여다본다.
     watch = setInterval(() => { if (끝났나()) done(true); }, 50);
-    proc.once('exit', () => { if (끝났나()) done(true); });
+    proc.once('exit', onExit);
     signal('SIGTERM');
     timers.push(setTimeout(() => signal('SIGKILL'), graceMs));
     // SIGKILL로도 사라지지 않으면(좀비 등) 검사를 거기서 멈추지는 않는다 — 알리는 것은 부르는 쪽이다.
@@ -138,6 +154,12 @@ export async function oneTab(port) {
 const SEND_TIMEOUT_MS = 20_000;
 const OPEN_TIMEOUT_MS = 20_000;
 
+// 페이지에서 난 오류의 이름. CDP가 준 className이 있으면 그것이고, 없으면 메시지 '첫 줄의 앞부분'만
+// 본다 — 그 뒤는 스택이라, 거기까지 훑으면 애먼 이름을 집는다.
+export const errorName = e => e?.className ?? (/^([A-Za-z]*Error)\b/.exec(String(e?.message ?? ''))?.[1] ?? '');
+// 기다린다고 달라지지 않는 것들 — 검사를 쓴 사람의 오타다 (아래 until).
+const FATAL_ERRORS = new Set(['SyntaxError', 'ReferenceError']);
+
 export class Page {
   constructor(ws) { this.ws = ws; this._id = 0; this.pending = new Map(); this.logs = []; this.dead = null; }
 
@@ -175,7 +197,9 @@ export class Page {
         // 브라우저가 스스로 내는 오류(CSP 위반·불러오지 못한 자원)는 console API를 거치지 않으므로
         // Runtime.consoleAPICalled에는 오르지 않는다. 그것을 듣지 않으면 index.html의 img-src
         // 방어선이 실제로 걸려도 검사는 아무것도 보지 못한다(확인: 그때 page.logs는 비어 있었다).
-        p.logs.push(`${m.params.entry.source}: ${m.params.entry.text}`);
+        // 어느 자원이었는지까지 남긴다 — 'Failed to load resource'만 남기면 무엇이 막힌 것인지
+        // 알 수 없고, 일부러 낸 줄을 가려내야 하는 쪽(ui.test.mjs)도 그것을 집을 수 없다.
+        p.logs.push(`${m.params.entry.source}: ${m.params.entry.text}${m.params.entry.url ? ` (${m.params.entry.url})` : ''}`);
       }
     };
     // 소켓이 끊기면 기다리던 요청은 영영 답을 받지 못한다 — node:test에는 기본 시간 제한이 없어
@@ -187,10 +211,25 @@ export class Page {
     };
     ws.onclose = () => fail('브라우저와의 연결이 끊겼습니다');
     ws.onerror = () => fail('브라우저와의 연결에 오류가 났습니다');
-    await p.send('Page.enable');
-    await p.send('Runtime.enable');
-    await p.send('Log.enable');
-        return p;
+    // 여기서부터는 소켓이 열려 있다 — 아래 셋 중 하나라도 실패하면 그 손잡이를 놓고 나간다.
+    // 위 손짓 단계에서 닫는 것과 같은 이유이고, 이쪽이 실제로 더 흔한 길이다: 포트도 손짓도 끝냈는데
+    // CDP가 답하지 않거나 오류로 답하는 브라우저(탭이 방금 닫혔거나 죽어 가는 중)가 그 모양이다.
+    // 열린 채로 두면 그 손잡이 하나가 node를 끝나지 못하게 붙잡아, 검사가 실패도 아니고 끝나지도
+    // 않는다 — 부르는 쪽의 after()는 page를 받지 못했으므로 닫아 줄 소켓을 알지 못한다.
+    // (확인: 손짓만 끝내고 Page.enable에 오류로 답하는 서버를 세우니 거절은 곧바로 왔는데 아이
+    //  프로세스는 30초 뒤에도 끝나지 않았다. 아래 test/process.test.js가 그 모양을 재현한다.)
+    // close()가 닿는 데까지가 여기서 할 수 있는 전부다: 상대가 close 프레임에 답하지 않으면 소켓은
+    // CLOSING에 머물고(확인: readyState 2로 계속), node의 WebSocket에는 강제로 끊을 손잡이가 없다.
+    // 그 경우(멈춰 버린 브라우저)는 부르는 쪽의 after()가 브라우저를 내리면서 함께 풀린다.
+    try {
+      await p.send('Page.enable');
+      await p.send('Runtime.enable');
+      await p.send('Log.enable');
+    } catch (e) {
+      try { ws.close(); } catch { /* 이미 닫혔다 */ }
+      throw e;
+    }
+    return p;
   }
 
   send(method, params = {}, { timeoutMs = SEND_TIMEOUT_MS } = {}) {
@@ -210,7 +249,14 @@ export class Page {
 
   async eval(expression, opts) {
     const r = await this.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, opts);
-    if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text);
+    if (r.exceptionDetails) {
+      const ex = r.exceptionDetails.exception;
+      const e = new Error(ex?.description ?? r.exceptionDetails.text);
+      // 무엇이 났는지는 CDP가 이름으로도 알려준다(className). 메시지(description)는 스택까지 담은
+      // 글자라 거기서 이름을 찾으면 남의 프레임 하나에 속는다 — 아래 until이 그것으로 갈랐었다.
+      e.className = ex?.className ?? null;
+      throw e;
+    }
     return r.result.value;
   }
 
@@ -231,7 +277,10 @@ export class Page {
         //   못 읽는 식(SyntaxError)과 없는 이름(ReferenceError)은 기다린다고 달라지지 않는다 —
         //   둘 다 검사를 쓴 사람의 오타다. TypeError는 삼킨다: 화면이 서기 전의 null을 만지는 것은
         //   지나가는 일이라 그 다음 폴링에서 풀린다(document.querySelector('.chat').scrollTop 등).
-        if (this.dead || /SyntaxError|ReferenceError/.test(e.message)) throw e;
+        //   가르는 것은 오류의 '이름'이다(errorName). 메시지 전체에서 그 글자를 찾으면 스택에 섞인
+        //   남의 이름 하나로 — 번들 모듈 이름, 앱이 낸 문자열 — 지나가는 TypeError가 치명이 되어,
+        //   통과했을 검사가 애먼 말과 함께 죽는다.
+        if (this.dead || FATAL_ERRORS.has(errorName(e))) throw e;
         last = e;
       }
       if (ok) return true;
