@@ -3,6 +3,12 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- 그림은 이 화면 안의 것과 data: 만. 답변의 글자는 모델이 쓴 것이고 그 재료에는 조회 결과가
+         섞이므로, 주소 하나가 사용자가 누르기도 전에 바깥으로 나가는 요청이 되어서는 안 된다.
+         markdown의 ![](주소)는 App.jsx(AltImage)가, 흐름도 라벨의 <img>는 Mermaid.jsx(htmlLabels:false)가
+         이미 막는다 — 여기서 한 번 더 막는 이유는 그 둘이 '자리마다 하나씩'이라 새 자리가 생기면
+         (그림 노드 같은 새 문법) 다시 뚫리기 때문이다. 이 줄은 자리와 무관하게 걸린다. -->
+    <meta http-equiv="Content-Security-Policy" content="img-src 'self' data:" />
     <title>SPACE Assistant</title>
     <style>
       :root {

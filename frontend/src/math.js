@@ -115,21 +115,45 @@ function splitText(node, source) {
 //                   모델은 별행 수식을 거의 언제나 한 줄로 쓴다 — 그대로 두면 가운데 정렬도, 넘칠 때의
 //                   가로 스크롤(.katex-display)도 없이 말풍선의 overflow-x: clip에 잘려 오른쪽이 통째로
 //                   닿을 수 없게 된다(실측: 폭 574px 말풍선에 2,069px짜리 수식, 1,478px이 잘렸다).
-const BRACKET_BLOCK_RE = /^\\\[([\s\S]+)\\\]$/;
+// \[ … \] 덩어리. 비탐욕(+?)이어야 한 문단에 둘이 있을 때 그 사이까지 한 수식으로 삼키지 않는다.
+const BRACKET_ALL_RE = /\\\[([\s\S]+?)\\\]/g;
+// 문단에 글은 없고 수식만 있으면 별행으로 올린다. 하나든, 빈 줄 없이 잇달아 쓴 여럿이든 마찬가지다 —
+// 모델은 유도 과정을 빈 줄 없이 줄바꿈만으로 잇대어 쓴다(실측: $$ 쪽은 가운데 정렬도 넘칠 때의 가로
+// 스크롤도 없이 문장 속 표기로 남았고, \[…\] 쪽은 둘을 한 덩어리로 물어 수식으로 인식되지도 않았다).
+// 글자가 섞인 문단은 올리지 않는다 — 그것은 문장 속 표기다.
 function displayParagraph(node, source) {
-  if (node.type !== 'paragraph' || node.children.length !== 1) return null;
-  const child = node.children[0];
-  const from = child.position?.start?.offset;
-  if (from === undefined) return null;
-  // remark-math가 만든 한 줄짜리 $$…$$. 지금의 계약(아래 REMARK_PLUGINS의 singleDollarTextMath: false)
-  // 아래에서 inlineMath로 오는 것은 $$뿐이라 이 확인은 늘 참이다 — 계약이 풀렸을 때를 위해 남겨 둔다.
-  // 홑 $ 하나짜리($v=d/t$ 한 줄)는 그때에도 별행으로 올리지 않는다: 그것을 쓴 사람은 문장 속 표기를
-  // 쓴 것이고, 우리 판정(splitText)도 인라인으로 내놓는다.
-  if (child.type === 'inlineMath') return source.startsWith('$$', from) ? mathNode(child.value, true) : null;
-  if (child.type !== 'text') return null;
-  const m = BRACKET_BLOCK_RE.exec(source.slice(from, child.position.end.offset).trim());
-  return m && m[1].trim() ? mathNode(m[1].trim(), true) : null;
+  if (node.type !== 'paragraph') return null;
+  const out = [];
+  for (const child of node.children) {
+    const from = child.position?.start?.offset;
+    if (from === undefined) return null;
+    if (child.type === 'inlineMath') {
+      // 지금의 계약(아래 REMARK_PLUGINS의 singleDollarTextMath: false)에서 inlineMath로 오는 것은
+      // $$뿐이라 이 확인은 늘 참이다 — 계약이 풀렸을 때를 위해 남겨 둔다. 홑 $ 하나짜리($v=d/t$)는
+      // 그때에도 별행으로 올리지 않는다: 그것을 쓴 사람은 문장 속 표기를 쓴 것이다.
+      if (!source.startsWith('$$', from) || !child.value.trim()) return null;
+      out.push(mathNode(child.value, true));
+      continue;
+    }
+    if (child.type !== 'text') return null;
+    const raw = source.slice(from, child.position.end.offset);
+    if (!raw.trim()) continue; // 수식 사이의 줄바꿈·공백
+    const parts = [...raw.matchAll(BRACKET_ALL_RE)].filter(m => m[1].trim());
+    // 덩어리 밖에 글자가 남으면 그것은 문장이다
+    if (!parts.length || raw.replace(BRACKET_ALL_RE, '').trim()) return null;
+    for (const m of parts) out.push(mathNode(m[1].trim(), true));
+  }
+  return out.length ? out : null;
 }
+
+// remark-math는 '$$' 뒤에 이어 쓴 글자를 코드펜스의 언어처럼 meta에 담는다 — 닫힌 블록에서도 그렇다.
+// 그것을 그대로 두면 '$$ \bar{x} = 1' 로 시작한 수식이 빈 조판 블록이 되어 화면에서 통째로 사라진다
+// (실측: 여는 줄에 쓴 글자가 없어지고, 본문이 함께 있으면 그 줄만 남았다).
+// 노드를 고쳐 쓰지 않고 새로 만드는 이유: remark-math는 이미 data.hChildren에 '무엇을 그릴지'를
+// 구워 두었다(빈 값 그대로). 값만 바꿔 끼우면 화면에는 여전히 빈 블록이 나온다(실측).
+const withMeta = node => (node.type === 'math' && node.meta
+  ? mathNode(node.value ? `${node.meta}\n${node.value}` : node.meta, true)
+  : null);
 
 // 닫히지 않은 별행 수식($$ 뒤에 닫는 줄이 없는 경우)은 남은 답변을 통째로 수식으로 삼킨다.
 // 토큰 한도로 잘린 응답에서 실제로 나오고, 그러면 본문이 조판 속으로 사라진다.
@@ -157,8 +181,13 @@ function walk(node, source) {
   if (!children) return;
   for (let i = 0; i < children.length; i++) {
     const child = children[i];
-    const replaced = displayParagraph(child, source) ?? unclosedMath(child, source);
-    if (replaced) { children[i] = replaced; continue; }
+    const replaced = displayParagraph(child, source) ?? unclosedMath(child, source) ?? withMeta(child);
+    if (replaced) {
+      const nodes = Array.isArray(replaced) ? replaced : [replaced];
+      children.splice(i, 1, ...nodes);
+      i += nodes.length - 1;
+      continue;
+    }
     if (child.type === 'text') {
       const parts = splitText(child, source);
       if (parts) { children.splice(i, 1, ...parts); i += parts.length - 1; }

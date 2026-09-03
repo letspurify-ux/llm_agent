@@ -4,7 +4,7 @@ import remarkGfm from 'remark-gfm';
 // 수식 표기의 계약(무엇이 수식인가 + 그것을 어떻게 그리는가)은 전부 math.js에 있다.
 import { REMARK_PLUGINS, REHYPE_PLUGINS } from './math.js';
 // 차트 블록의 계약(무엇을 차트로 받는가 + 이력으로 되돌릴 때의 모양)은 chart.js에 있다.
-import { parseChartBlock, splitBlock, chartTableMarkdownFrom, chartBlocksToTables, sliceSafe, MAX_CHARTS_PER_MESSAGE } from './chart.js';
+import { parseChartBlock, splitBlock, chartTableMarkdownFrom, chartBlocksToTables, sliceSafe, clip, MAX_CHARTS_PER_MESSAGE } from './chart.js';
 // trace 패널의 계약(열·셀 표기·CSV)은 trace.js에 있다.
 import { columnsOf, cellText, toCsv, csvFileName } from './trace.js';
 
@@ -83,7 +83,7 @@ const ChartBudget = createContext(null);
 function ChartBlock({ text }) {
   const budget = useContext(ChartBudget);
   const block = splitBlock(text);
-  const parsed = parseChartBlock(text);
+  const parsed = parseChartBlock(text, block);
   const draw = parsed.ok && budget && budget.n++ < MAX_CHARTS_PER_MESSAGE;
   const titled = <ChartTable text={text} block={block} withTitle />;
   if (!draw) return titled;
@@ -160,7 +160,10 @@ function AltImage({ node, src, alt, title }) {
   const scheme = typeof src === 'string' && /^[a-z][a-z0-9+.-]*:/i.exec(src);
   if (typeof src !== 'string' || src === '' || inLink || src.startsWith('//')
       || (scheme && !/^https?:$/i.test(scheme[0]))) {
-    return <em>🖼 {label || '이미지'}</em>;
+    // 열어 주지 않더라도 무엇을 가리키는지는 보여야 한다 — 링크 안의 그림처럼 주소가 아예 닿을 수
+    // 없는 자리에서는 이것이 유일한 단서다. 아주 긴 주소(data: 등)는 끝을 줄인다.
+    const where = typeof src === 'string' && src ? ` (${clip(src, 60)})` : '';
+    return <em>🖼 {label || '이미지'}{where}</em>;
   }
   // 페이지 안 앵커는 제자리에서 연다 — 링크와 같은 규칙이다(NewTabLink). 새 탭으로 열면 대화가
   // 없는 앱이 한 벌 더 뜬다.
@@ -200,7 +203,9 @@ function countLabel(t) {
   if (t.rowCount === undefined) return `${n}건`; // 몇 건 중 몇 건인지 말할 근거가 없다
   // 상한에 걸린 것과 실린 행이 일부인 것은 함께 올 수 있다(서버 result.js) — 그때 둘 중 하나만
   // 말하면 '왜 이만큼뿐인가'의 절반이 사라진다.
-  if (t.capped && t.omittedRows) return `${t.rowCount}건 — 조회 상한에 걸렸고, 아래는 그중 ${n}건입니다`;
+  // 상한에 걸린 rowCount는 서버가 '1000+'처럼 준다(result.js) — 같은 패널에서 '건 이상'과 '+건'이
+  // 섞이지 않게 여기서도 같은 말로 푼다.
+  if (t.capped && t.omittedRows) return `${String(t.rowCount).replace(/\+$/, '')}건 이상 — 조회 상한에 걸렸고, 아래는 그중 ${n}건입니다`;
   if (t.omittedRows) return `${t.rowCount}건 (아래는 그중 ${n}건)`;
   if (t.capped) return `${n}건 이상 — 조회 상한에 걸려 처음 ${n}건만 가져왔습니다`;
   return `${t.rowCount}건`;
@@ -521,9 +526,14 @@ export default function App() {
     // 1,000px가 미끄러져 잡고 있던 표가 화면 위로 사라졌다). 놓는 곳은 대화 밖일 수 있으므로
     // 움직임·놓음은 창에서 듣는다. (손가락으로 미는 것은 pointer 이벤트로 잡히지 않는다 — 바로 아래 참고)
     const onDown = e => {
+      // 스크롤바를 잡은 것은 '움직이려는 입력'이다(byUser). 대화 안을 그냥 누른 것은 아니다 —
+      // offsetX가 보이는 폭을 넘으면 그 자리는 스크롤바다.
+      if (e.target === el && e.offsetX >= el.clientWidth) noteInput();
       // 오른쪽·가운데 단추로 누른 것은 끄는 것이 아니다(글을 고르지도, 표를 끌지도 않는다). 두 번째
       // 손가락도 마찬가지다 — 첫 손가락의 시작점을 덮어쓰면 그중 하나만 떼어도 끌기가 통째로 풀린다.
-      if (!e.isPrimary || (e.pointerType === 'mouse' && e.button !== 0)) return;
+      // 이미 끌고 있는 중이면 새 포인터는 받지 않는다. isPrimary는 '종류마다 하나'라 손가락으로 끄는
+      // 중에 마우스가 눌리면 그것도 주 포인터다 — 그대로 두면 첫 손가락의 끌기가 덮여 사라진다.
+      if (dragRef.current || !e.isPrimary || (e.pointerType === 'mouse' && e.button !== 0)) return;
       dragRef.current = { id: e.pointerId, x: e.clientX, y: e.clientY, moved: false, vertical: false };
     };
     const onMove = e => {
@@ -532,7 +542,9 @@ export default function App() {
       // 놓은 것을 놓치는 경로가 있다: 오른쪽 클릭 메뉴가 뜬 사이의 pointerup, 창 밖에서 뗀 단추.
       // 눌린 단추 없이 오는 마우스 움직임이 곧 '이미 놓았다'는 뜻이다 — 여기서 끝낸 것으로 친다.
       // 놓친 채로 두면 dragRef가 영영 남아 새로고침할 때까지 따라가기가 죽는다.
-      if (e.pointerType === 'mouse' && !e.buttons) { endDrag(); return; }
+      // 단추 없이 오는 마우스 움직임 = 이미 놓았다. 이벤트를 그대로 넘겨 그 포인터의 끌기만 끝낸다
+      // (넘기지 않으면 손가락으로 끄는 중에 지나간 마우스가 남의 끌기를 끝낸다).
+      if (e.pointerType === 'mouse' && !e.buttons) { endDrag(e); return; }
       if (Math.abs(e.clientY - d.y) > 4) d.vertical = true;
       // 끌기 시작이 곧 사용자의 개입이다. 앞으로의 미끄러짐은 holding()이 막지만, 이미 돌고 있는 것은
       // 여기서 멈추지 않으면 계속 흘러 고르던 글의 시작점이 손 밑에서 떠내려간다.
@@ -589,13 +601,11 @@ export default function App() {
       if (!SCROLL_KEYS.has(e.key) || inputRef.current?.contains(e.target)) return;
       noteInput();
     };
-    const onScrollbarDown = e => { if (e.target === el && e.offsetX >= el.clientWidth) noteInput(); };
     addEventListener('keydown', onKeyInput, true);
     // 확대 제스처(트랙패드 핀치·Ctrl+휠)는 휠 이벤트로 오지만 스크롤이 아니다 — 대화 밖 휠을 넘겨 주는
     // 쪽(onOutsideWheel)이 이미 빼고 있는 것과 같은 이유로 여기서도 뺀다.
     const onWheelInput = e => { if (!e.ctrlKey) noteInput(); };
     addEventListener('wheel', onWheelInput, { capture: true, passive: true });
-    el?.addEventListener('pointerdown', onScrollbarDown);
     const onTouchEnd = e => {
       if (e.touches.length > 0) return; // 아직 다른 손가락이 닿아 있다
       if (panRef.current) markBusy(); // 뗀 뒤에도 관성으로 더 미끄러진다 — 그동안도 만지는 중이다
@@ -648,7 +658,6 @@ export default function App() {
       removeEventListener('pointermove', onMove);
       removeEventListener('keydown', onKeyInput, true);
       removeEventListener('wheel', onWheelInput, true);
-      el?.removeEventListener('pointerdown', onScrollbarDown);
       removeEventListener('pointerup', endDrag);
       removeEventListener('pointercancel', endDrag);
       removeEventListener('blur', onWindowBlur);
@@ -819,7 +828,9 @@ export default function App() {
       // ??가 아니라 ||인 이유: 빈 문자열도 걸러야 한다. undefined는 이력에 들어가면 다음 전송을 깨고,
       // ''는 빈 말풍선으로 렌더된 뒤 그 빈 턴이 다음 질문의 맥락으로 서버에 되돌아간다.
       // (답변은 항상 문자열이므로 0·false가 ||에 걸려 사라질 일은 없다)
-      answer = data.answer || data.error || answer;
+      // 답이 비어 있는 것과 통신하지 못한 것은 다르다 — 서버가 답한 것을 '통신하지 못했습니다'로
+      // 보여주면, 그 아래 실행된 쿼리 패널에는 성공한 조회가 그대로 보이면서 화면이 앞뒤가 맞지 않는다.
+      answer = data.answer || data.error || (res.ok ? '답변을 만들지 못했습니다.' : answer);
       trace = data.trace;
       // 오류 응답(4xx/5xx, 또는 error 필드)은 모델이 한 말이 아니다 — 이력에 넣지 않는다.
       // 답이 비어 있을 때(200인데 answer가 '')도 마찬가지다: 그때 화면에 서는 것은 위의 기본 문구인데,

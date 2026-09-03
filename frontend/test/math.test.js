@@ -109,6 +109,24 @@ test('닫히지 않은 $$가 남은 답변을 통째로 삼키지 않는다', ()
   assert.ok(visible(tail).includes('\\alpha + \\beta') && visible(tail).includes('이어지는 설명이다.'), visible(tail));
 });
 
+test('별행 수식은 여는 줄에 이어 써도, 빈 줄 없이 잇달아 써도 온전히 그려진다', () => {
+  // remark-math는 '$$' 뒤에 이어 쓴 글자를 코드펜스의 언어처럼 meta에 담는다 — 그것을 빠뜨리면
+  // 닫힌 블록에서도 수식이 빈 조판 블록이 되어 화면에서 통째로 사라진다.
+  assert.deepStrictEqual(formulas('평균:\n\n$$ \\bar{x} = 1\n$$'), ['\\bar{x} = 1']);
+  assert.deepStrictEqual(formulas('$$ \\alpha\n\\beta\n$$'), ['\\alpha\n\\beta']);
+  assert.deepStrictEqual(formulas('$$\nx = 1\n$$'), ['x = 1']);
+  // 유도 과정은 빈 줄 없이 줄바꿈만으로 잇대어 온다 — 그 둘 다 별행이어야 가운데 정렬과 가로 스크롤을 얻는다
+  const two = '$$a = 1$$\n$$b = 2$$';
+  assert.deepStrictEqual(formulas(two), ['a = 1', 'b = 2']);
+  assert.strictEqual((render(two).match(/katex-display/g) ?? []).length, 2);
+  const brackets = '\\[ a=1 \\]\n\\[ b=2 \\]';
+  assert.deepStrictEqual(formulas(brackets), ['a=1', 'b=2']);
+  assert.strictEqual((render(brackets).match(/katex-display/g) ?? []).length, 2);
+  // 글자가 섞인 문단은 그대로 문장 속 표기다
+  assert.ok(!isDisplay('앞 $$a = 1$$ 뒤'));
+  assert.deepStrictEqual(formulas('앞 $$a = 1$$ 뒤'), ['a = 1']);
+});
+
 test('코드 안의 $와 \\(는 글자 그대로 남는다', () => {
   const fenced = '```bash\necho $HOME\n```';
   assert.deepStrictEqual(formulas(fenced), []);

@@ -200,8 +200,10 @@ const isNumericColumn = (rows, i) => {
 
 // 블록 본문 → 그릴 수 있는 명세. 그릴 수 없으면 { ok:false, reason } — reason은 개발자용 문자열이며
 // 화면에는 표만 보인다.
-export function parseChartBlock(text) {
-  const { config, table } = splitBlock(text);
+// block: 부르는 쪽이 이미 splitBlock한 것이 있으면 그것을 준다 — 화면은 같은 블록을 표로도 그리므로
+// 두 번 훑을 이유가 없다 (없으면 여기서 가른다).
+export function parseChartBlock(text, block) {
+  const { config, table } = block ?? splitBlock(text);
   if (config.data !== undefined && !table.length) return { ok: false, reason: 'data 참조가 채워지지 않음' };
   const parsed = parseTable(table);
   if (!parsed) return { ok: false, reason: '표 없음' };
@@ -232,8 +234,10 @@ export function parseChartBlock(text) {
   if ((yNamed.length && !y.length) || (!single && y2Named.length && !y2Numeric.length)) return { ok: false, reason: '지정한 열이 숫자 열이 아님' };
   const y2 = single ? [] : y2Numeric.slice(0, 2);
   if (!y.length) y = header.map((_, i) => i).filter(i => !used.has(i) && isNumericColumn(rows, i));
-  // 왼쪽에 그릴 것이 없고 오른쪽만 있으면(y2만 적은 블록) 그것을 왼쪽에 그린다 — 축 하나면 오른쪽일 이유가 없다.
-  if (!y.length && y2.length) { y = y2.splice(0); }
+  // 왼쪽에 그릴 것이 없고 오른쪽만 있으면(y2만 적은 블록) 그것을 왼쪽에 그린다 — 축 하나면 오른쪽일
+  // 이유가 없다. pie·scatter에서는 y2를 비워 두므로(위 single) 그 이름들을 여기서 되찾아야 한다 —
+  // 그러지 않으면 'y2: 건수'라고만 적은 원그래프가 그릴 열을 하나도 찾지 못한다(실측).
+  if (!y.length && (y2.length || y2Numeric.length)) y = y2.length ? y2.splice(0) : y2Numeric.slice(0, 1);
   if (!y.length) return { ok: false, reason: '숫자 열 없음' };
   // pie·scatter는 값 하나만 그린다 — 둘째 시리즈부터는 겹쳐 그릴 자리가 없다.
   y = y.slice(0, single ? 1 : MAX_SERIES - y2.length);
