@@ -855,6 +855,9 @@ const handledTagRe = () => new RegExp(
 
 // insideDecision(i): 그 위치가 파싱된 결정 JSON 안인지. 답변 본문이 태그를 '설명'하는 경우
 // (이 파일이 지키려는 바로 그 상황)까지 경고하면 진짜 신호가 묻힌다.
+//
+// 물음의 위치는 오름차순으로만 온다(matchAll이 앞에서부터 훑는다) — insideDecision은 그 전제 위에
+// 서 있는 커서라(insideDecisionChecker), 위치를 되돌려 물으면 답이 틀린다.
 function warnUnknownReasoningMarkup(content, insideDecision) {
   const handled = handledTagRe();
   for (const m of content.matchAll(MARKER_RE())) {
@@ -865,6 +868,25 @@ function warnUnknownReasoningMarkup(content, insideDecision) {
       `Add the tag name to REASONING_TAGS in llm-openai.js if this is a reasoning marker.`);
     return; // 한 종류만 알리면 충분하다 — 나머지는 그 표기를 지원한 뒤 다시 드러난다
   }
+}
+
+// '파싱된 결정 JSON 안인가'의 판정자. 마커 위치(matchAll)와 객체 span(scanCandidates)이 둘 다
+// 오름차순이고 span은 서로 겹치지 않으므로, 커서 하나를 앞으로만 움직이며 함께 훑는다 —
+// 전체 비용이 '마커 수 + 객체 수'로 유계다.
+// 마커마다 목록을 처음부터 다시 보면(objects.some) 비용이 '마커 수 × 객체 수'라 정확히 이차다.
+// 작은 결정 JSON마다 사고 과정 낱말이 든 미지의 마커가 하나씩 실린 응답('{"a":"<rethink>"}' 반복 —
+// temperature=0의 토큰 반복 퇴화가 정확히 이런 모양을 만든다)에서 실측 256KB 211ms → 512KB 776ms
+// → 1MB 2.8초, 크기 2배마다 4배. 응답 상한(MAX_UPSTREAM_JSON_BYTES, 8MB)까지 가면 분 단위가 되고,
+// 그 시간은 동기 작업이라 동시에 처리 중인 모든 요청이 함께 멈춘다 — 후보 예산(MAX_UNMATCHED_*)과
+// 태그 상한(MAX_TAG_ATTR_LEN)이 막는 것과 같은 종류의 실패가 경고 스캔 문으로 되살아난 것이다.
+// 커서를 지나간 객체로 되돌리지 않아도 되는 이유: end < i인 객체는 이 위치에도, 그보다 뒤의
+// 어떤 위치에도 답이 될 수 없다(마커 위치는 오름차순이다).
+function insideDecisionChecker(objects) {
+  let k = 0;
+  return i => {
+    while (k < objects.length && objects[k].end < i) k++;
+    return k < objects.length && i > objects[k].start && i <= objects[k].end;
+  };
 }
 
 // 후보와 태그를 함께 읽는 토큰. 후보는 '{' 다음이 (공백을 건너뛰어) '"'인 것만 본다 — 우리가 찾는
@@ -981,8 +1003,9 @@ function parseDecision(content, forceAnswer) {
 
   // 모르는 표기가 왔다는 사실만은 소리 나게 한다 — 이 실패는 '정상 응답'처럼 보여 로그가 유일한
   // 단서다. 파싱된 객체 안의 마커는 답변 본문이 태그를 설명하는 것이므로 세지 않는다.
-  // 객체 span은 서로 겹치지 않는다(성공하면 그 끝으로 건너뛰므로) — 그래서 그냥 훑으면 된다.
-  warnUnknownReasoningMarkup(content, i => objects.some(o => i > o.start && i <= o.end));
+  // 객체 span은 서로 겹치지 않고 오름차순이다(성공하면 그 끝으로 건너뛰므로) — 판정은 그 성질을
+  // 쓰는 커서 스캔이다. 마커마다 목록을 처음부터 다시 훑으면 이차가 된다(insideDecisionChecker 주석).
+  warnUnknownReasoningMarkup(content, insideDecisionChecker(objects));
 
   // 1순위 = 사고 과정 밖. 2순위 = 추정 구간(②) 안 — 그 추정이 틀렸을 때(모델이 답변에 '</think>'를
   // 쓴 경우처럼) 제대로 답한 응답을 통째로 버리지 않기 위한 뒷문이다.

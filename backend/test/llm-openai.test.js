@@ -295,6 +295,19 @@ test('닫는 태그가 반복돼도 후보 탐색 총량이 이차로 늘지 않
   assert.ok(Date.now() - t0 < 2000, `파싱이 너무 오래 걸림: ${Date.now() - t0}ms`);
 });
 
+test('결정 JSON 안의 미지 마커가 반복돼도 경고 스캔이 이벤트 루프를 붙잡지 않는다', async () => {
+  // 마커마다 파싱된 객체 목록을 처음부터 다시 훑으면 '마커 수 × 객체 수'라 정확히 이차다.
+  // '{"a":"<rethink>"}' 반복이 그 최악을 정확히 만든다: 후보는 전부 파싱에 성공해 후보 예산
+  // (MAX_UNMATCHED_*) 밖이고, 마커는 사고 과정 낱말(REASONING_WORD)이라 안/밖 판정까지 가며,
+  // 전부 결정 JSON 안이라 경고 없이(이른 return 없이) 끝까지 훑는다 — temperature=0의 토큰 반복
+  // 퇴화가 이런 모양을 만든다. 실측(고치기 전): 256KB 211ms → 512KB 776ms → 1MB 2.8초, 크기
+  // 2배마다 4배 — 응답 상한(MAX_UPSTREAM_JSON_BYTES, 8MB) 근처면 분 단위가 된다. 그 시간은 동기
+  // 작업이라 동시에 처리 중인 모든 요청이 함께 멈춘다 (llm-openai.js insideDecisionChecker 주석).
+  const t0 = Date.now();
+  await decide('{"a":"<rethink>"}'.repeat(90_000));   // 약 1.5MB — 객체·마커 각 9만 개
+  assert.ok(Date.now() - t0 < 2000, `파싱이 너무 오래 걸림: ${Date.now() - t0}ms`);
+});
+
 test('앞선 사고 과정 구간이 뒤 구간의 후보 예산을 먹지 않는다', async () => {
   // 앞 구간에서 쓴 예산을 그대로 이어가면, 후보가 잔뜩 든 구간 하나가 뒤 구간의 몫까지 먹는다.
   // 그 뒤에 진짜 결정이 있으면 후보로 오르지도 못해 파싱이 통째로 실패한다
@@ -347,6 +360,17 @@ test('모르는 사고 과정 표기가 오면 로그로 알린다', async () =>
     assert.equal(markup.length, 1, `${open} 를 알려야 한다`);
     assert.ok(markup[0].includes(open), `어떤 표기였는지 로그에 남아야 한다: ${markup[0]}`);
   }
+});
+
+test('결정 안의 마커를 지나간 뒤에 오는 미지 표기도 놓치지 않는다', async () => {
+  // 안/밖 판정은 앞으로만 가는 커서다(insideDecisionChecker) — '안'의 마커를 지나치며 커서가
+  // 객체를 넘어선 뒤에도 '밖'의 마커는 밖으로 판정되어야 한다. 여기가 어긋나면 오류 없이
+  // 경고만 조용히 사라져, 모르는 표기를 쓰는 모델의 초안 실행을 알 단서가 없어진다.
+  const { decision, markup } = await decideWithWarnings(
+    '{"action":"answer","answer":"<deepthink> 는 태그다"}\n<deepthink>여담</deepthink>');
+  assert.deepStrictEqual(decision, { action: 'answer', answer: '<deepthink> 는 태그다' });
+  assert.equal(markup.length, 1, '결정 밖의 미지 표기를 알리지 않았다');
+  assert.ok(markup[0].includes('<deepthink>'), `어떤 표기였는지 로그에 남아야 한다: ${markup[0]}`);
 });
 
 test('아는 표기와 무관한 마크업에는 경고하지 않는다', async () => {
