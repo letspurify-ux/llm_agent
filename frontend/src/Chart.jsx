@@ -6,7 +6,7 @@ import {
   ResponsiveContainer, ComposedChart, PieChart, ScatterChart,
   Bar, Line, Area, Pie, Scatter, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
 } from 'recharts';
-import { pieSlices, clip } from './chart.js';
+import { pieSlices, clip, chartNotes } from './chart.js';
 
 // 첫 색은 앱의 강조색(index.html --accent)을 따라가고, 나머지는 서로 구별되는 고정 팔레트다.
 // 강조색은 이 모듈이 처음 실행될 때 한 번 읽는다 — 차트가 나올 시점에는 문서가 이미 그려져 있다.
@@ -251,12 +251,10 @@ export default function Chart({ spec }) {
     <figure className="chart" aria-labelledby={spec.title ? id : undefined}>
       {spec.title && <figcaption id={id}>{spec.title}</figcaption>}
       <View spec={spec} />
-      {spec.clipped && <div className="chart-note">처음 {spec.rows.length}행만 그렸습니다 (전체 {spec.total}행).</div>}
-      {/* 명시한 xtype으로 읽지 못해 뺀 행 — '합계' 행이나 다른 꼴의 날짜가 조용히 사라지지 않게 밝힌다. */}
-      {spec.skipped > 0 && <div className="chart-note">x를 {spec.xKind === 'time' ? '시간' : '숫자'}으로 읽지 못한 {spec.skipped}행은 그리지 않았습니다.</div>}
-      {/* 원그래프가 조각으로 만들 수 없어 뺀 행(값이 0 이하). 표에는 있는 행이라 밝히지 않으면
-          비율의 분모가 달라진 것을 사용자가 알 수 없다. */}
-      {spec.dropped > 0 && <div className="chart-note">값이 없거나 0 이하인 {spec.dropped}행은 조각으로 그리지 않았습니다.</div>}
+      {/* 표에는 있는데 그림에서 빠진 행(행 상한·못 읽은 x·0 이하 조각)을 밝힌다. 문구는 chart.js가
+          만든다 — 순수 함수라 회귀 테스트가 붙는다(chartNotes 주석). 문구끼리는 앞머리가 서로 달라
+          겹치지 않으므로 문구 자체가 key가 된다. */}
+      {chartNotes(spec).map(n => <div key={n} className="chart-note">{n}</div>)}
     </figure>
   );
 }

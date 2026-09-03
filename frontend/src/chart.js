@@ -325,6 +325,24 @@ export function pieSlices(rows, max = MAX_PIE_SLICES) {
   return [...data.filter((_, i) => keep.has(i)), { name: other, full: other, value: rest.reduce((a, d) => a + d.value, 0) }];
 }
 
+// 차트 아래에 붙이는 안내 문구 — '표에는 있는데 그림에서 빠진 행'을 사용자가 알 수 있는 유일한
+// 단서다. 그리는 쪽(Chart.jsx)이 아니라 여기 있는 이유는 trace.js의 건수 문구와 같다: 순수 함수라
+// node:test로 회귀 테스트가 붙는다. 문구 결함은 오류를 남기지 않아 테스트가 유일한 방어선인데,
+// 문자열이 JSX 안에 살면 그 방어선을 세울 수 없다 — 실제로 skipped 문구가 조사를 붙인 채
+// ('숫자' + '으로' = '숫자으로') 화면에 나가고 있었고, 회귀 테스트가 없어 아무도 보지 못했다.
+//   clipped — 행 상한(MAX_CHART_ROWS)에 걸려 앞부분만 그렸다. 그래프만 보면 그것이 전부로 읽힌다.
+//   skipped — 명시한 xtype으로 읽지 못해 뺀 행('합계' 행, 다른 꼴의 날짜). 조용히 빠지면 그 행이
+//             없어진 것을 알 길이 없다.
+//   dropped — 원그래프가 조각으로 만들 수 없어 뺀 행(값이 없거나 0 이하). 표에는 있는 행이라
+//             밝히지 않으면 비율의 분모가 달라진 것을 사용자가 알 수 없다.
+export function chartNotes(spec) {
+  const notes = [];
+  if (spec.clipped) notes.push(`처음 ${spec.rows.length}행만 그렸습니다 (전체 ${spec.total}행).`);
+  if (spec.skipped > 0) notes.push(`x를 ${spec.xKind === 'time' ? '시간으로' : '숫자로'} 읽지 못한 ${spec.skipped}행은 그리지 않았습니다.`);
+  if (spec.dropped > 0) notes.push(`값이 없거나 0 이하인 ${spec.dropped}행은 조각으로 그리지 않았습니다.`);
+  return notes;
+}
+
 // 블록 안의 표만 markdown으로. 차트를 그리지 못할 때·그리기 전에·'표로 보기'에 그대로 렌더한다.
 // 구분 줄이 빠졌거나 칸 수가 머리글과 다른 표는 GFM이 표로 인정하지 않는다(파이프 글자가 문단으로
 // 그대로 보인다) — 머리글 칸 수에 맞춰 넣어 준다. 위 splitBlock·parseTable은 어느 쪽이든 읽으므로

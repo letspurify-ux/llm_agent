@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import {
   parseChartBlock, chartBlocksToTables, chartTableMarkdown, toNumber, toTime, pieSlices, clip, sliceSafe,
-  MAX_CHART_ROWS, MAX_SERIES, MAX_LABEL_LEN, MAX_PIE_SLICES,
+  chartNotes, MAX_CHART_ROWS, MAX_SERIES, MAX_LABEL_LEN, MAX_PIE_SLICES,
 } from '../src/chart.js';
 
 const TABLE = '| 월 | 건수 | 금액 |\n|---|---|---|\n| 2024-01 | 120 | 1,000 |\n| 2024-02 | 80 | 2,500 |';
@@ -276,6 +276,24 @@ test('pie·scatter는 y2를 그리지 않으므로 그 설정 때문에 차트�
   assert.deepStrictEqual(spec(`type: bar\ny2: 건수\n${t}`).series, [{ name: '건수', axis: 'left' }]);
   // 막대에서는 y2가 글자 열이면 그대로 포기한다 (오른쪽 축에 두라던 열을 왼쪽에 그리면 조용한 오답이다)
   assert.strictEqual(parseChartBlock(`type: bar\ny2: 비고\n${t}`).ok, false);
+});
+
+test('차트 안내 문구: 빠진 행을 밝히고, 조사는 축의 표기를 따른다', () => {
+  // 문구는 순수 함수(chartNotes)가 만든다 — JSX 안에 문자열이 살면 이 결함은 브라우저에서만
+  // 보인다. 실제로 xtype: number의 skipped 문구가 '숫자' + '으로'로 붙어 '숫자으로'로 나가고
+  // 있었다(화면 재현으로 확인). 명세는 손으로 짓지 않고 진짜 파서에 원문을 넣어 받는다 —
+  // 여기서 spec 모양을 지어내면 파서가 skipped를 세는 방식이 바뀐 날 검사만 옛 모양을 본다.
+  const num = spec('type: scatter\nxtype: number\n| x | y |\n|---|---|\n| 10 | 1 |\n| 합계 | 9 |');
+  assert.deepStrictEqual(chartNotes(num), ['x를 숫자로 읽지 못한 1행은 그리지 않았습니다.']);
+  const time = spec('type: line\nxtype: time\n| 일자 | 값 |\n|---|---|\n| 2024-01-01 | 1 |\n| 합계 | 9 |\n| 2024-01-02 | 2 |');
+  assert.deepStrictEqual(chartNotes(time), ['x를 시간으로 읽지 못한 1행은 그리지 않았습니다.']);
+  const pie = spec('type: pie\n| 항목 | 값 |\n|---|---|\n| 가 | 5 |\n| 나 | 0 |\n| 다 | - |');
+  assert.deepStrictEqual(chartNotes(pie), ['값이 없거나 0 이하인 2행은 조각으로 그리지 않았습니다.']);
+  const rows = Array.from({ length: MAX_CHART_ROWS + 3 }, (_, i) => `| 항목${i} | ${i + 1} |`).join('\n');
+  const clipped = spec(`type: bar\n| 항목 | 값 |\n|---|---|\n${rows}`);
+  assert.deepStrictEqual(chartNotes(clipped), [`처음 ${MAX_CHART_ROWS}행만 그렸습니다 (전체 ${MAX_CHART_ROWS + 3}행).`]);
+  // 빠진 행이 없는 차트에는 아무 문구도 붙지 않는다 — 문구가 곧 '빠졌다'는 신호이기 때문이다
+  assert.deepStrictEqual(chartNotes(spec(`type: bar\n${TABLE}`)), []);
 });
 
 test('자르기는 상한을 넘지 않고 서로게이트 쌍을 쪼개지 않는다', () => {
