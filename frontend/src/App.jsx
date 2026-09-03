@@ -4,7 +4,7 @@ import remarkGfm from 'remark-gfm';
 // 수식 표기의 계약(무엇이 수식인가 + 그것을 어떻게 그리는가)은 전부 math.js에 있다.
 import { REMARK_PLUGINS, REHYPE_PLUGINS } from './math.js';
 // 차트 블록의 계약(무엇을 차트로 받는가 + 이력으로 되돌릴 때의 모양)은 chart.js에 있다.
-import { parseChartBlock, splitBlock, chartTableMarkdown, chartBlocksToTables, MAX_CHARTS_PER_MESSAGE } from './chart.js';
+import { parseChartBlock, splitBlock, chartTableMarkdown, chartBlocksToTables, sliceSafe, MAX_CHARTS_PER_MESSAGE } from './chart.js';
 // trace 패널의 계약(열·셀 표기·CSV)은 trace.js에 있다.
 import { columnsOf, cellText, toCsv, csvFileName } from './trace.js';
 
@@ -22,11 +22,7 @@ const HISTORY_LEN = 1500;
 // 단순 slice는 경계의 서로게이트 쌍(이모지 등)을 반으로 쪼개 짝 잃은 코드유닛을 남기고,
 // 그 값은 서버를 거쳐 LLM 프롬프트로 가는 인코딩 단계에서 U+FFFD로 조용히 훼손된다.
 // 경계에 걸린 상위 서로게이트 하나를 떼어 항상 온전한 문자열만 보낸다 (서버 constants.clipText와 같은 방식).
-const clipTurn = s => {
-  const t = String(s ?? '').slice(0, HISTORY_LEN);
-  const last = t.charCodeAt(t.length - 1);
-  return last >= 0xd800 && last <= 0xdbff ? t.slice(0, -1) : t;
-};
+const clipTurn = s => sliceSafe(String(s ?? ''), HISTORY_LEN);
 
 // 요청 상한. 서버 최악 = 루프 진입 예산 180초(agent.js MAX_LOOP_MS) + 마지막 LLM 호출 120초
 // + 강제 답변 120초 ≈ 420초이므로 그보다 뒤에 둔다. 짧게 잡으면 서버가 답을 만들어 보내는 중에
@@ -164,7 +160,14 @@ function AltImage({ node, src, alt, title }) {
       || (scheme && !/^https?:$/i.test(scheme[0]))) {
     return <em>🖼 {label || '이미지'}</em>;
   }
-  return <a href={src} target="_blank" rel="noopener noreferrer" title={title || undefined}>🖼 {label || src}</a>;
+  // 페이지 안 앵커는 제자리에서 연다 — 링크와 같은 규칙이다(NewTabLink). 새 탭으로 열면 대화가
+  // 없는 앱이 한 벌 더 뜬다.
+  const inPage = src.startsWith('#');
+  return (
+    <a href={src} title={title || undefined} {...(inPage ? {} : { target: '_blank', rel: 'noopener noreferrer' })}>
+      🖼 {label || src}
+    </a>
+  );
 }
 // 플러그인 배열과 마찬가지로 모듈 상수여야 한다 — 새 객체를 넘기면 매 렌더가 파이프라인 재구축이다.
 const MD_COMPONENTS = { pre: PreOrBlock, a: NewTabLink, img: AltImage };
@@ -192,10 +195,10 @@ function countLabel(t) {
   const n = t.rows?.length ?? 0;
   // rowCount는 서버가 늘 준다(result.js clientTrace). 없으면 실린 행 수로 말한다 — 'undefined건'은
   // 화면에 나가서는 안 되는 글자이고, 이 패널의 다른 값들도 모두 없을 때를 정해 두고 있다.
-  const total = t.rowCount ?? n;
-  if (t.omittedRows) return `${total}건 (아래는 그중 ${n}건)`;
+  if (t.rowCount === undefined) return `${n}건`; // 몇 건 중 몇 건인지 말할 근거가 없다
+  if (t.omittedRows) return `${t.rowCount}건 (아래는 그중 ${n}건)`;
   if (t.capped) return `${n}건 이상 — 조회 상한에 걸려 처음 ${n}건만 가져왔습니다`;
-  return `${total}건`;
+  return `${t.rowCount}건`;
 }
 
 // 실행된 쿼리 한 건: 이름·대상 DB·바인드 한 줄 + 조회된 행 전부의 표.
@@ -316,6 +319,9 @@ const REDUCED = typeof matchMedia === 'function' ? matchMedia('(prefers-reduced-
 // 미끄러지고, 표 위에서 굴린 휠도 한 번에 오지 않고 몇십 ms 간격으로 이어 온다.
 const BUSY_MS = 600;
 
+// 대화를 움직일 수 있는 키. 스페이스는 브라우저의 '한 화면 내리기'다.
+const SCROLL_KEYS = new Set(['PageUp', 'PageDown', 'ArrowUp', 'ArrowDown', 'Home', 'End', ' ']);
+
 export default function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -341,7 +347,7 @@ export default function App() {
   const panRef = useRef(false);   // 손가락으로 화면을 밀고 있는가 (touchmove가 켜고 touchend가 끈다)
   const busyRef = useRef(0);      // 이 시각까지는 만지는 중으로 친다 (아래 busy 참고)
   const busyTimerRef = useRef(0); // 그 여운이 끝나면 한 번 더 확인하는 타이머 (아래 markBusy 참고)
-  const pendingRef = useRef(false); // 만지는 중이라 건너뛴 크기 변화가 있는가 (그 타이머가 갚는다)
+  const pendingRef = useRef(null); // 만지는 중이라 건너뛴 크기 변화 { box } (그 타이머가 갚는다)
   const emptyRef = useRef(true); // 대화가 비었는가 — ResizeObserver 콜백은 한 번만 만들어져 messages를 못 본다
 
   // 대화를 목표까지 미끄러뜨린다. 브라우저의 smooth 스크롤(scrollIntoView·scrollBy)을 쓰지 않는 이유:
@@ -369,7 +375,12 @@ export default function App() {
       // 자라면 그 변화의 ResizeObserver는 아직 우리가 미끄러지는 중일 때 와서 같은 목표를 세워 두고
       // 가고, 그 뒤로는 크기가 잠잠해 아무도 다시 알려 주지 않는다 — 답의 끝 몇 십 px이 입력창 뒤에
       // 남는 자리가 여기다(실측 25px). 붙어 있고 손을 대고 있지 않을 때만이다.
-      if (stuckRef.current && !holding() && el.scrollHeight - el.scrollTop - el.clientHeight >= 8) el.scrollTop = target();
+      if (stuckRef.current && el.scrollHeight - el.scrollTop - el.clientHeight >= 8) {
+        // 만지는 중(과 그 여운)이면 여기서도 움직이지 않는다 — 관찰자가 지키는 것과 같은 규칙이어야
+        // 한다. 대신 미뤄 두면 여운이 끝날 때 갚는다.
+        if (busy()) pendingRef.current = { box: pendingRef.current?.box ?? false };
+        else el.scrollTop = target();
+      }
     };
     g.raf = requestAnimationFrame(step);
   }
@@ -412,8 +423,11 @@ export default function App() {
       // 화면(emptyRef)에서는 '쉬는 자리'가 맨 위라, 여기서 따라가면 칩을 보려고 내려 둔 화면이 맨 위로
       // 튕긴다. 조건을 한 번 더 적는 대신 건너뛴 사실만 표시로 남겨 두는 이유가 이것이다.
       if (!pendingRef.current || !el || emptyRef.current || !stuckRef.current || busy()) return;
-      pendingRef.current = false;
-      glide(el, restOf(el));
+      // 상자 자신이 변한 것(창 크기·입력창)은 관찰자와 같이 한 번에 놓는다 — 부드럽게 하면 바닥이
+      // 한 박자 뒤에서 따라와 흔들린다. 미뤘다고 그 성질이 바뀌지는 않는다.
+      const box = pendingRef.current.box;
+      pendingRef.current = null;
+      glide(el, restOf(el), box);
     }, BUSY_MS + 20);
   };
   const busy = () => holding() || performance.now() < busyRef.current;
@@ -445,14 +459,16 @@ export default function App() {
         // 비어 있는 첫 화면에는 따라갈 것이 없다. 그 '쉬는 자리'는 맨 위인데(restOf), 크기가 바뀔 때마다
         // 그것을 다시 놓으면 낮은 창에서 예시 칩을 보려고 내려 둔 화면이 입력창이 한 줄 자랄 때마다,
         // 창을 조금 줄일 때마다 맨 위로 튕긴다 — 맨 위로 되돌리는 것은 홈으로 돌아갈 때 한 번이면 된다.
-        if (emptyRef.current || !stuckRef.current) return;
+        // 따라가지 않기로 한 자리에서는 미뤄 둔 것도 지운다 — 남겨 두면 한참 뒤 엉뚱한 순간에
+        // (다시 바닥에 붙고 무언가를 만졌다 놓는 순간) 옛 변화를 갚겠다고 화면이 움직인다.
+        if (emptyRef.current || !stuckRef.current) { pendingRef.current = null; return; }
         // 만지는 중이면 건너뛰되 '건너뛰었다'를 남긴다. ResizeObserver는 '변할 때'만 오므로, 그냥
         // 돌아가면 그 변화는 아무도 다시 알려 주지 않아 답의 끝이 입력창 뒤에 영영 남는다(실측 316px).
-        if (busy()) { pendingRef.current = true; return; }
-        pendingRef.current = false;
+        const boxResized = entries.some(x => x.target === el);
+        if (busy()) { pendingRef.current = { box: pendingRef.current?.box || boxResized }; return; }
+        pendingRef.current = null;
         // 스크롤 상자 자신이 변한 것(입력창이 여러 줄로 커짐, 창 크기 조정)은 즉시 붙인다 — 부드럽게 하면
         // 창을 끄는 동안 바닥이 한 박자 뒤에서 따라와 흔들린다. 내용이 자란 것은 부드럽게 내려간다.
-        const boxResized = entries.some(x => x.target === el);
         glide(el, restOf(el), boxResized);
       });
     }
@@ -505,11 +521,13 @@ export default function App() {
       // 눌린 단추 없이 오는 마우스 움직임이 곧 '이미 놓았다'는 뜻이다 — 여기서 끝낸 것으로 친다.
       // 놓친 채로 두면 dragRef가 영영 남아 새로고침할 때까지 따라가기가 죽는다.
       if (e.pointerType === 'mouse' && !e.buttons) { endDrag(); return; }
-      noteInput();
       if (Math.abs(e.clientY - d.y) > 4) d.vertical = true;
       // 끌기 시작이 곧 사용자의 개입이다. 앞으로의 미끄러짐은 holding()이 막지만, 이미 돌고 있는 것은
       // 여기서 멈추지 않으면 계속 흘러 고르던 글의 시작점이 손 밑에서 떠내려간다.
       if (!d.moved && Math.hypot(e.clientX - d.x, e.clientY - d.y) > 4) { d.moved = true; stopGlide(); }
+      // 문턱을 넘은 뒤부터 '움직이려는 입력'으로 센다(byUser). 누르고 있는 동안의 손떨림 1~2px까지
+      // 세면 그냥 클릭한 사람이 그 뒤의 브라우저 보정에 따라가기를 잃는다(실측: 답의 끝 616px).
+      if (d.moved) noteInput();
     };
     // 놓을 때 실제 위치로 '붙어 있는가'를 다시 판정한다: 잡고 있는 동안 답이 자랐다면 이미 바닥이
     // 아니므로 붙어 있던 것으로 치지 않는다(놓자마자 바닥으로 끌려가면 잡고 있던 뜻이 없다).
@@ -550,7 +568,12 @@ export default function App() {
     // 입력창에서 글을 쓰는 키는 뺀다 — 그것은 대화를 움직이려는 뜻이 아니다(PageUp·PageDown은
     // 그쪽에서 직접 다룬다). 누름은 스크롤바를 잡은 것만 센다: 대화 안을 그냥 누른 것(클릭)까지
     // 세면, 답이 도착한 찰나에 아무 데나 누른 사람이 그 뒤의 브라우저 보정에 따라가기를 잃는다.
-    const onKeyInput = e => { if (!inputRef.current?.contains(e.target)) noteInput(); };
+    // 화면을 움직일 수 있는 키만 센다 — Shift·Ctrl이나 복사 단축키, 눌린 채 반복되는 키까지 세면
+    // 그 400ms 안의 브라우저 보정이 사용자의 뜻으로 읽힌다(R1과 같은 결).
+    const onKeyInput = e => {
+      if (!SCROLL_KEYS.has(e.key) || inputRef.current?.contains(e.target)) return;
+      noteInput();
+    };
     const onScrollbarDown = e => { if (e.target === el && e.offsetX >= el.clientWidth) noteInput(); };
     addEventListener('keydown', onKeyInput, true);
     addEventListener('wheel', noteInput, { capture: true, passive: true });

@@ -122,14 +122,16 @@ export function toTime(cell, explicit = false) {
   return t.getMonth() === +mo - 1 && t.getDate() === +(d ?? 1) && +mo >= 1 && +mo <= 12 ? t.getTime() : null;
 }
 
-// 글자를 n자까지만. 경계에서 서로게이트 쌍(이모지 등)을 반으로 쪼개지 않는다 — 짝 잃은 코드유닛은
-// 화면에 U+FFFD로 남는다(App.jsx clipTurn이 이력에서 같은 일을 막는다).
-export const clip = (s, n) => {
-  if (s.length <= n) return s;
-  const cut = s.slice(0, n - 1);
+// 글자를 n자까지 자른다. 경계에서 서로게이트 쌍(이모지 등)을 반으로 쪼개지 않는다 — 짝 잃은
+// 코드유닛은 화면에서 U+FFFD가 되고, 이력으로 나가면 프롬프트 인코딩에서 같은 일이 일어난다.
+// 자르는 곳이 둘이라(라벨·범례는 아래 clip, 이력은 App.jsx clipTurn) 경계 규칙만 여기 한 번 적는다.
+export const sliceSafe = (s, n) => {
+  const cut = s.slice(0, n);
   const last = cut.charCodeAt(cut.length - 1);
-  return `${last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut}…`;
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
 };
+// 넘치면 끝을 …로 대신한다 (그 한 글자 자리를 비워 둔다).
+export const clip = (s, n) => (s.length > n ? `${sliceSafe(s, n - 1)}…` : s);
 const EMPTY_LABEL = '(빈값)';
 
 // 블록 본문(펜스 안의 글자)을 설정과 표 줄로 가른다. 설정은 표가 시작되기 전까지만 읽는다 —

@@ -197,6 +197,8 @@
       }
       /* 블록 안의 code에는 인라인용 알약 배경·여백을 걷어낸다 — 두 배경이 겹쳐 얼룩덜룩해진다 */
       .md pre code { background: none; padding: 0; border-radius: 0; font-size: inherit; }
+      /* 지금은 닿지 않는 규칙이다 — 답변의 그림은 App.jsx AltImage가 링크로만 남기고 <img>를 만들지
+         않는다. 그림을 다시 띄우기로 하면 그 한 곳만 되돌리면 되도록 크기 규칙은 남겨 둔다. */
       .md img { max-width: 100%; }
 
       /* ===== 차트·흐름도 (App.jsx ChartBlock / MermaidBlock) ===== */

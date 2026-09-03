@@ -1,7 +1,7 @@
 // 차트 블록 하나를 그린다. 무엇을 그릴지는 chart.js parseChartBlock이 이미 정했고, 여기는 그 명세를
 // Recharts 요소로 옮기는 일만 한다. App.jsx가 React.lazy로 부르므로 이 파일과 recharts는 첫 차트가
 // 나올 때까지 내려받지 않는다 — 대부분의 답변은 글과 표뿐이다.
-import { useId, useLayoutEffect, useRef, useState } from 'react';
+import { useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   ResponsiveContainer, ComposedChart, PieChart, ScatterChart,
   Bar, Line, Area, Pie, Scatter, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
@@ -166,30 +166,34 @@ const insideLabel = ({ cx, cy, midAngle, outerRadius, percent, index }) => {
 // 상자 폭에서만 나온다(높이는 260px로 고정이다). 380px 아래에서 잘리기 시작한다 — 실측값이다.
 // 재는 자리는 figure 하나다(아래 Chart). 그리는 쪽마다 따로 재면 같은 폭을 여러 번 재게 되고,
 // 그 값이 필요한 곳도 한 군데씩 늘어난다 — 지금 쓰는 것은 원그래프뿐이다.
-function useNarrow(enabled, limit = 380) {
+function useNarrow(limit = 380) {
   const ref = useRef(null);
   const [narrow, setNarrow] = useState(false);
   useLayoutEffect(() => {
     const el = ref.current;
-    // 쓰지 않는 그래프에서는 재지 않는다 — 관찰자 하나와 렌더 한 번이 매 차트마다 헛돈다.
-    if (!el || !enabled) return;
+    if (!el) return;
     const mark = () => setNarrow(el.clientWidth > 0 && el.clientWidth < limit);
     mark();
     if (typeof ResizeObserver === 'undefined') return;
     const ro = new ResizeObserver(mark);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [enabled, limit]);
+  }, [limit]);
   return [ref, narrow];
 }
 
-function PieView({ spec, narrow }) {
+function PieView({ spec }) {
   // 조각 고르기(큰 것 남기고 나머지는 '기타')는 chart.js pieSlices — 표 순서와 무관하게 값으로 고른다.
-  const data = pieSlices(spec.rows);
+  // 행이 바뀔 때만 고른다: 폭이 380px을 넘나들 때마다(useNarrow) 다시 렌더되는데, 그때마다 100행을
+  // 다시 훑고 정렬할 이유가 없다.
+  const data = useMemo(() => pieSlices(spec.rows), [spec.rows]);
   const total = data.reduce((a, d) => a + d.value, 0);
   const pct = v => (total > 0 ? `${((v / total) * 100).toFixed(1)}%` : '');
+  // 폭을 재는 것은 원그래프뿐이다 — 여기서 재면 그 뜻이 쓰이는 자리에 머문다(막대·선·산점도는
+  // 이 값을 읽지 않으므로 관찰자도 달지 않는다).
+  const [boxRef, narrow] = useNarrow();
   return (
-    <>
+    <div ref={boxRef}>
     <ResponsiveContainer width="100%" height={HEIGHT}>
       <PieChart margin={{ top: 4, right: 4, bottom: 4, left: 4 }}>
         <Pie data={data} dataKey="value" nameKey="name" outerRadius={narrow ? '62%' : '72%'} isAnimationActive={false}
@@ -215,7 +219,7 @@ function PieView({ spec, narrow }) {
         ))}
       </ul>
     )}
-    </>
+    </div>
   );
 }
 
@@ -242,13 +246,11 @@ function ScatterView({ spec }) {
 // 제목 + 그래프. 표는 App.jsx가 <details>로 아래에 붙인다 — 이 컴포넌트는 그리는 것만 안다.
 export default function Chart({ spec }) {
   const id = useId();
-  // 폭을 재는 것은 원그래프뿐이다 (아래 useNarrow) — 나머지는 관찰자를 달지 않는다.
-  const [boxRef, narrow] = useNarrow(spec.type === 'pie');
   const View = spec.type === 'pie' ? PieView : spec.type === 'scatter' ? ScatterView : Cartesian;
   return (
-    <figure className="chart" ref={boxRef} aria-labelledby={spec.title ? id : undefined}>
+    <figure className="chart" aria-labelledby={spec.title ? id : undefined}>
       {spec.title && <figcaption id={id}>{spec.title}</figcaption>}
-      <View spec={spec} narrow={narrow} />
+      <View spec={spec} />
       {spec.clipped && <div className="chart-note">처음 {spec.rows.length}행만 그렸습니다 (전체 {spec.total}행).</div>}
       {/* 명시한 xtype으로 읽지 못해 뺀 행 — '합계' 행이나 다른 꼴의 날짜가 조용히 사라지지 않게 밝힌다. */}
       {spec.skipped > 0 && <div className="chart-note">x를 {spec.xKind === 'time' ? '시간' : '숫자'}으로 읽지 못한 {spec.skipped}행은 그리지 않았습니다.</div>}
