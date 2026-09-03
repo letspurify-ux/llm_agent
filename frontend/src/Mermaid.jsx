@@ -54,15 +54,16 @@ export default function Mermaid({ text }) {
       const el = box.querySelector('svg');
       if (!el) return;
       el.style.minWidth = '';
-      const natural = parseFloat(el.style.maxWidth) || Infinity; // mermaid가 인라인으로 적어 둔 제 크기
-      // 글자 높이는 가장 작은 것으로 잰다. 한 그림 안에서도 크기는 자리마다 다르고(노드 이름, 화살표에
-      // 붙는 말, 묶음 제목), 처음 만난 라벨 하나로 정하면 그보다 작은 글자가 기준 아래에 남는다.
-      // 여러 줄로 감긴 라벨은 상자 높이가 줄 수만큼이므로 한 줄(tspan)로 잰다.
-      const smallest = () => {
-        const hs = [...el.querySelectorAll('.nodeLabel, text')]
-          .map(n => (n.querySelector?.('tspan') ?? n).getBoundingClientRect().height)
-          .filter(v => v > 0);
-        return hs.length ? Math.min(...hs) : 0;
+      // 제 크기(이 이상 넓혀도 더 커지지 않는다). mermaid가 인라인으로 적어 두지만(useMaxWidth),
+      // 그 설정을 끄면 없다 — 그때는 viewBox의 폭이 같은 뜻이다. 둘 다 없을 때만 상한이 없다.
+      const natural = parseFloat(el.style.maxWidth) || el.viewBox?.baseVal?.width || Infinity;
+      // 눈에 보이는 첫 라벨의 글자 높이. 그림 안의 모든 라벨을 재어 가장 작은 것을 고르지는 않는다 —
+      // 라벨이 수백 개인 흐름도에서 창을 끄는 동안 매 프레임 전부를 재게 되고, 화살표에 붙는 작은 글자
+      // 하나 때문에 이미 읽히던 그림을 통째로 넓히게 된다. 여러 줄로 감긴 라벨은 상자 높이가 줄 수만큼
+      // 이므로 한 줄(tspan)로 잰다.
+      const lineHeight = () => {
+        const label = [...el.querySelectorAll('.nodeLabel, text')].find(n => n.getBoundingClientRect().height > 0);
+        return ((label?.querySelector?.('tspan') ?? label)?.getBoundingClientRect().height) ?? 0;
       };
       // 넓힌 뒤 다시 재서 모자라면 한 번 더 넓힌다. '폭을 두 배로 하면 글자도 두 배'가 아니기 때문이다 —
       // 브라우저는 아주 작은 글자를 어느 선 아래로는 줄이지 않아, 줄어든 그림에서 잰 글자는 실제보다
@@ -70,7 +71,7 @@ export default function Mermaid({ text }) {
       // 그 어긋남을 한 번의 계산으로 맞출 수는 없으므로 실제 결과를 보고 좁힌다. 늘 몇 번 안에 끝난다:
       // 글자가 커질수록 비례에 가까워지고, 제 크기(natural)에 닿으면 더 넓힐 것이 없다.
       for (let i = 0; i < 4; i++) {
-        const h = smallest();
+        const h = lineHeight();
         if (!h || h >= MIN_LABEL_PX) break;
         const now = el.getBoundingClientRect().width;
         const want = Math.min(natural, Math.ceil(now * (MIN_LABEL_PX / h)));

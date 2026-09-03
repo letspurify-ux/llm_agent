@@ -154,9 +154,14 @@ function NewTabLink({ node, href, children, ...props }) {
 function AltImage({ node, src, alt, title, ...props }) {
   const label = String(alt || title || '').trim();
   const inLink = useContext(InLink);
-  // 주소가 없거나(react-markdown이 위험한 주소를 ''로 지운다) 링크 안이면 글자로만 남긴다.
-  // 링크 안에서 주소를 또 보여줄 이유도 없다 — 누를 자리는 바깥 링크가 이미 만들어 두었다.
-  if (typeof src !== 'string' || src === '' || inLink) return <em>🖼 {label || '이미지'}</em>;
+  // 링크로 남기는 것은 http(s)와 주소만 적힌 상대 경로(chart.png, /img/a.png, ?id=3)뿐이다.
+  // 그 밖의 방식(mailto:·tel:·data: 등)은 그림 자리에 올 것이 아니고, 눌러서 좋을 것도 없다.
+  // 라이브러리가 위험한 주소를 걸러 주는 것에 기대지 않고 여기서도 한 번 더 좁힌다.
+  // 링크 안이면(inLink) <a>를 또 열 수 없으므로 글자로만 — 누를 자리는 바깥 링크가 이미 만들어 두었다.
+  const scheme = typeof src === 'string' && /^[a-z][a-z0-9+.-]*:/i.exec(src);
+  if (typeof src !== 'string' || src === '' || inLink || (scheme && !/^https?:$/i.test(scheme[0]))) {
+    return <em>🖼 {label || '이미지'}</em>;
+  }
   return <a href={src} target="_blank" rel="noopener noreferrer" title={title || undefined}>🖼 {label || src}</a>;
 }
 // 플러그인 배열과 마찬가지로 모듈 상수여야 한다 — 새 객체를 넘기면 매 렌더가 파이프라인 재구축이다.
@@ -326,14 +331,14 @@ export default function App() {
   // 화면이 대화의 바닥에 붙어 있는가. 말풍선이 뒤늦게 커질 때 따라 내려갈지를 이것으로 정한다.
   const stuckRef = useRef(true);
   const lastTopRef = useRef(0);
-  const lastHeightRef = useRef(0); // 직전 스크롤에서 본 내용 높이 (아래 onChatScroll 참고)
+  const inputAtRef = useRef(0);   // 사용자가 마지막으로 화면을 만진 시각 (아래 byUser 참고)
   const growRef = useRef(null); // 말풍선 크기 변화를 보는 ResizeObserver (아래 효과가 처음 필요할 때 만든다)
   const glideRef = useRef(null); // 진행 중인 미끄러짐 { raf, expect } (아래 glide 참고)
   const dragRef = useRef(null); // 대화 안에서 끌고 있는 중인가 { x, y, moved, vertical } (아래 holding 참고)
-  const touchRef = useRef(false); // 대화에 손가락이 닿아 있는가
-  const panRef = useRef(false);   // 그 손가락으로 화면을 밀고 있는가 (닿은 채 실제로 움직였는가)
+  const panRef = useRef(false);   // 손가락으로 화면을 밀고 있는가 (touchmove가 켜고 touchend가 끈다)
   const busyRef = useRef(0);      // 이 시각까지는 만지는 중으로 친다 (아래 busy 참고)
   const busyTimerRef = useRef(0); // 그 여운이 끝나면 한 번 더 확인하는 타이머 (아래 markBusy 참고)
+  const pendingRef = useRef(false); // 만지는 중이라 건너뛴 크기 변화가 있는가 (그 타이머가 갚는다)
   const emptyRef = useRef(true); // 대화가 비었는가 — ResizeObserver 콜백은 한 번만 만들어져 messages를 못 본다
 
   // 대화를 목표까지 미끄러뜨린다. 브라우저의 smooth 스크롤(scrollIntoView·scrollBy)을 쓰지 않는 이유:
@@ -373,6 +378,14 @@ export default function App() {
   // 그동안은 화면을 움직이지 않는다 — 잡고 있는 것이 손 밑에서 달아나면 고르던 글도, 보던 행도 잃는다.
   // 누르기만 한 것(클릭·탭)은 잡은 것이 아니다: 답이 도착한 그 찰나에 아무 데나 눌렀다고 답을 놓치면 안 된다.
   const holding = () => !!dragRef.current?.moved || panRef.current;
+  // 화면이 움직인 것이 사용자 때문인가. 스크롤 이벤트만으로는 알 수 없다 — 같은 이벤트를 우리(glide)도,
+  // 브라우저도(내용이 위에서 자라거나 줄면 보던 것을 붙잡으려고 스스로 자리를 옮긴다) 일으키기 때문이다.
+  // 세 번을 고쳐 보고 나서야 안 것은, 그 둘을 자리와 높이의 산수로는 가를 수 없다는 것이다(자라는 쪽과
+  // 줄어드는 쪽이 한 프레임에 같이 오면 셈이 맞지 않는다). 그래서 짐작 대신 사용자 입력을 직접 듣는다:
+  // 휠·키·누름·손가락. 그 신호 없이 자리가 바뀐 것은 사용자의 뜻이 아니므로 따라가기를 끊지 않는다.
+  const INPUT_MS = 400; // 입력 하나가 일으키는 스크롤이 이 안에 온다 (관성·부드러운 스크롤 포함)
+  const noteInput = () => { inputAtRef.current = performance.now(); };
+  const byUser = () => performance.now() - inputAtRef.current < INPUT_MS;
   // 여기에 '방금 전까지 만지던 동안'을 더한 것. 손을 뗀 화면은 관성으로 더 미끄러지고, 표 위의 휠은
   // 이어서 온다 — 그 틈을 비워 두면 그 사이에 자란 차트가 읽던 자리를 끌어내린다. 뒤늦게 커지는 것을
   // 따라갈지는 이것으로 정하고, 새 말풍선은 이 여운까지 기다리지 않는다(holding만 본다).
@@ -385,8 +398,12 @@ export default function App() {
     clearTimeout(busyTimerRef.current);
     busyTimerRef.current = setTimeout(() => {
       const el = chatRef.current;
-      if (!el || !stuckRef.current || busy()) return;
-      if (el.scrollHeight - el.scrollTop - el.clientHeight >= 8) glide(el, restOf(el));
+      // 관찰자가 만지는 중이라 건너뛴 것이 있을 때만 갚는다. 조건도 그쪽과 같아야 한다 — 특히 빈 첫
+      // 화면(emptyRef)에서는 '쉬는 자리'가 맨 위라, 여기서 따라가면 칩을 보려고 내려 둔 화면이 맨 위로
+      // 튕긴다. 조건을 한 번 더 적는 대신 건너뛴 사실만 표시로 남겨 두는 이유가 이것이다.
+      if (!pendingRef.current || !el || emptyRef.current || !stuckRef.current || busy()) return;
+      pendingRef.current = false;
+      glide(el, restOf(el));
     }, BUSY_MS + 20);
   };
   const busy = () => holding() || performance.now() < busyRef.current;
@@ -414,7 +431,11 @@ export default function App() {
         // 비어 있는 첫 화면에는 따라갈 것이 없다. 그 '쉬는 자리'는 맨 위인데(restOf), 크기가 바뀔 때마다
         // 그것을 다시 놓으면 낮은 창에서 예시 칩을 보려고 내려 둔 화면이 입력창이 한 줄 자랄 때마다,
         // 창을 조금 줄일 때마다 맨 위로 튕긴다 — 맨 위로 되돌리는 것은 홈으로 돌아갈 때 한 번이면 된다.
-        if (emptyRef.current || !stuckRef.current || busy()) return;
+        if (emptyRef.current || !stuckRef.current) return;
+        // 만지는 중이면 건너뛰되 '건너뛰었다'를 남긴다. ResizeObserver는 '변할 때'만 오므로, 그냥
+        // 돌아가면 그 변화는 아무도 다시 알려 주지 않아 답의 끝이 입력창 뒤에 영영 남는다(실측 316px).
+        if (busy()) { pendingRef.current = true; return; }
+        pendingRef.current = false;
         // 스크롤 상자 자신이 변한 것(입력창이 여러 줄로 커짐, 창 크기 조정)은 즉시 붙인다 — 부드럽게 하면
         // 창을 끄는 동안 바닥이 한 박자 뒤에서 따라와 흔들린다. 내용이 자란 것은 부드럽게 내려간다.
         const boxResized = entries.some(x => x.target === el);
@@ -470,6 +491,7 @@ export default function App() {
       // 눌린 단추 없이 오는 마우스 움직임이 곧 '이미 놓았다'는 뜻이다 — 여기서 끝낸 것으로 친다.
       // 놓친 채로 두면 dragRef가 영영 남아 새로고침할 때까지 따라가기가 죽는다.
       if (e.pointerType === 'mouse' && !e.buttons) { endDrag(); return; }
+      noteInput();
       if (Math.abs(e.clientY - d.y) > 4) d.vertical = true;
       // 끌기 시작이 곧 사용자의 개입이다. 앞으로의 미끄러짐은 holding()이 막지만, 이미 돌고 있는 것은
       // 여기서 멈추지 않으면 계속 흘러 고르던 글의 시작점이 손 밑에서 떠내려간다.
@@ -493,25 +515,27 @@ export default function App() {
     addEventListener('pointercancel', endDrag);
     // 창이 초점을 잃으면(다른 창으로 넘어감, 오른쪽 클릭 메뉴) 놓았다는 소식이 오지 않는다.
     // 잡고 있던 표시가 그대로 남으면 그 뒤로 이 대화가 끝날 때까지 따라가기가 죽는다 — 여기서 다 푼다.
-    const onWindowBlur = () => { endDrag(); touchRef.current = false; panRef.current = false; };
+    const onWindowBlur = () => { endDrag(); panRef.current = false; };
     addEventListener('blur', onWindowBlur);
 
     // 손가락으로 미는 중인가는 pointer 이벤트로 알 수 없다 — 브라우저가 스크롤을 가져가는 순간
     // pointercancel이 오고 그 뒤로는 아무 소식이 없다(뗀 것조차 오지 않는다). 그래서 손가락은 touch
     // 이벤트로 따로 본다. 손가락이 실제로 움직였을 때만 '미는 중'이다(아래 onTouchMove) — 그냥 톡
     // 누른 것까지 미는 중으로 치면 그 찰나에 도착한 답을 놓친다.
-    const onTouchStart = () => { touchRef.current = true; };
+
     // 손가락이 움직였다 = 미는 중이다. 스크롤이 났는지로 미루어 짐작하지 않는다 — 우리가 놓은 값도,
-    // 크기가 바뀌어 브라우저가 옮긴 값도 스크롤 이벤트로 오기 때문에, 화면에 손만 얹고 답을 기다린
-    // 사람이 미는 중으로 잡혀 뒤늦게 서는 차트를 놓쳤다(실측: 답의 끝 115~148px이 남았다).
-    const onTouchMove = () => { panRef.current = true; };
+    // 브라우저가 옮긴 값도 스크롤 이벤트로 오기 때문에, 화면에 손만 얹고 답을 기다린 사람이 미는 중으로
+    // 잡혀 뒤늦게 서는 차트를 놓쳤다(실측: 답의 끝 115~148px이 남았다).
+    const onTouchMove = () => { panRef.current = true; noteInput(); };
+    // 사용자가 화면을 만졌다는 신호(byUser 참고). 스크롤바를 끄는 동안은 onMove가 이어서 갱신한다.
+    el?.addEventListener('wheel', noteInput, { passive: true });
+    el?.addEventListener('keydown', noteInput);
+    el?.addEventListener('pointerdown', noteInput);
     const onTouchEnd = e => {
-      touchRef.current = e.touches.length > 0;
-      if (touchRef.current) return;
+      if (e.touches.length > 0) return; // 아직 다른 손가락이 닿아 있다
       if (panRef.current) markBusy(); // 뗀 뒤에도 관성으로 더 미끄러진다 — 그동안도 만지는 중이다
       panRef.current = false;
     };
-    el?.addEventListener('touchstart', onTouchStart, { passive: true });
     el?.addEventListener('touchmove', onTouchMove, { passive: true });
     addEventListener('touchend', onTouchEnd);
     addEventListener('touchcancel', onTouchEnd);
@@ -543,6 +567,7 @@ export default function App() {
       }
       // deltaMode: 픽셀(0)이 보통이지만 줄(1)·쪽(2)으로 오는 환경이 있다 — 픽셀로 환산한다.
       const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? el.clientHeight : 1;
+      noteInput(); // 대화 밖에서 굴린 것이지만 대화를 움직이는 것은 사용자다
       stopGlide();
       el.scrollTop += e.deltaY * unit;
     };
@@ -553,10 +578,12 @@ export default function App() {
       el?.removeEventListener('toggle', onToggle, true);
       el?.removeEventListener('pointerdown', onDown);
       removeEventListener('pointermove', onMove);
+      el?.removeEventListener('wheel', noteInput);
+      el?.removeEventListener('keydown', noteInput);
+      el?.removeEventListener('pointerdown', noteInput);
       removeEventListener('pointerup', endDrag);
       removeEventListener('pointercancel', endDrag);
       removeEventListener('blur', onWindowBlur);
-      el?.removeEventListener('touchstart', onTouchStart);
       el?.removeEventListener('touchmove', onTouchMove);
       removeEventListener('touchend', onTouchEnd);
       removeEventListener('touchcancel', onTouchEnd);
@@ -580,17 +607,12 @@ export default function App() {
     // 자리는 브라우저가 놓은 그대로 둔다: 우리 궤적을 마저 그리면 화면이 뒤로 튄다. 이어서 갈 일이면
     // 크기 변화를 본 ResizeObserver가 그 자리에서 다시 시작한다.
     if (glideRef.current && !ours) stopGlide();
-    // 내용이 줄면 그 줄어든 만큼까지는 위로 밀릴 수 있다(실측: 73px 줄자 화면이 65px 밀렸다).
-    // 그 폭을 넘어서 올라간 것만 사용자의 뜻으로 센다 — '크기가 바뀌면 무조건 무시'로 하면 자라는
-    // 도중에 화살표 키를 한 번 누른 사람의 뜻이 통째로 버려진다(실측: 다시 바닥으로 끌려갔다).
-    const shrank = Math.max(0, lastHeightRef.current - el.scrollHeight);
     if (el.scrollHeight - el.scrollTop - el.clientHeight < 8) stuckRef.current = true;
-    // '위로 올렸다'는 판정은 사용자가 움직였을 때만 한다. 우리가 놓은 값(ours)은 그 판정에서 뺀다 —
-    // 미끄러지는 동안에도 서브픽셀 반올림으로 한두 px 뒤로 물러설 수 있고, 그것을 뜻으로 읽으면
-    // 바닥으로 가던 화면이 그 자리에서 떨어져 나가 답의 끝이 입력창 뒤에 남는다(실측: 25px).
-    else if (!ours && lastTopRef.current - el.scrollTop > shrank + 2) stuckRef.current = false;
+    // 위로 올라간 것을 '떨어지겠다는 뜻'으로 읽는 것은 사용자가 방금 만졌을 때뿐이다(byUser).
+    // 우리가 놓은 값(ours)도, 브라우저가 스스로 옮긴 값도 아니어야 한다 — 그 둘을 뜻으로 읽으면
+    // 차트·흐름도가 자리를 잡는 순간에 따라가기가 끊겨 답의 끝이 입력창 뒤에 남는다(실측 25~110px).
+    else if (!ours && byUser() && el.scrollTop < lastTopRef.current) stuckRef.current = false;
     lastTopRef.current = el.scrollTop;
-    lastHeightRef.current = el.scrollHeight;
   }
 
   // textarea는 내용이 늘어도 스스로 커지지 않는다 — 줄 수에 맞춰 높이를 직접 맞춘다.
@@ -840,7 +862,9 @@ export default function App() {
                     // 키로 올린 것은 옛 답을 읽으러 간 것이다 — 여기서 직접 뗀다. 이 스크롤은 우리가
                     // 놓는 값이라 onChatScroll의 '위로 올렸다'에 걸리지 않아, 그러지 않으면 뒤늦게 서는
                     // 차트에 다시 바닥으로 끌려간다(실측). 내려가 바닥에 닿으면 그쪽이 다시 붙인다.
-                    if (e.key === 'PageUp') stuckRef.current = false;
+                    // 더 올라갈 데가 없으면 화면은 그대로다 — 그때까지 뗐다고 하면 도착한 답을
+                    // 따라가지 않으면서 사용자에게는 아무 일도 일어나지 않은 것으로 보인다.
+                    if (e.key === 'PageUp' && chat.scrollTop > 0) stuckRef.current = false;
                     glide(chat, () => to);
                   }
                 }

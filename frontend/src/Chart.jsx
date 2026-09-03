@@ -40,6 +40,13 @@ const inkOn = c => (luminance(c) > 0.179 ? '#000' : '#fff');
 const HORIZONTAL_FROM = 13;
 const HEIGHT = 260;
 
+// 범례에 적는 이름의 상한. 축 눈금의 30자(chart.js MAX_LABEL_LEN)보다 넉넉하다 — 이 목록은 아래로
+// 감기므로 이름 하나가 두 줄이 되어도 그림을 밀어내지 않는다. 그래도 상한은 있어야 한다: 조각 이름은
+// 조회 결과의 셀 값 그대로라(chart.js는 full에 길이를 두지 않는다) 자유 텍스트 한 문단이 올 수 있고,
+// 그러면 열두 개가 답변을 덮는 글자 벽이 된다.
+const MAX_LEGEND_LEN = 60;
+const clipLegend = s => (s.length > MAX_LEGEND_LEN ? `${s.slice(0, MAX_LEGEND_LEN - 1)}…` : s);
+
 const fmtNum = v => (typeof v === 'number' && Number.isFinite(v) ? v.toLocaleString('ko-KR', { maximumFractionDigits: 2 }) : '');
 const pad2 = n => String(n).padStart(2, '0');
 const MIN = 60_000;
@@ -204,7 +211,7 @@ function PieView({ spec, narrow }) {
     {narrow && (
       <ul className="chart-legend">
         {data.map((d, i) => (
-          <li key={i}><i style={{ background: color(i) }} />{d.full ?? d.name}</li>
+          <li key={i}><i style={{ background: color(i) }} />{clipLegend(String(d.full ?? d.name))}</li>
         ))}
       </ul>
     )}
