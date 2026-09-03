@@ -4,7 +4,7 @@ import remarkGfm from 'remark-gfm';
 // 수식 표기의 계약(무엇이 수식인가 + 그것을 어떻게 그리는가)은 전부 math.js에 있다.
 import { REMARK_PLUGINS, REHYPE_PLUGINS } from './math.js';
 // 차트 블록의 계약(무엇을 차트로 받는가 + 이력으로 되돌릴 때의 모양)은 chart.js에 있다.
-import { parseChartBlock, splitBlock, chartTableMarkdown, chartBlocksToTables, sliceSafe, MAX_CHARTS_PER_MESSAGE } from './chart.js';
+import { parseChartBlock, splitBlock, chartTableMarkdownFrom, chartBlocksToTables, sliceSafe, MAX_CHARTS_PER_MESSAGE } from './chart.js';
 // trace 패널의 계약(열·셀 표기·CSV)은 trace.js에 있다.
 import { columnsOf, cellText, toCsv, csvFileName } from './trace.js';
 
@@ -49,12 +49,13 @@ const TABLE_COMPONENTS = { a: NewTabLink, img: AltImage };
 // 표가 없는 블록: `data:` 참조가 남아 있으면 서버가 채우지 못한 것이다(서버가 못 알아본 펜스 등) —
 // 설정 줄을 코드로 보여줘 봐야 사용자는 읽을 수 없으니 서버가 쓰는 것과 같은 안내 문장으로 바꾼다.
 // 참조도 표도 없는 블록은 무엇인지 모르므로(모델이 펜스를 다른 용도로 썼을 수 있다) 원문 그대로 둔다.
-function ChartTable({ text, withTitle = false }) {
-  const md = chartTableMarkdown(text);
-  const { config } = splitBlock(text);
-  const title = String(config.title ?? '').trim();
+// block은 부르는 쪽(ChartBlock)이 한 번 갈라 둔 것이다 — 같은 블록을 표로 두 번 그리므로
+// 여기서 다시 가르면 한 답변에 같은 글자를 몇 번씩 훑게 된다.
+function ChartTable({ text, block, withTitle = false }) {
+  const md = chartTableMarkdownFrom(block);
+  const title = String(block.config.title ?? '').trim();
   if (!md) {
-    if (config.data === undefined) return <pre><code>{text}</code></pre>;
+    if (block.config.data === undefined) return <pre><code>{text}</code></pre>;
     return <p><em>{title ? `'${title}' ` : ''}차트를 그리지 못했습니다: 조회 결과를 채우지 못했습니다</em></p>;
   }
   return (
@@ -81,11 +82,12 @@ const ChartBudget = createContext(null);
 
 function ChartBlock({ text }) {
   const budget = useContext(ChartBudget);
+  const block = splitBlock(text);
   const parsed = parseChartBlock(text);
   const draw = parsed.ok && budget && budget.n++ < MAX_CHARTS_PER_MESSAGE;
-  const titled = <ChartTable text={text} withTitle />;
+  const titled = <ChartTable text={text} block={block} withTitle />;
   if (!draw) return titled;
-  const table = <ChartTable text={text} />;
+  const table = <ChartTable text={text} block={block} />;
   // 그리다 던지면 '그리지 않은 블록'과 같은 모양(제목 + 표)으로 — '표로 보기'까지 경계 안에 두어 표가 두 번 남지 않게 한다.
   return (
     <BlockBoundary fallback={titled}>
@@ -196,6 +198,9 @@ function countLabel(t) {
   // rowCount는 서버가 늘 준다(result.js clientTrace). 없으면 실린 행 수로 말한다 — 'undefined건'은
   // 화면에 나가서는 안 되는 글자이고, 이 패널의 다른 값들도 모두 없을 때를 정해 두고 있다.
   if (t.rowCount === undefined) return `${n}건`; // 몇 건 중 몇 건인지 말할 근거가 없다
+  // 상한에 걸린 것과 실린 행이 일부인 것은 함께 올 수 있다(서버 result.js) — 그때 둘 중 하나만
+  // 말하면 '왜 이만큼뿐인가'의 절반이 사라진다.
+  if (t.capped && t.omittedRows) return `${t.rowCount}건 — 조회 상한에 걸렸고, 아래는 그중 ${n}건입니다`;
   if (t.omittedRows) return `${t.rowCount}건 (아래는 그중 ${n}건)`;
   if (t.capped) return `${n}건 이상 — 조회 상한에 걸려 처음 ${n}건만 가져왔습니다`;
   return `${t.rowCount}건`;
@@ -242,12 +247,15 @@ function TraceGrid({ rows }) {
   // (패널이 접혀 있으면 높이가 0이라 걸리지 않고, 펼치면 크기가 바뀌어 다시 잰다).
   useLayoutEffect(() => {
     const el = ref.current;
-    if (!el || typeof ResizeObserver === 'undefined') return;
+    if (!el) return;
     const mark = () => {
       el.style.overscrollBehavior = el.scrollHeight - el.clientHeight > el.clientHeight / 2 ? 'contain' : '';
       setClipped(el.scrollHeight - el.clientHeight > 1 || el.scrollWidth - el.clientWidth > 1);
     };
+    // 한 번은 반드시 잰다. 관찰자가 없는 브라우저에서 그냥 돌아가면 휠 가두기도, 인쇄 안내도 영영
+    // 붙지 않아 1000행짜리 표가 잘린 채 소리 없이 인쇄된다.
     mark();
+    if (typeof ResizeObserver === 'undefined') return;
     const ro = new ResizeObserver(mark);
     ro.observe(el);
     return () => ro.disconnect();
@@ -422,7 +430,11 @@ export default function App() {
       // 관찰자가 만지는 중이라 건너뛴 것이 있을 때만 갚는다. 조건도 그쪽과 같아야 한다 — 특히 빈 첫
       // 화면(emptyRef)에서는 '쉬는 자리'가 맨 위라, 여기서 따라가면 칩을 보려고 내려 둔 화면이 맨 위로
       // 튕긴다. 조건을 한 번 더 적는 대신 건너뛴 사실만 표시로 남겨 두는 이유가 이것이다.
-      if (!pendingRef.current || !el || emptyRef.current || !stuckRef.current || busy()) return;
+      if (!pendingRef.current) return;
+      if (busy()) return; // 아직 만지는 중 — 놓을 때 다시 타이머가 선다
+      // 따라갈 자리가 아니면 미룬 것도 버린다. 남겨 두면 한참 뒤 다시 바닥에 붙어 무언가를 만졌다
+      // 놓는 순간, 몇 분 전의 크기 변화를 갚겠다고 화면이 움직인다.
+      if (!el || emptyRef.current || !stuckRef.current) { pendingRef.current = null; return; }
       // 상자 자신이 변한 것(창 크기·입력창)은 관찰자와 같이 한 번에 놓는다 — 부드럽게 하면 바닥이
       // 한 박자 뒤에서 따라와 흔들린다. 미뤘다고 그 성질이 바뀌지는 않는다.
       const box = pendingRef.current.box;
@@ -512,7 +524,7 @@ export default function App() {
       // 오른쪽·가운데 단추로 누른 것은 끄는 것이 아니다(글을 고르지도, 표를 끌지도 않는다). 두 번째
       // 손가락도 마찬가지다 — 첫 손가락의 시작점을 덮어쓰면 그중 하나만 떼어도 끌기가 통째로 풀린다.
       if (!e.isPrimary || (e.pointerType === 'mouse' && e.button !== 0)) return;
-      dragRef.current = { x: e.clientX, y: e.clientY, moved: false, vertical: false };
+      dragRef.current = { id: e.pointerId, x: e.clientX, y: e.clientY, moved: false, vertical: false };
     };
     const onMove = e => {
       const d = dragRef.current;
@@ -534,10 +546,13 @@ export default function App() {
     // 세로로 움직인 끌기만 그렇게 한다 — 표를 가로로 끈 것은 대화에서 떨어지겠다는 뜻이 아닌데,
     // 그사이 답이 자랐다는 이유로 떼어 버리면 그 뒤로 도착하는 것(늦게 서는 차트, 다음 답)을 따라가지
     // 않아 사용자에게는 대화가 그냥 멎은 것으로 보인다.
-    const endDrag = () => {
+    const endDrag = e => {
       const d = dragRef.current;
+      // 끌기를 시작한 그 포인터가 떨어졌을 때만 끝낸다. 두 번째 손가락(펜+터치, 하이브리드 기기)이
+      // 떨어졌다고 풀어 버리면, 첫 손가락으로 아직 잡고 있는데 화면이 바닥으로 뛴다.
+      if (!d || (e && e.pointerId !== undefined && e.pointerId !== d.id)) return;
       dragRef.current = null;
-      if (!d?.moved) return;
+      if (!d.moved) return;
       markBusy(); // 놓은 손은 아직 그 자리를 보고 있다 — 놓자마자 화면이 뛰지 않게 여운을 둔다
       if (d.vertical && el) stuckRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 8;
     };
@@ -576,7 +591,10 @@ export default function App() {
     };
     const onScrollbarDown = e => { if (e.target === el && e.offsetX >= el.clientWidth) noteInput(); };
     addEventListener('keydown', onKeyInput, true);
-    addEventListener('wheel', noteInput, { capture: true, passive: true });
+    // 확대 제스처(트랙패드 핀치·Ctrl+휠)는 휠 이벤트로 오지만 스크롤이 아니다 — 대화 밖 휠을 넘겨 주는
+    // 쪽(onOutsideWheel)이 이미 빼고 있는 것과 같은 이유로 여기서도 뺀다.
+    const onWheelInput = e => { if (!e.ctrlKey) noteInput(); };
+    addEventListener('wheel', onWheelInput, { capture: true, passive: true });
     el?.addEventListener('pointerdown', onScrollbarDown);
     const onTouchEnd = e => {
       if (e.touches.length > 0) return; // 아직 다른 손가락이 닿아 있다
@@ -593,6 +611,10 @@ export default function App() {
     // 대화가 바닥에 있으면 여전히 바닥이다.
     const onInnerScroll = e => {
       if (e.target === el) return;
+      // 안쪽 상자(코드·표·수식)의 스크롤은 사용자만 내는 것이 아니다 — 옆의 차트가 서면서 폭이 바뀌면
+      // 브라우저가 그 상자의 자리를 깎으며 같은 이벤트를 낸다. 그것까지 '굴리는 중'으로 치면 아무도
+      // 만지지 않았는데 600ms 동안 따라가기가 멎는다. 방금 사용자 입력이 있었을 때만 센다.
+      if (!byUser()) return;
       stopGlide();
       // 굴리는 그 순간만이 아니라 직후의 짧은 동안도 만지는 중으로 친다. 멈추기만 하고 두면 바로 다음
       // 크기 변화(늦게 서는 차트·흐름도)가 미끄러짐을 되살려, 읽던 표가 결국 화면 밖으로 달아난다.
@@ -625,7 +647,7 @@ export default function App() {
       el?.removeEventListener('pointerdown', onDown);
       removeEventListener('pointermove', onMove);
       removeEventListener('keydown', onKeyInput, true);
-      removeEventListener('wheel', noteInput, true);
+      removeEventListener('wheel', onWheelInput, true);
       el?.removeEventListener('pointerdown', onScrollbarDown);
       removeEventListener('pointerup', endDrag);
       removeEventListener('pointercancel', endDrag);

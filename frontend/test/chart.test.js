@@ -227,15 +227,17 @@ test('chartBlocksToTables: 이력으로 보낼 때 펜스·설정을 벗기고 �
   assert.strictEqual(chartBlocksToTables(md), `앞 문장\n\n월별 처리\n${TABLE}\n\n뒤 문장`);
   // 대소문자·들여쓰기(목록 안)·CRLF
   assert.strictEqual(chartBlocksToTables('  ```Chart\r\ntype: pie\r\n| a | b |\r\n|---|---|\r\n| x | 1 |\r\n  ```'), '| a | b |\n|---|---|\n| x | 1 |');
-  assert.strictEqual(chartBlocksToTables('```chart\r\n| a | b |\r\n| x | 1 |\r\n```\r\n뒤'), '| a | b |\n| x | 1 |\n뒤');
+  // 구분 줄이 빠진 표는 채워서 보낸다 — 화면(chartTableMarkdown)이 채워 그린 것과 같은 표여야 한다.
+  // 그러지 않으면 모델의 '## 최근 대화'에는 표가 아닌 파이프 글자 묶음이 실린다.
+  assert.strictEqual(chartBlocksToTables('```chart\r\n| a | b |\r\n| x | 1 |\r\n```\r\n뒤'), '| a | b |\n| --- | --- |\n| x | 1 |\n뒤');
   // markdown 파서가 펜스로 읽는 것은 다 잡는다: 4칸 들여쓰기(`10. ` 항목 안)·언어 뒤 덧말·백틱 4개로 닫기
-  assert.strictEqual(chartBlocksToTables('10. 항목\n    ```chart\n    | a | b |\n    | x | 1 |\n    ```'), '10. 항목\n    | a | b |\n    | x | 1 |');
-  assert.strictEqual(chartBlocksToTables('```chart 월별\n| a | b |\n| x | 1 |\n````'), '| a | b |\n| x | 1 |');
+  assert.strictEqual(chartBlocksToTables('10. 항목\n    ```chart\n    | a | b |\n    | x | 1 |\n    ```'), '10. 항목\n    | a | b |\n    | --- | --- |\n    | x | 1 |');
+  assert.strictEqual(chartBlocksToTables('```chart 월별\n| a | b |\n| x | 1 |\n````'), '| a | b |\n| --- | --- |\n| x | 1 |');
   assert.strictEqual(chartBlocksToTables('```charts\n| a | b |\n```'), '```charts\n| a | b |\n```');
   // 긴 표는 20행 + 건수
   const rows = Array.from({ length: 25 }, (_, i) => `| r${i} | ${i} |`);
   const out = chartBlocksToTables(`\`\`\`chart\n| a | b |\n|---|---|\n${rows.join('\n')}\n\`\`\``);
-  assert.strictEqual(out.split('\n').length, 2 + 20 + 1);
+  assert.strictEqual(out.split('\n').length, 2 + 20 + 1); // 머리글 + 구분 줄 + 20행 + 건수
   assert.ok(out.endsWith('(외 5행)'));
   // 차트가 아닌 코드펜스와 닫히지 않은 펜스는 그대로
   assert.strictEqual(chartBlocksToTables('```sql\nselect 1\n```'), '```sql\nselect 1\n```');

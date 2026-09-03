@@ -90,7 +90,9 @@ const splitNames = v => String(v ?? '').split(/[,;]/).map(s => s.trim()).filter(
 // 글자 열이 숫자 열로 둔갑한다(실측). '1 000'·'1,000,000'은 묶음이고 '10 20'·'1,2'는 아니다.
 const isMissing = s => s === '' || s === '-' || s === '–' || s === '—' || s === 'null' || /^n\/?a$/i.test(s);
 const CURRENCY_RE = /^([-+]?)\s*[₩$€¥]\s*/;
-const GROUPED_RE = /^[-+]?\d{1,3}(?:([, ])\d{3})+(?:\.\d*)?$/;
+// 되참조(\1)로 첫 구분자와 같은 것만 받는다 — 잡아만 두고 쓰지 않으면 '1 234,567'처럼 섞인 표기가
+// 통과해 1234567이 된다(실측). 그러면 글자 열이 숫자 열로 둔갑해 없는 값이 그려진다.
+const GROUPED_RE = /^[-+]?\d{1,3}(?:([, ])\d{3})(?:\1\d{3})*(?:\.\d*)?$/;
 const PLAIN_RE = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?$/i;
 export function toNumber(cell) {
   let s = String(cell ?? '').trim();
@@ -115,6 +117,9 @@ export function toTime(cell, explicit = false) {
   if (!m && explicit) m = COMPACT_DATE_RE.exec(s) || (/^\d{4}$/.test(s) ? [s, s, '1'] : null);
   if (!m) return null;
   const [, y, mo, d, h, mi, sec] = m;
+  // 시각도 범위를 넘으면 날짜가 아니다. Date는 12:99를 13:39로 조용히 넘겨 버려(실측), 잘못 적힌
+  // 시각이 축의 엉뚱한 자리에 찍힌다 — 아래 날짜 확인은 하루를 넘길 때만 걸린다.
+  if (+(h ?? 0) > 23 || +(mi ?? 0) > 59 || +(sec ?? 0) > 59) return null;
   const t = new Date(+y, +mo - 1, +(d ?? 1), +(h ?? 0), +(mi ?? 0), +(sec ?? 0));
   // 생성자는 0~99년을 1900년대로 올린다 — 네 자리로 적힌 해는 적힌 그대로다.
   t.setFullYear(+y);
@@ -126,12 +131,17 @@ export function toTime(cell, explicit = false) {
 // 코드유닛은 화면에서 U+FFFD가 되고, 이력으로 나가면 프롬프트 인코딩에서 같은 일이 일어난다.
 // 자르는 곳이 둘이라(라벨·범례는 아래 clip, 이력은 App.jsx clipTurn) 경계 규칙만 여기 한 번 적는다.
 export const sliceSafe = (s, n) => {
+  if (n <= 0) return '';
   const cut = s.slice(0, n);
   const last = cut.charCodeAt(cut.length - 1);
   return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
 };
 // 넘치면 끝을 …로 대신한다 (그 한 글자 자리를 비워 둔다).
-export const clip = (s, n) => (s.length > n ? `${sliceSafe(s, n - 1)}…` : s);
+export const clip = (s, n) => {
+  if (s.length <= n) return s;
+  // 자리가 한 글자뿐이면 …를 붙일 자리도 없다 — 붙이면 상한을 넘긴다.
+  return n <= 1 ? sliceSafe(s, n) : `${sliceSafe(s, n - 1)}…`;
+};
 const EMPTY_LABEL = '(빈값)';
 
 // 블록 본문(펜스 안의 글자)을 설정과 표 줄로 가른다. 설정은 표가 시작되기 전까지만 읽는다 —
@@ -216,14 +226,16 @@ export function parseChartBlock(text) {
   const y2Numeric = y2Named.filter(i => isNumericColumn(rows, i));
   const yNamed = config.y ? resolveColumns(splitNames(config.y), header, used) : [];
   let y = yNamed.filter(i => isNumericColumn(rows, i));
-  if ((yNamed.length && !y.length) || (y2Named.length && !y2Numeric.length)) return { ok: false, reason: '지정한 열이 숫자 열이 아님' };
-  const y2 = y2Numeric.slice(0, 2);
+  // pie·scatter는 값 하나만 그리므로 y2는 애초에 그리지 않는다 — 그 설정이 숫자 열이 아니라고
+  // 그릴 수 있는 그래프까지 포기하면, 쓰이지도 않는 줄 하나 때문에 표만 남는다.
+  const single = type === 'pie' || type === 'scatter';
+  if ((yNamed.length && !y.length) || (!single && y2Named.length && !y2Numeric.length)) return { ok: false, reason: '지정한 열이 숫자 열이 아님' };
+  const y2 = single ? [] : y2Numeric.slice(0, 2);
   if (!y.length) y = header.map((_, i) => i).filter(i => !used.has(i) && isNumericColumn(rows, i));
   // 왼쪽에 그릴 것이 없고 오른쪽만 있으면(y2만 적은 블록) 그것을 왼쪽에 그린다 — 축 하나면 오른쪽일 이유가 없다.
   if (!y.length && y2.length) { y = y2.splice(0); }
   if (!y.length) return { ok: false, reason: '숫자 열 없음' };
   // pie·scatter는 값 하나만 그린다 — 둘째 시리즈부터는 겹쳐 그릴 자리가 없다.
-  const single = type === 'pie' || type === 'scatter';
   y = y.slice(0, single ? 1 : MAX_SERIES - y2.length);
 
   // x의 종류. 명시(xtype)가 우선이고, 없으면 시간·숫자 축이 뜻이 있는 그래프에서만 추론한다.
@@ -313,15 +325,28 @@ export function pieSlices(rows, max = MAX_PIE_SLICES) {
 // 구분 줄이 빠졌거나 칸 수가 머리글과 다른 표는 GFM이 표로 인정하지 않는다(파이프 글자가 문단으로
 // 그대로 보인다) — 머리글 칸 수에 맞춰 넣어 준다. 위 splitBlock·parseTable은 어느 쪽이든 읽으므로
 // 차트는 그려지는데 '표로 보기'만 깨지는 일이 없어야 한다.
-export function chartTableMarkdown(text) {
-  // 줄 앞의 공백은 벗긴다 — 펜스 안에서는 뜻이 없던 들여쓰기가 표만 떼어 렌더하면 4칸부터 코드블록이다.
-  const table = splitBlock(text).table.map(l => l.trim());
-  if (!table.length) return '';
+// 표 줄들을 GFM이 표로 인정하는 모양으로: 머리글 · 구분 줄 · 값 줄들. 구분 줄이 없거나 칸 수가
+// 머리글과 다르면 채워 넣는다 — 모델이 빼먹는 일이 있다. 화면과 이력이 같은 함수를 쓰는 이유는,
+// 한쪽만 고쳐 두면 화면에는 표인 것이 모델에게는 파이프 글자 묶음으로 가기 때문이다(실측).
+export function normalizeTable(table) {
+  if (!table.length) return null;
   const cols = splitRow(table[0]).length;
-  const hasSep = table.length > 1 && SEP_ROW_RE.test(table[1]);
-  if (hasSep && splitRow(table[1]).length === cols) return table.join('\n');
-  return [table[0], `|${' --- |'.repeat(cols)}`, ...table.slice(hasSep ? 2 : 1)].join('\n');
+  const isSep = table.length > 1 && SEP_ROW_RE.test(table[1]);
+  // 채워 넣는 구분 줄은 머리글과 같은 들여쓰기로 — 이력에서는 원문의 줄 모양을 그대로 두기 때문에
+  // (목록 안의 표는 항목 폭만큼 들여 온다) 이 줄만 왼쪽 끝에 붙으면 그 표가 목록에서 떨어져 나간다.
+  const indent = /^\s*/.exec(table[0])[0];
+  const sep = isSep && splitRow(table[1]).length === cols ? table[1] : `${indent}|${' --- |'.repeat(cols)}`;
+  return { header: table[0], sep, rows: table.slice(isSep ? 2 : 1) };
 }
+
+// 이미 가른 블록에서 바로. 화면은 한 블록을 두 번(제목 있는 표·'표로 보기') 그리므로, 부르는 쪽이
+// splitBlock을 한 번만 하고 그 결과를 돌려쓸 수 있어야 한다.
+export function chartTableMarkdownFrom(block) {
+  // 줄 앞의 공백은 벗긴다 — 펜스 안에서는 뜻이 없던 들여쓰기가 표만 떼어 렌더하면 4칸부터 코드블록이다.
+  const t = normalizeTable(block.table.map(l => l.trim()));
+  return t ? [t.header, t.sep, ...t.rows].join('\n') : '';
+}
+export const chartTableMarkdown = text => chartTableMarkdownFrom(splitBlock(text));
 
 // 답변 본문에서 ```chart 펜스를 찾는다. markdown 파서(react-markdown)가 펜스로 읽는 것과 같은 범위를
 // 잡아야 한다 — 이쪽이 놓친 블록은 화면에서는 차트인데 이력에서는 설정 줄째 남고, 서버(backend chart.js)의
@@ -340,14 +365,10 @@ export function chartBlocksToTables(md) {
     const title = String(config.title ?? '').trim();
     const out = [];
     if (title) out.push(title);
-    if (table.length) {
-      const header = table[0];
-      const rest = table.slice(1);
-      const sep = rest.length && SEP_ROW_RE.test(rest[0]) ? rest.shift() : null;
-      out.push(header);
-      if (sep) out.push(sep);
-      out.push(...rest.slice(0, HISTORY_TABLE_ROWS));
-      if (rest.length > HISTORY_TABLE_ROWS) out.push(`(외 ${rest.length - HISTORY_TABLE_ROWS}행)`);
+    const t = normalizeTable(table);
+    if (t) {
+      out.push(t.header, t.sep, ...t.rows.slice(0, HISTORY_TABLE_ROWS));
+      if (t.rows.length > HISTORY_TABLE_ROWS) out.push(`(외 ${t.rows.length - HISTORY_TABLE_ROWS}행)`);
     }
     return out.join('\n');
   });
