@@ -231,3 +231,28 @@ test('이스케이프된 표시(\\$, \\\\( )는 수식의 여닫는 표시가 �
   assert.deepStrictEqual(formulas('\\\\$x$ 뒤'), ['x']);
   assert.deepStrictEqual(formulas('\\\\\\(x\\\\\\)'), ['x\\\\']);
 });
+
+test('수식 코드펜스는 ```math·```latex·```tex 셋 다 별행 수식으로 그린다', () => {
+  // 모델이 수식을 코드펜스에 넣는 일이 잦다. ```latex 만 코드블록으로 남던 때, 'latex 어려운 수식 10개'
+  // 요청의 답이 통째로 원문으로 화면에 나왔다(실측). 코드블록은 '글자 그대로'라는 표기라 화면 잘못이 아니었다.
+  const EQ = '\\begin{aligned}\n\\mathcal{L}\\{f(t)\\}(s) &= \\int_{0}^{\\infty} e^{-st}f(t)\\,dt \\\\\n\\end{aligned}';
+  for (const lang of ['math', 'latex', 'tex']) {
+    const md = '```' + lang + '\n' + EQ + '\n```';
+    assert.deepStrictEqual(formulas(md), [EQ], `\`\`\`${lang} 이 수식으로 그려지지 않았다`);
+    assert.ok(isDisplay(md), `\`\`\`${lang} 이 별행으로 그려지지 않았다`);
+    // 코드블록으로 남지 않아야 한다 — rehype-katex는 pre째로 바꾼다 (원문은 KaTeX가 MathML 주석에 싣는다)
+    assert.ok(!render(md).includes('<code'), `\`\`\`${lang} 이 코드블록으로 남았다`);
+  }
+});
+
+test('수식이 아닌 코드펜스는 그대로 코드로 남는다', () => {
+  // 사용자가 원문을 보여 달라고 하면 모델은 ```text 를 쓴다 (시스템 프롬프트) — 그 길이 막히면 안 된다.
+  for (const lang of ['text', 'js', 'sql', 'json']) {
+    const md = '```' + lang + '\n\\frac{a}{b}\n```';
+    assert.deepStrictEqual(formulas(md), [], `\`\`\`${lang} 이 수식으로 그려졌다`);
+    assert.ok(render(md).includes('<code'), `\`\`\`${lang} 이 코드블록으로 남지 않았다`);
+    assert.ok(visible(md).includes('\\frac{a}{b}'), `\`\`\`${lang} 의 원문이 화면에서 사라졌다`);
+  }
+  // 언어를 적지 않은 펜스도 코드다
+  assert.deepStrictEqual(formulas('```\n\\frac{a}{b}\n```'), []);
+});

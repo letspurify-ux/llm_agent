@@ -28,7 +28,31 @@ import rehypeKatex from 'rehype-katex';
 // KaTeX 옵션에 throwOnError를 넣지 않는다: rehype-katex가 스프레드 뒤에 자기 값(true)을 덮어쓰므로
 // 넘겨도 무시된다. '문법이 틀린 수식만 붉게 남기고 나머지는 살린다'는 동작은 그 라이브러리가
 // 던진 뒤 strict:'ignore'로 다시 그리는 자기 폴백에서 나온다 — 우리 옵션과 무관하다.
-export const REHYPE_PLUGINS = [[rehypeKatex, {
+// 모델이 수식을 코드펜스에 넣는 일이 잦다. ```math 는 rehype-katex가 알아보지만(language-math 클래스)
+// ```latex·```tex 는 평범한 코드블록이 되어 원문이 그대로 화면에 남는다 — 코드블록은 markdown이
+// '글자 그대로 보이라'고 정의한 것이라 화면 잘못이 아니다. 실측: 'latex 어려운 수식 10개' 요청의 답이
+// 통째로 ```latex 블록이었고, 사용자는 \begin{aligned}…를 글자로 봤다.
+// 그래서 세 이름을 같은 것으로 본다 — 렌더 전에 클래스만 갈아 준다. rehype-katex는 pre>code에 붙은
+// language-math를 보면 pre째로 별행 수식으로 바꾼다(그 라이브러리의 ```math 처리와 같은 길이다).
+//
+// 대가가 하나 있다: 'LaTeX 원문을 보여 달라'는 요청에 모델이 ```latex 를 쓰면 원문 대신 조판된 수식이
+// 보인다. 그 경우에는 ```text 를 쓰라고 시스템 프롬프트가 따로 말한다 (backend/src/llm-openai.js).
+// 이름을 늘릴 때는 그 프롬프트와 함께 볼 것 — 한쪽만 늘리면 그 언어로 쓴 원문이 조용히 사라진다.
+const MATH_FENCE_CLASSES = ['language-latex', 'language-tex'];
+
+const mathFence = () => tree => {
+  const walk = node => {
+    const cls = node?.properties?.className;
+    if (node?.tagName === 'code' && Array.isArray(cls) && cls.some(c => MATH_FENCE_CLASSES.includes(c))) {
+      node.properties.className = cls.map(c => (MATH_FENCE_CLASSES.includes(c) ? 'language-math' : c));
+    }
+    for (const child of node?.children ?? []) walk(child);
+  };
+  walk(tree);
+};
+
+// mathFence가 rehypeKatex보다 앞에 와야 한다 — 클래스를 갈아 준 뒤에 그것을 읽는다.
+export const REHYPE_PLUGINS = [mathFence, [rehypeKatex, {
   // \rule{1em}{500em} 한 줄이 말풍선을 7000px짜리 검은 막대로 늘리는 것을 막는다. 가로는 .bubble의
   // overflow-x: clip이 가두지만 세로는 무엇도 가두지 않아, 그 한 줄이 대화 전체를 화면 밖으로 민다.
   maxSize: 10,
