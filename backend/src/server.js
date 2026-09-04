@@ -88,46 +88,65 @@ const TRACE_VERSION = 3;
 const MAX_PENDING_LOG_WRITES = 1000;
 
 const pendingLogWrites = new Set();
+// 기록은 응답에 어떤 영향도 주어서는 안 된다. 이 함수는 응답 경로와 오류 경로 양쪽에서 불리는데,
+// 여기서 던지면 그 예외가 부르는 쪽의 흐름을 끊는다 — async 핸들러 안에서라면 express 4는 그것을
+// 잡아 주지 않으므로(아래 /api/chat 주석) 요청이 답을 받지 못한 채 열린 채로 남는다.
+// 로그가 목적이지 로그 때문에 서버가 흔들리면 안 된다는 것은 위 MAX_PENDING_LOG_WRITES와 같은 기준이다.
 function recordChatLog(question, answer, extra) {
-  if (pendingLogWrites.size >= MAX_PENDING_LOG_WRITES) {
-    warnOnce('chat_log', `${MAX_PENDING_LOG_WRITES}건이 아직 기록 중이라 새 대화 로그를 건너뜁니다 — 관리 DB가 밀리고 있는지 확인할 것.`);
-    return;
+  try {
+    // question은 NOT NULL이고 상한이 있다. 부르는 쪽마다 기억할 일이 아니라 여기서 한 번에 맞춘다 —
+    // 거부된 요청은 본문이 1MB까지 올 수 있고('너무 김'), 답변까지 간 요청은 이미 상한 안이라
+    // 이 자르기가 아무 일도 하지 않는다.
+    const q = clipText(String(question ?? ''), MAX_QUESTION_LEN);
+    if (pendingLogWrites.size >= MAX_PENDING_LOG_WRITES) {
+      warnOnce('chat_log', `${MAX_PENDING_LOG_WRITES}건이 아직 기록 중이라 새 대화 로그를 건너뜁니다 — 관리 DB가 밀리고 있는지 확인할 것.`);
+      return;
+    }
+    // 실패를 먼저 삼킨 promise를 담는다 — 그래야 종료 경로의 Promise.all이 기록 실패로 거부되지 않는다.
+    const p = insertChatLog(q, answer, { v: TRACE_VERSION, ...extra })
+      .catch(e => console.warn('[chat_log] failed to record:', e.message))
+      .finally(() => pendingLogWrites.delete(p));
+    pendingLogWrites.add(p);
+  } catch (e) {
+    console.warn('[chat_log] failed to record:', e?.message ?? e);
   }
-  // 실패를 먼저 삼킨 promise를 담는다 — 그래야 종료 경로의 Promise.all이 기록 실패로 거부되지 않는다.
-  const p = insertChatLog(question, answer, { v: TRACE_VERSION, ...extra })
-    .catch(e => console.warn('[chat_log] failed to record:', e.message))
-    .finally(() => pendingLogWrites.delete(p));
-  pendingLogWrites.add(p);
 }
 
 // 답변까지 가지 못하고 거부된 요청의 기록. question은 NOT NULL이라 없으면 빈 문자열로 남긴다 —
 // '무엇을 물었는지조차 읽지 못한 요청'도 건수로는 보여야 한다.
-// 질문 본문은 상한 안으로 잘라 넣는다: 거부 사유가 '너무 김'인 요청은 본문이 1MB까지 올 수 있다.
 const recordRejected = (question, reason, extra) =>
-  recordChatLog(clipText(String(question ?? ''), MAX_QUESTION_LEN), null, { outcome: 'rejected', reason, ...extra });
+  recordChatLog(question, null, { outcome: 'rejected', reason, ...extra });
 
+// 요청 하나가 프로세스를 내리거나 답 없이 매달리게 두지 않는다.
+// express 4는 async 핸들러가 거부해도 잡아 주지 않는다 — 그 거부는 오류 미들웨어로 가지 않고
+// unhandledRejection으로 새고(서버는 살아남지만) 요청은 답을 받지 못한 채 열린 채로 남는다.
+// 클라이언트는 자기 타임아웃까지 기다리고(프런트는 450초), 그동안 화면에는 타이핑 표시만 돈다.
+// 그래서 본문 '전체'를 하나의 try로 감싼다: 검증도, chat_log 기록도, 답을 만들기 전의 줄들도
+// 모두 그 안에 있어야 그 문이 닫힌다(앞서는 handleQuestion 위쪽이 밖에 있었다).
 app.post('/api/chat', async (req, res) => {
-  const raw = req.body?.message;
-  if (typeof raw !== 'string') {
-    recordRejected('', 'no_message');
-    return res.status(400).json({ error: 'message가 필요합니다.' });
-  }
-  // 짝 잃은 서로게이트를 여기서 걷어낸다 — 클라이언트가 이모지 한가운데를 자른 조각을 보내면
-  // 그 문자열은 유효한 UTF-8이 아니라서 LLM 요청이 통째로 거부되거나 본문이 U+FFFD로 훼손되고,
-  // chat_log INSERT도 같은 이유로 깨진다. 대화 턴이 normalizeChat에서 같은 처리를 받는 것과
-  // 같은 이유다 (agent.js clipChatText). 규칙 자체는 agent.js가 갖고 있고 여기서도 그 함수를
-  // 부른다 — 두 경계가 각자 적으면 어느 문으로 들어오느냐에 따라 질문이 달라진다.
-  const message = normalizeQuestion(raw);
-  if (!message) {
-    recordRejected(raw, 'empty_message');
-    return res.status(400).json({ error: 'message가 필요합니다.' });
-  }
-  // 상한은 constants.js가 정한다 — 프롬프트 예산 계산과 회귀 테스트가 같은 값을 본다.
-  if (message.length > MAX_QUESTION_LEN) {
-    recordRejected(message, 'too_long', { length: message.length });
-    return res.status(400).json({ error: `질문이 너무 깁니다 (최대 ${MAX_QUESTION_LEN.toLocaleString('ko-KR')}자).` });
-  }
+  // 오류 기록에 쓸 질문. try 밖에 두어야 어느 줄에서 던지든 catch가 그때까지 읽어낸 것을 남긴다.
+  let message = '';
   try {
+    const raw = req.body?.message;
+    if (typeof raw !== 'string') {
+      recordRejected('', 'no_message');
+      return res.status(400).json({ error: 'message가 필요합니다.' });
+    }
+    // 짝 잃은 서로게이트를 여기서 걷어낸다 — 클라이언트가 이모지 한가운데를 자른 조각을 보내면
+    // 그 문자열은 유효한 UTF-8이 아니라서 LLM 요청이 통째로 거부되거나 본문이 U+FFFD로 훼손되고,
+    // chat_log INSERT도 같은 이유로 깨진다. 대화 턴이 normalizeChat에서 같은 처리를 받는 것과
+    // 같은 이유다 (agent.js clipChatText). 규칙 자체는 agent.js가 갖고 있고 여기서도 그 함수를
+    // 부른다 — 두 경계가 각자 적으면 어느 문으로 들어오느냐에 따라 질문이 달라진다.
+    message = normalizeQuestion(raw);
+    if (!message) {
+      recordRejected(raw, 'empty_message');
+      return res.status(400).json({ error: 'message가 필요합니다.' });
+    }
+    // 상한은 constants.js가 정한다 — 프롬프트 예산 계산과 회귀 테스트가 같은 값을 본다.
+    if (message.length > MAX_QUESTION_LEN) {
+      recordRejected(message, 'too_long', { length: message.length });
+      return res.status(400).json({ error: `질문이 너무 깁니다 (최대 ${MAX_QUESTION_LEN.toLocaleString('ko-KR')}자).` });
+    }
     // history: 클라이언트가 보내는 최근 대화 [{role:'user'|'assistant', text}] (서버는 상태를 저장하지 않는다)
     const { answer, trace, search, fullRows } = await handleQuestion(message, req.body?.history);
     // 대화 로그 (비동기 — 기록 실패가 응답을 막지 않는다). search(검색 적중 수)를 함께 남겨
@@ -143,10 +162,14 @@ app.post('/api/chat', async (req, res) => {
     // 답하지 못한 질문 중 가장 중요한 부류가 이것이다 — 반드시 기록한다.
     // 오류 원문은 chat_log에만 남긴다(화면에는 아래 일반 문구만 나간다). trace.steps[].error가
     // 이미 드라이버 원문을 담는 필드이므로 같은 기준이다.
+    // 이 기록은 던지지 않는다(recordChatLog가 스스로 삼킨다) — 여기서 던지면 아래 응답이
+    // 나가지 못해, 오류를 알리려던 자리가 '답이 영영 오지 않는 요청'이 된다.
     recordChatLog(message, null, { outcome: 'error', error: e?.message ?? String(e) });
+    // 이미 답이 나간 뒤에 던진 것이라면 여기서 또 쓰지 않는다 — 헤더가 나간 응답에 다시 쓰면
+    // 그 쓰기가 던지고, 그 거부는 아무도 받지 않아(위 주석) 요청이 열린 채 남는다.
     // 실패는 400/413/500 어느 경로든 error 필드로 통일한다 — 여기만 answer로 보내면
     // error 유무로 실패를 판정하는 클라이언트가 서버 오류를 정상 답변으로 읽는다.
-    res.status(500).json({ error: '처리 중 오류가 발생했습니다.' });
+    if (!res.headersSent) res.status(500).json({ error: '처리 중 오류가 발생했습니다.' });
   }
 });
 
