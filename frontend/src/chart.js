@@ -379,14 +379,17 @@ export const chartTableMarkdown = text => chartTableMarkdownFrom(splitBlock(text
 // ~~~chart·````chart 블록이 화면에서는 차트인데 이력에는 설정 줄째 그대로 실려 갔다(실측). 닫는 펜스는 markdown과
 // 같이 여는 펜스(\1)에 그 글자(\2)가 더 붙은 것까지다 — ````chart 안의 ``` 줄은 끝이 아니라 내용이고, ```~처럼
 // 글자가 섞인 줄도 끝이 아니다. 그룹 1이 펜스, 2가 펜스 글자, 본문은 그룹 3이다.
-export const CHART_FENCE_RE = /^[ \t]*((`|~)\2{2,})[ \t]*chart(?:[ \t]+[^\r\n]*)?\r?\n([\s\S]*?)\r?\n[ \t]*\1\2*[ \t]*\r?$/gim;
+// 본문은 없을 수도 있다(```chart 바로 아래 ```) — 그것도 markdown에게는 닫힌 블록이다. 본문 한 줄을 요구하던
+// 때에는 빈 블록의 여는 펜스가 다음 차트 블록의 닫는 펜스와 짝이 되어 그 사이의 문장까지 한 블록으로 삼켰다
+// (실측: 빈 블록 뒤의 설명 문장이 이력에서 사라졌다). 빈 본문을 먼저 시도해야(??) 그 짝짓기가 생기지 않는다.
+export const CHART_FENCE_RE = /^[ \t]*((`|~)\2{2,})[ \t]*chart(?:[ \t]+[^\r\n]*)?\r?\n(?:([\s\S]*?)\r?\n)??[ \t]*\1\2*[ \t]*\r?$/gim;
 
 // 대화 이력으로 보낼 때 차트 블록을 평범한 표로 되돌린다. 모델의 다음 턴에 필요한 것은 '무슨 값을
 // 보여줬는가'이지 그것을 어떻게 그렸는가가 아니다 — 펜스와 설정 줄을 그대로 돌려보내면 이력
 // 상한(HISTORY_LEN)의 일부를 그 글자가 먹고, 모델은 그 모양을 답변마다 흉내 낸다.
 // 표는 20행까지만 남기고 나머지는 건수로 적는다.
 export function chartBlocksToTables(md) {
-  return String(md ?? '').replace(CHART_FENCE_RE, (_, _fence, _ch, body) => {
+  return String(md ?? '').replace(CHART_FENCE_RE, (_, _fence, _ch, body = '') => {
     const { config, table } = splitBlock(body);
     const title = String(config.title ?? '').trim();
     const out = [];

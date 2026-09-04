@@ -242,6 +242,11 @@ test('chartBlocksToTables: 이력으로 보낼 때 펜스·설정을 벗기고 �
   assert.strictEqual(chartBlocksToTables('````chart\n| a | b |\n```'), '````chart\n| a | b |\n```');
   assert.strictEqual(chartBlocksToTables('~~~chart\n| a | b |\n```'), '~~~chart\n| a | b |\n```');
     assert.strictEqual(chartBlocksToTables('```chart\n| a | b |\n```~'), '```chart\n| a | b |\n```~'); // 섞인 글자는 닫는 펜스가 아니다
+    // 빈 블록(여는 펜스 바로 아래 닫는 펜스)도 markdown에게는 닫힌 블록이다 — 본문 한 줄을 요구하면 그 여는 펜스가
+    // 다음 차트 블록의 닫는 펜스와 짝이 되어 사이의 문장까지 삼킨다(실측: 빈 블록 뒤의 설명 문장이 이력에서 사라졌다).
+    assert.strictEqual(chartBlocksToTables('```chart\n```\n\n설명\n\n```chart\n| a | b |\n| x | 1 |\n```'), '\n\n설명\n\n| a | b |\n| --- | --- |\n| x | 1 |');
+    // 첫 본문 줄이 더 긴 같은 글자 펜스면 그것이 닫는 펜스다(빈 블록) — 뒤의 표는 블록 밖이다
+    assert.strictEqual(chartBlocksToTables('```chart\n````\n| x | 1 |\n```'), '\n| x | 1 |\n```');
   // 긴 표는 20행 + 건수
   const rows = Array.from({ length: 25 }, (_, i) => `| r${i} | ${i} |`);
   const out = chartBlocksToTables(`\`\`\`chart\n| a | b |\n|---|---|\n${rows.join('\n')}\n\`\`\``);

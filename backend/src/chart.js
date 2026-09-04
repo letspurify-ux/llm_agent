@@ -37,8 +37,10 @@ export const MAX_CHART_INJECT_LEN = 30_000;
 // 채워지지 않은 `data:` 참조로 화면에 간다 — 프런트는 markdown이 펜스로 읽는 것을 다 차트로 그리므로, 백틱 셋만
 // 받던 때에는 ~~~chart·````chart로 적힌 참조가 '조회 결과를 채우지 못했습니다'로 화면에 갔다(실측).
 // 들여쓰기(목록 안의 펜스)는 m[1]로 받아 채워 넣는 줄에도 붙이고, 펜스(m[2])는 다시 쓸 때 그대로 쓴다.
-// 닫는 펜스는 markdown과 같이 여는 펜스에 그 글자(m[3])가 더 붙은 것까지다 — 글자가 섞인 줄은 끝이 아니다. 본문은 m[4].
-const FENCE_RE = /^([ \t]*)((`|~)\3{2,})[ \t]*chart(?:[ \t]+[^\r\n]*)?\r?\n([\s\S]*?)\r?\n[ \t]*\2\3*[ \t]*\r?$/gim;
+// 닫는 펜스는 markdown과 같이 여는 펜스에 그 글자(m[3])가 더 붙은 것까지다 — 글자가 섞인 줄은 끝이 아니다. 본문은 m[4],
+// 빈 블록(```chart 바로 아래 ```)이면 undefined다. 본문 한 줄을 요구하던 때에는 빈 블록의 여는 펜스가 다음 차트 블록의
+// 닫는 펜스와 짝이 되어 그 사이의 문장을 삼킨 채 표로 다시 써 답변에서 지웠다(실측). 빈 본문을 먼저 시도한다(??).
+const FENCE_RE = /^([ \t]*)((`|~)\3{2,})[ \t]*chart(?:[ \t]+[^\r\n]*)?\r?\n(?:([\s\S]*?)\r?\n)??[ \t]*\2\3*[ \t]*\r?$/gim;
 const CONFIG_RE = /^\s*(type|title|x|y|y2|xtype|data)\s*:\s*(.*?)\s*$/i;
 
 // 셀 값을 표의 칸으로. 숫자는 천 단위 구분 없이 그대로(프런트가 숫자로 읽는다), 파이프와 줄바꿈은
@@ -108,9 +110,9 @@ export function resolveChartData(answer, steps) {
   const text = String(answer ?? '');
   if (!/(?:```|~~~)[ \t]*chart/i.test(text)) return text;
   const needsFill = body => { const b = splitBlock(body); return b.config.data !== undefined && !b.hasTable; };
-  let blocksLeft = [...text.matchAll(FENCE_RE)].filter(m => needsFill(m[4])).length;
+  let blocksLeft = [...text.matchAll(FENCE_RE)].filter(m => needsFill(m[4] ?? '')).length;
   let budget = MAX_CHART_INJECT_LEN;
-  return text.replace(FENCE_RE, (whole, indent, fence, _ch, body) => {
+  return text.replace(FENCE_RE, (whole, indent, fence, _ch, body = '') => {
     const { config, lines, hasTable } = splitBlock(body);
     if (config.data === undefined) return whole;
     // 표가 함께 있으면 표가 우선이다 — data 줄만 지운다 (프런트는 어차피 무시하지만, 이력으로
