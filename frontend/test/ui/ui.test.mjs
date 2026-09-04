@@ -356,6 +356,41 @@ it('좁은 화면: 흐름도 글자가 읽히는 크기로 남고, 인쇄에서�
   assert.ok(paper.넘침 <= 1);
 });
 
+it('조합 확정으로 보낸 질문은 입력창에 남지 않는다 (마지막 input이 compositionend 뒤에 오는 브라우저)', async () => {
+  // 한글은 마지막 글자가 늘 조합 중이라 Enter 전송은 거의 언제나 조합 확정을 거친다. 그런데 확정의
+  // 마지막 input 이벤트가 compositionend '앞'에 오는 브라우저와 '뒤'에 오는 브라우저가 갈린다 —
+  // 뒤에 오는 쪽에서는 그 이벤트가 아직 지워지지 않은 입력창(DOM)의 값을 읽어, 전송이 방금 비운
+  // state를 보낸 글자로 되돌린다. 보낸 질문이 입력창에 그대로 남고, 사용자가 Enter를 한 번 더
+  // 누르면 같은 질문이 두 번 나간다(실측: 그 순서로 이벤트를 내자 그대로 재현됐다).
+  // 헤드리스 Chrome의 IME는 앞에 오는 순서만 내주므로 이벤트를 그 순서로 직접 낸다. 값을 넣는
+  // 길(네이티브 setter + input 이벤트)은 아래 '긴 초안' 시험과 같다 — React가 그 변화를 보는 길이다.
+  await page.goto(url(), '.chip');
+  await page.eval(`document.querySelector('.composer textarea').focus()`);
+  await page.eval(`(() => {
+    const ta = document.querySelector('.composer textarea');
+    const set = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    ta.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    set.call(ta, '한'); ta.dispatchEvent(new Event('input', { bubbles: true }));
+    // 조합 중의 Enter는 IME가 먼저 받으므로 keyCode 229로 온다 (App.jsx가 그것으로 조합을 알아본다)
+    ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 229, which: 229, bubbles: true, cancelable: true }));
+    set.call(ta, '한글');
+    ta.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '한글' }));
+    ta.dispatchEvent(new Event('input', { bubbles: true }));   // 확정의 마지막 input — compositionend '뒤'다
+    return true; })()`);
+  await page.until(`document.querySelectorAll('.row.user').length === 1`, { what: '조합 확정으로 보낸 질문이 서기' });
+  assert.strictEqual(await page.eval(`document.querySelector('.row.user .bubble').textContent`), '한글',
+    '조합 중이던 마지막 글자가 빠진 채 나갔다');
+  assert.strictEqual(await page.eval(`document.querySelector('.composer textarea').value`), '',
+    '보낸 질문이 입력창에 그대로 남았다');
+  // 남지 않는다는 것을 결과로도 못 박는다 — 그것이 사용자가 겪는 손해다(같은 질문이 두 번 나간다).
+  await page.until(`!document.querySelector('.typing')`, { what: '답이 도착하기' });
+  await settled();
+  await page.key('Enter', 'Enter', 13);
+  await sleep(500);
+  assert.strictEqual(await page.eval(`document.querySelectorAll('.row.user').length`), 1,
+    '보낸 뒤 다시 누른 Enter가 같은 질문을 한 번 더 보냈다');
+});
+
 it('낮은 화면에서 긴 초안이 대화를 잡아먹지 않는다', async () => {
   await answered(390, 740, { mobile: true });
   await page.viewport(390, 380, true); await sleep(500);

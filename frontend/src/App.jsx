@@ -749,6 +749,14 @@ export default function App() {
     const message = text.trim();
     if (!message || !canSend()) return;
     setInput('');
+    // 입력창(DOM)의 값도 함께 비운다. state만 비우면 조합 확정의 마지막 input 이벤트가
+    // compositionEnd '뒤에' 오는 브라우저에서 그 이벤트가 아직 지워지지 않은 DOM의 값을 읽어
+    // 방금 비운 state를 보낸 글자로 되돌린다 — 보낸 질문이 입력창에 그대로 남고, 사용자가
+    // Enter를 한 번 더 누르면 같은 질문이 두 번 나간다(실측: 순서가 뒤바뀐 확정에서 재현된다).
+    // 한글은 마지막 글자가 늘 조합 중이라 그 브라우저에서는 모든 전송이 이 경로다.
+    // 여기서 비워 두면 뒤늦게 오는 input 이벤트가 읽는 것도 빈 값이라 순서와 무관해진다
+    // (전송이 받아들여진 뒤에만 비운다 — 위 가드에 걸린 글자는 초안으로 남아야 한다).
+    if (inputRef.current) inputRef.current.value = '';
     ask(message);
   }
 
