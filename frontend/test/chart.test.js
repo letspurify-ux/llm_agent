@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import {
   parseChartBlock, chartBlocksToTables, chartTableMarkdown, toNumber, toTime, pieSlices, clip, sliceSafe,
-  chartNotes, fmtNum, MAX_CHART_ROWS, MAX_SERIES, MAX_LABEL_LEN, MAX_PIE_SLICES,
+  chartNotes, fmtNum, pieLabelsOverflow, MAX_CHART_ROWS, MAX_SERIES, MAX_LABEL_LEN, MAX_PIE_SLICES,
 } from '../src/chart.js';
 
 const TABLE = '| 월 | 건수 | 금액 |\n|---|---|---|\n| 2024-01 | 120 | 1,000 |\n| 2024-02 | 80 | 2,500 |';
@@ -252,6 +252,14 @@ test('chartBlocksToTables: 이력으로 보낼 때 펜스·설정을 벗기고 �
   const out = chartBlocksToTables(`\`\`\`chart\n| a | b |\n|---|---|\n${rows.join('\n')}\n\`\`\``);
   assert.strictEqual(out.split('\n').length, 2 + 20 + 1); // 머리글 + 구분 줄 + 20행 + 건수
   assert.ok(out.endsWith('(외 5행)'));
+  // 목록 안의 블록에서 우리가 새로 적는 줄(제목·건수)도 펜스의 들여쓰기를 따른다. 표 줄은 원문의
+  // 들여쓰기를 그대로 두는데 이 줄들만 왼쪽 끝에 붙으면 제목이 목록 밖의 문단이 되어 항목이 거기서
+  // 끝나고, 뒤의 표는 목록에서 떨어져 나간다(실측: `목록 안\n    | a | b |…`로 나갔다).
+  const inList = `1. 항목\n\n    \`\`\`chart\n    title: 목록 안\n    | a | b |\n    |---|---|\n${
+    Array.from({ length: 21 }, (_, i) => `    | r${i} | ${i} |`).join('\n')}\n    \`\`\``;
+  const listOut = chartBlocksToTables(inList);
+  assert.ok(listOut.startsWith('1. 항목\n\n    목록 안\n    | a | b |\n    |---|---|\n    | r0 | 0 |'), listOut);
+  assert.ok(listOut.endsWith('    | r19 | 19 |\n    (외 1행)'), listOut);
   // 차트가 아닌 코드펜스와 닫히지 않은 펜스는 그대로
   assert.strictEqual(chartBlocksToTables('```sql\nselect 1\n```'), '```sql\nselect 1\n```');
   assert.strictEqual(chartBlocksToTables('```chart\ntype: bar\n| a | b |'), '```chart\ntype: bar\n| a | b |');
@@ -307,6 +315,29 @@ test('차트 안내 문구: 빠진 행을 밝히고, 조사는 축의 표기를 
   assert.deepStrictEqual(chartNotes(clipped), [`처음 ${MAX_CHART_ROWS}행만 그렸습니다 (전체 ${MAX_CHART_ROWS + 3}행).`]);
   // 빠진 행이 없는 차트에는 아무 문구도 붙지 않는다 — 문구가 곧 '빠졌다'는 신호이기 때문이다
   assert.deepStrictEqual(chartNotes(spec(`type: bar\n${TABLE}`)), []);
+});
+
+test('원그래프 바깥 라벨의 자리: Recharts가 놓는 자리 그대로 세어, 들어가지 않는 글자만 안으로 보낸다', () => {
+  // 상자 폭 하나로 가르던 때에는(380px 아래에서만 안으로) 데스크톱 폭에서도 스무 자 이름이 양끝에서
+  // 잘렸다(화면 재현으로 확인: 폭 574px 상자에서 네 이름의 폭이 227·208·212·149px일 때 왼쪽 24px·
+  // 오른쪽 3px). 같은 자리에 100px 이름은 들어간다. 그리는 쪽(Chart.jsx useLabelsFit)은 글자의 폭만
+  // 재어 여기에 묻는다 — 자리의 셈은 Recharts를 따른다: 여백 4px을 뺀 짧은 변(260-8)의 절반에 0.72를
+  // 곱한 반지름에 20px을 더한 점에서, 중심의 오른쪽이면 오른쪽 끝까지, 왼쪽이면 왼쪽 끝까지가 자리다.
+  const box = { width: 574, height: 260, margin: 4, radiusRatio: 0.72 };
+  assert.strictEqual(pieLabelsOverflow({ ...box, values: [40, 35, 30, 25], widths: [227, 208, 212, 149] }), true);
+  assert.strictEqual(pieLabelsOverflow({ ...box, values: [40, 35, 30, 25], widths: [100, 100, 100, 100] }), false);
+  // 조각 하나뿐이면 가운데 각도가 180°(9시)라 왼쪽으로 뻗는다 — 자리는 중심에서 라벨 점까지를 뺀 나머지다
+  const room = 574 / 2 - (0.72 * ((260 - 8) / 2) + 20);
+  assert.strictEqual(pieLabelsOverflow({ ...box, values: [1], widths: [room - 1] }), false);
+  assert.strictEqual(pieLabelsOverflow({ ...box, values: [1], widths: [room + 1] }), true);
+  // 자리는 각도에 달려 있다: 반반이면 가운데 각도가 90°(12시)·270°(6시)라 라벨 점이 중심에 서고,
+  // 그때는 양쪽 중 좁은 쪽(상자의 반)이 자리다 — 3시 방향이라면 들어가지 못했을 글자가 여기서는 들어간다.
+  assert.strictEqual(pieLabelsOverflow({ ...box, values: [1, 1], widths: [280, 280] }), false);
+  assert.strictEqual(pieLabelsOverflow({ ...box, values: [1, 1], widths: [300, 0] }), true);
+  // 좁은 상자에서는 짧은 이름도 들어가지 않는다 — 지금까지 380px 아래에서 안으로 보내던 길이 여기 있다
+  assert.strictEqual(pieLabelsOverflow({ ...box, width: 340, values: [1], widths: [80] }), true);
+  // 상자의 크기를 아직 모르면(0) 넘칠 것도 없다 — 크기가 서면 그리는 쪽이 다시 묻는다
+  assert.strictEqual(pieLabelsOverflow({ ...box, width: 0, values: [1], widths: [999] }), false);
 });
 
 test('자르기는 상한을 넘지 않고 서로게이트 쌍을 쪼개지 않는다', () => {

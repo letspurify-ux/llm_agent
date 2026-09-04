@@ -78,6 +78,15 @@ const acceptDollar = (tex, raw, from, to) =>
   !/[A-Za-z0-9]/.test(raw[to] ?? '') &&
   (!CJK_RE.test(tex) || MATH_SIGNAL_RE.test(tex));
 
+// 그 자리의 글자가 markdown의 백슬래시 이스케이프에 물려 있는가 — 바로 앞에 이어진 백슬래시가 홀수 개면
+// 그렇다. `\$`는 글자 $이고(모델이 금액을 그렇게 적는다 — 수식으로 읽힐까 봐), `\\$`는 백슬래시 하나 뒤의
+// 진짜 $다. `\\(`도 같다: 백슬래시 하나 뒤의 여는 괄호이지 수식 표시가 아니다.
+const escapedAt = (raw, i) => {
+  let n = 0;
+  while (i - 1 - n >= 0 && raw[i - 1 - n] === '\\') n++;
+  return n % 2 === 1;
+};
+
 // 텍스트 노드 하나를 [글자, 수식, 글자, …]로 쪼갠다. 쪼갤 것이 없으면 null.
 function splitText(node, source) {
   const from = node.position?.start?.offset;
@@ -94,7 +103,16 @@ function splitText(node, source) {
   SPAN_RE.lastIndex = 0;
   for (let m; (m = SPAN_RE.exec(raw)); ) {
     const tex = (m[1] ?? m[2] ?? m[3]).trim();
-    if (m[3] !== undefined && !acceptDollar(tex, raw, m.index, m.index + m[0].length)) {
+    const end = m.index + m[0].length;
+    // 여는 표시나 닫는 표시가 이스케이프된 것이면 후보가 아니다. 그것을 수식 표시로 읽으면 글자 $가
+    // 사라지고 끝에 남은 백슬래시가 조판 오류로 붉게 선다(실측: '가격은 \$5이고 이익은 \$.'가
+    // '가격은 \5이고 이익은 \.'로 나왔다). 홑 $는 그 글자 자리를, \(·\[는 백슬래시 자리를 본다.
+    const close = m[3] !== undefined ? end - 1 : end - 2;
+    if (escapedAt(raw, m.index) || escapedAt(raw, close)) {
+      SPAN_RE.lastIndex = m.index + 1;
+      continue;
+    }
+    if (m[3] !== undefined && !acceptDollar(tex, raw, m.index, end)) {
       // 물린 후보의 여는 자리 바로 뒤에서 다시 시작한다 — 매치 끝까지 건너뛰면 그 안에 있던
       // 진짜 수식을 놓친다('$100 이고 … $200 이다 $v=d/t$'의 마지막이 그렇게 사라졌다).
       SPAN_RE.lastIndex = m.index + 1;

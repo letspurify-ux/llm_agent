@@ -2,6 +2,8 @@
 // App.jsx가 React.lazy로 부른다 — mermaid는 번들이 수 MB라 첫 흐름도가 나올 때까지 내려받지 않는다.
 import { useEffect, useLayoutEffect, useRef, useState, useId } from 'react';
 import mermaid from 'mermaid';
+// 그림 안 링크의 주소 규칙과 그림 노드의 판정은 답변의 링크·그림과 같은 자리에 있다 (markdown.js).
+import { rawLinkTarget, mermaidLoadsImage, mermaidFetchesViaStyle } from './markdown.js';
 
 mermaid.initialize({
   startOnLoad: false,
@@ -15,6 +17,15 @@ mermaid.initialize({
   // 루트의 이 값이 모든 그림 종류를 덮는다 — mermaid 11에서 flowchart.htmlLabels 같은 종류별 설정은
   // 폐기됐고 루트가 우선한다. 종류마다 따로 적으면 새 그림이 늘 때마다 빠뜨릴 자리만 늘어난다.
   htmlLabels: false,
+  // 위 htmlLabels를 그림의 글자가 되돌리지 못하게 한다. mermaid는 본문의 지시문(`%%{init: {…}}%%`)과
+  // 머리말(`---` config: `---`)로 설정을 덮어쓰게 해 주는데, 그 덮어쓰기에서 지키는 것은 secure에 적힌
+  // 키뿐이다 — 기본 목록에 securityLevel은 있어도 htmlLabels는 없다. 그래서 모델이(또는 모델이 베낀
+  // 조회 결과가) 그 한 줄을 쓰면 라벨이 다시 HTML이 된다(실측: `%%{init: {"htmlLabels": true}}%%` 한 줄로
+  // <foreignObject> 안에 <img>가 서서 주소가 불려 나갔고, <a href>는 같은 탭에서 열리는 링크로 남았다 —
+  // 답변의 링크를 새 탭으로만 여는 이 화면의 규칙(App.jsx NewTabLink) 밖이다). 머리말의 config도
+  // 같은 문을 지나므로 함께 막힌다. 지키는 키는 어느 깊이에 있든 걸러진다(flowchart.htmlLabels도).
+  // 기본 목록을 이어받아 늘린다 — 통째로 다시 적으면 mermaid가 기본 목록에 키를 더한 날 그것을 조용히 잃는다.
+  secure: [...(mermaid.mermaidAPI?.defaultConfig?.secure ?? []), 'htmlLabels'],
   // 문법이 틀린 그림에 mermaid가 '폭탄' 오류 SVG를 문서에 직접 끼워 넣는 것을 막는다 —
   // 그 경우는 아래에서 원문 코드로 되돌린다.
   suppressErrorRendering: true,
@@ -33,10 +44,37 @@ export default function Mermaid({ text }) {
   useEffect(() => {
     let alive = true;
     setSvg(null);
+    // 그리는 도중에 주소를 불러오는 그림은 그리지 않는다 — 그림 노드(`A@{ img: "주소" }`)와, 설정 자리의
+    // CSS가 바깥을 부르는 것(지시문의 themeCSS·fontFamily에 든 url(…))이다(markdown.js mermaidLoadsImage·
+    // mermaidFetchesViaStyle). 둘 다 그린 뒤에는 늦다 — mermaid가 크기를 재려고 SVG를 문서에 넣는 순간
+    // 요청이 나간다. 문법 오류와 같이 원문 코드가 남는다. 오류가 아니라 정책이므로 경고가 아니라 알림으로만 남긴다.
+    if (mermaidLoadsImage(text) || mermaidFetchesViaStyle(text)) {
+      console.info('[mermaid] 그리는 도중에 주소를 불러오는 그림(img: 노드, url( 지시문)은 그리지 않습니다');
+      return;
+    }
     // 그리지 못하면(문법 오류 등) svg를 null로 둔 채 끝낸다 — 아래에서 원문을 코드로 보여준다.
     mermaid.render(id, text).then(r => { if (alive) setSvg(r.svg); }, e => console.warn('[mermaid] render failed:', e?.message ?? e));
     return () => { alive = false; };
   }, [text, id]);
+  // 그림 안의 링크(`click A "주소"`)는 답변의 링크와 같은 규칙으로 연다 — 새 탭, 페이지 안 앵커만
+  // 제자리(App.jsx NewTabLink). mermaid는 strict에서도 링크를 남기되 target은 주지 않고(`_blank`라고
+  // 적어도 버린다) `_self`는 그대로 두어, 누르면 같은 탭에서 열려 대화가 통째로 사라진다(실측). 주소도
+  // 같은 문(markdown.js rawLinkTarget)을 지나게 한다 — 걷어내면 남지 않는 주소는 링크에서 뗀다.
+  // SVG는 innerHTML로 넣었으므로 React가 이 속성들을 다시 건드리지 않는다. 그리기 전에 손봐야 하므로
+  // useLayoutEffect다.
+  useLayoutEffect(() => {
+    const box = boxRef.current;
+    if (!box || svg === null) return;
+    for (const a of box.querySelectorAll('a')) {
+      const href = a.getAttribute('href') ?? a.getAttribute('xlink:href');
+      if (href === null) continue; // mermaid가 이미 걷어낸 것(javascript: 등) — 누를 것이 없는 <a>다
+      const { url, attrs } = rawLinkTarget(href);
+      for (const k of ['href', 'xlink:href', 'target', 'rel']) a.removeAttribute(k);
+      if (url === '') continue;
+      a.setAttribute('href', url);
+      for (const [k, v] of Object.entries(attrs)) a.setAttribute(k, v);
+    }
+  }, [svg]);
   // mermaid의 SVG는 width="100%"라 상자에 맞춰 통째로 줄어든다. 좁은 상자에서는 그 배율이 끝없이
   // 내려가 그림은 다 보이는데 글자를 못 읽는 상태가 된다 — 실측: 폭 238px 상자에서 흐름도 높이 41px,
   // 라벨 글자 3px. 그래서 글자가 MIN_LABEL_PX 아래로 내려가면 거기서 멈추고 남는 폭은 .mermaid의

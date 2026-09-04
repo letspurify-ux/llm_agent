@@ -214,3 +214,20 @@ test('긴 입력에도 선형으로 동작한다', () => {
     assert.ok(performance.now() - t0 < 3000, unit);
   }
 });
+
+test('이스케이프된 표시(\\$, \\\\( )는 수식의 여닫는 표시가 아니다', () => {
+  // markdown에서 `\$`는 글자 $이다 — 모델이 금액을 수식으로 읽힐까 봐 그렇게 적는다. 그것을 여닫는
+  // 표시로 읽으면 글자 $가 사라지고 끝에 남은 백슬래시가 조판 오류로 붉게 선다(화면 재현으로 확인:
+  // '가격은 \$5이고 이익은 \$.'가 '가격은 \5이고 이익은 \.'로 나왔다).
+  for (const md of ['\\$a\\$', '가격은 \\$5이고 이익은 \\$.', '비용 \\$5 (최소) ~ \\$ 단위', '$a\\$b$']) {
+    assert.deepStrictEqual(formulas(md), [], md);
+    assert.strictEqual(visible(md), plain(md).replace(/<[^>]*>/g, ""), md); // 수식 처리를 뺀 렌더와 글자가 같다
+    assert.ok(!render(md).includes('katex-error'), `${md}: 조판 오류가 남았다`);
+  }
+  // `\\(`는 백슬래시 하나 뒤의 여는 괄호다 — 표시가 아니다
+  assert.deepStrictEqual(formulas('\\\\(x\\\\)'), []);
+  assert.strictEqual(visible('\\\\(x\\\\)'), '\\(x\\)');
+  // 이스케이프된 백슬래시 뒤의 진짜 표시는 그대로 수식이다 — 백슬래시가 짝수 개면 표시가 살아 있다
+  assert.deepStrictEqual(formulas('\\\\$x$ 뒤'), ['x']);
+  assert.deepStrictEqual(formulas('\\\\\\(x\\\\\\)'), ['x\\\\']);
+});

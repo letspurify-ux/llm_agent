@@ -6,7 +6,7 @@ import {
   ResponsiveContainer, ComposedChart, PieChart, ScatterChart,
   Bar, Line, Area, Pie, Scatter, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
 } from 'recharts';
-import { pieSlices, clip, chartNotes, fmtNum } from './chart.js';
+import { pieSlices, clip, chartNotes, fmtNum, pieLabelsOverflow } from './chart.js';
 
 // 첫 색은 앱의 강조색(index.html --accent)을 따라가고, 나머지는 서로 구별되는 고정 팔레트다.
 // 강조색은 이 모듈이 처음 실행될 때 한 번 읽는다 — 차트가 나올 시점에는 문서가 이미 그려져 있다.
@@ -138,65 +138,98 @@ function Cartesian({ spec }) {
   );
 }
 
+// 원그래프의 치수. 라벨을 밖에 둘 자리가 있는지를 재는 쪽(아래 useLabelsFit → chart.js pieLabelsOverflow)이
+// 그리는 쪽과 같은 값을 봐야 하므로 한 번만 적는다 — 반지름을 여기서 바꾸고 재는 쪽이 옛 값을 보면
+// 판정이 실제 그림과 어긋나 잘리는 라벨이 되살아난다.
+const PIE_MARGIN = 4;         // PieChart의 네 변 여백
+const PIE_RADIUS = 0.72;      // 바깥 라벨일 때의 반지름 (짧은 변의 절반에 대한 비율)
+const PIE_RADIUS_INSIDE = 0.62; // 안쪽 라벨(비율만)일 때 — 범례가 아래 붙으므로 조금 작게
+const LABEL_FONT_PX = 11;
+
 // 조각 라벨: 이름과 비율. Recharts가 라벨 자리(x·y·textAnchor)와 비율(percent)을 계산해 넘겨 준다.
+// 글자는 아래 labelTextOf와 같아야 한다 — 그쪽이 이 글자의 폭을 재어 자리를 판정한다.
+const labelTextOf = (name, percent) => `${name} ${(percent * 100).toFixed(1)}%`;
 const sliceLabel = ({ x, y, textAnchor, name, percent }) => (
-  <text x={x} y={y} textAnchor={textAnchor} dominantBaseline="central" fontSize={11} fill="#374151">
-    {`${name} ${(percent * 100).toFixed(1)}%`}
+  <text x={x} y={y} textAnchor={textAnchor} dominantBaseline="central" fontSize={LABEL_FONT_PX} fill="#374151">
+    {labelTextOf(name, percent)}
   </text>
 );
 
-// 좁은 상자에서 쓰는 라벨. 원 밖에 이름을 적으면 SVG 경계에 그대로 잘린다 — 창을 좁히면 소리 없이
-// 글자가 사라진다(실측: 창 360px에서 이름이 최대 37px, 320px에서 50px 잘렸다). 그래서 좁아지면
-// 비율만 조각 안에 적고 이름은 범례로 내린다. 글자가 들어갈 수 없는 얇은 조각은 비운다 — 그 조각의
-// 이름과 값은 범례와 툴팁에 그대로 있다.
+// 바깥에 둘 자리가 없을 때의 라벨. 원 밖에 이름을 적으면 SVG 경계에 그대로 잘린다 — 창을 좁히면 소리
+// 없이 글자가 사라진다(실측: 창 360px에서 이름이 최대 37px, 320px에서 50px 잘렸다). 그래서 자리가
+// 없으면 비율만 조각 안에 적고 이름은 범례로 내린다. 글자가 들어갈 수 없는 얇은 조각은 비운다 — 그
+// 조각의 이름과 값은 범례와 툴팁에 그대로 있다.
 const insideLabel = ({ cx, cy, midAngle, outerRadius, percent, index }) => {
   if (percent < 0.06) return null;
   const rad = (-midAngle * Math.PI) / 180; // Recharts의 각도는 도(°)이고 화면 y는 아래로 자란다
   const r = outerRadius * 0.62;
   return (
     <text x={cx + r * Math.cos(rad)} y={cy + r * Math.sin(rad)} textAnchor="middle"
-          dominantBaseline="central" fontSize={11} fontWeight="600" fill={inkOn(color(index))}>
+          dominantBaseline="central" fontSize={LABEL_FONT_PX} fontWeight="600" fill={inkOn(color(index))}>
       {`${(percent * 100).toFixed(0)}%`}
     </text>
   );
 };
 
-// 상자가 좁은가. 라벨을 밖에 두려면 원 좌우로 이름이 들어갈 자리가 있어야 하는데, 그 여백은
-// 상자 폭에서만 나온다(높이는 260px로 고정이다). 380px 아래에서 잘리기 시작한다 — 실측값이다.
-// 재는 자리는 figure 하나다(아래 Chart). 그리는 쪽마다 따로 재면 같은 폭을 여러 번 재게 되고,
-// 그 값이 필요한 곳도 한 군데씩 늘어난다 — 지금 쓰는 것은 원그래프뿐이다.
-function useNarrow(limit = 380) {
+// 글자의 폭을 재는 함수를 만든다. SVG의 글자와 같은 글꼴로 canvas에 재면 실제로 그려지는 폭과 같다
+// (같은 글꼴 엔진이다). 글꼴은 그림이 들어갈 요소에서 읽는다 — 라벨은 글꼴을 따로 정하지 않고 문서의
+// 것을 물려받는다(index.html body). canvas가 글꼴 줄을 받아 주지 않으면(이름을 못 읽는 오래된 환경)
+// 기본 글꼴(10px sans-serif)로 재어 실제보다 좁게 나오고, 그러면 자리가 있다고 믿고 밖에 두어 잘린다 —
+// 그때는 글자 수로 어림한다: 한글·한자는 한 글자가 글자 크기만큼, 나머지는 그 6할.
+const CJK_CHAR = /[ᄀ-ᇿ　-鿿가-힯]/;
+function textMeasurer(el) {
+  const ctx = typeof document !== 'undefined' && document.createElement('canvas').getContext?.('2d');
+  if (ctx) {
+    ctx.font = `${LABEL_FONT_PX}px ${getComputedStyle(el).fontFamily}`;
+    if (ctx.font.startsWith(`${LABEL_FONT_PX}px`)) return t => ctx.measureText(t).width;
+  }
+  return t => [...t].reduce((w, c) => w + (CJK_CHAR.test(c) ? 1 : 0.6) * LABEL_FONT_PX, 0);
+}
+
+// 바깥 라벨(이름과 비율)을 둘 자리가 있는가. 상자 폭 하나로 가르던 때에는(380px 아래에서만 안으로)
+// 데스크톱 폭에서도 스무 자 이름이 양끝에서 잘렸다(실측: 폭 574px 상자에서 왼쪽 24px·오른쪽 3px) —
+// 라벨은 조회 결과의 셀 값이라 폭이 아니라 '이 글자들이 이 자리에 들어가는가'로 정해야 한다. 판정은
+// chart.js pieLabelsOverflow(순수 함수라 회귀 테스트가 붙는다)가 하고, 여기서는 글자의 폭을 재고
+// 상자 폭이 바뀔 때마다 다시 묻는다. 글자의 폭은 조각이 바뀔 때만 잰다.
+// 재는 자리는 원그래프뿐이다 — 막대·선·산점도는 이 값을 읽지 않으므로 관찰자도 달지 않는다.
+function useLabelsFit(data, total) {
   const ref = useRef(null);
-  const [narrow, setNarrow] = useState(false);
+  const [inside, setInside] = useState(false);
+  const labels = useMemo(
+    () => data.map(d => labelTextOf(d.name, total > 0 ? d.value / total : 0)), [data, total]);
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const mark = () => setNarrow(el.clientWidth > 0 && el.clientWidth < limit);
+    const measure = textMeasurer(el);
+    const widths = labels.map(measure);
+    const values = data.map(d => d.value);
+    const mark = () => setInside(pieLabelsOverflow({
+      width: el.clientWidth, height: HEIGHT, margin: PIE_MARGIN, radiusRatio: PIE_RADIUS, values, widths,
+    }));
     mark();
     if (typeof ResizeObserver === 'undefined') return;
     const ro = new ResizeObserver(mark);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [limit]);
-  return [ref, narrow];
+  }, [labels, data]);
+  return [ref, inside];
 }
 
 function PieView({ spec }) {
   // 조각 고르기(큰 것 남기고 나머지는 '기타')는 chart.js pieSlices — 표 순서와 무관하게 값으로 고른다.
-  // 행이 바뀔 때만 고른다: 폭이 380px을 넘나들 때마다(useNarrow) 다시 렌더되는데, 그때마다 100행을
+  // 행이 바뀔 때만 고른다: 폭이 바뀔 때마다(useLabelsFit) 다시 렌더되는데, 그때마다 100행을
   // 다시 훑고 정렬할 이유가 없다.
   const data = useMemo(() => pieSlices(spec.rows), [spec.rows]);
   const total = data.reduce((a, d) => a + d.value, 0);
   const pct = v => (total > 0 ? `${((v / total) * 100).toFixed(1)}%` : '');
-  // 폭을 재는 것은 원그래프뿐이다 — 여기서 재면 그 뜻이 쓰이는 자리에 머문다(막대·선·산점도는
-  // 이 값을 읽지 않으므로 관찰자도 달지 않는다).
-  const [boxRef, narrow] = useNarrow();
+  const [boxRef, inside] = useLabelsFit(data, total);
   return (
     <div ref={boxRef}>
     <ResponsiveContainer width="100%" height={HEIGHT}>
-      <PieChart margin={{ top: 4, right: 4, bottom: 4, left: 4 }}>
-        <Pie data={data} dataKey="value" nameKey="name" outerRadius={narrow ? '62%' : '72%'} isAnimationActive={false}
-             label={narrow ? insideLabel : sliceLabel} labelLine={narrow ? false : { stroke: '#9ca3af' }}>
+      <PieChart margin={{ top: PIE_MARGIN, right: PIE_MARGIN, bottom: PIE_MARGIN, left: PIE_MARGIN }}>
+        <Pie data={data} dataKey="value" nameKey="name" outerRadius={`${(inside ? PIE_RADIUS_INSIDE : PIE_RADIUS) * 100}%`}
+             isAnimationActive={false}
+             label={inside ? insideLabel : sliceLabel} labelLine={inside ? false : { stroke: '#9ca3af' }}>
           {data.map((d, i) => <Cell key={i} fill={color(i)} />)}
         </Pie>
         {/* 이름은 조각(범주)의 것이다 — 시리즈 이름은 제목이 이미 말하고, 툴팁이 답해야 할 것은 '어느 조각인가'다.
@@ -204,14 +237,14 @@ function PieView({ spec }) {
         <Tooltip contentStyle={tooltipStyle} formatter={(v, name, item) => [`${fmtNum(v)} (${pct(v)})`, item?.payload?.full ?? name]} />
       </PieChart>
     </ResponsiveContainer>
-    {/* 이름이 조각 밖으로 나가지 못하는 폭에서만 범례를 단다 — 넓은 화면에서는 라벨이 이미 이름을 말한다.
+    {/* 이름을 조각 곁에 둘 자리가 없을 때만 범례를 단다 — 자리가 있으면 라벨이 이미 이름을 말한다.
         recharts의 <Legend>가 아니라 평범한 목록인 이유: 그 범례는 260px 상자 '안'에 들어가 그래프 몫의
         높이를 가져간다. 이름이 길고 조각이 많으면(최대 12개 × 30자) 좁은 폭에서 열 줄 넘게 감겨 남는
         높이가 0 아래로 내려가고, 그러면 원의 중심과 반지름이 엉뚱한 값이 되어 그래프가 상자 밖으로
         밀려 잘린다. 밖에 두면 그냥 아래로 자란다 — 잘리는 것도, 그래프를 먹는 것도 없다.
         이름은 잘리지 않은 것(full)으로 적는다 — 축 눈금과 달리 이 목록은 아래로 감기므로 줄일 이유가
         없고, 이름이 잘려 사라지는 것을 막으려 단 범례가 다시 잘린 이름을 보여줄 수는 없다. */}
-    {narrow && (
+    {inside && (
       <ul className="chart-legend">
         {data.map((d, i) => (
           <li key={i}><i style={{ background: color(i) }} />{clip(String(d.full ?? d.name), MAX_LEGEND_LEN)}</li>

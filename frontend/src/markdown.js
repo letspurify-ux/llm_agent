@@ -91,3 +91,37 @@ export function linkTarget(href) {
   const url = cleanUrl(href);
   return { url, attrs: 걷어낸것의_속성(url) };
 }
+
+// 흐름도 원문에 그림 노드(`A@{ img: "주소" }`)가 있는가. mermaid는 이 노드의 크기를 재려고 그리는 도중에
+// 그 주소를 new Image()로 불러온다 — 사용자가 누르기도 전에, 그리고 그림이 화면에 서기도 전에 요청이
+// 나간다(실측: 같은 출처 요청 1건이 먼저 나가고, 다른 출처는 CSP에 막힌 뒤에야 멈춘다). 설정으로 끄는
+// 길이 없으므로 그리기 전에 원문에서 알아보고 그리지 않는다(Mermaid.jsx) — 원문 코드가 남는다. 이 화면이
+// 답변의 그림을 링크로만 남기는 것(App.jsx AltImage)과 같은 규칙이다. 판정은 mermaid의 노드 속성 문법
+// (`@{ … }` 안의 `img:` 키)을 본다 — 줄을 넘어 적어도, 다른 속성 뒤에 와도, 키를 따옴표로 감싸도(YAML이
+// 허용한다 — `"img":`) 걸린다. 닫는 `}`를 찾아 그 안만 보지 않는다: 속성값의 따옴표 안에 `}`가 있으면
+// (`label: "a } b", img: …`) 그 앞에서 멈춰 뒤의 img를 놓친다(실측: 그 둘로 요청이 나갔다). 그래서 `@{`
+// 뒤에 오는 것은 어디까지든 본다. 라벨의 글자에 같은 모양이 있으면 그리지 않는 쪽으로 틀리는데, 그
+// 손해는 흐름도 하나가 코드로 남는 것뿐이다.
+export const mermaidLoadsImage = text => /@\s*\{[\s\S]*?["']?\bimg\b["']?\s*:/i.test(String(text ?? ''));
+
+// 흐름도 원문의 설정 자리(지시문 `%%{…}%%`, 머리말 `---…---`)가 바깥을 부르는 CSS(url(…)·@import)를 담고
+// 있는가. mermaid는 그 자리의 글자(themeCSS·fontFamily·fontSize·themeVariables)를 그대로 <style>에 넣고,
+// 그리는 도중에 그 SVG를 문서에 넣어 크기를 잰다 — 그 순간 `background: url(주소)`가 요청이 된다(실측:
+// 같은 출처 요청이 나갔고 다른 출처는 CSP가 막았다. 그린 뒤 <style>에서 걷어내 보았으나 요청은 이미
+// 나간 뒤였다). 그래서 위 그림 노드와 같이 그리기 전에 알아보고 그리지 않는다(Mermaid.jsx). 라벨의
+// 글자는 보지 않는다 — 라벨은 CSS가 아니다. 색·테마를 바꾸는 지시문은 그대로 그려진다.
+export const mermaidFetchesViaStyle = text => {
+  const s = String(text ?? '');
+  const config = [...s.matchAll(/%%\{[\s\S]*?\}%%/g)].map(m => m[0]).join('\n')
+    + '\n' + (/^\s*---\r?\n([\s\S]*?)\r?\n---/.exec(s)?.[1] ?? '');
+  return /url\s*\(|@import\b/i.test(config);
+};
+
+// react-markdown을 거치지 않은 링크(흐름도의 `click` 링크 — mermaid가 SVG 안에 <a>로 만든다). 위
+// linkTarget은 href가 이미 기본 규칙(defaultUrlTransform)을 지난 것으로 알고 받으므로, 그 규칙을
+// 여기서 먼저 건다 — 같은 화면의 링크가 온 길에 따라 다른 주소를 허용하면 안 된다.
+// 앞뒤 공백은 기본 규칙보다 먼저 걷어낸다 — markdown의 링크는 파서가 걷어낸 주소를 기본 규칙에 넘기는데,
+// 여기서는 그 단계가 없어 ' https://…'가 방식 없는 주소로 읽혀 통째로 버려진다.
+export function rawLinkTarget(href) {
+  return linkTarget(defaultUrlTransform(cleanUrl(href)));
+}

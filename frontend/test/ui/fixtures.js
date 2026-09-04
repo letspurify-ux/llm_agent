@@ -29,6 +29,15 @@ export const ANCHOR_URL = '#status-now';
 export const ANCHOR_TEXT = '앵커 링크';
 export const ANCHOR_IMG_TEXT = '앵커 그림';
 
+// 원그래프 라벨의 자리를 재는 답변 둘의 이름. 긴 이름(축 눈금 상한 30자 안쪽의 스무 자 남짓)은
+// 데스크톱 폭에서도 조각 곁에 들어가지 못해 범례로 내려가야 하고, 짧은 이름은 지금까지처럼 곁에
+// 남아야 한다 — 한쪽만 재면 '늘 범례로 내린다'도 통과한다(Chart.jsx useLabelsFit).
+export const PIE_LONG_NAMES = ['서울 리전 웹서버 그룹 프라이머리 노드 알파', '부산 리전 배치 처리 노드 세컨더리 베타',
+  '대전 데이터센터 백업 스토리지 감마 델타', '인천 캐시 클러스터 엡실론'];
+export const PIE_SHORT_NAMES = ['서울', '부산', '대전', '인천'];
+const pieOf = names => ['```chart', 'type: pie', 'title: 노드별 처리 건수', '| 노드 | 건수 |', '| --- | --- |',
+  ...names.map((n, i) => `| ${n} | ${40 - i * 5} |`), '```'].join('\n');
+
 // 원그래프가 될 차트 블록의 원문(펜스 안쪽 — App.jsx가 ```chart 블록에서 꺼내 주는 그 글자).
 // 따로 내주는 이유: 조각이 몇이어야 하는지를 재는 쪽이 '이름 수와 상한'으로 다시 셈하면 그것은 앱의
 // 규칙을 검사가 한 벌 더 구현한 것이다. 이 원문을 진짜 파서에 그대로 넣어 물어보게 한다(ui.test.mjs).
@@ -70,6 +79,27 @@ export const CASES = {
   // 흐름도 라벨에 HTML을 넣은 답변
   mermaidhtml: ['```mermaid', 'flowchart LR',
     '  A["<img src=/__probe-pixel.png?d=4>"] --> B["<b>굵게</b>"]', '```'].join('\n'),
+  // 같은 라벨을, 설정을 덮어쓰는 문 둘(머리말의 config·`%%{init}%%` 지시문)로 HTML 라벨을 되살려 놓고
+  // 넣은 답변. 머리말은 맨 앞이어야 하고 지시문은 그 뒤에 온다. 지키지 않으면 <img>가 서서 주소가
+  // 불려 나가고, <a>는 같은 탭에서 열리는 링크가 된다(Mermaid.jsx secure).
+  mermaiddirective: ['```mermaid', '---', 'config:', '  htmlLabels: true', '---',
+    '%%{init: {"htmlLabels": true, "flowchart": {"htmlLabels": true}}}%%', 'flowchart LR',
+    '  A["<img src=/__probe-pixel.png?f=6>"] --> B["<a href=/__probe-link>링크</a>"]', '```'].join('\n'),
+  // 흐름도 안의 링크(`click`). mermaid는 strict에서도 링크를 남기되 target은 주지 않고 `_self`는 두어
+  // 같은 탭에서 열린다 — 답변의 링크와 같은 규칙(새 탭, 앵커만 제자리)이어야 한다(Mermaid.jsx).
+  mermaidclick: ['```mermaid', 'flowchart LR', '  A[하나] --> B[둘] --> C[셋]',
+    `  click A "${NESTED_LINK}" _self`, `  click B "${ANCHOR_URL}"`, '  click C "javascript:alert(1)"', '```'].join('\n'),
+  // 흐름도의 그림 노드. mermaid는 이 노드의 크기를 재려고 그리는 도중에 주소를 불러온다 — 그림이 서기도
+  // 전에 요청이 나간다(실측). 그리지 않고 원문 코드가 남아야 한다(markdown.js mermaidLoadsImage).
+  mermaidimg: ['```mermaid', 'flowchart LR', '  A@{ img: "/__probe-pixel.png?i=7", label: "그림", pos: "b", w: 60, h: 60 } --> B[둘]', '```'].join('\n'),
+  // 지시문의 themeCSS·fontFamily는 그 글자가 <style>에 그대로 들어가는 자리다 — 그 안의 url(…)은 mermaid가
+  // 크기를 재려고 SVG를 문서에 넣는 순간 요청이 된다(실측). 그리지 않고 원문 코드가 남아야 한다
+  // (markdown.js mermaidFetchesViaStyle).
+  mermaidstyle: ['```mermaid',
+    '%%{init: {"themeCSS": ".node rect { background: url(/__probe-pixel.png?t=8) }", "fontFamily": "x; background-image: url(/__probe-pixel.png?g=9)"}}%%',
+    'flowchart LR', '  A[하나] --> B[둘]', '```'].join('\n'),
+  pielong: pieOf(PIE_LONG_NAMES),
+  pieshort: pieOf(PIE_SHORT_NAMES),
 };
 
 // 서버가 줄 수 없어야 하지만 줄 수는 있는 응답들 — 배포가 어긋난 서버, 중간에 낀 프록시의 응답.
@@ -127,7 +157,14 @@ export const READY = {
          && document.querySelector('.mermaid svg')`,
   images: `document.querySelector(${주소를_가리키는_링크(NESTED_LINK)})`,
   mermaidhtml: `document.querySelector('.mermaid svg')`,
+  mermaiddirective: `document.querySelector('.mermaid svg')`,
+  mermaidclick: `document.querySelector('.mermaid svg')`,
+  // 그리지 않는 것이 맞는 답이다 — 원문 코드가 선 것으로 '다 그려졌다'를 안다
+  mermaidimg: `document.querySelector('.bubble.assistant pre code')`,
+  mermaidstyle: `document.querySelector('.bubble.assistant pre code')`,
   wideprint: `document.querySelector('.md table')`,
+  pielong: `document.querySelector('figure.chart .recharts-pie-sector')`,
+  pieshort: `document.querySelector('figure.chart .recharts-pie-sector')`,
   // 차트가 서고 '표로 보기'의 표까지 붙은 뒤라야 셀 안의 그림을 볼 수 있다(접혀 있어도 DOM에는
   // 있고, 브라우저는 접힌 <details> 안의 <img>도 불러온다).
   tableimg: `document.querySelector('figure.chart .recharts-surface') && document.querySelector('.md .chart-table table')`,

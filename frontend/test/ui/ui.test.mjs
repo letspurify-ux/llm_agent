@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { findChrome, launchChrome, chromePort, stopProcess, killOnExit, freePort, oneTab, Page, sleep, STATE,
   alive, aliveGroup } from './driver.mjs';
 import { pieSlices, parseChartBlock } from '../../src/chart.js';
-import { TRACE, READY, PIE_BLOCK, LONG_URL, DATA_URL, MAIL_URL, CAPPED_LABEL, ERROR_LABEL,
+import { TRACE, READY, PIE_BLOCK, PIE_LONG_NAMES, PIE_SHORT_NAMES, LONG_URL, DATA_URL, MAIL_URL, CAPPED_LABEL, ERROR_LABEL,
   ANCHOR_URL, ANCHOR_TEXT, ANCHOR_IMG_TEXT, NESTED_LINK, BROKEN_RESPONSES, 주소를_가리키는_링크 } from './fixtures.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -412,6 +412,30 @@ it('좁은 화면: 원그래프 조각이 잘리지 않고 이름은 그래프 �
   assert.strictEqual(await page.eval(`document.documentElement.scrollWidth - document.documentElement.clientWidth`), 0);
 });
 
+it('원그래프: 이름이 길면 넓은 화면에서도 범례로 내리고, 짧으면 조각 곁에 둔다 — 어느 쪽도 잘리지 않는다', async () => {
+  // 상자 폭 하나로 가르던 때에는(380px 아래에서만 안으로) 데스크톱 폭에서도 스무 자 이름이 양끝에서
+  // 잘렸다(실측: 폭 574px 상자에서 왼쪽 24px·오른쪽 3px) — 잘린 글자는 아무 표시 없이 사라진다. 이름은
+  // 조회 결과의 셀 값이라 폭이 아니라 '이 글자들이 이 자리에 들어가는가'로 정해야 한다(Chart.jsx useLabelsFit).
+  // 반대쪽도 함께 못 박는다: 짧은 이름은 지금까지처럼 곁에 남아야 한다 — 늘 범례로 내려도 앞쪽만 재는
+  // 검사는 통과하고, 넓은 화면의 라벨은 이름을 잃는다.
+  const 재기 = `(() => { const fig = document.querySelector('figure.chart');
+    const svg = fig.querySelector('.recharts-surface').getBoundingClientRect();
+    const 글자 = [...fig.querySelectorAll('.recharts-surface text')].map(t => ({ 글: t.textContent, r: t.getBoundingClientRect() }));
+    const legend = fig.querySelector('.chart-legend');
+    return { 잘린것: 글자.filter(({ r }) => r.left < svg.left - 1 || r.right > svg.right + 1).map(x => x.글),
+      곁의글자: 글자.map(x => x.글),
+      범례: legend ? [...legend.querySelectorAll('li')].map(li => li.textContent) : null }; })()`;
+  await answered(1000, 760, { c: 'pielong' });
+  const 긴것 = await page.eval(재기);
+  assert.deepStrictEqual(긴것.잘린것, [], '긴 이름이 그림 상자 밖으로 나가 잘렸다');
+  assert.deepStrictEqual(긴것.범례, PIE_LONG_NAMES, '긴 이름을 말할 범례가 없거나 이름이 다르다');
+  await answered(1000, 760, { c: 'pieshort' });
+  const 짧은것 = await page.eval(재기);
+  assert.deepStrictEqual(짧은것.잘린것, []);
+  assert.strictEqual(짧은것.범례, null, '짧은 이름인데도 범례로 내렸다 — 넓은 화면의 라벨이 이름을 잃는다');
+  for (const n of PIE_SHORT_NAMES) assert.ok(짧은것.곁의글자.some(t => t.startsWith(n)), `조각 곁에 '${n}'이 없다: ${JSON.stringify(짧은것.곁의글자)}`);
+});
+
 it('좁은 화면: 흐름도 글자가 읽히는 크기로 남고, 인쇄에서는 그 최소 폭이 풀린다', async () => {
   await answered(360, 800, { mobile: true });
   const screen = await page.eval(`(() => { const svg = document.querySelector('.mermaid svg');
@@ -503,16 +527,27 @@ it('낮은 화면에서 긴 초안이 대화를 잡아먹지 않는다', async (
 it('모델이 쓴 주소는 저절로 불려 나가지 않는다 (그림·흐름도 라벨·차트 표의 셀)', async () => {
   // tableimg는 차트 블록의 표다. 그쪽 파이프라인은 그림 주소를 원문 그대로 넘기므로(App.jsx
   // mdProps의 urlTransform) TABLE_MD의 img 하나가 유일한 관문이다 — 본문과 따로 확인해야 한다.
-  for (const c of ['images', 'mermaidhtml', 'tableimg']) {
+  // mermaiddirective는 흐름도의 설정을 본문에서 덮어써(머리말 config·%%{init}%%) HTML 라벨을 되살리려는
+  // 답변이다 — 그 문이 열려 있으면 라벨의 <img>가 주소를 부르고 <a>는 같은 탭에서 열리는 링크가 된다
+  // (실측: 지시문 한 줄로 둘 다 그렇게 됐다. Mermaid.jsx secure).
+  // mermaidimg는 흐름도의 그림 노드(`A@{ img: "주소" }`), mermaidstyle은 지시문의 themeCSS·fontFamily에 든
+  // url(…)이다 — 둘 다 mermaid가 그리는 도중에 그 주소를 불러오므로 그리기 전에 알아보고 그리지 않아야
+  // 한다(markdown.js mermaidLoadsImage·mermaidFetchesViaStyle). 원문 코드가 남는다.
+  for (const c of ['images', 'mermaidhtml', 'mermaiddirective', 'mermaidimg', 'mermaidstyle', 'tableimg']) {
     await answered(900, 760, { c });
     const got = await page.eval(`(() => ({
       요청: performance.getEntriesByType('resource').map(e => e.name).filter(n => /__probe-pixel/.test(n)).length,
-      img: document.querySelectorAll('.md img, .mermaid img').length,
+      img: document.querySelectorAll('.md img, .mermaid img, .mermaid image').length,
+      흐름도링크: document.querySelectorAll('.mermaid a').length,
       중첩앵커: !!document.querySelector('.md a a'),
     }))()`);
     assert.strictEqual(got.요청, 0, `${c}: 주소가 저절로 불려 나갔다`);
     assert.strictEqual(got.img, 0, `${c}: <img>가 만들어졌다`);
+    assert.strictEqual(got.흐름도링크, 0, `${c}: 흐름도 안에 링크가 생겼다 — 같은 탭에서 열려 대화가 사라진다`);
     assert.ok(!got.중첩앵커, `${c}: 링크 안에 링크가 생겼다`);
+    // 그림 노드는 그리지 않은 것이지 앱이 죽거나 빈칸이 된 것이 아니다 — 원문이 코드로 남는다(READY가
+    // 그것을 기다린다). 그림이 서지 않았다는 것까지 못 박는다: 서면 그 주소는 이미 불려 나간 뒤다.
+    if (c === 'mermaidimg' || c === 'mermaidstyle') assert.strictEqual(await page.eval(`!document.querySelector('.mermaid svg')`), true, `${c}: 그리는 도중에 주소를 부르는 흐름도를 그렸다`);
   }
   // 열어 주지 않았을 뿐, 셀이 무엇을 가리키는지는 남아야 한다 (표에서도 본문과 같은 모양이다)
   const 셀 = await page.eval(`(() => { const a = [...document.querySelectorAll('.md table a')]
@@ -539,6 +574,23 @@ it('페이지 안 앵커는 그림이든 링크든 제자리에서 연다', asyn
   assert.ok(got.글자.includes(ANCHOR_TEXT) && got.글자.includes(ANCHOR_IMG_TEXT), `앵커의 글자가 사라졌다: ${got.글자}`);
   // 반대쪽도 함께 못 박는다 — 바깥 주소까지 제자리에서 열면 대화가 통째로 사라진다
   assert.strictEqual(got.바깥, '_blank', '바깥 주소가 같은 탭에서 열린다');
+});
+
+it('흐름도 안의 링크도 답변의 링크와 같은 규칙이다 — 새 탭, 페이지 안 앵커만 제자리, 위험한 주소는 링크가 아니다', async () => {
+  // mermaid는 strict에서도 `click A "주소"`를 <a>로 남기되 target은 주지 않고(`_blank`라 적어도 버린다)
+  // `_self`는 그대로 두어, 누르면 같은 탭에서 열려 대화가 통째로 사라진다(실측). 이 화면의 링크는 어느
+  // 길로 왔든 같은 규칙이어야 한다(markdown.js rawLinkTarget, Mermaid.jsx).
+  await answered(900, 760, { c: 'mermaidclick' });
+  const got = await page.eval(`(() => [...document.querySelectorAll('.mermaid a')]
+    .map(a => ({ href: a.getAttribute('href') ?? a.getAttribute('xlink:href'), target: a.getAttribute('target'), rel: a.getAttribute('rel') })))()`);
+  const 바깥 = got.find(a => a.href === NESTED_LINK);
+  assert.ok(바깥, `바깥 주소의 링크가 없다: ${JSON.stringify(got)}`);
+  assert.strictEqual(바깥.target, '_blank', '흐름도의 바깥 링크가 같은 탭에서 열린다 — 대화가 통째로 사라진다');
+  assert.strictEqual(바깥.rel, 'noopener noreferrer');
+  const 앵커 = got.find(a => a.href === ANCHOR_URL);
+  assert.ok(앵커, `앵커 링크가 없다: ${JSON.stringify(got)}`);
+  assert.strictEqual(앵커.target, null, '페이지 안 앵커를 새 탭에서 연다');
+  assert.ok(!got.some(a => /javascript:/i.test(a.href ?? '')), `위험한 주소가 링크로 남았다: ${JSON.stringify(got)}`);
 });
 
 it('열어 주지 않는 주소도 무엇인지 밝히고, 긴 주소가 답변을 덮지 않는다', async () => {
@@ -673,7 +725,7 @@ it('기다림은 오타를 곧바로 알리고, 지나가는 오류는 그 글�
 
 it('렌더링 중 콘솔에 예외도 오류도 오르지 않는다', async () => {
   // 로그는 시험마다 afterEach가 확인하고 비운다 — 이 시험이 보는 것은 아래 네 화면이 낸 것뿐이다.
-  for (const c of ['rich', 'images', 'mermaidhtml', 'tableimg']) await answered(1000, 760, { c });
+  for (const c of ['rich', 'images', 'mermaidhtml', 'mermaiddirective', 'mermaidclick', 'mermaidimg', 'mermaidstyle', 'tableimg', 'pielong']) await answered(1000, 760, { c });
   assert.deepStrictEqual(page.logs, []);
   // 듣고 있다는 것까지 확인한다 — 귀를 닫은 검사는 무엇이 나가도 늘 통과한다(React는 렌더의
   // 문제를 예외가 아니라 console.error로 말하므로, 그 귀가 이 검사의 전부다).

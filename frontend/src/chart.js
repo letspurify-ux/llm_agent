@@ -325,6 +325,38 @@ export function pieSlices(rows, max = MAX_PIE_SLICES) {
   return [...data.filter((_, i) => keep.has(i)), { name: other, full: other, value: rest.reduce((a, d) => a + d.value, 0) }];
 }
 
+// 원그래프의 바깥 라벨(이름과 비율을 조각 곁에 적는 것)이 그림 상자를 넘는가. 넘으면 그리는 쪽(Chart.jsx
+// PieView)은 비율만 조각 안에 적고 이름은 상자 아래 범례로 내린다 — SVG 밖으로 나간 글자는 소리 없이
+// 잘리기 때문이다. 상자 폭 하나로 가르던 때에는(380px 아래에서만 안으로) 데스크톱 폭에서도 스무 자
+// 이름이 양끝에서 잘렸다(실측: 폭 574px 상자에서 왼쪽 24px·오른쪽 3px). 라벨의 길이는 조회 결과의 셀
+// 값이라(30자까지, MAX_LABEL_LEN) 폭이 아니라 '이 글자들이 이 자리에 들어가는가'로 정해야 한다.
+// 자리는 Recharts가 정하는 그대로 따라 센다(recharts polar/Pie): 조각의 가운데 각도에서 반지름에
+// 20px(offsetRadius)을 더한 점에 글자가 서고, 그 점이 중심의 오른쪽이면 오른쪽으로, 왼쪽이면 왼쪽으로
+// 뻗는다(textAnchor). 각도는 0°가 3시 방향이고 반시계로 돈다. 조각은 값의 비율만큼이고 사이 틈은 없다.
+// 반지름은 여백을 뺀 상자의 짧은 변의 절반에 비율(radiusRatio, Recharts의 outerRadius '72%')을 곱한 것.
+// 글자의 폭(widths)은 부르는 쪽이 재어 준다 — 순수 함수로 두어 회귀 테스트가 붙게 하려는 것이고,
+// 실제 폭은 폰트에 달려 있어 여기서 알 수 없다.
+export function pieLabelsOverflow({ width, height, margin, radiusRatio, values, widths, offsetRadius = 20 }) {
+  if (!(width > 0) || !(height > 0)) return false;
+  const inner = Math.min(width - 2 * margin, height - 2 * margin);
+  const reach = radiusRatio * (inner / 2) + offsetRadius;
+  const cx = width / 2;
+  const total = values.reduce((a, v) => a + (v > 0 ? v : 0), 0);
+  let angle = 0;
+  return values.some((v, i) => {
+    const delta = total > 0 && v > 0 ? (v / total) * 360 : 0;
+    const mid = angle + delta / 2;
+    angle += delta;
+    const x = cx + Math.cos((-mid * Math.PI) / 180) * reach;
+    // 오른쪽으로 뻗으면 상자의 오른쪽 끝까지, 왼쪽이면 왼쪽 끝까지가 자리다. 정확히 중심(12시·6시)이면
+    // Recharts는 가운데 정렬로 그리는데, 그 판정은 부동소수점의 마지막 자리에 달려 있어 여기서 같은 답을
+    // 낸다고 장담할 수 없다 — 그래서 중심에서는 양쪽 중 좁은 쪽을 자리로 친다(어느 쪽으로 그려지든
+    // 들어간다). 그만큼은 넉넉히 보는 셈이고, 그 손해는 상자의 반보다 넓은 라벨 하나가 안으로 가는 것뿐이다.
+    const room = x > cx ? width - x : x < cx ? x : Math.min(x, width - x);
+    return widths[i] > room;
+  });
+}
+
 // 차트에 적는 숫자(축 눈금·툴팁). 값이 없는 칸(null)은 빈 글자다 — 그리는 쪽은 결측을 0으로 그리지 않는다.
 // 소수 두 자리로 자르면 0.0012 같은 값이 '0'으로 나온다. 축 눈금이 모두 '0'이 되고, 막대에 손을 얹은
 // 사람은 값이 0이라는 답을 듣는다 — 값이 있는데 없다고 말하는 셈이라, 이 파일이 처음부터 막으려던
@@ -394,27 +426,32 @@ export const chartTableMarkdown = text => chartTableMarkdownFrom(splitBlock(text
 // 3개 넘는 백틱으로 닫는 펜스, CRLF도 받는다. 닫는 펜스가 없는 블록(토큰 한도로 잘린 응답)은 잡히지 않고 그대로 남는다.
 // 펜스 글자도 markdown이 받는 대로 — 백틱이든 물결(~~~chart)이든 셋 이상 몇 개든 받는다. 백틱 셋만 받던 때에는
 // ~~~chart·````chart 블록이 화면에서는 차트인데 이력에는 설정 줄째 그대로 실려 갔다(실측). 닫는 펜스는 markdown과
-// 같이 여는 펜스(\1)에 그 글자(\2)가 더 붙은 것까지다 — ````chart 안의 ``` 줄은 끝이 아니라 내용이고, ```~처럼
-// 글자가 섞인 줄도 끝이 아니다. 그룹 1이 펜스, 2가 펜스 글자, 본문은 그룹 3이다.
+// 같이 여는 펜스(\2)에 그 글자(\3)가 더 붙은 것까지다 — ````chart 안의 ``` 줄은 끝이 아니라 내용이고, ```~처럼
+// 글자가 섞인 줄도 끝이 아니다. 그룹 1이 여는 펜스의 들여쓰기, 2가 펜스, 3이 펜스 글자, 본문은 그룹 4다
+// (서버 backend chart.js FENCE_RE와 같은 그룹 배치다 — 들여쓰기는 아래 chartBlocksToTables가 쓴다).
 // 본문은 없을 수도 있다(```chart 바로 아래 ```) — 그것도 markdown에게는 닫힌 블록이다. 본문 한 줄을 요구하던
 // 때에는 빈 블록의 여는 펜스가 다음 차트 블록의 닫는 펜스와 짝이 되어 그 사이의 문장까지 한 블록으로 삼켰다
 // (실측: 빈 블록 뒤의 설명 문장이 이력에서 사라졌다). 빈 본문을 먼저 시도해야(??) 그 짝짓기가 생기지 않는다.
-export const CHART_FENCE_RE = /^[ \t]*((`|~)\2{2,})[ \t]*chart(?:[ \t]+[^\r\n]*)?\r?\n(?:([\s\S]*?)\r?\n)??[ \t]*\1\2*[ \t]*\r?$/gim;
+export const CHART_FENCE_RE = /^([ \t]*)((`|~)\3{2,})[ \t]*chart(?:[ \t]+[^\r\n]*)?\r?\n(?:([\s\S]*?)\r?\n)??[ \t]*\2\3*[ \t]*\r?$/gim;
 
 // 대화 이력으로 보낼 때 차트 블록을 평범한 표로 되돌린다. 모델의 다음 턴에 필요한 것은 '무슨 값을
 // 보여줬는가'이지 그것을 어떻게 그렸는가가 아니다 — 펜스와 설정 줄을 그대로 돌려보내면 이력
 // 상한(HISTORY_LEN)의 일부를 그 글자가 먹고, 모델은 그 모양을 답변마다 흉내 낸다.
 // 표는 20행까지만 남기고 나머지는 건수로 적는다.
+// 우리가 새로 적는 줄(제목·건수)은 여는 펜스의 들여쓰기를 따른다. 표 줄들은 원문의 들여쓰기를 그대로
+// 두는데(normalizeTable이 채우는 구분 줄도 머리글을 따른다) 이 줄들만 왼쪽 끝에 붙으면, 목록 안에 있던
+// 블록의 제목이 목록 밖의 문단이 되어 항목이 거기서 끊기고 뒤의 표는 목록에서 떨어져 나간다(실측:
+// `1. 항목` 아래 4칸 들여 쓴 블록의 이력이 `목록 안\n    | a | b |…`로 나가 목록이 끝났다).
 export function chartBlocksToTables(md) {
-  return String(md ?? '').replace(CHART_FENCE_RE, (_, _fence, _ch, body = '') => {
+  return String(md ?? '').replace(CHART_FENCE_RE, (_, indent, _fence, _ch, body = '') => {
     const { config, table } = splitBlock(body);
     const title = String(config.title ?? '').trim();
     const out = [];
-    if (title) out.push(title);
+    if (title) out.push(indent + title);
     const t = normalizeTable(table);
     if (t) {
       out.push(t.header, t.sep, ...t.rows.slice(0, HISTORY_TABLE_ROWS));
-      if (t.rows.length > HISTORY_TABLE_ROWS) out.push(`(외 ${t.rows.length - HISTORY_TABLE_ROWS}행)`);
+      if (t.rows.length > HISTORY_TABLE_ROWS) out.push(`${indent}(외 ${t.rows.length - HISTORY_TABLE_ROWS}행)`);
     }
     return out.join('\n');
   });

@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
-import { isInPage, linkAttrs, imageKind, mdUrlTransform, cleanUrl, imageTarget, linkTarget, mdProps } from '../src/markdown.js';
+import { isInPage, linkAttrs, imageKind, mdUrlTransform, cleanUrl, imageTarget, linkTarget, rawLinkTarget, mermaidLoadsImage, mermaidFetchesViaStyle, mdProps } from '../src/markdown.js';
 
 test('링크는 새 탭에서, 페이지 안 앵커만 제자리에서 연다', () => {
   // 같은 탭에서 열리면 대화가 사라진다. noreferrer까지 붙여 사내 주소가 referer로 새지 않게 한다.
@@ -140,4 +140,55 @@ test('화면의 모든 <ReactMarkdown>이 그 한 벌을 받는다 (App.jsx)', (
   // 풀어서 따로 넘기는 자리도 없어야 한다 — 그러면 짝을 맞추는 일이 다시 사람의 기억이 된다
   assert.ok(!/urlTransform=/.test(src), 'urlTransform을 따로 넘기는 자리가 있다 (mdProps로 묶어야 한다)');
   assert.ok(!/components=/.test(src), 'components를 따로 넘기는 자리가 있다 (mdProps로 묶어야 한다)');
+});
+
+test('react-markdown을 거치지 않은 링크(흐름도의 click)도 같은 규칙을 지난다', () => {
+  // mermaid가 SVG 안에 만드는 <a>는 react-markdown의 기본 규칙(위험한 방식은 빈 주소)을 지나지 않았다.
+  // 같은 화면의 링크가 온 길에 따라 다른 주소를 허용하면 안 되므로 그 규칙을 여기서 먼저 건다.
+  assert.deepStrictEqual(rawLinkTarget('https://ex.test/a'), { url: 'https://ex.test/a', attrs: { target: '_blank', rel: 'noopener noreferrer' } });
+  assert.deepStrictEqual(rawLinkTarget('#status-now'), { url: '#status-now', attrs: {} });
+  assert.strictEqual(rawLinkTarget('javascript:alert(1)').url, '');
+  assert.strictEqual(rawLinkTarget('\tjavascript:alert(1)').url, '');
+  assert.strictEqual(rawLinkTarget('data:text/html,x').url, '');
+  assert.strictEqual(rawLinkTarget(undefined).url, '');
+  // 기본 규칙이 허용하는 방식은 그대로 — mailto:도 답변의 링크와 같이 새 탭이다
+  assert.deepStrictEqual(rawLinkTarget('mailto:a@b.test').attrs, { target: '_blank', rel: 'noopener noreferrer' });
+});
+
+test('흐름도의 그림 노드(img:)는 원문에서 알아본다 — mermaid가 그리는 도중에 그 주소를 불러온다', () => {
+  // 같은 출처 요청이 그림이 서기도 전에 나갔다(화면 재현으로 확인). 노드 속성 문법 `@{ … img: … }`을 본다.
+  assert.ok(mermaidLoadsImage('flowchart LR\n  A@{ img: "/x.png", label: "그림" } --> B'));
+  assert.ok(mermaidLoadsImage('flowchart TD\n  A@{ shape: rect, label: "a",\n    img:"https://ex.test/x.png" }'));
+  assert.ok(mermaidLoadsImage('A@{ IMG : "x" }'));
+  // 그림이 아닌 노드 속성과 라벨 속의 img 글자는 걸리지 않는다
+  assert.ok(!mermaidLoadsImage('flowchart LR\n  A@{ icon: "logos:aws", form: "square" } --> B'));
+  assert.ok(!mermaidLoadsImage('flowchart LR\n  A[img: 없음] --> B["<img src=x>"]'));
+  assert.ok(!mermaidLoadsImage('A@{ shape: rect, label: "imgur" }'));
+  assert.ok(!mermaidLoadsImage(undefined));
+});
+
+test('흐름도 설정 자리의 CSS가 바깥을 부르면 원문에서 알아본다 — 지시문·머리말의 url(…)·@import', () => {
+  // mermaid는 지시문의 themeCSS·fontFamily 글자를 <style>에 그대로 넣고, 그리는 도중에 SVG를 문서에 넣어
+  // 크기를 잰다 — 그 순간 요청이 나간다(화면 재현으로 확인: 그린 뒤 <style>에서 걷어내도 늦었다).
+  assert.ok(mermaidFetchesViaStyle('%%{init: {"themeCSS": ".a{background:url(/p.png)}"}}%%\nflowchart LR\n A-->B'));
+  assert.ok(mermaidFetchesViaStyle('%%{init: {"fontFamily": "x; background-image: URL (/p.png)"}}%%\nflowchart LR\n A-->B'));
+  assert.ok(mermaidFetchesViaStyle('%%{init: {"themeCSS": "@import \'/c.css\';"}}%%\nflowchart LR\n A-->B'));
+  assert.ok(mermaidFetchesViaStyle('%%{init: {\n "themeVariables": {\n  "fontFamily": "x;background:url(/p.png)"\n }\n}}%%\nflowchart LR'));
+  assert.ok(mermaidFetchesViaStyle('---\nconfig:\n  themeCSS: ".a{background:url(/p.png)}"\n---\nflowchart LR\n A-->B'));
+  // 색·테마만 바꾸는 지시문과, 라벨 글자의 url(는 그리지 않을 이유가 아니다 — 라벨은 CSS가 아니다
+  assert.ok(!mermaidFetchesViaStyle('%%{init: {"theme": "dark", "themeVariables": {"primaryColor": "#f00"}}}%%\nflowchart LR\n A-->B'));
+  assert.ok(!mermaidFetchesViaStyle('flowchart LR\n  A[getUrl( )] --> B["@import 문"]'));
+  assert.ok(!mermaidFetchesViaStyle('---\ntitle: 제목\n---\nflowchart LR\n A[url(x)]'));
+  assert.ok(!mermaidFetchesViaStyle(undefined));
+});
+
+test('그림 노드 판정은 닫는 }까지만 보지 않고, 따옴표 친 키도 잡는다 — 둘 다 판정을 비켜 가 요청이 나갔다', () => {
+  // 화면 재현으로 확인: 속성값의 따옴표 안에 든 }와 YAML의 따옴표 친 키("img":)로 그 주소가 불려 나갔다.
+  assert.ok(mermaidLoadsImage('flowchart LR\n  A@{ "img": "/x.png", label: "그림" } --> B'));
+  assert.ok(mermaidLoadsImage("flowchart LR\n  A@{ 'img': '/x.png' } --> B"));
+  assert.ok(mermaidLoadsImage('flowchart LR\n  A@{ label: "a } b", img: "/x.png" } --> B'));
+  assert.ok(mermaidLoadsImage('A@ { img : "/x.png" }'));
+  // 흐름도 안의 링크 주소는 앞뒤 공백을 기본 규칙보다 먼저 걷어낸다 — 안 그러면 방식 없는 주소로 읽혀 통째로 버려진다
+  assert.strictEqual(rawLinkTarget('  https://ex.test/x  ').url, 'https://ex.test/x');
+  assert.strictEqual(rawLinkTarget(' \tjavascript:alert(1)').url, '');
 });
