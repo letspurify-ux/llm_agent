@@ -83,3 +83,19 @@ test('safe 표시가 없는 오류 원문은 화면으로 나가지 않는다', 
   assert.ok(!('hint' in ours), 'hint는 모델 전용 지침이라 화면에 나가면 안 된다');
   assert.equal(driver.rows, undefined, '오류 기록에 빈 배열을 주면 화면이 0건 조회 성공으로 읽는다');
 });
+
+test('검색 기록은 검색어·대상·적중 수로 패널에 나가고, 가드 note는 나가지 않는다', () => {
+  const out = clientTrace([
+    { search: '배치 재시작', targets: ['knowledge', 'query'], hits: { knowledge: 2, qaMethods: null, queries: 3 } },
+    { search: '배치 재시작', targets: ['knowledge'], note: '이미 같은 검색어' },
+    { search: 'x', targets: ['qa_method'], hits: { knowledge: null, qaMethods: null, queries: null }, failed: ['qa_method'] },
+    { query_name: 'q', params: {}, rows: [{ a: 1 }], totalRows: 1 },
+  ]);
+  assert.equal(out.length, 3);
+  assert.deepStrictEqual(out[0], { step: 1, search: '배치 재시작', targets: ['knowledge', 'query'], hits: { knowledge: 2, qaMethods: null, queries: 3 } });
+  assert.deepStrictEqual(out[1], { step: 3, search: 'x', targets: ['qa_method'], hits: { knowledge: null, qaMethods: null, queries: null }, failed: ['qa_method'] });
+  assert.equal(out[2].query_name, 'q');
+  // 번호는 이력의 절대 순번이다 — 제외된 note 항목(2번)만큼 건너뛴다. 모델이 보는 번호와 같아야 한다.
+  assert.equal(out[2].step, 4);
+  assert.ok(!('search' in out[2]) && !('query_name' in out[0]), '검색 항목과 쿼리 항목의 모양이 섞였다');
+});

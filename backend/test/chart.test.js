@@ -182,3 +182,90 @@ test('markdown 파서가 펜스로 읽는 변형을 다 받는다 — 언어 뒤
   // ```charts 는 차트 펜스가 아니다
   assert.strictEqual(resolveChartData('```charts\ndata: step 1\n```', [rows]), '```charts\ndata: step 1\n```');
 });
+
+// ===== ```table 블록 =====
+import { resolveTableData, MAX_TABLE_BLOCK_ROWS, DEFAULT_TABLE_ROWS, MAX_TABLE_COLS, MAX_TABLE_CELL_LEN, MAX_TABLE_INJECT_LEN } from '../src/chart.js';
+
+const tblock = (body, indent = '') => `${indent}\`\`\`table\n${body}\n${indent}\`\`\``;
+
+test('table 블록의 step: N 을 그 스텝의 행으로 만든 GFM 표로 바꾼다 — 펜스 없이', () => {
+  const out = resolveTableData(`앞\n\n${tblock('step: 1')}\n\n뒤`, [rows]);
+  assert.strictEqual(out, [
+    '앞', '',
+    '| MONTH | CNT | AMT | NOTE |', '| --- | --- | --- | --- |',
+    '| 2024-01 | 120 | 1000.5 | a\\|b |', '| 2024-02 |  | 2500 | x y |',
+    '', '뒤',
+  ].join('\n'));
+  // 차트 습관(data: step N)과 '실행 2' 표기도 받는다
+  assert.ok(resolveTableData(tblock('data: 실행 1'), [rows]).startsWith('| MONTH |'));
+});
+
+test('cols로 열을 고르고(대소문자 무시·없는 이름은 버림), limit으로 행 수를 정한다', () => {
+  const many = Array.from({ length: 50 }, (_, i) => ({ A: i, B: `b${i}`, C: 'c' }));
+  const out = resolveTableData(tblock('step: 1\ncols: b, A, nope\nlimit: 3'), [many]);
+  assert.strictEqual(out, ['| B | A |', '| --- | --- |', '| b0 | 0 |', '| b1 | 1 |', '| b2 | 2 |',
+    '_(50행 중 처음 3행만 실었습니다 — 전부는 아래 ⚡ 패널에 있습니다)_'].join('\n'));
+  // limit이 없으면 기본 행 수, 상한을 넘겨 적으면 상한까지
+  assert.equal((resolveTableData(tblock('step: 1'), [many]).match(/^\| \d+ \|/gm) || []).length, DEFAULT_TABLE_ROWS);
+  const big = Array.from({ length: MAX_TABLE_BLOCK_ROWS + 20 }, (_, i) => ({ A: i }));
+  assert.equal((resolveTableData(tblock('step: 1\nlimit: 999'), [big]).match(/^\| \d/gm) || []).length, MAX_TABLE_BLOCK_ROWS);
+  // cols가 전부 틀리면 앞 열들로 — 이름 하나 틀렸다고 표를 잃지 않는다
+  assert.ok(resolveTableData(tblock('step: 1\ncols: x, y'), [rows]).startsWith('| MONTH | CNT |'));
+});
+
+test('cols를 적지 않은 넓은 결과는 앞 열들만 싣고 그 사실을 밝힌다', () => {
+  const wide = [Object.fromEntries(Array.from({ length: MAX_TABLE_COLS + 5 }, (_, i) => [`C${i}`, i]))];
+  const out = resolveTableData(tblock('step: 1'), [wide]);
+  assert.equal((out.split('\n')[0].match(/\|/g) || []).length, MAX_TABLE_COLS + 1);
+  assert.match(out, new RegExp(`${MAX_TABLE_COLS + 5}열 중 앞 ${MAX_TABLE_COLS}열만 실었습니다`));
+});
+
+test('0건·없는 스텝·번호 없는 참조는 안내 문장으로, 참조 없는 table 펜스는 그대로 둔다', () => {
+  assert.strictEqual(resolveTableData(tblock('step: 1'), [[]]), '_실행 1의 조회 결과가 0건입니다_');
+  assert.strictEqual(resolveTableData(tblock('step: 3'), [rows]), '_표를 채우지 못했습니다: 실행 3의 결과가 없습니다_');
+  assert.strictEqual(resolveTableData(tblock('step: 1'), [null]), '_표를 채우지 못했습니다: 실행 1의 결과가 없습니다_');
+  assert.strictEqual(resolveTableData(tblock('step: 없음'), [rows]), '_표를 채우지 못했습니다: step 참조에 실행 번호가 없습니다_');
+  // 설정 줄도 참조도 없으면 모델이 펜스를 다른 용도로 쓴 것이다 — 펜스만 벗겨 본문이 그대로 렌더되게 한다.
+  // 코드블록으로 남기면 화면이 파이프 원문을 코드로 보여주고(프런트는 chart·mermaid 펜스만 따로 알아본다)
+  // 사용자는 그것이 무엇인지 모른다.
+  assert.strictEqual(resolveTableData(tblock('| a | b |\n| 1 | 2 |'), [rows]), '| a | b |\n| 1 | 2 |');
+  assert.strictEqual(resolveTableData(tblock('그냥 글', '  '), [rows]), '그냥 글');
+  // 이 블록을 쓰려다 step만 빠뜨린 경우는 다르다 — 본문을 그대로 내보내면 'cols: A' 같은 설정 줄이
+  // 답변 글자로 사용자에게 보인다.
+  assert.match(resolveTableData(tblock('cols: A\nlimit: 5'), [rows]), /^_표를 채우지 못했습니다: step 참조가 없습니다_$/);
+  assert.ok(!resolveTableData(tblock('cols: A\nlimit: 5'), [rows]).includes('cols:'));
+  assert.strictEqual(resolveTableData('표 없는 답', [rows]), '표 없는 답');
+});
+
+test('표 블록도 스텝 번호는 이력의 절대 인덱스이고, 들여쓴 펜스는 같은 들여쓰기로 채운다', () => {
+  const out = resolveTableData(tblock('step: 2', '  '), [null, rows]);
+  assert.ok(out.startsWith('  | MONTH |') && out.includes('\n  | --- |'), out);
+});
+
+test('긴 셀과 총량 예산을 지킨다 — 표 하나가 답변을 통째로 차지하지 않는다', () => {
+  const long = [{ T: 'x'.repeat(MAX_TABLE_CELL_LEN + 50) }];
+  const out = resolveTableData(tblock('step: 1'), [long]);
+  assert.ok(!out.includes('x'.repeat(MAX_TABLE_CELL_LEN + 1)), '셀이 상한을 넘겼다');
+  const fat = Array.from({ length: MAX_TABLE_BLOCK_ROWS }, (_, i) => ({ A: `${i}-${'y'.repeat(MAX_TABLE_CELL_LEN)}`, B: 'z'.repeat(MAX_TABLE_CELL_LEN) }));
+  const two = resolveTableData(`${tblock('step: 1\nlimit: 100')}\n\n${tblock('step: 1\nlimit: 100')}`, [fat]);
+  assert.ok(two.length <= MAX_TABLE_INJECT_LEN + 400, `총량 예산을 넘었다: ${two.length}`);
+  assert.match(two, /행만 실었습니다/, '다 싣지 못한 사실을 밝혀야 한다');
+});
+
+test('차트와 표 참조가 한 답변에 함께 있어도 각자 채워진다', () => {
+  const out = resolveChartData(resolveTableData(`${tblock('step: 1\ncols: MONTH, CNT')}\n\n${block('type: bar\ndata: step 1')}`, [rows]), [rows]);
+  assert.ok(out.startsWith('| MONTH | CNT |'));
+  assert.ok(out.includes('```chart\ntype: bar\n| MONTH | CNT | AMT | NOTE |'));
+});
+
+test('참조 없는 블록은 채울 표의 예산을 나눠 갖지 않는다', () => {
+  // 예산을 블록 수로 나누는데 참조 없는 블록까지 세면, 아무것도 쓰지 않는 블록이 몫을 가져가 정작 채우는
+  // 표가 잘린다 (실측: 참조 없는 블록 넷이 섞이자 87행이 17행이 됐다).
+  const wide = Array.from({ length: MAX_TABLE_BLOCK_ROWS }, (_, i) => ({ A: `${i}-${'x'.repeat(110)}`, B: 'y'.repeat(110), C: 'z'.repeat(110) }));
+  const ref = tblock(`step: 1\nlimit: ${MAX_TABLE_BLOCK_ROWS}`);
+  const refless = tblock('| a |\n| --- |\n| 1 |');
+  const count = md => (resolveTableData(md, [wide]).match(/^\| \d+-x/gm) || []).length;
+  const alone = count(ref);
+  assert.ok(alone > 0);
+  assert.equal(count([ref, refless, refless, refless, refless].join('\n\n')), alone, '참조 없는 블록이 예산을 가져갔다');
+});

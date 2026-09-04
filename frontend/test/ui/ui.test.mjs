@@ -18,6 +18,7 @@ import { findChrome, launchChrome, chromePort, stopProcess, killOnExit, freePort
   alive, aliveGroup } from './driver.mjs';
 import { pieSlices, parseChartBlock, MAX_TITLE_LEN } from '../../src/chart.js';
 import { TRACE, READY, PIE_BLOCK, PIE_LONG_NAMES, PIE_SHORT_NAMES, LONG_URL, DATA_URL, MAIL_URL, CAPPED_LABEL, ERROR_LABEL,
+  STREAM_SEARCH, STREAM_SEARCH_LABEL, STREAM_SUMMARY, STREAM_PREVIEW_TEXT,
   ANCHOR_URL, ANCHOR_TEXT, ANCHOR_IMG_TEXT, NESTED_LINK, LONG_CELL, LONG_SERIES_NAMES, LONG_CATEGORY_NAMES,
   BROKEN_RESPONSES, 주소를_가리키는_링크 } from './fixtures.js';
 
@@ -975,4 +976,41 @@ it('렌더링 중 콘솔에 예외도 오류도 오르지 않는다', async () =
     i.src = 'https://ex.test/__csp-probe.png'; document.body.appendChild(i); return true; })()`);
   await 콘솔에_오를때까지(/Content Security Policy/)
     .catch(e => assert.fail(`브라우저가 낸 오류를 듣지 못한다 — 그림 정책이 걸려도 이 검사는 보지 못한다: ${e.message}`));
+});
+
+test('검색·조회가 도는 동안 진행 줄이 바로 서고, 답이 오면 패널로 옮겨 간다', async () => {
+  // 서버는 검색을 시작하는 순간 이벤트를 흘려보낸다(backend server.js openStream). 그 줄이 답보다 먼저
+  // 서야 사용자는 '지금 무엇을 찾고 있는지'를 본다 — 답과 함께 도착하면 스트림의 뜻이 없다.
+  // 이벤트 사이를 넉넉히 벌려(gap) '아직 답이 없는데 검색 줄은 있다'는 순간을 실제로 만든다.
+  await page.touchMode(false);
+  await page.viewport(1000, 760, false);
+  await page.goto(`${url()}&stream=1&delay=100&gap=700`, '.chip');
+  await page.eval(`document.querySelectorAll('.chip')[0].click()`);
+  await page.until(`!!document.querySelector('.typing') && !!document.querySelector('.progress li') && !document.querySelector('.row.assistant .md')`,
+    { what: '답이 오기 전에 검색 줄이 서기' });
+  const first = await page.eval(`document.querySelector('.progress li').textContent`);
+  assert.ok(first.includes(STREAM_SEARCH.text), `검색어가 안 보인다: ${first}`);
+  assert.ok(first.includes('지식') && first.includes('처리방법'), `검색 대상이 안 보인다: ${first}`);
+  assert.ok(!first.includes(STREAM_SEARCH_LABEL), `아직 끝나지 않은 검색에 결과가 붙었다: ${first}`);
+  // 검색이 끝나면 같은 줄에 적중 수가 붙고, 조회 줄이 그 아래 선다
+  await page.until(`document.querySelectorAll('.progress li').length === 2 && document.querySelector('.progress li').textContent.includes(${JSON.stringify(STREAM_SEARCH_LABEL)})`,
+    { what: '검색 결과와 조회 줄' });
+  const second = await page.eval(`document.querySelectorAll('.progress li')[1].textContent`);
+  assert.ok(second.includes('vm_agent_health_summary@space_ops'), `조회 줄이 이름을 말하지 않는다: ${second}`);
+  // 답변 조각이 오면 답이 서기 전에 미리보기가 선다 — 표·차트 자리는 자리 표시다
+  await page.until(`!!document.querySelector('.typing') && (document.querySelector('.preview')?.textContent ?? '').includes(${JSON.stringify(STREAM_PREVIEW_TEXT)})`,
+    { what: '답이 오기 전에 미리보기가 서기' });
+  const previewText = await page.eval(`document.querySelector('.preview').textContent`);
+  assert.ok(previewText.includes('준비하고 있습니다'), `차트 자리가 자리 표시가 아니다: ${previewText.slice(0, 120)}`);
+  // 답이 서면 진행 줄·미리보기·타이핑 점은 사라지고, 패널이 검색과 쿼리를 함께 말한다
+  await page.until(READY.rich, { what: '답변이 서기' });
+  await page.until(`!document.querySelector('.progress') && !document.querySelector('.typing') && !document.querySelector('.preview')`, { what: '진행 줄과 미리보기가 걷히기' });
+  const panel = await page.eval(`(() => ({
+    summary: document.querySelector('.trace summary')?.textContent ?? '',
+    search: document.querySelector('.trace-search')?.textContent ?? '',
+    steps: document.querySelectorAll('.trace-step').length,
+  }))()`);
+  assert.ok(panel.summary.includes(STREAM_SUMMARY), `패널 머리띠가 검색을 말하지 않는다: ${panel.summary}`);
+  assert.ok(panel.search.includes(STREAM_SEARCH.text) && panel.search.includes(STREAM_SEARCH_LABEL), `패널의 검색 줄이 다르다: ${panel.search}`);
+  assert.strictEqual(panel.steps, TRACE.length + 1, '검색 항목이 패널에 남지 않았거나 쿼리 항목이 빠졌다');
 });

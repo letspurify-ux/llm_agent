@@ -2,6 +2,51 @@
 // 별도 모듈로 둔 이유: 이 값들이 oracle.js/agent.js/llm*.js에 걸쳐 있어 어느 한쪽에 두면
 // 프롬프트 조립 모듈이 DB 드라이버(oracledb)를 import하게 되고, 정의와 사용 방향이 엇갈린다.
 
+// ===== 환경변수 파서 =====
+// 파일 맨 앞에 둔다. 아래 상수 몇 개가 모듈이 평가되는 '그 자리에서' 이 함수를 부르는데(SEARCH_LIMIT·
+// MAX_SEARCHES), 함수 선언은 호이스팅되어도 그 함수가 닫아 잡은 const(INT_RE)는 그렇지 않다 —
+// 뒤에 두면 값을 설정한 순간에만 'Cannot access INT_RE before initialization'으로 모듈이 통째로 죽는다.
+// 값을 비워 둔 기본 설정에서는 numEnv가 그 줄에 닿기 전에 돌아가므로 아무 일도 없어, 문서대로 값을
+// 채워 넣은 설치에서만 서버가 뜨지 않는다(실측). 선언 순서가 곧 계약이라 여기서 확정한다.
+
+// 정수 환경변수 파서. 빈 문자열('')과 공백은 미설정으로 취급한다 —
+// `Number(process.env.X ?? 기본값)`은 `X=`(빈 값)에서 ??가 발동하지 않아 0이 되고,
+// 0이 "타임아웃 없음"이나 "주기 동기화 끔" 같은 정반대 의미를 갖는 자리에서 조용히 기능을 꺼버린다.
+// 정수만 허용하는 이유: 이 값들이 가는 곳이 전부 정수를 요구한다 —
+// node-oracledb의 callTimeout 세터는 정수가 아니면 던지고(모든 조회 실패), listen()의 포트도 마찬가지다.
+// 검증한다고 해놓고 소수를 흘려보내면 '검증했다'는 착각만 남는다.
+// allowZero: 0을 유효한 값(끄기)으로 허용할지. 기본은 양수만 허용.
+// 값이 아니라 '표기'를 먼저 본다. Number()는 16진수('0x50' → 80)와 지수 표기('1e10' → 10000000000)를
+// 조용히 받아주는데, 그 결과는 정수라 Number.isInteger 검사를 그대로 통과한다 — 오타 하나가 경고 없이
+// 전혀 다른 설정이 된다. ORACLE_TIMEOUT_MS=1e10은 callTimeout을 약 116일로 만들어 사실상 '타임아웃 없음'이
+// 되고(바로 위 주석이 막겠다고 한 그 결과가 다른 오타로 되살아난다), MARIADB_POOL_SIZE=1e5는
+// 커넥션 10만 개를 요청하며, PORT=0x50은 .env 어디에도 적혀 있지 않은 80번 포트에 바인드한다.
+// 셋 다 남는 증상이 '멈춤' 또는 '접속 폭주'뿐이고 설정을 가리키는 단서는 없다.
+// 안전 정수 범위도 함께 본다 — 그 밖의 값은 Number()가 근사해 적어둔 표기와 실제 값이 갈라진다.
+const INT_RE = /^[+-]?\d+$/;
+
+// 상한이 있는 정수 환경변수 — numEnv에 '이보다 크면 상한으로 낮춘다'를 더한다. 이 값들(검색 후보 수·검색 횟수)은
+// 프롬프트 예산이 전제하는 최대치라 넘기면 예산 불변식이 조용히 깨진다. 낮추는 것은 알리고 받아들인다 —
+// 조용히 기본값으로 되돌리면 "20으로 적었는데 왜 그대로지"가 되고, 던지면 설정 하나로 서버가 안 뜬다.
+// 함수 선언이라 위(MAX_SEARCHES)에서 먼저 불러도 된다(호이스팅) — numEnv도 같은 이유로 선언문이다.
+export function boundedEnv(name, fallback, max) {
+  const v = numEnv(name, fallback);
+  if (v <= max) return v;
+  console.warn(`[env] ${name}=${v} exceeds the ceiling (${max}) the prompt budget is built for — using ${max}.`);
+  return max;
+}
+
+export function numEnv(name, fallback, { allowZero = false } = {}) {
+  const raw = process.env[name];
+  const s = raw === undefined ? '' : String(raw).trim();
+  if (s === '') return fallback;
+  const v = Number(s);
+  if (INT_RE.test(s) && Number.isSafeInteger(v) && (v > 0 || (allowZero && v === 0))) return v;
+  console.warn(`[env] invalid value for ${name}, falling back to default (${fallback}): ${JSON.stringify(raw)}`);
+  return fallback;
+}
+
+
 // 조회 결과 상한 — capped 판정(oracle.js)과 사용자 안내 문구(llm*.js)가 같은 값을 봐야 한다.
 // 이 행 전부가 가는 곳은 화면 trace 패널(result.js clientTrace)과 답변의 차트 참조(chart.js, 글자 예산으로
 // 따로 묶인다)뿐이다 — 프롬프트·chat_log는 MAX_RESULT_ROWS(20)만 본다. 한 스텝의 최악 크기는
@@ -76,15 +121,17 @@ export const MAX_PROMPT_TOTAL_LEN = 64_000;
 export const PROMPT_FLOORS = {
   knowledge: 10_000, // 항목 상한(MAX_PROMPT_ITEM_LEN) 기준 10건 — 검색 후보(search.js LIMIT 20)의 절반
   qaMethods: 10_000, // 같음
-  history: 20_000,   // MAX_STEPS 스텝이 각자 상한까지 차도 전부 실리는 크기 — llm-openai.js가 로드 시 검증한다
+  history: 23_400,   // MAX_HISTORY_ROWS 줄(쿼리 MAX_STEPS + 검색 MAX_SEARCHES + 상한 안내 1)이 각자 상한까지
+                     // 차도 전부 실리는 크기 — llm-openai.js가 로드 시 검증한다
   queries: 20_000,   // 등록 30건(agent.js MAX_PROMPT_QUERIES)이 자세한 형태로 ~600자씩 — 남는 여유도 전부 여기로
 };
 
 // 섹션 본문이 아닌 고정 틀의 몫 — 섹션 제목 줄(건수 포함)·블록 사이 빈 줄·질문 제목·지시 블록
-// (현재 시각 한 줄과 지시문). 실측 205자에 건수 자릿수 여유를 더해 잡았다 (llm-openai buildPrompt).
+// (현재 시각 한 줄과 지시문. 아직 아무것도 검색하지 않은 첫 스텝에는 안내 한 줄이 더 붙는다).
+// 실측 최대치에 건수 자릿수 여유를 더해 잡았다 (llm-openai buildPrompt, 회귀 테스트가 실측한다).
 // 이 몫을 떼지 않으면 네 섹션이 각자 예산에 꽉 찬 요청에서 정확히 이 길이만큼 전체 상한을
 // 넘는다 — 회귀 테스트가 그 상태를 만들어 잡아내지만, 값이 어긋나면 그 전까지는 조용하다.
-export const PROMPT_FRAME_RESERVE = 300;
+export const PROMPT_FRAME_RESERVE = 400;
 
 const FLOOR_SUM = Object.values(PROMPT_FLOORS).reduce((a, b) => a + b, 0) + PROMPT_FRAME_RESERVE;
 if (FLOOR_SUM > MAX_PROMPT_TOTAL_LEN) {
@@ -96,11 +143,110 @@ if (FLOOR_SUM > MAX_PROMPT_TOTAL_LEN) {
 }
 
 export const MAX_PROMPT_ITEM_LEN = 1000;  // 항목 본문 1건
-export const MAX_PROMPT_SQL_LEN = 2000;   // query_sql — 잘려도 바인드명은 프롬프트가 따로 싣는다
+// query_sql의 표시 상한. 잘려도 바인드명은 프롬프트가 따로 싣는다. 2,000이던 것을 줄였다 — SQL은
+// 쿼리를 '고르는' 근거가 아니라(용도·입출력 설명이 그 근거다) 바인드가 어느 컬럼에 걸리는지, 결과가
+// 몇 건으로 제한되는지 같은 보조 정보이고, 등록 SQL 대부분은 이 길이 안이다. 목록 30건에 각 2,000자를
+// 실으면 그것만으로 스텝마다 60k자를 다시 보낸다(prefill이 스텝 수만큼 곱해진다).
+export const MAX_PROMPT_SQL_LEN = 800;
 // 에이전트 루프의 스텝 상한(agent.js). 여기 두는 이유: 실행 이력의 최소 몫(PROMPT_FLOORS.history)은
 // 'MAX_STEPS 스텝이 각자 상한까지 차도 전부 실린다'가 근거인데, 그 검증(llm-openai.js)이 이 값을
 // 봐야 한다. agent.js 안의 리터럴이면 스텝 수를 올리는 변경이 이력 몫과 어긋나도 아무 데서도 드러나지 않는다.
 export const MAX_STEPS = 5;
+// 검색 행동(search)의 횟수 상한 (agent.js). 쿼리 실행 스텝(MAX_STEPS)과 따로 센다 — 실행 이력의
+// 최소 몫은 '어떤 종류의 줄이 몇 개까지 오는가'로 계산되므로(llm-openai.js HISTORY_FLOOR_NEEDED),
+// 두 카운터를 섞으면 그 근거가 무너진다. 3인 이유: 기본 검색 1회 + 검색어를 고쳐 다시 1회 +
+// 두 주제를 함께 묻는 질문의 추가 1회. 그 이상은 검색이 아니라 헛도는 것이다.
+// 환경변수로 '낮출' 수 있다 (MAX_SEARCHES=1~3) — 계측(chat_log의 timing·search)에서 두 번째 검색이 거의
+// 진도를 내지 못하는 것으로 보이면 줄인다. 올리지는 못한다: 이력의 최소 몫이 이 상한을 전제로 검증된다.
+export const MAX_SEARCHES_CEILING = 3;
+export const MAX_SEARCHES = boundedEnv('MAX_SEARCHES', MAX_SEARCHES_CEILING, MAX_SEARCHES_CEILING);
+// 검색 한 번이 소스당 돌려주는 최대 후보 수 (search.js). 환경변수로 '낮출' 수 있다 (SEARCH_LIMIT=1~20) —
+// 모델이 검색어를 핵심 낱말로 쓰므로 후보 정밀도가 높고, 후보를 줄이면 스텝마다 다시 보내는 prefill이 그만큼 준다.
+// 근거는 계측이다: 검색 뒤 LLM 호출의 prompt 토큰(trace.timing.llm[].prompt)과 적중 수(search.knowledge 등)가
+// 상한에 붙어 있는가(README '검색 후보 수·검색 횟수 조정'). 올리지는 못한다: 프롬프트 최소 몫이 이 값을 전제한다.
+export const MAX_SEARCH_LIMIT = 20;
+export const SEARCH_LIMIT = boundedEnv('SEARCH_LIMIT', MAX_SEARCH_LIMIT, MAX_SEARCH_LIMIT);
+// 이력(history)에 남길 수 있는 줄 수의 상한. 프롬프트 예산의 이력 몫(PROMPT_FLOORS.history)이 '이만큼은
+// 반드시 전부 실린다'를 보장하는 근거이므로, 루프가 이 수를 넘겨 기록하면 그 보장이 조용히 깨진다 —
+// 넘친 만큼 가장 오래된 줄이 프롬프트에서 빠지고, 그것은 앞선 조회가 통째로 헛수고가 됐다는 뜻이다.
+// 쿼리 줄 MAX_STEPS + 검색 줄 MAX_SEARCHES + 상한 안내 한 줄(agent.js가 잘라 낸 일괄 조회를 알리는 줄).
+// 일괄 조회 전에는 루프 반복 수(MAX_STEPS + MAX_SEARCHES)가 곧 줄 수여서 저절로 지켜졌는데, 결정 하나가
+// 조회 여럿을 만들게 되면서 그 등식이 깨졌다 — 그래서 줄 수를 직접 센다 (agent.js가 이 값을 본다).
+export const MAX_HISTORY_ROWS = MAX_STEPS + MAX_SEARCHES + 1;
+
+// ===== 자료 항목의 식별자 =====
+// 지식·처리방법 항목을 모델이 지목하는 방법. 제목으로는 지목할 수 없다 — title은 VARCHAR(200)인데
+// 프롬프트에는 MAX_PROMPT_NAME_LEN(100)으로 잘려 실리므로, 긴 제목은 모델이 온전한 형태를 본 적이
+// 없어 옮겨 적는 것이 불가능하다. 쿼리는 사정이 반대라(query_name이 짧은 식별자로 설계돼 온전히
+// 실린다) 번호를 만들지 않는다 — 한 대상에 표기가 둘이 되는 값을 치를 이유가 없다.
+//
+// seq를 쓰는 이유: 목록 안의 위치는 검색 결과가 앞에 붙을 때마다 바뀌므로(agent.js mergeFront)
+// 1스텝에서 본 번호가 2스텝에서 다른 항목을 가리킨다. seq는 요청 내내 고정이다.
+export const ITEM_PREFIX = { knowledge: 'k', qaMethods: 'm' };
+const ITEM_LIST = { k: 'knowledge', m: 'qaMethods' };
+const ITEM_ID_RE = /^([km])([1-9][0-9]*)$/;
+
+// 'k12' → { list: 'knowledge', seq: 12 }. 형식이 아니면 null.
+// 대소문자는 흡수한다 — 모델이 'K12'로 적었다고 지목을 잃을 이유가 없다 (nameKey와 같은 기준).
+export function parseItemId(id) {
+  const m = ITEM_ID_RE.exec(String(id ?? '').trim().toLowerCase());
+  return m ? { list: ITEM_LIST[m[1]], seq: Number(m[2]) } : null;
+}
+
+// 결정에 실려 온 식별자 목록을 정규화한다 — 배열이든 하나든 받고, 형식이 아닌 것은 버리고,
+// 중복을 없애고, 개수를 확정한다. 형식이 아닌 값을 버리되 결정 자체는 버리지 않는다:
+// 모델이 넷 중 하나를 잘못 적었다고 나머지 셋까지 다시 요청하게 할 이유가 없다.
+export function normalizeItemIds(raw, max) {
+  const list = Array.isArray(raw) ? raw : raw === undefined || raw === null ? [] : [raw];
+  const seen = new Set();
+  const out = [];
+  for (const v of list) {
+    const parsed = parseItemId(v);
+    if (!parsed) continue;
+    const id = `${ITEM_PREFIX[parsed.list]}${parsed.seq}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+// 한 요청에 펼칠 수 있는 항목 수와 펼친 본문의 상한. 둘의 곱(8,000자)이 지식·처리방법 섹션의
+// 최소 몫(PROMPT_FLOORS 각 10,000자) 안에 들어야 한다 — 둘 다 한 섹션에 몰려도 다른 후보 몇 건이
+// 함께 실릴 자리가 남는다. 이 곱을 키우려면 그 몫부터 다시 본다.
+export const MAX_EXPANDS = 2;
+export const MAX_EXPANDED_ITEM_LEN = 4000;
+// 결정 하나가 버릴 수 있는 항목 수. 검색 한 번이 소스당 SEARCH_LIMIT건을 얹으므로 그 두 배면
+// 한 결정으로 앞선 검색 결과를 통째로 정리할 수 있다.
+export const MAX_DROPS = 40;
+
+// 결정 하나(run_queries)에 담을 수 있는 조회 수. 서로 의존하지 않는 조회를 한 번에 요청해 LLM 왕복을 줄이는
+// 길이다 — 조회는 병렬로 돈다. 4인 이유는 둘이다: 정당한 질문이 한 번에 묻는 독립 조회가 그 안이고
+// ('서울·부산·대전 재고'), 조회 DB에 요청 하나가 여는 세션 수가 곧 이 값이다 — 조회 DB 풀은 이 값을
+// 근거로 크기를 잡는다(oracle.js POOL_MAX = 이 값 × 2, 그런 요청 둘이 겹쳐도 기다리지 않게).
+// 이 값을 올리면 그 풀이 운영 DB에 여는 세션도 함께 늘어난다.
+export const MAX_BATCH_QUERIES = 4;
+// 검색어 상한. 정당한 검색어는 질문의 핵심 낱말 몇 개라 이보다 길 수 없다 — 넘으면 자른다.
+// 바인드 값과 달리 실행을 거부하지 않는다: 잘린 검색어로도 검색은 성립하고, 임베딩 원문 상한
+// (MAX_EMBED_TEXT_LEN)보다 훨씬 작아 그쪽 경계에 닿지 않는다.
+export const MAX_SEARCH_TEXT_LEN = 500;
+// 검색 대상의 단일 정의. 결정 경계(llm.js)·프롬프트(llm-openai.js)·검색 실행(agent.js)·Mock이 같은
+// 이름을 봐야 한다 — 한 곳이 다른 철자를 쓰면 모델이 프롬프트대로 적은 대상이 '모르는 값'이 되어
+// 셋 다로 조용히 넓어진다(아래 normalizeSearchTargets의 기본값). 순서는 프롬프트 표기 순서이자
+// 같은 검색인지 판정하는 정규 순서다(agent.js searchKey).
+export const SEARCH_TARGETS = ['knowledge', 'qa_method', 'query'];
+
+// 결정의 targets를 정규화한다 — 배열이든 문자열 하나든 받고, 대소문자·공백을 흡수하고, 모르는 값은
+// 버린다. 남는 것이 없으면(생략·빈 배열·전부 오타) 셋 다로 본다: 모델이 대상을 고르지 못한 것은
+// '아무것도 찾지 마라'가 아니라 '무엇이 필요한지 모르겠다'이고, 그때 가장 싼 실패는 넓게 찾는 것이다
+// (세 검색은 병렬이고 임베딩은 한 번이다). 결과는 SEARCH_TARGETS 순서로 돌려준다.
+export function normalizeSearchTargets(raw) {
+  const list = Array.isArray(raw) ? raw : raw === undefined || raw === null ? [] : [raw];
+  const keys = new Set(list.map(v => nameKey(v)));
+  const picked = SEARCH_TARGETS.filter(t => keys.has(t));
+  return picked.length ? picked : [...SEARCH_TARGETS];
+}
 // 실행 이력 1스텝의 결과 JSON 상한. 스텝 하나가 이력 예산을 통째로 먹으면 나머지 스텝이 전부 밀려난다 —
 // 다단계 절차에서 앞 단계의 결과가 사라지면 모델이 그 단계를 다시 실행하려 든다.
 // (한 줄의 상한은 이 값 + 머리말이다 — 쿼리명·대상DB·params·건수 안내. 각각 이름 있는 상한으로 묶여 있다.)
@@ -147,6 +293,11 @@ export const MAX_BIND_LEN = MAX_QUESTION_LEN;
 // 실제로 이 값에 닿는 LLM 답변은 없다 — 모델 출력을 실질적으로 묶는 것은 시간(llm-openai.js
 // TIMEOUT_MS 120초, 30~50 tok/s면 4~6k 토큰)과 폭주 가드(MAX_COMPLETION_TOKENS)다. 이 값은 그 둘이
 // 못 보는 경로, 즉 조회 결과와 지식 본문을 그대로 싣는 폴백 답변(llm.js renderAnswer)의 천장이다.
+//
+// 사용자에게 나가는 답변은 이 값보다 클 수 있다: 참조를 실제 표로 채우는 일이 이 절단 '뒤에' 일어나기
+// 때문이다(agent.js finish → chart.js). 그 몫은 각자 상한이 있으므로 최악은 이 값 + MAX_TABLE_INJECT_LEN +
+// MAX_CHART_INJECT_LEN(각 30k)이고, 그 합이 응답 본문과 chat_log.answer(MEDIUMTEXT)의 실제 천장이다.
+// 채움을 절단보다 먼저 할 수는 없다 — 참조가 가리키는 스텝 번호는 이력이 다 끝난 뒤에야 확정된다.
 export const MAX_ANSWER_LEN = 70_000;
 
 // LLM 한 번 호출의 출력 토큰 상한(max_tokens) — 답변 길이 상한이 아니라 폭주 가드다.
@@ -313,32 +464,6 @@ export function warnOnce(scope, message) {
 // 사용자 trace 패널(server.js)에는 message만 나간다. 한 문자열에 섞으면 "…쿼리를 선택하라"류의
 // 내부 지시문이 safe 표시를 타고 화면까지 나간다 — note와 error를 나눈 것과 같은 이유로 필드를 나눈다.
 export const safeError = (msg, hint) => Object.assign(new Error(msg), { safe: true, ...(hint && { hint }) });
-
-// 정수 환경변수 파서. 빈 문자열('')과 공백은 미설정으로 취급한다 —
-// `Number(process.env.X ?? 기본값)`은 `X=`(빈 값)에서 ??가 발동하지 않아 0이 되고,
-// 0이 "타임아웃 없음"이나 "주기 동기화 끔" 같은 정반대 의미를 갖는 자리에서 조용히 기능을 꺼버린다.
-// 정수만 허용하는 이유: 이 값들이 가는 곳이 전부 정수를 요구한다 —
-// node-oracledb의 callTimeout 세터는 정수가 아니면 던지고(모든 조회 실패), listen()의 포트도 마찬가지다.
-// 검증한다고 해놓고 소수를 흘려보내면 '검증했다'는 착각만 남는다.
-// allowZero: 0을 유효한 값(끄기)으로 허용할지. 기본은 양수만 허용.
-// 값이 아니라 '표기'를 먼저 본다. Number()는 16진수('0x50' → 80)와 지수 표기('1e10' → 10000000000)를
-// 조용히 받아주는데, 그 결과는 정수라 Number.isInteger 검사를 그대로 통과한다 — 오타 하나가 경고 없이
-// 전혀 다른 설정이 된다. ORACLE_TIMEOUT_MS=1e10은 callTimeout을 약 116일로 만들어 사실상 '타임아웃 없음'이
-// 되고(바로 위 주석이 막겠다고 한 그 결과가 다른 오타로 되살아난다), MARIADB_POOL_SIZE=1e5는
-// 커넥션 10만 개를 요청하며, PORT=0x50은 .env 어디에도 적혀 있지 않은 80번 포트에 바인드한다.
-// 셋 다 남는 증상이 '멈춤' 또는 '접속 폭주'뿐이고 설정을 가리키는 단서는 없다.
-// 안전 정수 범위도 함께 본다 — 그 밖의 값은 Number()가 근사해 적어둔 표기와 실제 값이 갈라진다.
-const INT_RE = /^[+-]?\d+$/;
-
-export function numEnv(name, fallback, { allowZero = false } = {}) {
-  const raw = process.env[name];
-  const s = raw === undefined ? '' : String(raw).trim();
-  if (s === '') return fallback;
-  const v = Number(s);
-  if (INT_RE.test(s) && Number.isSafeInteger(v) && (v > 0 || (allowZero && v === 0))) return v;
-  console.warn(`[env] invalid value for ${name}, falling back to default (${fallback}): ${JSON.stringify(raw)}`);
-  return fallback;
-}
 
 // base URL 뒤에 경로를 붙인다. 끝의 '/' 유무는 설정하는 사람마다 다르고(`…/v1`과 `…/v1/`), 그대로
 // 이으면 `…/v1//chat/completions`가 된다 — 대부분의 서버는 받아주지만 경로를 엄격히 대조하는

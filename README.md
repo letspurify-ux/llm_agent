@@ -4,10 +4,18 @@
 
 ```
 사용자 질문 (+ 최근 대화)
-  → 지식/Q&A처리방법 하이브리드 검색 (LIKE + 벡터, 상위 20건) + 쿼리 라우팅 (관련 쿼리만 선별)
-  → LLM 결정 루프: 답변 가능하면 답변 / DB 조회가 필요하면 쿼리 관리 테이블의 쿼리 실행 (여러 번 가능)
-  → 최종 답변 (+ 실행된 쿼리 trace)
+  → LLM 결정 루프 (매 스텝 행동 하나):
+      search      — 사내 자료가 필요하면 지식/Q&A처리방법/쿼리 중 필요한 대상을 골라 벡터 검색 (검색어는 LLM이 쓴다)
+      expand      — 잘린 지식·처리방법 본문의 전체를 청구 (search·expand에는 더는 필요 없는 자료를 버리는 drop을 함께 실을 수 있다)
+      run_query   — DB 조회가 필요하면 쿼리 관리 테이블의 쿼리 실행 (여러 번 가능)
+      run_queries — 서로 의존하지 않는 조회 여럿을 한 번에 (병렬 실행, 최대 4개)
+      answer      — 답변 (인사·잡담은 검색 없이 바로). 조회 결과의 표는 참조(```table step: N)로 적고 서버가 채운다
+  → 최종 답변 (+ 검색·실행된 쿼리 trace)
 ```
+
+검색은 LLM이 요청할 때만 일어난다. 인사 한 줄에도 지식·처리방법·쿼리 목록을 미리 실어 보내던 구조를
+뒤집은 것이다 — 그때는 첫 LLM 호출의 프롬프트가 질문과 무관하게 최대치였다. 검색·조회가 진행되는 동안
+화면에는 그 사실이 바로 표시된다(아래 '진행 상황 스트림').
 
 - **agent 관리 DB**: MariaDB — `knowledge`(지식), `qa_method`(Q&A 처리 방법), `query_registry`(쿼리 관리), `target_db`(조회대상 DB 접속 정보)
 - **조회용 DB**: Oracle (node-oracledb — 기본은 Thin 모드라 Instant Client 불필요, `.env`의 `ORACLE_DRIVER=oci`로 Thick(OCI) 모드 전환 가능). 여러 개 등록 가능
@@ -20,10 +28,13 @@
 클라이언트가 최근 대화를 `POST /api/chat`의 `history`에 실어 보낸다 (최근 6턴, 턴당 1,500자로 제한).
 
 - LLM 프롬프트에 "최근 대화" 섹션으로 전달되어 지시대명사·생략된 대상을 해석한다
-- 현재 질문만으로 지식/처리방법이 **하나도 검색되지 않은 경우에만** 직전 질문을 덧붙여 재검색한다
-  → 평소 검색 정확도는 그대로 두면서 후속 질문만 복구 (`agent.js`)
+- 검색어는 LLM이 쓴다 — 후속 질문이면 대화에서 대상을 복원해 적는다 ("그럼 김철수는?" → "김철수 고객 주문 상태").
+  Mock은 그럴 수 없으므로 첫 검색이 빈손일 때만 직전 질문을 덧붙여 한 번 더 찾는다 (`llm.js` mockDecide)
 
 ## 디렉토리
+
+[context.md](context.md)에 **컨텍스트 관리 규칙**이 설계도로 정리돼 있다 — 무엇이 프롬프트에 들어가고,
+어떻게 들어오고, 얼마나 실리고, 어떻게 나가는가. 상수 하나를 고칠 때 함께 봐야 할 것도 그 문서에 있다.
 
 ```
 backend/
@@ -32,7 +43,7 @@ backend/
   src/agent.js               # agentic loop (핵심 제어 흐름)
   src/llm.js                 # LLM 인터페이스 + Mock (provider 선택)
   src/llm-openai.js          # OpenAI 호환 클라이언트 (vLLM/OpenRouter)
-  src/search.js              # 하이브리드 검색(LIKE 관련도 + 벡터, RRF 병합) — 검색 구현은 이 파일에만 있다
+  src/search.js              # 벡터 검색(MariaDB VECTOR 인덱스) — 검색 구현은 이 파일에만 있다
   src/db.js                  # MariaDB 풀 + 관리 테이블 로더
   src/oracle.js              # Oracle 실행기 + SELECT 전용 가드 + mock 모드
 frontend/
@@ -311,7 +322,9 @@ y2: 성공률
 #### 조회 결과 전체 보기 (⚡ 실행된 쿼리 패널)
 
 모델은 조회 결과를 20행(`MAX_RESULT_ROWS`)까지만 보고 그중 몇 행만 답변에 옮겨 적는다. 조회된 행
-**전부**(드라이버 상한 `MAX_ROWS` = 1,000건까지)는 답변 아래 **⚡ 실행된 쿼리 N건** 패널에 있다 — 스텝마다
+**전부**(드라이버 상한 `MAX_ROWS` = 1,000건까지)는 답변 아래 **⚡ 패널**에 있다 (검색과 조회를 함께 세어
+"검색 1회 · 실행된 쿼리 2건"으로 보인다). 줄 앞의 번호는 모델이 본 이력 번호와 같은 값이라, 답변이
+"2번 조회 결과"라고 말하면 패널의 2번이 그것이다 — 스텝마다
 쿼리 이름`@`대상 DB·바인드 값과 함께 행 전체를 표(세로·가로 스크롤, 머리글 고정)로 싣고, **CSV 내려받기**로
 파일(UTF-8 BOM, 엑셀에서 바로 열림)로 받을 수 있다. 상한에 걸린 결과는 "N건 이상 — 조회 상한에 걸려
 처음 N건만"으로 표시한다(실제는 더 많다). 오류 스텝은 우리가 만든 문구만 보이고 드라이버 원문은 로그에만
@@ -349,6 +362,59 @@ y2: 성공률
 curl -s localhost:3001/api/chat -H 'Content-Type: application/json' -d '{"message":"홍길동 고객 주문 상태 알려줘"}'
 ```
 
+자료 섹션(관련 지식·Q&A 처리 방법·쿼리 목록)은 **검색한 뒤에만** 실린다. 찾아보지 않은 대상의 섹션은 아예 없고,
+찾았는데 없으면 `(없음)`이다 — 둘을 섞으면 모델은 '등록된 것이 없다'로 읽고 검색 없이 일반 지식으로 답한다.
+쿼리 목록은 짧은 형태(이름·용도·바인드)가 기본이고, 처리방법이 지목한 절차용 쿼리·직접 검색의 상위 5건·모델이
+지목한 쿼리만 입출력 설명과 SQL까지 실린다 — 스텝마다 다시 보내는 prefill을 묶기 위해서다.
+
+### 답변 안의 표 — 참조로 적고 서버가 채운다
+
+조회 결과를 표로 보일 때 모델은 값을 옮겨 적지 않는다. 20행 × 6열이면 수백에서 천 토큰을 한 글자씩 생성해야 하고
+그 출력이 답변 지연의 큰 몫이었다(출력 토큰은 prefill보다 수십 배 느리다). 대신 참조 한 줄을 적는다:
+
+````
+```table
+step: 2
+cols: JOB_ID, STATUS, LAST_RUN_AT
+limit: 20
+```
+````
+
+참조가 없는 ```` ```table ```` 블록은 펜스만 벗겨 본문을 그대로 내보낸다(모델이 표를 손수 적었으면 표로 보인다).
+서버(`backend/src/chart.js` `resolveTableData`)가 그 실행의 결과 행으로 GFM 표를 만들어 블록을 통째로 바꾼다 —
+차트의 `data: step N`과 같은 기제다. `step`은 실행 이력의 번호(검색 줄도 번호를 차지한다), `cols`는 보일 열
+(생략하면 앞 10열), `limit`은 행 수(생략하면 30, 최대 100). 다 싣지 못하면 표 아래에 밝히고, 전부는 ⚡ 패널에 있다.
+옮겨 적다 틀리는 값(반올림·자릿수 누락)도 사라진다.
+
+### 진행 상황 스트림 (`POST /api/chat`)
+
+검색·조회가 시작되는 순간 화면에 보이도록 응답을 흘려보낼 수 있다. 클라이언트가 `Accept: application/x-ndjson`을
+보내면 한 줄에 이벤트 하나(NDJSON)로 답하고, 없으면 위 curl처럼 JSON 하나로 답한다 — 마지막 `done` 줄의 본문이
+그 JSON과 같다.
+
+```bash
+curl -sN localhost:3001/api/chat -H 'Content-Type: application/json' -H 'Accept: application/x-ndjson' \
+  -d '{"message":"BATCH001 작업 상태 알려줘"}'
+# {"type":"search","text":"BATCH001 배치 상태","targets":["qa_method","query"]}
+# {"type":"search_done","text":"…","targets":[…],"hits":{"knowledge":null,"qaMethods":1,"queries":3}}
+# {"type":"run_query","query_name":"batch_job_status","params":{"job_id":"BATCH001"},"targetDb":"ORDER_DB"}
+# {"type":"run_query_done","query_name":"batch_job_status","targetDb":"ORDER_DB","rowCount":1}
+# {"type":"done","answer":"…","trace":[…]}
+```
+
+| type | 시점 | 실리는 것 |
+|---|---|---|
+| `search` / `search_done` | 검색 시작 / 끝 | 검색어, 대상, 대상별 적중 수(`hits`), 검색이 성립하지 않은 대상(`failed`) |
+| `run_query` / `run_query_done` | 조회 시작 / 끝 | 쿼리 이름, 바인드, 대상 DB, 건수 또는 화면용 오류 문구 (일괄 조회는 항목마다) |
+| `answer_delta` / `answer_reset` | 답변이 생성되는 동안 | 답변 문자열의 조각(디코딩된 글자). reset은 앞선 조각을 버리라는 뜻이다 — 재시도했거나, 모델이 사고 과정에 적었던 답변 초안을 접고 조회를 택했을 때 |
+| `done` | 마지막 | `{answer, trace}` — JSON 응답과 같다. 표·차트 참조가 채워진 최종 답이라 조각의 합과 다를 수 있다 |
+| `error` | 헤더가 나간 뒤 실패 | `{error}` |
+
+화면(`frontend/src/stream.js`)은 조각 경계와 예전 JSON 응답을 같은 함수로 읽고, 답을 기다리는 말풍선에 진행 줄을
+세웠다가 답이 오면 같은 내용을 ⚡ 패널에 남긴다. 답변 조각은 미리보기로 그려지는데(`preview.js`), 표·차트·그림
+블록은 done 뒤에야 성립하므로 그 자리는 안내 한 줄로 바꾼다. 프록시가 본문을 모아 두면 스트림의 뜻이 사라진다 — nginx는
+`X-Accel-Buffering: no`를 서버가 보내고, 다른 프록시는 `Cache-Control: no-transform`을 본다.
+
 ## 실제 LLM 연결 (vLLM / OpenRouter)
 
 `backend/.env`만 수정하면 된다 — 코드 변경 없음:
@@ -376,7 +442,13 @@ curl -s $LLM_BASE_URL/models | python3 -c 'import json,sys; print([m.get("max_mo
 - vLLM은 모델 config의 `max_position_embeddings`를 기본값으로 쓴다. `Qwen/Qwen2.5-32B-Instruct`는 그 값이 32,768이라 그대로 띄우면 **32k**다 — 128k는 YaRN을 켜야 나온다: `--max-model-len 131072 --hf-overrides '{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}}'` (정적 YaRN이라 짧은 입력의 품질이 조금 떨어진다는 것이 Qwen 쪽 안내다).
 - 컨텍스트가 더 작은 모델이면 `MAX_PROMPT_TOTAL_LEN`과 `MAX_COMPLETION_TOKENS`를 함께 줄인다 (둘의 합이 컨텍스트 안에 들어야 한다). 매 호출의 실제 토큰 수는 서버 로그의 `[llm] usage prompt=… completion=… finish=…` 한 줄로 확인할 수 있다 — `finish=length`면 출력 가드에서 끊긴 것이다.
 
-LLM 인터페이스는 `llm.js`의 `decide(ctx) → {action:'answer'|'run_query', ...}` 함수 하나다. 다른 provider가 필요하면 같은 시그니처의 함수를 추가하고 `llm.js`의 분기에 연결한다. `agent.js`는 변경되지 않는다.
+LLM 인터페이스는 `llm.js`의 `decide(ctx) → {action:'answer'|'search'|'run_query'|'run_queries', ...}` 함수 하나다. 다른 provider가 필요하면 같은 시그니처의 함수를 추가하고 `llm.js`의 분기에 연결한다. `agent.js`는 변경되지 않는다.
+
+호출은 스트림(`stream: true`)이다. 조각이 `LLM_IDLE_TIMEOUT_MS`(기본 30초) 동안 오지 않으면 끊고 재시도하므로 죽은
+엔드포인트를 전체 상한(120초) 전에 알아채고, 답변 문자열이 흘러오는 동안 화면에 미리보기를 낸다(위 '진행 상황
+스트림'의 `answer_delta`). 마지막 조각의 `usage`(`stream_options: {include_usage: true}`)를 요청별 계측에 남기며,
+그 파라미터를 모르는 서버(400)에는 다음부터 보내지 않는다 — `reasoning_effort`와 같은 규칙이다. SSE가 아니라
+JSON 하나로 답하는 프록시도 같은 길로 읽는다.
 
 ## 실제 Oracle 연결
 
@@ -460,23 +532,25 @@ could not be initialized …`가 남고 조회는 전부 실패한다 — 이 �
 - 조회 결과는 `maxRows: 1000`(`MAX_ROWS`) 제한. 셀당 200자 절단은 드라이버 경계(`oracle.js`)에서, 프롬프트·로그의 20행 절단은 `agent.js`의 `capRows`에서 적용하고
   "외 N건 생략 (총 N건)"으로 표기한다. LOB/이진 값도 이 경계에서 문자열로 정규화된다 (커넥션을 닫으면 무효가 되는 스트림 객체가 로그·프롬프트로 새지 않도록)
 
-## 검색 (하이브리드 — 10,000건 이상 대응)
+## 검색 (벡터 — 10,000건 이상 대응)
 
-지식·처리방법·쿼리 모두 **LIKE(관련도 정렬)와 벡터 검색을 병렬 실행해 RRF로 병합**한 상위 20건을 쓴다 (`search.js`).
-정확 키워드(BATCH001 등)는 LIKE가, 표현 차이("측정 안 하고 품질 아는 법" ↔ "가상계측")는 벡터가 잡는다.
+지식·처리방법·쿼리 모두 **벡터 검색**(MariaDB 네이티브 `VECTOR(1024)` + 벡터 인덱스, 코사인 거리)이다 (`search.js`).
+검색어는 LLM이 질문의 핵심 낱말 몇 개로 쓰고(`llm-openai.js` 시스템 프롬프트), 대상은 셋 중 필요한 것만 고른다 —
+`knowledge`(지식), `qa_method`(처리방법), `query`(쿼리 목록). 무엇이 필요한지 확실하지 않으면 셋 다 찾는다.
+세 검색은 병렬이고 임베딩은 한 번만 계산된다(검색어 단위 LRU 캐시).
 
-- **벡터 저장**: 별도 vector DB 없이 MariaDB 네이티브 `VECTOR(1024)` + 벡터 인덱스 (`vec_store` 테이블).
-  원본 3개 테이블은 변경하지 않는 companion 구조
-- **임베딩**: 로컬 Ollama의 OpenAI 호환 API (`embedding.js`). 기본 모델 bge-m3(1024차원)
-- **폴백**: 임베딩 서버가 없으면 자동으로 LIKE-only로 동작 — Ollama 없는 환경에서도 그대로 돌아간다.
-  Ollama를 아예 쓰지 않는다면 `.env`의 `EMBEDDING_URL`을 비워 두면 매 주기 임베딩 시도 자체를 건너뛴다
-  (원본이 삭제된 벡터 정리는 이 경우에도 계속 수행된다). 이 구성에서 `npm run embed`는 정상 종료(0)한다 —
-  종료 코드 1은 "임베딩 서버가 설정돼 있는데 응답하지 않은" 경우뿐이다
+- **LIKE 검색은 없앴다.** 인덱스를 못 쓰는 `%…%` 스캔이라 비용이 (행 수 × 낱말 수 × 조사 변형 × 컬럼 수 × 본문 길이)에
+  비례했고, 질문 낱말 30개면 행마다 LIKE를 180번 평가했다 — 지식이 만 건이면 검색 한 번이 초 단위였다.
+  정확 키워드(BATCH001 등)는 검색어에 그대로 들어가 벡터 거리에 반영된다.
+- **임베딩 서버가 없으면 검색이 성립하지 않는다.** 그 상태는 '0건'이 아니라 **검색 불가**로 프롬프트·화면·chat_log에
+  남는다 — 모델이 '등록된 자료가 없다'고 단정하지 않게 하고, 분석 SQL이 그 질문을 지식 보강 후보로 잘못 세지 않게 한다.
+- **벡터 저장**: 별도 vector DB 없이 `vec_store` 테이블. 원본 3개 테이블은 변경하지 않는 companion 구조
+- **임베딩**: 로컬 Ollama의 OpenAI 호환 API (`embedding.js`). 기본 모델 bge-m3(1024차원). 기동 시 한 번 예열한다
 - **동기화**: `embed-sync.js`가 원본 텍스트의 MD5를 비교해 신규/변경분만 임베딩(diff, 멱등).
   서버 기동 시 1회 + `EMBED_SYNC_INTERVAL`(기본 60초) 주기 + `npm run embed` 수동.
-  SQL로 직접 등록한 데이터도 1분 내 자동 반영되며, 그 사이에도 LIKE로는 즉시 검색된다
+  SQL로 직접 등록한 데이터는 다음 동기화(최대 1분) 뒤부터 검색된다
 
-### 임베딩 준비 (선택 — 없으면 LIKE-only)
+### 임베딩 준비 (필수 — 검색의 유일한 경로)
 
 macOS:
 
@@ -491,34 +565,86 @@ ollama pull bge-m3
 Windows: `setup/bge-m3/start.bat` 실행 (설치 확인·모델 다운로드·검증까지 자동, 중지는 `stop.bat`).
 자세한 내용은 [setup/bge-m3/README.md](setup/bge-m3/README.md) 참고.
 
-### 쿼리 라우팅 (프롬프트 폭발 방지)
+**모델을 내리지 않게 한다.** Ollama는 5분 유휴 뒤 모델을 메모리에서 내리고 다음 요청에서 다시 올리므로(수 초),
+한산한 시간대의 첫 질문이 그 비용을 그대로 낸다. `OLLAMA_KEEP_ALIVE=-1`로 끈다 — macOS는
+`launchctl setenv OLLAMA_KEEP_ALIVE -1` 뒤 Ollama 재기동, Windows는 `setx OLLAMA_KEEP_ALIVE -1` 뒤 새 터미널에서
+`start.bat` (그 스크립트가 이 값을 함께 걸어 준다). 서버는 기동 시 한 번 예열 호출을 보내 첫 질문만은 지켜 준다.
 
-쿼리 목록은 **등록 규모와 무관하게 질문 관련도 순으로 정렬해** 프롬프트에 싣는다
-(지식·처리방법과 같은 하이브리드 검색을 쓴다). 순서는 두 경로의 합집합이다 (`agent.js`의 `selectQueries`):
+### 자료 청구와 버리기 (`expand` · `drop`)
 
-- **경로A**: 매칭된 `qa_method` 본문이 지목한 `query_name` — 다단계 절차 보장 (본문 등장 순서를 지킨다)
-- **경로B**: 질문으로 `query_registry` 자체를 하이브리드 검색(LIKE + 벡터 RRF) — **qa_method 등록 없이 쿼리만 등록해도 찾는다**
+검색으로 받은 지식·처리방법 본문은 프롬프트에서 1,000자에서 잘립니다. 모델은 잘린 항목의 **전체 본문을
+청구**할 수 있고, 더는 필요 없는 자료를 **버릴** 수 있습니다.
 
-30건 이하면 검색에 걸리지 않은 쿼리까지 전부 뒤에 이어 붙이고, 초과하면 관련도 상위 30건만 싣는다.
+```json
+{"action":"expand","ids":["k12"],"drop":["k7","m2"]}
+{"action":"search","text":"…","targets":["knowledge"],"drop":["k7"]}
+```
+
+`k`는 지식, `m`은 처리방법의 `seq`입니다. 제목을 쓰지 않는 이유는 `title`이 VARCHAR(200)인데 프롬프트에는
+100자로 잘려 실리기 때문입니다. 긴 제목은 모델이 온전한 형태를 본 적이 없어 옮겨 적을 수 없습니다.
+목록 안의 위치도 쓸 수 없습니다. 검색 결과가 앞에 붙을 때마다 번호가 바뀌기 때문입니다.
+쿼리는 `query_name`이 짧은 식별자로 설계돼 온전히 실리므로 번호를 만들지 않습니다.
+
+- **번호는 잘렸고 아직 펼치지 않은 항목에만** 붙습니다. 청구할 수 있는 자리에만 보이므로 모델이 펼칠 수
+  없는 것을 청구하느라 스텝을 버리지 않습니다. 펼친 항목은 번호가 사라지는 것이 곧 "더 받을 것이 없다"입니다.
+- **펼친 본문은 4,000자, 요청당 2개까지**입니다. 둘이 한 섹션에 몰려도 그 섹션의 최소 몫(10,000자) 안에 듭니다.
+  펼친 항목은 목록 맨 앞으로 옮깁니다. 프롬프트 예산이 뒤에서부터 버리므로 그 자리라야 살아남습니다.
+- **버리기는 자료를 늘리는 행동에만** 얹힙니다(`search`·`expand`). 검색이 한 번뿐인 요청에서는 목록이 관련도
+  순이라 예산의 꼬리 버리기가 이미 옳은 정리입니다. 두 번째 검색부터 새 결과가 앞에 붙어 그 전제가 깨지고,
+  그때만 모델의 판단이 예산보다 낫습니다.
+- **버린 항목은 목록에서 지우지 않고 표시만 세웁니다.** 병합이 seq로 중복을 거르므로, 남겨 두어야 같은 항목이
+  재검색으로 되살아나지 않습니다. 효력은 그 요청 안에서만입니다.
+- 섹션 제목이 `## 관련 지식 (5건, 버림 3건)`으로 버린 수를 따로 밝힙니다. 건수만 줄이면 모델이 자기가 버린
+  것을 길이 제한으로 잘린 것으로 읽습니다.
+- 성공한 청구는 실행 이력에 남지 않습니다. 본문이 길어지는 것으로 프롬프트에 그대로 드러나기 때문입니다.
+  펼칠 것이 없거나 상한에 닿았을 때만 안내 한 줄이 남고 헛돈 스텝으로 셉니다.
+
+`chat_log`의 `trace.search`에 `expanded`·`dropped` 건수가 남습니다. 여러 요청에서 반복적으로 버려지는 지식은
+등록 품질 신호입니다.
+
+```sql
+-- 자주 버려지는 요청 찾기 (등록 내용을 손볼 후보)
+SELECT question, JSON_VALUE(trace, '$.search.dropped') AS dropped,
+       JSON_VALUE(trace, '$.search.expanded') AS expanded, created_at
+FROM chat_log WHERE JSON_VALUE(trace, '$.search.dropped') IS NOT NULL
+ORDER BY CAST(JSON_VALUE(trace, '$.search.dropped') AS UNSIGNED) DESC LIMIT 20;
+```
+
+### 쿼리 목록 (프롬프트 폭발 방지)
+
+쿼리 목록은 모델이 `query`를 검색했을 때 채워지고, 관련도 순으로 실린다 (`agent.js`의 `selectQueries`):
+
+- **경로A**: 찾은 `qa_method` 본문이 지목한 `query_name` — 다단계 절차 보장 (본문 등장 순서를 지킨다).
+  처리방법을 검색하면 `query`를 요청하지 않았어도 이 쿼리들은 함께 실린다 — 절차만 있고 쿼리 정의가 없으면 실행할 수 없다
+- **경로B**: 검색어로 `query_registry` 자체를 벡터 검색 — **qa_method 등록 없이 쿼리만 등록해도 찾는다**
+
+30건 이하면 검색에 걸리지 않은 쿼리까지 전부 뒤에 이어 붙이고(짧은 형태), 초과하면 검색 결과만 싣는다.
 정렬이 규모와 무관해야 하는 이유는 프롬프트 예산이 "뒤쪽일수록 덜 관련됐다"는 전제로 뒤에서부터
-줄이기 때문이다 — 저장 순서로 넘기면 예산이 버리는 것이 '덜 관련된 쿼리'가 아니라 '나중에 등록한 쿼리'가 된다.
+줄이기 때문이다.
 
-예산이 모자라면 **버리기 전에 줄인다**: 뒤쪽 쿼리는 `이름 / 용도 / 바인드`만 남긴 짧은 형태로 실린다.
-이름만 있어도 모델이 지목할 수 있고, 지목하면 서버가 등록 원문을 다시 찾아 다음 단계의 목록 맨 앞에
-전체 정의로 넣어준다. 즉 **등록한 쿼리가 프롬프트에서 통째로 사라지는 일은 없다**.
+자세한 형태(입출력 설명·SQL)는 경로A의 절차용 쿼리, 경로B 상위 5건, 그리고 모델이 지목한 쿼리에만 쓴다. 나머지는
+`이름 / 용도 / 바인드`만 실린다 — 이름만 있어도 모델이 지목할 수 있고, 지목하면 다음 스텝에 전체 정의로 실린다.
+즉 **등록한 쿼리가 프롬프트에서 통째로 사라지는 일은 없다**.
 
 따라서 `qa_method`는 여러 쿼리를 순서대로 쓰는 절차가 필요할 때만 등록하면 되고,
 단일 쿼리는 `query_registry`의 **`query_desc`(용도 요약)**를 성실히 쓰는 것으로 충분하다.
-`query_desc`는 벡터/LIKE 검색과 LLM 선택의 근거이므로 "어떤 질문일 때 무엇을 조회하는지"를 반드시 적을 것.
+`query_desc`는 벡터 검색과 LLM 선택의 근거이므로 "어떤 질문일 때 무엇을 조회하는지"를 반드시 적을 것.
 (짧은 형태로 실릴 때 남는 설명이 `query_desc` 앞부분이라는 점에서도 그렇다.)
 
 > 등록 SQL의 바인드는 **영문자로 시작하는 이름**이어야 한다 (`:job_id`). Oracle 위치 바인드(`:1`)는
 > 이 실행기가 값을 채울 수 없으므로 실행 직전 가드가 거부한다.
 
+### 조회 실행
+
+조회 DB 접속은 대상 DB(`target_db` 행)마다 커넥션 풀을 쓴다 (`oracle.js`). 실행마다 접속·해제하던 때는 세션 생성
+(수백 ms)과 NLS `ALTER SESSION` 왕복을 매 스텝 냈다. 풀은 처음 쓸 때 만들고, 등록을 고치면 다음 조회부터 새 풀이
+붙는다(접속정보·계정의 해시가 키다). 세션은 최대 4개, 5분 유휴면 정리한다. 결과 행은 상한(1,001행)까지 한 번에
+가져온다(`fetchArraySize`).
+
 ## 대화 로그
 
-모든 문답이 `chat_log` 테이블에 기록된다 (질문·답변·검색 적중 수·실행 쿼리 trace·시각). 용도는 두 가지 —
-평가셋 구축, 그리고 "못 답한 질문"을 찾아 지식/쿼리를 보강하는 운영 루프.
+모든 문답이 `chat_log` 테이블에 기록된다 (질문·답변·검색 요약·구간별 소요·검색과 실행 쿼리의 trace·시각). 용도는
+두 가지 — 평가셋 구축, 그리고 "못 답한 질문"을 찾아 지식/쿼리를 보강하는 운영 루프.
 
 - **3일 보존**: 서버가 기동 시 + 1시간 주기로 3일 지난 행을 정리한다 (`server.js`의 `CHAT_LOG_RETENTION_DAYS`)
 - 기록은 비동기라 실패해도 응답에 영향 없다
@@ -538,7 +664,10 @@ ORDER BY created_at DESC;
 특정 문구(`실행 오류` 등)로 거르면 정작 실패한 경우를 놓친다.
 `trace.steps[].error`에는 실제 쿼리 실패만 들어간다. 루프 가드가 남기는 제어용 기록(같은 쿼리 반복 등)은
 `note` 필드라 이 집계에 섞이지 않는다 — 정상적으로 답한 턴이 실패로 잡히지 않게 하기 위함.
-`trace.v`는 스키마 버전이다 (현재 3 — `{v, outcome, …}`. 이 필드가 없는 행은 trace가 steps 배열 자체였던 옛 형식).
+`trace.v`는 스키마 버전이다 (현재 4 — `{v, outcome, search, timing, steps}`. 이 필드가 없는 행은 trace가 steps 배열
+자체였던 옛 형식). 4부터 `steps`에는 검색 기록 `{search, targets, hits, failed?}`이 쿼리 기록과 같은 배열에 순서대로
+섞인다(번호가 곧 프롬프트의 스텝 번호), `search`는 요약 `{searches, targets, knowledge, qaMethods, queries,
+queriesFailed?, searchFailed?}`이고, `timing`은 `{total, llm[], search[], oracle[]}`(ms)이다.
 
 `trace.outcome`은 그 요청이 무엇으로 끝났는지다 (v3부터 반드시 있다). 답변까지 간 요청만이 아니라
 **답변에 닿지 못한 요청도 반드시 한 행을 남긴다** — 서버 오류·거부된 입력·본문 크기 초과가 기록되지
@@ -560,20 +689,79 @@ WHERE JSON_VALUE(trace, '$.outcome') <> 'answered'
 GROUP BY outcome, reason ORDER BY COUNT(*) DESC;
 ```
 
-검색이 아무것도 못 찾은 질문 (지식/쿼리 신규 등록 후보 — `trace.search`에 검색 적중 수가 남는다):
+검색이 아무것도 못 찾은 질문 (지식/쿼리 신규 등록 후보 — `trace.search`에 검색 요약이 남는다):
 
 ```sql
 SELECT question, created_at FROM chat_log
-WHERE JSON_VALUE(trace, '$.search.knowledge') = 0   -- search는 답변까지 간 요청(outcome='answered')에만 있다
-  AND JSON_VALUE(trace, '$.search.qaMethods') = 0
+WHERE JSON_VALUE(trace, '$.search.searches') > 0      -- 검색을 했는데 (인사처럼 검색 없이 답한 질문은 후보가 아니다)
+  AND COALESCE(JSON_VALUE(trace, '$.search.knowledge'), 0) = 0   -- 찾아본 적 없으면 null, 찾았는데 없으면 0
+  AND COALESCE(JSON_VALUE(trace, '$.search.qaMethods'), 0) = 0
   -- 경로B(qa_method 없이 쿼리만 등록)로 답한 질문을 후보로 잡지 않도록 쿼리 적중도 함께 본다.
   -- 라우팅이 동작하지 않는 소규모에서는 null이므로 그때는 이 조건을 적용하지 않는다.
   AND COALESCE(JSON_VALUE(trace, '$.search.queries'), 0) = 0
-  -- 관리 DB 장애로 쿼리 목록 자체를 못 읽은 요청은 후보에서 뺀다 (등록이 부족한 것이 아니다).
-  -- 그 요청은 `search.queriesFailed`가 true로 남는다 — 없으면 정상 경로다.
+  -- 검색이 성립하지 않았거나(임베딩 서버 없음) 관리 DB 장애로 쿼리 목록을 못 읽은 요청은 후보에서 뺀다
+  -- (등록이 부족한 것이 아니다). 그 요청은 search.searchFailed / search.queriesFailed 가 true로 남는다.
+  AND JSON_VALUE(trace, '$.search.searchFailed') IS NULL
   AND JSON_VALUE(trace, '$.search.queriesFailed') IS NULL
 ORDER BY created_at DESC;
 ```
+
+검색 없이 답한 질문 (모델이 검색을 건너뛴 경우 — 인사가 아닌데 여기 잡히면 시스템 프롬프트의 검색 규칙을 의심할 것):
+
+```sql
+SELECT question, LEFT(answer, 80) AS answer, created_at FROM chat_log
+WHERE JSON_VALUE(trace, '$.outcome') = 'answered' AND JSON_VALUE(trace, '$.search.searches') = 0
+ORDER BY created_at DESC;
+```
+
+어디가 느린가 (요청당 구간별 소요 — 서버 로그의 `[agent] timing …` 한 줄과 같은 값. `timing.llm`의 항목은
+`{ms, prompt, completion}`이고 토큰 수는 서버가 usage를 줄 때만 있다. `timing.oracle`의 항목은 조회 '한 번'이
+아니라 결정 한 번의 경과다 — 일괄 조회는 병렬로 돌므로 항목마다 재면 겹친 시간이 그 수만큼 더해진다):
+
+```sql
+SELECT question,
+       JSON_VALUE(trace, '$.timing.total') AS total_ms,
+       JSON_LENGTH(trace, '$.timing.llm') AS llm_calls,
+       JSON_EXTRACT(trace, '$.timing.llm[*].ms') AS llm_ms,
+       JSON_EXTRACT(trace, '$.timing.llm[*].prompt') AS prompt_tokens,
+       JSON_EXTRACT(trace, '$.timing.llm[*].completion') AS completion_tokens,
+       JSON_EXTRACT(trace, '$.timing.search') AS search_ms,
+       JSON_EXTRACT(trace, '$.timing.oracle') AS oracle_ms
+FROM chat_log WHERE JSON_VALUE(trace, '$.v') >= 4
+ORDER BY CAST(JSON_VALUE(trace, '$.timing.total') AS UNSIGNED) DESC LIMIT 20;
+```
+
+### 검색 후보 수·검색 횟수 조정
+
+두 값은 `.env`로 낮출 수 있다 — `SEARCH_LIMIT`(소스당 후보 수, 기본 20)과 `MAX_SEARCHES`(검색 횟수 상한, 기본 3).
+올리지는 못한다: 프롬프트 예산(`constants.js`)이 그 최대치를 전제로 검증된다. 낮출 근거는 계측이다.
+
+후보 수를 낮출 근거 — 검색 뒤 LLM 호출의 프롬프트가 크고(두 번째 호출의 `prompt` 토큰), 적중이 상한에 붙어 있다
+(20건이 늘 차면 관련도 임계값이 아니라 상한이 후보를 자르고 있다는 뜻이다). 절반으로 줄이면 그 호출의 prefill이
+대략 그만큼 준다:
+
+```sql
+SELECT ROUND(AVG(JSON_VALUE(trace, '$.timing.llm[1].prompt'))) AS prompt_after_search,
+       SUM(JSON_VALUE(trace, '$.search.knowledge') >= 20) AS knowledge_saturated,
+       SUM(JSON_VALUE(trace, '$.search.qaMethods') >= 20) AS qa_saturated,
+       COUNT(*) AS answered
+FROM chat_log
+WHERE JSON_VALUE(trace, '$.v') >= 4 AND JSON_VALUE(trace, '$.search.searches') >= 1;
+```
+
+검색 횟수를 낮출 근거 — 두 번째·세 번째 검색이 새 자료를 거의 더하지 않는다. 검색이 둘 이상인 요청의 비율과 그때
+답변까지의 LLM 호출 수를 본다:
+
+```sql
+SELECT JSON_VALUE(trace, '$.search.searches') AS searches,
+       COUNT(*) AS requests,
+       ROUND(AVG(JSON_LENGTH(trace, '$.timing.llm'))) AS llm_calls,
+       ROUND(AVG(JSON_VALUE(trace, '$.timing.total'))) AS total_ms
+FROM chat_log WHERE JSON_VALUE(trace, '$.v') >= 4 AND JSON_VALUE(trace, '$.outcome') = 'answered'
+GROUP BY searches ORDER BY searches;
+```
+
+값을 바꾸면 `[agent] timing` 로그의 `prompt … tok`과 위 SQL로 전후를 비교한다.
 
 ## 향후 확장 지점
 

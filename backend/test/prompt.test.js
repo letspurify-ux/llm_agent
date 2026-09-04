@@ -6,12 +6,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { buildPrompt } from '../src/llm-openai.js';
-import { MAX_PROMPT_TOTAL_LEN, MAX_PROMPT_STEP_LEN, PROMPT_FLOORS, PROMPT_FRAME_RESERVE, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN, MAX_CELL_LEN, MAX_RESULT_COLS, MAX_ROWS, MAX_STEPS, TRUNC_MARK } from '../src/constants.js';
+import { MAX_PROMPT_TOTAL_LEN, MAX_PROMPT_STEP_LEN, PROMPT_FLOORS, PROMPT_FRAME_RESERVE, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN, MAX_CELL_LEN, MAX_RESULT_COLS, MAX_ROWS, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_EXPANDED_ITEM_LEN, MAX_PROMPT_ITEM_LEN, TRUNC_MARK } from '../src/constants.js';
 
 const big = n => 'ㄱ'.repeat(n);
 
 const ctx = (over = {}) => ({
   question: '질문', chat: [], knowledge: [], qaMethods: [], queries: [], history: [], ...over,
+  // searched를 준 ctx는 이미 검색을 한 요청이다 (agent.js가 그 둘을 함께 채운다)
+  tried: over.tried ?? (over.searched?.length ?? 0) > 0,
 });
 
 // 컬럼 수는 드라이버 경계(oracle.js MAX_RESULT_COLS)가 묶지만, 프롬프트 조립은 그 경계가
@@ -22,9 +24,11 @@ const wideRows = (rows, cols) =>
 
 const knowledge = n => new Array(n).fill(0).map((_, i) => ({ seq: i, title: `지식${i}`, content: big(5000) }));
 const methods = n => new Array(n).fill(0).map((_, i) => ({ seq: i, title: `방법${i}`, method: big(5000) }));
+// detail: 자세한 형태(입출력·SQL)로 올릴 대상 표시 — agent.js가 절차용·상위 적중·지목된 쿼리에 붙인다.
+// 예산 테스트는 '올릴 수 있는 만큼 올린다'를 재므로 전부 표시해 둔다 (표시가 없으면 짧은 줄로만 실린다).
 const queries = n => new Array(n).fill(0).map((_, i) => ({
   seq: i, query_name: `q${i}`, query_desc: big(3000), input_desc: big(3000),
-  output_desc: big(3000), query_sql: `SELECT ${big(3000)} FROM t WHERE a = :a`, target_db_name: 'D',
+  output_desc: big(3000), query_sql: `SELECT ${big(3000)} FROM t WHERE a = :a`, target_db_name: 'D', detail: true,
 }));
 
 // 대화·질문은 이 예산 밖이다(각자 다른 상한으로 이미 묶여 있다) — 그 몫만큼 여유를 둔다.
@@ -321,7 +325,7 @@ test('본문에 든 개행이 목록 항목의 경계를 무너뜨리지 않는�
     knowledge: [{ title: '재시작\n절차', content: '1) 콘솔 접속\r\n2) 작업 선택\n\n3) 재시작' }, { title: 'B', content: 'b' }],
     qaMethods: [{ title: 'M', method: '1단계\n2단계' }],
     queries: [{ query_name: 'q0', query_desc: '용도\n두 줄', input_desc: 'i', output_desc: 'o',
-      query_sql: 'SELECT A\n  FROM T\n WHERE B = :b', target_db_name: 'D' }],
+      query_sql: 'SELECT A\n  FROM T\n WHERE B = :b', target_db_name: 'D', detail: true }],
     history: [{ query_name: 'q0', params: { b: 1 }, error: 'ORA-00942: table or view does not exist\nHelp: https://docs.oracle.com/error-help/db/ora-00942/', hint: '다른 쿼리를\n선택하라' }],
     chat: [{ role: 'assistant', text: '### 결과\n\n| A |\n|---|\n| 1 |' }],
   }));
@@ -347,14 +351,14 @@ test('자료가 먼저, 질문과 지시가 맨 끝에 온다', () => {
     queries: [{ query_name: 'q0', query_desc: 'd', input_desc: 'i', output_desc: 'o', query_sql: 'SELECT 1 FROM t WHERE a=:a' }],
     history: [{ query_name: 'q0', params: { a: 1 }, rows: [{ A: 1 }], totalRows: 1 }],
   }));
-  const order = ['## 관련 지식', '## Q&A 처리 방법', '## 실행 가능한 쿼리 목록', '## 쿼리 실행 이력', '## 최근 대화', '## 사용자 질문 (현재)\n그럼 김철수는?', '## 지시'];
+  const order = ['## 관련 지식', '## Q&A 처리 방법', '## 실행 가능한 쿼리 목록', '## 실행 이력 (검색·쿼리)', '## 최근 대화', '## 사용자 질문 (현재)\n그럼 김철수는?', '## 지시'];
   const at = order.map(h => p.indexOf(h));
   assert.ok(at.every(i => i >= 0), `빠진 섹션: ${order.filter((_, i) => at[i] < 0)}`);
   assert.deepStrictEqual([...at].sort((a, b) => a - b), at, '섹션 순서가 어긋났다');
   // 지시는 마지막 스텝에만 붙는 것이 아니다 — 평소에도 무엇을 하라는지 프롬프트 끝에 있어야 한다
   assert.match(p, /## 지시\n현재 시각: .+\n위 자료를 근거로 현재 질문에 대한 다음 행동 하나를 JSON으로 결정하라\.$/);
   const last = buildPrompt(ctx({ forceAnswer: true }));
-  assert.match(last, /## 지시\n현재 시각: .+\n더 이상 쿼리를 실행할 수 없다\. .*action="answer".*$/);
+  assert.match(last, /## 지시\n현재 시각: .+\n더 이상 검색하거나 쿼리를 실행할 수 없다\. .*action="answer".*$/);
   assert.ok(!last.includes('위 자료를 근거로'), '마지막 스텝에 두 지시가 함께 실렸다');
 });
 
@@ -391,16 +395,36 @@ test('실행 이력의 스텝 번호는 앞선 스텝이 생략돼도 당겨지�
   assert.deepStrictEqual([...all.matchAll(/^(\d+)\. step/gm)].map(m => m[1]), ['1', '2', '3']);
 });
 
-test('모든 섹션이 같은 형태로 건수를 달고, 비면 (없음)을 싣는다', () => {
+test('모든 섹션이 같은 형태로 건수를 달고, 찾아봤는데 비면 (없음)을 싣는다', () => {
   // 제목마다 규칙이 다르면(어떤 것엔 건수가 있고 어떤 본문은 빈 채로 끝나면) 모델은 '비어 있음'과
   // '누락됨'을 가를 수 없다. 건수는 생략 안내와 맞춰 볼 때 '몇 건 중 몇 건이 실렸는지'를 준다.
-  const p = buildPrompt(ctx());
-  for (const h of ['관련 지식 (0건)', 'Q&A 처리 방법 (0건)', '실행 가능한 쿼리 목록 (0건)', '쿼리 실행 이력 (0건)', '최근 대화 (0턴)']) {
+  const p = buildPrompt(ctx({ searched: ['knowledge', 'qa_method', 'query'] }));
+  for (const h of ['관련 지식 (0건)', 'Q&A 처리 방법 (0건)', '실행 가능한 쿼리 목록 (0건)', '실행 이력 (검색·쿼리) (0건)', '최근 대화 (0턴)']) {
     assert.ok(p.includes(`## ${h}\n(없음)`), `${h} 형태가 다르다`);
   }
   const some = buildPrompt(ctx({ queries: queries(2), history: [{ query_name: 'q0', params: {}, rows: [], totalRows: 0 }] }));
   assert.ok(some.includes('## 실행 가능한 쿼리 목록 (2건)\n- q0:'));
-  assert.ok(some.includes('## 쿼리 실행 이력 (1건)\n1. q0 '));
+  assert.ok(some.includes('## 실행 이력 (검색·쿼리) (1건)\n1. q0 '));
+});
+
+test('찾아보지 않은 자료의 섹션은 아예 싣지 않고, 그 사실을 지시에 적는다', () => {
+  // '(없음)'은 '찾았는데 없다'다. 찾아보지도 않은 대상을 (없음)으로 실으면 모델은 '등록된 것이 없다'로 읽고
+  // 검색 없이 일반 지식으로 답한다 — 검색을 모델의 요청에 맡긴 구조에서 가장 나쁜 실패다.
+  const none = buildPrompt(ctx());
+  for (const h of ['## 관련 지식', '## Q&A 처리 방법', '## 실행 가능한 쿼리 목록']) {
+    assert.ok(!none.includes(h), `${h}가 찾아보지도 않았는데 실렸다`);
+  }
+  assert.match(none, /## 지시\n현재 시각: .+\n아직 검색한 자료가 없다\. .*\n위 자료를 근거로/);
+  // 일부만 찾아봤으면 그 섹션만 — 나머지는 여전히 없다
+  const part = buildPrompt(ctx({ searched: ['knowledge'] }));
+  assert.ok(part.includes('## 관련 지식 (0건)\n(없음)'));
+  assert.ok(!part.includes('## Q&A 처리 방법') && !part.includes('## 실행 가능한 쿼리 목록'));
+  assert.ok(!part.includes('아직 검색한 자료가 없다'), '한 번이라도 찾아봤으면 안내를 붙이지 않는다');
+  // 처리방법이 지목해서 들어온 쿼리(경로A)는 query를 찾아본 적 없어도 실린다 — 목록에 있으면 보인다
+  const viaMethod = buildPrompt(ctx({ searched: ['qa_method'], queries: queries(1) }));
+  assert.ok(viaMethod.includes('## 실행 가능한 쿼리 목록 (1건)\n- q0:'));
+  // 강제 답변 스텝에는 안내를 붙이지 않는다 — 더 찾아볼 수 없는데 찾으라고 말하면 안 된다
+  assert.ok(!buildPrompt(ctx({ forceAnswer: true })).includes('아직 검색한 자료가 없다'));
 });
 
 test('꽉 찬 MAX_STEPS 스텝의 실행 이력이 강제 답변 스텝에서도 전부 실린다', () => {
@@ -421,4 +445,160 @@ test('꽉 찬 MAX_STEPS 스텝의 실행 이력이 강제 답변 스텝에서도
   }
   assert.ok(!p.includes('스텝은 프롬프트 길이 제한으로 생략'), '이력이 생략됐다');
   assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN, `프롬프트가 예산을 넘었다: ${p.length}`);
+});
+
+// ===== 검색 기록 줄 =====
+
+test('검색 기록은 대상별 적중 수를 대상 이름과 함께 한 줄로 싣는다', () => {
+  const p = buildPrompt(ctx({ searched: ['knowledge', 'query'], history: [
+    { search: '배치 재시작', targets: ['knowledge', 'query'], hits: { knowledge: 2, qaMethods: null, queries: 3 } },
+    { search: '배치 재시작', targets: ['knowledge'], note: '이미 같은 검색어·대상으로 검색했다' },
+    { search: '재시작', targets: ['knowledge', 'qa_method', 'query'], hits: { knowledge: 0, qaMethods: null, queries: null }, failed: ['qa_method', 'query'] },
+  ] }));
+  assert.ok(p.includes('1. 검색 "배치 재시작" [지식·쿼리] → 지식 2건 · 쿼리 3건'), p);
+  assert.ok(p.includes('2. 검색 "배치 재시작" [지식] → 실행하지 않음: 이미 같은 검색어·대상으로 검색했다'), p);
+  // 검색 불가는 0건과 다른 말이다 — 시스템 프롬프트가 이 표기를 그대로 언급한다
+  assert.ok(p.includes('3. 검색 "재시작" [지식·처리방법·쿼리] → 지식 0건 · 처리방법 검색 불가 · 쿼리 검색 불가'), p);
+  // 찾아보지 않은 대상은 줄에 나오지 않는다
+  assert.ok(!p.includes('처리방법 null'));
+});
+
+test('검색 줄도 스텝 번호를 차지한다 — 차트의 data: step N이 가리키는 번호와 같아야 한다', () => {
+  const p = buildPrompt(ctx({ searched: ['query'], history: [
+    { search: 'x', targets: ['query'], hits: { knowledge: null, qaMethods: null, queries: 1 } },
+    { query_name: 'q0', params: {}, rows: [{ A: 1 }], totalRows: 1 },
+  ] }));
+  assert.ok(p.includes('1. 검색 "x"'));
+  assert.ok(p.includes('2. q0 params={}'));
+});
+
+test('꽉 찬 쿼리 스텝 MAX_STEPS개에 검색 줄 MAX_SEARCHES개가 더해져도 이력이 전부 실린다', () => {
+  // 루프는 쿼리 결정과 검색을 따로 세므로(agent.js runs·searches) 이력에는 둘이 함께 온다.
+  // 이력 몫이 쿼리 줄만으로 계산되어 있으면 검색이 더해진 강제 답변 스텝에서 1번 스텝이 조용히 빠진다.
+  const full = i => ({
+    query_name: `step${i}${big(150)}`, targetDb: big(150), params: { p: big(600) },
+    rows: wideRows(20, 30), totalRows: MAX_ROWS, capped: true,
+  });
+  const search = i => ({ search: `검색${i}${big(600)}`, targets: ['knowledge', 'qa_method', 'query'], note: big(1200) });
+  const history = [];
+  for (let i = 0; i < MAX_SEARCHES; i++) history.push(search(i));
+  for (let i = 0; i < MAX_STEPS; i++) history.push(full(i));
+  const p = buildPrompt(ctx({
+    forceAnswer: true, searched: ['knowledge', 'qa_method', 'query'],
+    knowledge: knowledge(30), qaMethods: methods(30), queries: queries(35), history,
+  }));
+  assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN, `프롬프트가 예산을 넘었다: ${p.length}`);
+  assert.ok(p.includes('1. 검색 "검색0'), '첫 검색 줄이 빠졌다');
+  assert.ok(p.includes(`${MAX_SEARCHES + 1}. step0`), '첫 쿼리 스텝이 빠졌다');
+  assert.ok(!p.includes('스텝은 프롬프트 길이 제한으로 생략'), '이력이 잘렸다');
+});
+
+test('자세한 형태는 detail 표시가 붙은 쿼리만 — 나머지는 예산이 남아도 짧은 줄이다', () => {
+  // 예전에는 예산이 남는 만큼 앞에서부터 전부 올렸다. 검색이 요청 시에만 도는 구조에서는 예산이 늘 남아
+  // 등록 30건 × SQL 원문이 스텝마다 실렸다 — 그 prefill이 스텝 수만큼 곱해진다.
+  const list = queries(6).map((q, i) => ({ ...q, detail: i < 2 }));
+  const p = buildPrompt(ctx({ queries: list }));
+  assert.equal(countDetailed(p), 2);
+  assert.equal(countQueryLines(p), 6, '짧은 줄이라도 이름은 전부 실린다');
+  assert.match(p, /위 4건은 이름·용도·바인드만 표시했다/);
+});
+
+test('이력 줄 수 상한(MAX_HISTORY_ROWS)까지는 어떤 조합이든 전부 실린다', () => {
+  // 일괄 조회 전에는 루프 반복 수가 곧 줄 수여서 이 보장이 저절로 지켜졌다. 결정 하나가 조회 여럿을
+  // 만들게 되면서 줄이 반복 수보다 많아질 수 있고, 실측으로 9줄에서 1번 스텝이 빠졌다 —
+  // 그 손해는 '앞선 조회가 통째로 헛수고'라 오류 없이 답변만 부실해진다.
+  const full = i => ({
+    query_name: `step${i}${big(150)}`, targetDb: big(150), params: { p: big(600) },
+    rows: wideRows(20, 30), totalRows: MAX_ROWS, capped: true,
+  });
+  const searchRow = i => ({ search: `검색${i}${big(600)}`, targets: ['knowledge', 'qa_method', 'query'], note: big(1200) });
+  const noteRow = i => ({ query_name: `${i}${big(150)}`, targetDb: big(150), params: { p: big(600) }, note: big(1200) });
+  // 길이로 따진 최악 — 쿼리 줄을 최대한 많이, 남는 자리는 안내 줄과 검색 줄
+  const notes = MAX_HISTORY_ROWS - MAX_STEPS - MAX_SEARCHES;
+  const history = [
+    ...Array.from({ length: MAX_SEARCHES }, (_, i) => searchRow(i)),
+    ...Array.from({ length: MAX_STEPS }, (_, i) => full(i)),
+    ...Array.from({ length: notes }, (_, i) => noteRow(i)),
+  ];
+  assert.equal(history.length, MAX_HISTORY_ROWS);
+  const p = buildPrompt(ctx({
+    forceAnswer: true, searched: ['knowledge', 'qa_method', 'query'],
+    knowledge: knowledge(30), qaMethods: methods(30), queries: queries(35), history,
+  }));
+  assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN, `프롬프트가 예산을 넘었다: ${p.length}`);
+  assert.ok(!p.includes('스텝은 프롬프트 길이 제한으로 생략'), '이력이 잘렸다 — 이력 몫이 줄 수 상한을 감당하지 못한다');
+  assert.ok(p.includes('1. 검색 "검색0'), '첫 검색 줄이 빠졌다');
+  assert.ok(p.includes(`${MAX_SEARCHES + 1}. step0`), '첫 쿼리 스텝이 빠졌다');
+});
+
+test('검색이 성립하지 않아 섹션이 비어도 "아직 검색한 자료가 없다"고 말하지 않는다', () => {
+  // 임베딩 서버가 죽어 세 검색이 모두 불가였던 요청이다. 섹션은 없지만(그 대상들은 찾아본 것이 아니다)
+  // 모델은 이미 검색을 썼다 — 여기서 '먼저 찾으라'고 다시 말하면 남은 검색 기회를 그대로 태운다.
+  const p = buildPrompt(ctx({
+    tried: true, searched: [],
+    history: [{ search: 'x', targets: ['knowledge', 'qa_method', 'query'], hits: {}, failed: ['knowledge', 'qa_method', 'query'] }],
+  }));
+  assert.ok(!p.includes('아직 검색한 자료가 없다'), '검색을 이미 한 요청에 안내가 붙었다');
+  assert.ok(!p.includes('## 관련 지식'), '성립하지 않은 검색의 섹션이 (없음)으로 실렸다');
+  assert.match(p, /검색 불가/, '검색 불가는 이력 줄이 말해야 한다');
+});
+
+// ===== 자료 항목의 번호·펼침·버리기 =====
+
+test('번호는 잘렸고 아직 펼치지 않은 항목에만 붙는다', () => {
+  // 청구할 수 있는 자리에만 번호가 보여야 모델이 펼칠 수 없는 것을 청구하느라 스텝을 버리지 않는다.
+  const p = buildPrompt(ctx({ searched: ['knowledge'], knowledge: [
+    { seq: 12, title: '긴 것', content: big(MAX_PROMPT_ITEM_LEN + 1) },
+    { seq: 3, title: '짧은 것', content: '본문' },
+    { seq: 9, title: '이미 펼친 것', content: big(MAX_PROMPT_ITEM_LEN + 1), expanded: true },
+  ] }));
+  assert.match(p, /^- k12 \[긴 것\] /m, '잘린 항목에 번호가 없다');
+  assert.match(p, /^- \[짧은 것\] 본문$/m, '잘리지 않은 항목에 번호가 붙었다');
+  assert.match(p, /^- \[이미 펼친 것\] /m, '펼친 항목에 번호가 남았다 — 더 받을 것이 없다는 표시가 사라진다');
+});
+
+test('펼친 항목은 더 긴 상한으로 실린다', () => {
+  const body = big(MAX_EXPANDED_ITEM_LEN + 500);
+  const one = buildPrompt(ctx({ searched: ['knowledge'], knowledge: [{ seq: 1, title: 'K', content: body }] }));
+  const two = buildPrompt(ctx({ searched: ['knowledge'], knowledge: [{ seq: 1, title: 'K', content: body, expanded: true }] }));
+  const len = md => md.split('\n').find(l => l.startsWith('- ') || l.startsWith('- k')).length;
+  assert.ok(len(two) > len(one) + 2000, `펼친 본문이 길어지지 않았다: ${len(one)} → ${len(two)}`);
+  assert.ok(len(two) < MAX_EXPANDED_ITEM_LEN + 300, '펼친 본문이 상한을 넘었다');
+});
+
+test('버린 항목은 실리지도 세지도 않고, 버린 수는 따로 밝힌다', () => {
+  // 건수만 줄여 보이면 모델은 자기가 버린 것을 길이 제한으로 잘린 것으로 읽는다.
+  const p = buildPrompt(ctx({ searched: ['knowledge', 'qa_method'], knowledge: [
+    { seq: 1, title: '남길 것', content: 'a' },
+    { seq: 2, title: '버린 것', content: 'b', dropped: true },
+    { seq: 3, title: '또 버린 것', content: 'c', dropped: true },
+  ], qaMethods: [{ seq: 1, title: 'M', method: 'm' }] }));
+  assert.match(p, /^## 관련 지식 \(1건, 버림 2건\)$/m);
+  assert.ok(!p.includes('버린 것]'), '버린 항목이 실렸다');
+  assert.match(p, /^## Q&A 처리 방법 \(1건\)$/m, '버린 것이 없으면 그 표기를 붙이지 않는다');
+});
+
+test('모두 버린 섹션은 (없음)으로 남는다 — 찾아본 사실은 사라지지 않는다', () => {
+  const p = buildPrompt(ctx({ searched: ['knowledge'], knowledge: [{ seq: 1, title: 'K', content: 'a', dropped: true }] }));
+  assert.match(p, /^## 관련 지식 \(0건, 버림 1건\)\n\(없음\)$/m);
+});
+
+test('펼친 항목이 상한만큼 있어도 프롬프트가 예산을 넘지 않고, 그 본문이 잘리지 않는다', () => {
+  // 펼친 항목은 목록 맨 앞에 온다(agent.js) — 예산이 뒤에서부터 버리므로 그 자리라야 살아남는다.
+  const expanded = Array.from({ length: MAX_EXPANDS }, (_, i) => ({
+    seq: 100 + i, title: `펼친${i}`, content: big(MAX_EXPANDED_ITEM_LEN), expanded: true,
+  }));
+  const p = buildPrompt(ctx({
+    forceAnswer: true, searched: ['knowledge', 'qa_method', 'query'],
+    knowledge: [...expanded, ...knowledge(30)], qaMethods: methods(30), queries: queries(35),
+    history: new Array(MAX_STEPS).fill(0).map((_, i) => ({
+      query_name: `step${i}`, params: {}, rows: wideRows(20, 30), totalRows: MAX_ROWS, capped: true,
+    })),
+  }));
+  assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN, `프롬프트가 예산을 넘었다: ${p.length}`);
+  for (let i = 0; i < MAX_EXPANDS; i++) {
+    const line = p.split('\n').find(l => l.startsWith(`- [펼친${i}]`));
+    assert.ok(line, `펼친 항목 ${i}이 실리지 않았다`);
+    assert.ok(!line.includes(TRUNC_MARK), `펼친 항목 ${i}의 본문이 다시 잘렸다`);
+  }
 });

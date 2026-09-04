@@ -6,7 +6,11 @@ import { REMARK_PLUGINS, REHYPE_PLUGINS } from './math.js';
 // 차트 블록의 계약(무엇을 차트로 받는가 + 이력으로 되돌릴 때의 모양)은 chart.js에 있다.
 import { parseChartBlock, splitBlock, chartTableMarkdownFrom, chartBlocksToTables, sliceSafe, clip, MAX_CHARTS_PER_MESSAGE, MAX_TITLE_LEN } from './chart.js';
 // trace 패널의 계약(열·셀 표기·CSV)은 trace.js에 있다.
-import { columnsOf, cellText, toCsv, csvFileName, stepLabel, normalizeTrace } from './trace.js';
+import { columnsOf, cellText, toCsv, csvFileName, stepLabel, normalizeTrace, isSearchStep, targetsLabel, traceSummary,
+  applyProgress, progressText } from './trace.js';
+// 응답 스트림(진행 이벤트 + 마지막 답)을 읽는 계약은 stream.js에, 답변 미리보기의 손질은 preview.js에 있다.
+import { readEvents } from './stream.js';
+import { previewMarkdown } from './preview.js';
 // 답변 속 주소를 어떻게 다룰지의 판정은 markdown.js에 있다 (순수 함수라 회귀 테스트가 붙는다).
 import { linkTarget, imageTarget, mdProps } from './markdown.js';
 
@@ -31,6 +35,8 @@ const clipTurn = s => sliceSafe(String(s ?? ''), HISTORY_LEN);
 // 클라이언트가 먼저 끊어 "서버와 통신하지 못했습니다"로 뭉개진다.
 // 이게 없으면 반대로 서버가 응답하지 않을 때 타이핑 표시가 영원히 돈다.
 const REQUEST_TIMEOUT_MS = 450_000;
+// 답변 조각을 화면에 올리는 간격(ms). 눈에는 연속으로 보이면서 markdown 파싱은 초당 여덟 번을 넘지 않는다.
+const PREVIEW_FLUSH_MS = 120;
 
 const EXAMPLES = [
   'SPACE 시스템이 뭐야?',
@@ -234,6 +240,9 @@ function TraceStep({ step: t, showGrid }) {
   return (
     <div className="trace-step">
       <div className="trace-head">
+        {/* 번호는 서버가 준 이력의 절대 순번이다 (result.js clientTrace) — 모델이 답변에서 "3번 조회"라고 말할 때
+            사용자가 여기서 세는 번호와 같아야 한다. 남은 것만 다시 세면 걸러진 항목만큼 어긋난다. */}
+        {t.step !== undefined && <span className="trace-no">{t.step}.</span>}
         {/* 대상 DB가 여럿인 쿼리는 쿼리 이름만으로 무엇을 조회했는지 알 수 없다.
             대상이 하나인 등록에서도 함께 보여준다 — 있고 없고가 등록 형태에 따라 갈리면
             같은 화면이 어떤 줄에서만 DB를 밝히게 되어 그 차이가 뜻으로 읽힌다.
@@ -304,16 +313,47 @@ function TraceGrid({ rows }) {
   );
 }
 
-// '⚡ 실행된 쿼리' 패널. 펼침 상태를 Message가 아니라 여기 두는 이유: Message가 다시 렌더되면 markdown을
-// 다시 파싱하고 차트를 다시 그린다 — 패널을 여닫는 일이 그 비용을 내서는 안 된다.
+// 검색 한 건: 검색어·대상·대상별 적중 수 한 줄. 답을 기다리는 동안 진행 줄로 보이던 것이 답이 온 뒤에는
+// 여기 남는다 — 무엇을 찾아봤는지가 사라지면 '왜 이 답인가'의 절반이 사라진다. 표도 CSV 단추도 없다.
+function TraceSearch({ step: t }) {
+  return (
+    <div className="trace-step trace-search">
+      <div className="trace-head">
+        {t.step !== undefined && <span className="trace-no">{t.step}.</span>}
+        <code>🔎 검색 "{t.search}" ({targetsLabel(t.targets)})</code>
+        <span className="trace-count">{stepLabel(t)}</span>
+      </div>
+    </div>
+  );
+}
+
+// '⚡ 검색 N회 · 실행된 쿼리 M건' 패널. 펼침 상태를 Message가 아니라 여기 두는 이유: Message가 다시 렌더되면
+// markdown을 다시 파싱하고 차트를 다시 그린다 — 패널을 여닫는 일이 그 비용을 내서는 안 된다.
+// 검색 항목과 쿼리 항목은 서버가 준 순서 그대로다(그 번호가 모델이 본 스텝 번호다 — backend result.js).
 function TracePanel({ trace }) {
   // 한 번이라도 펼쳤는가 — 그 뒤로는 접어도 표를 지우지 않는다(다시 펼칠 때 재생성 비용을 내지 않게).
   const [opened, setOpened] = useState(false);
   return (
     <details className="trace" onToggle={e => { if (e.currentTarget.open) setOpened(true); }}>
-      <summary>⚡ 실행된 쿼리 {trace.length}건</summary>
-      {trace.map((t, j) => <TraceStep key={j} step={t} showGrid={opened} />)}
+      <summary>⚡ {traceSummary(trace)}</summary>
+      {trace.map((t, j) => (isSearchStep(t) ? <TraceSearch key={j} step={t} /> : <TraceStep key={j} step={t} showGrid={opened} />))}
     </details>
+  );
+}
+
+// 답을 기다리는 동안의 진행 줄 — 검색·조회가 시작되면 바로 서고(서버가 흘려보내는 이벤트, backend agent.js),
+// 끝나면 같은 줄에 결과가 붙는다. 답이 오면 이 목록은 사라지고 같은 내용이 답 아래 패널(TracePanel)에 남는다.
+// 글자는 trace.js progressText가 만든다 — 패널과 같은 말을 쓰게.
+function ProgressList({ items }) {
+  return (
+    <ul className="progress" aria-live="polite">
+      {items.map((it, i) => (
+        <li key={i} className={it.pending ? 'pending' : undefined}>
+          <span className="progress-icon" aria-hidden="true">{it.kind === 'search' ? '🔎' : '⚡'}</span>
+          <span className="progress-text">{progressText(it)}</span>
+        </li>
+      ))}
+    </ul>
   );
 }
 
@@ -364,6 +404,14 @@ export default function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  // 답을 기다리는 동안 서버가 흘려보낸 진행 줄 (ProgressList). 답이 오거나 요청이 끝나면 비운다.
+  const [progress, setProgress] = useState([]);
+  // 답변 미리보기 — 서버가 흘려보내는 답변 조각(answer_delta)을 모은 글자. 최종 답은 done이 다시 준다.
+  // 조각마다 state를 올리지 않는다: 한 답변에 조각이 수백 개고 그때마다 markdown을 다시 파싱하면 화면이 버벅인다.
+  // 모아 두었다가 짧은 간격으로 한 번씩 올린다 (아래 pushPreview).
+  const [preview, setPreview] = useState('');
+  const previewBufRef = useRef('');
+  const previewTimerRef = useRef(0);
   const inputRef = useRef(null);
   const historyRef = useRef([]);      // 서버로 보낼 대화 이력 (setState 비동기와 무관하게 즉시 반영)
   const composingRef = useRef(false); // IME 조합 진행 중
@@ -781,6 +829,21 @@ export default function App() {
   // 실제 중복 전송을 막는 것은 ref 쪽이다 (state는 버튼 비활성화 등 렌더에만 쓴다).
   const canSend = () => !loading && !sendingRef.current;
 
+  const pushPreview = text => {
+    previewBufRef.current += text;
+    if (previewTimerRef.current) return;
+    previewTimerRef.current = setTimeout(() => {
+      previewTimerRef.current = 0;
+      setPreview(previewBufRef.current);
+    }, PREVIEW_FLUSH_MS);
+  };
+  const resetPreview = () => {
+    previewBufRef.current = '';
+    clearTimeout(previewTimerRef.current);
+    previewTimerRef.current = 0;
+    setPreview('');
+  };
+
   // 첫 화면(빈 상태)으로 되돌린다. 화면이 하나뿐이라 '홈으로 이동'은 곧 대화를 접는 것이다.
   // 답을 기다리는 중에도 눌릴 수 있다 — 요청 상한이 450초라 그때까지 막아두면
   // 사실상 되돌아갈 수 없는 시간이 생긴다. 그래서 진행 중인 요청은 여기서 끊는다.
@@ -796,6 +859,8 @@ export default function App() {
     setMessages([]);
     setInput('');
     setLoading(false);
+    setProgress([]);
+    resetPreview();
     inputRef.current?.focus();
   }
 
@@ -886,14 +951,25 @@ export default function App() {
       historyRef.current = [...historyRef.current, { role: 'user', text: message }];
       setMessages(m => [...m, { role: 'user', text: message }]);
       setLoading(true);
+      setProgress([]);
       const res = await fetch('/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        // 진행 상황을 흘려 받는다(NDJSON — backend server.js openStream). Accept가 없으면 서버는 예전처럼
+        // JSON 하나를 주고, 그것도 같은 함수가 읽는다 (stream.js) — 검사의 가로채기가 주는 것이 그 모양이다.
+        headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
         signal: ctrl.signal,
         // 서버는 상태를 저장하지 않으므로 최근 대화를 함께 보낸다 (후속 질문 해석용)
         body: JSON.stringify({ message, history }),
       });
-      const data = await res.json();
+      // 진행 이벤트는 답을 기다리는 말풍선에 바로 선다. 그사이 홈으로 돌아갔으면(세대가 다르면) 버린다 —
+      // 비운 화면에 지난 대화의 검색 줄이 서면 안 된다. 마지막 이벤트(답·오류·예전 JSON)가 곧 응답 본문이다.
+      // 없으면(done 없이 닫혔다) 빈 것으로 두어 아래가 '답변을 만들지 못했습니다'로 다루게 한다.
+      const data = (await readEvents(res, e => {
+        if (sessionRef.current !== session) return;
+        if (e.type === 'answer_delta') { if (typeof e.text === 'string') pushPreview(e.text); return; }
+        if (e.type === 'answer_reset') { resetPreview(); return; }
+        setProgress(p => applyProgress(p, e));
+      })) ?? {};
       // 서버가 준 것을 그대로 화면에 넣지 않는다. 이 값의 모양은 우리가 정하지 못한다 — 배포가
       // 어긋난 서버, 중간에 낀 프록시의 응답, 앞으로 늘어날 필드가 모두 이 문으로 들어온다.
       // 문자열이 아닌 answer 하나가 화면에 닿으면 react-markdown이 렌더 도중에 던지고, 그것은
@@ -945,10 +1021,23 @@ export default function App() {
           console.error('[chat] 답을 화면에 얹지 못했습니다:', e);
         } finally {
           setLoading(false);
+          setProgress([]);
+          resetPreview();
           sendingRef.current = false;
         }
       }
     }
+  }
+
+  // 미리보기 손질은 JSX 밖에서 한다. 자식 요소는 렌더 중에 먼저 만들어지므로 여기서 던지면 아래 Boundary가
+  // 아니라 App이 받는다 — 이 화면에는 root 경계가 없어(main.jsx) 대화가 통째로 사라진다.
+  // 던질 일이 없더라도(순수한 문자열 치환이다) 경계가 지킨다고 적어 둔 자리를 실제로 지키게 둔다.
+  let previewMd = '';
+  try {
+    previewMd = preview ? previewMarkdown(preview) : '';
+  } catch (e) {
+    console.error('[chat] 미리보기를 손질하지 못했습니다:', e);
+    previewMd = preview;
   }
 
   return (
@@ -993,6 +1082,19 @@ export default function App() {
             <div className="row assistant">
               <div className="bubble assistant">
                 <div className="typing"><i /><i /><i /></div>
+                {progress.length > 0 && <ProgressList items={progress} />}
+                {/* 답변 미리보기 — 도착한 조각까지를 markdown으로 그린다. 표·차트 참조는 done 뒤에야 채워지므로
+                    자리 표시로 바꾼다(preview.js). 반쯤 온 글이 렌더러를 던지게 해도 답을 잃지 않게 경계로 감싼다. */}
+                {previewMd && (
+                  <Boundary what="preview" fallback={<pre className="preview-raw">{preview}</pre>}>
+                    <div className="md preview">
+                      <ChartBudget.Provider value={{ n: 0 }}>
+                        <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS}
+                                       {...MAIN_MD}>{previewMd}</ReactMarkdown>
+                      </ChartBudget.Provider>
+                    </div>
+                  </Boundary>
+                )}
               </div>
             </div>
           )}

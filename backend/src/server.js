@@ -3,8 +3,9 @@ import { writeSync } from 'node:fs';
 import express from 'express';
 import { handleQuestion, normalizeQuestion } from './agent.js';
 import { llmProvider } from './llm.js';
-import { oracleMock, oracleDriver, initOracleClient } from './oracle.js';
+import { oracleMock, oracleDriver, initOracleClient, closeOraclePools } from './oracle.js';
 import { syncEmbeddings, syncSummary, requestSyncStop } from './embed-sync.js';
+import { warmUpEmbedding } from './search.js';
 import { insertChatLog, cleanupChatLogs, closePool } from './db.js';
 import { numEnv, warnOnce, clipText, MAX_QUESTION_LEN } from './constants.js';
 import { clientTrace } from './result.js';
@@ -65,7 +66,36 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 // trace 스키마 버전. 형식이 바뀌어도 분석 SQL이 옛 행과 새 행을 구분할 수 있게 한다.
 // 3부터 outcome이 반드시 있다 (2에는 없다 — README의 대화 로그 절 참고).
-const TRACE_VERSION = 3;
+// 4부터 steps에 검색 기록이 쿼리 기록과 섞여 들어가고, search 요약에 검색 횟수·대상별 횟수가,
+// 그리고 구간별 소요(timing)가 붙는다 (schema.sql의 chat_log 주석).
+const TRACE_VERSION = 4;
+
+// ===== 진행 상황 스트림 =====
+// 검색·조회가 일어나는 동안 화면이 그 사실을 바로 보여주려면 응답을 한 번에 주는 대신 흘려보내야 한다 —
+// 서버는 상태를 저장하지 않고 요청 하나가 답 하나로 끝나므로 그 요청의 응답이 유일한 통로다.
+// 형식은 NDJSON(한 줄에 이벤트 하나)이고, 클라이언트가 Accept로 고른다. 협상을 두는 이유는 하나다:
+// curl 예시·서버 검사·화면 검사의 가로채기가 마지막 줄과 같은 모양의 JSON 하나를 그대로 쓴다 —
+// 에이전트 로직에는 분기가 없고 응답을 쓰는 이 자리에서만 갈린다.
+// 이벤트 종류는 agent.js가 정한다(search·search_done·run_query·run_query_done). 여기서는 마지막에
+// done(지금까지의 응답 본문과 같은 {answer, trace})을, 헤더가 나간 뒤의 실패에는 error를 덧붙인다.
+const NDJSON = 'application/x-ndjson';
+const wantsStream = req => String(req.headers.accept ?? '').toLowerCase().includes(NDJSON);
+const SERVER_ERROR = '처리 중 오류가 발생했습니다.';
+
+function openStream(res) {
+  res.status(200);
+  res.setHeader('Content-Type', `${NDJSON}; charset=utf-8`);
+  // 프록시가 본문을 모아 두면 진행 상황이 답과 함께 한꺼번에 도착한다 — 스트림의 뜻이 사라진다.
+  // nginx는 X-Accel-Buffering을 보고, 그 밖의 프록시는 no-transform을 본다. Vite 개발 프록시는 그대로 흘린다.
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no');
+  // 헤더를 먼저 내보낸다 — 첫 이벤트가 검색 뒤에야 나오는데, 그때까지 헤더도 없으면 클라이언트는
+  // 응답이 시작됐는지조차 모른다(중간 프록시의 응답 대기 상한에도 걸린다).
+  res.flushHeaders();
+  // 끊긴 소켓에 쓰는 것은 무해하다(버려진다) — 루프는 답을 끝까지 만들고 chat_log에 남긴다.
+  const line = obj => { res.write(`${JSON.stringify(obj)}\n`); };
+  return { write: line, end: obj => { line(obj); res.end(); } };
+}
 
 // 대화 로그 기록은 응답을 막지 않는다(await 하지 않는다) — 대신 진행 중인 기록을 붙잡아 두어
 // 종료 경로가 기다릴 수 있게 한다. 재배포의 SIGTERM이 res.json 직후에 닿으면 shutdown이
@@ -147,16 +177,24 @@ app.post('/api/chat', async (req, res) => {
       recordRejected(message, 'too_long', { length: message.length });
       return res.status(400).json({ error: `질문이 너무 깁니다 (최대 ${MAX_QUESTION_LEN.toLocaleString('ko-KR')}자).` });
     }
+    // 진행 상황을 흘려보낼지는 클라이언트가 고른다 (openStream 주석). 스트림이면 헤더가 여기서 나간다 —
+    // 이 아래의 실패는 catch가 error 줄로 알린다.
+    const stream = wantsStream(req) ? openStream(res) : null;
     // history: 클라이언트가 보내는 최근 대화 [{role:'user'|'assistant', text}] (서버는 상태를 저장하지 않는다)
-    const { answer, trace, search, fullRows } = await handleQuestion(message, req.body?.history);
-    // 대화 로그 (비동기 — 기록 실패가 응답을 막지 않는다). search(검색 적중 수)를 함께 남겨
-    // "검색 0건이라 못 답한 질문"을 SQL로 바로 찾을 수 있게 한다 (README의 chat_log 예시 참고).
-    recordChatLog(message, answer, { outcome: 'answered', search, steps: trace });
+    const { answer, trace, search, fullRows, timing } = await handleQuestion(message, req.body?.history, {
+      onEvent: stream ? e => stream.write(e) : undefined,
+    });
+    // 대화 로그 (비동기 — 기록 실패가 응답을 막지 않는다). search(검색 요약)를 함께 남겨
+    // "검색 0건이라 못 답한 질문"을 SQL로 바로 찾을 수 있게 하고, timing으로 어디가 느린지를 남긴다
+    // (README의 chat_log 예시 참고).
+    recordChatLog(message, answer, { outcome: 'answered', search, timing, steps: trace });
     // 화면용 정리(제어용 기록 제외, 원문 오류 가리기, 조회된 행 전부 싣기)는 result.js가 한다 —
     // 건수 해석을 답변 본문·프롬프트와 한 곳에서 공유해야 하고, 여기 두면 테스트가 붙지 않는다.
     // chat_log(위 steps)에는 20행짜리 trace가 남고 화면에만 전체 행이 간다 — 로그는 분석용 표본이면 되고,
     // 행 전부가 필요한 사람은 화면에 있다.
-    res.json({ answer, trace: clientTrace(trace, fullRows) });
+    const body = { answer, trace: clientTrace(trace, fullRows) };
+    if (stream) stream.end({ type: 'done', ...body });
+    else res.json(body);
   } catch (e) {
     console.error('[chat error]', e);
     // 답하지 못한 질문 중 가장 중요한 부류가 이것이다 — 반드시 기록한다.
@@ -165,11 +203,14 @@ app.post('/api/chat', async (req, res) => {
     // 이 기록은 던지지 않는다(recordChatLog가 스스로 삼킨다) — 여기서 던지면 아래 응답이
     // 나가지 못해, 오류를 알리려던 자리가 '답이 영영 오지 않는 요청'이 된다.
     recordChatLog(message, null, { outcome: 'error', error: e?.message ?? String(e) });
-    // 이미 답이 나간 뒤에 던진 것이라면 여기서 또 쓰지 않는다 — 헤더가 나간 응답에 다시 쓰면
+    // 이미 답이 나간 뒤에 던진 것이라면 여기서 또 쓰지 않는다 — 끝난 응답에 다시 쓰면
     // 그 쓰기가 던지고, 그 거부는 아무도 받지 않아(위 주석) 요청이 열린 채 남는다.
+    // 스트림은 헤더가 먼저 나가므로 headersSent만으로는 '답이 나갔는가'를 알 수 없다 — 아직 열려 있으면
+    // error 줄을 쓰고 닫는다. 그러지 않으면 클라이언트는 done 없는 스트림을 자기 타임아웃까지 기다린다.
     // 실패는 400/413/500 어느 경로든 error 필드로 통일한다 — 여기만 answer로 보내면
     // error 유무로 실패를 판정하는 클라이언트가 서버 오류를 정상 답변으로 읽는다.
-    if (!res.headersSent) res.status(500).json({ error: '처리 중 오류가 발생했습니다.' });
+    if (!res.headersSent) res.status(500).json({ error: SERVER_ERROR });
+    else if (!res.writableEnded) { res.write(`${JSON.stringify({ type: 'error', error: SERVER_ERROR })}\n`); res.end(); }
   }
 });
 
@@ -229,6 +270,10 @@ function runJob(fn) {
     .finally(() => backgroundJobs.delete(p));
   backgroundJobs.add(p);
 }
+
+// 임베딩 모델 예열 — 검색이 벡터 단일 경로라 첫 검색이 모델 적재를 기다리면 첫 질문이 그만큼 늦다
+// (search.js warmUpEmbedding). 미설정이면 아무 일도 하지 않는다.
+runJob(() => warmUpEmbedding().then(ok => { if (ok) console.log('[embed] embedding model is warm'); }));
 
 // 임베딩 diff 동기화: 기동 시 1회 + 주기 실행 (SQL로 직접 등록한 데이터도 자동 반영).
 // 결과 문구는 embed-sync.js가 SKIP 옆에서 만든다 — 여기서 SKIP 키 맵을 다시 들면
@@ -331,6 +376,8 @@ async function shutdown(reason, code = 0) {
   // 접으라고 알렸으므로 여기서 오래 매달리지 않는다. 상한은 아래 10초 강제 타이머다.
   if (backgroundJobs.size) await Promise.all(backgroundJobs);
   await closePool().catch(e => console.warn('[shutdown] failed to close connection pool:', e.message));
+  // 조회 DB의 세션도 놓는다 — 쥔 채 내려가면 DB 쪽에 끊긴 세션이 남는다 (oracle.js closeOraclePools).
+  await closeOraclePools().catch(e => console.warn('[shutdown] failed to close Oracle pools:', e.message));
   clearTimeout(force);
   process.exit(code);
 }

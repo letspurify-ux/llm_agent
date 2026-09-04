@@ -1,14 +1,16 @@
 // Agent 처리 루프 — 시스템의 핵심 제어 흐름.
-// 질문 → 지식/처리방법 검색 → LLM 결정 루프(답변 또는 쿼리 실행) → 최종 답변.
-// 루프의 유일한 상태는 history 배열이며, 매 반복 전체 컨텍스트를 LLM에 전달한다.
+// 질문 → LLM 결정 루프(검색 / 쿼리 실행 / 답변) → 최종 답변.
+// 검색은 LLM이 요청할 때만 한다(search 행동). 인사 한 줄에도 지식·처리방법·쿼리 목록을 미리 실어
+// 보내던 구조를 뒤집은 것이다 — 그때는 첫 LLM 호출의 prefill이 질문과 무관하게 최대치였다.
+// 루프의 유일한 상태는 history 배열(과 검색이 채우는 세 목록)이며, 매 반복 전체 컨텍스트를 LLM에 전달한다.
 // 대화 맥락(chat)은 서버가 저장하지 않고 클라이언트가 매 요청에 실어 보낸다 (stateless 유지).
 import { searchKnowledge, searchQaMethods, searchQueries } from './search.js';
 import { loadQueryRegistry, loadQueriesByNames, loadQueriesMentionedIn } from './db.js';
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
 import { llm, renderAnswer, clipAnswer } from './llm.js';
-import { resolveChartData } from './chart.js';
-import { MAX_STEPS, MAX_RESULT_ROWS, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_CELL_LEN, TRUNC_MARK, nameKey, clipText, stripLoneSurrogates, bindValue, targetDbNames } from './constants.js';
+import { resolveChartData, resolveTableData } from './chart.js';
+import { MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_RESULT_ROWS, parseItemId, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_CELL_LEN, TRUNC_MARK, SEARCH_TARGETS, nameKey, clipText, stripLoneSurrogates, bindValue, targetDbNames } from './constants.js';
 
 // MAX_STEPS는 constants.js에 있다 — 실행 이력의 프롬프트 몫이 그 값에 묶여 있다.
 const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포함). 초과하면 남은 스텝을 포기하고 강제 답변으로 간다.
@@ -195,175 +197,445 @@ function clipChatText(text) {
 // 정규식 검사 한 번에 끝난다), 그래야 handleQuestion을 직접 부르는 경로도 같은 규칙을 받는다.
 export const normalizeQuestion = raw => stripLoneSurrogates(raw).trim();
 
-export async function handleQuestion(rawQuestion, rawChat = []) {
+// 같은 검색의 판정 키 — 검색어(대소문자·공백 흡수)와 대상 집합(정규 순서)으로 만든다.
+// 같은 검색어에 대상만 더한 검색은 새 검색이다 (아직 찾아보지 않은 대상이 있다).
+// (테스트에서 쓰므로 export 한다 — loopGuard와 같은 이유로 양쪽으로 조용히 깨진다)
+export const searchKey = (text, targets) =>
+  JSON.stringify([nameKey(text), SEARCH_TARGETS.filter(t => (targets ?? []).includes(t))]);
+
+// 검색 결과를 컨텍스트 목록의 앞에 합친다. 이미 있는 항목(seq)은 넣지 않고, 새 항목은 검색 결과의
+// 순서(관련도 순)대로 맨 앞에 둔다 — 방금 요청한 검색이 가장 관련 높다는 전제이고, 프롬프트 예산
+// (llm-openai.js renderItems)이 꼬리부터 버리기 때문이다. 넣은 수를 돌려준다.
+// (테스트에서 쓰므로 export 한다)
+export function mergeFront(list, rows) {
+  const seen = new Set(list.map(r => r.seq));
+  const fresh = rows.filter(r => !seen.has(r.seq) && seen.add(r.seq));
+  list.unshift(...fresh);
+  return fresh.length;
+}
+
+// 검색 한 번의 기록 — history에 남아 프롬프트 한 줄·chat_log·화면 trace로 나간다.
+//   search: 검색어, targets: 검색한 대상, hits: 대상별 적중 수(검색하지 않은 대상은 null),
+//   failed: 검색이 성립하지 않은 대상(임베딩·벡터 검색 실패 — '0건'이 아니다), note: 실행하지 않은 이유(가드).
+// hits의 키는 ctx 목록 이름과 같다 — chat_log의 search 요약과 같은 이름을 쓰게.
+const HIT_KEY = { knowledge: 'knowledge', qa_method: 'qaMethods', query: 'queries' };
+
+export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps } = {}) {
+  // deps는 테스트가 검색·조회·LLM을 스텁으로 바꿔 끼우는 자리다. 이 루프의 판정(검색 반복·상한·강제
+  // 답변 전환·이력 기록 모양)은 DB 없이 검증할 수 있어야 한다 — loopGuard를 순수 함수로 떼어낸 것과
+  // 같은 이유다: 어긋나도 오류를 남기지 않는 종류의 실패라 테스트가 유일한 방어선이다.
+  const { search = runSearch, run = runQuery, decide: decideFn = llm.decide } = deps ?? {};
   const question = normalizeQuestion(rawQuestion);
   const chat = normalizeChat(rawChat);
-  // 예산은 요청 시작점에서 잡는다 — 검색 뒤에 잡으면 임베딩 타임아웃(최대 2회 × 60초)이
-  // 예산 밖에 놓여, 문서화한 요청 상한과 프런트 abort 시각이 실제보다 낙관적이 된다.
-  const deadline = Date.now() + MAX_LOOP_MS;
+  const started = Date.now();
+  // 예산은 요청 시작점에서 잡는다 — 검색(임베딩 타임아웃 최대 60초)도 이 예산 안에서 돈다.
+  const deadline = started + MAX_LOOP_MS;
 
-  const [k0, m0] = await Promise.all([
-    searchKnowledge(question),
-    searchQaMethods(question),
-  ]);
-  let knowledge = k0;
-  let qaMethods = m0;
-  // 쿼리 검색에도 같은 문장을 써야 한다 — 아래에서 맥락을 덧붙여 재검색했는데
-  // 쿼리 라우팅만 원래 질문을 보면, qa_method 없이 등록된 쿼리(경로B)는 후속 질문마다 통째로 빠진다.
-  let searchText = question;
-
-  // "그럼 김철수는?" 같은 후속 질문은 그 문장만으로는 검색되지 않는다.
-  // 현재 질문으로 아무것도 못 찾았을 때만 직전 질문을 덧붙여 재검색한다
-  // (평소에는 현재 질문만 쓰므로 검색 정확도가 떨어지지 않는다).
-  if (!knowledge.length && !qaMethods.length && chat.length) {
-    const prevQuestions = chat.filter(m => m.role === 'user').slice(-2).map(m => m.text).join(' ');
-    if (prevQuestions) {
-      searchText = `${prevQuestions} ${question}`;
-      [knowledge, qaMethods] = await Promise.all([
-        searchKnowledge(searchText),
-        searchQaMethods(searchText),
-      ]);
-    }
-  }
-
-  // 쿼리 목록 로드 실패로 요청 전체를 버리지 않는다 — 함께 버려지는 것이 바로 위에서 이미
-  // 조회해둔 지식·처리방법이고, 그중에는 DB 조회가 아예 필요 없는 순수 지식 질문도 있다.
-  // 같은 테이블의 같은 실패를 한 스텝 뒤(resolveQuery)에서는 이미 이렇게 다루고 있었다 —
-  // 경계가 갈라져 있어서, 관리 DB가 흔들리면 모든 질문이 500이 되고 여기만 그 이유가 됐다.
-  const { list: queries, routed, failed: queriesFailed } =
-    await selectQueries(qaMethods, searchText).catch(e => {
-      // 상세는 로그에만 — 화면 문구는 호출부가 만들고, MariaDB 원문에는 스키마·호스트가 들어 있다.
-      console.warn('[agent] failed to load the query list:', e.message);
-      return { list: [], routed: false, failed: true };
-    });
-
-  // 검색 적중 수 — chat_log 분석용: 검색 0건(지식/쿼리 신규 등록 필요)과
-  // 적중은 했지만 답이 부실한 경우(내용 보강 필요)를 구분할 수 있게 한다.
-  // queries는 라우팅이 동작할 때(등록 30건 초과)만 적중 수이고, 전체를 싣는 소규모에서는 null (적중 개념 없음).
-  const search = {
-    knowledge: knowledge.length,
-    qaMethods: qaMethods.length,
-    queries: routed ? queries.length : null,
-    // 목록을 못 읽어 조회 경로가 통째로 빠진 요청은 '등록이 없어서 못 답한 질문'과 구분되어야 한다 —
-    // 둘을 섞으면 chat_log 분석이 지식 보강이 필요한 질문으로 잘못 집계한다.
-    ...(queriesFailed && { queriesFailed: true }),
+  // 구간별 소요(ms). 어디가 느린지는 이 숫자 없이는 알 수 없다 — 로그 한 줄과 chat_log(trace.timing)로 나간다.
+  const timing = { llm: [], search: [], oracle: [] };
+  const timed = async (bucket, fn) => {
+    const t0 = Date.now();
+    try { return await fn(); } finally { bucket.push(Date.now() - t0); }
+  };
+  // 진행 이벤트(검색·조회의 시작과 끝). 듣는 쪽(server.js의 스트림 응답)이 던져도 루프는 계속된다 —
+  // 화면 표시가 답을 막으면 안 된다.
+  const emit = (type, data) => {
+    if (!onEvent) return;
+    try { onEvent({ type, ...data }); } catch (e) { console.warn('[agent] progress listener failed:', e?.message ?? e); }
   };
 
+  // 세 목록은 비어서 시작하고 search 행동이 채운다 (파일 머리말).
+  // searched = 한 번이라도 '찾아본' 대상, succeeded = 그중 검색이 실제로 '성립한' 대상.
+  // 프롬프트에 나가는 것은 succeeded다 — 그 이유는 아래 ctx 주석에 있다.
+  const knowledge = [], qaMethods = [], queries = [];
+  const searched = new Set();
+  const succeeded = new Set();   // 검색이 실제로 성립한 대상 — chat_log의 적중 수는 이쪽 기준이다 (아래 done 주석)
+  const targetCounts = Object.fromEntries(SEARCH_TARGETS.map(t => [t, 0]));
+  let routed = null;             // 마지막 쿼리 검색의 라우팅 여부 — chat_log의 queries 적중 수 의미를 정한다
+  let queriesFailed = false;     // 관리 DB에서 쿼리 목록을 못 읽었다
+  let searchFailed = false;      // 어느 검색이든 성립하지 않은 대상이 있었다
   const history = [];
-  const ctx = () => ({ question, chat, knowledge, qaMethods, queries, history });
+  // ctx.searched에 담기는 것은 succeeded다 — 이름은 '찾아본 대상'이지만 뜻은 '찾아낸 대상'이다.
+  // 프롬프트의 자료 섹션은 '검색이 성립한' 대상만 보인다(succeeded). 검색해 봤지만 성립하지 않은 대상까지
+  // 넣으면 그 섹션이 '(없음)'으로 실려 모델이 '등록된 자료가 없다'로 읽는다 — 프롬프트가 '비어 있음'과
+  // '누락됨'을 가르는 이유가 정확히 그것인데, 검색 불가를 '없음' 쪽에 세우면 그 구분이 뒤집힌다.
+  // tried는 '한 번이라도 찾아봤는가'다 — '아직 아무것도 안 찾아봤다'는 안내를 붙일지만 가른다(검색이
+  // 성립하지 않아 섹션이 없는 요청에 '먼저 찾으라'고 다시 말하면 남은 검색 기회를 그대로 태운다).
+  const ctx = () => ({
+    question, chat, knowledge, qaMethods, queries, history,
+    searched: [...succeeded], tried: searched.size > 0,
+  });
   // 성공한 조회의 전체 행(≤MAX_ROWS). history에는 capRows로 자른 20행만 싣는다 — history는 프롬프트와
   // chat_log(steps)로 흘러가므로 거기에 전체를 실으면 둘이 함께 다섯 배 커진다.
   // 전체 행이 필요한 곳은 둘이다: 답변의 차트 참조(`data: step N`, 아래 finish)와 화면 trace 패널
   // (server.js → result.js clientTrace — 사용자가 조회된 행 전부를 보는 유일한 자리다). 둘 다 이 요청의
   // 응답 안에서 끝나므로 history와 나란히 들고 있다가 함께 돌려준다.
   const fullRows = new Map();
-  // 답변이 나가는 두 출구(모델의 answer, 강제 답변)가 같은 마무리를 지난다 — 차트 참조를 실제 표로 채운다.
-  // 스텝 번호는 history의 1-based 절대 인덱스(프롬프트의 '실행 N'과 같다, chart.js 주석 참고).
-  const finish = answer => resolveChartData(answer, history.map(h => fullRows.get(h) ?? null));
+  // 답변이 나가는 두 출구(모델의 answer, 강제 답변)가 같은 마무리를 지난다 — 표 참조(```table step: N)와 차트 참조
+  // (data: step N)를 실제 행으로 채운다. 스텝 번호는 history의 1-based 절대 인덱스(프롬프트의 'N.'과 같다 —
+  // 검색 줄도 번호를 차지한다, chart.js 주석 참고).
+  const finish = answer => {
+    const stepRows = history.map(h => fullRows.get(h) ?? null);
+    return resolveChartData(resolveTableData(answer, stepRows), stepRows);
+  };
   const resolveCache = new Map(); // 프롬프트 목록 밖 이름의 해석 결과 (미등록도 캐시한다)
   const clippedCopy = clippedCopyDetector(chat);
+  // LLM 호출 하나의 계측 항목은 {ms, prompt?, completion?}이다 — 토큰 실측은 provider가 훅으로 준다
+  // (llm-openai.js openaiDecide의 onUsage). 검색 후보 수·검색 횟수 상한을 조정할 근거가 이 숫자다 (README).
+  // 답변 조각 훅(onAnswerDelta)은 화면 미리보기다 — 최종 답변은 아래 finish가 확정한다.
+  const decideSafe = async c => {
+    const entry = { ms: 0 };
+    timing.llm.push(entry);
+    const t0 = Date.now();
+    try {
+      return await decide({
+        ...c,
+        onUsage: u => Object.assign(entry, { prompt: u.prompt_tokens, completion: u.completion_tokens }),
+        // 듣는 쪽이 없으면 훅을 주지 않는다 — provider는 이 훅이 있을 때만 답변 미리보기를 조립하므로
+        // (llm-openai.js answerPreviewer), 스트림을 요청하지 않은 요청에서 그 해독을 조각마다 헛돌게 하지 않는다.
+        ...(onEvent && {
+          onAnswerDelta: d => emit(d?.reset ? 'answer_reset' : 'answer_delta', d?.reset ? {} : { text: d.text }),
+        }),
+      }, decideFn);
+    } finally {
+      entry.ms = Date.now() - t0;
+    }
+  };
   let guardHits = 0;
+  let queryEventSeq = 0;         // 조회 진행 이벤트의 짝 번호 (아래 emit 주석)
+  let expands = 0;               // 본문을 펼친 항목 수 (≤ MAX_EXPANDS)
+  let drops = 0;                 // 모델이 버린 항목 수
+  let searches = 0;              // 실제로 실행한 검색 수 (≤ MAX_SEARCHES)
+  let runs = 0;                  // run_query 결정 수 — 가드에 걸린 것도 이력 한 줄이므로 함께 센다 (≤ MAX_STEPS).
+                                 // 이 두 상한이 실행 이력의 최소 몫(constants PROMPT_FLOORS.history)의 근거다.
 
-  for (let step = 0; step < MAX_STEPS; step++) {
+  // 식별자로 자료를 찾는 두 손잡이. 목록 이름은 식별자가 정한다 (constants.parseItemId).
+  const lists = { knowledge, qaMethods };
+  const rowAt = id => {
+    const at = parseItemId(id);
+    const list = at && lists[at.list];
+    return list ? { list, i: list.findIndex(o => o.seq === at.seq) } : { list: null, i: -1 };
+  };
+
+  // 버리기 — 자료를 늘리는 결정(search·expand)에 얹혀 온다. 표시만 세우고 목록에서 지우지 않는다:
+  // 병합이 seq로 중복을 거르므로(mergeFront) 남겨 두어야 같은 항목이 재검색으로 되살아나지 않는다.
+  // 효력은 이 요청 안에서만이다 — 다음 질문까지 남기면 한 번의 오판이 계속 따라다니고 보이지 않는다.
+  const applyDrop = ids => {
+    let n = 0;
+    for (const id of ids ?? []) {
+      const { list, i } = rowAt(id);
+      if (i < 0 || list[i].dropped) continue;   // 목록에 없거나 이미 버린 것은 조용히 넘긴다
+      list[i].dropped = true;
+      n++;
+      drops++;
+    }
+    return n;
+  };
+
+  // 본문 청구 — 잘린 항목의 전체 본문을 다음 스텝부터 싣는다. 목록 앞으로 옮기는 것이 중요하다:
+  // 프롬프트 예산은 뒤에서부터 버리므로, 그냥 두면 정작 펼친 항목이 잘려 나간다.
+  // 이미 펼쳤거나 버린 항목, 목록에 없는 식별자는 넘긴다 — 성공한 것의 목록을 돌려준다.
+  const applyExpand = ids => {
+    const done = [];
+    for (const id of ids ?? []) {
+      if (expands >= MAX_EXPANDS) break;
+      const { list, i } = rowAt(id);
+      if (i < 0 || list[i].dropped || list[i].expanded) continue;
+      const [row] = list.splice(i, 1);
+      row.expanded = true;
+      list.unshift(row);
+      expands++;
+      done.push(id);
+    }
+    return done;
+  };
+
+  // 이력 줄은 상한이 있다 — 자리가 없으면 안내를 접는다. 그때는 루프가 곧 그 상한에서 멈추므로
+  // 모델이 그 안내를 읽을 스텝 자체가 없다 (constants.MAX_HISTORY_ROWS).
+  const pushNote = row => { if (history.length < MAX_HISTORY_ROWS) history.push(row); };
+
+  // 요청의 결과를 조립한다. 검색 요약(chat_log 분석용): 검색 횟수와 대상별 횟수, 대상별 누적 적중 수,
+  // 그리고 목록·검색이 성립하지 않았다는 표시. 적중 수는 '검색이 성립한 적 있는' 대상만 숫자다 —
+  // 한 번도 찾지 않았거나 찾을 때마다 실패한 대상은 null이다. 0으로 적으면 '찾았는데 없다'와 섞여
+  // chat_log 분석이 임베딩 장애 동안의 질문을 전부 '지식 보강 후보'로 잘못 집계한다 (README의 SQL).
+  // queries는 라우팅이 동작할 때(등록 30건 초과)만 적중 수이고, 전체를 싣는 소규모에서는 null (적중 개념 없음).
+  const done = (answer, forced) => {
+    const total = Date.now() - started;
+    const summary = {
+      searches,
+      targets: { ...targetCounts },
+      knowledge: succeeded.has('knowledge') ? knowledge.length : null,
+      qaMethods: succeeded.has('qa_method') ? qaMethods.length : null,
+      queries: succeeded.has('query') && routed ? queries.length : null,
+      // 모델이 자료를 얼마나 손봤는가 — 자주 버려지는 지식은 등록 품질 신호다 (README의 운영 루프).
+      ...(expands && { expanded: expands }),
+      ...(drops && { dropped: drops }),
+      ...(queriesFailed && { queriesFailed: true }),
+      ...(searchFailed && { searchFailed: true }),
+    };
+    const sum = a => a.reduce((x, y) => x + y, 0);
+    const llmMs = sum(timing.llm.map(l => l.ms));
+    const tokens = timing.llm.some(l => l.prompt !== undefined)
+      ? `, prompt ${sum(timing.llm.map(l => l.prompt ?? 0))} tok, completion ${sum(timing.llm.map(l => l.completion ?? 0))} tok`
+      : '';
+    console.log(
+      `[agent] timing total=${total}ms llm=${timing.llm.length}(${llmMs}ms${tokens}) ` +
+      `search=${timing.search.length}(${sum(timing.search)}ms) oracle=${timing.oracle.length}(${sum(timing.oracle)}ms)` +
+      `${forced ? ' forced' : ''}`
+    );
+    return { answer, trace: history, search: summary, fullRows, timing: { total, ...timing } };
+  };
+
+  // 검색 결과를 컨텍스트에 흡수하고 이력 기록의 재료를 만든다. 넣은 항목 수도 돌려준다 (0이면 진도가 없다).
+  const absorb = (r, targets) => {
+    const want = new Set(targets);
+    const hits = { knowledge: null, qaMethods: null, queries: null };
+    const failed = [];
+    let added = 0;
+    const take = (target, rows, list) => {
+      if (rows === undefined) return;                       // 요청하지 않은 대상
+      searched.add(target);
+      targetCounts[target]++;
+      if (rows === null) { failed.push(target); return; }   // 검색이 성립하지 않았다 — 0건과 다르다
+      succeeded.add(target);
+      hits[HIT_KEY[target]] = rows.length;
+      added += mergeFront(list, rows);
+    };
+    take('knowledge', r.knowledge, knowledge);
+    take('qa_method', r.qaMethods, qaMethods);
+    // 쿼리 목록은 경로A(처리방법이 지목)만으로도 실린다 — 그때는 'query'를 검색한 것이 아니므로 searched에 넣지 않는다.
+    if (r.queries !== undefined) {
+      if (want.has('query')) { searched.add('query'); targetCounts.query++; }
+      if (r.queries === null) failed.push('query');
+      else {
+        // routed는 '성립한' 쿼리 검색의 판정만 기록한다. 마지막 값으로 덮어쓰면, 앞선 검색이 라우팅 규모를
+        // 확인해 목록을 채워 놓고도 뒤이은 검색이 관리 DB 실패로 null을 주는 순간 그 판정이 지워진다 —
+        // chat_log에는 '한 번도 못 찾았거나 매번 실패했다'로 남아(README의 분석 SQL) 정반대로 읽힌다.
+        if (want.has('query') && !r.directFailed) { succeeded.add('query'); routed = r.routed; }
+        hits.queries = r.queries.length;
+        added += mergeFront(queries, r.queries);
+      }
+    }
+    if (r.queriesFailed) queriesFailed = true;
+    if (r.directFailed && !failed.includes('query')) failed.push('query');
+    if (failed.length) searchFailed = true;
+    return { added, hits, failed };
+  };
+
+  // 조회 결정(하나 또는 일괄)을 실행한다. 두 단계다.
+  //   ① 순차 준비 — 이름 해석·루프 가드·미등록 판정. 실행할 항목은 자리(entry)를 먼저 이력에 넣어 배치 순서를
+  //      지킨다: 병렬 실행이 끝나는 순서는 정해져 있지 않고, 이력의 번호는 프롬프트·차트·표 참조가 보는 값이다.
+  //   ② 병렬 실행 — 각 항목의 결과를 자기 자리에 채운다. 단일 조회도 항목 하나짜리 배치다 — 길이 하나여야
+  //      한쪽만 조용히 어긋나지 않는다.
+  // 반환: progressed(하나라도 성공했다), wasted(전부 실행 없이 헛돈 항목이었다 — 가드·미등록·대상 DB 미선택).
+  // 실패의 종류에 따라 이력 필드를 나눈다: note는 LLM에게 경로를 바꾸라고 알리는 제어용 기록이고 error는 실제
+  // 실패다 — 같은 필드에 넣으면 사용자 trace 패널과 chat_log의 '실패한 질문' 집계에 정상 턴이 섞인다.
+  // safe는 이 문구를 사용자 화면에 그대로 내보내도 되는가 — 우리가 문구를 만든 오류만 true다 (드라이버·DB 원문은
+  // 스키마명·호스트를 담고 있다). 실패 기록의 targetDb는 모델이 고른 값(dbChoice) 그대로다 — 성공 기록은 실행 경계가
+  // 돌려준 등록 철자인데, 실패의 흔한 원인이 '요청한 이름이 후보에 없다'라 등록 철자로 바꿔 적으면 모델은 자기가
+  // 무엇을 잘못 적었는지 볼 수 없다.
+  const runBatch = async batch => {
+    const planned = [];
+    const seenInBatch = new Set();
+    let wastedCount = 0;
+    for (const item of batch) {
+      const { row: registryRow, error: resolveError, hint: resolveHint } =
+        await resolveQuery(item.query_name, queries, resolveCache);
+      // 이력에는 항상 정규 이름(등록된 철자)을 남긴다 — 가드와 프롬프트가 같은 이름을 보게.
+      const canonicalName = registryRow?.query_name ?? item.query_name;
+      const binds = registryRow ? bindNames(registryRow.query_sql) : null;
+      // 이 항목이 실제로 향하는 대상 DB. 가드·이력·실행이 같은 값을 봐야 한다.
+      const dbChoice = effectiveTargetDb(registryRow, item.target_db);
+      const base = { query_name: canonicalName, params: item.params, ...(dbChoice && { targetDb: dbChoice }) };
+      // 같은 배치 안의 중복은 아직 이력에 없어 루프 가드가 못 본다 — 같은 키로 여기서 잡는다.
+      const dupKey = JSON.stringify([nameKey(canonicalName), nameKey(dbChoice), paramKey(binds, item.params)]);
+      const guardNote = loopGuard(history, canonicalName, binds, item.params, dbChoice)
+        ?? (seenInBatch.has(dupKey) ? '같은 배치 안에 같은 조회가 둘 있다 — 하나만 실행한다' : null);
+      if (guardNote) {
+        history.push({ ...base, note: guardNote });
+        wastedCount++;
+        continue;
+      }
+      if (!registryRow) {
+        // 미등록 이름의 반복이 '가장 흔한 퇴화 패턴'(loopGuard 주석)인데, 모델이 매번 다른 이름을 지어내면
+        // 동일 실행 판정에는 한 번도 걸리지 않는다 — 이름이 무엇이든 '실행 없이 헛돈 항목'으로 센다.
+        history.push({
+          ...base, error: resolveError ?? '등록되지 않은 쿼리', safe: true,
+          hint: resolveHint ?? '쿼리 목록에 있는 이름만 실행할 수 있다 — 목록에서 고르거나 query를 검색하거나 지금까지의 정보로 답변하라',
+        });
+        wastedCount++;
+        continue;
+      }
+      // 모델이 지목한 쿼리는 다음 스텝에 자세한 형태(입출력 설명·SQL)로 보인다 — 바인드를 고칠 수 있어야 한다
+      // (llm-openai.js renderQueries 주석). 프롬프트 목록 밖에서 찾은 쿼리는 목록 앞에 넣는다: 뒤가 아니라 앞이다 —
+      // 프롬프트 예산은 '뒤쪽일수록 관련도가 낮다'는 전제로 꼬리부터 버린다. 중복은 넣지 않고, 늘어나는 상한은
+      // MAX_STEPS건이다 (즉 목록은 최대 MAX_PROMPT_QUERIES + MAX_STEPS건).
+      registryRow.detail = true;
+      if (!queries.includes(registryRow)) queries.unshift(registryRow);
+      seenInBatch.add(dupKey);
+      const entry = { ...base };
+      history.push(entry);
+      // 진행 이벤트의 짝 번호. 일괄 조회는 조회 여럿이 동시에 돌고 끝나는 순서가 시작 순서와 다르므로,
+      // 듣는 쪽이 '어느 줄의 끝인가'를 이름으로 짐작하면 안 된다 — 같은 쿼리를 다른 값으로 두 번 부르는
+      // 정당한 배치도 있고, 시작 이벤트의 대상 DB는 모델이 적은 철자인데 끝 이벤트는 실행 경계가 돌려준
+      // 등록 철자라 둘이 다를 수 있다(oracle.js resolveTargetDb). 번호는 요청 안에서만 뜻이 있다.
+      planned.push({ entry, registryRow, item, dbChoice, canonicalName, id: ++queryEventSeq });
+    }
+
+    let progressed = false;
+    // 배치의 조회 시간은 '실제로 흐른 시간'으로 한 번만 잰다. 항목마다 재면 병렬로 겹친 시간이 그 수만큼
+    // 더해져(4건이 2초에 끝나도 8초로 남는다) 계측이 조회 몫을 부풀린다 — README가 그 숫자를 보고
+    // 검색 후보 수·검색 횟수를 조정하라고 가리키는데, 부풀린 값은 그 판단을 반대로 이끈다.
+    // 실행할 것이 하나도 없으면(전부 가드·미등록) 아예 재지 않는다 — 0ms짜리 항목이 조회 횟수를 부풀린다.
+    if (!planned.length) return { progressed, wasted: wastedCount === batch.length };
+    await timed(timing.oracle, () => Promise.all(planned.map(async ({ entry, registryRow, item, dbChoice, canonicalName, id }) => {
+      emit('run_query', { id, query_name: canonicalName, params: item.params, ...(dbChoice && { targetDb: dbChoice }) });
+      // 이력의 잘린 셀에서 마크만 떼고 옮겨 적은 바인드 값은 여기서 따로 훑지 않는다 — 판정은 실행 경계 한 곳
+      // (oracle.js bindProblem)에서 하고, 이 파일은 그 판정에 필요한 '무엇을 잘랐는가'만 넘긴다(clippedCopy).
+      try {
+        // 대상 DB 선택은 실행 경계가 판정한다 (oracle.js resolveTargetDb) — 여기서 미리 고르거나 검증하지 않는다.
+        // 돌려받은 targetDb는 등록 철자이므로 이력·trace·프롬프트가 같은 이름을 본다.
+        const { rows, totalRows, capped, targetDb } = await run(registryRow, item.params, clippedCopy.isCopy, dbChoice);
+        clippedCopy.record(rows);
+        Object.assign(entry, { targetDb, rows: capRows(rows), totalRows, capped });
+        fullRows.set(entry, rows);
+        progressed = true;
+        emit('run_query_done', { id, query_name: canonicalName, targetDb, rowCount: capped ? `${totalRows}+` : totalRows });
+      } catch (e) {
+        // 실패도 이력에 남기고 루프를 계속한다 — LLM이 에러를 보고 재시도/우회/답변을 판단.
+        // 메시지가 비면 안 된다: error가 falsy면 프롬프트·답변 조립이 이 기록을 '오류'로 보지 않고
+        // rows가 있는 정상 결과로 취급해 들어간다.
+        Object.assign(entry, { error: e?.message || String(e), safe: e?.safe === true, ...(e?.hint && { hint: e.hint }) });
+        // 조회를 시작하지도 못하고 거부된 실패(oracle.js wastedStep — 대상 DB를 후보에서 못 골랐다)는 미등록 이름과
+        // 같은 부류다: DB를 건드리지 않았고, 고를 수 있는 값은 오류 문구가 이미 열거해 줬다.
+        if (e?.wastedStep) wastedCount++;
+        // 화면으로 나가는 문구는 trace 패널과 같은 기준이다 (result.js clientTrace) — 우리가 만든 문구만 원문으로.
+        emit('run_query_done', {
+          id, query_name: canonicalName, ...(dbChoice && { targetDb: dbChoice }),
+          error: e?.safe === true ? (e.message || String(e)) : '조회 중 오류가 발생했습니다.',
+        });
+      }
+    })));
+    return { progressed, wasted: !progressed && wastedCount === batch.length };
+  };
+
+  for (let i = 0; i < MAX_STEPS + MAX_SEARCHES + MAX_EXPANDS; i++) {
+    // 이력 줄 수도 상한이다 — 결정 하나가 조회 여럿을 만들 수 있으므로(일괄 조회) 반복 수만으로는 줄 수가
+    // 묶이지 않는다. 넘기면 프롬프트의 이력 몫이 보장하는 '전부 실린다'가 깨져 가장 오래된 조회 결과가
+    // 조용히 빠진다 (constants.MAX_HISTORY_ROWS).
+    if (history.length >= MAX_HISTORY_ROWS) break;
     // 스텝 수만으로는 소요 시간이 묶이지 않는다 — 느린 LLM 엔드포인트에서는
     // 스텝마다 LLM 타임아웃이 통째로 쌓여 요청 하나가 수십 분씩 워커를 점유한다.
     if (Date.now() > deadline) break;
-    const decision = await decide(ctx());
+    const decision = await decideSafe(ctx());
     if (!decision) break; // 결정을 얻지 못했다 — 아래 강제 답변/폴백으로 간다
     if (decision.action === 'answer') {
       const answer = answerOf(decision);
-      if (answer) return { answer: finish(answer), trace: history, search, fullRows };
+      if (answer) return done(finish(answer), false);
       break;   // 쓸 수 있는 답변이 아니다 — 아래 강제 답변/폴백으로 간다
     }
 
     // 예산은 스텝 진입에서만 보면 부족하다 — 239초에 시작한 스텝이 LLM 120초를 쓰고 나서
-    // Oracle 접속·조회까지 더 태우면 프런트가 먼저 끊는 지점을 넘긴다.
-    // LLM 응답을 받은 뒤 다시 확인해, 남지 않았으면 조회를 태우지 않고 강제 답변으로 간다.
+    // 검색·조회까지 더 태우면 프런트가 먼저 끊는 지점을 넘긴다.
     if (Date.now() > deadline) break;
 
-    const { row: registryRow, error: resolveError, hint: resolveHint } =
-      await resolveQuery(decision.query_name, queries, resolveCache);
-    // 이력에는 항상 정규 이름(등록된 철자)을 남긴다 — 가드와 프롬프트가 같은 이름을 보게.
-    const canonicalName = registryRow?.query_name ?? decision.query_name;
-    const binds = registryRow ? bindNames(registryRow.query_sql) : null;
-    // 이 스텝이 실제로 향하는 대상 DB. 가드·이력·실행이 같은 값을 봐야 한다.
-    const dbChoice = effectiveTargetDb(registryRow, decision.target_db);
-    // note는 LLM에게 경로를 바꾸라고 알리는 제어용 기록이다. 실제 쿼리 실패(error)와 필드를 나눈다 —
-    // 같은 필드에 넣으면 사용자 trace 패널과 chat_log의 '실패한 질문' 집계에 정상 턴이 섞인다.
-    // extra.safe = 이 문구를 사용자 화면(trace 패널)에 그대로 내보내도 되는가.
-    // 우리가 문구를 만든 오류만 true다 — 드라이버·DB 원문은 스키마명·호스트를 담고 있다(server.js가 이 표시를 본다).
-    // targetDb는 실패 기록에 dbChoice를 그대로 남긴다 — 성공 기록(아래)은 실행 경계가 돌려준
-    // 등록 철자다. 실패의 흔한 원인이 '요청한 이름이 후보에 없다'인데, 그때 등록 철자로 바꿔
-    // 적으면 모델은 자기가 무엇을 잘못 적었는지 볼 수 없고 오류 문구와 이력이 서로 다른 이름을
-    // 가리키게 된다.
-    const push = (field, msg, extra) => history.push({
-      query_name: canonicalName, params: decision.params,
-      ...(dbChoice && { targetDb: dbChoice }),
-      [field]: msg, ...extra,
-    });
+    // 자료를 늘리는 결정만 자료를 줄일 수 있다 (search·expand). 검색보다 '먼저' 적용한다 —
+    // 새 결과가 병합되기 전에 표시가 서 있어야 방금 버린 것이 그 검색으로 되살아나지 않는다.
+    const droppedNow = decision.action === 'search' || decision.action === 'expand'
+      ? applyDrop(decision.drop) : 0;
 
-    const guardNote = loopGuard(history, canonicalName, binds, decision.params, dbChoice);
-    if (guardNote) {
-      push('note', guardNote);
-      if (++guardHits >= MAX_GUARD_HITS) break;
-      continue;
-    }
-    if (!registryRow) {
-      push('error', resolveError ?? '등록되지 않은 쿼리', {
-        safe: true,
-        hint: resolveHint ?? '쿼리 목록에 있는 이름만 실행할 수 있다 — 목록에서 고르거나 지금까지의 정보로 답변하라',
+    if (decision.action === 'expand') {
+      const done = applyExpand(decision.ids);
+      // 펼쳤거나 버렸으면 자료가 달라졌다 — 진도로 본다. 둘 다 없으면 헛돈 스텝이다.
+      if (done.length || droppedNow) { guardHits = 0; continue; }
+      pushNote({
+        expand: decision.ids,
+        note: expands >= MAX_EXPANDS
+          ? `본문 청구 상한(${MAX_EXPANDS}건)에 닿았다 — 지금까지의 자료로 답변하라`
+          : '펼칠 수 있는 항목이 없다 — 번호가 붙은 항목만 청구할 수 있다',
       });
-      // 미등록 이름의 반복이 '가장 흔한 퇴화 패턴'(loopGuard 주석)인데, 모델이 매번 다른 이름을
-      // 지어내면 loopGuard의 동일 실행 판정에는 한 번도 걸리지 않는다 — 스텝마다 LLM 왕복(최대
-      // 120초)만 태우며 MAX_STEPS를 전부 소진한다. 이름이 무엇이든 '실행 없이 헛돈 스텝'이므로
-      // guardNote와 같은 연속 카운터로 센다 (조회에 성공하면 0으로 되돌리는 것도 같다).
       if (++guardHits >= MAX_GUARD_HITS) break;
       continue;
     }
-    // 프롬프트 목록 밖에서 찾은 쿼리는 목록에 넣어준다 — 다음 스텝에서 LLM이 input_desc를 보고
-    // 바인드를 고칠 수 있어야 한다. 중복은 넣지 않고, 늘어나는 상한은 MAX_STEPS건이다
-    // (즉 목록은 최대 MAX_PROMPT_QUERIES + MAX_STEPS건 — 무제한으로 커지지 않는다).
-    // 뒤가 아니라 앞에 넣는다 — 프롬프트 예산(llm-openai.js renderItems)은 '뒤쪽일수록 관련도가 낮다'는
-    // 전제로 꼬리부터 버린다. 방금 LLM이 이름을 대서 찾아낸 쿼리는 이번 스텝에서 가장 관련이 높은데,
-    // 뒤에 붙이면 등록이 조금만 많아도 그 한 건이 먼저 잘려 나가 이 복구 경로 자체가 조용히 사라진다.
-    if (!queries.includes(registryRow)) queries.unshift(registryRow);
-    // 이력의 잘린 셀에서 마크만 떼고 옮겨 적은 바인드 값은 여기서 따로 훑지 않는다 —
-    // 판정은 실행 경계 한 곳(oracle.js bindProblem)에서 하고, 이 파일은 그 판정에 필요한
-    // '무엇을 잘랐는가'만 넘긴다(clippedCopy). 값을 모으는 비용은 조회 1회당 한 번이고,
-    // 스텝마다 이력 전체를 다시 훑지 않는다.
-    try {
-      // 대상 DB 선택은 실행 경계가 판정한다 (oracle.js resolveTargetDb) — 여기서 미리 고르거나
-      // 검증하지 않는다. 돌려받은 targetDb는 등록 철자이므로 이력·trace·프롬프트가 같은 이름을 본다.
-      const { rows, totalRows, capped, targetDb } = await runQuery(
-        registryRow, decision.params, clippedCopy.isCopy, dbChoice
-      );
-      clippedCopy.record(rows);
-      history.push({ query_name: canonicalName, params: decision.params, targetDb, rows: capRows(rows), totalRows, capped });
-      fullRows.set(history[history.length - 1], rows);
-      guardHits = 0; // 진도가 나갔다 — 가드는 '연속' 헛도는 경우만 센다
-    } catch (e) {
-      // 실패도 이력에 남기고 루프를 계속한다 — LLM이 에러를 보고 재시도/우회/답변을 판단.
-      // 메시지가 비면 안 된다: error가 falsy면 프롬프트·답변 조립이 이 기록을 '오류'로 보지 않고
-      // rows가 있는 정상 결과로 취급해 들어간다.
-      push('error', e?.message || String(e), { safe: e?.safe === true, ...(e?.hint && { hint: e.hint }) });
-      // 조회를 시작하지도 못하고 거부된 실패(oracle.js wastedStep — 대상 DB를 후보에서 못 골랐다)는
-      // 미등록 쿼리 이름과 같은 부류다: DB를 건드리지 않았고, 고를 수 있는 값은 오류 문구가 이미
-      // 열거해 줬다. 그래서 같은 연속 카운터로 센다.
-      // 이 카운터가 없으면 모델이 매번 다른 틀린 이름을 대는 동안 loopGuard의 동일 실행 판정
-      // (이름·대상DB·바인드가 모두 같아야 한다)에 한 번도 걸리지 않아 MAX_STEPS를 전부 소진한다 —
-      // 실측: 왕복 5회 + 강제 답변 1회. 조회 성공은 아래에서 카운터를 0으로 되돌리므로,
-      // 여러 DB를 차례로 도는 정상 흐름은 이 상한에 걸리지 않는다.
-      if (e?.wastedStep && ++guardHits >= MAX_GUARD_HITS) break;
+
+    if (decision.action === 'search') {
+      const text = decision.text || question;   // 빈 검색어는 현재 질문으로 (llm.js sanitizeDecision 주석)
+      const targets = decision.targets;
+      const key = searchKey(text, targets);
+      // 같은 검색의 반복과 횟수 상한은 루프 가드와 같은 부류다 — note로 남기고 연속 카운터를 올린다.
+      const guardNote = history.some(h => h.search !== undefined && !h.note && searchKey(h.search, h.targets) === key)
+        ? '이미 같은 검색어·대상으로 검색했다 — 검색된 자료로 답변하거나 다른 검색어를 쓰라'
+        : searches >= MAX_SEARCHES
+          ? `검색 횟수 상한(${MAX_SEARCHES}회)에 닿았다 — 지금까지의 자료로 답변하라`
+          : null;
+      if (guardNote) {
+        history.push({ search: text, targets, note: guardNote });
+        if (++guardHits >= MAX_GUARD_HITS) break;
+        continue;
+      }
+      searches++;
+      emit('search', { text, targets });
+      // 검색 실패로 요청 전체를 버리지 않는다 — 함께 버려지는 것이 이미 조회해둔 결과다. 결정(decideSafe)과
+      // 조회(runBatch)가 각자 그 이유로 예외를 삼키는데, 검색을 루프 안으로 들여오면서 이 await만 밖에 있었다.
+      // runSearch는 자기가 아는 실패를 이미 삼키므로 여기 오는 것은 그 밖의 것이다(경고 함수의 예외 등) —
+      // 요청한 대상 전부가 '검색 불가'였던 것으로 기록하고 루프를 계속한다.
+      let result;
+      try {
+        result = await timed(timing.search, () => search(text, targets));
+      } catch (e) {
+        console.warn('[agent] search failed:', e?.message ?? e);
+        const asked = t => (targets.includes(t) ? null : undefined);
+        result = {
+          knowledge: asked('knowledge'), qaMethods: asked('qa_method'), queries: asked('query'),
+          routed: null, queriesFailed: false, directFailed: false,
+        };
+      }
+      const { added, hits, failed } = absorb(result, targets);
+      history.push({ search: text, targets, hits, ...(failed.length && { failed }) });
+      emit('search_done', { text, targets, hits, ...(failed.length && { failed }) });
+      // 새 자료가 하나도 없으면 헛돈 스텝이다 — 미등록 쿼리 이름과 같은 연속 카운터로 센다.
+      // (검색어를 바꿔 한 번 더 시도할 기회는 남는다 — 첫 1회는 카운터만 오른다)
+      if (added === 0) { if (++guardHits >= MAX_GUARD_HITS) break; } else guardHits = 0;
+      continue;
     }
+
+    // run_query / run_queries — 하나든 여럿이든 같은 길(runBatch)을 지난다. 일괄 조회는 서로 의존하지 않는 조회를
+    // 한 결정에 담아 LLM 왕복을 줄이는 길이다. 결정 수가 아니라 조회 수로 센다 — 가드·미등록으로 실행되지 않은
+    // 항목도 이력 한 줄을 차지한다. 상한을 넘는 항목은 잘라 낸다 (이력의 최소 몫이 MAX_STEPS 줄 기준이다).
+    if (runs >= MAX_STEPS) break;
+    const items = decision.action === 'run_queries' ? decision.queries : [decision];
+    // 실을 수 있는 항목 수 — 조회 수 상한과 이력 줄 수 상한 둘 다에 맞춘다. 다 싣지 못하면 그 사실을 알리는
+    // 안내 줄이 한 자리를 더 쓰므로(아래) 그 자리까지 셈에 넣는다. 자리를 늘 비워 두지는 않는다 —
+    // 그러면 안내가 필요 없는 배치에서 마지막 조회 하나를 공연히 잃는다.
+    const roomRows = MAX_HISTORY_ROWS - history.length;
+    const want = Math.min(items.length, MAX_STEPS - runs);
+    const take = want + (want < items.length ? 1 : 0) <= roomRows ? want : Math.max(0, roomRows - 1);
+    const batch = items.slice(0, take);
+    runs += batch.length;
+    const { progressed, wasted } = await runBatch(batch);
+    // 상한에 걸려 실행하지 못한 항목은 조용히 사라지지 않게 남긴다 — 모델은 자기가 넷을 요청했다는 것을
+    // 알고 있는데 이력에는 둘만 보이면, 나머지가 실패한 것인지 아직 도는 중인지 알 수 없다.
+    // 실행 줄 '뒤에' 적는다: 앞에 적으면 아직 나오지도 않은 결과를 두고 '실행하지 않았다'가 먼저 읽힌다.
+    // note라 실패 집계에는 섞이지 않는다 (loopGuard 기록과 같은 필드).
+    if (items.length > batch.length) {
+      history.push({
+        query_name: items.slice(batch.length).map(q => q.query_name).join(', '),
+        params: {},
+        note: `조회 스텝 상한(${MAX_STEPS}회)에 걸려 실행하지 않았다 — 지금까지의 결과로 답변하라`,
+      });
+    }
+    if (progressed) guardHits = 0;                        // 진도가 나갔다 — 가드는 '연속' 헛도는 경우만 센다
+    else if (wasted && ++guardHits >= MAX_GUARD_HITS) break;
   }
 
-  // 안전장치: MAX_STEPS 초과(또는 가드 반복) 시 강제 답변.
+  // 안전장치: 상한 초과(또는 가드 반복) 시 강제 답변.
   // 그마저 실패하면 fallbackAnswer가 손에 든 것으로 답을 조립한다.
   const finalCtx = { ...ctx(), forceAnswer: true };
-  const final = await decide(finalCtx);
+  const final = await decideSafe(finalCtx);
   const answer = answerOf(final) || fallbackAnswer(finalCtx);
-  return { answer: finish(answer), trace: history, search, fullRows };
+  return done(finish(answer), true);
 }
+
 
 // '이 바인드 값이 우리가 잘라서 보여준 값의 앞부분인가'를 답하는 판정자.
 //
@@ -455,15 +727,17 @@ export function fallbackAnswer(ctx) {
 // (HTTP·타임아웃·파싱), 그 밖의 실패는 여기서 받는다: 프롬프트 조립 오류, mock provider의 예외,
 // ctx에 예상 밖의 값이 섞인 경우. 보장은 provider가 아니라 '누적된 성과를 쥐고 있는' 이 경계에 둔다.
 // 결정을 얻지 못하면 null을 돌려주고, 호출부가 강제 답변 또는 폴백 답변으로 넘어간다.
-async function decide(ctx) {
+// fn은 테스트가 LLM을 스텁으로 바꿔 끼우는 자리다 (handleQuestion의 deps).
+async function decide(ctx, fn = llm.decide) {
   try {
-    return await llm.decide(ctx);
+    return await fn(ctx);
   } catch (e) {
     // 원문은 로그에만 — 스키마명·호스트가 섞일 수 있고, 사용자 문구는 호출부가 만든다.
     console.error('[agent] LLM decision failed:', e);
     return null;
   }
 }
+
 
 // 결정된 query_name → query_registry 행. 프롬프트 목록은 MAX_PROMPT_QUERIES로 잘릴 수 있으므로
 // (지식·처리방법 본문이 지목한 쿼리가 라우팅에서 빠질 수 있다) 목록에 없으면 이름으로 재확인한다.
@@ -492,99 +766,83 @@ async function resolveQuery(name, queries, cache) {
   }
 }
 
-// 프롬프트에 실을 쿼리를 관련도 순으로 정렬한다. 두 경로의 합집합이다:
-//   경로A: 매칭된 qa_method 본문이 지목한 query_name (다단계 절차 보장 — 본문 등장 순서를 지킨다)
-//   경로B: 질문으로 query_registry 자체를 하이브리드 검색(LIKE 관련도 + 벡터 RRF) —
-//          qa_method 등록 없이 등록된 쿼리도 질문만으로 찾는다
-// 지식·처리방법이 같은 hybrid()로 관련도 순을 만드는 것과 같은 순서 규칙이다.
-async function rankQueries(qaMethods, question) {
-  // 경로A는 '본문에서 이름처럼 보이는 토큰을 뽑아 IN 절로 묻는' 방식이었다. 그 추출식이
-  // /[A-Za-z_][A-Za-z0-9_]{2,}/ 라서 한글 query_name은 어떤 본문에서도 한 번도 뽑히지 않았다 —
-  // query_name은 VARCHAR(100)에 문자 제한이 없고 이 코드베이스는 다른 곳에 전부 한글을 쓴다.
-  // 그러면 '배치상태조회 를 실행한다'라고 적어도 경로A가 빈손이 되어, 이 경로가 존재하는 이유인
-  // 다단계 절차의 순서 보장('본문 등장 순서를 지킨다')이 통째로 사라진다. 경로B로 뒤늦게
-  // 올라오더라도 순서가 틀리고, 빠졌다는 사실은 어디에도 남지 않는다.
-  // 토큰화로는 고칠 수 없는 문제다: 한국어는 조사가 낱말에 붙어 '배치상태조회를'이 한 낱말이므로
-  // 이름의 끝을 공백으로 알 수 없고, 조사 변형을 다 만들면 본문의 평범한 낱말들이 상한을 채운다.
-  //
-  // 그래서 방향을 뒤집는다 — '등록된 이름이 본문에 들어 있는가'를 관리 DB가 직접 본다
-  // (db.js loadQueriesMentionedIn). 토큰화가 사라지므로 문자 종류에 좌우되지 않고, 이름 길이
-  // 제한(3자 이상)도 없어지며, 등장 위치를 DB가 함께 돌려주므로 순서 보장이 오히려 정확해진다.
-  // Mock provider가 같은 판정을 이미 이렇게 하고 있었다 (llm.js plannedQueries의 indexOf) —
-  // 두 곳이 '본문이 어떤 쿼리를 지목했는가'를 서로 다르게 답하고 있던 셈이다.
-  //
-  // 본문은 검색 결과 순서대로 이어 붙인다 — 위치 순서가 곧 '관련도 높은 처리방법 먼저,
-  // 그 안에서는 등장 순서대로'가 된다. method는 NOT NULL이지만 컬럼 하나가 완화되거나 임포터가
-  // NULL을 넣는 순간 여기서 죽는다 — 이 값의 다른 소비자(llm-openai clip, embed-sync toText)는
-  // 전부 NULL을 견딘다. 소문자화는 자르기 전에 한다 (자른 뒤에 하면 길이가 상한을 넘을 수 있다).
+// 검색 실행 — search 행동 한 번. 세 대상의 벡터 검색은 병렬이고 임베딩은 한 번만 계산된다(search.js 캐시).
+// 반환값의 세 목록은 셋을 구분한다 — 프롬프트가 '없다'와 '못 찾아봤다'를 갈라야 하기 때문이다:
+//   undefined = 요청하지 않은 대상, null = 검색이 성립하지 않음(임베딩·벡터 검색 실패), [] = 찾았는데 없음.
+// 쿼리 목록은 두 경로의 합집합이다 (selectQueries 주석) — qa_method를 찾았으면 'query'를 요청하지 않았어도
+// 경로A로 실린다. 절차만 있고 쿼리 정의가 없으면 실행할 수 없어 왕복만 하나 더 늘기 때문이다.
+async function runSearch(text, targets) {
+  const want = new Set(targets);
+  const [knowledge, qaMethods, direct] = await Promise.all([
+    want.has('knowledge') ? searchKnowledge(text) : undefined,
+    want.has('qa_method') ? searchQaMethods(text) : undefined,
+    want.has('query') ? searchQueries(text) : undefined,
+  ]);
+  const out = { knowledge, qaMethods, queries: undefined, routed: null, queriesFailed: false, directFailed: false };
+  if (!want.has('query') && !qaMethods?.length) return out;
+  // 쿼리 목록 로드 실패로 검색 전체를 버리지 않는다 — 함께 버려지는 것이 방금 찾은 지식·처리방법이고,
+  // 그중에는 DB 조회가 아예 필요 없는 순수 지식 질문도 있다. 실패는 표시로 남겨 chat_log가
+  // '등록이 없어서 못 답한 질문'과 구분하게 한다 (queriesFailed).
+  try {
+    const { list, routed } = await selectQueries(qaMethods ?? [], direct, want.has('query'));
+    out.queries = list;
+    out.routed = routed;
+    // 직접 검색이 성립하지 않았는데(direct === null) 등록이 소규모라 전체를 실었으면 그건 정상이다 —
+    // 목록에 없는 쿼리가 없다. 라우팅 규모에서만 '검색 불가'로 알린다 (경로A 쿼리만 실린 목록이므로).
+    out.directFailed = direct === null && routed === true;
+  } catch (e) {
+    // 상세는 로그에만 — 화면 문구는 호출부가 만들고, MariaDB 원문에는 스키마·호스트가 들어 있다.
+    console.warn('[agent] failed to load the query list:', e.message);
+    out.queries = null;
+    out.queriesFailed = true;
+  }
+  return out;
+}
+
+// 직접 검색(경로B)의 상위 몇 건까지 자세한 형태(입출력 설명·SQL)로 보일지. 나머지는 이름·용도·바인드만
+// 보인다 — 고르는 데는 그것이면 되고, 지목하면 다음 스텝에 자세히 실린다 (llm-openai.js renderQueries).
+const DETAIL_TOP = 5;
+
+// 프롬프트에 실을 쿼리 선정. 관련도 순으로 두 경로를 합친다:
+//   경로A: 찾은 qa_method 본문이 지목한 query_name (다단계 절차 보장 — 본문 등장 순서를 지킨다)
+//   경로B: 검색어로 query_registry 자체를 벡터 검색한 결과 (search.js) — qa_method 없이 등록한 쿼리도 찾는다
+// 등록 30건 이하면 검색에 걸리지 않은 나머지까지 전부 뒤에 이어 붙인다(짧은 형태) — 설명이 얇아 검색에
+// 안 걸린 쿼리도 이름은 보여야 모델이 지목할 수 있다. 초과하면 검색 결과만 싣는다(라우팅).
+// 반환: { list, routed } — routed는 'query'를 검색했을 때만 true/false이고, 경로A만 돌았으면 null.
+//
+// 경로A는 '본문에서 이름처럼 보이는 토큰을 뽑아 IN 절로 묻는' 방식이었다. 그 추출식이
+// /[A-Za-z_][A-Za-z0-9_]{2,}/ 라서 한글 query_name은 어떤 본문에서도 한 번도 뽑히지 않았다 —
+// query_name은 VARCHAR(100)에 문자 제한이 없고 이 코드베이스는 다른 곳에 전부 한글을 쓴다.
+// 한국어는 조사가 낱말에 붙어 '배치상태조회를'이 한 낱말이므로 토큰화로는 고칠 수 없다.
+// 그래서 방향을 뒤집는다 — '등록된 이름이 본문에 들어 있는가'를 관리 DB가 직접 본다
+// (db.js loadQueriesMentionedIn). 등장 위치를 DB가 함께 돌려주므로 순서 보장이 정확하다.
+// 본문은 검색 결과 순서대로 이어 붙인다 — 위치 순서가 곧 '관련도 높은 처리방법 먼저, 그 안에서는
+// 등장 순서대로'가 된다. method는 NOT NULL이지만 컬럼 하나가 완화되거나 임포터가 NULL을 넣는
+// 순간 여기서 죽는다 — 이 값의 다른 소비자(llm-openai clip, embed-sync toText)는 전부 NULL을 견딘다.
+// 소문자화는 자르기 전에 한다 (자른 뒤에 하면 길이가 상한을 넘을 수 있다).
+async function selectQueries(qaMethods, direct, wantDirect) {
   const routeText = clipText(
     qaMethods.map(m => String(m.method ?? '')).join('\n').toLowerCase(),
     MAX_ROUTE_TEXT_LEN
   );
-  const [named, direct] = await Promise.all([
-    loadQueriesMentionedIn(routeText),
-    searchQueries(question),
+  // 상한+1건만 읽어 "전체를 실어도 되는 규모인지"를 같은 왕복에서 판정한다 (COUNT 후 다시 SELECT하면
+  // 왕복 2회). 라우팅 규모에서는 이 31행이 버려진다 — 상한이 걸린 고정 비용이라 왕복 1회 쪽이 낫다.
+  const [named, head] = await Promise.all([
+    loadQueriesMentionedIn(routeText),               // 빈 본문이면 왕복하지 않는다 (db.js)
+    wantDirect ? loadQueryRegistry(MAX_PROMPT_QUERIES + 1) : [],
   ]);
-
-  const seen = new Set();
-  const ranked = [];
-  for (const q of [...named, ...direct]) {       // 절차용(경로A)을 우선 포함
-    if (seen.has(q.seq)) continue;
-    seen.add(q.seq);
-    ranked.push(q);
-  }
-  return ranked;
-}
-
-// 프롬프트에 실을 쿼리 선정.
-// 반환: { list, routed } — routed=false면 등록 전체를 실은 것이므로 '적중 수' 개념이 없다.
-//
-// 규모와 무관하게 목록은 반드시 '관련도 순'이어야 한다. 프롬프트 예산(llm-openai.js renderQueries)이
-// 뒤쪽일수록 덜 관련됐다는 전제로 뒤에서부터 줄이기 때문이다. 등록 30건 이하에서는 관련도 검색을
-// 아예 돌리지 않고 저장 순서 그대로 넘기고 있었는데, 그러면 예산이 버리는 것이 '덜 관련된 쿼리'가
-// 아니라 '나중에 등록한 쿼리'가 된다 — 하필 방금 등록한 쿼리부터 프롬프트에서 사라지고,
-// 로그·trace·chat_log 어디에도 그 사실이 남지 않는다.
-// 전체를 싣는 규모에서도 순서를 만들어 그 전제를 참으로 만든다. 추가 비용은 관리 DB 왕복이
-// 요청당 최대 3회(이름 조회 + LIKE + 벡터, 실측 평균 +2.75회) 늘어나는 것뿐이다 —
-// 질문 임베딩은 지식·처리방법 검색이 이미 계산해 두었고 search.js가 캐시하므로 다시 부르지 않는다.
-// 동시 점유는 3으로 CONNS_PER_REQUEST(4) 안이다(db.js 풀 산식 주석에 실측이 적혀 있다).
-async function selectQueries(qaMethods, question) {
-  // 상한+1건만 읽어 "전체를 실어도 되는 규모인지"를 같은 왕복에서 판정한다.
-  // COUNT 후 다시 SELECT하면 매 요청이 왕복 2회 + 풀 점유 2회가 되고, 그렇다고 무조건
-  // 전체를 읽으면 등록이 많을 때 대형 SELECT가 된다 — 상한+1은 양쪽 다 피한다.
-  // 대가: 라우팅이 도는 규모(등록 30건 초과)에서는 이 31행이 그대로 버려진다.
-  // 31행은 상한이 걸린 고정 비용이라 지금은 왕복 1회 쪽이 낫다고 봤다 —
-  // 등록이 크게 늘고 설명 컬럼이 길어져 이 전송이 부담이 되면
-  // 규모 판정만 `SELECT seq … LIMIT 31`로 떼고 전체 로드를 조건부로 되돌릴 것.
-  const head = await loadQueryRegistry(MAX_PROMPT_QUERIES + 1);
-  // 등록이 하나도 없으면 순서를 만들 대상이 없다 — 관리 DB 왕복 2회를 태우지 않는다
-  if (!head.length) return { list: [], routed: false };
-  const routed = head.length > MAX_PROMPT_QUERIES;
-
-  // 관련도 검색이 실패했을 때 무엇을 할지가 규모에 따라 다르다 — 손에 쥔 폴백이 다르기 때문이다.
-  //   라우팅 규모: 검색 결과가 곧 목록이다. 폴백이 없으므로 삼키지 않고 호출부로 올린다 —
-  //     그래야 chat_log에 queriesFailed로 남아 '등록이 없어서 못 답한 질문'과 구분된다.
-  //     여기서 읽어둔 31건으로 대신 채우면 목록은 그럴듯한데 순서는 등록 순서라, 실패가
-  //     '정상 라우팅 30건 적중'으로 기록되면서 조용히 사라진다.
-  //   전체를 싣는 규모: 등록 목록 전체(head)를 이미 손에 쥐고 있다. 순서만 잃고 계속한다 —
-  //     여기서 던지면 이 규모에서는 원래 없던 실패 경로가 새로 생긴다.
-  const ranked = routed
-    ? await rankQueries(qaMethods, question)
-    : await rankQueries(qaMethods, question).catch(e => {
-        console.warn('[agent] failed to rank the query list — falling back to registration order:', e.message);
-        return [];
-      });
+  const routed = wantDirect ? head.length > MAX_PROMPT_QUERIES : null;
 
   const seen = new Set();
   const list = [];
-  // 관련도 순이 먼저, 그다음이 검색에 걸리지 않은 나머지(등록 순서).
-  // 라우팅 규모에서는 head가 표본일 뿐이므로 뒤쪽을 붙이지 않는다 — 관련도 없는 31건 중 일부를
-  // 채워 넣으면 상한 자리만 차지하고 정작 관련 있는 쿼리를 밀어낸다.
-  for (const q of routed ? ranked : [...ranked, ...head]) {
-    if (seen.has(q.seq)) continue;
+  const push = (q, detail) => {
+    if (seen.has(q.seq)) return;
     seen.add(q.seq);
+    if (detail) q.detail = true;
     list.push(q);
-    if (list.length >= MAX_PROMPT_QUERIES) break;
-  }
-  return { list, routed };
+  };
+  named.forEach(q => push(q, true));                      // 절차용(경로A)이 먼저, 자세히
+  (direct ?? []).forEach((q, i) => push(q, i < DETAIL_TOP));
+  if (routed === false) head.forEach(q => push(q, false)); // 소규모: 나머지 등록 전부 (짧은 형태)
+  return { list: list.slice(0, MAX_PROMPT_QUERIES), routed };
 }

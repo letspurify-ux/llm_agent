@@ -2,7 +2,8 @@
 //   EMBEDDING_URL   예) http://localhost:11434/v1 (Ollama 기본)
 //   EMBEDDING_MODEL 예) bge-m3 (1024차원 — vec_store.embedding 차원과 일치해야 함)
 // 실패 시 EmbeddingError를 던진다 — 호출부가 '재시도할 실패'와 '입력이 거부된 실패'를 구분해야 하기 때문이다.
-// 미설정(LIKE-only)은 실패가 아니므로 호출부가 isEmbeddingEnabled()로 먼저 갈라낸다.
+// 미설정은 실패가 아니라 설정상의 선택이므로 호출부가 isEmbeddingEnabled()로 먼저 갈라낸다
+// (다만 그 구성에서는 검색이 성립하지 않는다 — search.js 머리말).
 // 모델명은 embed-sync의 embed_hash에도 들어간다(모델 교체 시 자동 재임베딩) — 한 곳에서만 정의한다
 import { warnOnce, joinUrl, readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_UPSTREAM_ERROR_BYTES } from './constants.js';
 
@@ -12,7 +13,7 @@ export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'bge-m3';
 // 재구성하면, 여기 설정 경로가 바뀔 때 호출부만 조용히 어긋난다.
 export const isEmbeddingEnabled = () => Boolean(process.env.EMBEDDING_URL);
 
-const TIMEOUT_MS = 60_000; // 모델 콜드 로드가 30초+ 걸릴 수 있어 넉넉히. 초과 시 LIKE-only 폴백
+const TIMEOUT_MS = 60_000; // 모델 콜드 로드가 30초+ 걸릴 수 있어 넉넉히. 초과하면 그 검색은 '검색 불가'가 된다
 
 // 임베딩 실패는 성격이 둘로 갈리고, 호출부가 해야 할 일이 정반대다 —
 // null 하나로 뭉개면 embed-sync가 둘을 구분하지 못해, 입력 한 건이 거부된 것을

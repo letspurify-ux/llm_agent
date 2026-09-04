@@ -58,7 +58,7 @@ CREATE TABLE query_registry (
   seq            INT AUTO_INCREMENT PRIMARY KEY,
   query_name     VARCHAR(100) NOT NULL UNIQUE,
   query_desc     TEXT,          -- 용도 요약: "어떤 질문일 때 무엇을 조회하는 쿼리인지".
-                                -- 벡터/LIKE 검색과 LLM의 쿼리 선택 근거이므로 성실히 작성할 것
+                                -- 벡터 검색과 LLM의 쿼리 선택 근거이므로 성실히 작성할 것
   input_desc     TEXT,
   query_sql      TEXT NOT NULL,
   output_desc    TEXT,
@@ -91,8 +91,12 @@ CREATE TABLE chat_log (
                                    -- utf8mb4 한글 기준 100KB를 넘고, strict 모드에서 INSERT가 거부돼
                                    -- 하필 '결과가 큰 대화'만 로그에서 빠진다
   trace      JSON,                -- {v: 스키마 버전, outcome: 이 요청이 무엇으로 끝났는가(v3+에는 반드시 있다),
-                                  --  search: 검색 적중 수(queries는 라우팅 동작 시에만, 아니면 null),
-                                  --  steps: 실행 쿼리·바인드·결과. 실패는 steps[].error, 루프 가드 기록은 steps[].note,
+                                  --  search: 검색 요약 — v4부터 {searches: 검색 횟수, targets: 대상별 검색 횟수,
+                                  --    knowledge/qaMethods/queries: 대상별 적중 수(찾아본 적 없거나 검색이 성립하지 않았으면 null,
+                                  --    queries는 라우팅 동작 시에만), queriesFailed/searchFailed: 목록·검색이 성립하지 않았음},
+                                  --  timing: v4부터 {total, llm[], search[], oracle[]} — 구간별 소요 ms (어디가 느린지의 유일한 기록),
+                                  --  steps: 실행 검색·쿼리. v4부터 검색 기록 {search, targets, hits, failed?}이 쿼리 기록과 같은 배열에
+                                  --    순서대로 섞인다 (번호가 곧 프롬프트의 스텝 번호). 실패는 steps[].error, 루프 가드 기록은 steps[].note,
                                   --  steps[].safe는 그 error 문구를 사용자 화면에 그대로 내보내도 되는지(우리가 쓴 안내문이면 true,
                                   --  드라이버·DB 원문이면 없음) — 화면에는 서버가 후자를 일반 문구로 바꿔 내보낸다.
                                   --  steps[].hint는 모델에게만 준 복구 지침(있을 때만) — 화면에는 나가지 않는다}
@@ -110,7 +114,8 @@ CREATE TABLE chat_log (
 -- embed-sync.js가 원본 텍스트의 MD5(embed_hash, DB에서 계산)를 비교해 신규/변경분만 임베딩한다.
 --
 -- 이 테이블만 MariaDB 11.7+를 요구하므로 파일 맨 뒤에 둔다 — 낮은 버전에서 여기서 멈춰도
--- 앞의 5개 테이블은 온전하고, 앱은 벡터 검색만 빼고(LIKE-only 폴백) 정상 동작한다.
+-- 앞의 5개 테이블은 온전하고 서버는 뜬다. 다만 검색이 벡터 단일 경로라(backend/src/search.js)
+-- 이 테이블이 없으면 지식·처리방법·쿼리를 하나도 찾지 못하고 '검색 불가'로 기록된다.
 CREATE TABLE vec_store (
   src        VARCHAR(20) NOT NULL,   -- 'knowledge' | 'qa_method' | 'query_registry'
   seq        INT NOT NULL,           -- 원본 행 seq

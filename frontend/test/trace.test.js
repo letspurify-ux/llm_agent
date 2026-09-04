@@ -2,7 +2,7 @@
 // CSV는 조용히 깨진다: 쉼표가 든 값 하나가 옆 열로 밀려도 파일은 열리고, 한글이 깨진 파일도 열린다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { columnsOf, cellText, toCsv, csvFileName, countLabel, stepLabel, normalizeTrace } from '../src/trace.js';
+import { columnsOf, cellText, toCsv, csvFileName, countLabel, stepLabel, normalizeTrace, isSearchStep, searchLabel, targetsLabel, traceSummary, applyProgress, progressText } from '../src/trace.js';
 
 test('열은 첫 등장 순서의 합집합이다', () => {
   assert.deepStrictEqual(columnsOf([{ B: 1, A: 2 }, { A: 3, C: 4 }, null, 'x']), ['B', 'A', 'C']);
@@ -93,7 +93,7 @@ test('trace는 화면이 그릴 수 있는 모양으로만 들어온다 — 어�
   assert.strictEqual(normalizeTrace([{ query_name: 'q', rows: '행이 아니다' }])[0].rows, undefined);
   assert.strictEqual(normalizeTrace([{ query_name: 'q' }])[0].rows, undefined);
   // 성한 스텝은 그대로 지나간다 — 정리한다는 이유로 화면이 쓰는 값을 잃어서는 안 된다
-  const 성한 = { query_name: 'q', targetDb: 'db', params: { a: 1 }, rowCount: '1000+', capped: true, omittedRows: 970, rows: [{ a: 1 }] };
+  const 성한 = { step: 2, query_name: 'q', targetDb: 'db', params: { a: 1 }, rowCount: '1000+', capped: true, omittedRows: 970, rows: [{ a: 1 }] };
   assert.deepStrictEqual(normalizeTrace([성한]), [성한]);
   // 정리한 스텝도 화면이 부르는 문구 함수를 그대로 통과해야 한다 (여기서 던지면 정리한 뜻이 없다)
   for (const step of normalizeTrace([{ query_name: {}, rows: 'x', rowCount: {}, error: {} }, { query_name: 'q', rows: [null, 'x', { a: 1 }] }]))
@@ -102,4 +102,157 @@ test('trace는 화면이 그릴 수 있는 모양으로만 들어온다 — 어�
   const rows = normalizeTrace([{ query_name: 'q', rows: [null, '글자', { a: 1 }] }])[0].rows;
   assert.deepStrictEqual(columnsOf(rows), ['a']);
   assert.strictEqual(toCsv(rows), '\ufeffa\r\n\r\n\r\n1\r\n');
+});
+
+// ===== 검색 항목과 진행 줄 =====
+
+test('검색 결과 문구: 적중 수·검색 불가·찾지 않은 대상을 가른다', () => {
+  assert.equal(searchLabel({ hits: { knowledge: 2, qaMethods: null, queries: 3 } }), '지식 2건 · 쿼리 3건');
+  assert.equal(searchLabel({ hits: { knowledge: 0 }, failed: ['qa_method', 'query'] }), '지식 0건 · 처리방법 검색 불가 · 쿼리 검색 불가');
+  assert.equal(searchLabel({}), '결과 없음');
+  assert.equal(searchLabel({ hits: 'x', failed: 'y' }), '결과 없음', '모양이 어긋난 값에 죽지 않는다');
+  assert.equal(targetsLabel(['knowledge', 'query', 'bogus']), '지식·쿼리·bogus');
+  assert.equal(targetsLabel([]), '전체');
+});
+
+test('스텝 문구: 검색 항목은 적중 수를, 쿼리 항목은 건수·오류를 말한다', () => {
+  assert.equal(stepLabel({ search: 'x', hits: { knowledge: 1 } }), '지식 1건');
+  assert.ok(isSearchStep({ search: 'x' }) && !isSearchStep({ query_name: 'q' }) && !isSearchStep(null));
+});
+
+test('패널 머리띠: 검색이 없으면 예전 그대로, 있으면 둘을 함께 말한다', () => {
+  assert.equal(traceSummary([{ query_name: 'q', rows: [] }]), '실행된 쿼리 1건');
+  assert.equal(traceSummary([{ search: 'x' }, { query_name: 'q' }, { query_name: 'r' }]), '검색 1회 · 실행된 쿼리 2건');
+  assert.equal(traceSummary([{ search: 'x' }]), '검색 1회');
+  assert.equal(traceSummary([]), '실행된 쿼리 0건');
+  assert.equal(traceSummary('x'), '실행된 쿼리 0건');
+});
+
+test('normalizeTrace는 검색 항목을 한 줄짜리 모양으로만 남긴다', () => {
+  const [s, q] = normalizeTrace([{ search: '배치', targets: ['knowledge', 3], hits: 'x', failed: null, rows: [{ a: 1 }] }, { query_name: 'q', rows: [] }]);
+  assert.deepStrictEqual(s, { search: '배치', targets: ['knowledge'], hits: {}, failed: [] });
+  assert.ok(!('rows' in s), '검색 항목에 표가 붙으면 안 된다');
+  assert.equal(q.query_name, 'q');
+});
+
+test('진행 줄: 시작이 줄을 세우고 끝이 그 줄에 결과를 붙인다 — 순서가 어긋나거나 모르는 종류가 와도 깨지지 않는다', () => {
+  let list = [];
+  list = applyProgress(list, { type: 'search', text: '배치', targets: ['knowledge', 'query'] });
+  assert.deepStrictEqual(list, [{ kind: 'search', text: '배치', targets: ['knowledge', 'query'], pending: true }]);
+  assert.equal(progressText(list[0]), '검색 "배치" (지식·쿼리)');
+  list = applyProgress(list, { type: 'search_done', text: '배치', targets: ['knowledge', 'query'], hits: { knowledge: 2, queries: 0 } });
+  assert.equal(list.length, 1);
+  assert.equal(list[0].pending, false);
+  assert.equal(progressText(list[0]), '검색 "배치" (지식·쿼리) → 지식 2건 · 쿼리 0건');
+  list = applyProgress(list, { type: 'run_query', query_name: 'q', targetDb: 'D', params: {} });
+  assert.equal(progressText(list[1]), '조회 q@D');
+  list = applyProgress(list, { type: 'run_query_done', query_name: 'q', targetDb: 'D', rowCount: '1000+' });
+  assert.equal(progressText(list[1]), '조회 q@D → 1000건 이상');   // 패널과 같은 말로 푼다 (아래 전용 검사)
+  list = applyProgress(list, { type: 'run_query_done', query_name: 'r', error: '조회 중 오류가 발생했습니다.' });
+  assert.equal(list.length, 3, '짝 없는 끝 이벤트는 새 줄로 선다');
+  assert.equal(progressText(list[2]), '조회 r → 오류: 조회 중 오류가 발생했습니다.');
+  assert.equal(applyProgress(list, { type: 'ping' }), list, '모르는 종류는 그대로');
+  assert.deepStrictEqual(applyProgress('x', null), [], '모양이 어긋난 값에 죽지 않는다');
+  // 이름 없는 조회·검색 불가
+  assert.equal(progressText({ kind: 'query', pending: false, rowCount: 0 }), '조회 (이름 없음) → 0건');
+  assert.equal(progressText({ kind: 'search', text: 'x', targets: ['qa_method'], failed: ['qa_method'], pending: false }), '검색 "x" (처리방법) → 처리방법 검색 불가');
+});
+
+test('여러 조회가 동시에 돌 때 끝 이벤트는 이름이 맞는 줄에 붙는다 — 줄이 뒤바뀌거나 사라지지 않는다', () => {
+  // 일괄 조회(backend run_queries)는 조회 여럿을 병렬로 돌리므로 끝나는 순서가 시작 순서와 다르다.
+  // 마지막 미완 줄에 붙이던 때에는 가운데가 먼저 끝나는 순간 그 줄이 다른 이름을 뒤집어써서
+  // 같은 이름이 두 줄로 보이고 한 조회는 화면에서 사라졌다.
+  let list = [];
+  for (const e of [
+    { type: 'run_query', query_name: 'A', targetDb: 'D' },
+    { type: 'run_query', query_name: 'B', targetDb: 'D' },
+    { type: 'run_query', query_name: 'C', targetDb: 'D' },
+    { type: 'run_query_done', query_name: 'B', targetDb: 'D', rowCount: 2 },
+  ]) list = applyProgress(list, e);
+  assert.deepStrictEqual(list.map(progressText), ['조회 A@D', '조회 B@D → 2건', '조회 C@D']);
+  for (const e of [
+    { type: 'run_query_done', query_name: 'C', targetDb: 'D', rowCount: 3 },
+    { type: 'run_query_done', query_name: 'A', targetDb: 'D', rowCount: 1 },
+  ]) list = applyProgress(list, e);
+  assert.deepStrictEqual(list.map(progressText), ['조회 A@D → 1건', '조회 B@D → 2건', '조회 C@D → 3건']);
+  // 같은 쿼리를 다른 DB에서 도는 흔한 경우도 갈린다
+  let two = [];
+  for (const e of [
+    { type: 'run_query', query_name: 'stock', targetDb: '서울' },
+    { type: 'run_query', query_name: 'stock', targetDb: '부산' },
+    { type: 'run_query_done', query_name: 'stock', targetDb: '서울', rowCount: 5 },
+  ]) two = applyProgress(two, e);
+  assert.deepStrictEqual(two.map(progressText), ['조회 stock@서울 → 5건', '조회 stock@부산']);
+  // 이름을 주지 않는 끝 이벤트는 마지막 미완 줄로 물러선다 (옛 배포·다른 서버)
+  let fb = applyProgress(applyProgress([], { type: 'run_query', query_name: 'A' }), { type: 'run_query_done', rowCount: 9 });
+  assert.equal(fb.length, 1);
+  assert.match(progressText(fb[0]), /9건/);
+});
+
+test('조회의 시작·끝은 서버가 준 짝 번호로 잇는다 — 이름·대상 DB로는 짝을 지을 수 없다', () => {
+  // 같은 쿼리를 다른 값으로 두 번 부르는 배치가 정당하고, 대상 DB의 철자도 시작 이벤트(모델이 적은 것)와
+  // 끝 이벤트(등록 철자)가 다를 수 있다 — 이름으로 짝을 지으면 그 두 경우에 줄이 뒤바뀐다.
+  let list = [];
+  for (const e of [
+    { type: 'run_query', id: 1, query_name: 'stock', targetDb: 'PROD' },   // 모델이 적은 철자
+    { type: 'run_query', id: 2, query_name: 'stock', targetDb: 'PROD' },   // 같은 쿼리·같은 DB, 다른 값
+    { type: 'run_query_done', id: 2, query_name: 'stock', targetDb: 'prod', rowCount: 7 },  // 등록 철자
+  ]) list = applyProgress(list, e);
+  assert.deepStrictEqual(list.map(progressText), ['조회 stock@PROD', '조회 stock@prod → 7건']);
+  list = applyProgress(list, { type: 'run_query_done', id: 1, query_name: 'stock', targetDb: 'prod', rowCount: 3 });
+  assert.deepStrictEqual(list.map(progressText), ['조회 stock@prod → 3건', '조회 stock@prod → 7건']);
+});
+
+test('짝 번호를 주지 않는 서버에서는 이름과 대상 DB로 물러서되 철자 차이는 흡수한다', () => {
+  let list = [];
+  for (const e of [
+    { type: 'run_query', query_name: 'A', targetDb: 'PROD' },
+    { type: 'run_query', query_name: 'B', targetDb: 'PROD' },
+    { type: 'run_query_done', query_name: ' a ', targetDb: 'prod', rowCount: 1 },
+  ]) list = applyProgress(list, e);
+  // 짝은 철자 차이를 넘어 지어지고, 화면에 보이는 이름은 서버가 준 그대로다 (정규화는 비교에만 쓴다)
+  assert.deepStrictEqual(list.map(progressText), ['조회  a @prod → 1건', '조회 B@PROD']);
+});
+
+test('패널의 번호는 서버가 준 이력의 절대 순번을 그대로 쓴다', () => {
+  // 모델이 답변에서 "3번 조회 결과"라고 말할 때 사용자가 패널에서 세는 번호와 같아야 한다 —
+  // 걸러진 항목(가드 안내)만큼 어긋나면 다른 조회를 가리킨다.
+  const [s1, q1] = normalizeTrace([
+    { step: 1, search: 'x', targets: ['knowledge'], hits: { knowledge: 1 } },
+    { step: 4, query_name: 'q', params: {}, rows: [{ a: 1 }], rowCount: 1 },
+  ]);
+  assert.equal(s1.step, 1);
+  assert.equal(q1.step, 4);
+});
+
+test('상한에 걸린 건수는 진행 줄과 패널이 같은 말로 푼다', () => {
+  // 서버는 '1000+'로 준다. 진행 줄이 그대로 찍으면 같은 조회가 몇 초 사이에 '1000+건'이었다가
+  // '1000건 이상'이 된다 — 사용자는 둘을 다른 일로 읽는다.
+  let l = applyProgress([], { type: 'run_query', id: 1, query_name: 'q', targetDb: 'D' });
+  l = applyProgress(l, { type: 'run_query_done', id: 1, query_name: 'q', targetDb: 'D', rowCount: '1000+' });
+  assert.equal(progressText(l[0]), '조회 q@D → 1000건 이상');
+  assert.match(countLabel({ rowCount: '1000+', capped: true, omittedRows: 980, rows: new Array(20) }), /^1000건 이상 —/);
+});
+
+test('짝 없는 번호의 끝 이벤트는 남의 줄을 덮지 않고 자기 줄을 세운다', () => {
+  // 시작을 못 받았거나 끝이 두 번 온 경우다. 남의 줄에 붙이면 그 줄이 다른 조회의 이름과 건수를
+  // 뒤집어쓰고(한 조회는 화면에서 사라진다) 진짜 끝이 나중에 와서 세 번째 줄을 만든다.
+  let l = [];
+  for (const e of [
+    { type: 'run_query', id: 1, query_name: 'A' },
+    { type: 'run_query', id: 3, query_name: 'C' },
+    { type: 'run_query_done', id: 2, query_name: 'B', rowCount: 2 },
+  ]) l = applyProgress(l, e);
+  assert.deepStrictEqual(l.map(progressText), ['조회 A', '조회 C', '조회 B → 2건']);
+  // 번호를 주지 않는 옛 배포는 그대로 마지막 미완 줄로 물러선다
+  let old = applyProgress(applyProgress([], { type: 'run_query', query_name: 'A' }), { type: 'run_query_done', query_name: '모르는이름', rowCount: 9 });
+  assert.equal(old.length, 1);
+});
+
+test('스텝 번호는 정수일 때만 화면으로 나간다', () => {
+  // 이 값은 React의 자식이 된다 — 객체가 그대로 통과하면 렌더가 던지고 패널이 통째로 사라진다.
+  assert.equal(normalizeTrace([{ step: { n: 3 }, query_name: 'q', rows: [] }])[0].step, undefined);
+  assert.equal(normalizeTrace([{ step: '2', search: 'x' }])[0].step, undefined);
+  assert.equal(normalizeTrace([{ step: 2, search: 'x' }])[0].step, 2);
+  assert.equal(normalizeTrace([{ step: 0, query_name: 'q' }])[0].step, undefined);
 });

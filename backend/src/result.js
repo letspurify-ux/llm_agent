@@ -38,13 +38,24 @@ export function rowCounts(h) {
 // fullRows는 agent.js가 history 항목을 키로 든 Map이다(성공한 조회에만 있다). 없는 항목은 history의
 // 20행으로 물러나고, 그때는 omittedRows로 몇 건을 못 실었는지 알린다 — 조용히 표본이 되지 않게.
 export function clientTrace(trace, fullRows = new Map()) {
-  // note만 있는 항목은 루프 가드가 LLM에게 남긴 제어용 기록이고 실행된 쿼리가 아니다 —
-  // '실행된 쿼리 N건' 목록에서 제외한다 (내부 지시문이 사용자에게 노출되지 않게).
-  return trace.filter(h => !h.note).map(h => {
+  // note만 있는 항목은 루프 가드가 LLM에게 남긴 제어용 기록이고 실행된 검색·쿼리가 아니다 —
+  // 패널의 목록에서 제외한다 (내부 지시문이 사용자에게 노출되지 않게).
+  //
+  // 다만 번호는 이력의 절대 순번을 그대로 실어 보낸다. 모델이 보는 번호(llm-openai.js renderHistory의 'N.')는
+  // 제외된 항목까지 세므로, 화면이 남은 것만 1부터 다시 세면 답변이 "3번 조회 결과"라고 말할 때 사용자가
+  // 패널에서 세는 3번과 다른 것을 가리킨다. 표·차트 참조는 서버가 채워서 안전하지만 답변 본문의 말은 그렇지 않다.
+  return trace.map((h, i) => [h, i + 1]).filter(([h]) => !h.note).map(([h, step]) => {
+    // 검색 기록 — 검색어·대상·대상별 적중 수. 답을 기다리는 동안 화면에 흘러간 것과 같은 값이 답이 온 뒤에도
+    // 패널에 남는다 (agent.js의 search_done 이벤트와 같은 재료). failed는 '검색 불가'였던 대상이다 —
+    // 0건과 구분해 보여야 사용자가 '등록이 없다'로 읽지 않는다.
+    if (h.search !== undefined) {
+      return { step, search: h.search, targets: h.targets ?? [], hits: h.hits ?? {}, ...(h.failed?.length && { failed: h.failed }) };
+    }
     const { rows, totalRows, capped } = rowCounts(h);
     // 오류 기록에는 rows 자체가 없다 — 빈 배열로 바꾸면 화면이 '0건 조회 성공'으로 읽는다.
     const shown = h.rows ? (fullRows.get(h) ?? rows) : undefined;
     return {
+      step,
       query_name: h.query_name,
       params: h.params,
       // 어느 DB를 조회했는지 화면에도 보여준다. 대상 DB가 여럿인 쿼리에서는 '무엇을 조회했나'의

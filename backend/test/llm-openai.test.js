@@ -7,8 +7,10 @@ import assert from 'node:assert';
 process.env.LLM_BASE_URL = 'http://test.invalid/v1';
 process.env.LLM_MODEL = 'test';
 delete process.env.LLM_API_KEY;
+// 스트림 유휴 상한을 짧게 — 아래 '멈춘 스트림' 검사가 30초를 기다리지 않게. 다른 검사의 스트림은 조각을 즉시 준다.
+process.env.LLM_IDLE_TIMEOUT_MS = '150';
 
-const { openaiDecide } = await import('../src/llm-openai.js');
+const { openaiDecide, answerPreviewer } = await import('../src/llm-openai.js');
 const { TRUNC_MARK, MAX_COMPLETION_TOKENS } = await import('../src/constants.js');
 
 const CTX = { question: 'q', chat: [], knowledge: [], qaMethods: [], queries: [], history: [] };
@@ -837,4 +839,219 @@ test('상류가 끝없이 쏟아내도 응답을 통째로 받지 않는다', as
   // 두 번 시도하므로 상한(8MB) × 2가 최악이다. 상한이 없으면 여기서 멈추는 것이 없다.
   assert.ok(보낸MB < 32, `본문을 통째로 받았다: ${보낸MB}MB`);
   assert.ok(경고.some(l => /상한/.test(l)), `상한에 걸린 사실이 로그에 남지 않았다: ${JSON.stringify(경고)}`);
+});
+
+test('검색 결정을 읽는다 — 강제 답변 단계와 사고 과정 안의 초안에서는 받지 않는다', async () => {
+  const d = await decide('{"action":"search","text":"배치 재시작","targets":["knowledge"]}');
+  assert.deepStrictEqual(d, { action: 'search', text: '배치 재시작', targets: ['knowledge'] });
+  // text가 없어도 결정이다 — 호출부가 질문으로 대신한다. targets는 정규화 없이 넘긴다(결정 경계의 일).
+  const bare = await decide('{"action":"search","targets":"bogus"}');
+  assert.deepStrictEqual(bare, { action: 'search', targets: 'bogus' });
+  // 강제 답변 단계에서는 더 찾아볼 수 없다 — run_query와 같은 판정
+  assert.equal(await decide('{"action":"search","text":"x"}', { ...CTX, forceAnswer: true }), null);
+  // 사고 과정 안의 초안 검색어로 검색을 태우지 않는다 — 초안을 실행하는 것보다 결정을 못 찾는 편이 낫다
+  const draft = await decide('생각 중 {"action":"search","text":"초안"} </think>\n{"action":"answer","answer":"a"}');
+  assert.equal(draft.action, 'answer');
+  const draftOnly = await decide('{"action":"search","text":"초안"} </think>');
+  assert.equal(draftOnly, null);
+});
+
+test('시스템 프롬프트가 세 행동과 검색 대상 이름을 프롬프트 표기 그대로 말한다', async () => {
+  const sys = (await capturedRequest()).messages[0].content;
+  for (const t of ['knowledge', 'qa_method', 'query']) assert.ok(sys.includes(`"${t}"`), `대상 이름이 빠졌다: ${t}`);
+  assert.match(sys, /"action":"search"/);
+  assert.match(sys, /검색 불가/, '이력의 검색 불가 표기를 모델에게 설명해야 한다');
+  assert.match(sys, /인사·잡담/, '인사에는 검색도 일반 지식 문구도 붙이지 않는다는 규칙이 있어야 한다');
+});
+
+test('일괄 조회 결정을 읽는다 — 형식이 아닌 항목만 버리고, 남는 것이 없으면 결정이 아니다', async () => {
+  const d = await decide('{"action":"run_queries","queries":[{"query_name":"a","params":{"x":1}},{"params":{}},"junk",{"query_name":"b","params":[1],"target_db":"D"}]}');
+  assert.deepStrictEqual(d, { action: 'run_queries', queries: [{ query_name: 'a', params: { x: 1 } }, { query_name: 'b', params: {}, target_db: 'D' }] });
+  assert.equal(await decide('{"action":"run_queries","queries":[{"params":{}}]}'), null);
+  assert.equal(await decide('{"action":"run_queries","queries":"x"}'), null);
+  assert.equal(await decide('{"action":"run_queries","queries":[{"query_name":"a","params":{}}]}', { ...CTX, forceAnswer: true }), null, '강제 답변 단계에서는 받지 않는다');
+});
+
+test('시스템 프롬프트가 일괄 조회와 table 참조를 설명한다', async () => {
+  const sys = (await capturedRequest()).messages[0].content;
+  assert.match(sys, /"action":"run_queries"/);
+  assert.ok(sys.includes('```table\nstep: 2'), 'table 블록 예시가 있어야 한다');
+});
+
+// ===== 스트림 응답 =====
+// 서버가 SSE로 답하면 조각을 이어 붙여 같은 결정을 얻고, 답변 조각을 미리보기로 흘리며, 멈추면 끊는다.
+const enc = new TextEncoder();
+const IDLE_MS = Number(process.env.LLM_IDLE_TIMEOUT_MS);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const sse = (chunks, { close = true } = {}) => new Response(new ReadableStream({
+  start(c) { for (const ch of chunks) c.enqueue(enc.encode(ch)); if (close) c.close(); },
+}), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+const data = obj => `data: ${JSON.stringify(obj)}\n\n`;
+const delta = (content, extra = {}) => data({ choices: [{ delta: { content }, ...extra }] });
+
+test('SSE 조각을 이어 붙여 결정을 읽고, 마지막 조각의 usage를 훅으로 준다', async () => {
+  let body;
+  globalThis.fetch = async (_url, init) => {
+    body = JSON.parse(init.body);
+    return sse([
+      ': ping\n\n',
+      delta('{"action":"run_qu'), delta('ery","query_name":"q1","par'),
+      delta('ams":{"a":1}}', { finish_reason: 'stop' }),
+      data({ choices: [], usage: { prompt_tokens: 321, completion_tokens: 12 } }),
+      'data: [DONE]\n\n',
+    ]);
+  };
+  let usage;
+  const d = await openaiDecide({ ...CTX, onUsage: u => { usage = u; } });
+  assert.deepStrictEqual(d, { action: 'run_query', query_name: 'q1', params: { a: 1 } });
+  assert.deepStrictEqual(usage, { prompt_tokens: 321, completion_tokens: 12 });
+  assert.equal(body.stream, true);
+  assert.deepStrictEqual(body.stream_options, { include_usage: true });
+});
+
+test('답변 조각은 디코딩된 글자로 미리보기 훅에 흘러오고, 사고 과정 안의 초안은 흘리지 않는다', async () => {
+  globalThis.fetch = async () => sse([
+    delta('<think>초안: {"action":"answer","answer":"버려야 한다"}'), delta(' 아니다</think>\n'),
+    delta('{"action":"answer","answer":"### 결과\\n'), delta('값은 \\"A\\" 이고 $\\\\frac{1}{2}$ \\ud83d'), delta('\\ude00 끝"}'),
+  ]);
+  const seen = [];
+  const d = await openaiDecide({ ...CTX, onAnswerDelta: e => seen.push(e) });
+  assert.equal(d.action, 'answer');
+  assert.equal(seen.map(e => e.text ?? '').join(''), '### 결과\n값은 "A" 이고 $\\frac{1}{2}$ 😀 끝');
+  assert.ok(!seen.some(e => e.reset), '재시도가 없으니 reset도 없어야 한다');
+  assert.ok(!seen.some(e => (e.text ?? '').includes('버려야')), '초안이 새어 나왔다');
+});
+
+test('answerPreviewer: 이스케이프가 조각 경계를 넘어도, 시작 패턴이 조각에 걸쳐 와도 잃지 않는다', () => {
+  const out = [];
+  const p = answerPreviewer(e => out.push(e.text));
+  p.feed('{"action":"ans');
+  p.feed('wer","answer":"a\\');
+  p.feed('nb\\u00');
+  p.feed('e9c\\');
+  p.feed('\\d"}');
+  assert.equal(out.join(''), 'a\nbéc\\d');
+  assert.equal(p.emitted, true);
+  // 닫는 따옴표 뒤는 흘리지 않는다
+  p.feed('"answer":"다시"');
+  assert.equal(out.join(''), 'a\nbéc\\d');
+  // 다른 결정(검색)에는 아무것도 흘리지 않는다
+  const none = [];
+  const q = answerPreviewer(e => none.push(e));
+  q.feed('{"action":"search","text":"배치"}');
+  assert.deepStrictEqual(none, []);
+  assert.equal(q.emitted, false);
+});
+
+test('첫 시도의 미리보기가 나갔는데 결정을 못 읽으면 reset을 알리고 재시도한다', async () => {
+  let n = 0;
+  globalThis.fetch = async () => (n++ === 0
+    ? sse([delta('{"action":"answer","answer":"앞부분만 오고')])          // 닫히지 않은 JSON — 파싱 실패
+    : sse([delta('{"action":"answer","answer":"완성"}')]));
+  const seen = [];
+  const d = await openaiDecide({ ...CTX, onAnswerDelta: e => seen.push(e) });
+  assert.equal(d.answer, '완성');
+  const resetAt = seen.findIndex(e => e.reset);
+  assert.ok(resetAt > 0, `reset이 없다: ${JSON.stringify(seen)}`);
+  assert.equal(seen.slice(resetAt + 1).map(e => e.text).join(''), '완성');
+});
+
+test('첫 조각을 기다리는 동안은 유휴 상한이 걸리지 않는다 — 느린 모델을 멈춤으로 오판하지 않게', async () => {
+  // 요청이 서버 대기열에 있거나 모델이 첫 토큰을 내기 전은 '멈춤'과 구분되지 않는다. 여기에 유휴 상한을
+  // 걸면 느릴 뿐인 요청이 실패로 끝난다 — 첫 바이트까지는 전체 상한이 지킨다.
+  globalThis.fetch = async () => {
+    await sleep(IDLE_MS * 3);                       // 유휴 상한의 세 배를 기다린 뒤에야 답하기 시작한다
+    return sse([delta('{"action":"answer","answer":"늦었지만 왔다"}')]);
+  };
+  const d = await openaiDecide(CTX);
+  assert.equal(d?.answer, '늦었지만 왔다', '첫 조각을 기다리다 끊겼다');
+});
+
+test('조각이 멈춘 스트림은 유휴 상한에서 끊고, 그 이유를 로그에 남긴다', async () => {
+  const warns = [];
+  const orig = console.warn;
+  console.warn = (...a) => warns.push(a.join(' '));
+  try {
+    globalThis.fetch = async () => sse([delta('{"action":"answer","answer":"멈')], { close: false });
+    const t0 = Date.now();
+    assert.equal(await openaiDecide(CTX), null);
+    assert.ok(Date.now() - t0 < 5_000, '전체 상한까지 기다렸다');
+    assert.ok(warns.some(l => /동안 멈췄습니다/.test(l)), JSON.stringify(warns));
+  } finally { console.warn = orig; }
+});
+
+test('stream_options를 모르는 서버에는 다음부터 보내지 않는다', async () => {
+  const bodies = [];
+  globalThis.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(init.body));
+    if (bodies.length === 1) return new Response('{"error":"unknown field stream_options"}', { status: 400 });
+    return 응답({ choices: [{ message: { content: '{"action":"answer","answer":"a"}' } }] });
+  };
+  const d = await openaiDecide(CTX);
+  assert.equal(d.answer, 'a');
+  assert.ok('stream_options' in bodies[0] && !('stream_options' in bodies[1]));
+  assert.equal(bodies[1].stream, true, '스트림 자체는 계속 요청한다');
+});
+
+test('JSON 하나로 답하는 서버에서도 미리보기 훅은 한 번에 흘러온다', async () => {
+  reply('{"action":"answer","answer":"한 번에"}');
+  const seen = [];
+  await openaiDecide({ ...CTX, onAnswerDelta: e => seen.push(e.text) });
+  assert.deepStrictEqual(seen, ['한 번에']);
+});
+
+test('답변이 아닌 결정으로 끝나면 흘려보낸 초안을 거둬들인다', async () => {
+  // 모델이 사고 과정에서 답변 초안을 적어 보고 접는 일이 흔하다. 그 초안은 닫는 태그 '앞'에 있어
+  // previewer가 걸러내지 못하므로, 거두지 않으면 사용자는 폐기된 답을 계속 보고 있고 다음 스텝의
+  // 진짜 답이 그 뒤에 이어 붙는다(App.jsx는 조각을 이어 붙인다).
+  // 조각으로 와야 재현된다: 초안이 먼저 도착해 흘러간 뒤에 닫는 태그가 온다. 한 덩어리로 오면
+  // previewer가 닫는 태그 뒤부터 보므로 초안이 아예 흘러가지 않는다.
+  globalThis.fetch = async () => sse([
+    delta('먼저 답을 적어보자 {"action":"answer","answer":"BATCH001은 정상 완료되었습니다."}'),
+    delta(' 아니다, 조회부터 하자</think>\n{"action":"run_query","query_name":"batch_job_status","params":{"job_id":"BATCH001"}}'),
+  ]);
+  const seen = [];
+  const d = await openaiDecide({ ...CTX, onAnswerDelta: e => seen.push(e) });
+  assert.equal(d.action, 'run_query');
+  assert.ok(seen.some(e => (e.text ?? '').includes('정상 완료')), '초안이 흘러가긴 했다 (이 검사의 전제)');
+  assert.ok(seen.at(-1)?.reset, `초안을 거두지 않았다: ${JSON.stringify(seen)}`);
+  // 답변 결정으로 끝나면 거두지 않는다 — 그 글자가 곧 답이다
+  const ok = [];
+  await decide('{"action":"answer","answer":"진짜 답"}', { ...CTX, onAnswerDelta: e => ok.push(e) });
+  assert.ok(!ok.some(e => e.reset));
+});
+
+test('자기닫힘 사고 과정 태그가 미리보기를 통째로 죽이지 않는다', async () => {
+  // <think/>를 여는 태그로 보면 그 뒤가 영영 사고 과정이 되어 그 모델의 모든 질문에서 미리보기가 사라진다.
+  // 결정 파서가 같은 표기에 같은 가드를 둔 이유와 같다.
+  const seen = [];
+  const d = await decide('<think/>{"action":"answer","answer":"진짜 답"}', { ...CTX, onAnswerDelta: e => seen.push(e.text) });
+  assert.equal(d.answer, '진짜 답');
+  assert.equal(seen.join(''), '진짜 답');
+  // 진짜 여는 태그는 그대로 막는다
+  const draft = [];
+  await decide('<think>{"action":"answer","answer":"초안"}', { ...CTX, onAnswerDelta: e => draft.push(e.text) });
+  assert.equal(draft.join(''), '');
+});
+
+test('본문 청구 결정을 읽는다 — 청구할 것이 없으면 결정이 아니다', async () => {
+  assert.deepStrictEqual(await decide('{"action":"expand","ids":["k12","m3"],"drop":["k7"]}'),
+    { action: 'expand', ids: ['k12', 'm3'], drop: ['k7'] });
+  assert.deepStrictEqual(await decide('{"action":"expand","ids":["k12"]}'), { action: 'expand', ids: ['k12'] });
+  assert.equal(await decide('{"action":"expand","ids":[]}'), null, '빈 목록은 청구가 아니다');
+  assert.equal(await decide('{"action":"expand","ids":"k12"}'), null, '목록이 아니면 형식이 아니다');
+  assert.equal(await decide('{"action":"expand","ids":["k12"]}', { ...CTX, forceAnswer: true }), null,
+    '강제 답변 단계에서는 더 찾아볼 수 없다');
+  // 검색에 얹힌 버리기도 그대로 통과한다 (정규화는 결정 경계의 일이다)
+  assert.deepStrictEqual(await decide('{"action":"search","text":"x","targets":["knowledge"],"drop":["k7"]}'),
+    { action: 'search', text: 'x', targets: ['knowledge'], drop: ['k7'] });
+});
+
+test('시스템 프롬프트가 본문 청구와 버리기를 설명한다', async () => {
+  const sys = (await capturedRequest()).messages[0].content;
+  assert.match(sys, /"action":"expand"/);
+  assert.ok(sys.includes(`${TRUNC_MARK} 으로 끝나고`), '어떤 항목을 청구할 수 있는지 표시와 함께 말해야 한다');
+  assert.match(sys, /번호가 붙은 항목만/);
+  assert.match(sys, /답변에 옮겨 적지 마라/, '자료 번호가 답변으로 새지 않게 막아야 한다');
+  assert.match(sys, /drop:/);
 });

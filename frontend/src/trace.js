@@ -11,8 +11,135 @@
 // 쪽)가 아니라 이 파일을 가리킨다. 실제로 픽스처가 스텝 하나를 find로 집어 온다(test/ui/fixtures.js).
 export const stepLabel = t => {
   if (!t) throw new TypeError('stepLabel: 스텝이 없습니다 — 부르는 쪽이 없는 스텝을 집었습니다');
+  if (isSearchStep(t)) return searchLabel(t);
   return t.error ? `오류: ${t.error}` : countLabel(t);
 };
+
+// ===== 검색 항목 =====
+// 서버 trace에는 검색 기록이 쿼리 기록과 같은 배열에 섞여 온다 (backend result.js clientTrace — {search, targets,
+// hits, failed?}). 답을 기다리는 동안 흘러오는 진행 이벤트(search·search_done)도 같은 재료다. 문구는 한 곳에서
+// 만든다 — 진행 줄과 패널이 같은 검색을 다른 말로 하면 사용자는 둘을 다른 일로 읽는다.
+// 대상 이름과 적중 수의 키는 서버가 정한다 (backend constants.js SEARCH_TARGETS, agent.js HIT_KEY).
+export const TARGET_LABEL = { knowledge: '지식', qa_method: '처리방법', query: '쿼리' };
+const HIT_KEY = { knowledge: 'knowledge', qa_method: 'qaMethods', query: 'queries' };
+const TARGETS = Object.keys(TARGET_LABEL);
+
+export const isSearchStep = t => !!t && typeof t === 'object' && typeof t.search === 'string';
+
+// 대상 목록의 표기 — '지식·처리방법'. 모르는 이름은 그대로 보인다(감추면 무엇을 찾았는지 알 수 없다).
+export const targetsLabel = targets =>
+  (Array.isArray(targets) ? targets : []).map(t => TARGET_LABEL[t] ?? cellText(t)).filter(Boolean).join('·') || '전체';
+
+// 검색 결과 문구 — '지식 2건 · 처리방법 검색 불가'. 검색 불가는 0건과 다른 말이다: 임베딩 서버가 없어
+// 찾아보지 못한 것이지 등록이 없는 것이 아니다 (서버 프롬프트도 같은 말을 쓴다). 찾지 않은 대상은 나오지 않는다.
+export function searchLabel(t) {
+  const failed = new Set(Array.isArray(t?.failed) ? t.failed : []);
+  const hits = t?.hits && typeof t.hits === 'object' ? t.hits : {};
+  const parts = TARGETS.map(k => {
+    if (failed.has(k)) return `${TARGET_LABEL[k]} 검색 불가`;
+    const n = hits[HIT_KEY[k]];
+    return typeof n === 'number' ? `${TARGET_LABEL[k]} ${n}건` : null;
+  }).filter(Boolean);
+  return parts.length ? parts.join(' · ') : '결과 없음';
+}
+
+// 패널 머리띠의 문구 — '검색 1회 · 실행된 쿼리 2건'. 검색이 없으면 예전 그대로 '실행된 쿼리 N건'이다.
+export function traceSummary(trace) {
+  const list = Array.isArray(trace) ? trace : [];
+  const searches = list.filter(isSearchStep).length;
+  const queries = list.length - searches;
+  const parts = [];
+  if (searches > 0) parts.push(`검색 ${searches}회`);
+  if (queries > 0 || searches === 0) parts.push(`실행된 쿼리 ${queries}건`);
+  return parts.join(' · ');
+}
+
+// ===== 답을 기다리는 동안의 진행 줄 =====
+// 서버가 흘려보내는 이벤트(backend agent.js emit)를 화면의 줄 목록으로 접는다. 시작 이벤트가 줄을 세우고
+// 끝 이벤트가 그 줄에 결과를 붙인다 — 같은 종류의 '아직 안 끝난' 마지막 줄을 찾아서. 순수 함수라 여기 둔다:
+// 이벤트 순서가 어긋나거나(끝이 먼저 온다) 모르는 종류가 와도 목록이 깨지지 않아야 하는데, 그 경우는 화면에서
+// 재현하기 어렵다.
+const strings = v => (Array.isArray(v) ? v.filter(x => typeof x === 'string') : []);
+
+// 끝 이벤트를 '그 줄'에 붙인다. 미완 줄이 여럿일 수 있으므로(일괄 조회는 조회 여럿이 동시에 돈다 —
+// backend agent.js runBatch) 짝을 찾아야 한다. 마지막 미완 줄에 붙이던 때에는 가운데 조회가 먼저 끝나는
+// 순간 줄이 뒤바뀌었다: A·B·C가 도는 중에 B가 끝나면 C의 줄이 'B → 2건'이 되어 'B'가 두 줄로 보이고
+// C는 화면에서 사라졌다(실측).
+// 짝은 서버가 매기는 번호(id)로 짓는다 — 이름으로는 지을 수 없다: 같은 쿼리를 다른 값으로 두 번 부르는
+// 배치가 정당하고, 대상 DB의 철자도 시작 이벤트(모델이 적은 것)와 끝 이벤트(등록 철자)가 다를 수 있다.
+// 번호를 주지 않는 서버·옛 배포에서는 이름과 대상 DB로 물러서되 철자 차이는 흡수한다(nameKey).
+// 짝을 못 찾았을 때 할 일이 두 경우에 다르다:
+//   번호로 찾았는데 없다 — 그 번호의 시작을 못 받았거나 끝이 두 번 왔다는 뜻이다. 남의 줄에 붙이면
+//     그 줄이 다른 조회의 이름과 건수를 뒤집어쓰고(한 조회는 화면에서 사라진다) 진짜 끝이 나중에 와서
+//     세 번째 줄을 만든다 — 새 줄로 세우는 편이 잃는 것이 없다.
+//   이름으로 물러섰는데 없다 — 애초에 무엇과 짝인지 알 수 없는 옛 배포다. 마지막 미완 줄에 붙인다.
+// 미완 줄이 아예 없으면 어느 쪽이든 새 줄로 세운다 (시작 없이 끝만 온 이벤트).
+const settle = (list, kind, done, same, strict = false) => {
+  const pending = [];
+  list.forEach((x, i) => { if (x.kind === kind && x.pending) pending.push(i); });
+  if (!pending.length) return [...list, done];
+  const found = pending.find(j => same(list[j]));
+  if (found === undefined && strict) return [...list, done];
+  const i = found ?? pending[pending.length - 1];
+  // 짝지은 줄의 값만 갈아 끼운다. id는 시작 줄의 것을 남긴다 — 끝 이벤트가 번호를 주지 않는 경우에도
+  // 그 줄이 자기 번호를 잃지 않게(뒤이은 다른 끝 이벤트가 그 줄을 다시 집지 않는다).
+  return list.map((x, j) => (j === i ? { ...x, ...done, id: x.id ?? done.id } : x));
+};
+
+// 이름 비교 키 — 대소문자·앞뒤 공백을 흡수한다 (backend constants.js nameKey와 같은 규칙).
+const nameKey = v => cellText(v).trim().toLowerCase();
+
+export function applyProgress(list, e) {
+  const cur = Array.isArray(list) ? list : [];
+  if (!e || typeof e !== 'object') return cur;
+  switch (e.type) {
+    case 'search':
+      return [...cur, { kind: 'search', text: cellText(e.text), targets: strings(e.targets), pending: true }];
+    case 'search_done': {
+      const done = {
+        kind: 'search', text: cellText(e.text), targets: strings(e.targets),
+        hits: e.hits && typeof e.hits === 'object' ? e.hits : {}, failed: strings(e.failed), pending: false,
+      };
+      return settle(cur, 'search', done, x => x.text === done.text);
+    }
+    case 'run_query':
+      return [...cur, { kind: 'query', id: e.id, query_name: cellText(e.query_name), targetDb: cellText(e.targetDb), pending: true }];
+    case 'run_query_done': {
+      const done = {
+        kind: 'query', id: e.id, query_name: cellText(e.query_name), targetDb: cellText(e.targetDb),
+        rowCount: typeof e.rowCount === 'number' || typeof e.rowCount === 'string' ? e.rowCount : undefined,
+        error: typeof e.error === 'string' && e.error ? e.error : undefined, pending: false,
+      };
+      const byId = done.id !== undefined;
+      const same = byId
+        ? x => x.id === done.id
+        : x => nameKey(x.query_name) === nameKey(done.query_name) && nameKey(x.targetDb) === nameKey(done.targetDb);
+      return settle(cur, 'query', done, same, byId);
+    }
+    default:
+      return cur;
+  }
+}
+
+// 조회 건수의 표기 — 서버는 상한에 걸린 결과를 '1000+'처럼 준다(backend result.js). 진행 줄과 패널이
+// 그것을 다르게 풀면 같은 조회가 몇 초 사이에 '1000+건'이었다가 '1000건 이상'이 된다 — 이 파일이
+// 문구를 한곳에서 만드는 이유가 그것이다(머리말). 진행 줄에는 아직 몇 행을 실을지가 정해지지 않았으므로
+// 패널 문구(countLabel)의 앞부분만 쓴다.
+const rowCountLabel = v => {
+  const s = String(v ?? 0);
+  return s.endsWith('+') ? `${s.slice(0, -1)}건 이상` : `${s}건`;
+};
+
+// 진행 줄 하나의 글자. 끝나지 않은 줄은 결과 없이 끝난다(기다림 표시는 CSS가 붙인다).
+export function progressText(it) {
+  if (it.kind === 'search') {
+    const head = `검색 "${it.text}" (${targetsLabel(it.targets)})`;
+    return it.pending ? head : `${head} → ${searchLabel(it)}`;
+  }
+  const head = `조회 ${it.query_name || '(이름 없음)'}${it.targetDb ? `@${it.targetDb}` : ''}`;
+  if (it.pending) return head;
+  return `${head} → ${it.error ? `오류: ${it.error}` : rowCountLabel(it.rowCount)}`;
+}
 
 // 조회 건수 문구. 조회 건수와 실린 행 수는 다를 수 있다 — 몇 건을 보고 있는지 밝히지 않으면
 // 사용자가 실린 것을 전부로 읽는다 (서버 result.js clientTrace가 omittedRows·capped를 준다).
@@ -43,17 +170,26 @@ export function countLabel(t) {
 //   스텝이 객체가 아니면 버린다: 무엇을 실행했는지조차 없는 항목이라 보여줄 것이 없다.
 //   query_name·targetDb는 글자로. 둘 다 화면의 자식이 되고 CSV 파일 이름이 된다.
 //   rows는 배열일 때만 행으로 본다 — 아니면 실행되지 못한 스텝과 같이 표도 CSV 단추도 없다.
+//   검색 항목(search가 글자)은 검색어·대상·적중 수만 남긴다 — 표도 CSV 단추도 없는 한 줄이다.
 export function normalizeTrace(trace) {
   if (!Array.isArray(trace)) return [];
   return trace
     .filter(t => t && typeof t === 'object' && !Array.isArray(t))
-    .map(t => ({
-      ...t,
-      query_name: cellText(t.query_name),
-      targetDb: cellText(t.targetDb),
-      rows: Array.isArray(t.rows) ? t.rows : undefined,
-    }));
+    .map(t => (isSearchStep(t)
+      ? { ...(stepNo(t.step) !== undefined && { step: stepNo(t.step) }), search: t.search, targets: strings(t.targets), hits: t.hits && typeof t.hits === 'object' ? t.hits : {}, failed: strings(t.failed) }
+      : {
+        ...t,
+        step: stepNo(t.step),
+        query_name: cellText(t.query_name),
+        targetDb: cellText(t.targetDb),
+        rows: Array.isArray(t.rows) ? t.rows : undefined,
+      }));
 }
+
+// 이력의 절대 순번. 화면의 자식이 되는 값이라 여기서 모양을 맞춘다 — 객체가 그대로 통과하면 React가
+// '객체는 자식이 될 수 없다'로 던지고, 이 파일이 문 앞에서 값을 맞추기로 한 이유가 정확히 그것이다.
+// 정수가 아니면 없는 것으로 본다: 번호가 없으면 화면이 번호를 그리지 않을 뿐이다.
+const stepNo = v => (Number.isInteger(v) && v > 0 ? v : undefined);
 
 // 행들의 열 이름 — 첫 등장 순서. 드라이버가 준 행은 열이 모두 같지만(oracle.js normalizeCells),
 // 다른 출처의 trace가 섞여도 한 행에만 있는 열이 빠지지 않게 합집합으로 모은다.

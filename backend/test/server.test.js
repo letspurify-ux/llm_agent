@@ -7,7 +7,8 @@
 // 그래서 여기서는 '무엇을 답했는가'가 아니라 '반드시 답했는가, 그리고 살아 있는가'만 본다.
 //
 // DB도 LLM도 없이 띄운다 — 그 실패는 각 경로가 이미 처리하고, 이 검사가 보는 것은 그 위의 껍데기다.
-import { test, before, after } from 'node:test';
+import { test, before, after, describe } from 'node:test';
+import { createServer as httpServer } from 'node:http';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import net from 'node:net';
@@ -161,4 +162,137 @@ test('요청 경로에서 새어 나온 예외도, 답 없이 매달린 요청�
   const 샌것 = 로그.split('\n').filter(l => /\[uncaughtException\]|\[unhandledRejection\]/.test(l));
   assert.deepStrictEqual(샌것.slice(0, 5), [], `요청 경로에서 예외가 샜다: ${샌것.slice(0, 5).join(' | ')}`);
   assert.ok(살아있나(), '검사가 끝난 뒤 서버가 내려가 있다');
+});
+
+// ===== 진행 상황 스트림 =====
+// 검색·조회 이벤트를 흘려보내는 응답(NDJSON)과, Accept가 없을 때의 JSON 하나가 같은 본문을 담는지 본다.
+// 이 검사는 관리 DB·임베딩 없이 돈다 — LLM은 아래 가짜 엔드포인트가 대본대로 답하고, 검색은 knowledge만
+// 요청해 임베딩 미설정으로 '검색 불가'가 되게 한다(그 경로는 관리 DB를 만지지 않는다 — agent.js runSearch).
+// 그래서 여기서 재는 것은 응답의 '모양'이지 검색의 결과가 아니다.
+describe('진행 상황 스트림', () => {
+  let llm; let llmPort; let sproc; let sport; let slog = '';
+  const script = [];   // 가짜 LLM이 차례로 돌려줄 결정 JSON
+  const sbase = () => `http://127.0.0.1:${sport}`;
+  const 살아있나2 = () => !!sproc && sproc.exitCode === null && sproc.signalCode === null;
+
+  before(async () => {
+    llmPort = await freePort();
+    // 진짜 엔드포인트처럼 SSE로 답한다 — 결정 JSON을 조각 셋으로 나눠 흘리고 마지막에 usage를 준다.
+    // 서버가 stream:true를 보내지 않으면(회귀) JSON 하나로 답해 그 사실이 드러나게 한다.
+    llm = httpServer((req, res) => {
+      let body = '';
+      req.on('data', d => { body += d; });
+      req.on('end', () => {
+        const content = script.shift() ?? '{"action":"answer","answer":"대본이 끝났다"}';
+        const wantsStream = (() => { try { return JSON.parse(body).stream === true; } catch { return false; } })();
+        if (!wantsStream) {
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ choices: [{ message: { content }, finish_reason: 'stop' }] }));
+          return;
+        }
+        res.setHeader('Content-Type', 'text/event-stream');
+        const size = Math.ceil(content.length / 3);
+        for (let i = 0; i < content.length; i += size) {
+          res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: content.slice(i, i + size) } }] })}\n\n`);
+        }
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 100, completion_tokens: 10 } })}\n\n`);
+        res.end('data: [DONE]\n\n');
+      });
+    });
+    await new Promise(r => llm.listen(llmPort, '127.0.0.1', r));
+    sport = await freePort();
+    const deadPort = await freePort();   // 아무도 듣지 않는 포트 — 관리 DB는 여기서 쓰지 않는다
+    sproc = spawn(process.execPath, [join(ROOT, 'src', 'server.js')], {
+      cwd: ROOT,
+      env: {
+        ...process.env, PORT: String(sport), ORACLE_MOCK: '1', EMBED_SYNC_INTERVAL: '0',
+        LLM_PROVIDER: 'openai', LLM_BASE_URL: `http://127.0.0.1:${llmPort}/v1`, LLM_MODEL: 'test', LLM_API_KEY: '',
+        EMBEDDING_URL: '', MARIADB_HOST: '127.0.0.1', MARIADB_PORT: String(deadPort),
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    sproc.stdout.on('data', d => { slog += d; });
+    sproc.stderr.on('data', d => { slog += d; });
+    for (let i = 0; i < 80; i++) {
+      try { if ((await fetch(`${sbase()}/api/health`)).ok) return; } catch { /* 아직 안 떴다 */ }
+      if (!살아있나2()) break;
+      await sleep(250);
+    }
+    throw new Error(`서버가 뜨지 않았습니다: ${slog.slice(0, 500)}`);
+  });
+
+  after(async () => {
+    sproc?.kill('SIGTERM');
+    for (let i = 0; i < 40 && 살아있나2(); i++) await sleep(100);
+    sproc?.kill('SIGKILL');
+    await new Promise(r => llm?.close(r));
+  });
+
+  const lines = text => text.split('\n').filter(l => l.trim()).map(l => JSON.parse(l));
+
+  test('Accept가 NDJSON이면 검색 이벤트가 줄로 흘러오고 마지막 줄이 done이다', async () => {
+    script.push('{"action":"search","text":"배치 재시작","targets":["knowledge"]}', '{"action":"answer","answer":"ok"}');
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 20_000);
+    try {
+      const res = await fetch(`${sbase()}/api/chat`, {
+        method: 'POST', signal: ctrl.signal,
+        headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
+        body: JSON.stringify({ message: '배치 재시작 방법', history: [] }),
+      });
+      assert.equal(res.status, 200);
+      assert.match(res.headers.get('content-type') ?? '', /application\/x-ndjson/);
+      const events = lines(await res.text());
+      // 답변 조각(answer_delta)이 done보다 먼저 흘러온다 — 조각의 합이 답이다
+      const deltas = events.filter(e => e.type === 'answer_delta');
+      assert.ok(deltas.length >= 1, `답변 조각이 없다: ${JSON.stringify(events.map(e => e.type))}`);
+      assert.equal(deltas.map(e => e.text).join(''), 'ok');
+      assert.deepStrictEqual(events.filter(e => e.type !== 'answer_delta').map(e => e.type), ['search', 'search_done', 'done'], JSON.stringify(events));
+      assert.deepStrictEqual(events[0], { type: 'search', text: '배치 재시작', targets: ['knowledge'] });
+      // 임베딩이 없으니 '검색 불가' — 0건이 아니다
+      assert.deepStrictEqual(events[1].failed, ['knowledge']);
+      assert.equal(events[1].hits.knowledge, null);
+      const done = events[events.length - 1];
+      assert.equal(done.answer, 'ok');
+      assert.deepStrictEqual(done.trace, [{ step: 1, search: '배치 재시작', targets: ['knowledge'], hits: { knowledge: null, qaMethods: null, queries: null }, failed: ['knowledge'] }]);
+    } finally { clearTimeout(timer); }
+  });
+
+  test('Accept가 없으면 지금까지처럼 JSON 하나이고, done 줄과 같은 본문이다', async () => {
+    script.push('{"action":"answer","answer":"바로 답"}');
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 20_000);
+    try {
+      const res = await fetch(`${sbase()}/api/chat`, {
+        method: 'POST', signal: ctrl.signal,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: '안녕', history: [] }),
+      });
+      assert.equal(res.status, 200);
+      assert.match(res.headers.get('content-type') ?? '', /application\/json/);
+      assert.deepStrictEqual(await res.json(), { answer: '바로 답', trace: [] });
+    } finally { clearTimeout(timer); }
+  });
+
+  test('스트림 도중 클라이언트가 끊어도 서버는 살아 있고 다음 요청에 답한다', async () => {
+    script.push('{"action":"search","text":"x","targets":["knowledge"]}', '{"action":"answer","answer":"늦은 답"}');
+    const ctrl = new AbortController();
+    const res = await fetch(`${sbase()}/api/chat`, {
+      method: 'POST', signal: ctrl.signal,
+      headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
+      body: JSON.stringify({ message: 'x', history: [] }),
+    });
+    const reader = res.body.getReader();
+    await reader.read();      // 첫 줄(검색 시작)을 받자마자 끊는다
+    ctrl.abort();
+    await sleep(200);
+    assert.ok(살아있나2(), '스트림 도중 끊긴 요청이 프로세스를 내렸다');
+    assert.ok((await fetch(`${sbase()}/api/health`)).ok);
+    script.length = 0;
+    script.push('{"action":"answer","answer":"다음 답"}');
+    const next = await fetch(`${sbase()}/api/chat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'y', history: [] }),
+    });
+    assert.equal((await next.json()).answer, '다음 답');
+  });
 });

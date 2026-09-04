@@ -3,7 +3,7 @@
 // 픽스처를 고친 날 검사는 조용히 다른 것을 재게 된다.
 import { MAX_PIE_SLICES, MAX_CHARTS_PER_MESSAGE, MAX_SERIES, MAX_NAME_LEN, MAX_LABEL_LEN, MAX_TITLE_LEN,
   CHART_FENCE_RE } from '../../src/chart.js';
-import { stepLabel } from '../../src/trace.js';
+import { stepLabel, searchLabel, traceSummary } from '../../src/trace.js';
 
 // 원그래프 조각 수의 상한을 늘 넘겨 둔다 — '기타'로 모으는 길이 실제로 밟힌다. 정해진 목록을
 // 잘라 쓰면 상한이 목록 길이에 닿는 순간 조용히 넘지 못하게 되고(그날 '기타'는 그려지지 않는데
@@ -224,3 +224,27 @@ export const READY = {
   // 있고, 브라우저는 접힌 <details> 안의 <img>도 불러온다).
   tableimg: `document.querySelector('figure.chart .recharts-surface') && document.querySelector('.md .chart-table table')`,
 };
+
+// ===== 진행 상황 스트림 =====
+// probe.jsx가 ?stream=1이면 이 이벤트들을 한 줄씩 흘려보낸 뒤 done을 준다 (backend agent.js가 내는 모양).
+// 검색 하나와 조회 하나 — 시작 이벤트가 줄을 세우고 끝 이벤트가 결과를 붙이는 두 길을 다 밟는다.
+export const STREAM_SEARCH = { text: '가상계측 배치 재시작', targets: ['knowledge', 'qa_method'] };
+const STREAM_HITS = { knowledge: 2, qaMethods: 1, queries: null };
+export const STREAM_EVENTS = [
+  { type: 'search', ...STREAM_SEARCH },
+  { type: 'search_done', ...STREAM_SEARCH, hits: STREAM_HITS },
+  // id는 실제 서버가 시작·끝 이벤트에 늘 싣는 짝 번호다 (backend agent.js runBatch) — 픽스처에서 빼면
+  // 화면 검사가 이름으로 물러서는 길만 밟고, 정작 운영에서 쓰이는 길은 한 번도 지나지 않는다.
+  { type: 'run_query', id: 1, query_name: 'vm_agent_health_summary', targetDb: 'space_ops', params: {} },
+  { type: 'run_query_done', id: 1, query_name: 'vm_agent_health_summary', targetDb: 'space_ops', rowCount: 3 },
+];
+// done 줄의 trace — 검색 항목이 쿼리 항목 앞에 선다 (서버 result.js clientTrace가 주는 순서)
+export const STREAM_TRACE = [{ search: STREAM_SEARCH.text, targets: STREAM_SEARCH.targets, hits: STREAM_HITS }, ...TRACE];
+// 화면에 남아야 하는 문구. 만드는 자리(trace.js)에서 그대로 받아 온다 — CAPPED_LABEL과 같은 이유.
+export const STREAM_SEARCH_LABEL = searchLabel(STREAM_TRACE[0]);
+export const STREAM_SUMMARY = traceSummary(STREAM_TRACE);
+
+// 답변 미리보기 — 스트림 모드는 done 전에 답변을 이만큼씩 나눠 answer_delta로 흘린다 (probe.jsx).
+// 첫 조각에 반드시 들어 있는 글자(첫 제목)로 '답이 오기 전에 미리보기가 섰다'를 잰다.
+export const STREAM_ANSWER_CHUNKS = 3;
+export const STREAM_PREVIEW_TEXT = CASES.rich.split('\n')[0].replace(/^#+\s*/, '');

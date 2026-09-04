@@ -150,3 +150,99 @@ export function resolveChartData(answer, steps) {
     return taken < rows.length ? `${block}\n${indent}_(표는 ${rows.length}행 중 처음 ${taken}행까지만 실었습니다)_` : block;
   });
 }
+
+// ===== 조회 결과 표 (```table 블록) =====
+// 답변의 ```table 블록에서 `step: N` 참조를 실제 조회 결과의 markdown 표로 채운다. 차트와 같은 이유·같은 규칙이다
+// (파일 머리말). 게다가 표는 모델이 답변마다 가장 많이 옮겨 적는 것이다 — 20행 × 6열이면 수백에서 천 토큰을
+// 모델이 한 글자씩 생성하고, 출력 토큰은 prefill보다 수십 배 느리다. 그 출력이 답변 지연의 큰 몫이었다.
+// 참조 한 줄이면 서버가 채우고, 옮겨 적다 틀리는 값(반올림·자릿수 누락)도 없다.
+// 블록 문법: step: N (필수), cols: 열이름들 (선택 — 결과의 일부 열만), limit: 행 수 (선택, MAX_TABLE_BLOCK_ROWS까지).
+// 차트 습관대로 data: step N 으로 적은 것도 받는다. 채운 결과는 펜스 없는 GFM 표다 — 프런트는 평범한 표로 그린다.
+export const MAX_TABLE_BLOCK_ROWS = 100;     // limit의 상한 (차트와 같다) — 전부는 trace 패널의 몫이다
+export const DEFAULT_TABLE_ROWS = 30;        // limit을 적지 않았을 때. 모델이 보던 20행보다 조금 넉넉하되 말풍선을 가득 채우지 않는다
+export const MAX_TABLE_COLS = 10;            // cols를 적지 않았을 때 싣는 열 수 — SELECT * 30열은 markdown 표로는 읽을 수 없다
+export const MAX_TABLE_CELL_LEN = 120;       // 표의 칸. 프롬프트 셀 상한(200)보다 짧고 차트(60)보다 길다
+export const MAX_TABLE_INJECT_LEN = 30_000;  // 답변 하나에 채워 넣는 표의 총 글자 수 (차트 예산과 별도 — 둘 다 MAX_ANSWER_LEN 위에 얹힌다)
+
+// FENCE_RE와 같은 모양, 언어만 table이다 (왜 이렇게 너그러운지는 FENCE_RE 주석).
+const TABLE_FENCE_RE = /^([ \t]*)((`|~)\3{2,})[ \t]*table(?:[ \t]+[^\r\n]*)?\r?\n(?:([\s\S]*?)\r?\n)??[ \t]*\2\3*[ \t]*\r?$/gim;
+const TABLE_CONFIG_RE = /^\s*(step|data|cols|limit)\s*:\s*(.*?)\s*$/i;
+
+// 표의 칸 — 차트의 cell과 같은 이스케이프, 상한만 다르다.
+const tableCell = v => {
+  if (v === null || v === undefined) return '';
+  const s = typeof v === 'number' ? String(v) : clipText(String(v), MAX_TABLE_CELL_LEN);
+  return s.replace(/\r\n?|\n/g, ' ').replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
+};
+
+const tableNote = (why, indent = '') => `${indent}_표를 채우지 못했습니다: ${why}_`;
+
+// answer 안의 표 블록을 채운다. steps는 resolveChartData와 같은 배열이다.
+// 표 블록이 없으면 원문 그대로 돌려준다 — 그 경로는 정규식 한 번이다.
+// 글자 예산은 채울 블록들에 고르게 나눈다 (resolveChartData와 같은 생각).
+export function resolveTableData(answer, steps) {
+  const text = String(answer ?? '');
+  if (!/(?:```|~~~)[ \t]*table/i.test(text)) return text;
+  const refOf = body => {
+    const config = {};
+    for (const raw of body.split(/\r\n?|\n/)) {
+      const m = TABLE_CONFIG_RE.exec(raw);
+      if (m) config[m[1].toLowerCase()] = m[2];
+    }
+    return { config, ref: config.step ?? config.data };
+  };
+  // 예산은 '채울 블록'에만 나눈다 — 참조 없는 블록까지 세면 아무것도 쓰지 않는 블록이 몫을 가져가
+  // 정작 채우는 표가 잘린다 (실측: 참조 없는 블록 넷이 섞이자 87행이 17행이 됐다).
+  // 차트 쪽(resolveChartData)이 needsFill로 미리 거르는 것과 같은 이유·같은 방식이다.
+  let blocksLeft = [...text.matchAll(TABLE_FENCE_RE)].filter(m => refOf(m[4] ?? '').ref !== undefined).length;
+  let budget = MAX_TABLE_INJECT_LEN;
+  return text.replace(TABLE_FENCE_RE, (whole, indent, _fence, _ch, body = '') => {
+    const { config, ref } = refOf(body);
+    // 참조가 없을 때 할 일이 두 경우에 다르다.
+    //   cols·limit 같은 이 블록의 설정 줄이 있다 — 모델이 이 블록을 쓰려다 step만 빠뜨린 것이다. 본문을
+    //     그대로 내보내면 'cols: A' 'limit: 5'라는 설정 줄이 답변 글자로 사용자에게 보인다. 안내로 바꾼다.
+    //   설정 줄도 없다 — 모델이 펜스를 다른 용도로 쓴 것이다. 펜스만 벗겨 본문이 렌더되게 한다(표를 손수
+    //     적었으면 표로, 다른 글이면 글로). 그대로 두면 화면이 코드블록으로 보여 무엇인지 알 수 없다 —
+    //     프런트는 chart·mermaid 펜스만 따로 알아보기 때문이다(차트 블록을 손대지 않는 것과 다른 이유다).
+    if (ref === undefined) return Object.keys(config).length ? tableNote('step 참조가 없습니다', indent) : body;
+    const allow = Math.floor(budget / Math.max(1, blocksLeft--));
+
+    const n = stepOf(ref);
+    const rows = n !== null && n >= 1 ? steps?.[n - 1] : undefined;
+    if (n === null) return tableNote('step 참조에 실행 번호가 없습니다', indent);
+    if (!Array.isArray(rows)) return tableNote(`실행 ${n}의 결과가 없습니다`, indent);
+    if (!rows.length) return `${indent}_실행 ${n}의 조회 결과가 0건입니다_`;
+    // 열은 모든 행의 합집합이다 (llm.js rowsToMarkdownTable과 같은 이유 — 뒤 행에만 있는 열이 사라지지 않게)
+    const keys = [...new Set(rows.flatMap(r => Object.keys(r ?? {})))].filter(k => k !== '…');
+    if (!keys.length) return tableNote(`실행 ${n}의 결과에 열이 없습니다`, indent);
+    if (allow <= 0) return tableNote('답변에 실을 수 있는 표의 양을 넘었습니다', indent);
+
+    // 열: cols로 고른 것(대소문자 무시, 없는 이름은 버린다). 없거나 전부 틀리면 앞 열들 — 이름 하나가 틀렸다고
+    // 표를 잃는 것보다 낫다 (차트 pickColumns와 같은 판단).
+    const byKey = new Map(keys.map(k => [nameKey(k), k]));
+    const picked = [...new Set(splitNames(config.cols).map(w => byKey.get(nameKey(w))).filter(k => k !== undefined))];
+    const cols = picked.length ? picked : keys.slice(0, MAX_TABLE_COLS);
+    const limitRaw = Number.parseInt(String(config.limit ?? ''), 10);
+    const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, MAX_TABLE_BLOCK_ROWS) : DEFAULT_TABLE_ROWS;
+
+    const table = [`${indent}| ${cols.map(tableCell).join(' | ')} |`, `${indent}|${' --- |'.repeat(cols.length)}`];
+    let used = table[0].length + table[1].length + 2;
+    let taken = 0;
+    for (const r of rows) {
+      if (taken >= limit) break;
+      const line = `${indent}| ${cols.map(c => tableCell(r?.[c])).join(' | ')} |`;
+      if (used + line.length + 1 > allow) break;
+      table.push(line);
+      used += line.length + 1;
+      taken++;
+    }
+    budget -= used;
+    if (!taken) return tableNote('답변에 실을 수 있는 표의 양을 넘었습니다', indent);
+    // 다 싣지 못한 것은 표 아래 밝힌다 — 표만 보면 그것이 전부로 읽힌다.
+    const notes = [];
+    if (taken < rows.length) notes.push(`${rows.length}행 중 처음 ${taken}행`);
+    if (!picked.length && cols.length < keys.length) notes.push(`${keys.length}열 중 앞 ${cols.length}열`);
+    const tail = notes.length ? `\n${indent}_(${notes.join(', ')}만 실었습니다 — 전부는 아래 ⚡ 패널에 있습니다)_` : '';
+    return table.join('\n') + tail;
+  });
+}

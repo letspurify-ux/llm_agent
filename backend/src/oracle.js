@@ -3,9 +3,10 @@
 // oci(node-oracledb Thick 모드, 설치된 Oracle Client 라이브러리 경유). 아래 oracleDriver 참고.
 // ORACLE_MOCK=1 이면 실제 접속 없이 하단 MOCK_DATA의 stub 결과를 반환한다.
 import oracledb from 'oracledb';
+import { createHash } from 'node:crypto';
 import { loadTargetDb } from './db.js';
 import { bindNames, assertReadOnly } from './sql.js';
-import { MAX_ROWS, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK, MAX_TARGET_DB_NAME_LEN, numEnv, nameKey, safeError, clipText, warnOnce, ownProp, bindValue, targetDbNames } from './constants.js';
+import { MAX_ROWS, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK, MAX_TARGET_DB_NAME_LEN, MAX_BATCH_QUERIES, numEnv, nameKey, safeError, clipText, warnOnce, ownProp, bindValue, targetDbNames } from './constants.js';
 
 // 드라이버 경계에서 타입을 확정한다. LOB은 기본값이 Lob 스트림 객체라 커넥션을 닫으면 무효가 되고
 // JSON 직렬화 시 순환 참조로 예외가 난다 — CLOB만이 아니라 NCLOB/BLOB도 같은 위험이므로 전부 다룬다.
@@ -328,51 +329,122 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
     );
   }
 
-  // 풀 없이 실행마다 접속/해제 — 사내 Q&A 트래픽 수준에 충분, 다중 target_db 관리 단순
-  const conn = await oracledb.getConnection({
-    user: target.db_user,
-    password: resolvePassword(target.db_password),
-    connectString: target.connection_info,
-    // 접속 자체에도 상한이 필요하다 — callTimeout은 커넥션이 생긴 뒤부터 적용되므로,
-    // 리스너가 TCP는 받아주고 핸드셰이크를 끝내지 않는 상태(기동 중이거나 멈춘 DB)에서는
-    // 여기서 무한정 매달려 agent의 요청 예산 검사가 무의미해진다. 단위는 초다(callTimeout만 ms).
-    //
-    // 둘 다 지정한다: 드라이버는 "둘 다 미설정"일 때만 transportConnectTimeout 기본값(20초)을 넣으므로,
-    // connectTimeout만 주면 TCP 단계의 기본 상한이 오히려 사라진다 (sessionAtts.js).
-    // 값을 작게 잡는 이유는 이 상한이 '주소마다' 적용되기 때문이다 — connect1이 주소 목록을
-    // do/while로 돌며 시도마다 타이머를 새로 건다. 'localhost'는 ::1과 127.0.0.1 둘로 풀리므로
-    // 실제 최악은 주소 수 × 값이다. 조회 타임아웃(ORACLE_TIMEOUT_MS)과 별개인 것도 그래서다.
-    //
-    // 이 두 값은 thin 모드에서만 쓰인다 — 이름은 검증되지만 실제로 읽는 곳이 thin의 sqlnet 계층뿐이라
-    // oci(Thick)에서는 조용히 무시된다. oci로 쓰면서 같은 상한이 필요하면 sqlnet.ora의
-    // SQLNET.OUTBOUND_CONNECT_TIMEOUT이나 접속 문자열의 (CONNECT_TIMEOUT=…)로 준다
-    // (ORACLE_CLIENT_CONFIG_DIR가 그 sqlnet.ora를 가리키는 자리다).
-    // 아래 callTimeout(조회 상한)은 두 모드 모두에 적용되므로 '예산 없는 조회'가 되지는 않는다.
-    connectTimeout: CONNECT_TIMEOUT_S,
-    transportConnectTimeout: TRANSPORT_CONNECT_TIMEOUT_S,
-  });
+  const conn = await acquireConnection(target);
   try {
     // 조회 타임아웃 — 느린 쿼리(락 대기, 잘못된 실행계획)가 요청을 무한 대기시키지 않게.
     // 초과 시 오류가 나고 agent가 history에 기록해 LLM이 안내 답변한다.
     // 반드시 try 안에서 설정한다 — 드라이버가 던지면 밖에서는 finally의 close가 실행되지 않아 커넥션이 샌다.
+    // 세션에 남는 값이지만 풀에서 받을 때마다 다시 건다 — 바뀔 일은 없어도, 풀이 돌려준 세션의 상태에
+    // 기대는 것보다 매번 확정하는 편이 싸고 확실하다(프로퍼티 대입 하나다).
     conn.callTimeout = TIMEOUT_MS;
-    await setSessionFormats(conn);
     // 사용자 입력은 바인드 값으로만 전달한다 (SQL 문자열 결합 금지).
     // sql은 가드가 승인하며 만든 실행용 형태다 — 여기서 다시 손보지 않는다.
+    // fetchArraySize·prefetchRows를 행 상한에 맞춘다 — 기본값(100)이면 상한(1,001행)까지 왕복이 11번이다.
+    // 행 수 상한이 곧 메모리 상한이므로 한 번에 받아도 크기는 같다.
     const result = await conn.execute(sql, binds, {
       outFormat: oracledb.OUT_FORMAT_OBJECT,
       maxRows: MAX_ROWS + 1,
+      fetchArraySize: MAX_ROWS + 1,
+      prefetchRows: MAX_ROWS + 2,
     });
     return capResult(result.rows ?? [], targetDbName);
   } finally {
-    await conn.close().catch(() => {}); // close 실패가 원본 쿼리 오류를 덮어쓰지 않게
+    // 풀 커넥션의 close()는 반납이다. 실패가 원본 쿼리 오류를 덮어쓰지 않게 삼킨다.
+    await conn.close().catch(() => {});
   }
+}
+
+// ===== 대상 DB별 커넥션 풀 =====
+// 실행마다 접속·해제하던 것을 풀로 바꿨다. Oracle 세션 생성은 LAN에서도 수백 ms(TCP·핸드셰이크·인증)이고
+// VPN이면 그 이상인데, 거기에 NLS ALTER SESSION 왕복과 close까지 매 스텝 냈다 — 2단계 절차면 두 번.
+// 답변 지연에서 조회 경로가 내는 몫의 대부분이 이 접속 비용이었다.
+// 풀은 대상 DB 등록(target_db 행)마다 하나이고 처음 쓸 때 만든다. NLS 포맷은 sessionCallback으로
+// 세션이 만들어질 때 한 번만 건다 — 풀이 돌려주는 세션은 그 설정을 유지한다. 문장 캐시(드라이버 기본
+// 30개)가 함께 붙어 같은 등록 쿼리의 재실행은 소프트 파싱도 준다.
+// 대가: 프로세스가 조회 DB의 세션을 쥐고 있게 된다. 그래서 작게 잡고(POOL_MAX) 유휴 세션은 정리한다
+// (POOL_TIMEOUT_S) — 조회 DB는 운영 DB이고, 이 에이전트의 조회는 요청당 순차라 동시 질문 수만큼이면 된다.
+const pools = new Map();          // 풀 키 → Promise<Pool>
+// 대상 DB 하나의 최대 세션 수. 요청 하나가 세션을 겹쳐 쓴다 — 일괄 조회(agent.js run_queries)는 최대
+// MAX_BATCH_QUERIES개를 병렬로 돌리기 때문이다. '요청당 하나'를 전제로 동시 질문 수만큼(4) 잡았던 값을
+// 그 배수로 되돌린다: 일괄 조회를 하는 요청 둘이 겹쳐도 기다리지 않는다. 그보다 몰리면 큐에서 기다리고
+// (queueTimeout), 그 대기는 조회 타임아웃과 같은 예산 안이다.
+// 무한정 키우지 않는 이유는 그대로다 — 조회 DB는 운영 DB이고 이 프로세스가 그 세션을 쥐고 있다.
+const POOL_MAX = MAX_BATCH_QUERIES * 2;
+const POOL_TIMEOUT_S = 300;       // 유휴 세션은 5분 뒤 정리 — 한산한 시간대에 세션을 쥐고 있지 않는다
+const POOL_PING_INTERVAL_S = 60;  // 유휴 60초를 넘긴 세션은 ping으로 살았는지 본 뒤 넘긴다 — 끊긴 세션이 조회 하나를 버리지 않게
+
+// 풀 키: 이름 + 접속정보·계정·비밀번호의 해시. 등록(target_db)을 고치면 키가 바뀌어 새 풀이 붙고
+// 같은 이름의 옛 풀은 닫는다 — 재기동 없이 반영된다. 비밀번호를 평문으로 키에 담지 않는다:
+// 키는 로그·오류 문구에 섞일 수 있다.
+function poolKey(target) {
+  const secret = [target.connection_info, target.db_user, resolvePassword(target.db_password)]
+    .map(v => String(v ?? '')).join('\n');
+  return `${nameKey(target.db_name)}\n${createHash('sha256').update(secret).digest('hex')}`;
+}
+
+async function acquireConnection(target) {
+  const key = poolKey(target);
+  let pending = pools.get(key);
+  if (!pending) {
+    // 같은 이름의 옛 풀(등록이 바뀌었다)은 닫는다 — 열린 채 두면 옛 접속정보로 세션을 쥐고 있게 된다.
+    const prefix = key.slice(0, key.indexOf('\n') + 1);
+    for (const [k, old] of pools) {
+      if (k !== key && k.startsWith(prefix)) {
+        pools.delete(k);
+        old.then(p => p.close(0)).catch(() => { /* 이미 닫혔거나 만들어지지 못했다 */ });
+      }
+    }
+    pending = oracledb.createPool({
+      user: target.db_user,
+      password: resolvePassword(target.db_password),
+      connectString: target.connection_info,
+      poolMin: 0,
+      poolMax: POOL_MAX,
+      poolIncrement: 1,
+      poolTimeout: POOL_TIMEOUT_S,
+      poolPingInterval: POOL_PING_INTERVAL_S,
+      // 풀이 꽉 찼을 때 기다리는 상한. 조회 타임아웃과 같은 값이면 '기다리다 끝난 요청'도 같은 예산 안에 든다.
+      queueTimeout: TIMEOUT_MS,
+      // 접속 자체에도 상한이 필요하다 — callTimeout은 세션이 생긴 뒤부터 적용되므로, 리스너가 TCP는
+      // 받아주고 핸드셰이크를 끝내지 않는 상태(기동 중이거나 멈춘 DB)에서는 여기서 무한정 매달려
+      // agent의 요청 예산 검사가 무의미해진다. 단위는 초다(callTimeout만 ms).
+      // 둘 다 지정한다: 드라이버는 "둘 다 미설정"일 때만 transportConnectTimeout 기본값(20초)을 넣으므로,
+      // connectTimeout만 주면 TCP 단계의 기본 상한이 오히려 사라진다 (sessionAtts.js).
+      // 값을 작게 잡는 이유는 이 상한이 '주소마다' 적용되기 때문이다 — 'localhost'는 ::1과 127.0.0.1
+      // 둘로 풀리므로 실제 최악은 주소 수 × 값이다. 조회 타임아웃(ORACLE_TIMEOUT_MS)과 별개인 것도 그래서다.
+      // 이 두 값은 thin 모드에서만 쓰인다 — oci(Thick)에서는 조용히 무시되므로, 같은 상한이 필요하면
+      // sqlnet.ora의 SQLNET.OUTBOUND_CONNECT_TIMEOUT이나 접속 문자열의 (CONNECT_TIMEOUT=…)로 준다
+      // (ORACLE_CLIENT_CONFIG_DIR가 그 sqlnet.ora를 가리키는 자리다). callTimeout은 두 모드 모두에 적용된다.
+      connectTimeout: CONNECT_TIMEOUT_S,
+      transportConnectTimeout: TRANSPORT_CONNECT_TIMEOUT_S,
+      // 세션이 처음 만들어질 때만 불린다 (드라이버는 콜백 형식으로 부른다 — lib/pool.js _tagFixup).
+      // setSessionFormats는 던지지 않으므로 실패해도 세션을 버리지 않는다 (그 함수 주석).
+      sessionCallback: (conn, requestedTag, cb) => setSessionFormats(conn).then(() => cb(), cb),
+      homogeneous: true,
+    }).catch(e => {
+      // 생성 실패는 캐시하지 않는다 — 다음 조회가 다시 시도한다 (접속정보를 고친 뒤 재기동하지 않아도 된다).
+      if (pools.get(key) === pending) pools.delete(key);
+      throw e;
+    });
+    pools.set(key, pending);
+  }
+  const pool = await pending;
+  return pool.getConnection();
+}
+
+// 정상 종료용 — 열린 풀을 전부 닫는다 (server.js shutdown). 세션을 쥔 채 프로세스가 내려가면 DB 쪽에
+// 끊긴 세션이 남아 정리될 때까지 자리를 차지한다. 진행 중인 조회는 기다리지 않는다(drainTime 0) —
+// 종료 경로는 이미 요청을 다 보낸 뒤다.
+export async function closeOraclePools() {
+  const open = [...pools.values()];
+  pools.clear();
+  await Promise.all(open.map(p => p.then(pool => pool.close(0)).catch(() => { /* 이미 닫혔거나 만들어지지 못했다 */ })));
 }
 
 // 세션 포맷 고정은 표기 품질을 위한 것이지 조회의 전제 조건이 아니다 —
 // 실패해도 조회는 계속한다 (여기서 던지면 부가 설정 하나가 모든 조회를 막는다).
 // 실패 시 날짜는 DB 기본 NLS 포맷 문자열로 오고, 그 값을 다음 스텝 바인드로 되돌릴 때만
-// 포맷 불일치(ORA-01861) 가능성이 남는다.
+// 포맷 불일치(ORA-01861) 가능성이 남는다. 풀의 sessionCallback이 세션마다 한 번 부른다.
 async function setSessionFormats(conn) {
   try {
     await conn.execute(NLS_SESSION_FORMATS);

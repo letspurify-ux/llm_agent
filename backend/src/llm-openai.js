@@ -9,9 +9,10 @@ import {
   MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK,
   MAX_PROMPT_ITEM_LEN, MAX_PROMPT_SQL_LEN, MAX_PROMPT_STEP_LEN,
   MAX_PROMPT_PARAMS_LEN, MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS, PROMPT_FRAME_RESERVE,
-  MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, MAX_COMPLETION_TOKENS, MAX_STEPS, MAX_RESULT_ROWS,
-  clipText, warnOnce, targetDbNames, isPlainObject, joinUrl,
-  readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_UPSTREAM_ERROR_BYTES,
+  MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, MAX_COMPLETION_TOKENS, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_BATCH_QUERIES, MAX_RESULT_ROWS,
+  MAX_EXPANDS, MAX_EXPANDED_ITEM_LEN, ITEM_PREFIX,
+  SEARCH_TARGETS, clipText, warnOnce, targetDbNames, isPlainObject, joinUrl,
+  readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_UPSTREAM_ERROR_BYTES, numEnv,
 } from './constants.js';
 import { bindNames } from './sql.js';
 import { rowCounts } from './result.js';
@@ -38,32 +39,70 @@ function resolveReasoningEffort() {
 // 서버가 이 파라미터를 거부하면 프로세스 수명 동안 다시 보내지 않는다 —
 // 지원하지 않는 엔드포인트에서 모든 질문이 실패하는 것보다, 한 번 배우고 빼는 편이 낫다.
 let effortAccepted = REASONING_EFFORT !== null;
+// stream_options(마지막 조각에 usage를 실어 달라는 요청)도 같은 방식이다 — 모르는 서버는 400으로 거절한다.
+let streamOptionsAccepted = true;
+
+// 스트림이 '흐르다 멈추면' 이만큼 기다렸다 끊는다. 전체 상한(TIMEOUT_MS)은 '정당하게 긴 답변'을 위한 것이라
+// 120초인데, 도중에 죽은 엔드포인트도 그때까지 붙잡는다 — 조각이 흐르던 응답에서는 멈춤이 훨씬 먼저 보인다.
+//
+// 첫 조각까지는 이 상한을 걸지 않는다. 그 구간(요청이 서버의 대기열에 있고, 프롬프트를 읽고, 모델이 첫 토큰을
+// 내기까지)은 '멈춤'과 구분되지 않는데, 바쁜 vLLM이나 사고 과정이 긴 모델에서는 정당하게 수십 초가 걸린다.
+// 거기에 이 상한을 걸면 느릴 뿐인 요청이 두 번의 시도 끝에 실패로 끝나고, 사용자는 원인을 '멈췄습니다'로
+// 잘못 안내받는다. 첫 바이트까지는 전체 상한이 지킨다(이 값이 없던 때와 같다) — 아래 armIdle을 첫 조각에서
+// 처음 건다. 바이트가 흐르기 시작한 뒤의 멈춤만 이 값이 잡는다.
+const IDLE_TIMEOUT_MS = numEnv('LLM_IDLE_TIMEOUT_MS', 30_000);
 
 // 시스템 프롬프트에는 요청마다 달라지는 것을 하나도 싣지 않는다 (현재 시각도 아래 buildPrompt가
 // 사용자 프롬프트 끝에 싣는다) — vLLM의 prefix caching은 앞에서부터 같은 토큰열만 재사용하므로,
 // 여기 한 글자가 바뀌면 모든 요청·모든 스텝이 시스템 프롬프트부터 다시 계산한다.
 const SYSTEM_PROMPT = `당신은 사내 지식 관리 및 DB 조회 Q&A 에이전트다.
-관련 지식, Q&A 처리 방법, 실행 가능한 쿼리 목록, 지금까지의 쿼리 실행 이력, 최근 대화, 그리고 사용자의 현재 질문이 이 순서로 주어진다.
-반드시 아래 두 형식 중 하나의 JSON 객체 하나만으로 응답하라. 다른 텍스트를 붙이지 마라.
+지금까지 검색·실행해서 확보한 자료(관련 지식, Q&A 처리 방법, 실행 가능한 쿼리 목록, 실행 이력), 최근 대화, 그리고 사용자의 현재 질문이 이 순서로 주어진다. 자료는 처음에는 없고 네가 search로 요청해야 채워진다.
+반드시 아래 세 형식 중 하나의 JSON 객체 하나만으로 응답하라. 다른 텍스트를 붙이지 마라.
 생각을 적어야 한다면 <think> 와 </think> 사이에만 적어라. 그 블록 밖에는 위 JSON 하나만 남긴다.
 
-1. 답변 전에 DB 조회가 더 필요하면:
+1. 사내 자료가 필요하면 먼저 검색한다:
+{"action":"search","text":"<검색어>","targets":["knowledge","qa_method","query"]}
+- targets: knowledge = 사내 지식(개념·정책·절차·안내문), qa_method = 질문 유형별 처리 방법(어떤 쿼리를 어떤 순서로 실행해 답하는지), query = 조회 DB에 실행할 수 있는 쿼리 목록(현재 상태·수치·이력 조회). 필요한 것만 고르되, 무엇이 필요한지 확실하지 않으면 셋 다 넣는다. qa_method를 찾으면 그 본문이 지목한 쿼리는 함께 실린다.
+- text: 질문의 핵심 낱말 2~6개(시스템명·작업 ID·고객명·절차명). 후속 질문이면 최근 대화에서 대상을 복원해 적는다 (예: "그럼 김철수는?" → "김철수 고객 주문 상태").
+- 사내 시스템·업무·절차·데이터에 관한 질문은 검색 없이 답하지 마라. 검색이 0건이면 검색어를 바꿔 한 번 더 시도하고, 그래도 없으면 3의 규칙대로 답한다. 이미 검색한 검색어·대상을 반복하지 마라.
+- 인사·잡담·감사 인사, 그리고 최근 대화에 이미 있는 내용의 재정리는 검색 없이 곧바로 답한다.
+- drop: 앞서 받은 자료 중 더는 필요 없는 것의 번호를 함께 적는다 (예: ["k7","m2"]). 적은 것은 다음 단계부터 실리지 않아 그 자리를 관련 있는 자료가 쓴다. 필요 없으면 생략한다.
+
+2. 자료의 본문이 ${TRUNC_MARK} 으로 끝나고 항목 앞에 번호가 붙어 있으면 그 전체 본문을 청구할 수 있다:
+{"action":"expand","ids":["k12"],"drop":["k7"]}
+- ids에는 번호가 붙은 항목만 적는다. 번호가 없는 항목은 이미 본문 전체가 실려 있어 청구할 것이 없다. 한 번에 최대 ${MAX_EXPANDS}개.
+- 절차나 기준의 뒷부분이 답에 필요할 때만 청구하라. 앞부분만으로 답할 수 있으면 그대로 답한다.
+- drop은 1의 것과 같다. 펼친 본문이 자리를 많이 쓰므로 더는 필요 없는 자료를 함께 적어라.
+
+3. 답변 전에 DB 조회가 더 필요하면:
 {"action":"run_query","query_name":"<쿼리이름>","params":{"<바인드변수명>":"<값>"},"target_db":"<대상DB이름>"}
-- query_name은 반드시 쿼리 목록에 있는 이름이어야 한다.
+- query_name은 반드시 쿼리 목록에 있는 이름이어야 한다. 목록이 없거나 맞는 쿼리가 없으면 먼저 query를 검색하라.
 - params에는 그 쿼리의 '바인드'에 적힌 변수를 전부 채워라. 키는 콜론 없이 쓴다 (:job_id → "job_id"). 값은 사용자 질문 또는 실행 이력의 결과에서 추출한다.
 - 실행 이력에서 ${TRUNC_MARK} 으로 끝나는 값은 길어서 잘린 값이다. 그 값은 앞부분만 옮겨 적더라도 바인드로 쓰지 마라 — 잘리지 않은 다른 컬럼(ID 등)으로 조회하거나 사용자에게 되물어라.
 - "어제", "이번 달", "최근 3일" 같은 상대 날짜는 질문 아래 '현재 시각'을 기준으로 절대 날짜로 바꿔 쓴다.
 - target_db: 같은 쿼리를 어느 DB에서 실행할지 정하는 값이다. 쿼리 목록의 '대상DB'에 후보가 둘 이상이면 반드시 그중 하나를 등록된 철자 그대로 골라라 (후보가 하나뿐이면 생략해도 된다). 무엇을 고를지는 그 쿼리의 용도 설명과 질문·Q&A 처리 방법을 근거로 판단한다.
 - 어느 후보를 골라야 할지 질문만으로 정할 수 없으면 지어내지 마라 — 어느 대상을 조회할지 사용자에게 되묻는 answer로 답하라.
 - Q&A 처리 방법에 여러 단계가 서술되어 있으면 그 순서대로 하나씩 실행한다.
+- 서로 의존하지 않는 조회가 둘 이상이면(예: 서울과 부산 재고, 두 배치의 상태) 한 번에 요청한다 — 왕복이 준다:
+{"action":"run_queries","queries":[{"query_name":"<쿼리이름>","params":{…},"target_db":"<대상DB이름>"}, …]}
+  최대 ${MAX_BATCH_QUERIES}개. 앞 조회의 결과가 다음 조회의 값이 되는 절차(처리 방법의 1단계→2단계)는 여기 담지 말고 run_query로 하나씩 실행한다.
 
-2. 답변이 가능하면:
+4. 답변이 가능하면:
 {"action":"answer","answer":"<사용자에게 보여줄 최종 답변>"}
+- k12·m3 같은 자료 번호는 내부 표기다 — 답변에 옮겨 적지 마라.
 - 관련 지식이나 쿼리 실행 결과가 있으면 반드시 그것에 근거해서 답하라.
-- 관련 지식·처리 방법·쿼리 결과가 전혀 없으면 너의 일반 지식으로 답하되, 답변 서두에 "*등록된 지식에 없는 내용이라 일반 지식으로 답변합니다.*" 한 줄을 붙여라.
+- 검색을 했는데도 관련 지식·처리 방법·쿼리 결과가 전혀 없으면 너의 일반 지식으로 답하되, 답변 서두에 "*등록된 지식에 없는 내용이라 일반 지식으로 답변합니다.*" 한 줄을 붙여라. 인사·잡담에는 이 문구를 붙이지 마라.
+- 실행 이력에 '검색 불가'가 있으면 등록된 자료가 없다고 단정하지 말고, 지금은 자료를 확인할 수 없다는 사실을 답변에 밝혀라.
 - 일반 지식으로 답할 때도 사내 시스템의 구체적 상태(수치, 상태값, 일정 등)는 절대 지어내지 마라. 확인이 필요하면 확인 방법을 안내하라.
 - 실행 이력의 오류 원문에 든 내부 정보(호스트·포트·접속 주소, 스키마·테이블·계정명, SQL 원문)는 answer에 옮겨 적지 마라. 오류는 "조회에 실패했다"는 사실과 사용자가 할 수 있는 다음 행동만 전달하라.
 - answer는 markdown 형식으로 구조화하라: 조회 결과는 표(table)로, 항목 나열은 목록으로, 섹션 구분은 ### 제목으로 작성한다.
+- 조회 결과를 표로 보일 때는 값을 옮겨 적지 말고 \`\`\`table 코드블록 하나에 참조만 적어라 — 서버가 그 실행의 결과(이력에 앞부분만 보인 것도, 최대 100행)로 표를 채운다. 옮겨 적는 것보다 빠르고 정확하다:
+\`\`\`table
+step: 2
+cols: JOB_ID, STATUS, LAST_RUN_AT
+limit: 20
+\`\`\`
+  step은 실행 이력의 번호(필수), cols는 보일 열(생략하면 앞 10열), limit은 행 수(생략하면 30). 표 위의 설명과 판단은 블록 밖에 쓴다. 결과의 한두 값만 인용할 때는 문장으로 쓰고 표를 만들지 마라.
 - 수식은 LaTeX로 쓴다: 인라인은 $E=mc^2$ 또는 $$E=mc^2$$ (\\( \\), \\[ \\] 표기도 된다), 넓은 수식은 $$ 를 앞뒤 독립된 줄에 두어 별행으로 — 인라인은 접히지 않아 넓으면 잘린다. 금액 $100, 환경변수 $ORACLE_HOME 의 $는 그냥 쓴다.
 - 수치의 비교·추이·비율은 표와 함께 차트로도 보여줘라 — 값이 셋 이상이고 숫자 열이 있을 때, 한 답변에 넷 이하. 차트는 \`\`\`chart 코드블록 하나다:
 \`\`\`chart
@@ -96,16 +135,30 @@ const TIMEOUT_MS = 120_000;
 // 해냈는지를 아는 쪽만 정할 수 있다. 조회를 세 번 성공해놓고 'LLM 호출에 실패했습니다' 한 줄만
 // 내보내면 그 성과가 통째로 사라지는데, provider는 실행 이력을 해석할 위치가 아니다.
 // agent.js가 null을 받아 손에 든 결과로 답을 만들고(renderAnswer), 그것마저 없을 때만 실패를 알린다.
+// ctx의 두 훅은 선택이다 (agent.js가 준다):
+//   onUsage(usage)          서버가 알려준 토큰 실측 — 요청별 계측(trace.timing)에 남긴다.
+//   onAnswerDelta({text})   답변 문자열이 흘러오는 동안의 조각(디코딩된 답변 글자) — 화면의 미리보기.
+//   onAnswerDelta({reset})  재시도로 앞선 조각을 버려야 한다.
 export async function openaiDecide(ctx) {
   const userPrompt = buildPrompt(ctx);
   const deadline = Date.now() + TIMEOUT_MS;
   for (let attempt = 0; attempt < 2; attempt++) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
+    const preview = ctx.onAnswerDelta ? answerPreviewer(ctx.onAnswerDelta) : null;
     try {
-      const content = await chatCompletion(userPrompt, remaining);
+      const { content, usage } = await chatCompletion(userPrompt, remaining, { onContent: preview?.feed });
+      if (usage) ctx.onUsage?.(usage);
       const decision = parseDecision(content, ctx.forceAnswer);
-      if (decision) return decision;
+      if (decision) {
+        // 답변이 아닌 결정으로 끝났는데 미리보기가 나갔으면 거둬들인다. 모델이 사고 과정에서 답변 초안을
+        // 적어 보고 접는 일이 흔한데(그 초안은 닫는 태그 앞에 있어 previewer가 걸러내지 못한다),
+        // 거두지 않으면 사용자는 폐기된 답을 계속 보고 있고 다음 스텝의 진짜 답이 그 뒤에 이어 붙는다.
+        if (decision.action !== 'answer' && preview?.emitted) ctx.onAnswerDelta({ reset: true });
+        return decision;
+      }
+      // 결정을 못 읽었는데 미리보기는 나갔다 — 재시도 전에 화면이 그것을 버리게 한다
+      if (preview?.emitted) ctx.onAnswerDelta({ reset: true });
       // 응답은 받았는데 결정 형식이 아니다 — 재시도한다.
       // temperature=0이라 같은 응답이 올 확률이 높지만, vLLM/OpenRouter의 continuous batching은
       // 실제로 결정론을 보장하지 않는다. 특히 forceAnswer 단계에서 여기 걸리면 이미 조회해둔
@@ -122,10 +175,87 @@ export async function openaiDecide(ctx) {
       );
     } catch (e) {
       console.warn(`[llm] call failed (attempt ${attempt + 1}/2):`, e.message);
+      if (preview?.emitted) ctx.onAnswerDelta({ reset: true });
     }
   }
   // 상세 오류는 위 warn 로그에만 남긴다 — 사용자용 문구는 호출부가 만든다 (위 주석 참고).
   return null;
+}
+
+// ===== 답변 미리보기 =====
+// 응답이 흘러오는 동안 {"action":"answer","answer":"…"} 의 문자열 안쪽을 디코딩해 조각으로 내보낸다.
+// 최종 답변은 파싱이 끝난 뒤 따로 확정되므로(parseDecision → agent.js finish) 이것은 '미리 보이는 글자'일 뿐이다 —
+// 그래서 파서만큼 엄밀할 필요가 없고, 틀리면 화면이 done에서 바꿔 끼운다. 다만 두 가지는 지킨다:
+//   ① 사고 과정 안의 초안은 내보내지 않는다 — 닫는 태그 뒤에서만 찾고, 열린 채인 여는 태그가 있으면 기다린다
+//      (parseDecision이 초안 JSON을 결정으로 삼지 않는 것과 같은 이유).
+//   ② JSON 이스케이프는 조각 경계를 넘어 이어질 수 있다 — 미완의 조각은 다음 조각 앞에 붙인다.
+// 모르는 이스케이프(\frac 같은 LaTeX)는 글자 그대로 둔다 — 파싱 경계(normalizeJsonEscapes)와 같은 관용이다.
+// 알려진 한계: 값이 백슬래시 하나로 끝나면(윈도우 경로) 그 닫는 따옴표를 이스케이프로 읽어 문자열의 끝을
+// 지나친다 — 미리보기 끝에 JSON 꼬리 몇 글자가 잠깐 붙는다. 파서는 그 경우를 위해 두 번째 읽기를 두지만
+// (matchingBrace의 literalBackslashBeforeQuote) 여기서는 그러지 않는다: 미리보기는 최종 답이 아니고
+// (done이 갈아 끼운다) 그 판정을 하려면 뒤를 다 봐야 하는데 흘려보내는 동안에는 뒤가 아직 없다.
+// (테스트에서 쓰므로 export 한다)
+const ANSWER_START_RE = /"action"\s*:\s*"answer"\s*,\s*"answer"\s*:\s*"/;
+// 자기닫힘 표기(<think/>)는 여는 태그가 아니다 — 열린 것으로 보면 그 뒤가 영영 사고 과정이 되어 그 모델의
+// 모든 질문에서 미리보기가 통째로 사라진다. 결정 파서(scanCandidates)가 같은 표기에 같은 가드를 두고 있다:
+// '모델이 이 표기를 한 번 쓰기 시작하면 모든 질문이 같은 이유로 실패한다'.
+const REASONING_OPEN_RE = new RegExp(`<(?:${['thinking', 'think', 'reasoning', 'reflection', 'scratchpad', 'thought'].join('|')})\\b[^>]{0,100}(?<!/)>`, 'i');
+const REASONING_CLOSE_RE = new RegExp(`</(?:${['thinking', 'think', 'reasoning', 'reflection', 'scratchpad', 'thought'].join('|')})\\s*>`, 'gi');
+const SIMPLE_ESCAPES = { n: '\n', t: '\t', r: '\r', b: '\b', f: '\f', '"': '"', '\\': '\\', '/': '/' };
+const SEEK_TAIL = 200;   // 찾는 동안 들고 있을 원문 — 시작 패턴은 이보다 짧다
+
+export function answerPreviewer(onDelta) {
+  let state = 'seek';   // seek → inside → done
+  let tail = '';        // seek: 마지막 닫는 태그 뒤의 원문 (상한 안에서)
+  let inThink = false;  // 열린 채인 사고 과정 태그가 있는가
+  let pending = '';     // inside: 아직 끝나지 않은 이스케이프 조각
+  let emitted = false;
+  const out = text => { if (text) { emitted = true; onDelta({ text }); } };
+
+  const decode = chunk => {
+    const text = pending + chunk;
+    pending = '';
+    let s = '';
+    let i = 0;
+    while (i < text.length) {
+      const c = text[i];
+      if (c === '"') { state = 'done'; break; }
+      if (c !== '\\') { s += c; i++; continue; }
+      const n = text[i + 1];
+      if (n === undefined) { pending = '\\'; break; }
+      if (n === 'u') {
+        const hex = text.slice(i + 2, i + 6);
+        if (hex.length < 4) { pending = text.slice(i); break; }
+        if (/^[0-9a-fA-F]{4}$/.test(hex)) { s += String.fromCharCode(parseInt(hex, 16)); i += 6; continue; }
+        s += '\\u'; i += 2; continue;
+      }
+      s += n in SIMPLE_ESCAPES ? SIMPLE_ESCAPES[n] : `\\${n}`;
+      i += 2;
+    }
+    return s;
+  };
+
+  return {
+    feed(chunk) {
+      if (!chunk || state === 'done') return;
+      if (state === 'inside') { out(decode(chunk)); return; }
+      tail += chunk;
+      // 닫는 태그가 왔으면 그 뒤만 본다 — 앞은 사고 과정이다
+      let lastClose = -1;
+      REASONING_CLOSE_RE.lastIndex = 0;
+      for (let m; (m = REASONING_CLOSE_RE.exec(tail));) lastClose = m.index + m[0].length;
+      if (lastClose >= 0) { tail = tail.slice(lastClose); inThink = false; }
+      if (REASONING_OPEN_RE.test(tail)) inThink = true;
+      if (inThink) { tail = tail.slice(-SEEK_TAIL); return; }
+      const m = ANSWER_START_RE.exec(tail);
+      if (!m) { tail = tail.slice(-SEEK_TAIL); return; }
+      state = 'inside';
+      const rest = tail.slice(m.index + m[0].length);
+      tail = '';
+      out(decode(rest));
+    },
+    get emitted() { return emitted; },
+  };
 }
 
 // response_format(구조화 출력, guided decoding)을 보내지 않는다. 두 가지를 재보고 내린 결론이다.
@@ -137,52 +267,144 @@ export async function openaiDecide(ctx) {
 //     <think> 자체를 낼 수 없게 되어(vLLM은 완성 전체에 문법을 건다) 이 파일이 공들여 다루는
 //     ①②③ 형태가 서버 설정에 따라 통째로 달라진다.
 // 그래서 '모델이 어떻게 쓰든 잃지 않게 읽는' 쪽(normalizeJsonEscapes)을 근본 대응으로 둔다.
-async function chatCompletion(userPrompt, timeoutMs) {
+// 반환: { content, usage } — usage는 서버가 주었을 때만.
+// 응답은 스트림(stream: true)으로 받는다. 세 가지를 얻는다: ① 조각이 멈추면 전체 상한(120초)보다 훨씬 먼저 끊을 수
+// 있다(IDLE_TIMEOUT_MS) ② 답변 문자열이 흘러오는 동안 화면에 미리보기를 낼 수 있다(onContent → answerPreviewer)
+// ③ 첫 조각이 오는 시각이 '모델이 생각을 끝냈다'는 신호다. 스트림을 주지 않는 서버(JSON 하나로 답하는 프록시나
+// 테스트 더블)는 예전 길로 읽는다 — 두 길이 같은 값을 돌려준다.
+async function chatCompletion(userPrompt, timeoutMs, { onContent } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (process.env.LLM_API_KEY) headers.Authorization = `Bearer ${process.env.LLM_API_KEY}`;
 
-  const res = await fetch(joinUrl(process.env.LLM_BASE_URL, 'chat/completions'), {
-    method: 'POST',
-    headers,
-    signal: AbortSignal.timeout(timeoutMs),
-    body: JSON.stringify({
-      model: process.env.LLM_MODEL,
-      temperature: 0,
-      // 폭주 가드이지 답변 길이 상한이 아니다 — 답변은 파싱 뒤 MAX_ANSWER_LEN이 묶는다 (constants.js 참고).
-      max_tokens: MAX_COMPLETION_TOKENS,
-      ...(effortAccepted && { reasoning_effort: REASONING_EFFORT }),
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: userPrompt },
-      ],
-    }),
-  });
-  if (!res.ok) {
-    // 오류 본문도 상한 안에서만 받는다 — 아래에서 300자만 쓰는데 전부 받아 놓고 자르면
-    // 실패한 요청이 오히려 성공한 요청보다 메모리를 더 쓴다 (constants.readCapped 주석).
-    const detail = (await readCapped(res, MAX_UPSTREAM_ERROR_BYTES, 'LLM 오류')).slice(0, 300);
-    // 이 파라미터를 모르는 서버는 400으로 거절한다. 한 번 겪으면 빼고 가도록 표시해두면
-    // 바로 이어지는 재시도가 성공한다 (설정 하나 때문에 모든 질문이 실패하지 않게).
-    if (res.status === 400 && effortAccepted && /reasoning/i.test(detail)) {
-      effortAccepted = false;
-      console.warn('[llm] this endpoint does not support reasoning_effort — omitting it from future requests.');
+  // 두 상한을 한 신호로 — 전체(timeoutMs)와 유휴(IDLE_TIMEOUT_MS). 유휴 타이머는 조각이 올 때마다 다시 건다.
+  const ctl = new AbortController();
+  let why = null;
+  const total = setTimeout(() => { why = `LLM 응답이 ${Math.round(timeoutMs / 1000)}초 안에 끝나지 않았습니다`; ctl.abort(); }, timeoutMs);
+  let idle;
+  const armIdle = () => {
+    clearTimeout(idle);
+    idle = setTimeout(() => { why = `LLM 응답이 ${Math.round(IDLE_TIMEOUT_MS / 1000)}초 동안 멈췄습니다`; ctl.abort(); }, IDLE_TIMEOUT_MS);
+  };
+  try {
+    const res = await fetch(joinUrl(process.env.LLM_BASE_URL, 'chat/completions'), {
+      method: 'POST',
+      headers,
+      signal: ctl.signal,
+      body: JSON.stringify({
+        model: process.env.LLM_MODEL,
+        temperature: 0,
+        // 폭주 가드이지 답변 길이 상한이 아니다 — 답변은 파싱 뒤 MAX_ANSWER_LEN이 묶는다 (constants.js 참고).
+        max_tokens: MAX_COMPLETION_TOKENS,
+        stream: true,
+        ...(streamOptionsAccepted && { stream_options: { include_usage: true } }),
+        ...(effortAccepted && { reasoning_effort: REASONING_EFFORT }),
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: userPrompt },
+        ],
+      }),
+    });
+    if (!res.ok) {
+      // 오류 본문도 상한 안에서만 받는다 — 아래에서 300자만 쓰는데 전부 받아 놓고 자르면
+      // 실패한 요청이 오히려 성공한 요청보다 메모리를 더 쓴다 (constants.readCapped 주석).
+      const detail = (await readCapped(res, MAX_UPSTREAM_ERROR_BYTES, 'LLM 오류')).slice(0, 300);
+      // 이 파라미터를 모르는 서버는 400으로 거절한다. 한 번 겪으면 빼고 가도록 표시해두면
+      // 바로 이어지는 재시도가 성공한다 (설정 하나 때문에 모든 질문이 실패하지 않게).
+      if (res.status === 400 && effortAccepted && /reasoning/i.test(detail)) {
+        effortAccepted = false;
+        console.warn('[llm] this endpoint does not support reasoning_effort — omitting it from future requests.');
+      }
+      if (res.status === 400 && streamOptionsAccepted && /stream_options/i.test(detail)) {
+        streamOptionsAccepted = false;
+        console.warn('[llm] this endpoint does not support stream_options — omitting it from future requests (no token usage will be logged).');
+      }
+      throw new Error(`LLM API ${res.status}: ${detail}`);
     }
-    throw new Error(`LLM API ${res.status}: ${detail}`);
+    const streamed = /text\/event-stream/i.test(res.headers.get('content-type') ?? '') && res.body?.getReader;
+    const { content, usage, finish } = streamed
+      ? await readEventStream(res, ctl.signal, armIdle, onContent)
+      : fromJson(JSON.parse(await readCapped(res, MAX_UPSTREAM_JSON_BYTES, 'LLM')), onContent);
+    // 실측을 남긴다 — 프롬프트 예산(constants.js)은 문자 기준 추정이고 토큰 수는 서버만 안다.
+    // 예산을 다시 잡을 때 필요한 숫자가 이 한 줄이다 (usage를 주지 않는 서버에서는 남길 것이 없다).
+    if (usage) console.log(`[llm] usage prompt=${usage.prompt_tokens} completion=${usage.completion_tokens} finish=${finish ?? '?'}`);
+    // 상한에서 끊긴 응답은 결정 JSON이 잘려 있어 아래 파싱이 실패한다. 그 실패는 '모델이 형식을 안 지켰다'
+    // 로 보이므로, 원인이 길이였다는 사실을 여기서 따로 남긴다 (폭주인지 정당하게 긴 것인지는 이 로그로 가른다).
+    if (finish === 'length') {
+      console.warn(`[llm] completion cut at max_tokens=${MAX_COMPLETION_TOKENS} — runaway generation or an answer that needs a higher MAX_COMPLETION_TOKENS (constants.js).`);
+    }
+    return { content, usage };
+  } catch (e) {
+    // 우리가 끊은 것은 이유를 말한다 — AbortError 한 줄로는 전체 상한인지 멈춤인지 알 수 없다.
+    if (why && (e?.name === 'AbortError' || ctl.signal.aborted)) throw new Error(why);
+    throw e;
+  } finally {
+    clearTimeout(total);
+    clearTimeout(idle);
   }
-  // res.json()이 아니라 상한을 건 읽기다 — 이 자리가 이 시스템에서 유일하게 예산 없는 I/O였다
-  // (확인: 64MB 응답 한 건에 RSS 86MB → 365MB). 상한과 근거는 constants.MAX_UPSTREAM_JSON_BYTES.
-  const data = JSON.parse(await readCapped(res, MAX_UPSTREAM_JSON_BYTES, 'LLM'));
+}
+
+// JSON 하나로 온 응답 (스트림을 주지 않는 서버). 미리보기도 한 번에 흘린다 — 두 길이 같은 훅을 지나게.
+function fromJson(data, onContent) {
   const choice = data.choices?.[0];
-  // 실측을 남긴다 — 프롬프트 예산(constants.js)은 문자 기준 추정이고 토큰 수는 서버만 안다.
-  // 예산을 다시 잡을 때 필요한 숫자가 이 한 줄이다 (usage를 주지 않는 서버에서는 남길 것이 없다).
-  const usage = data.usage;
-  if (usage) console.log(`[llm] usage prompt=${usage.prompt_tokens} completion=${usage.completion_tokens} finish=${choice?.finish_reason ?? '?'}`);
-  // 상한에서 끊긴 응답은 결정 JSON이 잘려 있어 아래 파싱이 실패한다. 그 실패는 '모델이 형식을 안 지켰다'
-  // 로 보이므로, 원인이 길이였다는 사실을 여기서 따로 남긴다 (폭주인지 정당하게 긴 것인지는 이 로그로 가른다).
-  if (choice?.finish_reason === 'length') {
-    console.warn(`[llm] completion cut at max_tokens=${MAX_COMPLETION_TOKENS} — runaway generation or an answer that needs a higher MAX_COMPLETION_TOKENS (constants.js).`);
+  const content = choice?.message?.content ?? '';
+  if (content) onContent?.(content);
+  return { content, usage: data.usage, finish: choice?.finish_reason };
+}
+
+// SSE(text/event-stream)를 읽는다. 한 줄 `data: {…}`에 조각 하나, `data: [DONE]`이 끝이다.
+// choices[0].delta.content를 이어 붙이고, usage는 어느 조각에 있든(보통 마지막) 받는다.
+// 크기 상한은 조각의 합으로 센다 — res.json()의 상한(constants.MAX_UPSTREAM_JSON_BYTES)과 같은 값, 같은 이유다.
+// 줄 하나가 JSON이 아니면 버린다(주석 줄 `: ping`, 다른 event: 줄) — 그런 줄로 응답 전체를 잃지 않는다.
+// 읽기는 신호(signal)와 경주시킨다. fetch의 abort는 본문 스트림을 끊어 주지만 그 보장은 구현마다 다르고
+// (테스트 더블의 Response는 신호를 모른다), 유휴 상한의 존재 이유가 '멈춘 읽기에서 빠져나오는 것'이라
+// 그 빠져나오는 길을 남의 구현에 맡기지 않는다.
+async function readEventStream(res, signal, onChunk, onContent) {
+  const reader = res.body.getReader();
+  const aborted = new Promise((_, reject) => {
+    const fail = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+    if (signal.aborted) fail(); else signal.addEventListener('abort', fail, { once: true });
+  });
+  aborted.catch(() => { /* 경주에서만 쓴다 — 홀로 남은 거부가 unhandledRejection이 되지 않게 */ });
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let buffer = '';
+  let content = '';
+  let usage;
+  let finish;
+  const takeLine = line => {
+    if (!line.startsWith('data:')) return;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]') return;
+    let obj;
+    try { obj = JSON.parse(payload); } catch { return; }
+    const choice = obj?.choices?.[0];
+    const delta = choice?.delta?.content;
+    if (typeof delta === 'string' && delta) { content += delta; onContent?.(delta); }
+    if (choice?.finish_reason) finish = choice.finish_reason;
+    if (obj?.usage) usage = obj.usage;
+  };
+  try {
+    for (;;) {
+      const { done, value } = await Promise.race([reader.read(), aborted]);
+      if (done) break;
+      onChunk();
+      bytes += value.byteLength;
+      if (bytes > MAX_UPSTREAM_JSON_BYTES) {
+        const e = new Error(`LLM 응답이 상한(${MAX_UPSTREAM_JSON_BYTES.toLocaleString('en-US')} bytes)을 넘었습니다`);
+        e.tooLarge = true;
+        throw e;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop();
+      for (const line of lines) takeLine(line);
+    }
+    buffer += decoder.decode();
+    if (buffer) takeLine(buffer);
+  } finally {
+    await reader.cancel().catch(() => { /* 이미 닫혔다 */ });
   }
-  return choice?.message?.content ?? '';
+  return { content, usage, finish };
 }
 
 // 검색 결과 본문(knowledge.content / qa_method.method / query_sql)은 전부 TEXT라 그 자체로는 상한이 없다.
@@ -258,6 +480,20 @@ function renderItems(items, render, budget) {
   return lines;
 }
 
+// 버린 자료는 프롬프트에서 빠진다. 목록에서 지우지는 않는다 — 병합이 seq로 중복을 거르므로(agent.js
+// mergeFront) 표시만 세워 두면 같은 항목이 재검색으로 되살아나지 않는다.
+export const live = list => (list ?? []).filter(o => !o?.dropped);
+
+// 자료 항목 한 줄. 본문이 잘렸고 아직 펼치지 않았으면 앞에 식별자를 붙인다 — 청구할 수 있는 자리에만
+// 번호가 보이게 해서, 모델이 펼칠 수 없는 것을 청구하느라 스텝을 버리지 않게 한다. 펼친 항목은 더 긴
+// 상한으로 싣고 번호를 떼는데, 번호가 없다는 것이 곧 '더 받을 것이 없다'는 표시다.
+const itemLine = (prefix, titleKey, bodyKey) => o => {
+  const max = o.expanded ? MAX_EXPANDED_ITEM_LEN : MAX_PROMPT_ITEM_LEN;
+  const text = indent(o[bodyKey]);
+  const askable = !o.expanded && text.length > max;
+  return `- ${askable ? `${prefix}${o.seq} ` : ''}[${clip(oneLine(o[titleKey]), MAX_PROMPT_NAME_LEN)}] ${clip(text, max)}`;
+};
+
 // 바인드 변수명을 SQL과 따로 싣는다 — SQL이 길어 잘리더라도 채워야 할 파라미터가 사라지지 않게.
 // 사라지면 모델이 params를 비우고, runQuery가 '바인드 변수를 쓸 수 없습니다'로 실패한다.
 // 개수·이름 길이에 상한을 둔다 — bindNames는 표시용 절단(MAX_PROMPT_SQL_LEN) 전의 SQL 원문
@@ -314,7 +550,7 @@ const queryItemShort = q =>
 // 짧은 형태로 실린 쿼리도 그대로 실행할 수 있다는 사실을 모델에게 알린다 —
 // 이 안내가 없으면 모델은 설명이 얇은 항목을 '정보가 부족한 쿼리'로 읽고 후보에서 뺀다.
 const shortFormNote = n =>
-  `- (위 ${n}건은 길이 제한으로 이름·용도·바인드만 표시했다 — 그대로 실행할 수 있고,` +
+  `- (위 ${n}건은 이름·용도·바인드만 표시했다 — 그대로 실행할 수 있고,` +
   ` 지목하면 전체 정의가 다음 단계에 실린다)`;
 
 // 쿼리 목록만 renderItems와 다른 규칙으로 싣는다. 손해의 크기가 다르기 때문이다.
@@ -338,19 +574,25 @@ function renderQueries(queries, budget) {
     if (kept > 0 && used + cost(short[kept]) > usable) break;
     used += cost(short[kept]);
   }
-  // ② 남는 여유만큼 앞에서부터 자세한 줄로 승격. 여기서는 강제 보장을 두지 않는다 —
-  //    ①이 이미 '모든 항목이 최소 한 줄'을 보장했으므로, 예산을 넘겨서까지 올릴 이유가 없다.
-  const lines = [];
-  let full = 0;
-  for (; full < kept; full++) {
-    const line = queryItem(queries[full]);
-    const extra = line.length - short[full].length;
+  // ② 자세한 줄로 올릴 대상은 detail 표시가 붙은 것뿐이다 — 경로A가 지목한 절차용 쿼리, 직접 검색의
+  //    상위 몇 건, 모델이 이름을 대서 찾아낸 쿼리(agent.js). 나머지는 짧은 줄로 충분하다: 고르는 근거는
+  //    이름·용도·바인드이고, 지목하면 다음 스텝에 자세히 실리며, 실행하면 결과 컬럼이 이력에 보인다.
+  //    예전에는 예산이 남는 만큼 앞에서부터 전부 올렸는데, 검색이 요청 시에만 도는 구조에서는 예산이
+  //    늘 남아 등록 30건 × SQL 원문이 스텝마다 그대로 실렸다 — prefill이 스텝 수만큼 곱해지는 자리다.
+  //    여기서는 강제 보장을 두지 않는다 — ①이 이미 '모든 항목이 최소 한 줄'을 보장했으므로,
+  //    예산을 넘겨서까지 올릴 이유가 없다.
+  const lines = short.slice(0, kept);
+  let detailed = 0;
+  for (let i = 0; i < kept; i++) {
+    if (queries[i].detail !== true) continue;
+    const line = queryItem(queries[i]);
+    const extra = line.length - short[i].length;
     if (used + extra > usable) break;
     used += extra;
-    lines.push(line);
+    lines[i] = line;
+    detailed++;
   }
-  for (let i = full; i < kept; i++) lines.push(short[i]);
-  if (full < kept) lines.push(shortFormNote(kept - full));
+  if (detailed < kept) lines.push(shortFormNote(kept - detailed));
   if (kept < queries.length) lines.push(omittedNote(queries.length - kept));
   return lines;
 }
@@ -440,9 +682,36 @@ const clipDisplayValue = v =>
     : v === null || typeof v === 'number' || typeof v === 'boolean' ? v
       : clip(JSON.stringify(v) ?? String(v), MAX_DISPLAY_VALUE_LEN);
 
+// 검색 기록 한 줄. 대상별 적중 수를 대상 이름과 함께 적는다 — 어느 대상을 아직 안 찾아봤는지가 이 줄에서 보여야
+// 다음 검색에서 그 대상을 더할 수 있다. '검색 불가'는 0건과 다른 말이다 (search.js 머리말) — 시스템 프롬프트가
+// 이 표기를 그대로 언급하므로 문구를 바꾸면 그쪽도 함께 본다.
+const TARGET_LABEL = { knowledge: '지식', qa_method: '처리방법', query: '쿼리' };
+const HIT_KEY = { knowledge: 'knowledge', qa_method: 'qaMethods', query: 'queries' };
+const MAX_PROMPT_SEARCH_LEN = 200;   // 검색어 표시 상한 (원문은 MAX_SEARCH_TEXT_LEN까지 — 표시는 이만큼이면 알아본다)
+
+function searchLine(h, step) {
+  const targets = (h.targets ?? []).map(t => TARGET_LABEL[t] ?? clip(oneLine(t), 20)).join('·');
+  const head = `${step}. 검색 "${clip(oneLine(h.search), MAX_PROMPT_SEARCH_LEN)}" [${targets || '전체'}]`;
+  if (h.note) return `${head} → 실행하지 않음: ${clip(oneLine(h.note))}`;
+  const failed = new Set(h.failed ?? []);
+  const parts = SEARCH_TARGETS.map(t => {
+    if (failed.has(t)) return `${TARGET_LABEL[t]} 검색 불가`;
+    const n = h.hits?.[HIT_KEY[t]];
+    return n === null || n === undefined ? null : `${TARGET_LABEL[t]} ${n}건`;
+  }).filter(Boolean);
+  return `${head} → ${parts.length ? parts.join(' · ') : '결과 없음'}`;
+}
+
 // step은 이력 안의 절대 순번(1부터)이다. 앞선 스텝이 예산으로 생략돼도 번호가 당겨지지 않아야
 // 처리 방법의 "2단계"와 모델이 보는 스텝이 어긋나지 않고, 화면 trace의 순번과도 같은 값을 가리킨다.
+// 검색 기록도 같은 번호열을 쓴다 — 차트의 `data: step N`이 history 인덱스를 가리키므로 종류별로 따로 세면 어긋난다.
 function historyLine(h, step) {
+  if (h.search !== undefined) return searchLine(h, step);
+  // 본문 청구가 헛돌았을 때만 이력에 남는다 — 성공하면 자료 섹션의 본문이 길어지는 것으로 드러나므로
+  // 따로 적을 것이 없다 (쿼리 상세 경로와 같다). 실행되지 못한 줄이라 결과도 오류도 없다.
+  if (h.expand !== undefined) {
+    return `${step}. 본문 청구 "${clip(oneLine((h.expand ?? []).join(', ')), MAX_PROMPT_NAME_LEN)}" → 실행하지 않음: ${clip(oneLine(h.note))}`;
+  }
   // 어느 DB에서 돈 스텝인지 함께 싣는다 — 대상DB 후보가 여럿인 쿼리에서 이것이 없으면 모델은
   // 방금 무엇을 조회했는지 알 수 없어, 다음 스텝에서 다른 후보를 골라 놓고 같은 결과를 기대하거나
   // 이미 본 DB를 다시 조회한다 (루프 가드는 이름·바인드만 보므로 그 반복을 잡지 못한다).
@@ -497,8 +766,8 @@ function renderHistory(history, budget) {
 // 네 섹션이 각자 예산에 꽉 찬 요청에서 틀의 길이만큼 정확히 전체 상한을 넘는다.
 function renderSections(ctx) {
   const builders = {
-    knowledge: budget => renderItems(ctx.knowledge, k => `- [${clip(oneLine(k.title), MAX_PROMPT_NAME_LEN)}] ${clip(indent(k.content))}`, budget),
-    qaMethods: budget => renderItems(ctx.qaMethods, m => `- [${clip(oneLine(m.title), MAX_PROMPT_NAME_LEN)}] ${clip(indent(m.method))}`, budget),
+    knowledge: budget => renderItems(live(ctx.knowledge), itemLine(ITEM_PREFIX.knowledge, 'title', 'content'), budget),
+    qaMethods: budget => renderItems(live(ctx.qaMethods), itemLine(ITEM_PREFIX.qaMethods, 'title', 'method'), budget),
     history: budget => renderHistory(ctx.history, budget),
     queries: budget => renderQueries(ctx.queries, budget),
   };
@@ -536,8 +805,9 @@ export function formatNow(now) {
 // 섹션 하나 = 제목 줄 + 본문 줄들. 네 섹션 모두 제목에 건수를 달고, 비면 '(없음)'을 싣는다 —
 // 규칙이 섹션마다 다르면(어떤 제목엔 건수가 있고 어떤 본문은 빈 채로 끝나면) 모델은 '비어 있음'과
 // '누락됨'을 구분할 수 없고, 건수는 생략 안내와 맞춰 볼 때 '몇 건 중 몇 건이 실렸는지'를 준다.
-const section = (title, count, lines, unit = '건') =>
-  [`## ${title} (${count}${unit})`, ...(lines.length ? lines : ['(없음)'])].join('\n');
+// 버린 건수는 따로 적는다 — 건수만 줄여 보이면 모델은 자기가 버린 것을 길이 제한으로 잘린 것으로 읽는다.
+const section = (title, count, lines, unit = '건', dropped = 0) =>
+  [`## ${title} (${count}${unit}${dropped ? `, 버림 ${dropped}건` : ''})`, ...(lines.length ? lines : ['(없음)'])].join('\n');
 
 // (테스트에서 쓰므로 export 한다 — 예산이 어긋나도 티가 나지 않는 종류의 실패라 회귀 테스트가 필요하다)
 // now를 인자로 받는 이유: 테스트가 시각을 고정할 수 있어야 한다 (기본값은 호출 시각).
@@ -557,22 +827,39 @@ export function buildPrompt(ctx, now = new Date()) {
   // 대화와 질문은 예산 밖이다: 각각 MAX_CHAT_TURNS×MAX_CHAT_LEN과 서버의 2,000자 제한으로
   // 이미 묶여 있고, 둘 다 빠지면 질문 자체가 성립하지 않아 버릴 수 있는 대상이 아니다.
   const chat = ctx.chat ?? [];
+  // 자료 섹션은 '한 번이라도 찾아본' 대상만 싣는다. 찾아보지 않은 대상의 섹션을 '(없음)'으로 실으면
+  // 모델은 '등록된 것이 없다'로 읽는다 — 비어 있음과 누락됨을 가르는 규칙(section 주석)의 연장이다.
+  // 목록에 무언가 있으면 찾아본 적이 없어도 싣는다: 쿼리는 처리방법이 지목해서(경로A) 들어오기도 한다.
+  const searched = new Set(ctx.searched ?? []);
+  // 건수와 표시 판정은 '살아 있는' 목록으로 한다 — 버린 항목은 프롬프트에 실리지 않으므로 세지도 않는다.
+  const kn = live(ctx.knowledge);
+  const qa = live(ctx.qaMethods);
+  const show = (target, list) => searched.has(target) || list.length > 0;
+  // '아직 아무것도 안 찾아봤다'는 안내는 정말 한 번도 찾아보지 않았을 때만 붙인다. 찾아봤는데 검색이
+  // 성립하지 않아 섹션이 비어 있는 요청에까지 '먼저 찾으라'고 말하면 남은 검색 기회를 그대로 태운다
+  // (그 상황은 이력의 '검색 불가' 줄이 말한다).
+  const nothingYet = !ctx.tried
+    && !show('knowledge', kn) && !show('qa_method', qa) && !show('query', ctx.queries);
   const blocks = [
-    section('관련 지식', ctx.knowledge.length, s.knowledge),
-    section('Q&A 처리 방법', ctx.qaMethods.length, s.qaMethods),
-    section('실행 가능한 쿼리 목록', ctx.queries.length, s.queries),
-    section('쿼리 실행 이력', ctx.history.length, s.history),
+    show('knowledge', kn) && section('관련 지식', kn.length, s.knowledge, '건', ctx.knowledge.length - kn.length),
+    show('qa_method', qa) && section('Q&A 처리 방법', qa.length, s.qaMethods, '건', ctx.qaMethods.length - qa.length),
+    show('query', ctx.queries) && section('실행 가능한 쿼리 목록', ctx.queries.length, s.queries),
+    section('실행 이력 (검색·쿼리)', ctx.history.length, s.history),
     section('최근 대화', chat.length, chat.map(m => `- ${m.role === 'user' ? '사용자' : '에이전트'}: ${indent(m.text)}`), '턴'),
     `## 사용자 질문 (현재)\n${ctx.question}`,
     // 지시는 항상 싣는다 — 마지막 스텝에만 붙으면 모델은 그 전까지 '지시가 없는 프롬프트'를 받아
     // 무엇을 하라는 것인지를 시스템 프롬프트에서 다시 찾아야 한다. 현재 시각도 여기 둔다: 질문과
     // 함께 읽혀야 하는 값이고, 매 분 바뀌는 값이라 앞쪽에 두면 ②의 재사용을 스스로 깬다.
+    // 아직 아무것도 찾아보지 않은 첫 스텝에는 그 사실을 한 줄 더 적는다 — 자료 섹션이 통째로 없는
+    // 프롬프트를 모델이 '자료가 없는 질문'으로 읽지 않게.
     `## 지시\n현재 시각: ${formatNow(now)}\n` + (ctx.forceAnswer
-      ? '더 이상 쿼리를 실행할 수 없다. 지금까지의 정보만으로 action="answer"로 최종 답변하라.'
-      : '위 자료를 근거로 현재 질문에 대한 다음 행동 하나를 JSON으로 결정하라.'),
-  ];
+      ? '더 이상 검색하거나 쿼리를 실행할 수 없다. 지금까지의 정보만으로 action="answer"로 최종 답변하라.'
+      : (nothingYet ? `${NOT_SEARCHED_NOTE}\n` : '') + '위 자료를 근거로 현재 질문에 대한 다음 행동 하나를 JSON으로 결정하라.'),
+  ].filter(Boolean);
   return blocks.join('\n\n');
 }
+
+const NOT_SEARCHED_NOTE = '아직 검색한 자료가 없다. 사내 지식·처리 방법·쿼리가 필요한 질문이면 search로 먼저 찾고, 인사·잡담이면 바로 답하라.';
 
 // ===== 예산 불변식 — 모듈 로드 시 검증 =====
 // 실행 이력의 최소 몫(constants.js PROMPT_FLOORS.history)은 'MAX_STEPS 스텝이 각자 상한까지 차도 전부
@@ -592,11 +879,42 @@ function maxHistoryLineLen() {
   const errorLine = historyLine({ ...head, error: over(MAX_PROMPT_ITEM_LEN), hint: over(MAX_PROMPT_ITEM_LEN) }, MAX_STEPS);
   return Math.max(resultLine.length - rowsLen + MAX_PROMPT_STEP_LEN, errorLine.length);
 }
-const HISTORY_FLOOR_NEEDED = MAX_STEPS * (maxHistoryLineLen() + 1) + NOTES_RESERVE; // +1: 줄마다 개행 (lineCost)
+// 검색 줄의 상한. 이력에는 쿼리 줄이 최대 MAX_STEPS개, 검색 줄이 최대 MAX_SEARCHES개 온다 — 루프가 두 결정을
+// 따로 세기 때문이다(agent.js runs·searches). 반복 상한이 둘의 합이라 어떤 조합이든 이 둘을 넘지 않고,
+// 검색 줄이 쿼리 줄보다 짧으므로 '쿼리 MAX_STEPS + 검색 MAX_SEARCHES'가 최악이다.
+function maxSearchLineLen() {
+  const over = n => 'x'.repeat(n + 1);
+  const base = { search: over(MAX_PROMPT_SEARCH_LEN), targets: [...SEARCH_TARGETS] };
+  const step = MAX_STEPS + MAX_SEARCHES;
+  return Math.max(
+    historyLine({ ...base, hits: { knowledge: MAX_ROWS, qaMethods: MAX_ROWS, queries: MAX_ROWS } }, step).length,
+    historyLine({ ...base, failed: [...SEARCH_TARGETS] }, step).length,
+    historyLine({ ...base, note: over(MAX_PROMPT_ITEM_LEN) }, step).length,
+  );
+}
+// 실행하지 않은 스텝의 줄(루프 가드·상한 안내)은 결과도 오류도 없어 위 두 상한보다 짧다 — 머리말과 안내 문구뿐이다.
+// 그 줄에 결과 줄의 상한을 매기면 이력 몫이 실제로 필요한 것보다 훨씬 커져 다른 섹션을 굶긴다.
+function maxNoteLineLen() {
+  const over = n => 'x'.repeat(n + 1);
+  return historyLine({
+    query_name: over(MAX_PROMPT_NAME_LEN), targetDb: over(MAX_TARGET_DB_NAME_LEN),
+    params: { p: over(MAX_PROMPT_PARAMS_LEN) }, note: over(MAX_PROMPT_ITEM_LEN),
+  }, MAX_HISTORY_ROWS).length;
+}
+
+// 이력이 받을 수 있는 줄은 MAX_HISTORY_ROWS개이고(constants.js — agent.js가 그 수를 지킨다) 종류는 셋이다.
+// 길이로 따진 최악은 '쿼리 줄을 최대한 많이'다: 쿼리 줄은 MAX_STEPS개까지만 생기고(루프의 조회 수 상한),
+// 남는 자리 하나는 상한 안내 줄(쿼리 모양의 note 줄), 나머지는 검색 줄이다.
+// 그 합이 몫 안에 들어야 '이력은 전부 실린다'가 참이 된다 — 넘치면 가장 오래된 조회 결과가 조용히 빠진다.
+const NOTE_ROWS = MAX_HISTORY_ROWS - MAX_STEPS - MAX_SEARCHES;
+const HISTORY_FLOOR_NEEDED =
+  MAX_STEPS * (maxHistoryLineLen() + 1) + NOTE_ROWS * (maxNoteLineLen() + 1)
+  + MAX_SEARCHES * (maxSearchLineLen() + 1) + NOTES_RESERVE; // +1: 줄마다 개행 (lineCost)
 if (PROMPT_FLOORS.history < HISTORY_FLOOR_NEEDED) {
   throw new Error(
-    `PROMPT_FLOORS.history (${PROMPT_FLOORS.history}) cannot hold MAX_STEPS (${MAX_STEPS}) full history lines ` +
-    `(${HISTORY_FLOOR_NEEDED} needed) — raise the floor or lower MAX_PROMPT_STEP_LEN in constants.js.`
+    `PROMPT_FLOORS.history (${PROMPT_FLOORS.history}) cannot hold MAX_HISTORY_ROWS (${MAX_HISTORY_ROWS}) full history lines ` +
+    `— ${MAX_STEPS} query + ${NOTE_ROWS} note + ${MAX_SEARCHES} search (${HISTORY_FLOOR_NEEDED} needed) — ` +
+    `raise the floor or lower MAX_PROMPT_STEP_LEN in constants.js.`
   );
 }
 
@@ -982,6 +1300,19 @@ function findDecision(value, answerOnly, depth = 0) {
 function toDecision(d, answerOnly) {
   if (!d || typeof d !== 'object') return null;
   if (d.action === 'answer' && typeof d.answer === 'string' && d.answer.trim()) return d;
+  // 검색 결정. text가 없거나 글자가 아니면 빼고 넘긴다 — 호출부(agent.js)가 현재 질문으로 대신한다.
+  // targets는 그대로 넘긴다 — 정규화(모르는 값 버리기·비면 셋 다)는 결정 경계(llm.js sanitizeDecision)의 일이다.
+  // answerOnly면 받지 않는다 — 강제 답변 단계에서는 더 찾아볼 수 없고, 2순위 채택(사고 과정 안의 초안)에서는
+  // 초안 검색어로 검색을 태울 이유가 없다 (run_query와 같은 판정).
+  if (!answerOnly && d.action === 'search') {
+    const text = typeof d.text === 'string' && d.text.trim() ? d.text : undefined;
+    return { action: 'search', ...(text && { text }), targets: d.targets, ...(d.drop !== undefined && { drop: d.drop }) };
+  }
+  // 본문 청구. ids가 목록이 아니거나 비어 있으면 결정이 아니다 — 청구할 것이 없는 청구다.
+  // 형식·개수 확정은 결정 경계(llm.js sanitizeDecision)가 한다. answerOnly 판정은 search와 같다.
+  if (!answerOnly && d.action === 'expand' && Array.isArray(d.ids) && d.ids.length) {
+    return { action: 'expand', ids: d.ids, ...(d.drop !== undefined && { drop: d.drop }) };
+  }
   if (!answerOnly && d.action === 'run_query' && typeof d.query_name === 'string' && d.query_name.trim()) {
     // target_db는 문자열일 때만 싣는다 — 크기 확정은 결정 경계(llm.js sanitizeDecision)가 한다.
     // 여기 일은 형식 검증이고, 없거나 형식이 아니면 '고르지 않음'으로 두면 된다:
@@ -994,6 +1325,17 @@ function toDecision(d, answerOnly) {
     // 바인드가 없는 쿼리는 그냥 실행된다 — 어느 쪽도 잡키('0','1')를 프롬프트에 싣지 않는다.
     const params = isPlainObject(d.params) ? d.params : {};
     return { action: 'run_query', query_name: d.query_name, params, ...(targetDb && { target_db: targetDb }) };
+  }
+  // 일괄 조회 — 항목마다 단일 조회와 같은 검증을 지나고, 형식이 아닌 항목은 버린다(결정 전체를 버리지 않는다:
+  // 모델이 넷 중 하나를 잘못 적었다고 나머지 셋까지 다시 요청하게 할 이유가 없다). 남는 항목이 없으면 결정이 아니다.
+  // 개수 상한은 결정 경계(llm.js sanitizeDecision)가 한 번 더 확정하지만 여기서도 자른다 — 형식 검증이 수백 항목을
+  // 돌지 않게. answerOnly 판정은 run_query와 같다.
+  if (!answerOnly && d.action === 'run_queries' && Array.isArray(d.queries)) {
+    const items = d.queries.slice(0, MAX_BATCH_QUERIES)
+      .map(q => (isPlainObject(q) ? toDecision({ ...q, action: 'run_query' }, false) : null))
+      .filter(Boolean)
+      .map(({ action, ...item }) => item);
+    return items.length ? { action: 'run_queries', queries: items } : null;
   }
   return null;
 }

@@ -2,14 +2,18 @@
 //
 // 인터페이스는 함수 시그니처 하나가 전부다:
 //   decide(ctx) → Promise<{action:'answer', answer}
+//                        |{action:'search', text?, targets[]}
 //                        |{action:'run_query', query_name, params}>
-//   ctx = {question, chat[], knowledge[], qaMethods[], queries[], history[], forceAnswer?}
+//   ctx = {question, chat[], knowledge[], qaMethods[], queries[], history[], searched[], forceAnswer?}
+//   knowledge·qaMethods·queries는 비어 있다가 search 행동이 채운다 (agent.js). searched는 검색이 실제로
+//   '성립한' 대상의 목록이고(성립하지 않은 대상은 빠진다), tried는 한 번이라도 찾아봤는가다 —
+//   프롬프트가 '아직 안 찾음'·'찾았는데 없음'·'못 찾아봤음' 셋을 가르는 근거다 (agent.js ctx 주석).
 //
 // LLM_PROVIDER=openai 이면 vLLM/OpenRouter(OpenAI 호환 API), 아니면 규칙 기반 Mock.
 // agent.js는 provider가 바뀌어도 변경되지 않는다.
 import { openaiDecide } from './llm-openai.js';
 import { bindNames } from './sql.js';
-import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, clipText, nameKey, ownProp, warnOnce, targetDbNames, isPlainObject } from './constants.js';
+import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, MAX_SEARCH_TEXT_LEN, MAX_BATCH_QUERIES, MAX_EXPANDS, MAX_DROPS, SEARCH_TARGETS, normalizeSearchTargets, normalizeItemIds, clipText, nameKey, ownProp, warnOnce, targetDbNames, isPlainObject } from './constants.js';
 import { rowCounts } from './result.js';
 
 // LLM provider 선택의 단일 해석 지점.
@@ -126,7 +130,34 @@ export function sanitizeDecision(d) {
     const answer = String(d.answer ?? '');
     return answer.length > MAX_ANSWER_LEN ? { ...d, answer: clipAnswer(answer) } : d;
   }
+  if (d.action === 'search') {
+    // 검색어는 자르기만 한다(MAX_SEARCH_TEXT_LEN 주석). 비면 키를 두지 않는다 — 호출부(agent.js)가
+    // 현재 질문으로 대신하는데, 그 판정을 ''와 없음 두 값으로 하게 두면 한쪽이 빠진다.
+    // 대상은 여기서 정규화해 배열로 확정한다 — 이 값이 이력·프롬프트·chat_log로 그대로 나간다.
+    const text = clipText(String(d.text ?? '').trim(), MAX_SEARCH_TEXT_LEN);
+    const drop = normalizeItemIds(d.drop, MAX_DROPS);
+    return { action: 'search', ...(text && { text }), targets: normalizeSearchTargets(d.targets), ...(drop.length && { drop }) };
+  }
+  if (d.action === 'expand') {
+    // 형식이 아닌 식별자는 버리되 결정은 버리지 않는다 — 남는 것이 없으면 호출부가 헛돈 스텝으로 센다.
+    // 버리기는 펼침이 하나도 성립하지 않아도 그대로 적용된다: 둘은 서로 다른 일이다.
+    const drop = normalizeItemIds(d.drop, MAX_DROPS);
+    return { action: 'expand', ids: normalizeItemIds(d.ids, MAX_EXPANDS), ...(drop.length && { drop }) };
+  }
+  if (d.action === 'run_queries') {
+    // 일괄 조회 — 항목마다 단일 조회와 같은 경계를 지난다. 개수는 여기서 확정한다(항목 하나가 아니라 항목 수도
+    // 프롬프트·이력·조회 DB로 흘러가는 크기다). 항목의 형식 검증은 llm-openai toDecision이 했다.
+    const queries = (Array.isArray(d.queries) ? d.queries : [])
+      .slice(0, MAX_BATCH_QUERIES)
+      .map(q => { const { action, ...item } = sanitizeRunQuery(isPlainObject(q) ? q : {}); return item; });
+    return { action: 'run_queries', queries };
+  }
   if (d.action !== 'run_query') return d;
+  return sanitizeRunQuery(d);
+}
+
+// run_query 결정 하나의 크기 확정 — 단일 조회와 일괄 조회의 항목이 같은 함수를 지난다.
+function sanitizeRunQuery(d) {
   // 이름에 '바인드(Bind)'를 박아 두는 이유: llm-openai.js에도 값 절단 규칙이 하나 더 있는데
   // 뜻이 다르다 (그쪽은 프롬프트 표시용이라 셀 상한 기준이고 항상 잘린 형태를 돌려준다 —
   // clipDisplayValue). 여기 규칙은 '실행에 쓸 값'의 상한이다: 상한을 넘으면 TRUNC_MARK를 붙여
@@ -192,6 +223,20 @@ async function mockDecide(ctx) {
   const hasError = history.some(h => h.error);
 
   if (!forceAnswer && !hasError) {
+    // 검색은 모델이 요청해야 일어난다 (agent.js). Mock은 판단력이 없으므로 늘 먼저 셋 다 찾는다 —
+    // 질문 그대로. 인사에도 검색하지만 그건 개발용 provider가 내는 비용이다.
+    const searches = history.filter(h => h.search !== undefined && !h.note);
+    if (!searches.length) {
+      return { action: 'search', text: ctx.question, targets: [...SEARCH_TARGETS] };
+    }
+    // "그럼 김철수는?" 같은 후속 질문은 그 문장만으로는 검색되지 않는다. 실제 LLM은 대화에서 대상을
+    // 복원해 검색어를 쓰지만 Mock은 그럴 수 없으므로, 첫 검색이 지식·처리방법을 하나도 못 찾았을 때만
+    // 직전 질문을 덧붙여 한 번 더 찾는다 (앞선 구조에서 agent.js가 모든 provider에 대해 하던 특례를
+    // Mock 안으로 옮긴 것이다 — 평소에는 현재 질문만 쓰므로 검색 정확도가 떨어지지 않는다).
+    if (searches.length === 1 && !ctx.knowledge.length && !qaMethods.length) {
+      const prev = (ctx.chat || []).filter(m => m.role === 'user').slice(-2).map(m => m.text).join(' ');
+      if (prev) return { action: 'search', text: `${prev} ${ctx.question}`, targets: [...SEARCH_TARGETS] };
+    }
     // 매칭된 qa_method 본문에 등장하는 순서대로 실행할 쿼리 계획 도출
     const planned = plannedQueries(qaMethods, queries);
     for (const q of planned) {

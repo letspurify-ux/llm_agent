@@ -1,68 +1,42 @@
-// LIKE 검색 토큰화 회귀 테스트 — 실행: npm test
-// 조사 제거(expandToken)는 /[가-힣]$/로 판정하므로 문장부호가 하나만 붙어도 변형이 전부 사라진다.
-// 그러면 "가상계측이란?"이 0건이 되는데, 물음표는 한국어 질문에서 가장 흔한 입력이라
-// 검색이 통째로 비는 것을 아무도 이상하게 보지 않는다.
+// 검색 경계 회귀 테스트 — 실행: npm test
+// 검색은 벡터 단일 경로다(search.js 머리말). 그래서 '검색이 성립하지 않았다'(null)와 '찾았는데 없다'([])의
+// 구분이 이 파일의 유일한 계약이고, 그 구분이 무너지면 모델은 '등록된 자료가 없다'고 조용히 단정한다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { searchTokens, likePattern, LIKE_ESCAPE } from '../src/search.js';
+import { searchKnowledge, searchQaMethods, searchQueries, warmUpEmbedding, SEARCH_COLUMNS } from '../src/search.js';
 
-test('앞뒤 문장부호를 떼고 조사 변형을 만든다', () => {
-  assert.deepStrictEqual(searchTokens('가상계측이란?'), ['가상계측이란', '가상계측이', '가상계측']);
-  assert.deepStrictEqual(searchTokens('가상계측이란'), ['가상계측이란', '가상계측이', '가상계측']);
-  assert.ok(searchTokens('BATCH001? 상태').includes('BATCH001'));
-  assert.ok(searchTokens('"배치", 상태!').includes('배치'));
-});
-
-test('토큰 가운데 부호는 식별자의 일부이므로 건드리지 않는다', () => {
-  assert.ok(searchTokens('BATCH-001 상태').includes('BATCH-001'));
-  assert.ok(searchTokens('restart_batch.sh 실행').includes('restart_batch.sh'));
-});
-
-test('토큰 상한은 조사 변형이 아니라 낱말에 걸린다', () => {
-  // 확장된 토큰 목록을 자르면 상한이 앞쪽 낱말의 변형들로 소진되어(낱말 하나가 최대 3개를
-  // 차지한다) 질문 뒤쪽의 구체적인 낱말이 SQL에 아예 실리지 않는다. 쿼리는 그대로 성공하므로
-  // 오류가 남지 않고, 일반적인 앞부분 낱말로만 점수가 매겨져 엉뚱한 지식이 위로 올라온다.
-  const lead = new Array(29).fill(0).map((_, i) => `앞말${i}이란`);
-  const tokens = searchTokens([...lead, '가상계측'].join(' '));
-  assert.ok(tokens.includes('가상계측'), '질문 끝의 낱말이 앞쪽 낱말의 변형에 밀려 사라졌다');
-  assert.ok(tokens.length > 50, '이 입력은 확장 뒤 상한(50)을 넘겨야 회귀를 잡는다');
-
-  // 상한 자체는 그대로다 — CASE 절 수천 개짜리 SQL은 MariaDB thread stack overrun을 낸다.
-  const many = searchTokens(new Array(200).fill(0).map((_, i) => `낱말${i}이란`).join(' '));
-  assert.ok(many.length <= 90, `토큰이 유계가 아니다: ${many.length}`);
-});
-
-test('2자 미만과 중복은 버린다', () => {
-  assert.deepStrictEqual(searchTokens('a ? !! 배치 배치'), ['배치']);
-  assert.deepStrictEqual(searchTokens(''), []);
-  assert.deepStrictEqual(searchTokens('???'), []);
-});
-
-test('LIKE 이스케이프는 sql_mode에 좌우되지 않는 문자를 쓴다', () => {
-  // 역슬래시는 서버 설정에 따라 뜻이 바뀐다: sql_mode에 NO_BACKSLASH_ESCAPES가 있으면 LIKE의
-  // 암묵 기본 이스케이프 문자가 사라져, 이스케이프한 줄 알았던 '\\_'가 '역슬래시 + 아무 글자'가 된다.
-  // 검색 토큰의 '_'는 아주 흔하다 — query_name이 snake_case이고 질문·qa_method 본문에 그대로
-  // 등장한다. 그러면 무관한 행이 점수를 받아 정답 지식이 LIMIT 밖으로 밀리는데 오류는 없다.
-  // ESCAPE 절에 '\\\\'를 적는 것도 답이 아니다 — 그 리터럴 자체가 같은 모드에서 두 글자가 된다.
-  assert.notEqual(LIKE_ESCAPE, '\\', '역슬래시는 sql_mode에 따라 뜻이 바뀐다');
-  assert.equal(LIKE_ESCAPE.length, 1, 'ESCAPE 인자는 한 글자여야 한다');
-
-  assert.equal(likePattern('batch_job_status'), '%batch!_job!_status%');
-  assert.equal(likePattern('50%'), '%50!%%');
-  assert.equal(likePattern('a!b'), '%a!!b%', '이스케이프 문자 자신도 이스케이프해야 한다');
-  // 역슬래시는 더 이상 특별하지 않다 — 그대로 지나가야 한다 (건드리면 두 모드에서 뜻이 갈린다)
-  assert.equal(likePattern('C:\\share'), '%C:\\share%');
-  assert.equal(likePattern('가상계측'), '%가상계측%');
-});
-
-test('2음절 명사에 붙은 2글자 조사도 어간까지 벗겨낸다', () => {
-  // '2음절 명사 + 2글자 조사'는 한국어 질문에서 가장 흔한 형태인데, 2글자를 떼는 임계값이 5라서
-  // 4자 낱말의 어간이 한 번도 검색되지 않았다 — 정작 title·query_name에 들어 있는 것이 그 어간이다.
-  // 노이즈 조각('배치에')이 제목 가중치를 그대로 받는 쪽이라 실패가 조용하다: 쿼리는 성공하고
-  // 엉뚱한 행이 정답 위로 올라올 뿐이다.
-  for (const [word, stem] of [['배치에서', '배치'], ['작업으로', '작업'], ['계정으로', '계정'], ['서버까지', '서버']]) {
-    assert.ok(searchTokens(word).includes(stem), `${word} → ${stem}이 검색어에 있어야 한다`);
+test('임베딩이 설정되지 않았으면 검색은 null(검색 불가)이고 관리 DB를 건드리지 않는다', async () => {
+  // DB 풀이 없는 환경에서 돈다 — 검색이 DB를 만지면 여기서 접속 오류로 죽는다. 빈 배열을 돌려주면 안 된다:
+  // 그것은 '찾았는데 없다'이고, 호출부(agent.js)는 그 둘을 다르게 기록한다.
+  const saved = process.env.EMBEDDING_URL;
+  delete process.env.EMBEDDING_URL;
+  try {
+    assert.equal(await searchKnowledge('배치 재시작'), null);
+    assert.equal(await searchQaMethods('배치 재시작'), null);
+    assert.equal(await searchQueries('배치 재시작'), null);
+    assert.equal(await warmUpEmbedding(), false, '미설정이면 예열도 하지 않는다');
+  } finally {
+    if (saved !== undefined) process.env.EMBEDDING_URL = saved;
   }
-  // 3자 낱말에서 2글자를 떼면 1자가 되므로 검색어가 되지 않는다 (2자 미만은 버린다)
-  assert.deepStrictEqual(searchTokens('배치가'), ['배치가', '배치']);
+});
+
+test('빈 검색어는 검색 불가가 아니라 0건이다', async () => {
+  // 빈 입력을 임베딩 서버에 보내면 거부되어 '검색 불가'로 기록된다 — 정상 경로에서는 오지 않지만
+  // (agent.js가 빈 검색어를 질문으로 대신한다) 이 경계는 스스로 그것을 가려야 한다.
+  const saved = process.env.EMBEDDING_URL;
+  process.env.EMBEDDING_URL = 'http://127.0.0.1:9';   // 닿지 않는 주소 — 빈 검색어는 여기까지 가면 안 된다
+  try {
+    assert.deepEqual(await searchKnowledge('   '), []);
+    assert.deepEqual(await searchQueries(undefined), []);
+  } finally {
+    if (saved === undefined) delete process.env.EMBEDDING_URL; else process.env.EMBEDDING_URL = saved;
+  }
+});
+
+test('임베딩 원문 컬럼은 세 소스 모두 제목/이름이 첫 컬럼이다', () => {
+  // embed-sync.js가 이 정의로 원문을 만든다 — 첫 컬럼이 제목이어야 짧은 제목 매칭이 본문에 묻히지 않는다.
+  assert.deepEqual(Object.keys(SEARCH_COLUMNS), ['knowledge', 'qa_method', 'query_registry']);
+  assert.equal(SEARCH_COLUMNS.knowledge[0], 'title');
+  assert.equal(SEARCH_COLUMNS.qa_method[0], 'title');
+  assert.equal(SEARCH_COLUMNS.query_registry[0], 'query_name');
 });

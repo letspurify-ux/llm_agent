@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { llm, renderAnswer, sanitizeDecision, llmProvider } from '../src/llm.js';
 import { normalizeCells } from '../src/oracle.js';
-import { MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN } from '../src/constants.js';
+import { MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN, MAX_BATCH_QUERIES, MAX_EXPANDS } from '../src/constants.js';
 
 const ok = (name, rows, extra = {}) => ({ query_name: name, params: {}, rows, totalRows: rows.length, ...extra });
 
@@ -252,6 +252,10 @@ test('provider 이름의 대소문자·공백을 흡수하고 모르는 값은 �
   }
 });
 
+// Mock은 검색 기록이 없으면 늘 search부터 낸다 (llm.js mockDecide). 실행 계획을 보는 아래 테스트들은
+// '이미 검색한 뒤'의 컨텍스트를 만든다 — 검색 기록 한 줄이 그 상태다 (agent.js handleQuestion의 이력 모양).
+const SEARCHED = { search: '검색어', targets: ['knowledge', 'qa_method', 'query'], hits: { knowledge: 0, qaMethods: 1, queries: 1 } };
+
 test('프로토타입 멤버와 겹치는 바인드명이 Mock 결정을 죽이지 않는다', async () => {
   // PARAM_RULES[name]·params[name] 접근이 프로토타입 체인을 타면 결정 루프 전체가 죽어
   // 매 스텝 무결정 → 사용자는 'LLM 호출 실패'만 본다. 소유 키 기준으로 무해해야 한다.
@@ -265,7 +269,7 @@ test('프로토타입 멤버와 겹치는 바인드명이 Mock 결정을 죽이�
     knowledge: [],
     qaMethods: [{ seq: 1, title: 't', method: 'proto_query 실행' }],
     queries: [{ seq: 1, query_name: 'proto_query', query_sql: 'SELECT 1 FROM t WHERE a = :constructor' }],
-    history: [],
+    history: [SEARCHED],
   });
   assert.equal(d.action, 'run_query');
   assert.ok(Object.hasOwn(d.params, 'constructor'), '값이 소유 키로 채워져야 한다 (대입은 setter를 타고 사라진다)');
@@ -281,7 +285,7 @@ const CUSTOMER_CTX = {
   knowledge: [],
   qaMethods: [{ seq: 1, title: '고객 주문 상태 확인', method: 'find_customer_id 쿼리로 고객명(:customer_name)을 조회한다' }],
   queries: [{ seq: 1, query_name: 'find_customer_id', query_sql: 'SELECT CUSTOMER_ID FROM CUSTOMERS WHERE CUSTOMER_NAME = :customer_name' }],
-  history: [],
+  history: [SEARCHED],
 };
 
 test('후속 질문의 새 대상이 직전 질문의 대상으로 덮이지 않는다', async () => {
@@ -314,7 +318,7 @@ test('현재 질문이 대상을 말하지 않을 때만 직전 질문에서 가
     knowledge: [],
     qaMethods: [{ seq: 1, title: '배치 상태', method: 'batch_job_status 쿼리를 실행한다' }],
     queries: [{ seq: 1, query_name: 'batch_job_status', query_sql: 'SELECT STATUS FROM BATCH_JOBS WHERE JOB_ID = :job_id' }],
-    history: [],
+    history: [SEARCHED],
     question: '재시작은 어떻게 해?',
     chat: [{ role: 'user', text: '그럼 BATCH002는?' }, { role: 'assistant', text: '(표)' }],
   });
@@ -334,7 +338,7 @@ test('본문이 NULL이어도 폴백 답변이 죽지 않는다', () => {
   assert.match(a, /FAILED/, '조회 결과가 남아야 한다');
 
   // 조회가 하나도 없으면 지식을 무조건 첨부하는 경로도 같은 값을 지나간다
-  assert.doesNotThrow(() => renderAnswer({ knowledge: [{ title: null, content: null }], history: [] }));
+  assert.doesNotThrow(() => renderAnswer({ knowledge: [{ title: null, content: null }], history: [SEARCHED] }));
 });
 
 test('qa_method 본문이 NULL이어도 Mock 실행 계획이 죽지 않는다', async () => {
@@ -347,7 +351,7 @@ test('qa_method 본문이 NULL이어도 Mock 실행 계획이 죽지 않는다',
     knowledge: [],
     qaMethods: [{ seq: 1, title: 't', method: null }],
     queries: [{ seq: 1, query_name: 'q', query_sql: 'SELECT 1 FROM t' }],
-    history: [],
+    history: [SEARCHED],
   });
   assert.equal(d.action, 'answer');
 });
@@ -362,7 +366,7 @@ test('대문자로 등록된 바인드명도 Mock 규칙이 걸린다', async ()
   try {
     for (const bind of [':job_id', ':JOB_ID', ':Job_Id']) {
       const d = await llm.decide({
-        question: 'BATCH001 상태 알려줘', chat: [], knowledge: [], history: [],
+        question: 'BATCH001 상태 알려줘', chat: [], knowledge: [], history: [SEARCHED],
         qaMethods: [{ title: 'm', method: 'batch_job_status 를 실행한다' }],
         queries: [{ query_name: 'batch_job_status', query_sql: `SELECT * FROM T WHERE JOB_ID = ${bind}`,
                     target_db_name: 'D', query_desc: '', input_desc: '', output_desc: '' }],
@@ -374,4 +378,65 @@ test('대문자로 등록된 바인드명도 Mock 규칙이 걸린다', async ()
     if (saved === undefined) delete process.env.LLM_PROVIDER;
     else process.env.LLM_PROVIDER = saved;
   }
+});
+
+// ===== 검색 결정 =====
+
+test('결정 경계는 검색어를 자르고 대상을 정규화한다', () => {
+  const d = sanitizeDecision({ action: 'search', text: '  배치 재시작  ', targets: ['Query', ' knowledge', 'bogus'] });
+  assert.deepStrictEqual(d, { action: 'search', text: '배치 재시작', targets: ['knowledge', 'query'] });
+  // 비거나 모르는 대상만 있으면 셋 다 — '아무것도 찾지 마라'가 아니라 '무엇이 필요한지 모르겠다'다
+  assert.deepStrictEqual(sanitizeDecision({ action: 'search' }).targets, ['knowledge', 'qa_method', 'query']);
+  assert.deepStrictEqual(sanitizeDecision({ action: 'search', targets: 'qa_method' }).targets, ['qa_method']);
+  // 빈 검색어는 키 자체를 두지 않는다 — 호출부가 질문으로 대신하는 판정이 하나여야 한다
+  assert.ok(!('text' in sanitizeDecision({ action: 'search', text: '   ' })));
+  const long = sanitizeDecision({ action: 'search', text: 'x'.repeat(10_000) });
+  assert.ok(long.text.length <= 500, '검색어 상한을 넘겼다');
+});
+
+test('Mock은 검색 기록이 없으면 셋 다 검색부터 요청한다', async () => {
+  delete process.env.LLM_PROVIDER;
+  const d = await llm.decide({ question: '배치 재시작 방법', chat: [], knowledge: [], qaMethods: [], queries: [], history: [] });
+  assert.deepStrictEqual(d, { action: 'search', text: '배치 재시작 방법', targets: ['knowledge', 'qa_method', 'query'] });
+});
+
+test('Mock은 첫 검색이 지식·처리방법을 못 찾았을 때만 직전 질문을 덧붙여 한 번 더 찾는다', async () => {
+  delete process.env.LLM_PROVIDER;
+  const once = { search: '그럼 김철수는?', targets: ['knowledge', 'qa_method', 'query'], hits: { knowledge: 0, qaMethods: 0, queries: 0 } };
+  const chat = [{ role: 'user', text: '홍길동 고객 주문 상태 알려줘' }, { role: 'assistant', text: '(표)' }];
+  const d = await llm.decide({ question: '그럼 김철수는?', chat, knowledge: [], qaMethods: [], queries: [], history: [once] });
+  assert.equal(d.action, 'search');
+  assert.equal(d.text, '홍길동 고객 주문 상태 알려줘 그럼 김철수는?');
+  // 대화가 없으면 덧붙일 것이 없다 — 답변으로 간다
+  const noChat = await llm.decide({ question: '그럼 김철수는?', chat: [], knowledge: [], qaMethods: [], queries: [], history: [once] });
+  assert.equal(noChat.action, 'answer');
+  // 두 번째 검색도 빈손이면 더 찾지 않는다
+  const twice = await llm.decide({ question: '그럼 김철수는?', chat, knowledge: [], qaMethods: [], queries: [], history: [once, { ...once, search: '재검색' }] });
+  assert.equal(twice.action, 'answer');
+});
+
+test('일괄 조회의 항목은 단일 조회와 같은 경계를 지나고, 개수는 상한에서 잘린다', () => {
+  const many = Array.from({ length: MAX_BATCH_QUERIES + 3 }, (_, i) => ({ query_name: ` q${i} `, params: { ':a': 'x'.repeat(MAX_BIND_LEN + 10) } }));
+  const d = sanitizeDecision({ action: 'run_queries', queries: many });
+  assert.equal(d.action, 'run_queries');
+  assert.equal(d.queries.length, MAX_BATCH_QUERIES);
+  assert.equal(d.queries[0].query_name, 'q0', '이름 앞뒤 공백을 떼야 한다');
+  assert.ok(d.queries[0].params.a.endsWith(TRUNC_MARK), '항목의 바인드 값도 상한에서 잘리고 표시가 붙어야 한다');
+  assert.ok(!('action' in d.queries[0]), '항목에 action이 남으면 안 된다');
+  // 항목이 객체가 아니면 빈 항목으로 — 결정 자체를 버리지 않는다 (미등록 처리로 소리 나게 실패한다)
+  assert.deepStrictEqual(sanitizeDecision({ action: 'run_queries', queries: 'x' }), { action: 'run_queries', queries: [] });
+});
+
+test('결정 경계가 본문 청구와 버리기의 식별자를 정규화한다', () => {
+  const d = sanitizeDecision({ action: 'expand', ids: ['K12', 'k12', 'm3', 'q9', 'x'], drop: ['m2', 'bad'] });
+  assert.deepStrictEqual(d, { action: 'expand', ids: ['k12', 'm3'], drop: ['m2'] });
+  // 개수는 상한에서 자른다
+  assert.equal(sanitizeDecision({ action: 'expand', ids: ['k1', 'k2', 'k3', 'k4'] }).ids.length, MAX_EXPANDS);
+  // 남는 식별자가 없어도 결정은 버리지 않는다 — 호출부가 헛돈 스텝으로 센다. 버리기는 그대로 적용된다.
+  assert.deepStrictEqual(sanitizeDecision({ action: 'expand', ids: ['q1'], drop: ['k7'] }),
+    { action: 'expand', ids: [], drop: ['k7'] });
+  // 버리기는 검색에도 얹힌다. 빈 값이면 키 자체를 두지 않는다.
+  const s2 = sanitizeDecision({ action: 'search', text: '배치', targets: ['knowledge'], drop: ['k7', 'k7'] });
+  assert.deepStrictEqual(s2, { action: 'search', text: '배치', targets: ['knowledge'], drop: ['k7'] });
+  assert.ok(!('drop' in sanitizeDecision({ action: 'search', targets: ['knowledge'], drop: ['nope'] })));
 });

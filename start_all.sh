@@ -8,7 +8,9 @@
 # 인프라는 이 머신의 설치 방식(brew·docker)을 전제한다 — 다르게 설치했으면 건너뛰고
 # 알린다. 없다고 실패시키지 않는 이유: 셋 다 없어도 기능이 남기 때문이다
 #   Oracle 없음  → ORACLE_MOCK=1이면 stub 결과로 동작
-#   Ollama 없음  → LIKE 검색만으로 자동 폴백 (setup/bge-m3/README.md)
+#   Ollama 없음  → 검색이 통째로 성립하지 않는다. 서버는 뜨고 답변도 나가지만 지식·처리방법·쿼리를
+#                  하나도 찾지 못하고, 그 사실이 화면과 chat_log에 '검색 불가'로 남는다
+#                  (검색은 벡터 단일 경로다 — backend/src/search.js, setup/bge-m3/README.md).
 #   MariaDB 없음 → 이건 진짜로 못 뜬다. 유일하게 필수라 아래에서 따로 다룬다.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -80,9 +82,9 @@ if [ "$APPS_ONLY" -eq 0 ]; then
     else warn "Oracle이 ${ORACLE_WAIT_S}초 내에 준비되지 않았다 — 'docker logs $ORACLE_CONTAINER' 확인"; fi
   fi
 
-  # --- Ollama (임베딩, 선택) ---
+  # --- Ollama (임베딩) — 검색의 유일한 경로다 ---
   if ! have ollama; then
-    skip "Ollama 건너뜀 (미설치) — 벡터 검색 없이 LIKE 검색만 쓴다"
+    warn "Ollama 미설치 — 검색이 성립하지 않는다. 지식·처리방법·쿼리를 하나도 찾지 못한다 (setup/bge-m3/README.md)"
   elif curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
     ok "Ollama 이미 실행 중"
   else
@@ -92,18 +94,18 @@ if [ "$APPS_ONLY" -eq 0 ]; then
       sleep 1
     done
     if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then ok "Ollama 기동"
-    else warn "Ollama가 30초 내에 응답하지 않는다 — LIKE 검색만으로 계속 동작한다"; fi
+    else warn "Ollama가 30초 내에 응답하지 않는다 — 그동안의 질문은 검색 없이 답한다"; fi
   fi
 
-  # 모델이 없으면 임베딩 호출이 매번 실패한다 — 폴백이 있어 답변은 나가지만 벡터 검색이
-  # 통째로 빠진 채로 조용히 돈다. 있는지만 보고, 없으면 받는다(최초 1회 ~1.2GB).
+  # 모델이 없으면 임베딩 호출이 매번 실패하고, 그것은 곧 검색이 없다는 뜻이다(벡터 단일 경로).
+  # 답변은 나가지만 등록된 자료를 하나도 못 찾는다. 있는지만 보고, 없으면 받는다(최초 1회 ~1.2GB).
   if have ollama && curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
     if ollama list 2>/dev/null | grep -q "^${EMBEDDING_MODEL}"; then
       ok "임베딩 모델 $EMBEDDING_MODEL 준비됨"
     else
       echo "  [.] $EMBEDDING_MODEL 내려받는 중 (최초 1회, ~1.2GB)..."
       if ollama pull "$EMBEDDING_MODEL" >/dev/null 2>&1; then ok "$EMBEDDING_MODEL 준비됨"
-      else warn "$EMBEDDING_MODEL 다운로드 실패 — LIKE 검색만으로 계속 동작한다"; fi
+      else warn "$EMBEDDING_MODEL 다운로드 실패 — 이 모델 없이는 검색이 성립하지 않는다"; fi
     fi
   fi
   echo

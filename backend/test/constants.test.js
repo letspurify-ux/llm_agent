@@ -3,8 +3,13 @@
 // 함께 쓴다. 여기가 어긋나면 어긋난 티가 나지 않는 자리에서 조용히 갈라진다.
 import { test } from 'node:test';
 import assert from 'node:assert';
+import { execFileSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { clipText, nameKey, stripLoneSurrogates, numEnv, bindValue, warnOnce, targetDbNames, joinUrl, isPlainObject,
-  readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_COMPLETION_TOKENS } from '../src/constants.js';
+  readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_COMPLETION_TOKENS, normalizeSearchTargets, SEARCH_TARGETS, boundedEnv,
+  MAX_SEARCHES, MAX_SEARCHES_CEILING, SEARCH_LIMIT, MAX_SEARCH_LIMIT,
+  parseItemId, normalizeItemIds, MAX_EXPANDS, MAX_EXPANDED_ITEM_LEN, PROMPT_FLOORS as FLOORS } from '../src/constants.js';
 
 test('절단이 서로게이트 쌍을 쪼개지 않는다', () => {
   // 쪼개면 짝 잃은 코드유닛이 남아 JSON은 통과하지만 유효한 UTF-8이 아니게 된다 —
@@ -223,4 +228,73 @@ test('clipText: 음수 상한은 아무것도 남기지 않는다 — 상한보�
     assert.ok(r.length <= Math.max(0, max), `상한 ${max}인데 ${r.length}자`);
     assert.ok('a😀b가c😀'.startsWith(r), `접두가 아니다: ${JSON.stringify(r)}`);
   }
+});
+
+test('검색 대상 정규화: 표기 차이를 흡수하고, 모르는 값은 버리며, 남는 것이 없으면 셋 다다', () => {
+  // 모델이 프롬프트대로 적은 대상이 '모르는 값'이 되면 검색이 조용히 셋 다로 넓어진다 — 그 자체는
+  // 안전한 방향이지만, 정당한 표기(대소문자·공백)까지 그 길로 보내면 대상 선택이 있으나 마나다.
+  assert.deepStrictEqual(normalizeSearchTargets(['QUERY', ' Knowledge ']), ['knowledge', 'query']);
+  assert.deepStrictEqual(normalizeSearchTargets('qa_method'), ['qa_method']);
+  assert.deepStrictEqual(normalizeSearchTargets(['bogus']), [...SEARCH_TARGETS]);
+  assert.deepStrictEqual(normalizeSearchTargets([]), [...SEARCH_TARGETS]);
+  assert.deepStrictEqual(normalizeSearchTargets(undefined), [...SEARCH_TARGETS]);
+  assert.deepStrictEqual(normalizeSearchTargets(null), [...SEARCH_TARGETS]);
+  assert.deepStrictEqual(normalizeSearchTargets(['query', 'query', 'knowledge']), ['knowledge', 'query'], '중복은 하나로, 순서는 정규 순서로');
+  assert.deepStrictEqual(normalizeSearchTargets({ a: 1 }), [...SEARCH_TARGETS], '배열도 문자열도 아니면 셋 다');
+});
+
+test('상한 있는 환경변수는 넘는 값을 상한으로 낮추고 알리되, 그 안의 값과 미설정은 그대로다', () => {
+  const warns = [];
+  const orig = console.warn;
+  console.warn = (...a) => warns.push(a.join(' '));
+  try {
+    process.env.BOUNDED_TEST = '50';
+    assert.equal(boundedEnv('BOUNDED_TEST', 20, 20), 20);
+    assert.ok(warns.some(l => l.includes('BOUNDED_TEST=50')), JSON.stringify(warns));
+    process.env.BOUNDED_TEST = '7';
+    assert.equal(boundedEnv('BOUNDED_TEST', 20, 20), 7);
+    delete process.env.BOUNDED_TEST;
+    assert.equal(boundedEnv('BOUNDED_TEST', 20, 20), 20);
+    process.env.BOUNDED_TEST = 'abc';
+    assert.equal(boundedEnv('BOUNDED_TEST', 20, 20), 20, '오타는 numEnv의 규칙대로 기본값');
+  } finally { console.warn = orig; delete process.env.BOUNDED_TEST; }
+  // 기본 설정에서 두 값은 상한 그대로다 — 프롬프트 예산이 그 값을 전제한다
+  assert.equal(MAX_SEARCHES, MAX_SEARCHES_CEILING);
+  assert.equal(SEARCH_LIMIT, MAX_SEARCH_LIMIT);
+});
+
+test('설정 파일에 적을 수 있는 환경변수를 실제로 채워도 모듈이 뜬다', () => {
+  // 모듈 평가 중에 부르는 함수가 자기보다 뒤에 선언된 const를 닫아 잡으면, 값을 비워 둔 기본 설정에서는
+  // 그 줄에 닿지 않아 아무 일도 없다가 문서대로 값을 채운 설치에서만 모듈이 통째로 죽는다
+  // (실측: SEARCH_LIMIT=10 → 'Cannot access INT_RE before initialization', 서버가 뜨지 않았다).
+  // 검사가 같은 프로세스에서 import하면 이미 평가가 끝난 뒤라 재현되지 않는다 — 새 프로세스로 확인한다.
+  const SRC = join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'constants.js');
+  const load = env => execFileSync(process.execPath, ['-e',
+    `import(${JSON.stringify(SRC)}).then(m => console.log(m.SEARCH_LIMIT, m.MAX_SEARCHES))`],
+    { env: { ...process.env, ...env }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  assert.equal(load({ SEARCH_LIMIT: '', MAX_SEARCHES: '' }), '20 3', '기본값');
+  assert.equal(load({ SEARCH_LIMIT: '10', MAX_SEARCHES: '2' }), '10 2', '값을 채운 설치에서 뜨지 않는다');
+  assert.equal(load({ SEARCH_LIMIT: '999', MAX_SEARCHES: '9' }), '20 3', '상한을 넘으면 상한으로');
+  assert.equal(load({ SEARCH_LIMIT: 'abc' }), '20 3', '오타는 기본값으로');
+});
+
+test('자료 식별자는 접두사와 seq로만 이뤄지고, 표기 차이는 흡수한다', () => {
+  assert.deepStrictEqual(parseItemId('k12'), { list: 'knowledge', seq: 12 });
+  assert.deepStrictEqual(parseItemId(' M3 '), { list: 'qaMethods', seq: 3 });
+  for (const bad of ['q1', 'k0', 'k', '12', 'k1.5', 'k-1', 'kk1', '', null, undefined, {}, 'k01']) {
+    assert.equal(parseItemId(bad), null, `형식이 아닌 값이 통과했다: ${JSON.stringify(bad)}`);
+  }
+  // 형식이 아닌 것은 버리되 결정은 버리지 않는다. 중복은 하나로, 개수는 상한까지.
+  assert.deepStrictEqual(normalizeItemIds(['k1', 'K1', 'm2', 'q3', 'x', ' m2 '], 10), ['k1', 'm2']);
+  assert.deepStrictEqual(normalizeItemIds('k5', 10), ['k5'], '하나만 온 것도 받는다');
+  assert.deepStrictEqual(normalizeItemIds(['k1', 'k2', 'k3'], 2), ['k1', 'k2']);
+  assert.deepStrictEqual(normalizeItemIds(undefined, 10), []);
+  assert.deepStrictEqual(normalizeItemIds({ a: 1 }, 10), []);
+});
+
+test('펼친 본문의 최악 총량이 그 섹션의 최소 몫 안에 든다', () => {
+  // 둘 다 한 섹션에 몰려도 다른 후보가 함께 실릴 자리가 남아야 한다 — 이 곱을 키우려면 몫부터 다시 본다.
+  assert.ok(MAX_EXPANDS * MAX_EXPANDED_ITEM_LEN < FLOORS.knowledge,
+    `펼침 총량(${MAX_EXPANDS * MAX_EXPANDED_ITEM_LEN})이 지식 몫(${FLOORS.knowledge})을 넘는다`);
+  assert.ok(MAX_EXPANDS * MAX_EXPANDED_ITEM_LEN < FLOORS.qaMethods);
 });

@@ -7,15 +7,16 @@ import { numEnv, nameKey } from './constants.js';
 // 풀 크기의 근거. 셋을 따로 두는 이유는 성격이 다르기 때문이다 — 앞의 둘은 곱해지는 양이고,
 // 마지막 하나는 '짧게 빌려 쓰는' 나머지와 달리 동기화가 끝날 때까지 계속 쥐고 있는 몫이라
 // 곱셈 밖에서 더해야 한다. 이전 값(10)은 실질 동시 처리가 2건이었다.
-const CONNS_PER_REQUEST = 4;   // 요청 1건의 동시 점유 최대치. 요청 하나가 커넥션을 겹쳐 쓰는 구간이 둘이다:
-                               //   ① 지식·처리방법 검색 — 둘이 병렬이고 각각 LIKE+벡터가 다시 병렬이다
-                               //      (search.js hybrid). 벡터 쪽은 임베딩 응답을 먼저 기다리므로
-                               //      실측 피크는 4가 아니라 2다(LIKE 2 → 벡터 2 순).
-                               //   ② 쿼리 목록의 관련도 정렬 — 본문 대조 조회 + LIKE + 벡터가 병렬이다
-                               //      (agent.js rankQueries). 실측 피크 3으로, 여기가 최대다.
-                               //   ①과 ②는 순차라 겹치지 않는다 (②는 ①의 결과를 받아 돈다).
-                               // 값은 실측 피크(3)에 여유 한 칸을 더해 잡는다 — 임베딩 캐시 적중 여부에
-                               // 따라 ①의 순서가 달라질 수 있고, 모자라면 증상이 '질문이 어렵다'처럼 보인다.
+const CONNS_PER_REQUEST = 5;   // 요청 1건의 동시 점유 최대치. 커넥션을 겹쳐 쓰는 구간이 셋이고 서로 순차다:
+                               //   ① 세 대상의 벡터 검색 — 임베딩 한 번 뒤 knowledge·qa_method·query_registry
+                               //      조회가 병렬이다 (search.js). 피크 3.
+                               //   ② 쿼리 목록 — 처리방법 본문 대조 조회 + 등록 목록 읽기가 병렬이다. 피크 2.
+                               //   ③ 조회 실행 — 조회 자체는 Oracle이지만 그 앞에서 접속 정보를 읽는다
+                               //      (oracle.js runQuery → loadTargetDb, 조회마다 한 번). 일괄 조회는 최대
+                               //      MAX_BATCH_QUERIES(4)를 병렬로 돌리므로 피크 4다 — 여기가 최대다.
+                               // 값은 피크(4)에 여유 한 칸을 더해 잡는다 — 모자라면 증상이 커넥터의 획득 대기
+                               // (10초) 뒤 500이라 '질문이 어렵다'처럼 보일 뿐 풀 크기를 가리키지 않는다.
+                               // 일괄 조회 수(MAX_BATCH_QUERIES)나 검색 병렬 구간을 늘리면 이 값부터 다시 셀 것.
 const CONCURRENT_REQUESTS = 4; // 이 크기로 감당하려는 동시 질문 수 (사내 Q&A 트래픽 기준).
 const RESERVED_FOR_SYNC = 1;   // embed-sync가 동기화 내내 쥐는 GET_LOCK 전용 커넥션.
 const POOL_SIZE = CONNS_PER_REQUEST * CONCURRENT_REQUESTS + RESERVED_FOR_SYNC;

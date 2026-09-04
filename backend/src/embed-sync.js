@@ -49,11 +49,13 @@ const hashExpr = cols =>
   `MD5(CONCAT_WS(CHAR(10), ?, ${cols.map(c => `COALESCE(${c}, '')`).join(', ')}))`;
 
 // skipped 값 — 호출부(서버 로그, CLI 종료 코드)가 "설정상 안 쓰는 것"과 "쓰려는데 실패한 것"을
-// 구분해야 한다. LIKE-only 운영은 정상 구성이므로 실패로 보고하면 안 된다.
+// 구분해야 한다. 임베딩을 끄고 쓰는 것은 설정상의 선택이므로 이 동기화의 실패로 보고하지 않는다 —
+// 다만 그 구성에서는 검색이 성립하지 않는다(벡터 단일 경로, search.js). 그 사실은 검색 경로가
+// 요청마다 알리고(warnOnce) 화면·chat_log에 '검색 불가'로 남는다.
 export const SKIP = {
   NONE: false,
   BUSY: 'busy',                 // 다른 동기화가 진행 중 (이번 회차만 건너뜀)
-  UNCONFIGURED: 'unconfigured', // EMBEDDING_URL 미설정 — LIKE-only 정상 구성
+  UNCONFIGURED: 'unconfigured', // EMBEDDING_URL 미설정 — 임베딩을 쓰지 않는 구성 (그 구성에서는 검색이 없다)
   UNAVAILABLE: 'unavailable',   // 임베딩 서버가 설정돼 있으나 응답하지 않음
   STOPPED: 'stopped',           // 정상 종료 요청으로 도중에 접음 (다음 실행이 이어받는다)
 };
@@ -64,8 +66,8 @@ export const SKIP = {
 //  것인데, 구분해서 보여줄 문구가 호출부마다 흩어져 있으면 그 목적이 반만 달성된다.)
 const SKIP_NOTE = {
   [SKIP.BUSY]: 'skipped — another sync is already in progress',
-  [SKIP.UNCONFIGURED]: 'EMBEDDING_URL not set — LIKE-only setup, embedding skipped',
-  [SKIP.UNAVAILABLE]: 'could not reach the embedding server — some rows skipped, continuing LIKE-only',
+  [SKIP.UNCONFIGURED]: 'EMBEDDING_URL not set — embedding skipped; search cannot run at all without it',
+  [SKIP.UNAVAILABLE]: 'could not reach the embedding server — some rows skipped; those rows stay unsearchable',
   [SKIP.STOPPED]: 'stopped early for shutdown — the remaining rows are picked up on the next run',
 };
 
@@ -136,7 +138,7 @@ export async function syncEmbeddings() {
 }
 
 async function doSync() {
-  // 임베딩을 쓰지 않는 환경(LIKE-only)에서는 본문 읽기와 해시 계산을 건너뛴다.
+  // 임베딩을 쓰지 않는 환경에서는 본문 읽기와 해시 계산을 건너뛴다.
   // 단, 원본이 삭제된 vec_store 행 정리는 이 함수에만 있으므로 그 경로는 계속 태운다 —
   // 건너뛰면 삭제된 지식의 벡터가 남아, 임베딩을 다시 켤 때까지 검색에 노출된다.
   const enabled = isEmbeddingEnabled();
@@ -325,7 +327,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   // 'Aborted connection … Got an error reading communication packets'가 쌓인다.
   // server.js의 정상 종료가 closePool을 부르는 것과 같은 이유인데 이쪽 종료 경로만 빠져 있었다.
   await closePool().catch(e => console.warn('[embed] failed to close connection pool:', e.message));
-  // 실패로 종료하는 것은 "쓰려고 했는데 안 된" 경우뿐이다 — LIKE-only는 지원되는 구성이므로
-  // 프로비저닝 스크립트가 이 명령의 종료 코드로 실패 판정을 하면 안 된다.
+  // 실패로 종료하는 것은 "쓰려고 했는데 안 된" 경우뿐이다 — 임베딩을 끄고 쓰는 것은 설정상의
+  // 선택이라(그 구성에서는 검색이 없다) 프로비저닝 스크립트가 이 명령의 종료 코드로 그것을
+  // 실패로 판정하면 안 된다.
   process.exit(r.skipped === SKIP.UNAVAILABLE ? 1 : 0);
 }

@@ -1,12 +1,19 @@
-// 지식/Q&A처리방법/쿼리 검색 — 하이브리드(LIKE 관련도 + 벡터, RRF 병합).
-// 검색 구현은 이 파일에만 있다. 임베딩 서버가 없으면 자동으로 LIKE-only로 동작한다.
+// 지식/Q&A처리방법/쿼리 검색 — 벡터 검색(MariaDB VECTOR 인덱스, 코사인 거리) 단일 경로.
+// 검색 구현은 이 파일에만 있다.
+//
+// LIKE 검색을 걷어낸 이유. 앞선 구현은 LIKE 관련도와 벡터를 병렬로 돌려 RRF로 합쳤다. LIKE는
+// 인덱스를 못 쓰는 '%…%' 스캔이라 비용이 (행 수 × 낱말 수 × 조사 변형 × 컬럼 수 × 본문 길이)에
+// 비례했고, 질문 낱말 30개면 행마다 LIKE를 180번 평가했다 — 지식이 만 건이면 검색 한 번이 초
+// 단위였다. 검색어를 이제 모델이 핵심 낱말 몇 개로 쓰므로(llm-openai.js 시스템 프롬프트) 표현 차이는
+// 벡터가 흡수하고, 정확 키워드는 검색어 자체에 들어가 벡터 거리에도 그대로 반영된다.
+// 대가: 임베딩 서버가 없으면 검색이 성립하지 않는다. 그 상태를 '0건'으로 뭉개지 않고 null로 돌려
+// 호출부(agent.js)가 '못 찾아봤다'를 모델과 chat_log에 남기게 한다 — 조용히 빈 결과가 되면
+// 모델은 '등록된 자료가 없다'고 단정하고, 그 오답은 어디에도 기록되지 않는다.
 import { query } from './db.js';
 import { embed, isEmbeddingEnabled, warnEmbeddingFailure } from './embedding.js';
-import { warnOnce } from './constants.js';
+import { warnOnce, SEARCH_LIMIT } from './constants.js';
 
-const LIMIT = 20;         // LLM에 넘길 최대 후보 수 (건당 약 84토큰)
-const TITLE_WEIGHT = 3;   // 제목(첫 컬럼) 매칭은 본문 매칭보다 높게
-const RRF_K = 60;         // Reciprocal Rank Fusion 상수 (표준값)
+const LIMIT = SEARCH_LIMIT; // 검색 한 번이 돌려주는 최대 후보 수 — 기본 20, 환경변수로 낮춘다 (constants.js SEARCH_LIMIT)
 const EF_SEARCH = 400;    // MHNSW 탐색 깊이. 기본값(20)은 1024차원에서 recall이 크게 떨어진다
                           // (10k 부하 테스트에서 실측: 기본값은 최근접을 놓치고, 400이면 정확 검색과 일치·~20ms)
 const VEC_OVERFETCH = 5;  // vec_store는 세 소스(knowledge/qa_method/query_registry)를 한 테이블·한 인덱스에 담는다.
@@ -15,125 +22,110 @@ const VEC_OVERFETCH = 5;  // vec_store는 세 소스(knowledge/qa_method/query_r
                           // 경로B(qa_method 없이 등록한 쿼리) 라우팅이 통째로 사라지는데 오류는 남지 않는다.
                           // 넉넉히 뽑아 거른 뒤 LIMIT을 다시 적용해 그 순서 의존을 없앤다
                           // (EF_SEARCH가 LIMIT×OVERFETCH보다 커야 의미가 있다 — 400 > 100).
-const MAX_DIST = 0.55;    // 벡터 매칭 관련도 임계값 (코사인 거리). 실측: 관련 0.30~0.53, 무관 0.58~0.75.
+const MAX_DIST = 0.55;    // 관련도 임계값 (코사인 거리). 실측: 관련 0.30~0.53, 무관 0.58~0.75.
                           // top-K는 무관해도 항상 K건을 돌려주므로, 이 필터가 없으면 "관련 지식 없음 →
-                          // 일반 지식 답변" 폴백이 무력화된다. LIKE 쪽은 무필터(정확 키워드 보존).
+                          // 일반 지식 답변" 폴백이 무력화된다.
 
-// 테이블별 검색 대상 컬럼 (첫 컬럼 = 제목/이름, 가중치가 높다).
-// embed-sync.js가 임베딩 원문을 만들 때도 같은 정의를 쓴다 — LIKE와 벡터가 서로 다른 내용을 보지 않도록.
+// 테이블별 임베딩 원문 컬럼 (첫 컬럼 = 제목/이름). embed-sync.js가 임베딩 원문을 만들 때 쓴다 —
+// 검색이 무엇을 보고 맞추는지가 곧 이 컬럼들이다. 쿼리는 SQL 원문을 넣지 않는다(질문과 닮은 것은 설명이다).
 export const SEARCH_COLUMNS = {
   knowledge: ['title', 'content'],
   qa_method: ['title', 'method'],
   query_registry: ['query_name', 'query_desc', 'input_desc', 'output_desc'],
 };
 
-export function searchKnowledge(question) {
-  return hybrid('knowledge', question);
+// 반환: 관련도 순 행 배열. 검색 자체가 성립하지 않았으면(임베딩 미설정·임베딩 실패·벡터 SQL 실패)
+// null이다 — '찾았는데 없다'([])와 '찾아보지 못했다'(null)를 호출부가 구분해야 한다 (파일 머리말 참고).
+export function searchKnowledge(text) {
+  return vectorSearch('knowledge', text);
 }
 
-export function searchQaMethods(question) {
-  return hybrid('qa_method', question);
+export function searchQaMethods(text) {
+  return vectorSearch('qa_method', text);
 }
 
-// 쿼리 직접 검색 — qa_method 등록 없이도 질문으로 쿼리를 찾는 경로 (agent.js 라우팅에서 사용)
-export function searchQueries(question) {
-  return hybrid('query_registry', question);
+// 쿼리 직접 검색 — qa_method 등록 없이도 검색어로 쿼리를 찾는 경로 (agent.js 라우팅의 경로B)
+export function searchQueries(text) {
+  return vectorSearch('query_registry', text);
 }
 
-// LIKE(정확 키워드에 강함)와 벡터(표현 차이에 강함)를 병렬 실행 후 RRF로 병합.
-// RRF는 순위만 쓰므로 점수 스케일 튜닝이 필요 없다: score = Σ 1/(K + rank)
-async function hybrid(table, question) {
-  const [likeRows, vecRows] = await Promise.all([
-    // 벡터 쪽만 자기 실패를 삼키고 있었다 — 같은 Promise.all 안에서 LIKE 쪽이 거부하면
-    // searchKnowledge → handleQuestion → /api/chat 순으로 그대로 올라가 '모든 질문이 500'이 된다.
-    // 관리 DB가 잠깐 흔들리는 것(조회 타임아웃·테이블 락·권한 상실)만으로 서비스가 통째로 멈추는
-    // 셈인데, 이 시스템의 나머지 I/O 경계는 전부 degrade하도록 되어 있다. 여기만 예외였다.
-    // 검색이 비면 답변이 부실해질 뿐이고, 그 사실은 chat_log의 search 적중 수에 남는다.
-    // 억제 범위(scope)를 벡터 경고와 나누고, 테이블별로도 나눈다 — 한 scope로 묶으면 두 실패가
-    // 번갈아 일어날 때 warnOnce가 '성격이 바뀌었다'고 보고 매번 다시 찍어 로그를 도배한다.
-    // 테이블명을 문구에만 담고 scope를 공유하면 그 도배가 scope 안에서 그대로 되살아난다:
-    // 요청 하나가 세 테이블을 검색하므로, 관리 DB가 죽으면 테이블만 다른 문구가 번갈아 들어와
-    // 억제가 한 번도 걸리지 않는다(실측: 요청 4건에 8줄). scope는 '무엇에 대한 경고인가'여야 하고,
-    // 그 안에서 오류의 성격(메시지)이 바뀔 때만 다시 알린다.
-    likeSearch(table, SEARCH_COLUMNS[table], question).catch(e => {
-      warnOnce(`search-like:${table}`, `LIKE search failed on ${table} — continuing without keyword matches: ${e.message}`);
-      return [];
-    }),
-    vecSearch(table, question),
-  ]);
-  if (!vecRows) return likeRows; // 임베딩 불가 → LIKE-only 폴백
-  return rrfMerge(likeRows, vecRows).slice(0, LIMIT);
-}
-
-function rrfMerge(...lists) {
-  const score = new Map();
-  const rows = new Map();
-  for (const list of lists) {
-    list.forEach((r, rank) => {
-      rows.set(r.seq, r);
-      score.set(r.seq, (score.get(r.seq) || 0) + 1 / (RRF_K + rank + 1));
-    });
-  }
-  return [...score.entries()].sort((a, b) => b[1] - a[1]).map(([seq]) => rows.get(seq));
-}
-
-// ===== 벡터 검색 =====
-// 같은 질문은 임베딩을 1회만 계산한다 — 요청 1건이 지식/처리방법/쿼리 검색으로
-// vecSearch를 3회 이상 호출하므로, promise를 캐시해 병렬 호출까지 합친다.
-const embedCache = new Map();
-const EMBED_CACHE_MAX = 100;
-
-function embedQuestion(question) {
-  if (!isEmbeddingEnabled()) return null; // 설정상 LIKE-only — 오류 경로가 아니다
-  const hit = embedCache.get(question);
-  if (hit) {
-    // 적중한 항목을 맨 뒤로 옮긴다 — 삽입 순서만 보고 밀어내면(FIFO) 가장 자주 묻는 질문이
-    // 한 번 들어간 뒤 스쳐 가는 질문 100건에 그대로 밀려난다. 캐시는 가득 찬 채로 적중률만
-    // 0에 수렴하고, 오류는 나지 않은 채 같은 질문마다 임베딩 왕복(최대 60초)이 되돌아온다.
-    // sql.js analysisCache가 같은 이유로 같은 방식(delete 후 재삽입)을 쓴다 — 이쪽만 FIFO였다.
-    embedCache.delete(question);
-    embedCache.set(question, hit);
-    return hit;
-  }
-  // 가득 차면 통째로 비우지 않고 가장 오래 '안 쓴' 것부터 하나씩 밀어낸다 (Map은 삽입 순서를
-  // 지키고, 위에서 적중할 때마다 맨 뒤로 다시 넣으므로 그 순서가 곧 LRU다).
-  // clear()는 아직 응답을 기다리는 최신 항목까지 버려서, 같은 질문의 다음 검색이
-  // 진행 중인 요청에 합류하지 못하고 60초짜리 임베딩 호출을 한 번 더 만든다.
-  while (embedCache.size >= EMBED_CACHE_MAX) {
-    embedCache.delete(embedCache.keys().next().value);
-  }
-  const p = embed([question])
-    .then(v => v[0])
-    .catch(e => {
-      warnEmbeddingFailure(e);
-      // 실패는 캐시하지 않는다 (다음 요청에서 재시도). 단, 그 자리에 있는 것이 '이 promise'일 때만
-      // 지운다 — 느린 실패가 돌아오는 사이 위의 LRU가 이 항목을 밀어내고 같은 질문의 새 요청이
-      // 새 promise를 넣었을 수 있는데, 키로만 지우면 그 진행 중인 항목까지 함께 버려
-      // 다음 검색이 합류하지 못하고 60초짜리 임베딩 호출을 한 번 더 만든다.
-      if (embedCache.get(question) === p) embedCache.delete(question);
-      return null;                 // 검색은 LIKE-only로 계속한다
-    });
-  embedCache.set(question, p);
-  return p;
-}
-
-// 질문 임베딩 후 vec_store에서 코사인 거리 상위 LIMIT건 → 원본 행 JOIN.
-// SQL 오류(vec_store 미생성, 차원 불일치 등)도 null로 폴백해 LIKE-only로 계속 동작한다.
-async function vecSearch(table, question) {
-  const vector = await embedQuestion(question);
+async function vectorSearch(table, text) {
+  // 빈 검색어는 '아무것도 찾지 않았다'다 — 임베딩 서버에 빈 입력을 보내면 거부되어 '검색 불가'로
+  // 잘못 기록된다. 호출부는 빈 검색어를 질문으로 대체하므로(agent.js) 정상 경로에서는 오지 않는다.
+  if (!String(text ?? '').trim()) return [];
+  const vector = await embedText(text);
   if (!vector) return null;
   return vecQuery(table, vector).catch(e => {
     // 억제는 warnOnce에 맡긴다 — '한 번만 경고' 플래그를 쓰면 vec_store 미생성으로 한 번 알린 뒤
     // 차원 불일치·인덱스 손상 같은 전혀 다른 이유로 벡터 검색이 죽어도 로그가 남지 않는다.
-    // 이 경로는 조용히 LIKE-only로 폴백하므로 로그가 유일한 단서다.
-    // scope를 테이블별로 나누는 이유는 LIKE 쪽과 같다 — 문구에 테이블명이 없어도 드라이버가
-    // 돌려주는 e.message에는 대상 테이블이 섞여 들어오므로, 한 scope로 묶으면 요청마다
-    // 세 문구가 번갈아 들어와 억제가 걸리지 않는다.
-    warnOnce(`search:${table}`, `vector search failed on ${table} — falling back to LIKE-only search: ${e.message}`);
+    // 검색이 통째로 없는 상태라 로그와 이력의 '검색 불가' 표시가 유일한 단서다.
+    // scope를 테이블별로 나눈다 — 드라이버가 돌려주는 e.message에 대상 테이블이 섞여 들어오므로,
+    // 한 scope로 묶으면 요청마다 세 문구가 번갈아 들어와 억제가 걸리지 않는다.
+    warnOnce(`search:${table}`, `vector search failed on ${table} — this search returns nothing: ${e.message}`);
     return null;
   });
 }
 
+// ===== 임베딩 =====
+// 같은 검색어는 임베딩을 1회만 계산한다 — 검색 한 번이 세 소스를 병렬로 돌리므로,
+// promise를 캐시해 병렬 호출까지 합친다.
+const embedCache = new Map();
+const EMBED_CACHE_MAX = 100;
+
+function embedText(text) {
+  if (!isEmbeddingEnabled()) {
+    // 설정상 검색이 없는 상태다. 오류는 아니지만 '검색 불가'가 매 요청 조용히 반복되므로 한 번은 알린다.
+    warnOnce('search:embedding', 'EMBEDDING_URL is not set — every search returns nothing (vector search is the only search path). Set it in backend/.env.');
+    return null;
+  }
+  const hit = embedCache.get(text);
+  if (hit) {
+    // 적중한 항목을 맨 뒤로 옮긴다 — 삽입 순서만 보고 밀어내면(FIFO) 가장 자주 묻는 검색어가
+    // 한 번 들어간 뒤 스쳐 가는 검색어 100건에 그대로 밀려난다. 캐시는 가득 찬 채로 적중률만
+    // 0에 수렴하고, 오류는 나지 않은 채 같은 검색어마다 임베딩 왕복(최대 60초)이 되돌아온다.
+    // sql.js analysisCache가 같은 이유로 같은 방식(delete 후 재삽입)을 쓴다.
+    embedCache.delete(text);
+    embedCache.set(text, hit);
+    return hit;
+  }
+  // 가득 차면 통째로 비우지 않고 가장 오래 '안 쓴' 것부터 하나씩 밀어낸다 (Map은 삽입 순서를
+  // 지키고, 위에서 적중할 때마다 맨 뒤로 다시 넣으므로 그 순서가 곧 LRU다).
+  // clear()는 아직 응답을 기다리는 최신 항목까지 버려서, 같은 검색어의 다음 검색이
+  // 진행 중인 요청에 합류하지 못하고 60초짜리 임베딩 호출을 한 번 더 만든다.
+  while (embedCache.size >= EMBED_CACHE_MAX) {
+    embedCache.delete(embedCache.keys().next().value);
+  }
+  const p = embed([text])
+    .then(v => v[0])
+    .catch(e => {
+      warnEmbeddingFailure(e);
+      // 실패는 캐시하지 않는다 (다음 요청에서 재시도). 단, 그 자리에 있는 것이 '이 promise'일 때만
+      // 지운다 — 느린 실패가 돌아오는 사이 위의 LRU가 이 항목을 밀어내고 같은 검색어의 새 요청이
+      // 새 promise를 넣었을 수 있는데, 키로만 지우면 그 진행 중인 항목까지 함께 버려
+      // 다음 검색이 합류하지 못하고 60초짜리 임베딩 호출을 한 번 더 만든다.
+      if (embedCache.get(text) === p) embedCache.delete(text);
+      return null;                 // 검색 불가 — vectorSearch가 null로 알린다
+    });
+  embedCache.set(text, p);
+  return p;
+}
+
+// 임베딩 모델을 미리 올려 둔다. Ollama는 유휴 뒤 모델을 내리므로(기본 5분, OLLAMA_KEEP_ALIVE로
+// 바꾼다 — README) 한산한 시간대의 첫 검색이 모델 재적재(수 초)를 그대로 낸다. 기동 시 한 번
+// 불러 두면 최소한 첫 질문은 그 비용을 내지 않는다. 실패해도 조용히 넘긴다 — 검색 시점에 다시
+// 시도하고 그때의 실패는 그쪽이 알린다. 미설정이면 아무것도 하지 않는다(경고는 검색 시점에 한 번).
+export async function warmUpEmbedding() {
+  if (!isEmbeddingEnabled()) return false;
+  try {
+    await embed(['warm-up']);
+    return true;
+  } catch (e) {
+    warnEmbeddingFailure(e);
+    return false;
+  }
+}
+
+// 검색어 임베딩 후 vec_store에서 코사인 거리 상위 LIMIT건 → 원본 행 JOIN.
 function vecQuery(table, vector) {
   return query(
     `SET STATEMENT mhnsw_ef_search=${EF_SEARCH} FOR
@@ -144,100 +136,4 @@ function vecQuery(table, vector) {
      ORDER BY v._dist LIMIT ${LIMIT}`,
     [JSON.stringify(vector), table]
   );
-}
-
-// ===== LIKE 검색 (관련도 점수) =====
-// 점수 = Σ (컬럼 가중치 × 토큰 길이)
-//   - 여러 토큰이 맞을수록, 첫 컬럼(제목/이름)에 맞을수록, 긴(구체적인) 토큰이 맞을수록 높다
-//   - 조사를 뗀 변형 토큰은 원형보다 짧으므로 자연히 낮게 반영된다
-
-// LIKE 와일드카드('%', '_')의 이스케이프 문자. 역슬래시가 아니라 '!'를 쓰고, ESCAPE 절로 명시한다.
-// 역슬래시는 서버 설정에 따라 뜻이 바뀐다: sql_mode에 NO_BACKSLASH_ESCAPES가 있으면 LIKE의
-// 암묵 기본 이스케이프 문자가 사라져, 이스케이프한 줄 알았던 '\_'가 '역슬래시 + 아무 글자 하나'가 된다.
-// 검색 토큰에 '_'는 아주 흔하다 — query_name이 snake_case이고(batch_job_status,
-// order_status_by_customer) 질문과 qa_method 본문에 그대로 등장한다. 그러면 '_'가 와일드카드로
-// 살아나 무관한 행이 점수를 받고, 정답 지식이 LIMIT 20 밖으로 밀린다 — 오류는 어디에도 없다.
-// ESCAPE 절에 '\\'를 적어 넣는 것도 답이 아니다. 그 리터럴 자체가 같은 sql_mode에서 뜻이 바뀌어
-// '문자 두 개'가 되고 ESCAPE 인자로 거부된다. 두 모드에서 뜻이 같은 문자를 골라야 한다.
-// (embed-sync.js hashExpr이 리터럴 '\n' 대신 CHAR(10)을 쓰는 것과 같은 이유·같은 방식이다.)
-// 이 상수와 아래 SQL의 ESCAPE 절은 반드시 같은 문자를 봐야 한다 — 갈라지면 이스케이프가
-// 무효가 되고, 그 실패는 '무관한 행이 조금 더 섞인다'로만 나타나 오류를 남기지 않는다.
-// (테스트에서 쓰므로 export 한다 — 회귀가 보이지 않는 종류의 실패라 테스트가 유일한 방어선이다)
-export const LIKE_ESCAPE = '!';
-const LIKE_META_RE = /[!%_]/g;   // 이스케이프 문자 자신도 이스케이프해야 한다
-export const likePattern = tok => `%${String(tok).replace(LIKE_META_RE, `${LIKE_ESCAPE}$&`)}%`;
-
-async function likeSearch(table, columns, question) {
-  // 상한은 searchTokens가 '확장 전 낱말'에 건다 (그 주석 참고) — 여기서 확장된 토큰 목록을
-  // 다시 자르면 상한이 앞쪽 낱말의 조사 변형들로 소진되어 질문 뒤쪽 낱말이 통째로 빠진다.
-  const tokens = searchTokens(question);
-  if (tokens.length === 0) return [];
-
-  const scoreParts = [];
-  const params = [];
-  for (const tok of tokens) {
-    columns.forEach((col, i) => {
-      const weight = (i === 0 ? TITLE_WEIGHT : 1) * tok.length;
-      scoreParts.push(`CASE WHEN ${col} LIKE ? ESCAPE '${LIKE_ESCAPE}' THEN ${weight} ELSE 0 END`);
-      params.push(likePattern(tok));
-    });
-  }
-
-  // LIKE '%...%'는 인덱스를 못 쓰므로 WHERE로 거르나 HAVING으로 거르나 비용이 같다.
-  // 점수를 한 번만 계산하도록 HAVING을 쓴다 (파라미터 중복 없음).
-  return query(
-    `SELECT *, ${scoreParts.join(' + ')} AS _score FROM ${table}
-     HAVING _score > 0 ORDER BY _score DESC, seq LIMIT ${LIMIT}`,
-    params
-  );
-}
-
-// 상한은 조사 변형을 붙이기 '전'의 낱말에 건다. 확장 뒤에 자르면 상한이 앞쪽 낱말의 변형들로
-// 소진되어(낱말 하나가 최대 3개를 차지한다) 질문 뒤쪽 낱말이 SQL에 아예 실리지 않는다 —
-// 긴 한국어 질문에서 변별력 있는 명사는 대개 뒤에 온다('… 가상계측 배치 재시작 절차').
-// 그 낱말이 빠져도 쿼리는 성공하므로 오류가 남지 않는다: 앞부분의 일반적인 낱말로만 점수가
-// 매겨져 엉뚱한 지식이 정답 위로 올라올 뿐이다.
-// 상한의 목적 자체는 그대로다 — 대형 입력이 CASE 절 수천 개짜리 SQL을 만들면 MariaDB
-// thread stack overrun이 난다. 낱말 30개 × 변형 3개 × 컬럼 4개 = 최대 360개 CASE로 유계다.
-const MAX_SEARCH_WORDS = 30;
-
-// 질문 → LIKE 검색 토큰. 공백으로 나눈 뒤 앞뒤 문장부호를 떼고 조사 변형을 붙인다.
-// 문장부호 제거가 먼저여야 한다: expandToken의 조사 판정이 /[가-힣]$/라서, 물음표 하나만 붙어도
-// 판정이 실패해 변형이 하나도 만들어지지 않는다. "가상계측이란?"은 그 상태로 0건이 되고
-// "가상계측이란"은 정상 적중한다 — 한국어 질문에 물음표를 붙이는 건 지극히 자연스러운 입력이다.
-// (테스트에서 쓰므로 export 한다)
-export function searchTokens(question) {
-  // 2자 미만은 확장해도 2자 미만이라(변형은 원형보다 짧다) 상한을 세기 전에 버린다 —
-  // 버릴 낱말이 상한을 차지하면 그만큼 실제 검색어가 밀려난다.
-  const words = [...new Set(
-    String(question ?? '')
-      .split(/\s+/)
-      .map(stripPunctuation)
-      .filter(t => t.length >= 2)
-  )].slice(0, MAX_SEARCH_WORDS);
-  return [...new Set(words.flatMap(expandToken).filter(t => t.length >= 2))];
-}
-
-// 토큰 앞뒤의 문장부호·따옴표·괄호를 뗀다. 가운데는 건드리지 않는다 —
-// 'BATCH-001'이나 'restart_batch.sh'처럼 부호가 식별자의 일부인 경우가 있다.
-const stripPunctuation = t => t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
-
-// 한국어는 조사가 붙어("가상계측이") 원형("가상계측")과 LIKE 매칭이 되지 않는다.
-// 끝 1~2글자를 뗀 형태도 함께 검색해 조사를 흡수한다.
-//
-// 임계값의 근거는 하나다: 조사를 뗀 형태도 2자 이상이어야 검색어로 쓸모가 있다
-// (1자 토큰은 searchTokens가 어차피 버리고, 버리지 않더라도 어지간한 본문에 다 들어 있다).
-// 그래서 1글자를 떼는 데는 3자, 2글자를 떼는 데는 4자가 필요하다.
-// 2글자 조사 쪽 임계값이 5였던 탓에 '2음절 명사 + 2글자 조사'(배치에서, 작업으로, 계정으로 —
-// 한국어 질문에서 가장 흔한 형태다)의 어간이 한 번도 검색되지 않았다: '배치에서'는
-// ['배치에서', '배치에']로만 확장돼, 정작 title·query_name에 들어 있는 '배치'로는 점수가 0이고
-// 노이즈 조각인 '배치에'가 제목 가중치(TITLE_WEIGHT×3)를 그대로 받았다.
-// 쿼리는 성공하므로 오류가 남지 않는다 — 엉뚱한 행이 정답 위로 올라올 뿐이다.
-function expandToken(token) {
-  const variants = [token];
-  if (/[가-힣]$/.test(token)) {
-    if (token.length >= 3) variants.push(token.slice(0, -1));
-    if (token.length >= 4) variants.push(token.slice(0, -2));
-  }
-  return variants;
 }

@@ -5,8 +5,8 @@
 // 어느 쪽도 오류를 남기지 않아 로그로는 알 수 없다. 테스트가 유일한 방어선이다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { loopGuard, paramKey, normalizeChat, fallbackAnswer, normalizeQuestion, clippedCopyDetector, answerOf } from '../src/agent.js';
-import { MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_ANSWER_LEN, MAX_RESULT_ROWS, MAX_RESULT_COLS, MAX_CELL_LEN, TRUNC_MARK } from '../src/constants.js';
+import { loopGuard, paramKey, normalizeChat, fallbackAnswer, normalizeQuestion, clippedCopyDetector, answerOf, handleQuestion, searchKey, mergeFront } from '../src/agent.js';
+import { MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_ANSWER_LEN, MAX_RESULT_ROWS, MAX_RESULT_COLS, MAX_CELL_LEN, TRUNC_MARK, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_BATCH_QUERIES, MAX_EXPANDS, SEARCH_TARGETS } from '../src/constants.js';
 
 const ran = (name, params, rows = [{ A: 1 }]) => ({ query_name: name, params, rows, totalRows: rows.length });
 const failed = (name, params) => ({ query_name: name, params, error: 'ORA-00942' });
@@ -364,4 +364,580 @@ test('반복 실패 판정도 대상 DB별로 따로 센다', () => {
   const history = [fail('SEOUL'), fail('SEOUL')];
   assert.match(loopGuard(history, 'stock', ['item'], { item: 'A' }, 'SEOUL'), /반복 실패/);
   assert.equal(loopGuard(history, 'stock', ['item'], { item: 'A' }, 'BUSAN'), null);
+});
+
+// ===== 결정 루프 — 검색 행동 =====
+// 검색은 모델이 요청할 때만 일어난다. 이 루프의 판정은 loopGuard와 같은 부류다: 느슨하면 같은 검색으로
+// 제자리를 돌고, 빡빡하면 정당한 재검색이 막힌다. 어느 쪽도 오류를 남기지 않으므로 DB·LLM 없이 스텁으로 잰다.
+const ALL = [...SEARCH_TARGETS];
+const K = (seq, title = `지식${seq}`) => ({ seq, title, content: `${title} 본문` });
+const Q = (seq, name) => ({ seq, query_name: name, query_sql: 'SELECT 1 FROM t WHERE a = :a', target_db_name: 'D' });
+
+// 결정을 순서대로 내는 LLM 스텁. 받은 ctx를 기록해 '모델이 무엇을 보았는가'를 잴 수 있게 한다.
+function scripted(decisions) {
+  const seen = [];
+  const decide = async ctx => {
+    seen.push({ ...ctx, knowledge: [...ctx.knowledge], qaMethods: [...ctx.qaMethods], queries: [...ctx.queries], history: [...ctx.history] });
+    if (ctx.forceAnswer) return { action: 'answer', answer: '강제 답변' };
+    return decisions.shift() ?? { action: 'answer', answer: '기본 답변' };
+  };
+  return { decide, seen };
+}
+const found = over => ({ knowledge: undefined, qaMethods: undefined, queries: undefined, routed: null, queriesFailed: false, directFailed: false, ...over });
+const silence = () => { const orig = console.log; console.log = () => {}; return () => { console.log = orig; }; };
+
+test('인사는 검색 없이 LLM 호출 한 번으로 끝난다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([{ action: 'answer', answer: '안녕하세요!' }]);
+    let searchedTimes = 0;
+    const r = await handleQuestion('안녕', [], { deps: { decide: llm.decide, search: async () => { searchedTimes++; return found(); } } });
+    assert.equal(r.answer, '안녕하세요!');
+    assert.equal(searchedTimes, 0, '인사에 검색이 돌았다');
+    assert.deepStrictEqual(r.trace, []);
+    assert.equal(r.search.searches, 0);
+    assert.deepStrictEqual(r.search.targets, { knowledge: 0, qa_method: 0, query: 0 });
+    assert.equal(r.search.knowledge, null, '찾아보지 않은 대상은 0이 아니라 null이다');
+    assert.equal(r.timing.llm.length, 1, 'LLM 호출이 한 번이어야 한다');
+    // 첫 호출의 컨텍스트는 비어 있고 아무것도 찾아보지 않은 상태다
+    assert.deepStrictEqual(llm.seen[0].searched, []);
+  } finally { restore(); }
+});
+
+test('검색 결정은 요청한 대상만 찾고, 결과가 다음 호출의 컨텍스트에 실린다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([{ action: 'search', text: '배치 재시작', targets: ['knowledge'] }, { action: 'answer', answer: '답' }]);
+    const calls = [];
+    const search = async (text, targets) => { calls.push([text, targets]); return found({ knowledge: [K(1), K(2)] }); };
+    const r = await handleQuestion('배치 재시작 방법 알려줘', [], { deps: { decide: llm.decide, search } });
+    assert.deepStrictEqual(calls, [['배치 재시작', ['knowledge']]]);
+    assert.deepStrictEqual(r.trace, [{ search: '배치 재시작', targets: ['knowledge'], hits: { knowledge: 2, qaMethods: null, queries: null } }]);
+    const second = llm.seen[1];
+    assert.deepStrictEqual(second.knowledge.map(k => k.seq), [1, 2]);
+    assert.deepStrictEqual(second.searched, ['knowledge']);
+    assert.deepStrictEqual(r.search, { searches: 1, targets: { knowledge: 1, qa_method: 0, query: 0 }, knowledge: 2, qaMethods: null, queries: null });
+    assert.equal(r.timing.search.length, 1);
+  } finally { restore(); }
+});
+
+test('빈 검색어는 현재 질문으로 대신한다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([{ action: 'search', targets: ALL }]);
+    const calls = [];
+    await handleQuestion('  BATCH001 상태  ', [], { deps: { decide: llm.decide, search: async (t, g) => { calls.push([t, g]); return found({ knowledge: [K(1)] }); } } });
+    assert.deepStrictEqual(calls, [['BATCH001 상태', ALL]]);
+  } finally { restore(); }
+});
+
+test('같은 검색어·대상의 반복은 실행하지 않고 note로 남긴다 — 연속되면 강제 답변으로 간다', async () => {
+  const restore = silence();
+  try {
+    const same = { action: 'search', text: '배치', targets: ['knowledge'] };
+    const llm = scripted([same, { ...same, text: ' 배치 ' }, same, same]);
+    let times = 0;
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide, search: async () => { times++; return found({ knowledge: [K(1)] }); } } });
+    assert.equal(times, 1, '같은 검색이 다시 실행됐다');
+    assert.equal(r.trace.length, 3, '실행 1건 + 반복 note 2건 뒤에 강제 답변으로 가야 한다');
+    assert.match(r.trace[1].note, /이미 같은 검색어/);
+    assert.equal(r.answer, '강제 답변');
+    assert.ok(llm.seen.at(-1).forceAnswer, '마지막 호출이 강제 답변이어야 한다');
+    assert.equal(r.search.searches, 1);
+  } finally { restore(); }
+});
+
+test('같은 검색어라도 대상을 더하면 새 검색이다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', text: '배치', targets: ['knowledge'] },
+      { action: 'search', text: '배치', targets: ['knowledge', 'query'] },
+      { action: 'answer', answer: '답' },
+    ]);
+    const calls = [];
+    const search = async (t, g) => { calls.push(g); return found({ knowledge: [K(1)], ...(g.includes('query') && { queries: [Q(7, 'q7')], routed: false }) }); };
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide, search } });
+    assert.deepStrictEqual(calls, [['knowledge'], ['knowledge', 'query']]);
+    assert.equal(r.trace.filter(h => h.note).length, 0);
+    assert.deepStrictEqual(r.search.targets, { knowledge: 2, qa_method: 0, query: 1 });
+  } finally { restore(); }
+});
+
+test('검색 횟수는 MAX_SEARCHES를 넘지 못한다', async () => {
+  const restore = silence();
+  try {
+    const decisions = new Array(MAX_SEARCHES + 2).fill(0).map((_, i) => ({ action: 'search', text: `검색어${i}`, targets: ALL }));
+    const llm = scripted(decisions);
+    let times = 0;
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide, search: async (t) => { times++; return found({ knowledge: [K(times)] }); } } });
+    assert.equal(times, MAX_SEARCHES);
+    const notes = r.trace.filter(h => h.note);
+    assert.ok(notes.length >= 1 && notes.every(n => /검색 횟수 상한/.test(n.note)), JSON.stringify(notes));
+    assert.equal(r.search.searches, MAX_SEARCHES);
+  } finally { restore(); }
+});
+
+test('검색이 성립하지 않은 대상은 0건이 아니라 failed로 남는다', async () => {
+  // 임베딩 서버가 없으면 검색이 null이다(search.js). 그것을 0건으로 기록하면 모델은 '등록된 자료가 없다'고
+  // 단정하고, chat_log는 그 질문을 '지식 보강 후보'로 잘못 집계한다.
+  const restore = silence();
+  try {
+    const llm = scripted([{ action: 'search', text: 'x', targets: ALL }, { action: 'answer', answer: '답' }]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide, search: async () => found({ knowledge: null, qaMethods: [], queries: null, routed: true, queriesFailed: true }) } });
+    assert.deepStrictEqual(r.trace[0], { search: 'x', targets: ALL, hits: { knowledge: null, qaMethods: 0, queries: null }, failed: ['knowledge', 'query'] });
+    assert.equal(r.search.knowledge, null);
+    assert.equal(r.search.qaMethods, 0, '찾았는데 없는 것은 0이다');
+    assert.equal(r.search.searchFailed, true);
+    assert.equal(r.search.queriesFailed, true);
+    // 검색이 성립하지 않은 대상은 '찾아본' 것이 아니다 — 프롬프트가 그 섹션을 '(없음)'으로 실으면
+    // 모델은 '등록된 자료가 없다'로 읽는다. 성립한 대상(qa_method)만 섹션으로 보이고, 성립하지 않은 것은
+    // 이력의 '검색 불가' 줄이 말한다. tried는 '한 번은 찾아봤다'라서 '아직 안 찾아봤다' 안내를 막는다.
+    assert.deepStrictEqual(llm.seen[1].searched, ['qa_method']);
+    assert.equal(llm.seen[1].tried, true);
+  } finally { restore(); }
+});
+
+test('처리방법이 지목한 쿼리는 query를 찾지 않았어도 목록에 실리되 query를 찾아본 것으로 세지 않는다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([{ action: 'search', text: 'x', targets: ['qa_method'] }, { action: 'answer', answer: '답' }]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide, search: async () => found({ qaMethods: [{ seq: 1, title: 'm', method: 'q1 실행' }], queries: [Q(1, 'q1')], routed: null }) } });
+    assert.deepStrictEqual(llm.seen[1].queries.map(q => q.query_name), ['q1']);
+    assert.deepStrictEqual(llm.seen[1].searched, ['qa_method']);
+    assert.equal(r.trace[0].hits.queries, 1);
+    assert.deepStrictEqual(r.search.targets, { knowledge: 0, qa_method: 1, query: 0 });
+    assert.equal(r.search.queries, null);
+  } finally { restore(); }
+});
+
+test('검색 뒤 쿼리 실행 — 진행 이벤트가 순서대로 나가고, 듣는 쪽이 던져도 루프는 계속된다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', text: 'BATCH001', targets: ['query'] },
+      { action: 'run_query', query_name: 'batch_job_status', params: { a: 'BATCH001' } },
+      { action: 'answer', answer: '답' },
+    ]);
+    const events = [];
+    let thrown = 0;
+    const onEvent = e => { events.push(e); if (thrown++ === 0) throw new Error('listener boom'); };
+    const run = async (row, params) => ({ rows: [{ STATUS: 'OK' }], totalRows: 1, capped: false, targetDb: 'D' });
+    const r = await handleQuestion('BATCH001 상태', [], {
+      onEvent,
+      deps: { decide: llm.decide, run, search: async () => found({ queries: [Q(1, 'batch_job_status')], routed: false }) },
+    });
+    assert.equal(r.answer, '답');
+    assert.deepStrictEqual(events.map(e => e.type), ['search', 'search_done', 'run_query', 'run_query_done']);
+    assert.deepStrictEqual(events[0], { type: 'search', text: 'BATCH001', targets: ['query'] });
+    assert.deepStrictEqual(events[1].hits, { knowledge: null, qaMethods: null, queries: 1 });
+    assert.deepStrictEqual(events[2], { type: 'run_query', id: 1, query_name: 'batch_job_status', params: { a: 'BATCH001' }, targetDb: 'D' });
+    assert.deepStrictEqual(events[3], { type: 'run_query_done', id: 1, query_name: 'batch_job_status', targetDb: 'D', rowCount: 1 });
+    assert.equal(r.trace.length, 2);
+    assert.equal(r.timing.oracle.length, 1);
+    // 모델이 지목한 쿼리는 다음 스텝에 자세히 보인다
+    assert.equal(llm.seen[2].queries[0].detail, true);
+  } finally { restore(); }
+});
+
+test('조회 실패 이벤트는 우리가 만든 문구만 원문으로 내보낸다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', targets: ['query'] },
+      { action: 'run_query', query_name: 'q1', params: {} },
+      { action: 'run_query', query_name: 'q1', params: { a: 2 } },
+      { action: 'answer', answer: '답' },
+    ]);
+    const events = [];
+    let n = 0;
+    const run = async () => { throw n++ === 0 ? Object.assign(new Error('ORA-00942 at HOST/SCHEMA'), {}) : Object.assign(new Error('우리 문구'), { safe: true }); };
+    await handleQuestion('q', [], { onEvent: e => events.push(e), deps: { decide: llm.decide, run, search: async () => found({ queries: [Q(1, 'q1')], routed: false }) } });
+    const dones = events.filter(e => e.type === 'run_query_done');
+    assert.equal(dones[0].error, '조회 중 오류가 발생했습니다.');
+    assert.equal(dones[1].error, '우리 문구');
+  } finally { restore(); }
+});
+
+test('쿼리 실행 결정은 MAX_STEPS를 넘지 못하고, 검색은 그 수에 들어가지 않는다', async () => {
+  const restore = silence();
+  try {
+    const decisions = [{ action: 'search', targets: ['query'] }];
+    for (let i = 0; i < MAX_STEPS + 2; i++) decisions.push({ action: 'run_query', query_name: 'q1', params: { a: i } });
+    const llm = scripted(decisions);
+    let runs = 0;
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide, run: async () => { runs++; return { rows: [], totalRows: 0, capped: false, targetDb: 'D' }; }, search: async () => found({ queries: [Q(1, 'q1')], routed: false }) } });
+    assert.equal(runs, MAX_STEPS, '검색이 쿼리 스텝을 잡아먹거나, 쿼리 스텝이 상한을 넘었다');
+    assert.equal(r.answer, '강제 답변');
+    assert.equal(r.trace.length, MAX_STEPS + 1);
+  } finally { restore(); }
+});
+
+test('새 자료가 없는 검색이 연속되면 강제 답변으로 간다 — 한 번은 검색어를 고칠 기회를 준다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', text: 'a', targets: ALL }, { action: 'search', text: 'b', targets: ALL }, { action: 'search', text: 'c', targets: ALL },
+    ]);
+    let times = 0;
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide, search: async () => { times++; return found({ knowledge: [], qaMethods: [] }); } } });
+    assert.equal(times, 2, '0건 검색은 두 번째까지만 — 그 뒤는 강제 답변');
+    assert.equal(r.answer, '강제 답변');
+  } finally { restore(); }
+});
+
+test('searchKey는 검색어의 대소문자·공백과 대상 순서를 흡수한다', () => {
+  assert.equal(searchKey(' Batch ', ['query', 'knowledge']), searchKey('batch', ['knowledge', 'query']));
+  assert.notEqual(searchKey('batch', ['knowledge']), searchKey('batch', ['knowledge', 'query']));
+  assert.notEqual(searchKey('batch', ['knowledge']), searchKey('배치', ['knowledge']));
+});
+
+test('mergeFront는 새 항목만 앞에 넣고 넣은 수를 돌려준다', () => {
+  const list = [K(1), K(2)];
+  assert.equal(mergeFront(list, [K(2), K(3), K(3), K(4)]), 2);
+  assert.deepStrictEqual(list.map(k => k.seq), [3, 4, 1, 2]);
+  assert.equal(mergeFront(list, [K(1)]), 0);
+});
+
+// ===== 일괄 조회 (run_queries) =====
+
+test('일괄 조회는 병렬로 돌고 이력은 배치 순서를 지킨다 — 끝나는 순서와 무관하게', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', targets: ['query'] },
+      { action: 'run_queries', queries: [{ query_name: 'q1', params: { a: 1 } }, { query_name: 'q2', params: { a: 2 } }, { query_name: 'q1', params: { a: 3 } }] },
+      { action: 'answer', answer: '답' },
+    ]);
+    let active = 0, peak = 0;
+    const run = async (row, params) => {
+      active++; peak = Math.max(peak, active);
+      await new Promise(r => setTimeout(r, params.a === 1 ? 60 : 10));   // 첫 항목이 가장 늦게 끝난다
+      active--;
+      return { rows: [{ V: params.a }], totalRows: 1, capped: false, targetDb: 'D' };
+    };
+    const events = [];
+    const r = await handleQuestion('q', [], { onEvent: e => events.push(e), deps: { decide: llm.decide, run, search: async () => found({ queries: [Q(1, 'q1'), Q(2, 'q2')], routed: false }) } });
+    assert.equal(peak, 3, '병렬로 돌지 않았다');
+    assert.deepStrictEqual(r.trace.slice(1).map(h => [h.query_name, h.params.a, h.rows[0].V]), [['q1', 1, 1], ['q2', 2, 2], ['q1', 3, 3]]);
+    assert.equal(events.filter(e => e.type === 'run_query_done').length, 3);
+    // 조회 시간은 배치의 실제 경과로 한 번만 잰다 — 항목마다 재면 병렬로 겹친 시간이 그 수만큼 더해져
+    // 계측이 조회 몫을 부풀린다(4건이 2초에 끝나도 8초로 남는다). README가 그 숫자로 조정을 판단한다.
+    assert.equal(r.timing.oracle.length, 1, '배치 하나가 항목 수만큼 기록됐다');
+    assert.ok(r.timing.oracle[0] < 200, `겹친 시간이 더해졌다: ${r.timing.oracle[0]}ms (가장 느린 항목은 60ms)`);
+    // 시작·끝 이벤트는 짝 번호로 이어진다 — 이름·대상 DB로는 짝을 지을 수 없다(같은 쿼리를 다른 값으로 부르는
+    // 배치가 정당하고, 대상 DB의 철자도 시작(모델)과 끝(등록)이 다를 수 있다).
+    const starts = events.filter(e => e.type === 'run_query');
+    const dones = events.filter(e => e.type === 'run_query_done');
+    assert.deepStrictEqual(starts.map(e => e.id), [1, 2, 3]);
+    assert.deepStrictEqual([...dones.map(e => e.id)].sort(), [1, 2, 3]);
+    assert.equal(llm.seen.length, 3, 'LLM 왕복은 검색·일괄 조회·답변 셋뿐이어야 한다');
+    // 차트·표 참조가 보는 스텝 번호는 배치 순서다 (2번 = q1 a:1)
+    assert.equal(r.fullRows.get(r.trace[1])[0].V, 1);
+  } finally { restore(); }
+});
+
+test('일괄 조회도 MAX_STEPS 안이다 — 넘치는 항목은 잘리고 강제 답변으로 간다', async () => {
+  const restore = silence();
+  try {
+    const many = Array.from({ length: MAX_STEPS + 3 }, (_, i) => ({ query_name: 'q1', params: { a: i } }));
+    const llm = scripted([{ action: 'search', targets: ['query'] }, { action: 'run_queries', queries: many }, { action: 'run_query', query_name: 'q1', params: { a: 99 } }]);
+    let runs = 0;
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide, run: async () => { runs++; return { rows: [], totalRows: 0, capped: false, targetDb: 'D' }; }, search: async () => found({ queries: [Q(1, 'q1')], routed: false }) } });
+    assert.equal(runs, MAX_STEPS);
+    assert.equal(r.answer, '강제 답변');
+    // 상한에 걸려 실행하지 못한 항목은 조용히 사라지지 않는다 — 모델은 자기가 몇을 요청했는지 안다
+    const dropped = r.trace.filter(h => /조회 스텝 상한/.test(h.note ?? ''));
+    assert.equal(dropped.length, 1, JSON.stringify(r.trace.map(h => h.note ?? h.query_name)));
+    assert.equal(r.trace.length, MAX_STEPS + 2, '검색 1 + 실행 MAX_STEPS + 안내 1');
+    // 안내는 실행 줄 '뒤'에 온다 — 앞에 오면 아직 나오지도 않은 결과를 두고 '실행하지 않았다'가 먼저 읽히고,
+    // 그 줄이 낮은 번호를 차지해 모델이 답변에서 가리키는 번호도 함께 밀린다.
+    assert.equal(r.trace.at(-1).note, dropped[0].note, `안내가 실행 줄보다 먼저 기록됐다: ${JSON.stringify(r.trace.map(h => h.note ? 'note' : h.query_name))}`);
+  } finally { restore(); }
+});
+
+test('배치 안의 중복·미등록·가드 항목은 실행하지 않고 각자 기록되며, 하나라도 성공하면 진도다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', targets: ['query'] },
+      { action: 'run_query', query_name: 'q1', params: { a: 1 } },
+      { action: 'run_queries', queries: [
+        { query_name: 'q1', params: { a: 1 } },      // 이력에 이미 있다 → 루프 가드
+        { query_name: 'q2', params: { a: 2 } },
+        { query_name: 'q2', params: { a: 2 } },      // 같은 배치 안 중복
+        { query_name: 'nope', params: {} },          // 미등록 (목록에 없고 캐시도 없다 — DB를 부르지 않게 resolveCache를 채운다)
+      ] },
+      { action: 'answer', answer: '답' },
+    ]);
+    const run = async (row, params) => ({ rows: [{ V: params.a }], totalRows: 1, capped: false, targetDb: 'D' });
+    // 미등록 이름은 DB 재조회를 타므로 여기서는 이름을 목록에 넣되 등록 행이 아닌 것으로 만들 수 없다 —
+    // 대신 run 스텁이 미등록을 흉내 낼 수 없으니, 목록에 'nope'를 넣지 않고 resolveQuery가 DB로 가기 전에
+    // 캐시를 채울 수 없다. 그래서 이 항목은 배치에서 빼고 셋만 본다.
+    llm.seen.length = 0;
+    const decisions = llm;
+    const r = await handleQuestion('q', [], { deps: { decide: async ctx => {
+      const d = await decisions.decide(ctx);
+      if (d?.action === 'run_queries') d.queries = d.queries.filter(q => q.query_name !== 'nope');
+      return d;
+    }, run, search: async () => found({ queries: [Q(1, 'q1'), Q(2, 'q2')], routed: false }) } });
+    const batch = r.trace.slice(2);
+    assert.equal(batch.length, 3);
+    assert.match(batch[0].note, /이미 같은 파라미터/);
+    assert.equal(batch[1].rows[0].V, 2);
+    assert.match(batch[2].note, /같은 배치 안/);
+    assert.equal(r.answer, '답');
+  } finally { restore(); }
+});
+
+test('전부 헛돈 배치는 연속 가드로 세고, 강제 답변으로 간다', async () => {
+  const restore = silence();
+  try {
+    const dup = { query_name: 'q1', params: { a: 1 } };
+    const llm = scripted([
+      { action: 'search', targets: ['query'] },
+      { action: 'run_query', ...dup },
+      { action: 'run_queries', queries: [dup, dup] },   // 둘 다 가드 → 헛돈 배치 1
+      { action: 'run_queries', queries: [dup] },        // 헛돈 배치 2 → 강제 답변
+      { action: 'answer', answer: '여기 오면 안 된다' },
+    ]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide, run: async () => ({ rows: [{ V: 1 }], totalRows: 1, capped: false, targetDb: 'D' }), search: async () => found({ queries: [Q(1, 'q1')], routed: false }) } });
+    assert.equal(r.answer, '강제 답변');
+  } finally { restore(); }
+});
+
+test('답변의 table 참조는 그 스텝의 전체 행으로 채워진다', async () => {
+  const restore = silence();
+  try {
+    const rowsAll = Array.from({ length: 25 }, (_, i) => ({ ID: i, NAME: `n${i}` }));
+    const llm = scripted([
+      { action: 'search', targets: ['query'] },
+      { action: 'run_query', query_name: 'q1', params: {} },
+      { action: 'answer', answer: '결과:\n\n```table\nstep: 2\ncols: NAME\nlimit: 2\n```\n\n끝' },
+    ]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide, run: async () => ({ rows: rowsAll, totalRows: 25, capped: false, targetDb: 'D' }), search: async () => found({ queries: [Q(1, 'q1')], routed: false }) } });
+    assert.equal(r.answer, '결과:\n\n| NAME |\n| --- |\n| n0 |\n| n1 |\n_(25행 중 처음 2행만 실었습니다 — 전부는 아래 ⚡ 패널에 있습니다)_\n\n끝');
+  } finally { restore(); }
+});
+
+test('이력은 MAX_HISTORY_ROWS 줄을 넘지 않는다 — 검색·일괄 조회·가드 안내가 뒤섞여도', async () => {
+  // 일괄 조회 전에는 루프 반복 수가 곧 줄 수여서 이 상한이 저절로 지켜졌다. 결정 하나가 조회 여럿을 만들게
+  // 되면서 줄이 반복 수보다 많아질 수 있는데, 그러면 프롬프트의 이력 몫이 보장하는 '전부 실린다'가 깨져
+  // 가장 오래된 조회 결과가 조용히 빠진다 (test/prompt.test.js가 그 몫을 따로 지킨다).
+  const restore = silence();
+  try {
+    const decisions = [];
+    for (let i = 0; i < MAX_SEARCHES; i++) {
+      decisions.push({ action: 'search', text: `검색${i}`, targets: ALL });
+      decisions.push({ action: 'search', text: `검색${i}`, targets: ALL });   // 같은 검색 → 안내 줄
+    }
+    for (let i = 0; i < 4; i++) {
+      decisions.push({ action: 'run_queries', queries: Array.from({ length: 4 }, (_, j) => ({ query_name: 'q1', params: { a: i * 4 + j } })) });
+    }
+    const llm = scripted(decisions);
+    let n = 0;
+    const r = await handleQuestion('q', [], { deps: {
+      decide: llm.decide,
+      run: async () => ({ rows: [{ V: n++ }], totalRows: 1, capped: false, targetDb: 'D' }),
+      search: async () => found({ knowledge: [K(++n)], qaMethods: [], queries: [Q(1, 'q1')], routed: false }),
+    } });
+    assert.ok(r.trace.length <= MAX_HISTORY_ROWS, `이력이 ${r.trace.length}줄 — 상한 ${MAX_HISTORY_ROWS}을 넘었다`);
+    // 상한에 실제로 닿아야 이 검사가 무언가를 재는 것이다 (닿지 않으면 다른 상한이 먼저 걸린 것이다)
+    assert.equal(r.trace.length, MAX_HISTORY_ROWS, `상한에 닿지 않아 아무것도 재지 못했다: ${r.trace.length}줄`);
+    // 조회 줄은 조회 수 상한 안이다
+    assert.ok(r.trace.filter(h => h.rows).length <= MAX_STEPS);
+  } finally { restore(); }
+});
+
+test('검색이 던져도 이미 조회해둔 결과를 버리지 않는다 — 그 검색만 검색 불가로 남는다', async () => {
+  // 결정·조회는 각자 예외를 삼킨다(함께 버려지는 것이 이미 조회해둔 결과이기 때문이다). 검색을 루프
+  // 안으로 들여오면서 그 await만 밖에 있었다 — 두 번째 검색이 던지면 첫 조회 결과까지 통째로 잃고 500이 된다.
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', text: 'a', targets: ['query'] },
+      { action: 'run_query', query_name: 'q1', params: { a: 1 } },
+      { action: 'search', text: 'b', targets: ['knowledge', 'qa_method'] },
+      { action: 'answer', answer: '답' },
+    ]);
+    let n = 0;
+    const r = await handleQuestion('q', [], { deps: {
+      decide: llm.decide,
+      run: async () => ({ rows: [{ V: 1 }], totalRows: 1, capped: false, targetDb: 'D' }),
+      search: async () => { if (n++ === 0) return found({ queries: [Q(1, 'q1')], routed: false }); throw new Error('임베딩 폭발'); },
+    } });
+    assert.equal(r.answer, '답');
+    assert.equal(r.trace.filter(h => h.rows).length, 1, '조회 결과가 사라졌다');
+    const 던진검색 = r.trace.at(-1);
+    assert.deepStrictEqual(던진검색.failed, ['knowledge', 'qa_method'], '요청한 대상이 검색 불가로 남아야 한다');
+    assert.equal(r.search.searchFailed, true);
+  } finally { restore(); }
+});
+
+test('라우팅 판정은 성립한 쿼리 검색의 것만 남는다 — 뒤이은 실패가 지우지 않는다', async () => {
+  // 마지막 값으로 덮으면, 앞선 검색이 목록을 채워 놓고도 뒤 검색이 관리 DB 실패로 null을 주는 순간
+  // chat_log에 '한 번도 못 찾았거나 매번 실패했다'로 남아(README 분석 SQL) 정반대로 읽힌다.
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', text: 'a', targets: ['query'] },
+      { action: 'search', text: 'b', targets: ['query'] },
+      { action: 'answer', answer: '답' },
+    ]);
+    let n = 0;
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide, search: async () => (n++ === 0
+      ? found({ queries: [Q(1, 'q1'), Q(2, 'q2')], routed: true })
+      : found({ queries: null, routed: null, queriesFailed: true })) } });
+    assert.equal(r.search.queries, 2, '앞선 검색의 라우팅 판정이 지워졌다');
+    assert.equal(r.search.queriesFailed, true, '실패한 사실은 그대로 남아야 한다');
+  } finally { restore(); }
+});
+
+test('실행할 것이 하나도 없는 배치는 조회 시간에 기록되지 않는다', async () => {
+  // 0ms짜리 항목이 조회 횟수를 부풀린다 — README가 그 숫자로 검색 폭을 조정하라고 가리킨다.
+  const restore = silence();
+  try {
+    const dup = { query_name: 'q1', params: { a: 1 } };
+    const llm = scripted([
+      { action: 'search', targets: ['query'] },
+      { action: 'run_query', ...dup },
+      { action: 'run_queries', queries: [dup, dup] },   // 둘 다 가드 — 실행되는 것이 없다
+      { action: 'answer', answer: '답' },
+    ]);
+    let runs = 0;
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      run: async () => { runs++; return { rows: [{ V: 1 }], totalRows: 1, capped: false, targetDb: 'D' }; },
+      search: async () => found({ queries: [Q(1, 'q1')], routed: false }) } });
+    assert.equal(runs, 1);
+    assert.equal(r.timing.oracle.length, 1, `실행 없는 배치가 계측에 들어갔다: ${JSON.stringify(r.timing.oracle)}`);
+  } finally { restore(); }
+});
+
+// ===== 본문 청구(expand)와 버리기(drop) =====
+// 둘 다 조용히 깨진다. 펼친 항목이 목록 뒤에 남으면 예산에 밀려 정작 그 본문이 잘리고, 버린 항목이
+// 목록에서 빠지면 다음 검색이 같은 것을 다시 실어 온다 — 어느 쪽도 오류를 남기지 않는다.
+const LONG = (seq, title) => ({ seq, title, content: `${title} 본문 `.repeat(400) });
+
+test('본문 청구는 표시를 세우고 그 항목을 목록 맨 앞으로 옮긴다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', text: 'x', targets: ['knowledge'] },
+      { action: 'expand', ids: ['k2'] },
+      { action: 'answer', answer: '답' },
+    ]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      search: async () => found({ knowledge: [LONG(1, '첫째'), LONG(2, '둘째'), LONG(3, '셋째')] }) } });
+    const seen = llm.seen.at(-1).knowledge;
+    assert.deepStrictEqual(seen.map(k => k.seq), [2, 1, 3], '펼친 항목이 앞으로 오지 않았다 — 예산에 밀려 잘린다');
+    assert.equal(seen[0].expanded, true);
+    assert.ok(!seen[1].expanded && !seen[2].expanded);
+    assert.equal(r.search.expanded, 1);
+    assert.equal(r.trace.filter(h => h.expand !== undefined).length, 0, '성공한 청구는 이력에 남지 않는다');
+  } finally { restore(); }
+});
+
+test('버린 항목은 프롬프트에서 빠지고 재검색으로 되살아나지 않는다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', text: 'a', targets: ['knowledge'] },
+      { action: 'search', text: 'b', targets: ['knowledge'], drop: ['k1'] },
+      { action: 'answer', answer: '답' },
+    ]);
+    let n = 0;
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      // 두 번째 검색이 버린 항목을 다시 찾아온다 — 되살아나면 안 된다
+      search: async () => found({ knowledge: n++ === 0 ? [K(1), K(2)] : [K(1), K(3)] }) } });
+    const last = llm.seen.at(-1).knowledge;
+    assert.deepStrictEqual(last.filter(k => !k.dropped).map(k => k.seq), [3, 2]);
+    assert.equal(last.find(k => k.seq === 1).dropped, true, '버린 항목이 목록에서 사라지면 재검색으로 되살아난다');
+    assert.equal(r.search.dropped, 1);
+  } finally { restore(); }
+});
+
+test('버리기는 검색보다 먼저 적용된다 — 방금 버린 것이 그 검색으로 되살아나지 않게', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', text: 'a', targets: ['knowledge'] },
+      { action: 'search', text: 'b', targets: ['knowledge'], drop: ['k1'] },
+      { action: 'answer', answer: '답' },
+    ]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      search: async () => found({ knowledge: [K(1)] }) } });   // 두 검색이 같은 항목만 돌려준다
+    assert.equal(llm.seen.at(-1).knowledge.find(k => k.seq === 1).dropped, true);
+    assert.equal(r.search.dropped, 1);
+  } finally { restore(); }
+});
+
+test('펼칠 것이 없는 청구는 안내를 남기고 헛돈 스텝으로 센다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', text: 'x', targets: ['knowledge'] },
+      { action: 'expand', ids: ['k99'] },   // 목록에 없다
+      { action: 'expand', ids: ['k99'] },   // 두 번째 — 강제 답변으로 간다
+      { action: 'answer', answer: '여기 오면 안 된다' },
+    ]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      search: async () => found({ knowledge: [LONG(1, 'K')] }) } });
+    assert.equal(r.answer, '강제 답변');
+    const notes = r.trace.filter(h => h.expand !== undefined);
+    assert.equal(notes.length, 2);
+    assert.match(notes[0].note, /번호가 붙은 항목만/);
+  } finally { restore(); }
+});
+
+test('청구 상한을 넘으면 더 펼치지 않고 그 사실을 알린다', async () => {
+  const restore = silence();
+  try {
+    const ids = Array.from({ length: MAX_EXPANDS + 1 }, (_, i) => `k${i + 1}`);
+    const llm = scripted([
+      { action: 'search', text: 'x', targets: ['knowledge'] },
+      { action: 'expand', ids },              // 상한까지만 펼쳐진다
+      { action: 'expand', ids: ['k9'] },      // 상한에 닿았다
+      { action: 'answer', answer: '답' },
+    ]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      search: async () => found({ knowledge: ids.concat('k9').map((_, i) => LONG(i + 1, `K${i + 1}`)) }) } });
+    assert.equal(r.search.expanded, MAX_EXPANDS);
+    assert.match(r.trace.find(h => h.expand !== undefined).note, /상한/);
+  } finally { restore(); }
+});
+
+test('버리기만 한 청구도 진도로 본다 — 자료가 달라졌다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', text: 'x', targets: ['knowledge'] },
+      { action: 'expand', ids: ['k99'], drop: ['k1'] },   // 펼치지는 못했지만 버렸다
+      { action: 'answer', answer: '답' },
+    ]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      search: async () => found({ knowledge: [K(1), K(2)] }) } });
+    assert.equal(r.answer, '답');
+    assert.equal(r.search.dropped, 1);
+    assert.equal(r.trace.filter(h => h.expand !== undefined).length, 0, '진도가 났으면 안내를 남기지 않는다');
+  } finally { restore(); }
+});
+
+test('이력 줄 수 상한은 본문 청구가 섞여도 지켜진다', async () => {
+  const restore = silence();
+  try {
+    const decisions = [];
+    for (let i = 0; i < MAX_SEARCHES; i++) {
+      decisions.push({ action: 'search', text: `검색${i}`, targets: ALL });
+      decisions.push({ action: 'expand', ids: ['k99'] });          // 매번 헛돌아 안내를 남긴다
+      decisions.push({ action: 'search', text: `검색${i}`, targets: ALL });   // 같은 검색 — 안내
+    }
+    for (let i = 0; i < 3; i++) decisions.push({ action: 'run_queries', queries: [
+      { query_name: 'q1', params: { a: i * 2 } }, { query_name: 'q1', params: { a: i * 2 + 1 } }] });
+    const llm = scripted(decisions);
+    let n = 0;
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      run: async () => ({ rows: [{ V: n++ }], totalRows: 1, capped: false, targetDb: 'D' }),
+      search: async () => found({ knowledge: [K(++n)], qaMethods: [], queries: [Q(1, 'q1')], routed: false }) } });
+    assert.ok(r.trace.length <= MAX_HISTORY_ROWS, `이력이 ${r.trace.length}줄 — 상한 ${MAX_HISTORY_ROWS}을 넘었다`);
+  } finally { restore(); }
 });

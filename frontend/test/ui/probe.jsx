@@ -2,12 +2,16 @@
 // 가로챈다 — 서버도 모델도 없이 '답이 도착하고, 차트·흐름도가 뒤늦게 자리를 잡는' 그 순간을
 // 되풀이해서 만들 수 있어야 하기 때문이다.
 // 화면 껍데기(CSS)는 index.html에서 그대로 가져온다 (ui.test.mjs가 그 파일로 probe용 html을 만든다).
-import { CASES, TRACE, BROKEN_RESPONSES } from './fixtures.js';
+import { CASES, TRACE, BROKEN_RESPONSES, STREAM_EVENTS, STREAM_TRACE, STREAM_ANSWER_CHUNKS } from './fixtures.js';
 
 const which = new URLSearchParams(location.search).get('case') ?? 'rich';
 // ?broken=1 이면 정상 답 대신 BROKEN_RESPONSES를 한 번에 하나씩 차례로 내준다 — 한 대화 안에서
 // 모든 모양을 겪게 해야 '그중 하나에서 앱이 내려가면 그 뒤 질문도 못 한다'까지 함께 재게 된다.
 const broken = new URLSearchParams(location.search).has('broken');
+// ?stream=1 이면 서버가 진행 상황을 흘려보내는 모양(NDJSON — backend server.js openStream)으로 답한다:
+// STREAM_EVENTS를 ?gap= 간격으로 한 줄씩, 마지막에 done. 답이 오기 전에 검색 줄이 서는지를 재려면
+// 이벤트 사이가 눈에 보일 만큼 벌어져야 한다.
+const stream = new URLSearchParams(location.search).has('stream');
 let 몇번째 = 0;
 const realFetch = window.fetch.bind(window);
 window.fetch = async (url, opts) => {
@@ -24,6 +28,29 @@ window.fetch = async (url, opts) => {
         reject(new DOMException('The user aborted a request.', 'AbortError'));
       });
     });
+    if (stream) {
+      const gap = Number(new URLSearchParams(location.search).get('gap') ?? 400);
+      const enc = new TextEncoder();
+      const line = obj => enc.encode(`${JSON.stringify(obj)}\n`);
+      const body = new ReadableStream({
+        async start(c) {
+          for (const e of STREAM_EVENTS) {
+            c.enqueue(line(e));
+            await new Promise(r => setTimeout(r, gap));
+          }
+          // 답변 조각 — 서버가 답변 문자열을 디코딩해 흘리는 모양 (backend agent.js answer_delta)
+          const answer = CASES[which] ?? CASES.rich;
+          const size = Math.ceil(answer.length / STREAM_ANSWER_CHUNKS);
+          for (let i = 0; i < answer.length; i += size) {
+            c.enqueue(line({ type: 'answer_delta', text: answer.slice(i, i + size) }));
+            await new Promise(r => setTimeout(r, gap));
+          }
+          c.enqueue(line({ type: 'done', answer, trace: STREAM_TRACE }));
+          c.close();
+        },
+      });
+      return new Response(body, { status: 200, headers: { 'Content-Type': 'application/x-ndjson' } });
+    }
     const body = broken
       ? BROKEN_RESPONSES[몇번째++ % BROKEN_RESPONSES.length]
       : { answer: CASES[which] ?? CASES.rich, trace: which === 'rich' ? TRACE : undefined };
