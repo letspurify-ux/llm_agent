@@ -373,7 +373,15 @@ export default function App() {
   // 화면이 대화의 바닥에 붙어 있는가. 말풍선이 뒤늦게 커질 때 따라 내려갈지를 이것으로 정한다.
   const stuckRef = useRef(true);
   const lastTopRef = useRef(0);
-  const inputAtRef = useRef(0);   // 사용자가 마지막으로 화면을 만진 시각 (아래 byUser 참고)
+  // 사용자가 마지막으로 화면을 만진 시각 (아래 byUser 참고).
+  // 0이 아니라 -Infinity로 시작해야 한다: byUser는 performance.now()(문서를 열고 지난 시각)에서
+  // 이 값을 빼므로, 0은 '문서를 여는 순간 만졌다'가 되어 화면이 뜨고 INPUT_MS 동안 브라우저가
+  // 스스로 하는 자리 보정까지 전부 사용자의 뜻으로 읽힌다. 그동안 차트·흐름도가 자리를 잡으며
+  // 대신 서 있던 코드·표보다 짧아지면(내용이 줄어든다) 브라우저는 보던 것을 붙잡으려 scrollTop을
+  // 끌어내리는데(스크롤 앵커링), 그 한 번이 '사용자가 위로 올렸다'가 되어 따라가기가 끊긴다 —
+  // 답의 끝 150~190px이 화면 밖에 남았다(실측: 열 번 중 다섯 번, 열자마자 물었을 때).
+  // 아직 만지지 않았다는 것은 '아주 오래전'이지 '방금'이 아니다.
+  const inputAtRef = useRef(-Infinity);
   const lastHeightRef = useRef(0); // 마지막으로 본 내용 높이 — 관찰자와 onChatScroll이 함께 갱신한다
   const growRef = useRef(null); // 말풍선 크기 변화를 보는 ResizeObserver (아래 효과가 처음 필요할 때 만든다)
   const glideRef = useRef(null); // 진행 중인 미끄러짐 { raf, expect } (아래 glide 참고)
