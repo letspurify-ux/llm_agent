@@ -34,7 +34,10 @@ export const REHYPE_PLUGINS = [[rehypeKatex, {
   maxSize: 10,
   // 한글이 수식 안에 들어오면(모델이 \text 없이 쓰는 일이 흔하다) 경고를 콘솔에 쏟는 대신 그냥 그린다.
   strict: 'ignore',
-  // index.html의 .md .katex [style*="#cc0000"] 가 이 색으로 오류 글자를 찾는다 — 함께 바꿔야 한다.
+  // 문법이 틀린 자리를 붉게 남기는 색. 이 색으로 오류 글자를 '찾는' CSS는 없다 — React가 인라인
+  // 스타일을 CSSOM으로 얹어 style 속성에 16진수가 남지 않기 때문이고, 찾아서 접어 봐야 KaTeX의
+  // 중첩된 inline-block이 한 글자 폭으로 무너진다(index.html의 .katex-error 옆 주석 참고).
+  // 그러니 이 값은 '보이는 색'을 정할 뿐이고, 바꿔도 다른 파일과 어긋날 것이 없다.
   errorColor: '#cc0000',
 }]];
 

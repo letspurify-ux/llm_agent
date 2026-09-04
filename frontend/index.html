@@ -258,12 +258,19 @@
          — 이 패딩이 막으려던 바로 그 손상이 스크롤바 쪽 문으로 되돌아온다. */
       .md .katex-display { overflow-x: auto; overflow-y: hidden; padding: 4px 0 16px; margin: 10px 0 0; }
       /* 문법이 틀린 수식을 KaTeX가 붉게 남기는 경로는 둘이다. 파싱 자체가 실패하면 원문 전체가
-         .katex-error로 나오지만, 모르는 명령(\foobar)은 .katex '안'에 붉은 글자로 들어간다.
-         뒤쪽은 위의 word-break: normal이 걸려 있어 긴 명령 이름이 줄바꿈되지 않고,
-         .bubble의 overflow-x: clip에 잘려 아무것도 안 보이게 된다 — 두 경로 모두 접히게 한다.
-         색 값은 math.js의 errorColor와 짝이다(한쪽만 바꾸면 이 규칙이 조용히 안 걸린다). */
+         .katex-error(평범한 span)로 나오고, 그것은 이 한 줄로 접힌다.
+         모르는 명령(\foobar)은 .katex '안'에 붉은 글자로 들어가는데, 그쪽은 여기서 접을 수 없다.
+         앞서 `.md .katex [style*="#cc0000"]` 한 줄이 그것을 맡고 있었지만 두 가지 이유로 죽은 규칙이었다:
+           ① React는 인라인 스타일을 CSSOM으로 얹으므로 style 속성에는 우리가 적은 16진수가 남지
+              않는다 — 실제 값은 `color: rgb(204, 0, 0);`이라 이 선택자는 한 번도 걸리지 않았다.
+           ② 그래서 선택자를 고쳐 걸어 보면 오히려 더 나빠진다. KaTeX의 출력은 inline-block이 겹겹이
+              중첩된 구조라 word-break: break-all이 매 층의 최소 폭을 한 글자로 만든다 —
+              실측: 말풍선이 304×2,729px가 되고 붉은 글자가 한 글자씩 266줄로 섰다.
+         KaTeX 출력은 다시 흐르도록 만들어진 구조가 아니다. 그래서 이 경로는 넘치는 인라인 수식과
+         같은 규칙을 따른다: 별행($$)은 .katex-display의 가로 스크롤로 끝까지 닿고(위 참고),
+         인라인은 .bubble의 overflow-x: clip이 상자 안에 가둔다. 붉은 글자의 앞부분은 그대로 보이므로
+         '무언가 틀렸다'는 신호는 남는다. (math.js errorColor는 그 붉은색을 정하는 몫만 한다) */
       .md .katex-error { word-break: break-word; overflow-wrap: anywhere; }
-      .md .katex [style*="#cc0000"] { white-space: normal; word-break: break-all; }
       .md > :first-child { margin-top: 0; }
       .md > :last-child { margin-bottom: 0; }
 
