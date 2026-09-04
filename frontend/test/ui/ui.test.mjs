@@ -356,6 +356,27 @@ it('좁은 화면: 흐름도 글자가 읽히는 크기로 남고, 인쇄에서�
   assert.ok(paper.넘침 <= 1);
 });
 
+it('인쇄물에서 답변 안의 넓은 표가 소리 없이 잘리지 않는다', async () => {
+  // 종이에는 가로 스크롤이 없다 — 화면에서 넓은 표를 가두는 overflow-x가 종이에서는 그대로
+  // '오른쪽을 버린다'가 되고, 그러고도 아무 표시가 남지 않는다(실측: 열 14개 표의 오른쪽 587px).
+  // 조회 결과 표(.trace-grid)는 잘린다는 것을 안내로 밝히고 전체를 CSV로 넘기지만, 답변 안의
+  // 표에는 그런 출구가 없다 — 여기서 잘린 값은 어디에서도 볼 수 없다.
+  await answered(1000, 760, { c: 'wideprint' });
+  const 재기 = `(() => { const t = document.querySelector('.md table');
+    return { 잘림: Math.round(t.scrollWidth - t.clientWidth),
+             밖으로: Math.round(t.getBoundingClientRect().right - document.querySelector('.chat-inner').getBoundingClientRect().right) }; })()`;
+  const 화면 = await page.eval(재기);
+  // 전제: 화면에서는 이 표가 실제로 넘쳐 가로 스크롤에 갇혀 있어야 한다 (넘치지 않으면 아무것도 재지 않는다)
+  assert.ok(화면.잘림 > 50, `화면에서 표가 넘치지 않아 이 검사가 성립하지 않는다 (${화면.잘림}px)`);
+  await page.media('print');
+  const 종이 = await page.eval(재기);
+  await page.media('screen');
+  assert.ok(종이.잘림 <= 1, `인쇄물에서 표의 오른쪽 ${종이.잘림}px이 잘렸다 — 그 값은 어디에서도 볼 수 없다`);
+  assert.ok(종이.밖으로 <= 1, `표가 종이의 열 밖으로 ${종이.밖으로}px 나갔다 — 그만큼은 여백에 잘린다`);
+  // 화면은 지금까지 그대로여야 한다 — 종이를 고치려다 화면의 표가 한 글자 폭으로 접히면 안 된다
+  assert.strictEqual((await page.eval(재기)).잘림, 화면.잘림, '인쇄 미디어를 다녀온 뒤 화면의 표가 달라졌다');
+});
+
 it('조합 확정으로 보낸 질문은 입력창에 남지 않는다 (마지막 input이 compositionend 뒤에 오는 브라우저)', async () => {
   // 한글은 마지막 글자가 늘 조합 중이라 Enter 전송은 거의 언제나 조합 확정을 거친다. 그런데 확정의
   // 마지막 input 이벤트가 compositionend '앞'에 오는 브라우저와 '뒤'에 오는 브라우저가 갈린다 —

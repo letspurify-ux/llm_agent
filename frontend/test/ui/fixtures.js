@@ -60,6 +60,13 @@ export const CASES = {
   tableimg: ['```chart', 'type: bar', 'title: 셀 안의 그림',
     '| 이름 | 값 |', '| --- | --- |',
     '| ![셀그림](/__probe-pixel.png?e=5) | 3 |', '| 평범한 이름 | 5 |', '```'].join('\n'),
+  // 인쇄에서 잘리는지 보는 답변 — 화면에서 가로로 넘치는 넓은 표. 종이에는 가로 스크롤이 없어
+  // 화면의 가둠(.md table의 overflow-x)이 그대로 '오른쪽을 버린다'가 된다(index.html @media print).
+  // 열은 어느 창 폭에서도 넘치도록 넉넉히 둔다 — 넘치지 않으면 그 시험은 아무것도 재지 않는다.
+  wideprint: [`| ${Array.from({ length: 14 }, (_, i) => `아주 긴 열 이름 ${i + 1}`).join(' | ')} |`,
+    `|${' --- |'.repeat(14)}`,
+    ...Array.from({ length: 3 }, (_, r) =>
+      `| ${Array.from({ length: 14 }, (_, i) => `값 ${r + 1}-${i + 1} 조금 길게`).join(' | ')} |`)].join('\n'),
   // 흐름도 라벨에 HTML을 넣은 답변
   mermaidhtml: ['```mermaid', 'flowchart LR',
     '  A["<img src=/__probe-pixel.png?d=4>"] --> B["<b>굵게</b>"]', '```'].join('\n'),
@@ -103,6 +110,7 @@ export const READY = {
          && document.querySelector('.mermaid svg')`,
   images: `document.querySelector(${주소를_가리키는_링크(NESTED_LINK)})`,
   mermaidhtml: `document.querySelector('.mermaid svg')`,
+  wideprint: `document.querySelector('.md table')`,
   // 차트가 서고 '표로 보기'의 표까지 붙은 뒤라야 셀 안의 그림을 볼 수 있다(접혀 있어도 DOM에는
   // 있고, 브라우저는 접힌 <details> 안의 <img>도 불러온다).
   tableimg: `document.querySelector('figure.chart .recharts-surface') && document.querySelector('.md .chart-table table')`,

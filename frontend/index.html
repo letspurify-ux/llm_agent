@@ -428,8 +428,17 @@
         .trace-grid { overflow: hidden; }
         .trace-print-note { display: block; }
         .md .chart { break-inside: avoid; }
-        /* 종이에는 가로 스크롤이 없다 — 코드는 접어서 보여 준다(표·차트는 원래 폭을 지킨다) */
+        /* 종이에는 가로 스크롤이 없다 — 코드는 접어서 보여 준다 */
         .md pre { white-space: pre-wrap; overflow: visible; }
+        /* 답변 안의 표도 같다. 화면에서는 넓은 표를 가로 스크롤(.md table의 overflow-x)로 가두는데,
+           종이에서 그것은 '오른쪽을 그냥 버린다'가 된다 — 그러고도 아무 표시가 남지 않는다
+           (실측: 열 14개짜리 표의 오른쪽 587px이 인쇄물에서 사라졌다). 조회 결과 표(.trace-grid)는
+           잘린다는 것을 안내로 밝히고 전체를 CSV로 넘기지만, 답변 안의 표에는 그런 출구가 없다 —
+           여기서 잘린 값은 어디에서도 볼 수 없다. 그래서 코드와 같은 처방으로 셀을 접어 폭 안에 들인다
+           (nowrap은 화면에서 열이 한 글자 폭으로 접히지 않게 하려는 것이라 종이에서는 할 일이 없다).
+           .trace-grid의 셀은 .md 밖이라 이 규칙에 닿지 않는다 — 그쪽은 지금처럼 안내로 밝힌다. */
+        .md table { overflow-x: visible; }
+        .md th, .md td { white-space: normal; }
         /* 흐름도도 마찬가지다. 좁은 창에서는 글자가 읽히도록 SVG에 최소 폭을 인라인으로 걸어 두는데
            (Mermaid.jsx), 인쇄에는 ResizeObserver가 돌지 않아 그 값이 그대로 남는다 — 종이에서는
            스크롤로 볼 수 없으니 오른쪽이 그냥 잘린다. 인라인 값을 덮으려면 !important여야 한다. */
