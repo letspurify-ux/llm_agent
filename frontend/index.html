@@ -234,6 +234,11 @@
       /* recharts 툴팁 등은 자기 스타일을 인라인으로 갖는다. 글자 줄바꿈 규칙만 말풍선 것을 되돌린다 —
          축 눈금은 SVG 글자라 영향이 없지만 범례·툴팁은 HTML이다. */
       .md .chart .recharts-wrapper { word-break: normal; overflow-wrap: normal; }
+      /* 그 되돌림의 예외 둘. 범례·툴팁에 서는 이름은 조회 결과의 열 이름·셀 값 그대로이고(chart.js가
+         MAX_NAME_LEN 60자까지만 들여보낸다) 띄어쓰기가 없을 수 있다 — 위 규칙 그대로면 60자짜리
+         식별자 하나가 상자를 뚫고 나가고, 나간 글자는 말풍선의 overflow-x: clip에 잘려 읽을 수 없다.
+         이 둘은 아래로 감겨도 그림을 밀어내지 않는 자리이므로 여기서만 다시 켠다. */
+      .md .chart .recharts-tooltip-wrapper, .md .chart .recharts-legend-wrapper { overflow-wrap: anywhere; }
       /* mermaid는 SVG에 자기 폭(max-width: NNNpx)을 인라인으로 쓴다 — 말풍선보다 넓으면 줄인다 */
       .md .mermaid { margin: 8px 0; overflow-x: auto; }
       .md .mermaid svg { max-width: 100%; height: auto; }

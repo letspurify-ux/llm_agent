@@ -15,17 +15,37 @@ import { defaultUrlTransform } from 'react-markdown';
 export const mdUrlTransform = (url, key, node) =>
   (key === 'src' && node?.tagName === 'img' ? url : defaultUrlTransform(url));
 
+// 각주([^1])를 그릴 때 붙는 글자. remark-rehype가 만드는 것이고 기본값은 영어다 — 한국어 화면에
+// 'Footnotes'라는 제목과 'Back to reference 1'이라는 스크린리더 글자가 그대로 나간다(실측: 말풍선이
+// '본문에 각주가 있습니다1. Footnotes 각주 내용입니다. ↩'로 보였다). 오류는 나지 않는다.
+// 제목의 클래스도 함께 비운다. 기본값은 sr-only인데(화면에서 감추고 스크린리더에만 읽히라는 뜻),
+// 이 화면에는 그런 규칙이 없어 감춰지지 않는다 — 이름이 하는 말과 실제가 다른 클래스를 남겨 두면
+// 언젠가 누가 .sr-only 한 줄을 더한 날 이 제목이 소리 없이 사라진다. 보이는 편이 낫다: 감추면
+// 각주 묶음이 모델이 쓴 번호 목록과 구별되지 않는다. 그래서 '보이는 제목'이라고 여기서 못 박는다
+// (id는 라이브러리가 늘 붙이므로 본문의 aria-describedby는 그대로 이어진다).
+const FOOTNOTE_OPTIONS = Object.freeze({
+  footnoteLabel: '각주',
+  footnoteLabelProperties: Object.freeze({}),
+  footnoteBackLabel: (i, r) => `본문으로 돌아가기 ${i + 1}${r > 1 ? `-${r}` : ''}`,
+});
+
 // <ReactMarkdown>에 걸 한 벌. 위의 urlTransform은 그림 src의 기본 검사를 걷어내므로, 그 값을 <img>로
 // 만들지 않는 img 컴포넌트(App.jsx AltImage)가 반드시 함께 있어야 한다 — 둘을 따로 넘기면 짝을
 // 맞추는 일이 자리마다의 기억이 되고, 새 <ReactMarkdown> 하나가 그것을 잊으면 모델이 쓴 주소가
 // 곧바로 <img src>가 되어 사용자가 누르기도 전에 불려 나간다(오류로는 보이지 않는다).
 // 그래서 한 객체로 묶어 내고, img가 없으면 여기서 곧바로 멈춘다.
+// 각주 글자(위 FOOTNOTE_OPTIONS)도 같은 한 벌에 넣는 이유가 이것이다 — 자리마다 따로 적으면
+// 새 <ReactMarkdown> 하나가 영어 제목을 그대로 내보낸다.
 // 부르는 쪽은 모듈 상수로 한 번만 만든다 — 렌더마다 새 객체를 넘기면 react-markdown이 파이프라인을
-// 매번 다시 조립한다(App.jsx의 플러그인 배열과 같은 이유).
+// 매번 다시 조립한다(App.jsx의 플러그인 배열과 같은 이유. remarkRehypeOptions도 그 재조립의 조건이다).
 export function mdProps(components) {
   if (typeof components?.img !== 'function')
     throw new Error('mdProps: img 컴포넌트가 없으면 그림 주소가 곧바로 <img src>가 된다');
-  return Object.freeze({ urlTransform: mdUrlTransform, components: Object.freeze({ ...components }) });
+  return Object.freeze({
+    urlTransform: mdUrlTransform,
+    remarkRehypeOptions: FOOTNOTE_OPTIONS,
+    components: Object.freeze({ ...components }),
+  });
 }
 
 // 브라우저가 주소를 읽기 전에 걷어내는 것(URL 표준). 앞뒤의 제어문자·공백은 잘리고, 탭·줄바꿈은

@@ -4,7 +4,7 @@ import remarkGfm from 'remark-gfm';
 // 수식 표기의 계약(무엇이 수식인가 + 그것을 어떻게 그리는가)은 전부 math.js에 있다.
 import { REMARK_PLUGINS, REHYPE_PLUGINS } from './math.js';
 // 차트 블록의 계약(무엇을 차트로 받는가 + 이력으로 되돌릴 때의 모양)은 chart.js에 있다.
-import { parseChartBlock, splitBlock, chartTableMarkdownFrom, chartBlocksToTables, sliceSafe, clip, MAX_CHARTS_PER_MESSAGE } from './chart.js';
+import { parseChartBlock, splitBlock, chartTableMarkdownFrom, chartBlocksToTables, sliceSafe, clip, MAX_CHARTS_PER_MESSAGE, MAX_TITLE_LEN } from './chart.js';
 // trace 패널의 계약(열·셀 표기·CSV)은 trace.js에 있다.
 import { columnsOf, cellText, toCsv, csvFileName, stepLabel, normalizeTrace } from './trace.js';
 // 답변 속 주소를 어떻게 다룰지의 판정은 markdown.js에 있다 (순수 함수라 회귀 테스트가 붙는다).
@@ -57,7 +57,11 @@ const TABLE_MD = mdProps({ a: NewTabLink, img: AltImage });
 // 여기서 다시 가르면 한 답변에 같은 글자를 몇 번씩 훑게 된다.
 function ChartTable({ text, block, withTitle = false }) {
   const md = chartTableMarkdownFrom(block);
-  const title = String(block.config.title ?? '').trim();
+  // 제목은 그리는 쪽과 같은 길이로 묶는다(chart.js MAX_TITLE_LEN). 여기서만 자르지 않으면, 같은
+  // 블록이 그려질 때는 80자짜리 제목을 달고 그리지 못할 때는 모델이 쓴 글이 통째로 제목이 된다 —
+  // 실측: 600자 제목이 그대로 말풍선에 폈다(그리는 쪽 figcaption은 80자였다). 이 값도 조회 결과가
+  // 섞인 모델의 글자라 길이의 상한이 없고, 상한이 어느 갈래에만 있으면 그것은 상한이 아니다.
+  const title = clip(String(block.config.title ?? '').trim(), MAX_TITLE_LEN);
   if (!md) {
     if (block.config.data === undefined) return <pre><code>{text}</code></pre>;
     return <p><em>{title ? `'${title}' ` : ''}차트를 그리지 못했습니다: 조회 결과를 채우지 못했습니다</em></p>;
@@ -835,10 +839,19 @@ export default function App() {
   // execCommand는 폐기 예정이지만 이 용도는 아직 모든 브라우저가 지원하고, 값을 직접 갈아끼우는 것과 달리
   // 진짜 input 이벤트를 일으켜 controlled state가 따라오고 되돌리기(Ctrl+Z) 이력도 남는다.
   function insertNewline(el) {
-    if (document.execCommand('insertText', false, '\n')) return;
+    // 던지는 브라우저도 있다(이 명령을 아예 꺼 둔 환경). 던지게 두면 keydown 핸들러가 통째로 끊겨
+    // 아래 대비 경로까지 닿지 못하고, Alt+Enter는 아무 일도 하지 않는다 — 막힌 것과 같은 처지이므로
+    // 같은 길로 내려보낸다.
+    try { if (document.execCommand('insertText', false, '\n')) return; } catch { /* 아래 대비 경로로 */ }
     // 막혔을 때의 대비. 이게 없으면 Alt+Enter가 아무 일도 하지 않는 것처럼 보인다.
     const { selectionStart: start, selectionEnd: end, value } = el;
-    setInput(`${value.slice(0, start)}\n${value.slice(end)}`);
+    const next = `${value.slice(0, start)}\n${value.slice(end)}`;
+    // 이 길은 브라우저의 입력 경로를 지나지 않으므로 입력창의 maxLength가 걸리지 않는다 — 여기서
+    // 직접 지킨다. 그러지 않으면 상한을 넘긴 질문이 만들어지고, 그 사실은 다 쓰고 보낸 뒤 서버가
+    // 400으로 되돌려 줄 때에야 알게 된다(backend constants.js MAX_QUESTION_LEN).
+    // 넘치면 아무 일도 하지 않는다 — 상한에 닿은 입력창에 글자를 더 치는 것과 같은 모습이다.
+    if (el.maxLength >= 0 && next.length > el.maxLength) return;
+    setInput(next);
     // 커서는 React가 새 값을 그린 뒤에 옮긴다 — 지금 옮기면 그 렌더가 커서를 맨 뒤로 되돌린다.
     queueMicrotask(() => el.setSelectionRange(start + 1, start + 1));
   }
@@ -905,7 +918,13 @@ export default function App() {
     } catch (e) {
       // answer는 통신 오류 기본값 유지. 콘솔에는 남긴다 —
       // 네트워크 실패·타임아웃·클라이언트 예외가 화면에서는 모두 같은 문구로 보이기 때문이다.
-      console.error('[chat] request failed:', e);
+      // 다만 우리가 일부러 끊은 것(홈 단추·요청 상한)은 실패가 아니다. 그것까지 오류로 적으면
+      // 사용자가 평범하게 누른 단추 하나가 콘솔에 붉은 줄을 남겨, 지원하는 사람이 보는 화면에서
+      // 진짜 통신 실패와 구분되지 않는다(실측: 홈을 누를 때마다 '[chat] request failed: AbortError').
+      // 그리고 이 길은 '콘솔이 조용한가'를 보는 UI 검사가 영영 지나갈 수 없는 길이 된다.
+      // 오류가 아니라 우리가 한 일이므로 알림으로만 남긴다 (Mermaid.jsx의 정책 경로와 같은 결).
+      if (e?.name === 'AbortError') console.info('[chat] 요청을 끊었습니다 (홈으로 돌아갔거나 시간이 다 됐습니다)');
+      else console.error('[chat] request failed:', e);
     } finally {
       clearTimeout(timer);
       // 화면에는 항상 남기지만, 서버로 되돌려 보내는 이력에는 서버가 준 답만 넣는다 —

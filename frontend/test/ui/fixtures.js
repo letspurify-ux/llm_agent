@@ -1,7 +1,8 @@
 // UI 회귀 테스트가 화면에 흘려 넣는 답변과 trace. probe.jsx(그리는 쪽)와 ui.test.mjs(재는 쪽)가
 // 같은 것을 봐야 하므로 JSX가 없는 이 파일에 둔다 — 재는 쪽이 픽스처를 눈대중으로 베껴 적으면,
 // 픽스처를 고친 날 검사는 조용히 다른 것을 재게 된다.
-import { MAX_PIE_SLICES, MAX_CHARTS_PER_MESSAGE, CHART_FENCE_RE } from '../../src/chart.js';
+import { MAX_PIE_SLICES, MAX_CHARTS_PER_MESSAGE, MAX_SERIES, MAX_NAME_LEN, MAX_LABEL_LEN, MAX_TITLE_LEN,
+  CHART_FENCE_RE } from '../../src/chart.js';
 import { stepLabel } from '../../src/trace.js';
 
 // 원그래프 조각 수의 상한을 늘 넘겨 둔다 — '기타'로 모으는 길이 실제로 밟힌다. 정해진 목록을
@@ -15,6 +16,27 @@ export const NODE_NAMES = Array.from({ length: MAX_PIE_SLICES + 2 }, (_, i) => �
 // 음수가 되고, recharts는 음수 조각의 path를 그리지 않는다 — 조각 수가 조용히 모자라 검사는
 // 애먼 앱을 탓한다. 모두 양수이면서 내림차순이라 '기타'로 모이는 것은 늘 작은 값들이다.
 export const NODE_VALUES = NODE_NAMES.map((_, i) => (NODE_NAMES.length - i) * 8);
+
+// 조회 결과의 셀 하나가 이만큼 길 수 있다. 서버의 셀 상한(backend constants.js MAX_CELL_LEN 200자)보다
+// 넉넉히 잡는다 — 그 상한이 늘어도 이 픽스처가 먼저 걸리게. 띄어쓰기가 없어야 한다: 줄바꿈으로 접히는
+// 글자는 상자를 밀어내지 않으므로, 접히지 않는 한 덩어리라야 '화면 밖으로 나가는가'를 실제로 잰다.
+export const LONG_CELL = '노드'.repeat(120);
+
+// 상한에 꽉 찬 이름 하나. 길이를 상수에서 받아 오는 이유는 NODE_VALUES와 같다 — 상한을 바꾼 날
+// 픽스처가 상한 아래로 내려가면, 그 검사는 아무것도 재지 않으면서 초록불을 낸다.
+// 띄어쓰기는 두지 않는다: 접히는 글자는 상자를 밀어내지 않으므로 한 덩어리라야 실제로 잰다.
+const 꽉찬이름 = (len, i) => '노드이름'.repeat(Math.ceil(len / 4)).slice(0, len - String(i).length) + i;
+// 시리즈 이름이 상한까지 길고 시리즈도 상한까지 많은 답변. 그 범례를 그림 상자 '안'에 두면 범례가
+// 그래프 몫의 높이를 통째로 가져가, 막대도 축도 눈금선도 없이 범례만 선 그림이 남는다(실측: 창
+// 1000px에서 그려진 요소 0개). 이름은 조회 결과의 열 이름 그대로이므로 이 길이가 실제로 온다.
+export const LONG_SERIES_NAMES = Array.from({ length: MAX_SERIES }, (_, i) => 꽉찬이름(MAX_NAME_LEN, i));
+// 범주 이름이 축 눈금 상한까지 긴 눕힌 막대(범주 13개 이상, Chart.jsx HORIZONTAL_FROM). 그 축은
+// 라벨만큼 넓어지므로(width="auto") 좁은 화면에서는 축 하나가 상자를 다 먹는다(실측: 창 320px에서
+// 막대 0개, 창 380px에서 막대가 설 자리 23px).
+export const LONG_CATEGORY_NAMES = Array.from({ length: 15 }, (_, i) => 꽉찬이름(MAX_LABEL_LEN, i));
+// 상한을 훌쩍 넘긴 제목. 차트를 그릴 때는 MAX_TITLE_LEN으로 잘리는데, 그리지 못한 블록의 제목도
+// 같은 길이여야 한다 — 한쪽만 묶여 있으면 그것은 상한이 아니다.
+export const LONG_TITLE = '제목'.repeat(MAX_TITLE_LEN);
 
 // 모델이 쓴 주소가 조회 결과를 실어 나르면 이만큼 길어진다 (화면에 그대로 펴지면 답이 묻힌다).
 export const LONG_URL = `https://ex.test/report?q=${encodeURIComponent('가'.repeat(300))}`;
@@ -100,6 +122,25 @@ export const CASES = {
     'flowchart LR', '  A[하나] --> B[둘]', '```'].join('\n'),
   pielong: pieOf(PIE_LONG_NAMES),
   pieshort: pieOf(PIE_SHORT_NAMES),
+  // 조회 결과의 셀·열 이름이 그대로 차트의 이름이 되는 답변. 그 길이를 묶지 않으면 툴팁 상자가 그만큼
+  // 옆으로 자라 화면 밖으로 나가고(실측 2,513px 상자, 1,000px 창의 오른쪽 1,653px 밖), 나간 글자는
+  // 말풍선의 overflow-x: clip에 잘려 어디에서도 읽을 수 없다.
+  longnames: ['```chart', 'type: bar', 'title: 긴 이름',
+    `| 이름 | ${LONG_CELL} |`, '| --- | --- |', `| ${LONG_CELL} | 5 |`, '| 짧은것 | 9 |', '```'].join('\n'),
+  // 그림 상자의 곁것(범례·범주 축)이 상자를 다 먹어 그림이 사라지던 두 자리. 한 답변에 함께 둔다 —
+  // 둘은 같은 계약이다: recharts가 스스로 크기를 정하는 곁것은 그림 몫을 남겨 두어야 한다.
+  longnamechart: ['```chart', 'type: bar', 'title: 긴 이름 여섯 열',
+    `| 월 | ${LONG_SERIES_NAMES.join(' | ')} |`, `|${' --- |'.repeat(LONG_SERIES_NAMES.length + 1)}`,
+    ...['1월', '2월', '3월'].map((m, r) => `| ${m} | ${LONG_SERIES_NAMES.map((_, i) => (r + 1) * (i + 1) * 10).join(' | ')} |`),
+    '```', '',
+    '```chart', 'type: bar', 'title: 눕힌 막대', '| 항목 | 값 |', '|---|---|',
+    ...LONG_CATEGORY_NAMES.map((n, i) => `| ${n} | ${(i * 37) % 90 + 10} |`), '```'].join('\n'),
+  // 그린 블록과 그리지 못한 블록이 같은 제목을 단다 — 제목의 길이는 두 갈래에서 같아야 한다.
+  // 뒤 블록은 값 열이 글자라 그리지 못한다(chart.js '숫자 열 없음').
+  longtitle: ['```chart', 'type: bar', `title: ${LONG_TITLE}`, '| 이름 | 값 |', '|---|---|', '| a | 1 |', '| b | 2 |', '```', '',
+    '```chart', 'type: bar', `title: ${LONG_TITLE}`, '| 이름 | 값 |', '|---|---|', '| a | 글자 |', '| b | 글자 |', '```'].join('\n'),
+  // 각주가 달린 답변. 각주 묶음의 제목·되돌아가기 글자는 remark-rehype가 붙이는데 기본값이 영어다.
+  footnote: ['본문에 각주가 있습니다[^1].', '', '[^1]: 각주 내용입니다.'].join('\n'),
   // 눕힌 막대(범주 13개 이상, Chart.jsx HORIZONTAL_FROM)와 세로 막대 한 벌 — 툴팁이 마우스 자리의 행을 맞게
   // 찾는지 두 방향 모두에서 본다. 눕힌 쪽은 범주 축이 YAxis(yAxisId="left")라 툴팁이 축을 따로 받아야 한다.
   bars: ['```chart', 'type: bar', 'title: 눕힌 막대', '| 항목 | 값 |', '|---|---|',
@@ -171,6 +212,13 @@ export const READY = {
   wideprint: `document.querySelector('.md table')`,
   pielong: `document.querySelector('figure.chart .recharts-pie-sector')`,
   pieshort: `document.querySelector('figure.chart .recharts-pie-sector')`,
+  longnames: `document.querySelector('figure.chart .recharts-bar-rectangle .recharts-rectangle')`,
+  // 두 차트가 모두 '무언가를 그렸다'까지 기다린다 — 막대로 기다리면 고치기 전에는 영영 서지 않아
+  // 시험이 실패가 아니라 시간 초과로 죽는다(그러면 무엇이 잘못됐는지는 말해 주지 않는다).
+  longnamechart: `document.querySelectorAll('figure.chart').length === 2
+    && [...document.querySelectorAll('figure.chart')].every(f => f.querySelector('.recharts-wrapper svg'))`,
+  longtitle: `document.querySelector('figure.chart .recharts-surface') && document.querySelector('.md strong')`,
+  footnote: `document.querySelector('.md .footnotes')`,
   bars: `document.querySelectorAll('figure.chart').length === 2 && [...document.querySelectorAll('figure.chart')].every(f => f.querySelector('.recharts-bar-rectangle .recharts-rectangle'))`,
   // 차트가 서고 '표로 보기'의 표까지 붙은 뒤라야 셀 안의 그림을 볼 수 있다(접혀 있어도 DOM에는
   // 있고, 브라우저는 접힌 <details> 안의 <img>도 불러온다).

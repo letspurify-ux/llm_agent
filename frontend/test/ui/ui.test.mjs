@@ -16,9 +16,10 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { findChrome, launchChrome, chromePort, stopProcess, killOnExit, freePort, oneTab, Page, sleep, STATE,
   alive, aliveGroup } from './driver.mjs';
-import { pieSlices, parseChartBlock } from '../../src/chart.js';
+import { pieSlices, parseChartBlock, MAX_TITLE_LEN } from '../../src/chart.js';
 import { TRACE, READY, PIE_BLOCK, PIE_LONG_NAMES, PIE_SHORT_NAMES, LONG_URL, DATA_URL, MAIL_URL, CAPPED_LABEL, ERROR_LABEL,
-  ANCHOR_URL, ANCHOR_TEXT, ANCHOR_IMG_TEXT, NESTED_LINK, BROKEN_RESPONSES, 주소를_가리키는_링크 } from './fixtures.js';
+  ANCHOR_URL, ANCHOR_TEXT, ANCHOR_IMG_TEXT, NESTED_LINK, LONG_CELL, LONG_SERIES_NAMES, LONG_CATEGORY_NAMES,
+  BROKEN_RESPONSES, 주소를_가리키는_링크 } from './fixtures.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const PROBE = join(ROOT, 'ui-probe.html');
@@ -474,6 +475,198 @@ it('막대 위의 툴팁은 눕힌 막대에서도 마우스 자리의 행을 �
     const tip = await hover(1, i, 'left');
     assert.ok(tip && tip.startsWith(name) && tip.includes(String(value)), `세로 막대 ${i + 1}열의 툴팁이 그 열이 아니다: ${JSON.stringify(tip)}`);
   }
+});
+
+it('값 축의 눈금선이 눈금 자리에 그려진다 (격자도 자기 축을 id로 찾는다)', async () => {
+  // Recharts 3의 격자는 축을 axisId로 고르고 기본값은 0인데, 이 화면의 Y축은 전부 이름 붙은
+  // 축("left"·"right")이라 0번 축이 없다. 그러면 격자는 눈금을 하나도 찾지 못하고 상자의 위·아래
+  // 경계선 두 줄만 긋는다 — 값 축의 눈금선이 통째로 사라지는 셈이라 막대·선의 값을 눈으로 읽을
+  // 수 없다(실측: 눈금 0·3·6·9·12에 선은 맨 위와 맨 아래 둘뿐이었다). 툴팁이 같은 이유로 엉뚱한
+  // 행을 보이던 것과 같은 결이고, 오류는 나지 않으므로 이 검사가 유일한 방어선이다.
+  // 두 방향을 함께 못 박는다: 세로 막대의 값 축은 YAxis(이름 붙은 축), 눕힌 막대의 값 축은
+  // XAxis(id 없는 축)라 한쪽만 재면 고치기 전에도 절반은 통과한다.
+  await answered(1000, 760, { c: 'bars' });
+  const got = await page.eval(`(() => {
+    const num = v => Math.round(parseFloat(v));
+    const of = (i, sel) => [...document.querySelectorAll('figure.chart')[i].querySelectorAll(sel)];
+    const 눕힌 = { 선: of(0, '.recharts-cartesian-grid-vertical line').map(l => num(l.getAttribute('x1'))),
+                   눈금: of(0, '.recharts-xAxis-tick-labels text').map(t => num(t.getAttribute('x'))) };
+    const 세로 = { 선: of(1, '.recharts-cartesian-grid-horizontal line').map(l => num(l.getAttribute('y1'))),
+                   눈금: of(1, '.recharts-yAxis-tick-labels text').map(t => num(t.getAttribute('y'))) };
+    const 빠진것 = ({ 선, 눈금 }) => 눈금.filter(v => !선.some(s => Math.abs(s - v) <= 1));
+    return { 세로눈금수: 세로.눈금.length, 세로빠짐: 빠진것(세로),
+             눕힌눈금수: 눕힌.눈금.length, 눕힌빠짐: 빠진것(눕힌) }; })()`);
+  assert.ok(got.세로눈금수 > 2, `세로 막대의 값 축에 눈금이 ${got.세로눈금수}개뿐이라 이 검사가 성립하지 않는다`);
+  assert.deepStrictEqual(got.세로빠짐, [], '세로 막대의 값 축 눈금 자리에 눈금선이 없다 — 막대의 값을 눈으로 읽을 수 없다');
+  assert.ok(got.눕힌눈금수 > 2, `눕힌 막대의 값 축에 눈금이 ${got.눕힌눈금수}개뿐이라 이 검사가 성립하지 않는다`);
+  assert.deepStrictEqual(got.눕힌빠짐, [], '눕힌 막대의 값 축 눈금 자리에 눈금선이 없다');
+});
+
+it('조회 결과가 실린 긴 이름이 툴팁을 화면 밖으로 밀어내지 않는다', async () => {
+  // 차트의 이름(열 이름·조각 이름)은 조회 결과의 셀 값 그대로다. 축 눈금(label)만 길이를 묶어
+  // 두었을 때, 240자짜리 범주 이름 하나가 툴팁을 2,513px 상자로 부풀려 1,000px 창의 오른쪽
+  // 1,653px 밖으로 나갔다(좁은 화면 380px에서는 2,173px). 나간 글자는 말풍선의 overflow-x: clip에
+  // 잘려 어디에서도 읽을 수 없다 — 화면 밖으로 나가지 않는 것과 무엇인지 보이는 것을 함께 잰다.
+  // 좁은 화면까지 재는 이유: 넓은 화면에서만 재면 상한을 그림 상자보다 넓게 잡아도 통과한다.
+  const 툴팁 = async () => {
+    const b = await page.eval(`(() => { const r = document.querySelector('figure.chart .recharts-bar-rectangle .recharts-rectangle')
+      ?.getBoundingClientRect(); return r ? { x: r.left + Math.max(3, r.width / 2), y: r.top + r.height / 2 } : null; })()`);
+    assert.ok(b, '막대가 없다 (검사의 전제)');
+    // 이동은 되풀이해 보낸다 — 차트가 다시 그려지는 순간에 온 이동은 그리는 쪽이 놓치고, 그 뒤로는
+    // 아무도 다시 알려 주지 않는다 (위 '막대 위의 툴팁' 시험과 같은 이유).
+    for (let t = 0; t < 10; t++) {
+      await page.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: b.x - 1, y: b.y });
+      await page.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: b.x, y: b.y });
+      await sleep(150);
+      const got = await page.eval(`(() => { const w = document.querySelector('.recharts-tooltip-wrapper');
+        if (!w || getComputedStyle(w).visibility !== 'visible') return null;
+        const r = w.getBoundingClientRect();
+        const fig = document.querySelector('figure.chart').getBoundingClientRect();
+        return { 글자: w.textContent.replace(/\\s+/g, ' ').trim(),
+                 그림밖: Math.round(Math.max(r.right - fig.right, fig.left - r.left)),
+                 창밖: Math.round(Math.max(r.right - innerWidth, 0 - r.left)) }; })()`);
+      if (got) return got;
+    }
+    assert.fail('툴팁이 서지 않았다 (검사의 전제)');
+  };
+  for (const [w, h] of [[1000, 760], [380, 760]]) {
+    await answered(w, h, { c: 'longnames' });
+    const t = await 툴팁();
+    assert.ok(t.창밖 <= 0, `창 ${w}px에서 툴팁이 화면 밖으로 ${t.창밖}px 나갔다 — 그만큼은 잘려 읽을 수 없다`);
+    assert.ok(t.그림밖 <= 0, `창 ${w}px에서 툴팁이 그림 상자 밖으로 ${t.그림밖}px 나갔다`);
+    // 나가지 않는 것만으로는 모자라다 — 이름을 통째로 지워도 통과한다. 무엇인지는 보여야 한다.
+    assert.ok(t.글자.includes(LONG_CELL.slice(0, 20)), `툴팁이 무엇인지 말하지 않는다: ${JSON.stringify(t.글자)}`);
+  }
+});
+
+it('그림 상자의 곁것(범례·범주 축)이 그림 몫을 통째로 먹지 않는다', async () => {
+  // recharts는 범례와 범주 축의 크기를 스스로 정하고, 그만큼을 260px 상자 '안'에서 가져간다.
+  // 그 크기를 정하는 글자는 조회 결과의 열 이름·셀 값이라 상한까지 길어질 수 있는데(MAX_NAME_LEN
+  // 60자 × MAX_SERIES 6열, 축 눈금 MAX_LABEL_LEN 30자), 그러면 곁것이 상자를 통째로 먹고 그림이
+  // 사라진다 — 막대도 축도 눈금선도 하나 없이 범례만, 또는 라벨만 남았다(실측: 창 1000px에서 범례가
+  // 230px을 먹어 그려진 요소 0개. 눕힌 막대는 창 320px에서 0개, 창 380px에서 막대가 설 자리 23px).
+  // 아무 오류도 나지 않는다 — 사용자에게는 그냥 차트가 없는 답변이라, 이 검사가 유일한 방어선이다.
+  // 두 자리를 함께 못 박는 이유는 같은 계약이기 때문이다: 스스로 크기를 정하는 곁것은 그림 몫을
+  // 남겨 두어야 한다. 한쪽만 재면 다른 쪽이 같은 길로 다시 사라진다.
+  // 좁은 화면(320px — index.html이 상정하는 가장 좁은 창)까지 재는 이유: 넓은 화면에서만 재면
+  // 곁것에 상자보다 넉넉한 몫을 내주어도 통과한다.
+  for (const [w, h] of [[1000, 900], [320, 900]]) {
+    await answered(w, h, { c: 'longnamechart' });
+    const got = await page.eval(`(() => [...document.querySelectorAll('figure.chart')].map(f => {
+      const box = f.getBoundingClientRect();
+      const grid = f.querySelector('.recharts-cartesian-grid')?.getBoundingClientRect();
+      const legend = f.querySelector('.chart-legend');
+      const items = legend ? [...legend.querySelectorAll('li')] : [];
+      const svg = f.querySelector('.recharts-wrapper svg')?.getBoundingClientRect();
+      return {
+        그린것: f.querySelectorAll('.recharts-bar-rectangle .recharts-rectangle').length,
+        격자: grid ? { w: Math.round(grid.width), h: Math.round(grid.height) } : null,
+        범례항목: items.map(li => li.textContent),
+        범례가_그림밖: legend && svg ? legend.getBoundingClientRect().top >= svg.bottom - 1 : null,
+        말풍선밖: items.some(li => li.getBoundingClientRect().right > box.right + 1),
+      }; }))()`);
+    const [세로, 눕힘] = got;
+    assert.strictEqual(세로.그린것, 3 * LONG_SERIES_NAMES.length, `창 ${w}px: 긴 이름의 시리즈가 그려지지 않았다 (${JSON.stringify(세로)})`);
+    assert.ok(세로.격자?.h > 60, `창 ${w}px: 범례가 그림 몫의 높이를 먹었다 (격자 높이 ${세로.격자?.h}px)`);
+    // 이름은 범례에 온전히 남아야 한다 — 그림을 살리자고 이름을 지우면 어느 색이 무엇인지 알 수 없다
+    assert.deepStrictEqual(세로.범례항목, LONG_SERIES_NAMES, `창 ${w}px: 범례가 열 이름을 그대로 말하지 않는다`);
+    assert.ok(세로.범례가_그림밖, `창 ${w}px: 범례가 그림 상자 안에 있다`);
+    assert.ok(!세로.말풍선밖, `창 ${w}px: 범례가 말풍선 밖으로 나갔다`);
+    assert.strictEqual(눕힘.그린것, LONG_CATEGORY_NAMES.length, `창 ${w}px: 눕힌 막대가 그려지지 않았다 (${JSON.stringify(눕힘)})`);
+    assert.ok(눕힘.격자?.w > 60, `창 ${w}px: 범주 축이 그림 몫의 폭을 먹었다 (격자 폭 ${눕힘.격자?.w}px)`);
+  }
+  // 축 눈금은 줄이더라도 상자 안에 서야 한다 — 밖으로 나간 글자는 아무 표시 없이 잘린다.
+  // (온전한 이름은 툴팁과 '표로 보기'에 있다. 여기서 재는 것은 '잘린 채 밖에 서 있지 않은가'다)
+  const 눈금 = await page.eval(`(() => { const f = document.querySelectorAll('figure.chart')[1];
+    const svg = f.querySelector('.recharts-wrapper svg').getBoundingClientRect();
+    const ts = [...f.querySelectorAll('.recharts-yAxis-tick-labels text')];
+    return { 수: ts.length, 밖으로: Math.round(Math.max(0, ...ts.map(t => svg.left - t.getBoundingClientRect().left))),
+             줄인것: ts.filter(t => t.textContent.endsWith('…')).length }; })()`);
+  assert.strictEqual(눈금.수, LONG_CATEGORY_NAMES.length, '눕힌 막대의 범주 눈금이 사라졌다');
+  assert.strictEqual(눈금.밖으로, 0, `범주 눈금이 그림 상자 왼쪽으로 ${눈금.밖으로}px 나가 잘렸다`);
+  assert.ok(눈금.줄인것 > 0, '좁은 화면인데 줄인 눈금이 하나도 없다 — 이 검사가 줄이는 길을 밟지 않았다');
+});
+
+it('각주 묶음도 한국어로 적힌다 (기본값은 영어라 화면에 그대로 나간다)', async () => {
+  // 각주 묶음의 제목과 되돌아가기 링크의 글자는 remark-rehype가 붙이고 기본값이 영어다 —
+  // 온통 한국어인 이 화면에 'Footnotes'라는 제목이 그대로 섰고, 스크린리더가 읽는 글자도
+  // 'Back to reference 1'이었다(실측). 오류는 나지 않는다.
+  // 제목의 클래스(기본값 sr-only)도 함께 잰다: 이 화면에는 그 클래스를 감추는 규칙이 없어 제목은
+  // 보이는 글자다. 이름이 하는 말과 실제가 다른 클래스를 남겨 두면, 누가 .sr-only 한 줄을 더한 날
+  // 각주 제목이 소리 없이 사라진다 (markdown.js FOOTNOTE_OPTIONS).
+  await answered(1000, 760, { c: 'footnote' });
+  const got = await page.eval(`(() => { const md = document.querySelector('.bubble.assistant .md');
+    const h = md.querySelector('#footnote-label');
+    return { 제목: h?.textContent ?? null, 클래스: h?.className ?? null,
+             보임: h ? h.getBoundingClientRect().height > 0 : false,
+             되돌아가기: [...md.querySelectorAll('a[data-footnote-backref]')].map(a => a.getAttribute('aria-label')) }; })()`);
+  assert.strictEqual(got.제목, '각주', `각주 묶음의 제목이 한국어가 아니다: ${JSON.stringify(got.제목)}`);
+  assert.strictEqual(got.클래스, '', `제목에 감추라는 클래스가 남아 있다: ${JSON.stringify(got.클래스)}`);
+  assert.ok(got.보임, '각주 제목이 보이지 않는다 — 각주 묶음이 모델이 쓴 번호 목록과 구별되지 않는다');
+  assert.deepStrictEqual(got.되돌아가기, ['본문으로 돌아가기 1'], '되돌아가기 링크의 글자가 한국어가 아니다');
+});
+
+it('그리지 못한 차트의 제목도 그린 차트와 같은 길이로 묶인다', async () => {
+  // 제목은 모델이 쓴 글자이고 그 재료에는 조회 결과가 섞인다 — 길이의 상한이 없다. 그리는 쪽은
+  // MAX_TITLE_LEN으로 자르는데 그리지 못한 블록은 자르지 않아, 같은 제목이 한 답변 안에서 80자와
+  // 600자로 갈렸다(실측). 상한이 어느 갈래에만 있으면 그것은 상한이 아니다.
+  await answered(1000, 760, { c: 'longtitle' });
+  const got = await page.eval(`(() => ({
+    그린것: document.querySelector('figure.chart figcaption')?.textContent?.length ?? null,
+    못그린것: document.querySelector('.bubble.assistant .md strong')?.textContent?.length ?? null }))()`);
+  assert.strictEqual(got.그린것, MAX_TITLE_LEN, '그린 차트의 제목이 상한과 다르다 (검사의 전제)');
+  assert.strictEqual(got.못그린것, MAX_TITLE_LEN,
+    `그리지 못한 블록의 제목이 ${got.못그린것}자다 — 그린 쪽은 ${got.그린것}자다`);
+});
+
+it('홈으로 끊은 요청은 오류가 아니다 (콘솔에 붉은 줄을 남기지 않는다)', async () => {
+  // 홈 단추는 진행 중인 요청을 끊는다(App.jsx goHome) — 요청 상한 450초를 다 기다리게 하지 않으려고
+  // 일부러 그렇게 만든 길이다. 그런데 그 AbortError가 통신 실패와 같은 자리에서 console.error로
+  // 나가고 있었다(실측: 홈을 누를 때마다 '[chat] request failed: AbortError'). 지원하는 사람이 보는
+  // 콘솔에서 평범한 단추 하나가 장애처럼 보이고, 무엇보다 이 길은 '콘솔이 조용한가'를 보는 아래
+  // afterEach가 영영 지나갈 수 없는 길이 된다 — 실제로 걸리는 것은 그 afterEach다.
+  await page.viewport(1000, 760);
+  await page.goto(`${url()}&delay=5000`, '.chip');
+  await page.eval(`document.querySelectorAll('.chip')[0].click()`);
+  await page.until(`document.querySelector('.typing')`, { what: '답을 기다리는 중이 되기' });
+  await page.eval(`document.querySelector('.home-btn').click()`);
+  await sleep(600);
+  // 끊긴 요청이 비운 화면에 뒤늦게 떨어지지도 않아야 한다 (goHome의 세대 번호)
+  const 화면 = await page.eval(`({ 말풍선: document.querySelectorAll('.row').length,
+                                   기다림: !!document.querySelector('.typing'), 첫화면: !!document.querySelector('.empty') })`);
+  assert.deepStrictEqual(화면, { 말풍선: 0, 기다림: false, 첫화면: true }, '홈으로 돌아간 화면이 첫 화면이 아니다');
+});
+
+it('줄바꿈의 대비 경로도 입력 상한을 지킨다 (execCommand가 막힌 브라우저)', async () => {
+  // Alt+Enter의 줄바꿈은 execCommand로 넣는다. 그것이 막힌 브라우저를 위한 대비 경로는 값을 직접
+  // 갈아끼우는데, 그 길은 브라우저의 입력 경로를 지나지 않아 입력창의 maxLength가 걸리지 않았다
+  // (실측: 2,000자에서 Alt+Enter 한 번에 2,001자가 됐다). 넘긴 질문은 다 쓰고 보낸 뒤에야 서버가
+  // 400으로 돌려준다. 그 명령을 꺼 둔 브라우저(false를 돌려주는 것과 던지는 것 둘 다 있다)를 흉내 낸다.
+  for (const 막는법 of ['() => false', '() => { throw new Error("disabled"); }']) {
+    await page.viewport(1000, 760);
+    await page.goto(url(), '.chip');
+    await page.eval(`(() => { document.execCommand = ${막는법}; return true; })()`);
+    await page.eval(`document.querySelector('.composer textarea').focus()`);
+    const 상한 = await page.eval(`document.querySelector('.composer textarea').maxLength`);
+    await page.send('Input.insertText', { text: 'ㄱ'.repeat(상한) });
+    assert.strictEqual(await page.eval(`document.querySelector('.composer textarea').value.length`), 상한, '검사의 전제: 입력창이 상한까지 찼다');
+    const alt = { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, modifiers: 1 };
+    await page.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...alt });
+    await page.send('Input.dispatchKeyEvent', { type: 'keyUp', ...alt });
+    await sleep(250);
+    assert.strictEqual(await page.eval(`document.querySelector('.composer textarea').value.length`), 상한,
+      `execCommand가 ${막는법}인 브라우저에서 줄바꿈이 입력 상한을 넘겼다`);
+  }
+  // 막지 않은 브라우저에서는 그대로 줄이 바뀐다 — 상한을 지키려다 줄바꿈을 죽이지 않았는지 함께 본다
+  await page.goto(url(), '.chip');
+  await page.eval(`document.querySelector('.composer textarea').focus()`);
+  await page.send('Input.insertText', { text: '한 줄' });
+  const alt = { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, modifiers: 1 };
+  await page.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...alt });
+  await page.send('Input.dispatchKeyEvent', { type: 'keyUp', ...alt });
+  await sleep(250);
+  assert.strictEqual(await page.eval(`JSON.stringify(document.querySelector('.composer textarea').value)`), '"한 줄\\n"',
+    'Alt+Enter가 줄을 바꾸지 않았다');
 });
 
 it('좁은 화면: 흐름도 글자가 읽히는 크기로 남고, 인쇄에서는 그 최소 폭이 풀린다', async () => {

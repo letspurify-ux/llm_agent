@@ -14,7 +14,16 @@ window.fetch = async (url, opts) => {
   if (String(url).includes('/api/chat')) {
     // 서버가 답하기까지의 사이. 기본은 짧게 두고(대부분의 검사는 기다릴 이유가 없다), 답이
     // 오기 전에 화면을 만져 봐야 하는 검사만 ?delay=로 늘린다.
-    await new Promise(r => setTimeout(r, Number(new URLSearchParams(location.search).get('delay') ?? 150)));
+    // 끊으라는 신호(App.jsx의 AbortController — 홈 단추와 요청 상한이 쓴다)는 진짜 fetch와 같이
+    // AbortError로 답한다. 그러지 않으면 여기서는 아무리 끊어도 답이 그대로 도착해, 끊는 길을
+    // 지나는 검사가 사실은 아무것도 끊지 않은 채 초록불을 낸다.
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, Number(new URLSearchParams(location.search).get('delay') ?? 150));
+      opts?.signal?.addEventListener('abort', () => {
+        clearTimeout(timer);
+        reject(new DOMException('The user aborted a request.', 'AbortError'));
+      });
+    });
     const body = broken
       ? BROKEN_RESPONSES[몇번째++ % BROKEN_RESPONSES.length]
       : { answer: CASES[which] ?? CASES.rich, trace: which === 'rich' ? TRACE : undefined };

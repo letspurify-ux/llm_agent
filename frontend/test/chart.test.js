@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import {
   parseChartBlock, chartBlocksToTables, chartTableMarkdown, toNumber, toTime, pieSlices, clip, sliceSafe,
-  chartNotes, fmtNum, pieLabelsOverflow, MAX_CHART_ROWS, MAX_SERIES, MAX_LABEL_LEN, MAX_PIE_SLICES,
+  chartNotes, fmtNum, pieLabelsOverflow, fitText, MAX_CHART_ROWS, MAX_SERIES, MAX_LABEL_LEN, MAX_NAME_LEN, MAX_PIE_SLICES,
 } from '../src/chart.js';
 
 const TABLE = '| 월 | 건수 | 금액 |\n|---|---|---|\n| 2024-01 | 120 | 1,000 |\n| 2024-02 | 80 | 2,500 |';
@@ -195,6 +195,37 @@ test('모르는 type은 막대, 별칭은 정규화, 상한(행·시리즈·라�
   assert.strictEqual(long.rows[0].full.length, 50);
 });
 
+test('모르는 type은 무엇이든 막대다 — 별칭 표가 프로토타입까지 뒤지지 않는다', () => {
+  // 별칭 표를 평범한 객체로 두면 [] 조회가 프로토타입까지 올라간다. `type: constructor` 한 줄이면
+  // Object 함수가 '아는 이름'으로 돌아와 spec.type이 문자열이 아니게 되고, 그 값은 모델이 쓴 글자
+  // 하나로 정해진다 — 그리는 쪽은 type을 문자열로 비교하므로(Chart.jsx) 이 계약이 깨지는 것은
+  // 조용하다. 소문자 이름만 걸리므로(nameKey가 내리므로) 다른 프로토타입 멤버는 이미 막대였다.
+  for (const t of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__', 'isPrototypeOf']) {
+    const s = spec(`type: ${t}\n| a | b |\n|---|---|\n| x | 1 |`);
+    assert.strictEqual(s.type, 'bar', `type: ${t} 가 막대가 아니다 (${typeof s.type})`);
+  }
+});
+
+test('범례·툴팁에 서는 이름은 상한 안이다 — 조회 결과가 그대로 이름이 되는 자리', () => {
+  // 열 이름과 조각 이름은 조회 결과의 셀·열 이름 그대로다(서버 MAX_CELL_LEN 200자). 축 눈금(label)만
+  // 묶어 두었을 때, 240자짜리 범주 이름 하나가 툴팁을 2,513px 상자로 부풀려 1,000px 창의 오른쪽
+  // 1,653px 밖으로 나갔다(실측, 창 380px에서는 2,173px). 그렇게 나간 글자는 말풍선의 overflow-x: clip에
+  // 잘려 어디에서도 읽을 수 없다 — 잘리지 않은 값은 차트 곁의 '표로 보기'에 있다.
+  const 긴것 = '노드'.repeat(120);
+  const s = spec(`type: bar\nx: 이름\n| 이름 | ${긴것} | ${긴것}2 |\n|---|---|---|\n| ${긴것} | 1 | 2 |\n| 짧은것 | 3 | 4 |`);
+  assert.ok(s.xName.length <= MAX_NAME_LEN, `x 이름이 ${s.xName.length}자다`);
+  for (const x of s.series) assert.ok(x.name.length <= MAX_NAME_LEN, `시리즈 이름이 ${x.name.length}자다`);
+  for (const r of s.rows) assert.ok(r.full.length <= MAX_NAME_LEN, `full이 ${r.full.length}자다`);
+  // 축 눈금은 그보다 더 짧게 남아 있어야 한다 — 이름 상한이 눈금 상한을 덮어써서는 안 된다
+  assert.strictEqual(s.rows[0].label.length, MAX_LABEL_LEN);
+  // 짧은 이름은 그대로다 (상한이 모든 이름을 자르는 규칙이 되어서는 안 된다)
+  assert.strictEqual(s.rows[1].full, '짧은것');
+  // 오른쪽 축의 이름도 같은 문을 지난다
+  const 두축 = spec(`type: bar\nx: 이름\ny: ${긴것}\ny2: ${긴것}2\n| 이름 | ${긴것} | ${긴것}2 |\n|---|---|---|\n| a | 1 | 2 |`);
+  for (const x of 두축.series) assert.ok(x.name.length <= MAX_NAME_LEN, `두 축의 이름이 ${x.name.length}자다`);
+  assert.strictEqual(두축.series.filter(x => x.axis === 'right').length, 1);
+});
+
 test('표 안의 \\| 와 구분 줄 생략, 표 뒤의 설명 줄을 받아들인다', () => {
   const s = spec('type: bar\n| a | b |\n| x\\|y | 1 |\n| z | 2 |\n위 표는 예시다\ntype: 이건 설정이 아니다');
   assert.deepStrictEqual(s.rows.map(r => r.x), ['x|y', 'z']);
@@ -263,9 +294,26 @@ test('chartBlocksToTables: 이력으로 보낼 때 펜스·설정을 벗기고 �
   // 차트가 아닌 코드펜스와 닫히지 않은 펜스는 그대로
   assert.strictEqual(chartBlocksToTables('```sql\nselect 1\n```'), '```sql\nselect 1\n```');
   assert.strictEqual(chartBlocksToTables('```chart\ntype: bar\n| a | b |'), '```chart\ntype: bar\n| a | b |');
-  // 표 없이 제목만 남은 블록은 제목 한 줄, 아무것도 없으면 빈 줄
+  // 표 없이 제목만 남은 블록(서버가 채우지 못한 `data:` 참조)은 제목 한 줄
   assert.strictEqual(chartBlocksToTables('```chart\ntitle: 제목\ndata: step 1\n```'), '제목');
-  assert.strictEqual(chartBlocksToTables('```chart\ntype: bar\n```'), '');
+  assert.strictEqual(chartBlocksToTables('```chart\ndata: step 1\n```'), '');
+});
+
+test('표도 `data:` 참조도 없는 chart 펜스는 화면에 남는 그대로 이력에도 남는다', () => {
+  // 그런 블록은 차트가 아니다 — 모델이 펜스를 다른 용도로 쓴 것이라, 화면은 그 글자를 원문 그대로
+  // 코드로 보인다(App.jsx ChartTable: '참조도 표도 없는 블록은 무엇인지 모르므로 원문 그대로 둔다').
+  // 이력에서만 지우면 사용자가 보고 있는 글을 모델만 보지 못한다 — 다음 질문의 '## 최근 대화'에
+  // 그 자리가 통째로 비어, 모델은 자기가 방금 한 말을 근거로 답할 수 없다. 오류는 나지 않는다.
+  assert.strictEqual(chartBlocksToTables('앞\n\n```chart\n이건 그냥 글입니다\n```\n\n뒤'), '앞\n\n이건 그냥 글입니다\n\n뒤');
+  // 설정 줄만 있는 블록도 같다 — 화면은 그 줄을 코드로 보인다
+  assert.strictEqual(chartBlocksToTables('```chart\ntype: bar\n```'), 'type: bar');
+  // 제목이 있어도 표가 없으면 화면은 원문을 보인다(제목 한 줄로 바꾸지 않는다) — 이력도 그래야 한다
+  assert.strictEqual(chartBlocksToTables('```chart\ntitle: 제목만\n아무 글\n```'), 'title: 제목만\n아무 글');
+  // 표가 있으면 지금까지대로 제목 + 표다 (원문을 그대로 두는 것은 표가 없을 때뿐이다)
+  assert.strictEqual(chartBlocksToTables('```chart\ntitle: 제목\n| a | b |\n|---|---|\n| x | 1 |\n```'),
+    '제목\n| a | b |\n|---|---|\n| x | 1 |');
+  // 본문의 들여쓰기는 원문 그대로 둔다 — 목록 안의 블록이 목록 밖으로 떨어져 나가지 않게
+  assert.strictEqual(chartBlocksToTables('1. 항목\n\n    ```chart\n    그냥 글\n    ```'), '1. 항목\n\n    그냥 글');
 });
 
 // 값 읽기의 실패 방향은 한쪽으로만 열려 있어야 한다: 읽지 못하면 빈칸(그리지 않음)이지, 그럴듯한
@@ -351,6 +399,35 @@ test('자르기는 상한을 넘지 않고 서로게이트 쌍을 쪼개지 않�
   assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(clip(emoji, 60)));
   assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(sliceSafe(emoji, 59)));
   assert.ok(clip(emoji, 60).length <= 60);
+});
+
+test('fitText: 자리보다 넓은 글자는 그 자리 안으로 줄인다 (넘치면 소리 없이 잘리는 자리)', () => {
+  // 눕힌 막대의 범주 축은 라벨이 긴 만큼 넓어지고(Chart.jsx width="auto"), 라벨은 조회 결과의 셀
+  // 값이라 상한(MAX_LABEL_LEN 30자)까지 온다 — 좁은 화면에서는 축 하나가 상자를 통째로 먹어
+  // 막대도 축도 눈금선도 사라졌다(실측: 창 320px). 그래서 축에 내주는 자리를 정하고 그 안으로 줄인다.
+  // 폭을 재는 일은 부르는 쪽(글꼴을 아는 자리)의 몫이라 여기서는 어떤 재기 함수든 받는다.
+  const measure = t => [...t].reduce((w, c) => w + (/[가-힣]/.test(c) ? 11 : 6), 0);
+  const 이름 = '항목이름'.repeat(7) + '00';   // 30자
+  assert.strictEqual(measure(이름), 28 * 11 + 2 * 6);
+  // 자리에 맞게 줄이되 그 자리를 넘지 않는다 (…도 폭을 차지한다 — 그것까지 세어야 한다)
+  for (const room of [11, 30, 100, 200, 300]) {
+    const got = fitText(이름, room, measure);
+    assert.ok(measure(got) <= room, `자리 ${room}px에 ${measure(got)}px짜리를 남겼다: ${JSON.stringify(got)}`);
+    assert.ok(got.length < 이름.length, `줄이지 않았다: ${JSON.stringify(got)}`);
+  }
+  // 줄인 것은 줄였다고 보여야 한다 — 표시 없이 잘린 이름은 그것이 원래 이름인 줄 알게 만든다
+  // (…를 붙일 자리조차 없는 한 글자짜리는 clip의 규칙대로 그냥 한 글자다)
+  assert.ok(fitText(이름, 100, measure).endsWith('…'));
+  assert.strictEqual(fitText(이름, 11, measure), '항');
+  // 자리가 넉넉하면 그대로 둔다 — 들어가는 이름까지 줄이면 읽을 수 있던 것이 …가 된다
+  assert.strictEqual(fitText(이름, 1000, measure), 이름);
+  assert.strictEqual(fitText('가', 1000, measure), '가');
+  // 자리가 없거나 말이 안 되면 빈 글자다 (상자 폭을 아직 재지 못한 첫 렌더 등)
+  assert.strictEqual(fitText(이름, 0, measure), '');
+  assert.strictEqual(fitText(이름, -1, measure), '');
+  assert.strictEqual(fitText(이름, NaN, measure), '');
+  // 한 글자도 못 들어가는 자리에서는 아무것도 남기지 않는다 (한 글자를 억지로 세우지 않는다)
+  assert.strictEqual(fitText(이름, 3, measure), '');
 });
 
 test('차트의 숫자 표기: 소수 두 자리로 담기지 않는 작은 값을 0이라고 말하지 않는다', () => {

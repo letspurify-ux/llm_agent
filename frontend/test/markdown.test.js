@@ -120,6 +120,16 @@ test('urlTransform과 img는 한 벌로만 나온다 (한쪽만 걸린 자리를
   assert.throws(() => mdProps(), /img/);
   // 부르는 쪽이 뒤에서 img만 갈아 끼우지 못하게 얼려 둔다(모듈 상수로 한 번만 만든다)
   assert.ok(Object.isFrozen(한벌) && Object.isFrozen(한벌.components));
+  // 각주 글자도 같은 한 벌에 실린다 — 기본값이 영어라, 자리마다 따로 적으면 새 <ReactMarkdown>
+  // 하나가 'Footnotes'라는 제목을 한국어 화면에 그대로 내보낸다(아래 시험이 그 자리를 다 센다).
+  const 각주 = 한벌.remarkRehypeOptions;
+  assert.strictEqual(각주.footnoteLabel, '각주');
+  assert.strictEqual(각주.footnoteBackLabel(0, 1), '본문으로 돌아가기 1');
+  // 제목의 클래스는 비워 둔다 — 기본값 sr-only는 '감추라'는 뜻인데 이 화면에는 그런 규칙이 없어
+  // 감춰지지 않는다. 이름과 실제가 다른 클래스를 남기면 누가 .sr-only 한 줄을 더한 날 제목이 사라진다.
+  assert.deepStrictEqual(각주.footnoteLabelProperties, {});
+  // 렌더마다 새 객체를 넘기면 react-markdown이 파이프라인을 다시 조립한다(그 값이 useMemo의 조건이다)
+  assert.strictEqual(각주, mdProps({ img: () => null }).remarkRehypeOptions);
 });
 
 test('화면의 모든 <ReactMarkdown>이 그 한 벌을 받는다 (App.jsx)', () => {

@@ -34,6 +34,14 @@ export const MAX_CHART_ROWS = 100;
 export const MAX_SERIES = 6;
 export const MAX_LABEL_LEN = 30;
 export const MAX_TITLE_LEN = 80;
+// 범례·툴팁에 적는 이름의 상한 — 열 이름(header)과 조각의 원래 이름(full). 축 눈금의 30자보다
+// 넉넉하다: 두 자리 모두 아래로 감기므로 이름 하나가 두 줄이 되어도 그림을 밀어내지 않는다.
+// 그래도 상한이 있어야 한다. 이 둘은 조회 결과의 셀·열 이름 그대로라(서버 MAX_CELL_LEN 200자)
+// 자유 텍스트 한 문단이 그대로 온다 — 축 눈금(label)만 묶어 두었을 때, 240자짜리 범주 이름 하나가
+// 툴팁을 2,513px 상자로 부풀려 1,000px 창의 오른쪽 1,653px 밖으로 나갔다(실측: 창 380px에서는
+// 2,173px). 그렇게 나간 글자는 말풍선의 overflow-x: clip에 잘려 어디에서도 읽을 수 없다.
+// 잘리지 않은 값은 차트 곁의 '표로 보기'에 늘 그대로 있다.
+export const MAX_NAME_LEN = 60;
 // 원그래프 조각 수. 그 뒤는 '기타' 한 조각으로 모은다(작은 조각 스무 개는 범례도 색도 읽히지 않는다).
 export const MAX_PIE_SLICES = 12;
 // 메시지 하나에 그릴 차트 수. 모델이 열 개를 내놓으면 열 개의 ResponsiveContainer가 리사이즈
@@ -44,14 +52,18 @@ const HISTORY_TABLE_ROWS = 20;
 
 const TYPES = new Set(['bar', 'stacked-bar', 'line', 'area', 'pie', 'scatter']);
 // 모델이 실제로 쓰는 변형들. 모르는 이름은 막대다 — 표만 남기는 것보다 낫고, 막대는 무엇이든 담는다.
-const TYPE_ALIASES = {
+// 평범한 객체가 아니라 Map인 이유: 객체의 [] 조회는 프로토타입까지 올라간다. `type: constructor`
+// 한 줄이면 TYPE_ALIASES['constructor']가 Object 함수를 돌려주고, ?? 는 그것을 '아는 이름'으로
+// 받아들여 spec.type이 문자열이 아닌 함수가 된다 — '모르는 이름은 막대'라는 이 표의 계약이
+// 모델이 쓴 글자 하나로 깨진다. Map은 자기가 담은 것만 안다.
+const TYPE_ALIASES = new Map(Object.entries({
   column: 'bar', columns: 'bar', bars: 'bar', histogram: 'bar',
   stacked: 'stacked-bar', stackedbar: 'stacked-bar', 'stacked-column': 'stacked-bar',
   lines: 'line', spline: 'line', trend: 'line',
   areas: 'area', 'stacked-area': 'area',
   donut: 'pie', doughnut: 'pie',
   scatterplot: 'scatter', points: 'scatter', bubble: 'scatter',
-};
+}));
 
 // 설정 줄. 콜론 뒤는 값이며 따옴표가 있어도 벗기지 않는다(모델이 따옴표를 쓰면 그것까지 제목이다 —
 // 벗기기 시작하면 어디까지 벗길지가 또 하나의 규칙이 된다). `data:` 는 서버가 채우고 지우는 줄이라
@@ -142,6 +154,23 @@ export const clip = (s, n) => {
   // 자리가 한 글자뿐이면 …를 붙일 자리도 없다 — 붙이면 상한을 넘긴다.
   return n <= 1 ? sliceSafe(s, n) : `${sliceSafe(s, n - 1)}…`;
 };
+// 글자를 주어진 폭(px) 안으로 줄인다. 넘치는 만큼은 clip과 같이 …로 대신한다.
+// 폭을 재는 일은 부르는 쪽(글꼴을 아는 자리, Chart.jsx textMeasurer)이 하고 여기서는 '몇 자까지
+// 남길 것인가'만 정한다 — 순수 함수라 회귀 테스트가 붙는다(pieLabelsOverflow와 같은 가름이다).
+// 자를 자리를 이분법으로 찾는 이유: 눈금 열다섯 개 × 서른 자를 한 글자씩 재면 창을 끌 때마다
+// 수백 번의 측정이 된다.
+export function fitText(s, room, measure) {
+  if (!(room > 0)) return '';
+  if (measure(s) <= room) return s;
+  let lo = 0;          // clip(s, lo)는 들어간다 (0자는 빈 글자다)
+  let hi = s.length;   // clip(s, hi)는 넘친다 (바로 위에서 확인했다)
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (measure(clip(s, mid)) <= room) lo = mid; else hi = mid;
+  }
+  return clip(s, lo);
+}
+
 const EMPTY_LABEL = '(빈값)';
 
 // 블록 본문(펜스 안의 글자)을 설정과 표 줄로 가른다. 설정은 표가 시작되기 전까지만 읽는다 —
@@ -176,7 +205,7 @@ export function parseTable(lines) {
 
 const normalizeType = t => {
   const k = nameKey(t).replace(/[\s_]+/g, '-');
-  return TYPES.has(k) ? k : (TYPE_ALIASES[k] ?? 'bar');
+  return TYPES.has(k) ? k : (TYPE_ALIASES.get(k) ?? 'bar');
 };
 
 // 열 이름 목록을 열 번호로. 없는 이름은 버린다(있는 것만으로 그린다 — 하나가 틀렸다고 전부 표로
@@ -258,9 +287,11 @@ export function parseChartBlock(text, block) {
   // 산점도는 x가 수치여야 한다 — 범주 x의 점들은 그냥 세로줄이다.
   if (type === 'scatter' && xKind === 'category') return { ok: false, reason: '산점도의 x가 수치가 아님' };
 
+  // 이름은 여기서 한 번만 묶는다(MAX_NAME_LEN) — 그리는 쪽이 자리마다 다시 자르면 범례와 툴팁이
+  // 다른 글자를 쓰게 되고, 툴팁 항목의 순서를 이름으로 맞추는 쪽(Chart.jsx byColumn)이 짝을 잃는다.
   const series = [
-    ...y.map(i => ({ name: header[i], col: i, axis: 'left' })),
-    ...(single ? [] : y2.map(i => ({ name: header[i], col: i, axis: 'right' }))),
+    ...y.map(i => ({ name: clip(header[i], MAX_NAME_LEN), col: i, axis: 'left' })),
+    ...(single ? [] : y2.map(i => ({ name: clip(header[i], MAX_NAME_LEN), col: i, axis: 'right' }))),
   ];
 
   const data = [];
@@ -283,7 +314,9 @@ export function parseChartBlock(text, block) {
     // 뺀 행은 세어 둔다: 표에는 있는 행이 그림에서만 없어지면 비율의 분모가 달라진 것을 알 길이 없다
     // (x를 읽지 못해 뺀 행을 skipped로 밝히는 것과 같은 이유다 — 조용히 빠지는 행이 있어서는 안 된다).
     if (type === 'pie' && !(values[0] > 0)) { dropped++; continue; }
-    data.push({ x, label: clip(label, MAX_LABEL_LEN), full: label, values, t });
+    // full은 '축 눈금보다는 긴 이름'이지 '자르지 않은 이름'이 아니다 — 범례와 툴팁이 이것을 쓰고,
+    // 그 둘도 화면 안에 들어가야 한다(MAX_NAME_LEN). 온전한 값은 '표로 보기'에 있다.
+    data.push({ x, label: clip(label, MAX_LABEL_LEN), full: clip(label, MAX_NAME_LEN), values, t });
   }
   if (!data.length) return { ok: false, reason: '그릴 행 없음' };
   // 선·영역은 x 하나에 값이 하나여야 한다. 피벗되지 않은 결과(일자×상태×건수)를 `x: 일자`로 그리면 같은
@@ -300,7 +333,7 @@ export function parseChartBlock(text, block) {
     ok: true,
     spec: {
       type, title, xKind,
-      xName: header[xi],
+      xName: clip(header[xi], MAX_NAME_LEN),
       series: series.map(({ name, axis }) => ({ name, axis })),
       rows: clipped ? data.slice(0, MAX_CHART_ROWS) : data,
       clipped,
@@ -445,10 +478,17 @@ export const CHART_FENCE_RE = /^([ \t]*)((`|~)\3{2,})[ \t]*chart(?:[ \t]+[^\r\n]
 export function chartBlocksToTables(md) {
   return String(md ?? '').replace(CHART_FENCE_RE, (_, indent, _fence, _ch, body = '') => {
     const { config, table } = splitBlock(body);
+    const t = normalizeTable(table);
+    // 표도 `data:` 참조도 없는 블록은 차트가 아니다 — 모델이 펜스를 다른 용도로 쓴 것이고, 화면은
+    // 그 글자를 원문 그대로 코드로 보인다(App.jsx ChartTable도 같은 이유로 그렇게 한다).
+    // 여기서만 지우면 사용자가 보고 있는 글을 모델만 보지 못한다 — 화면과 이력이 다른 것을 말하면
+    // 다음 질문의 '## 최근 대화'는 있지도 않은 침묵을 모델의 지난 턴으로 싣는다(실측: ```chart
+    // 안에 쓴 문장 하나가 이력에서 통째로 사라졌고, 화면에는 그대로 남아 있었다).
+    // 본문의 들여쓰기는 원문 그대로 둔다 — 아래에서 우리가 새로 적는 줄만 여는 펜스를 따른다.
+    if (!t && config.data === undefined) return body;
     const title = String(config.title ?? '').trim();
     const out = [];
     if (title) out.push(indent + title);
-    const t = normalizeTable(table);
     if (t) {
       out.push(t.header, t.sep, ...t.rows.slice(0, HISTORY_TABLE_ROWS));
       if (t.rows.length > HISTORY_TABLE_ROWS) out.push(`${indent}(외 ${t.rows.length - HISTORY_TABLE_ROWS}행)`);
