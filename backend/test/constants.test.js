@@ -205,3 +205,22 @@ test('상류 응답 상한은 완성 토큰 상한보다 넉넉하다', () => {
   assert.ok(MAX_UPSTREAM_JSON_BYTES > MAX_COMPLETION_TOKENS * 3 * 6,
     `완성 상한(${MAX_COMPLETION_TOKENS}토큰)에 비해 응답 상한이 빠듯하다: ${MAX_UPSTREAM_JSON_BYTES}`);
 });
+
+test('clipText: 음수 상한은 아무것도 남기지 않는다 — 상한보다 긴 글자를 돌려주지 않는다', () => {
+  // slice(0, -1)은 뒤에서 세므로, 가드가 없으면 '길이를 묶으라고 부른 함수'가 거의 원문을 돌려준다
+  // (실측: clipText('abcdef', -1) === 'abcde'). 상한 계산이 한 번 음수로 떨어지면 이 파일의 예산이
+  // 전부 조용히 무의미해지는 자리라, 부르는 쪽의 기억이 아니라 여기서 보장한다.
+  // 같은 규칙을 적어 둔 프런트(frontend/src/chart.js sliceSafe)는 이미 이 경계를 지킨다.
+  for (const max of [-1, -3, -100]) assert.strictEqual(clipText('abcdef', max), '');
+  // 0과 양수는 지금까지 그대로다
+  assert.strictEqual(clipText('abcdef', 0), '');
+  assert.strictEqual(clipText('', 0), '');
+  assert.strictEqual(clipText('abcdef', 2), 'ab');
+  assert.strictEqual(clipText('abc', 10), 'abc');
+  // 어떤 상한에서도 결과는 상한 이하이고 원문의 접두다
+  for (let max = -5; max <= 12; max++) {
+    const r = clipText('a😀b가c😀', max);
+    assert.ok(r.length <= Math.max(0, max), `상한 ${max}인데 ${r.length}자`);
+    assert.ok('a😀b가c😀'.startsWith(r), `접두가 아니다: ${JSON.stringify(r)}`);
+  }
+});

@@ -169,6 +169,14 @@ export const MAX_COMPLETION_TOKENS = 16_384;
 // 임베딩에서는 그 한 행이 매 주기 거부되고, 프롬프트에서는 본문이 조용히 훼손된다.
 // 경계에 걸린 상위 서로게이트 하나를 떼어 항상 온전한 문자열을 돌려준다.
 export function clipText(s, max) {
+  // 음수 상한은 '아무것도 남기지 않는다'로 본다. 이 한 줄이 없으면 slice(0, -1)이 뒤에서 세어
+  // 'abcdef'가 'abcde'가 된다 — 길이를 묶으라고 부른 함수가 상한보다 긴 글자를 돌려주는 셈이라,
+  // 상한 계산이 한 번 음수로 떨어지는 날 이 파일의 모든 예산이 조용히 무의미해진다.
+  // 지금은 부르는 쪽이 전부 양수 상수를 넘기므로 닿지 않는 길이지만, 이 함수는 '길이 상한으로
+  // 자르는 단일 지점'이라 그 보장이 부르는 쪽의 기억이어서는 안 된다.
+  // 같은 규칙을 적어 둔 프런트(frontend/src/chart.js sliceSafe)는 이미 이 경계를 지키고 있었다 —
+  // '같은 방식'이라고 적어 둔 둘이 경계에서만 갈라져 있으면 그 주석 자체가 거짓이 된다.
+  if (max <= 0) return '';
   if (s.length <= max) return s;
   const cut = s.slice(0, max);
   const last = cut.charCodeAt(cut.length - 1);
