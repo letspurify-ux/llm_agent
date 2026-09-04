@@ -18,7 +18,7 @@ import { findChrome, launchChrome, chromePort, stopProcess, killOnExit, freePort
   alive, aliveGroup } from './driver.mjs';
 import { pieSlices, parseChartBlock } from '../../src/chart.js';
 import { TRACE, READY, PIE_BLOCK, LONG_URL, DATA_URL, MAIL_URL, CAPPED_LABEL, ERROR_LABEL,
-  ANCHOR_URL, ANCHOR_TEXT, ANCHOR_IMG_TEXT, NESTED_LINK, 주소를_가리키는_링크 } from './fixtures.js';
+  ANCHOR_URL, ANCHOR_TEXT, ANCHOR_IMG_TEXT, NESTED_LINK, BROKEN_RESPONSES, 주소를_가리키는_링크 } from './fixtures.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const PROBE = join(ROOT, 'ui-probe.html');
@@ -492,6 +492,49 @@ it('열어 주지 않는 주소도 무엇인지 밝히고, 긴 주소가 답변�
   assert.ok(got.data?.includes(DATA_URL.slice(0, 40)), `data: 그림이 무엇을 가리키는지 사라졌다: ${got.data}`);
   assert.ok(got.mailto?.includes(MAIL_URL), `mailto: 그림이 무엇을 가리키는지 사라졌다: ${got.mailto}`);
   assert.strictEqual(got.가로넘침, 0, '긴 주소가 화면을 가로로 밀어냈다');
+});
+
+it('서버가 어떤 응답을 주어도 앱이 내려가지 않는다', async () => {
+  // 이 화면의 대화는 메모리에만 있다 — 렌더 도중에 한 번 던지면 React가 앱 전체를 내리고 그 순간
+  // 대화가 통째로 사라진다. 서버가 주는 값의 모양은 우리가 정하지 못하므로(배포가 어긋난 서버,
+  // 중간에 낀 프록시), 어떤 응답이 와도 그 답 하나만 상하고 대화와 다음 질문은 남아야 한다.
+  // BROKEN_RESPONSES를 한 대화 안에서 차례로 받는다 — 중간에 앱이 내려가면 그 뒤 질문 자체가
+  // 되지 않으므로, 마지막의 '말풍선 수'가 그 전부를 한 번에 재는 자리가 된다.
+  // 마지막 응답은 글자만으로 렌더가 던지는 것이라(겹친 인용) 콘솔에 그 오류가 오른다 — 잡혔다는
+  // 증거이므로 여기서는 일부러 낸 줄로 둔다.
+  일부러_낸_줄 = /Maximum call stack|error occurred|render failed/;
+  await page.goto(`${url()}&broken=1`, '.chip');
+  await page.eval(`document.querySelectorAll('.chip')[0].click()`);
+  for (let i = 1; i < BROKEN_RESPONSES.length; i++) {
+    await page.until(`document.querySelectorAll('.row.assistant').length === ${i} && !document.querySelector('.typing')`,
+      { what: `${i}번째 이상한 응답이 화면에 서기` });
+    await page.eval(`(() => { const ta = document.querySelector('.composer textarea');
+      const set = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+      ta.focus(); set.call(ta, '질문 ${i}'); ta.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+    await page.key('Enter', 'Enter', 13);
+  }
+  await page.until(`document.querySelectorAll('.row.assistant').length === ${BROKEN_RESPONSES.length} && !document.querySelector('.typing')`,
+    { what: '마지막 이상한 응답이 화면에 서기' });
+  const got = await page.eval(`(() => ({
+    살아있나: !!document.querySelector('.composer textarea'),
+    질문: document.querySelectorAll('.row.user').length,
+    답: document.querySelectorAll('.row.assistant').length,
+    빈답: [...document.querySelectorAll('.bubble.assistant')].filter(b => !b.textContent.trim()).length,
+    폴백: document.querySelectorAll('.bubble.assistant pre code').length,
+  }))()`);
+  assert.strictEqual(got.살아있나, true, '앱이 내려가 입력창이 사라졌다 — 대화가 통째로 사라진 상태다');
+  assert.strictEqual(got.질문, BROKEN_RESPONSES.length, '앞선 응답에서 앱이 내려가 뒤의 질문이 나가지 못했다');
+  assert.strictEqual(got.답, BROKEN_RESPONSES.length, '이상한 응답 하나가 대화에서 통째로 빠졌다');
+  assert.strictEqual(got.빈답, 0, '무엇을 받았는지 알 수 없는 빈 말풍선이 남았다');
+  // 글자만으로 던진 답은 경계가 잡고 원문을 그대로 보인다 — 빈칸으로 두면 무엇이 왔는지 알 수 없다
+  assert.ok(got.폴백 > 0, '렌더가 던진 답이 원문조차 남기지 못했다');
+  // 그 뒤로도 평범한 대화가 이어져야 한다 (경계가 걸린 채 화면이 굳지 않는가)
+  await page.eval(`(() => { const ta = document.querySelector('.composer textarea');
+    const set = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    ta.focus(); set.call(ta, '마지막 질문'); ta.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+  await page.key('Enter', 'Enter', 13);
+  await page.until(`document.querySelectorAll('.row.assistant').length === ${BROKEN_RESPONSES.length + 1} && !document.querySelector('.typing')`,
+    { what: '이상한 응답들 뒤의 평범한 질문이 답을 받기' });
 });
 
 it('띄운 브라우저는 끝나면 정말 사라지고, 끊긴 연결은 기다리던 요청을 놓아준다', async () => {

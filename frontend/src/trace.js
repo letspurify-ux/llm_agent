@@ -31,6 +31,30 @@ export function countLabel(t) {
   return `${t.rowCount}건`;
 }
 
+// 서버가 준 trace를 화면이 그릴 수 있는 모양으로 맞춘다. 이 값의 모양은 우리가 정하지 못한다 —
+// 배포가 어긋난 서버, 중간에 낀 프록시의 응답, 앞으로 늘어날 필드가 모두 이 문으로 들어온다.
+// 모양이 어긋나면 그리는 쪽이 렌더 도중에 던지고, 그것은 이 화면에서 '대화가 통째로 사라진다'와
+// 같은 말이다(이력은 메모리에만 있다). 실측으로 확인한 세 자리: trace가 문자열이면 trace.map에서,
+// 원소가 null이면 t.rows에서, query_name이 객체면 React의 '객체는 자식이 될 수 없다'에서 백지가 됐다.
+// 그리는 자리마다 방어를 흩뿌리는 대신 들어오는 문 하나에서 맞춘다 — 순수 함수라 회귀 테스트가 붙는다.
+// (App.jsx의 말풍선 경계가 마지막 그물이지만, 그물에 걸린 말풍선은 원문만 남는다 — 여기서 맞출 수
+//  있는 것은 맞춰서 제대로 보이는 편이 낫다.)
+//   배열이 아니면 없는 것으로 본다 — 패널을 아예 그리지 않는다.
+//   스텝이 객체가 아니면 버린다: 무엇을 실행했는지조차 없는 항목이라 보여줄 것이 없다.
+//   query_name·targetDb는 글자로. 둘 다 화면의 자식이 되고 CSV 파일 이름이 된다.
+//   rows는 배열일 때만 행으로 본다 — 아니면 실행되지 못한 스텝과 같이 표도 CSV 단추도 없다.
+export function normalizeTrace(trace) {
+  if (!Array.isArray(trace)) return [];
+  return trace
+    .filter(t => t && typeof t === 'object' && !Array.isArray(t))
+    .map(t => ({
+      ...t,
+      query_name: cellText(t.query_name),
+      targetDb: cellText(t.targetDb),
+      rows: Array.isArray(t.rows) ? t.rows : undefined,
+    }));
+}
+
 // 행들의 열 이름 — 첫 등장 순서. 드라이버가 준 행은 열이 모두 같지만(oracle.js normalizeCells),
 // 다른 출처의 trace가 섞여도 한 행에만 있는 열이 빠지지 않게 합집합으로 모은다.
 export function columnsOf(rows) {

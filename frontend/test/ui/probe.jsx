@@ -2,15 +2,21 @@
 // 가로챈다 — 서버도 모델도 없이 '답이 도착하고, 차트·흐름도가 뒤늦게 자리를 잡는' 그 순간을
 // 되풀이해서 만들 수 있어야 하기 때문이다.
 // 화면 껍데기(CSS)는 index.html에서 그대로 가져온다 (ui.test.mjs가 그 파일로 probe용 html을 만든다).
-import { CASES, TRACE } from './fixtures.js';
+import { CASES, TRACE, BROKEN_RESPONSES } from './fixtures.js';
 
 const which = new URLSearchParams(location.search).get('case') ?? 'rich';
+// ?broken=1 이면 정상 답 대신 BROKEN_RESPONSES를 한 번에 하나씩 차례로 내준다 — 한 대화 안에서
+// 모든 모양을 겪게 해야 '그중 하나에서 앱이 내려가면 그 뒤 질문도 못 한다'까지 함께 재게 된다.
+const broken = new URLSearchParams(location.search).has('broken');
+let 몇번째 = 0;
 const realFetch = window.fetch.bind(window);
 window.fetch = async (url, opts) => {
   if (String(url).includes('/api/chat')) {
     await new Promise(r => setTimeout(r, 150)); // 서버가 답하기까지의 짧은 사이
-    return new Response(JSON.stringify({ answer: CASES[which] ?? CASES.rich, trace: which === 'rich' ? TRACE : undefined }),
-      { status: 200, headers: { 'Content-Type': 'application/json' } });
+    const body = broken
+      ? BROKEN_RESPONSES[몇번째++ % BROKEN_RESPONSES.length]
+      : { answer: CASES[which] ?? CASES.rich, trace: which === 'rich' ? TRACE : undefined };
+    return new Response(JSON.stringify(body ?? null), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }
   return realFetch(url, opts);
 };

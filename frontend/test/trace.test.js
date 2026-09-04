@@ -2,7 +2,7 @@
 // CSV는 조용히 깨진다: 쉼표가 든 값 하나가 옆 열로 밀려도 파일은 열리고, 한글이 깨진 파일도 열린다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { columnsOf, cellText, toCsv, csvFileName, countLabel, stepLabel } from '../src/trace.js';
+import { columnsOf, cellText, toCsv, csvFileName, countLabel, stepLabel, normalizeTrace } from '../src/trace.js';
 
 test('열은 첫 등장 순서의 합집합이다', () => {
   assert.deepStrictEqual(columnsOf([{ B: 1, A: 2 }, { A: 3, C: 4 }, null, 'x']), ['B', 'A', 'C']);
@@ -75,4 +75,31 @@ test('스텝의 문구: 실행되지 못한 스텝은 건수 대신 오류를 �
   // 실제로 픽스처가 스텝을 find로 집어 온다(test/ui/fixtures.js) — 그 find가 빗나가는 날이 이 길이다.
   assert.throws(() => stepLabel(undefined), /스텝이 없습니다/);
   assert.throws(() => stepLabel(null), /스텝이 없습니다/);
+});
+
+test('trace는 화면이 그릴 수 있는 모양으로만 들어온다 — 어긋난 값에 화면이 죽지 않는다', () => {
+  // 이 값의 모양은 우리가 정하지 못한다(배포가 어긋난 서버·중간에 낀 프록시). 어긋난 것이 그대로
+  // 화면에 닿으면 렌더 도중에 던지고, 이 화면에서 그것은 '대화가 통째로 사라진다'와 같은 말이다.
+  // 아래 세 모양은 실제로 백지를 만들던 것들이다(화면 재현으로 확인).
+  assert.deepStrictEqual(normalizeTrace('배열이 아니다'), []);      // trace.map이 없다
+  assert.deepStrictEqual(normalizeTrace({}), []);
+  assert.deepStrictEqual(normalizeTrace(undefined), []);
+  assert.deepStrictEqual(normalizeTrace([null, 1, '글자', []]), []); // 스텝이 아닌 원소는 버린다
+  // query_name·targetDb는 화면의 자식이 되고 CSV 파일 이름이 된다 — 객체가 오면 React가 던진다
+  const [t] = normalizeTrace([{ query_name: { a: 1 }, targetDb: { d: 2 }, params: { x: 1 }, rowCount: 3, rows: [{ a: 1 }] }]);
+  assert.strictEqual(t.query_name, '{"a":1}');
+  assert.strictEqual(t.targetDb, '{"d":2}');
+  // 행이 배열이 아니면 행이 없는 것으로 본다 (표도 CSV 단추도 없는 '실행되지 못한 스텝'과 같은 모양)
+  assert.strictEqual(normalizeTrace([{ query_name: 'q', rows: '행이 아니다' }])[0].rows, undefined);
+  assert.strictEqual(normalizeTrace([{ query_name: 'q' }])[0].rows, undefined);
+  // 성한 스텝은 그대로 지나간다 — 정리한다는 이유로 화면이 쓰는 값을 잃어서는 안 된다
+  const 성한 = { query_name: 'q', targetDb: 'db', params: { a: 1 }, rowCount: '1000+', capped: true, omittedRows: 970, rows: [{ a: 1 }] };
+  assert.deepStrictEqual(normalizeTrace([성한]), [성한]);
+  // 정리한 스텝도 화면이 부르는 문구 함수를 그대로 통과해야 한다 (여기서 던지면 정리한 뜻이 없다)
+  for (const step of normalizeTrace([{ query_name: {}, rows: 'x', rowCount: {}, error: {} }, { query_name: 'q', rows: [null, 'x', { a: 1 }] }]))
+    assert.strictEqual(typeof stepLabel(step), 'string');
+  // 행 안의 이상한 값도 표·CSV가 받아 낸다 (열은 객체 행에서만 모은다)
+  const rows = normalizeTrace([{ query_name: 'q', rows: [null, '글자', { a: 1 }] }])[0].rows;
+  assert.deepStrictEqual(columnsOf(rows), ['a']);
+  assert.strictEqual(toCsv(rows), '\ufeffa\r\n\r\n\r\n1\r\n');
 });

@@ -6,7 +6,7 @@ import { REMARK_PLUGINS, REHYPE_PLUGINS } from './math.js';
 // 차트 블록의 계약(무엇을 차트로 받는가 + 이력으로 되돌릴 때의 모양)은 chart.js에 있다.
 import { parseChartBlock, splitBlock, chartTableMarkdownFrom, chartBlocksToTables, sliceSafe, clip, MAX_CHARTS_PER_MESSAGE } from './chart.js';
 // trace 패널의 계약(열·셀 표기·CSV)은 trace.js에 있다.
-import { columnsOf, cellText, toCsv, csvFileName, stepLabel } from './trace.js';
+import { columnsOf, cellText, toCsv, csvFileName, stepLabel, normalizeTrace } from './trace.js';
 // 답변 속 주소를 어떻게 다룰지의 판정은 markdown.js에 있다 (순수 함수라 회귀 테스트가 붙는다).
 import { linkTarget, imageTarget, mdProps } from './markdown.js';
 
@@ -70,13 +70,39 @@ function ChartTable({ text, block, withTitle = false }) {
   );
 }
 
-// 그리는 쪽이 렌더 중에 던지면(모델이 만든 값이라 무엇이 올지 모른다) React는 앱 전체를 내린다 —
-// 대화가 통째로 사라진다. 그 블록 하나만 폴백으로 바꾼다.
-class BlockBoundary extends Component {
+// 렌더 도중에 던지면 React는 그것을 잡아 줄 경계를 찾고, 없으면 앱 전체를 내린다 — 이 화면의
+// 대화는 메모리에만 있으므로 그 순간 대화가 통째로 사라진다. 던지는 값은 모두 우리가 만든 것이
+// 아니다: 모델이 쓴 답변 글자, 서버가 준 trace, 그것을 읽는 라이브러리.
+// try/catch로는 막을 수 없다 — 렌더 중의 던짐은 React가 가로채기 때문이다. 경계가 그 자리의
+// try/catch이고, 걸린 자리만 폴백으로 바꾼 뒤 나머지는 그대로 둔다.
+// 폴백 자체는 절대 던지지 않아야 한다: 같은 경계는 자기 폴백의 오류를 다시 잡지 못해, 그러면
+// 결국 앱이 내려간다. 그래서 폴백에는 markdown도 차트도 두지 않는다.
+// what은 콘솔에 남길 이름이다 — 어느 자리가 걸렸는지 모르면 고칠 수도 없다.
+class Boundary extends Component {
   state = { failed: false };
   static getDerivedStateFromError() { return { failed: true }; }
-  componentDidCatch(e) { console.warn('[chart] render failed:', e?.message ?? e); }
+  componentDidCatch(e) { console.warn(`[${this.props.what}] render failed:`, e?.message ?? e); }
   render() { return this.state.failed ? this.props.fallback : this.props.children; }
+}
+
+// 말풍선 하나가 그려지다 던졌을 때 그 자리에 놓는 것. 답변의 글자만으로도 렌더는 던진다 —
+// 실측: '>'가 3천 번 겹친 답변 하나가 markdown 파서의 스택을 넘겨(RangeError) 화면을 백지로 만들었다.
+// 서버 상한(MAX_ANSWER_LEN 70,000자) 안에서 얼마든지 올 수 있는 글자다.
+// 던진 자리를 빈칸으로 두지 않고 원문을 그대로 보인다 — 흐름도·차트가 실패했을 때와 같은 처방이다.
+// 이 안에서는 무엇도 던지면 안 되므로 글자만 놓고, 글자로 만드는 일도 어떤 값이든 받아 주는
+// cellText에 맡긴다(text가 문자열이 아닐 수 있는 마지막 경우까지 여기서 끝난다).
+function BrokenMessage({ role, text }) {
+  const who = role === 'user' ? 'user' : 'assistant';
+  return (
+    <div className={`row ${who}`}>
+      <div className={`bubble ${who}`}>
+        <div className="md">
+          <p><em>이 답변을 그리지 못했습니다 — 원문을 그대로 보입니다.</em></p>
+          <pre><code>{cellText(text)}</code></pre>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // 메시지 하나에 그리는 차트 수의 예산. 블록은 자기가 몇 번째인지 모르므로 메시지가 렌더될 때마다
@@ -94,24 +120,24 @@ function ChartBlock({ text }) {
   const table = <ChartTable text={text} block={block} />;
   // 그리다 던지면 '그리지 않은 블록'과 같은 모양(제목 + 표)으로 — '표로 보기'까지 경계 안에 두어 표가 두 번 남지 않게 한다.
   return (
-    <BlockBoundary fallback={titled}>
+    <Boundary what="chart" fallback={titled}>
       <Suspense fallback={table}>
         <Chart spec={parsed.spec} />
       </Suspense>
       {/* 차트는 값을 읽는 데 한계가 있다(정확한 수치·잘린 라벨·그리지 않은 열). 표는 늘 곁에 둔다. */}
       <details className="chart-table"><summary>표로 보기</summary>{table}</details>
-    </BlockBoundary>
+    </Boundary>
   );
 }
 
 function MermaidBlock({ text }) {
   const code = <pre><code>{text}</code></pre>;
   return (
-    <BlockBoundary fallback={code}>
+    <Boundary what="mermaid" fallback={code}>
       <Suspense fallback={code}>
         <Mermaid text={text} />
       </Suspense>
-    </BlockBoundary>
+    </Boundary>
   );
 }
 
@@ -288,22 +314,33 @@ function TracePanel({ trace }) {
 }
 
 const Message = memo(function Message({ role, text, trace }) {
+  // 말풍선 하나가 던져도 나머지 대화는 남는다 (Boundary 참고). 경계를 memo 안에 두는 이유는
+  // 바깥에 두면 대화가 늘 때마다 경계가 다시 렌더되기 때문이다 — 여기 두면 memo가 함께 막는다.
   return (
-    <div className={`row ${role}`}>
-      <div className={`bubble ${role}`}>
-        {role === 'assistant'
-          ? <div className="md">
-              {/* 플러그인 배열은 math.js의 상수를 그대로 쓴다 — react-markdown은 렌더마다 options로
-                  파이프라인을 다시 조립하므로, 여기서 새 배열 리터럴을 만들면 매 렌더가 프로세서 재구축이 된다. */}
-              <ChartBudget.Provider value={{ n: 0 }}>
-                <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS}
-                               {...MAIN_MD}>{text}</ReactMarkdown>
-              </ChartBudget.Provider>
-            </div>
-          : text}
-        {trace?.length > 0 && <TracePanel trace={trace} />}
+    <Boundary what="message" fallback={<BrokenMessage role={role} text={text} />}>
+      <div className={`row ${role}`}>
+        <div className={`bubble ${role}`}>
+          {role === 'assistant'
+            ? <div className="md">
+                {/* 플러그인 배열은 math.js의 상수를 그대로 쓴다 — react-markdown은 렌더마다 options로
+                    파이프라인을 다시 조립하므로, 여기서 새 배열 리터럴을 만들면 매 렌더가 프로세서 재구축이 된다. */}
+                <ChartBudget.Provider value={{ n: 0 }}>
+                  <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS}
+                                 {...MAIN_MD}>{text}</ReactMarkdown>
+                </ChartBudget.Provider>
+              </div>
+            : text}
+          {/* 패널에 경계를 하나 더 두는 이유: 여기서 던졌다고 답변까지 원문으로 되돌릴 이유가 없다.
+              trace는 조회 결과에서 온 구조라 답변 글자보다 모양이 어긋날 길이 많다(normalizeTrace가
+              문 앞에서 맞추지만, 그 뒤로 늘어날 필드까지 미리 알 수는 없다). */}
+          {trace?.length > 0 && (
+            <Boundary what="trace" fallback={<div className="trace"><em>실행된 쿼리를 보여주지 못했습니다.</em></div>}>
+              <TracePanel trace={trace} />
+            </Boundary>
+          )}
+        </div>
       </div>
-    </div>
+    </Boundary>
   );
 });
 
@@ -825,18 +862,27 @@ export default function App() {
         body: JSON.stringify({ message, history }),
       });
       const data = await res.json();
+      // 서버가 준 것을 그대로 화면에 넣지 않는다. 이 값의 모양은 우리가 정하지 못한다 — 배포가
+      // 어긋난 서버, 중간에 낀 프록시의 응답, 앞으로 늘어날 필드가 모두 이 문으로 들어온다.
+      // 문자열이 아닌 answer 하나가 화면에 닿으면 react-markdown이 렌더 도중에 던지고, 그것은
+      // 이 화면에서 '대화가 통째로 사라진다'와 같은 말이다(실측: answer가 숫자·객체이면 백지가 됐다).
+      // Boundary가 마지막 그물이지만, 그물에 걸린 말풍선은 원문만 남는다 — 여기서 맞출 수 있는
+      // 것은 맞춰서 제대로 보이게 한다. 글자로 쓸 수 있는 것만 글자로 받는다.
+      const answerText = typeof data?.answer === 'string' ? data.answer : '';
+      const errorText = typeof data?.error === 'string' ? data.error : '';
       // ??가 아니라 ||인 이유: 빈 문자열도 걸러야 한다. undefined는 이력에 들어가면 다음 전송을 깨고,
       // ''는 빈 말풍선으로 렌더된 뒤 그 빈 턴이 다음 질문의 맥락으로 서버에 되돌아간다.
-      // (답변은 항상 문자열이므로 0·false가 ||에 걸려 사라질 일은 없다)
       // 답이 비어 있는 것과 통신하지 못한 것은 다르다 — 서버가 답한 것을 '통신하지 못했습니다'로
       // 보여주면, 그 아래 실행된 쿼리 패널에는 성공한 조회가 그대로 보이면서 화면이 앞뒤가 맞지 않는다.
-      answer = data.answer || data.error || (res.ok ? '답변을 만들지 못했습니다.' : answer);
-      trace = data.trace;
+      answer = answerText || errorText || (res.ok ? '답변을 만들지 못했습니다.' : answer);
+      // 배열도 아니고 원소가 스텝도 아닌 trace는 패널이 그리다 던진다 (trace.js normalizeTrace).
+      trace = normalizeTrace(data?.trace);
       // 오류 응답(4xx/5xx, 또는 error 필드)은 모델이 한 말이 아니다 — 이력에 넣지 않는다.
       // 답이 비어 있을 때(200인데 answer가 '')도 마찬가지다: 그때 화면에 서는 것은 위의 기본 문구인데,
       // 그것을 '답'으로 세면 클라이언트가 만든 실패 문구가 모델의 지난 턴으로 서버에 되돌아간다
       // (실측: 다음 질문의 이력에 assistant "서버와 통신하지 못했습니다."가 실려 갔다).
-      answered = res.ok && !data.error && !!data.answer;
+      // error는 글자가 아니어도 '서버가 오류라고 말했다'는 뜻이므로 그 자체의 참·거짓으로 본다.
+      answered = res.ok && !data?.error && !!answerText;
     } catch (e) {
       // answer는 통신 오류 기본값 유지. 콘솔에는 남긴다 —
       // 네트워크 실패·타임아웃·클라이언트 예외가 화면에서는 모두 같은 문구로 보이기 때문이다.
@@ -850,11 +896,19 @@ export default function App() {
       // 떨어뜨리지 않는다. loading·sendingRef도 goHome이 이미 정리했으므로 건드리지 않는다
       // (여기서 내리면 그 뒤에 시작된 새 요청의 상태를 지우게 된다).
       if (sessionRef.current === session) {
-        abortRef.current = null;
-        if (answered) historyRef.current = [...historyRef.current, { role: 'assistant', text: answer }];
-        setMessages(m => [...m, { role: 'assistant', text: answer, trace }]);
-        setLoading(false);
-        sendingRef.current = false;
+        // 답을 얹는 일이 어떤 이유로든 던져도 플래그는 반드시 내린다. 걸린 채 남으면 화면은
+        // 멀쩡한데 전송만 영구히 막힌다 — loading이 false라 단추도 활성으로 보여서, 사용자에게는
+        // 누를 수 있는 단추가 아무 일도 하지 않는 화면이 된다(위 sendingRef 주석과 같은 걱정이다).
+        try {
+          abortRef.current = null;
+          if (answered) historyRef.current = [...historyRef.current, { role: 'assistant', text: answer }];
+          setMessages(m => [...m, { role: 'assistant', text: answer, trace }]);
+        } catch (e) {
+          console.error('[chat] 답을 화면에 얹지 못했습니다:', e);
+        } finally {
+          setLoading(false);
+          sendingRef.current = false;
+        }
       }
     }
   }

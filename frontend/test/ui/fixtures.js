@@ -72,6 +72,23 @@ export const CASES = {
     '  A["<img src=/__probe-pixel.png?d=4>"] --> B["<b>굵게</b>"]', '```'].join('\n'),
 };
 
+// 서버가 줄 수 없어야 하지만 줄 수는 있는 응답들 — 배포가 어긋난 서버, 중간에 낀 프록시의 응답.
+// 하나라도 그대로 화면에 닿아 렌더 도중에 던지면 React는 앱 전체를 내리고, 이 화면의 대화는
+// 메모리에만 있으므로 통째로 사라진다. 앞의 것들은 '모양'으로 던지고(App.jsx가 문 앞에서 맞춘다),
+// 마지막 하나는 모양이 아니라 '글자'로 던진다 — 겹친 인용은 markdown 파서의 스택을 넘긴다
+// (실측: 3천 겹부터 RangeError로 화면이 백지가 됐다. 서버 상한 70,000자 안에 드는 글자다).
+// 그것은 문 앞 정리로는 막을 수 없고 말풍선 경계(App.jsx Boundary)만이 잡는다 — 둘 다 있어야
+// '어떤 응답에도 앱이 내려가지 않는다'가 성립하므로 한 목록에 함께 둔다.
+export const BROKEN_RESPONSES = [
+  { answer: 12345 },                                     // 문자열이 아닌 답 (react-markdown이 던진다)
+  { answer: { text: '객체' } },
+  { answer: '답은 정상입니다.', trace: 'trace가 배열이 아니다' },   // trace.map이 없다
+  { answer: '답은 정상입니다.', trace: [null] },                  // 스텝이 없다
+  { answer: '답은 정상입니다.', trace: [{ query_name: { a: 1 }, params: { x: 1 }, rows: '행이 배열이 아니다' }] },
+  null,                                                  // 본문이 통째로 없다
+  { answer: `${'>'.repeat(20000)} 겹친 인용` },            // 글자만으로 렌더가 던진다
+];
+
 const COLS = ['node_id', 'node_name', 'region', 'status', 'cpu_pct', 'agent_version'];
 const ROWS = Array.from({ length: 30 }, (_, i) => Object.fromEntries(COLS.map(c => [c, `${c}-값-${i + 1}-조금-길게-써서-가로로-넘치게-한다`])));
 
