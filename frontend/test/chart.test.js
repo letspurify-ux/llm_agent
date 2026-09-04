@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import {
   parseChartBlock, chartBlocksToTables, chartTableMarkdown, toNumber, toTime, pieSlices, clip, sliceSafe,
-  chartNotes, MAX_CHART_ROWS, MAX_SERIES, MAX_LABEL_LEN, MAX_PIE_SLICES,
+  chartNotes, fmtNum, MAX_CHART_ROWS, MAX_SERIES, MAX_LABEL_LEN, MAX_PIE_SLICES,
 } from '../src/chart.js';
 
 const TABLE = '| 월 | 건수 | 금액 |\n|---|---|---|\n| 2024-01 | 120 | 1,000 |\n| 2024-02 | 80 | 2,500 |';
@@ -320,4 +320,25 @@ test('자르기는 상한을 넘지 않고 서로게이트 쌍을 쪼개지 않�
   assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(clip(emoji, 60)));
   assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(sliceSafe(emoji, 59)));
   assert.ok(clip(emoji, 60).length <= 60);
+});
+
+test('차트의 숫자 표기: 소수 두 자리로 담기지 않는 작은 값을 0이라고 말하지 않는다', () => {
+  // 축 눈금과 툴팁이 같은 함수를 쓴다(Chart.jsx). 소수 두 자리로 자르던 때에는 비율 열(0.0012)의
+  // 축이 통째로 '0'이었고, 막대에 손을 얹은 사람은 값이 0이라는 답을 들었다 — 표에는 있는 값을
+  // 그림이 없다고 말하는 조용한 오답이라, 이 파일이 막으려던 것과 같은 결함이다(화면 재현으로 확인).
+  assert.strictEqual(fmtNum(0.0012), '0.0012');
+  assert.strictEqual(fmtNum(-0.001), '-0.001');
+  assert.strictEqual(fmtNum(0.000025), '0.000025');
+  // 아주 작은 값은 지수로 — 유효숫자로만 세면 눈금 하나가 수백 자가 된다(모델이 쓴 표에는 무엇이든 온다)
+  assert.ok(fmtNum(5e-324).length <= 12, `아주 작은 값의 표기가 길다: ${fmtNum(5e-324)}`);
+  assert.strictEqual(Number(fmtNum(1e-7)), 1e-7);
+  // 0.01 이상은 지금까지의 표기 그대로다 — 천 단위 쉼표와 소수 두 자리
+  assert.strictEqual(fmtNum(0), '0');
+  assert.strictEqual(fmtNum(0.01), '0.01');
+  assert.strictEqual(fmtNum(0.5), '0.5');
+  assert.strictEqual(fmtNum(1234.567), '1,234.57');
+  assert.strictEqual(fmtNum(1234567), '1,234,567');
+  // 값이 없는 칸은 빈 글자다 — 결측을 0으로 그리지 않는다는 규칙이 표기에서도 같아야 한다
+  // (툴팁은 toNumber가 null로 둔 칸을 그대로 받는다)
+  for (const v of [null, undefined, NaN, Infinity, -Infinity, '3', {}]) assert.strictEqual(fmtNum(v), '');
 });

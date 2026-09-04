@@ -6,7 +6,7 @@ import {
   ResponsiveContainer, ComposedChart, PieChart, ScatterChart,
   Bar, Line, Area, Pie, Scatter, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
 } from 'recharts';
-import { pieSlices, clip, chartNotes } from './chart.js';
+import { pieSlices, clip, chartNotes, fmtNum } from './chart.js';
 
 // 첫 색은 앱의 강조색(index.html --accent)을 따라가고, 나머지는 서로 구별되는 고정 팔레트다.
 // 강조색은 이 모듈이 처음 실행될 때 한 번 읽는다 — 차트가 나올 시점에는 문서가 이미 그려져 있다.
@@ -46,7 +46,6 @@ const HEIGHT = 260;
 // 그러면 열두 개가 답변을 덮는 글자 벽이 된다.
 const MAX_LEGEND_LEN = 60;
 
-const fmtNum = v => (typeof v === 'number' && Number.isFinite(v) ? v.toLocaleString('ko-KR', { maximumFractionDigits: 2 }) : '');
 const pad2 = n => String(n).padStart(2, '0');
 const MIN = 60_000;
 const HOUR = 60 * MIN;

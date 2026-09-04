@@ -325,6 +325,23 @@ export function pieSlices(rows, max = MAX_PIE_SLICES) {
   return [...data.filter((_, i) => keep.has(i)), { name: other, full: other, value: rest.reduce((a, d) => a + d.value, 0) }];
 }
 
+// 차트에 적는 숫자(축 눈금·툴팁). 값이 없는 칸(null)은 빈 글자다 — 그리는 쪽은 결측을 0으로 그리지 않는다.
+// 소수 두 자리로 자르면 0.0012 같은 값이 '0'으로 나온다. 축 눈금이 모두 '0'이 되고, 막대에 손을 얹은
+// 사람은 값이 0이라는 답을 듣는다 — 값이 있는데 없다고 말하는 셈이라, 이 파일이 처음부터 막으려던
+// 조용한 오답('숫자로 읽히지 않는 값을 0으로 그린다')이 표기 쪽 문으로 되돌아온 것이다(실측: 비율
+// 열 0.0012·0.0034가 축도 툴팁도 전부 '0'이었다). 그래서 두 자리로 담을 수 없는 값에서는 자릿수가
+// 아니라 유효숫자로 센다. 0.01 이상은 지금까지의 표기 그대로다(천 단위 쉼표, 소수 두 자리).
+// 아주 작은 값은 지수로 적는다 — 유효숫자로만 세면 모델이 쓴 표의 1e-300 한 칸이 눈금 하나를
+// 수백 자로 만든다(라벨을 clip으로 묶어 두는 것과 같은 이유다).
+// Chart.jsx가 아니라 여기 있는 이유는 아래 chartNotes와 같다: 순수 함수라 회귀 테스트가 붙는다.
+// 표기 결함은 오류를 남기지 않아 테스트가 유일한 방어선인데, 그 함수가 JSX 안에 살면 방어선을 세울 수 없다.
+export function fmtNum(v) {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return '';
+  const a = Math.abs(v);
+  if (a === 0 || a >= 0.01) return v.toLocaleString('ko-KR', { maximumFractionDigits: 2 });
+  return a >= 1e-6 ? v.toLocaleString('ko-KR', { maximumSignificantDigits: 3 }) : v.toExponential(2);
+}
+
 // 차트 아래에 붙이는 안내 문구 — '표에는 있는데 그림에서 빠진 행'을 사용자가 알 수 있는 유일한
 // 단서다. 그리는 쪽(Chart.jsx)이 아니라 여기 있는 이유는 trace.js의 건수 문구와 같다: 순수 함수라
 // node:test로 회귀 테스트가 붙는다. 문구 결함은 오류를 남기지 않아 테스트가 유일한 방어선인데,
