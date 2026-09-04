@@ -100,6 +100,12 @@ export const CASES = {
     'flowchart LR', '  A[하나] --> B[둘]', '```'].join('\n'),
   pielong: pieOf(PIE_LONG_NAMES),
   pieshort: pieOf(PIE_SHORT_NAMES),
+  // 눕힌 막대(범주 13개 이상, Chart.jsx HORIZONTAL_FROM)와 세로 막대 한 벌 — 툴팁이 마우스 자리의 행을 맞게
+  // 찾는지 두 방향 모두에서 본다. 눕힌 쪽은 범주 축이 YAxis(yAxisId="left")라 툴팁이 축을 따로 받아야 한다.
+  bars: ['```chart', 'type: bar', 'title: 눕힌 막대', '| 항목 | 값 |', '|---|---|',
+    ...Array.from({ length: 15 }, (_, i) => `| 항목${i + 1} | ${(i * 37) % 90 + 10} |`), '```', '',
+    '```chart', 'type: bar', 'title: 세로 막대', '| 항목 | 값 |', '|---|---|',
+    ...Array.from({ length: 5 }, (_, i) => `| 열${i + 1} | ${(i * 37) % 90 + 10} |`), '```'].join('\n'),
 };
 
 // 서버가 줄 수 없어야 하지만 줄 수는 있는 응답들 — 배포가 어긋난 서버, 중간에 낀 프록시의 응답.
@@ -165,6 +171,7 @@ export const READY = {
   wideprint: `document.querySelector('.md table')`,
   pielong: `document.querySelector('figure.chart .recharts-pie-sector')`,
   pieshort: `document.querySelector('figure.chart .recharts-pie-sector')`,
+  bars: `document.querySelectorAll('figure.chart').length === 2 && [...document.querySelectorAll('figure.chart')].every(f => f.querySelector('.recharts-bar-rectangle .recharts-rectangle'))`,
   // 차트가 서고 '표로 보기'의 표까지 붙은 뒤라야 셀 안의 그림을 볼 수 있다(접혀 있어도 DOM에는
   // 있고, 브라우저는 접힌 <details> 안의 <img>도 불러온다).
   tableimg: `document.querySelector('figure.chart .recharts-surface') && document.querySelector('.md .chart-table table')`,

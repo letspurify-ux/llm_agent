@@ -436,6 +436,46 @@ it('원그래프: 이름이 길면 넓은 화면에서도 범례로 내리고, �
   for (const n of PIE_SHORT_NAMES) assert.ok(짧은것.곁의글자.some(t => t.startsWith(n)), `조각 곁에 '${n}'이 없다: ${JSON.stringify(짧은것.곁의글자)}`);
 });
 
+it('막대 위의 툴팁은 눕힌 막대에서도 마우스 자리의 행을 보여준다', async () => {
+  // Recharts 3의 툴팁은 '어느 행인가'를 범주 축에서 찾는데 그 축을 axisId(기본 0)로 고른다. 눕힌 막대의 범주
+  // 축은 YAxis(yAxisId="left")라 기본 축이 없어, 툴팁이 엉뚱한 띠로 행을 나눴다(실측: 15행 중 2·3행은 툴팁이
+  // 없고 8행이 1행의 값을 보였다). 세로 막대는 범주 축이 id 없는 XAxis라 맞았다 — 그쪽도 함께 못 박는다.
+  await answered(1000, 760, { c: 'bars' });
+  // 막대의 가운데로 마우스를 옮기고 툴팁이 설 때까지 기다린다. 이동은 되풀이해 보낸다 — 차트가 다시 그려지는
+  // 순간(ResponsiveContainer가 크기를 재는 때)에 온 이동은 그리는 쪽이 놓치고, 그 뒤로는 아무도 다시 알려 주지
+  // 않는다(한 번만 보내고 기다리면 툴팁이 영영 서지 않는 채로 시간이 간다).
+  // 차트를 먼저 화면 가운데로 가져온다 — 답이 도착하면 화면은 바닥에 붙어, 위쪽 차트의 앞 행들은 대화 영역
+  // 밖에 있다. 거기로 마우스를 옮겨 봐야 그 자리에는 아무 요소도 없다(실측: elementFromPoint가 null).
+  const hover = async (fig, i, by) => {
+    await page.eval(`document.querySelectorAll('figure.chart')[${fig}].scrollIntoView({ block: 'center' })`);
+    await sleep(300);
+    const 툴팁 = `(() => { const w = document.querySelectorAll('figure.chart')[${fig}].querySelector('.recharts-tooltip-wrapper');
+      return w && getComputedStyle(w).visibility === 'visible' ? w.textContent.replace(/\\s+/g, ' ').trim() : null; })()`;
+    for (let t = 0; t < 10; t++) {
+      const b = await page.eval(`(() => { const f = document.querySelectorAll('figure.chart')[${fig}];
+        const r = [...f.querySelectorAll('.recharts-bar-rectangle .recharts-rectangle')].map(p => p.getBoundingClientRect())
+          .sort((a, b) => ${JSON.stringify(by)} === 'top' ? a.top - b.top : a.left - b.left)[${i}];
+        return { x: r.left + Math.max(3, r.width / 2), y: r.top + r.height / 2 }; })()`);
+      await page.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: b.x - 1, y: b.y });
+      await page.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: b.x, y: b.y });
+      await sleep(150);
+      const tip = await page.eval(툴팁);
+      if (tip) return tip;
+    }
+    return null;
+  };
+  // 눕힌 막대: 사용자가 겪은 2·3행과 끝 행
+  for (const [i, name, value] of [[1, '항목2', 47], [2, '항목3', 84], [14, '항목15', 78]]) {
+    const tip = await hover(0, i, 'top');
+    assert.ok(tip && tip.startsWith(name) && tip.includes(String(value)), `눕힌 막대 ${i + 1}행의 툴팁이 그 행이 아니다: ${JSON.stringify(tip)}`);
+  }
+  // 세로 막대
+  for (const [i, name, value] of [[1, '열2', 47], [4, '열5', 68]]) {
+    const tip = await hover(1, i, 'left');
+    assert.ok(tip && tip.startsWith(name) && tip.includes(String(value)), `세로 막대 ${i + 1}열의 툴팁이 그 열이 아니다: ${JSON.stringify(tip)}`);
+  }
+});
+
 it('좁은 화면: 흐름도 글자가 읽히는 크기로 남고, 인쇄에서는 그 최소 폭이 풀린다', async () => {
   await answered(360, 800, { mobile: true });
   const screen = await page.eval(`(() => { const svg = document.querySelector('.mermaid svg');

@@ -129,7 +129,12 @@ function Cartesian({ spec }) {
               <YAxis yAxisId="left" width="auto" tick={axisStyle} tickFormatter={fmtNum} />
               {hasRight && <YAxis yAxisId="right" orientation="right" width="auto" tick={axisStyle} tickFormatter={fmtNum} />}
             </>}
-        <Tooltip contentStyle={tooltipStyle} formatter={v => fmtNum(v)} labelFormatter={labelOf} itemSorter={byColumn} />
+        {/* 툴팁은 마우스 자리에서 '어느 행인가'를 범주 축으로 찾는데, Recharts 3은 그 축을 axisId로 고르고
+            기본값은 0이다. 눕힌 그래프의 범주 축은 위의 YAxis(yAxisId="left")라 기본 축이 없어, 툴팁이 엉뚱한
+            띠로 행을 나눴다(실측: 15행 중 1·4행은 툴팁이 없고 8행은 1행의 값, 11·15행은 2행의 값을 보였다).
+            세로 그래프의 범주 축은 id 없는 XAxis라 기본값 그대로 맞는다. */}
+        <Tooltip contentStyle={tooltipStyle} formatter={v => fmtNum(v)} labelFormatter={labelOf} itemSorter={byColumn}
+                 axisId={horizontal ? 'left' : undefined} />
         {/* 시리즈가 하나면 제목이 곧 범례다. 제목도 없으면 이름을 보여줄 자리가 범례뿐이다. */}
         {(series.length > 1 || !spec.title) && <Legend wrapperStyle={{ fontSize: 12 }} itemSorter={byColumnLegend} />}
         {items}
