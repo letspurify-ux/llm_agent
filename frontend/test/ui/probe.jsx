@@ -12,7 +12,9 @@ let 몇번째 = 0;
 const realFetch = window.fetch.bind(window);
 window.fetch = async (url, opts) => {
   if (String(url).includes('/api/chat')) {
-    await new Promise(r => setTimeout(r, 150)); // 서버가 답하기까지의 짧은 사이
+    // 서버가 답하기까지의 사이. 기본은 짧게 두고(대부분의 검사는 기다릴 이유가 없다), 답이
+    // 오기 전에 화면을 만져 봐야 하는 검사만 ?delay=로 늘린다.
+    await new Promise(r => setTimeout(r, Number(new URLSearchParams(location.search).get('delay') ?? 150)));
     const body = broken
       ? BROKEN_RESPONSES[몇번째++ % BROKEN_RESPONSES.length]
       : { answer: CASES[which] ?? CASES.rich, trace: which === 'rich' ? TRACE : undefined };

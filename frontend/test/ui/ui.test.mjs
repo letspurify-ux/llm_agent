@@ -264,6 +264,52 @@ it('펼침(⚡ 실행된 쿼리·표로 보기)은 보던 화면을 그대로 �
   assert.ok(Math.abs((await seen('.md .chart-table > summary')) - sum) < 6, '펼치자 보던 자리가 움직였다');
 });
 
+it('답을 기다리는 동안 폈다 접은 패널은 따라가기를 되돌려 놓는다', async () => {
+  // '붙어 있는가'를 되돌리는 곳은 스크롤 이벤트뿐인데(onChatScroll), 내용이 '줄어드는' 변화는
+  // scrollTop을 옮기지 않아 그 이벤트가 나지 않는다. 그래서 펼침이 뗀 것을 접힘이 되돌리지
+  // 못했다 — 화면은 다시 바닥인데 떨어진 채로 남고, 기다리던 답이 도착해도 그대로 화면 밖에
+  // 놓인다(실측 1,030px). 접힘에서 떼지 않기로 한 이유가 바로 그 손해인데(App.jsx onToggle 주석)
+  // 그 손해가 한 걸음 뒤에서 그대로 일어나고 있었다.
+  // 반대쪽(펼치기만 하면 그 자리에 머문다)은 위 '펼침은 보던 화면을 그대로 둔다'가 지킨다 —
+  // 둘이 함께 있어야 '바닥에 있을 때만 되돌린다'는 경계가 못 박힌다.
+  await page.touchMode(false);
+  await page.viewport(1000, 700);
+  // 답이 오기 전에 화면을 만져야 하므로 서버가 답하는 사이를 늘려 둔다 (probe.jsx ?delay=)
+  await page.goto(`${url()}&delay=2000`, '.chip');
+  await page.viewport(1000, 700);
+  await page.eval(`document.querySelectorAll('.chip')[0].click()`);
+  await page.until(READY.rich, { what: '첫 답변이 다 서기' });
+  await settled();
+  assert.ok((await state()).rest < 8, '첫 답의 끝이 이미 화면 밖이다 (검사의 전제)');
+
+  // 둘째 질문을 보낸다 — 보낸 말은 언제나 바닥으로 가므로 여기서 다시 붙는다
+  await page.eval(`document.querySelector('.composer textarea').focus()`);
+  await page.send('Input.insertText', { text: '둘째 질문' });
+  await page.key('Enter', 'Enter', 13);
+  // 보낸 말이 바닥으로 미끄러지는 것(glide 350ms)이 끝난 뒤에 만진다 — 미끄러지는 중에 펼치면
+  // 그 미끄러짐이 매 프레임 바닥을 다시 재므로 펼친 만큼까지 따라가, 이 검사의 전제가 깨진다.
+  await sleep(700);
+  assert.ok((await state()).rest < 8, '질문을 보냈는데 바닥이 아니다 (검사의 전제)');
+
+  // 답을 기다리는 동안 ⚡ 패널을 폈다 접는다. 이 패널을 쓰는 이유는 말풍선의 맨 끝이라 바닥에
+  // 붙은 화면에서 실제로 보이기 때문이다 — 화면 위쪽에 있는 것을 펼치면 브라우저가 보던 자리를
+  // 지키려고 scrollTop을 함께 밀어(스크롤 앵커링) 바닥에서 떨어지지 않아, 이 검사가 재려는
+  // '펼치면 떨어진다 → 접으면 되돌아온다'가 성립하지 않는다.
+  await page.eval(`document.querySelector('details.trace > summary').click()`);
+  await sleep(600);
+  const 펼친뒤 = await state();
+  assert.ok(펼친뒤.rest > 100, `펼쳐도 바닥에서 떨어지지 않아 이 검사가 성립하지 않는다 (${펼친뒤.rest}px)`);
+  await page.eval(`document.querySelector('details.trace > summary').click()`);
+  await sleep(600);
+  assert.ok((await state()).rest < 8, '접었는데 화면이 바닥이 아니다 (검사의 전제)');
+
+  await page.until(`document.querySelectorAll('.row.assistant').length === 2 && !document.querySelector('.typing')`,
+    { what: '둘째 답이 도착하기', timeoutMs: 20_000 });
+  await settled();
+  assert.ok((await state()).rest < 8,
+    `폈다 접은 뒤 도착한 답의 끝이 화면 밖에 남았다 (${(await state()).rest}px) — 화면은 바닥인데 붙어 있지 않았다`);
+});
+
 it('표를 굴리는 동안에는 멈추고, 손을 뗀 여운이 지나면 밀린 것을 따라잡는다', async () => {
   await answered();
   await page.eval(`document.querySelector('details.trace > summary').click()`); await sleep(900);
