@@ -126,6 +126,22 @@ export function loadQueryRegistry(limit) {
     : query('SELECT * FROM query_registry ORDER BY seq LIMIT ?', [limit]);
 }
 
+// 지식 청크를 문서·순번 범위로 읽는다. 범위를 여럿 받아 한 문장으로 묶는 이유는 왕복 수다 —
+// 검색 한 번이 여러 문서에 걸리므로 문서마다 조회하면 그만큼 왕복이 늘고, 그 시간은 스텝마다 곱해진다.
+// 정렬을 걸어 돌려준다: 호출부(chunk.js buildItems)는 doc_seq·chunk_no로 Map을 만들지만, 정렬이
+// 서 있어야 그 Map을 만들기 전에 결과를 눈으로 확인할 수 있고 테스트도 순서를 기대할 수 있다.
+// 범위가 비면 왕복하지 않는다 — 적중이 없는 검색에서 빈 IN 절로 문장을 만들면 문법 오류가 난다.
+export function loadChunkRanges(ranges) {
+  const rs = (ranges ?? []).filter(r => r && r.doc_seq != null);
+  if (!rs.length) return Promise.resolve([]);
+  const where = rs.map(() => '(doc_seq = ? AND chunk_no BETWEEN ? AND ?)').join(' OR ');
+  return query(
+    `SELECT seq, doc_seq, chunk_no, chunk_of, title, content FROM knowledge_chunk
+     WHERE ${where} ORDER BY doc_seq, chunk_no`,
+    rs.flatMap(r => [r.doc_seq, r.from, r.to])
+  );
+}
+
 // qa_method 본문이 지목한 query_name들을 로드 (라우팅 경로A).
 // 요청한 이름 순서를 유지해 돌려준다 — 호출부(agent.js selectQueries)는 '앞쪽이 절차의 첫 단계'라는
 // 전제로 상한을 두고, 프롬프트 예산(llm-openai.js renderItems)도 같은 전제로 꼬리부터 버린다.

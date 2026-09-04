@@ -4,9 +4,9 @@
 --   운영 중인 DB에 실행하면 등록한 지식·쿼리와 chat_log가 전부 사라진다 (DDL은 롤백되지 않는다).
 --   기존 설치에 변경분만 반영하려면 README의 마이그레이션 절을 볼 것.
 --
--- 요구: MariaDB 11.7+ — vec_store의 VECTOR 타입과 VECTOR INDEX가 그 이상에서만 있다.
---   낮은 버전에서 돌리면 앞쪽 테이블은 만들어지고 vec_store에서 멈춘다(부분 적용).
---   그래서 vec_store를 파일 맨 뒤에 둔다 — 거기서 실패해도 나머지 스키마는 온전하다.
+-- 요구: MariaDB 11.7+ — vec_* 테이블의 VECTOR 타입과 VECTOR INDEX가 그 이상에서만 있다.
+--   낮은 버전에서 돌리면 앞쪽 테이블은 만들어지고 vec_*에서 멈춘다(부분 적용).
+--   그래서 vec_*를 파일 맨 뒤에 둔다 — 거기서 실패해도 나머지 스키마는 온전하다.
 --
 -- 적용: mariadb --default-character-set=utf8mb4 -u <user> -p < schema.sql
 
@@ -21,7 +21,11 @@ ALTER DATABASE llm_agent CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 USE llm_agent;
 
 DROP TABLE IF EXISTS chat_log;
-DROP TABLE IF EXISTS vec_store;
+DROP TABLE IF EXISTS vec_store;               -- 소스별로 나뉘기 전의 이름 (마이그레이션 참고)
+DROP TABLE IF EXISTS vec_knowledge_chunk;
+DROP TABLE IF EXISTS vec_qa_method;
+DROP TABLE IF EXISTS vec_query_registry;
+DROP TABLE IF EXISTS knowledge_chunk;         -- knowledge보다 먼저 — FK가 걸려 있다
 DROP TABLE IF EXISTS knowledge;
 DROP TABLE IF EXISTS qa_method;
 DROP TABLE IF EXISTS query_registry;
@@ -44,6 +48,33 @@ CREATE TABLE knowledge (
 
 -- Q&A 처리 방법: 질문 유형별 처리 절차 서술.
 -- 실행할 쿼리가 있으면 query_registry.query_name을 실행 순서대로 본문에 그대로 언급한다.
+-- 지식 원문을 검색 단위로 나눈 파생 테이블. 원문(knowledge)은 손대지 않는다 — 청크는 언제든
+-- 다시 만들 수 있어야 하고(doc_hash가 분할 규칙을 포함하므로 규칙을 고치면 자동으로 다시 나뉜다),
+-- 되돌릴 수 없는 변환이 되면 규칙을 고치는 일이 벌이 된다.
+--
+-- 왜 나누는가: 임베딩은 행 하나에 벡터 하나이고 원문은 MAX_EMBED_TEXT_LEN(4,000자)에서 잘린다.
+-- 2만 자짜리 지식을 등록하면 검색은 앞 20%만 보고 판단하고 뒤는 어떤 경로로도 모델에 닿지 않는데,
+-- 오류가 한 줄도 남지 않는다. 나눠 두면 '문서의 앞 4,000자'가 아니라 '질문에 맞는 구간'이 실린다.
+-- qa_method는 나누지 않는다 — 짧고, 경로A(agent.js selectQueries)가 본문 전체를 훑어 쿼리 이름을
+-- 찾으므로 쪼개면 이름이 청크 경계에 걸려 라우팅이 조용히 끊긴다.
+--
+-- title/content라는 컬럼 이름은 knowledge와 같아야 한다 — 검색·프롬프트 조립이 컬럼 이름으로
+-- 돌아가므로(search.js SEARCH_COLUMNS, llm-openai.js itemLine) 이름을 맞추면 그 코드가 안 바뀐다.
+CREATE TABLE knowledge_chunk (
+  seq      INT AUTO_INCREMENT PRIMARY KEY,  -- 프롬프트가 모델에게 보이는 식별자(k12의 12). 요청 내내 고정.
+  doc_seq  INT NOT NULL,                    -- knowledge.seq
+  chunk_no SMALLINT NOT NULL,               -- 문서 안 순번 (1부터)
+  chunk_of SMALLINT NOT NULL,               -- 그 문서의 총 청크 수 — 제목의 (3~7/22) 표기에 쓴다
+  doc_hash CHAR(32) NOT NULL,               -- MD5(분할 규칙 + 원문). 문서 단위 staleness를 이 테이블 안에서 판정한다
+  title    VARCHAR(200) NOT NULL,           -- 문서 제목 복사 (knowledge.title)
+  content  TEXT NOT NULL,                   -- 청크 본문
+  UNIQUE KEY uk_doc_chunk (doc_seq, chunk_no),
+  KEY k_doc (doc_seq),
+  -- 문서가 지워지면 청크도 함께 지운다. 남으면 삭제된 지식이 검색에 계속 노출된다 —
+  -- 벡터 쪽은 embed-sync의 고아 정리가 거두지만, 그것도 청크가 먼저 사라져야 동작한다.
+  CONSTRAINT fk_chunk_doc FOREIGN KEY (doc_seq) REFERENCES knowledge(seq) ON DELETE CASCADE
+);
+
 CREATE TABLE qa_method (
   seq    INT AUTO_INCREMENT PRIMARY KEY,
   title  VARCHAR(200) NOT NULL,
@@ -109,24 +140,46 @@ CREATE TABLE chat_log (
 );
 
 -- 벡터 검색용 임베딩 저장소.
--- 원본 3개 테이블(knowledge/qa_method/query_registry)은 변경하지 않고 companion 테이블로 둔다
+-- 원본 테이블(knowledge_chunk/qa_method/query_registry)은 변경하지 않고 companion 테이블로 둔다
 -- (VECTOR INDEX는 NOT NULL 필수라, 임베딩이 아직 없는 원본 행과 공존하려면 분리가 단순하다).
 -- embed-sync.js가 원본 텍스트의 MD5(embed_hash, DB에서 계산)를 비교해 신규/변경분만 임베딩한다.
 --
--- 이 테이블만 MariaDB 11.7+를 요구하므로 파일 맨 뒤에 둔다 — 낮은 버전에서 여기서 멈춰도
--- 앞의 5개 테이블은 온전하고 서버는 뜬다. 다만 검색이 벡터 단일 경로라(backend/src/search.js)
+-- 소스마다 테이블을 따로 둔다. 한 테이블에 담고 `WHERE src = ?`로 거르던 구조에서는 ANN이 상위
+-- K건을 고른 '뒤' src로 걸러지므로, 큰 소스가 K건을 차지해 작은 소스의 검색이 조용히 0~2건으로
+-- 주저앉았다 — 지식을 청크로 나누면 그 비대칭이 열 배로 벌어져 qa_method 검색이 상한을 못 채운다.
+-- 인덱스를 나누면 각자 자기 인덱스에서 LIMIT건만 찾으면 되므로 그 부류의 실패가 구조적으로
+-- 사라지고, 훑을 양이 줄어 mhnsw_ef_search도 낮출 수 있다 (search.js EF_SEARCH).
+-- 테이블 이름은 `vec_<원본테이블>` 규칙이다 — search.js·embed-sync.js가 그 규칙으로 이름을 만든다.
+--
+-- 이 테이블들만 MariaDB 11.7+를 요구하므로 파일 맨 뒤에 둔다 — 낮은 버전에서 여기서 멈춰도
+-- 앞의 테이블들은 온전하고 서버는 뜬다. 다만 검색이 벡터 단일 경로라(backend/src/search.js)
 -- 이 테이블이 없으면 지식·처리방법·쿼리를 하나도 찾지 못하고 '검색 불가'로 기록된다.
-CREATE TABLE vec_store (
-  src        VARCHAR(20) NOT NULL,   -- 'knowledge' | 'qa_method' | 'query_registry'
-  seq        INT NOT NULL,           -- 원본 행 seq
-  embed_hash CHAR(32) NOT NULL,      -- 변경 감지용 MD5(모델명+원문) — MariaDB가 계산한다 (embed-sync.js hashExpr)
-  embedding  VECTOR(1024) NOT NULL,  -- bge-m3 1024차원 (모델을 바꿔도 1024차원 유지)
-  PRIMARY KEY (src, seq),
+CREATE TABLE vec_knowledge_chunk (
+  seq        INT NOT NULL PRIMARY KEY,   -- knowledge_chunk.seq
+  embed_hash CHAR(32) NOT NULL,          -- 변경 감지용 MD5(모델명+원문) — MariaDB가 계산한다 (embed-sync.js hashExpr)
+  embedding  VECTOR(1024) NOT NULL,      -- bge-m3 1024차원 (모델을 바꿔도 1024차원 유지)
   VECTOR INDEX (embedding) DISTANCE=cosine  -- 검색이 VEC_DISTANCE_COSINE을 쓰므로 반드시 cosine으로.
                                             -- 기본값(euclidean)이면 인덱스를 타지 못해 풀스캔이 된다
 );
 
--- 앱 계정은 관리 테이블 4개는 SELECT만, 파생 테이블(vec_store, chat_log)에는 쓰기가 필요하다.
+CREATE TABLE vec_qa_method (
+  seq        INT NOT NULL PRIMARY KEY,
+  embed_hash CHAR(32) NOT NULL,
+  embedding  VECTOR(1024) NOT NULL,
+  VECTOR INDEX (embedding) DISTANCE=cosine
+);
+
+CREATE TABLE vec_query_registry (
+  seq        INT NOT NULL PRIMARY KEY,
+  embed_hash CHAR(32) NOT NULL,
+  embedding  VECTOR(1024) NOT NULL,
+  VECTOR INDEX (embedding) DISTANCE=cosine
+);
+
+-- 앱 계정은 관리 테이블 4개는 SELECT만, 파생 테이블(knowledge_chunk, vec_*, chat_log)에는 쓰기가 필요하다.
 -- (테이블 단위 권한은 이름으로 저장되므로 이 파일을 다시 돌려도 살아남는다 — 재부여 불필요)
---   GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_store TO 'agent'@'localhost';
+--   GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.knowledge_chunk TO 'agent'@'localhost';
+--   GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_knowledge_chunk TO 'agent'@'localhost';
+--   GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_qa_method TO 'agent'@'localhost';
+--   GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_query_registry TO 'agent'@'localhost';
 --   GRANT SELECT, INSERT, DELETE ON llm_agent.chat_log TO 'agent'@'localhost';

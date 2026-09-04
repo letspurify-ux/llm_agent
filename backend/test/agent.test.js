@@ -599,6 +599,44 @@ test('mergeFront는 새 항목만 앞에 넣고 넣은 수를 돌려준다', () 
   assert.equal(mergeFront(list, [K(1)]), 0);
 });
 
+// 본문 청구(expand)가 항목을 맨 앞으로 옮기는 것은 '예산이 뒤에서부터 버리므로 그 자리라야 살아남는다'가
+// 이유다(context.md 2-3). 뒤이은 검색이 그 앞에 후보를 쌓으면 그 이유가 통째로 무너진다 — 펼친 본문
+// (MAX_DOC_LEN)이 섹션 몫 밖으로 밀려나는데, 펼친 항목에는 번호가 붙지 않으므로 모델은 사라진
+// 것을 볼 수도 다시 청구할 수도 없고 MAX_EXPANDS만 하나 잃는다. 오류가 한 줄도 남지 않는 종류라 여기서 잰다.
+test('mergeFront는 펼친 항목을 넘어서지 않는다 — 검색은 펼침 구간 뒤에 끼운다', () => {
+  const list = [{ ...K(5), expanded: true }, K(1), K(2)];
+  assert.equal(mergeFront(list, [K(7), K(8)]), 2);
+  assert.deepStrictEqual(list.map(k => k.seq), [5, 7, 8, 1, 2]);
+
+  // 펼침이 여럿이어도(applyExpand가 unshift만 하므로 목록의 접두사를 이룬다) 그 구간 전체를 건너뛴다.
+  const two = [{ ...K(6), expanded: true }, { ...K(5), expanded: true }, K(1)];
+  mergeFront(two, [K(9)]);
+  assert.deepStrictEqual(two.map(k => k.seq), [6, 5, 9, 1]);
+
+  // 전부 펼친 목록이면 뒤에 붙인다 (findIndex가 -1을 주는 경계).
+  const all = [{ ...K(6), expanded: true }, { ...K(5), expanded: true }];
+  mergeFront(all, [K(9)]);
+  assert.deepStrictEqual(all.map(k => k.seq), [6, 5, 9]);
+});
+
+// 청크 항목의 seq는 '가장 가까운 청크'의 seq다(chunk.js buildItems). 두 번째 검색에서 같은 문서의
+// 다른 청크가 대표가 되면 seq가 달라지므로, seq로만 거르면 같은 문서가 두 항목으로 들어와 지식 몫을
+// 두 번 먹는다 — 모델은 같은 글을 두 번 읽고, 그 중복은 어디에도 기록되지 않는다.
+test('mergeFront는 청크 항목을 문서 단위로 거른다 — 대표 청크가 바뀌어도', () => {
+  const item = (seq, doc) => ({ seq, doc_seq: doc, title: `문서${doc}`, content: '본문' });
+  const list = [item(101, 1)];
+  // 같은 문서(1)의 다른 대표(105) + 새 문서(2)
+  assert.equal(mergeFront(list, [item(105, 1), item(201, 2)]), 1);
+  assert.deepStrictEqual(list.map(o => o.doc_seq), [2, 1]);
+  assert.deepStrictEqual(list.map(o => o.seq), [201, 101], '먼저 온 항목의 seq가 요청 내내 고정이어야 한다');
+});
+
+test('mergeFront의 문서 단위 판정은 청크가 아닌 항목을 건드리지 않는다', () => {
+  const list = [K(1)];
+  assert.equal(mergeFront(list, [K(1), K(2)]), 1);
+  assert.deepStrictEqual(list.map(k => k.seq), [2, 1]);
+});
+
 // ===== 일괄 조회 (run_queries) =====
 
 test('일괄 조회는 병렬로 돌고 이력은 배치 순서를 지킨다 — 끝나는 순서와 무관하게', async () => {

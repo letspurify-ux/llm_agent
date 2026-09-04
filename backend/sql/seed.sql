@@ -19,6 +19,10 @@ USE llm_agent;
 ALTER TABLE knowledge  ADD UNIQUE KEY IF NOT EXISTS uk_title (title);
 ALTER TABLE qa_method ADD UNIQUE KEY IF NOT EXISTS uk_title (title);
 
+-- 이 파일은 knowledge_chunk를 건드리지 않는다. 청크는 원문에서 파생되므로 embed-sync가 만든다 —
+-- ON DUPLICATE KEY UPDATE로 본문이 바뀌면 문서 해시가 달라져 다음 동기화가 그 문서만 재분할한다.
+-- 여기서 손으로 넣으면 두 곳이 같은 것을 만들게 되고, 어긋나도 '검색 결과가 이상하다'로만 보인다.
+
 -- target_db_name은 ';'로 구분한 목록을 담을 수 있다(여러 DB 중 하나를 LLM이 고른다).
 -- 구 스키마의 VARCHAR(100)에 목록을 넣으면 MariaDB 기본 모드에서 뒤가 잘린 채 저장되고,
 -- 잘려 나간 후보는 '등록한 적 없는 DB'가 되어 프롬프트에도 실행에도 나타나지 않는다 —

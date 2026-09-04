@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { clipText, nameKey, stripLoneSurrogates, numEnv, bindValue, warnOnce, targetDbNames, joinUrl, isPlainObject,
   readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_COMPLETION_TOKENS, normalizeSearchTargets, SEARCH_TARGETS, boundedEnv,
   MAX_SEARCHES, MAX_SEARCHES_CEILING, SEARCH_LIMIT, MAX_SEARCH_LIMIT,
-  parseItemId, normalizeItemIds, MAX_EXPANDS, MAX_EXPANDED_ITEM_LEN, PROMPT_FLOORS as FLOORS } from '../src/constants.js';
+  parseItemId, normalizeItemIds, MAX_EXPANDS, MAX_DOC_LEN, PROMPT_FLOORS as FLOORS } from '../src/constants.js';
 
 test('절단이 서로게이트 쌍을 쪼개지 않는다', () => {
   // 쪼개면 짝 잃은 코드유닛이 남아 JSON은 통과하지만 유효한 UTF-8이 아니게 된다 —
@@ -294,7 +294,7 @@ test('자료 식별자는 접두사와 seq로만 이뤄지고, 표기 차이는 
 
 test('펼친 본문의 최악 총량이 그 섹션의 최소 몫 안에 든다', () => {
   // 둘 다 한 섹션에 몰려도 다른 후보가 함께 실릴 자리가 남아야 한다 — 이 곱을 키우려면 몫부터 다시 본다.
-  assert.ok(MAX_EXPANDS * MAX_EXPANDED_ITEM_LEN < FLOORS.knowledge,
-    `펼침 총량(${MAX_EXPANDS * MAX_EXPANDED_ITEM_LEN})이 지식 몫(${FLOORS.knowledge})을 넘는다`);
-  assert.ok(MAX_EXPANDS * MAX_EXPANDED_ITEM_LEN < FLOORS.qaMethods);
+  assert.ok(MAX_EXPANDS * MAX_DOC_LEN < FLOORS.knowledge,
+    `펼침 총량(${MAX_EXPANDS * MAX_DOC_LEN})이 지식 몫(${FLOORS.knowledge})을 넘는다`);
+  assert.ok(MAX_EXPANDS * MAX_DOC_LEN < FLOORS.qaMethods);
 });

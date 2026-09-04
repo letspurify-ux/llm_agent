@@ -5,12 +5,13 @@
 // 루프의 유일한 상태는 history 배열(과 검색이 채우는 세 목록)이며, 매 반복 전체 컨텍스트를 LLM에 전달한다.
 // 대화 맥락(chat)은 서버가 저장하지 않고 클라이언트가 매 요청에 실어 보낸다 (stateless 유지).
 import { searchKnowledge, searchQaMethods, searchQueries } from './search.js';
-import { loadQueryRegistry, loadQueriesByNames, loadQueriesMentionedIn } from './db.js';
+import { loadQueryRegistry, loadQueriesByNames, loadQueriesMentionedIn, loadChunkRanges } from './db.js';
+import { canGrow, buildItems } from './chunk.js';
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
 import { llm, renderAnswer, clipAnswer } from './llm.js';
 import { resolveChartData, resolveTableData } from './chart.js';
-import { MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_RESULT_ROWS, parseItemId, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_CELL_LEN, TRUNC_MARK, SEARCH_TARGETS, nameKey, clipText, stripLoneSurrogates, bindValue, targetDbNames } from './constants.js';
+import { MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_DOC_LEN, MAX_RESULT_ROWS, parseItemId, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_CELL_LEN, TRUNC_MARK, SEARCH_TARGETS, nameKey, clipText, stripLoneSurrogates, bindValue, targetDbNames } from './constants.js';
 
 // MAX_STEPS는 constants.js에 있다 — 실행 이력의 프롬프트 몫이 그 값에 묶여 있다.
 const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포함). 초과하면 남은 스텝을 포기하고 강제 답변으로 간다.
@@ -206,12 +207,59 @@ export const searchKey = (text, targets) =>
 // 검색 결과를 컨텍스트 목록의 앞에 합친다. 이미 있는 항목(seq)은 넣지 않고, 새 항목은 검색 결과의
 // 순서(관련도 순)대로 맨 앞에 둔다 — 방금 요청한 검색이 가장 관련 높다는 전제이고, 프롬프트 예산
 // (llm-openai.js renderItems)이 꼬리부터 버리기 때문이다. 넣은 수를 돌려준다.
+//
+// 단, 펼친 항목(expanded)은 넘어서지 않는다 — 목록 맨 앞의 연속된 펼침 구간 '뒤'에 끼운다.
+// 그러지 않으면 본문 청구가 통째로 헛돈다: applyExpand가 '예산이 뒤에서부터 버리므로 맨 앞이라야
+// 살아남는다'는 이유로 항목을 앞으로 옮겨 놓는데, 뒤이은 검색 한 번이 후보 SEARCH_LIMIT건을 그
+// 앞에 쌓으면 펼친 본문(MAX_DOC_LEN)이 섹션 몫 밖으로 밀려난다. 밀려난 항목은 번호도
+// 붙지 않으므로(llm-openai.js itemLine — 펼친 항목에는 번호를 떼어 준다) 모델은 그것이 사라진
+// 것을 볼 수도, 다시 청구할 수도 없고, MAX_EXPANDS만 하나 잃는다.
+// 펼친 항목이 목록의 접두사를 이루는 것은 applyExpand가 unshift로만 옮기기 때문이다 —
+// 여기서 그 구간을 건너뛰어 끼우면 그 성질이 그대로 유지된다.
+// (쿼리 목록에는 펼침이 없어 findIndex가 0을 주므로 종전과 같이 맨 앞에 붙는다.)
 // (테스트에서 쓰므로 export 한다)
+// 중복 판정 키. 청크 항목은 문서 단위로 거른다 — 항목의 seq는 '가장 가까운 청크'의 seq인데
+// (chunk.js buildItems) 두 번째 검색에서 같은 문서의 다른 청크가 대표가 되면 seq가 달라져,
+// seq로만 거르면 같은 문서가 두 항목으로 들어온다. 먼저 온 것을 유지한다: 나중 것으로 교체하면
+// 모델이 이미 지목한(drop·expand) seq가 요청 도중 다른 것을 가리키게 되는데, seq가 요청 내내
+// 고정이라는 것이 식별자 설계의 근거다 (constants.js ITEM_PREFIX).
+const dedupKey = r => (r?.doc_seq != null ? `d${r.doc_seq}` : `s${r?.seq}`);
+
 export function mergeFront(list, rows) {
-  const seen = new Set(list.map(r => r.seq));
-  const fresh = rows.filter(r => !seen.has(r.seq) && seen.add(r.seq));
-  list.unshift(...fresh);
+  const seen = new Set(list.map(dedupKey));
+  const fresh = rows.filter(r => !seen.has(dedupKey(r)) && seen.add(dedupKey(r)));
+  const pinned = list.findIndex(o => !o?.expanded);
+  list.splice(pinned < 0 ? list.length : pinned, 0, ...fresh);
   return fresh.length;
+}
+
+// 청크 항목의 범위를 문서당 상한(MAX_DOC_LEN)까지 넓힌다 — 본문 청구(expand)의 실제 동작.
+// 읽어올 창은 현재 범위의 앞뒤 WINDOW개다. 문서 전체를 읽지 않는 이유: 문서는 수백 청크일 수 있고,
+// 상한이 4,500자라 그 이상은 어차피 버린다. 창을 넉넉히 잡는 것은 청크가 작을 때(문서 끝의 짧은
+// 조각)를 위한 여유다 — 상한을 채우기 전에 창이 먼저 바닥나면 모델은 '더 있는데 안 준다'를 본다.
+// 실패하면 null을 돌려 호출부가 '진도 없음'으로 처리하게 한다 (요청을 버리지 않는다).
+const GROW_WINDOW = 8;
+// 계측에 남길 지식 적중 수 (검색 한 번당). chat_log의 trace가 요청마다 커지지 않게 상위만 센다.
+const TOP_TRACE = 5;
+
+async function growItem(row) {
+  const lo = Math.max(1, row.from - GROW_WINDOW);
+  const hi = Math.min(row.chunk_of, row.to + GROW_WINDOW);
+  try {
+    const rows = await loadChunkRanges([{ doc_seq: row.doc_seq, from: lo, to: hi }]);
+    // buildItems에 grow=true를 주면 계획된 범위를 넘어 상한까지 채운다. 대표 청크(rep)를 그대로
+    // 넘기는 것이 중요하다: 중심이 옮겨 다니면 두 번째 청구가 첫 번째가 준 구간을 되밟고, 무엇보다
+    // 항목의 seq가 대표 청크의 것이라 중심이 바뀌면 seq도 바뀐다 — 모델이 방금 청구한 번호가
+    // 다음 스텝에 사라진다 (chunk.js buildItems의 rep 주석).
+    const [item] = buildItems(
+      [{ doc_seq: row.doc_seq, rep: row.rep ?? row.from, from: row.from, to: row.to, chunk_of: row.chunk_of, dist: row._dist }],
+      rows, { maxDocLen: MAX_DOC_LEN, grow: true }
+    );
+    return item ?? null;
+  } catch (e) {
+    console.warn('[agent] chunk expand failed:', e?.message ?? e);
+    return null;
+  }
 }
 
 // 검색 한 번의 기록 — history에 남아 프롬프트 한 줄·chat_log·화면 trace로 나간다.
@@ -306,6 +354,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
   let expands = 0;               // 본문을 펼친 항목 수 (≤ MAX_EXPANDS)
   let drops = 0;                 // 모델이 버린 항목 수
   let searches = 0;              // 실제로 실행한 검색 수 (≤ MAX_SEARCHES)
+  const topHits = [];            // 지식 적중의 (문서, 거리) — 계측 전용 (absorb 주석)
   let runs = 0;                  // run_query 결정 수 — 가드에 걸린 것도 이력 한 줄이므로 함께 센다 (≤ MAX_STEPS).
                                  // 이 두 상한이 실행 이력의 최소 몫(constants PROMPT_FLOORS.history)의 근거다.
 
@@ -334,15 +383,37 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
 
   // 본문 청구 — 잘린 항목의 전체 본문을 다음 스텝부터 싣는다. 목록 앞으로 옮기는 것이 중요하다:
   // 프롬프트 예산은 뒤에서부터 버리므로, 그냥 두면 정작 펼친 항목이 잘려 나간다.
+  // 그 자리는 이후 검색이 와도 지켜진다 — mergeFront가 펼침 구간 뒤에 끼운다(위 주석).
   // 이미 펼쳤거나 버린 항목, 목록에 없는 식별자는 넘긴다 — 성공한 것의 목록을 돌려준다.
-  const applyExpand = ids => {
+  const applyExpand = async ids => {
     const done = [];
     for (const id of ids ?? []) {
       if (expands >= MAX_EXPANDS) break;
       const { list, i } = rowAt(id);
-      if (i < 0 || list[i].dropped || list[i].expanded) continue;
-      const [row] = list.splice(i, 1);
-      row.expanded = true;
+      if (i < 0 || list[i].dropped) continue;
+      const row = list[i];
+      if (row.doc_seq != null) {
+        // 청크 항목 — 범위를 넓힌다. 항목을 새로 만들지 않는 이유: 항목이 곧 '문서의 한 구간'이라
+        // 같은 항목을 다시 청구하는 것이 자연스러운 이어받기가 된다. 별도 항목으로 넣으면 같은
+        // 문서가 여러 항목으로 흩어져 mergeFront의 문서 단위 중복 제거와 어긋난다.
+        if (!canGrow(row)) continue;                 // 상한에 닿았거나 범위 밖 청크가 없다
+        const grown = await growItem(row);
+        if (!grown || grown.content.length <= row.content.length) continue;  // 늘지 않았으면 진도가 아니다
+        // seq는 덮어쓰지 않는다. 모델이 지목한 번호가 그 스텝에 바뀌면 방금 청구한 항목을 다시
+        // 청구할 수도 버릴 수도 없다 — 'seq는 요청 내내 고정'이 식별자 설계의 근거다
+        // (constants.js ITEM_PREFIX). rep을 그대로 넘기므로 지금은 같은 값이 오지만, 그 계약을
+        // 호출 인자에 기대지 않고 여기서 구조로 못 박는다.
+        const { seq: _ignored, ...widened } = grown;
+        Object.assign(row, widened);
+        // 핀 표시. mergeFront가 이 표시로 펼침 구간을 알아보고 그 뒤에 새 검색 결과를 끼운다 —
+        // 표시를 세우지 않으면 다음 검색이 청구한 구간을 그대로 앞에서 밀어낸다.
+        row.expanded = true;
+      } else {
+        if (row.expanded) continue;                  // 청크가 아닌 항목(qa_method)은 한 번만 펼친다
+        row.expanded = true;
+      }
+      // 펼친 항목은 목록 맨 앞으로. 예산이 뒤에서부터 버리므로 그 자리라야 살아남는다.
+      list.splice(i, 1);
       list.unshift(row);
       expands++;
       done.push(id);
@@ -370,6 +441,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       // 모델이 자료를 얼마나 손봤는가 — 자주 버려지는 지식은 등록 품질 신호다 (README의 운영 루프).
       ...(expands && { expanded: expands }),
       ...(drops && { dropped: drops }),
+      ...(topHits.length && { top: topHits }),
       ...(queriesFailed && { queriesFailed: true }),
       ...(searchFailed && { searchFailed: true }),
     };
@@ -399,6 +471,15 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       if (rows === null) { failed.push(target); return; }   // 검색이 성립하지 않았다 — 0건과 다르다
       succeeded.add(target);
       hits[HIT_KEY[target]] = rows.length;
+      // 지식 적중의 거리 분포를 남긴다 — 문서당 글자 상한(MAX_DOC_LEN)이 옳은지는 논증이 아니라
+      // 이 숫자로 갈린다: 한 문서가 상위를 차지할 때 거리가 촘촘하게 낮으면(0.30~0.40) 그 문서가
+      // 정답이니 상한을 올릴 근거이고, 문턱 근처에 흩어져 있으면(0.48~0.55) 긴 문서가 청크 수로
+      // 밀고 들어온 것이니 유지할 근거다. 상위 몇 건만 센다 — chat_log가 요청마다 커지면 안 된다.
+      if (target === 'knowledge') {
+        for (const r of rows.slice(0, TOP_TRACE)) {
+          if (r?.doc_seq != null) topHits.push({ doc: r.doc_seq, d: Math.round(r._dist * 1000) / 1000 });
+        }
+      }
       added += mergeFront(list, rows);
     };
     take('knowledge', r.knowledge, knowledge);
@@ -545,7 +626,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       ? applyDrop(decision.drop) : 0;
 
     if (decision.action === 'expand') {
-      const done = applyExpand(decision.ids);
+      const done = await applyExpand(decision.ids);
       // 펼쳤거나 버렸으면 자료가 달라졌다 — 진도로 본다. 둘 다 없으면 헛돈 스텝이다.
       if (done.length || droppedNow) { guardHits = 0; continue; }
       pushNote({

@@ -9,19 +9,26 @@
 // 대가: 임베딩 서버가 없으면 검색이 성립하지 않는다. 그 상태를 '0건'으로 뭉개지 않고 null로 돌려
 // 호출부(agent.js)가 '못 찾아봤다'를 모델과 chat_log에 남기게 한다 — 조용히 빈 결과가 되면
 // 모델은 '등록된 자료가 없다'고 단정하고, 그 오답은 어디에도 기록되지 않는다.
-import { query } from './db.js';
+import { query, loadChunkRanges } from './db.js';
 import { embed, isEmbeddingEnabled, warnEmbeddingFailure } from './embedding.js';
-import { warnOnce, SEARCH_LIMIT } from './constants.js';
+import { warnOnce, SEARCH_LIMIT, MAX_DOC_LEN } from './constants.js';
+import { planRanges, buildItems } from './chunk.js';
 
 const LIMIT = SEARCH_LIMIT; // 검색 한 번이 돌려주는 최대 후보 수 — 기본 20, 환경변수로 낮춘다 (constants.js SEARCH_LIMIT)
-const EF_SEARCH = 400;    // MHNSW 탐색 깊이. 기본값(20)은 1024차원에서 recall이 크게 떨어진다
-                          // (10k 부하 테스트에서 실측: 기본값은 최근접을 놓치고, 400이면 정확 검색과 일치·~20ms)
-const VEC_OVERFETCH = 5;  // vec_store는 세 소스(knowledge/qa_method/query_registry)를 한 테이블·한 인덱스에 담는다.
-                          // ANN이 상위 K건을 고른 뒤 src로 거르는 순서가 되면, 큰 소스가 K건을 다 차지해
-                          // 작은 소스(예: query_registry 30건)의 벡터 검색이 조용히 0~2건으로 주저앉는다 —
-                          // 경로B(qa_method 없이 등록한 쿼리) 라우팅이 통째로 사라지는데 오류는 남지 않는다.
-                          // 넉넉히 뽑아 거른 뒤 LIMIT을 다시 적용해 그 순서 의존을 없앤다
-                          // (EF_SEARCH가 LIMIT×OVERFETCH보다 커야 의미가 있다 — 400 > 100).
+const EF_SEARCH = 150;    // MHNSW 탐색 깊이. 기본값(20)은 1024차원에서 recall이 크게 떨어진다
+                          // (10k 부하 테스트에서 실측: 기본값은 최근접을 놓치고, 400이면 정확 검색과 일치·~20ms).
+                          // 400에서 낮췄다 — 그 값은 한 인덱스에 세 소스를 담고 `WHERE src = ?`로 거르던 구조가
+                          // 요구한 여유였다. 소스별 테이블로 나뉜 지금은 자기 인덱스에서 LIMIT건만 찾으면 되므로
+                          // 훑을 양이 줄고 그만큼 빨라진다. 질의 하나가 요구하는 최대치(지식의
+                          // LIMIT × CHUNK_OVERFETCH = 60)보다 커야 한다 — 그래야 ANN이 그 수를 채운다.
+// 지식만 상한의 이 배수만큼 '청크'를 받는다. 청크는 문서로 병합되므로(planRanges) 20청크가 20항목이
+// 되지 않는다 — 한 문서가 적중을 독차지하면 20청크가 문서 1건으로 접히고, 다른 문서는 후보에 오르지도
+// 못한 채 사라진다(실측). 문서 상한을 채우려면 청크를 그 배수만큼 받아야 한다.
+//
+// 종전에는 이 배수를 '안쪽' 질의에 걸었는데 그 자리에서는 아무 일도 하지 않았다: 바깥의 거리 필터
+// (MAX_DIST)는 거리 순서와 단조라, 상위 60건을 걸러 20건을 취하나 상위 20건을 걸러 취하나 결과가 같다.
+// 배수는 '병합 뒤 몇 항목이 남는가'에 걸어야 뜻이 있으므로 바깥 상한에 건다.
+export const CHUNK_OVERFETCH = 3;  // (테스트에서 쓰므로 export 한다)
 const MAX_DIST = 0.55;    // 관련도 임계값 (코사인 거리). 실측: 관련 0.30~0.53, 무관 0.58~0.75.
                           // top-K는 무관해도 항상 K건을 돌려주므로, 이 필터가 없으면 "관련 지식 없음 →
                           // 일반 지식 답변" 폴백이 무력화된다.
@@ -29,15 +36,39 @@ const MAX_DIST = 0.55;    // 관련도 임계값 (코사인 거리). 실측: 관
 // 테이블별 임베딩 원문 컬럼 (첫 컬럼 = 제목/이름). embed-sync.js가 임베딩 원문을 만들 때 쓴다 —
 // 검색이 무엇을 보고 맞추는지가 곧 이 컬럼들이다. 쿼리는 SQL 원문을 넣지 않는다(질문과 닮은 것은 설명이다).
 export const SEARCH_COLUMNS = {
-  knowledge: ['title', 'content'],
+  // 지식은 원문(knowledge)이 아니라 청크를 검색한다. 원문은 임베딩 상한(MAX_EMBED_TEXT_LEN)에서
+  // 잘려 앞부분만 벡터가 되므로, 긴 문서의 뒷부분이 어떤 검색어로도 걸리지 않았다 (chunk.js 머리말).
+  // 컬럼 이름이 knowledge와 같아서 여기 한 줄만 바뀐다.
+  knowledge_chunk: ['title', 'content'],
   qa_method: ['title', 'method'],
   query_registry: ['query_name', 'query_desc', 'input_desc', 'output_desc'],
 };
 
+// 소스 테이블 → 그 임베딩 테이블. 규칙 하나로 파생한다 (schema.sql 참고) —
+// 매핑 표를 따로 들면 테이블을 더할 때 한쪽만 고쳐지고, 그 실패는 '검색 불가'로만 보인다.
+export const vecTable = table => `vec_${table}`;
+
 // 반환: 관련도 순 행 배열. 검색 자체가 성립하지 않았으면(임베딩 미설정·임베딩 실패·벡터 SQL 실패)
 // null이다 — '찾았는데 없다'([])와 '찾아보지 못했다'(null)를 호출부가 구분해야 한다 (파일 머리말 참고).
-export function searchKnowledge(text) {
-  return vectorSearch('knowledge', text);
+// 지식 검색만 후처리가 붙는다: 적중한 청크를 문서별로 묶고, 사이의 구멍을 메우고, 이어 붙인다.
+// 개수로 깎지 않는 이유와 문서당 글자 상한의 근거는 chunk.js의 병합 머리말에 있다.
+// 후처리에서 무엇이 잘못돼도 검색 자체를 '불가'로 떨어뜨리지는 않는다 — null은 임베딩·벡터 검색이
+// 성립하지 않았다는 뜻이고(파일 머리말), 병합 실패까지 그 뜻에 섞으면 모델은 '지금은 자료를 확인할
+// 수 없다'고 답한다. 청크 원문은 이미 손에 있으므로 병합 없이 그대로 싣는 편이 낫다.
+export async function searchKnowledge(text) {
+  const hits = await vectorSearch('knowledge_chunk', text, LIMIT * CHUNK_OVERFETCH);
+  if (!hits || !hits.length) return hits;
+  try {
+    const plans = planRanges(hits);
+    const rows = await loadChunkRanges(plans);
+    // 병합한 '문서'를 상한까지 취한다. 청크를 그보다 많이 받은 이유가 여기다 (CHUNK_OVERFETCH).
+    return buildItems(plans, rows, { maxDocLen: MAX_DOC_LEN }).slice(0, LIMIT);
+  } catch (e) {
+    // 병합에 실패하면 청크 원문을 그대로 싣는다. 다만 그 행들은 문서 단위로 접히지 않았으므로
+    // 목록 병합(agent.js mergeFront)이 문서당 하나만 남긴다 — 얕지만 틀리지는 않은 상태다.
+    warnOnce('search:merge', `chunk merge failed — falling back to raw chunks: ${e.message}`);
+    return hits.slice(0, LIMIT);
+  }
 }
 
 export function searchQaMethods(text) {
@@ -49,13 +80,13 @@ export function searchQueries(text) {
   return vectorSearch('query_registry', text);
 }
 
-async function vectorSearch(table, text) {
+async function vectorSearch(table, text, limit) {
   // 빈 검색어는 '아무것도 찾지 않았다'다 — 임베딩 서버에 빈 입력을 보내면 거부되어 '검색 불가'로
   // 잘못 기록된다. 호출부는 빈 검색어를 질문으로 대체하므로(agent.js) 정상 경로에서는 오지 않는다.
   if (!String(text ?? '').trim()) return [];
   const vector = await embedText(text);
   if (!vector) return null;
-  return vecQuery(table, vector).catch(e => {
+  return vecQuery(table, vector, limit).catch(e => {
     // 억제는 warnOnce에 맡긴다 — '한 번만 경고' 플래그를 쓰면 vec_store 미생성으로 한 번 알린 뒤
     // 차원 불일치·인덱스 손상 같은 전혀 다른 이유로 벡터 검색이 죽어도 로그가 남지 않는다.
     // 검색이 통째로 없는 상태라 로그와 이력의 '검색 불가' 표시가 유일한 단서다.
@@ -125,15 +156,21 @@ export async function warmUpEmbedding() {
   }
 }
 
-// 검색어 임베딩 후 vec_store에서 코사인 거리 상위 LIMIT건 → 원본 행 JOIN.
-function vecQuery(table, vector) {
+// 검색어 임베딩 후 그 소스의 임베딩 테이블에서 코사인 거리 상위 LIMIT건 → 원본 행 JOIN.
+// _dist를 함께 돌려준다 — 청크 병합이 대표 청크와 문서 순서를 이 값으로 정하고(chunk.js planRanges),
+// 계측(agent.js trace.search.top)도 이 값을 남겨 문서당 상한을 나중에 데이터로 다시 잡는다.
+// table은 코드가 정의한 식별자다(SEARCH_COLUMNS의 키) — 외부 입력이 아니다.
+function vecQuery(table, vector, limit) {
+  // 안팎 상한이 같다. 바깥의 거리 필터가 거리 순서와 단조라, 안쪽에서 더 뽑아 봐야 그 여분은
+  // 전부 필터에 걸린다 — 넉넉히 뽑는 것은 병합이 있는 지식 쪽에서 바깥 상한으로 한다.
+  const n = Number.isInteger(limit) && limit > 0 ? limit : LIMIT;
   return query(
     `SET STATEMENT mhnsw_ef_search=${EF_SEARCH} FOR
-     SELECT t.* FROM (
+     SELECT t.*, v._dist FROM (
        SELECT seq, VEC_DISTANCE_COSINE(embedding, VEC_FromText(?)) AS _dist
-       FROM vec_store WHERE src = ? ORDER BY _dist LIMIT ${LIMIT * VEC_OVERFETCH}
+       FROM ${vecTable(table)} ORDER BY _dist LIMIT ${n}
      ) v JOIN ${table} t ON t.seq = v.seq WHERE v._dist <= ${MAX_DIST}
-     ORDER BY v._dist LIMIT ${LIMIT}`,
-    [JSON.stringify(vector), table]
+     ORDER BY v._dist LIMIT ${n}`,
+    [JSON.stringify(vector)]
   );
 }

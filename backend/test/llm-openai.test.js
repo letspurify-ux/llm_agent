@@ -1055,8 +1055,11 @@ test('본문 청구 결정을 읽는다 — 청구할 것이 없으면 결정이
 test('시스템 프롬프트가 본문 청구와 버리기를 설명한다', async () => {
   const sys = (await capturedRequest()).messages[0].content;
   assert.match(sys, /"action":"expand"/);
-  assert.ok(sys.includes(`${TRUNC_MARK} 으로 끝나고`), '어떤 항목을 청구할 수 있는지 표시와 함께 말해야 한다');
-  assert.match(sys, /번호가 붙은 항목만/);
+  // 청구 조건은 '본문이 잘렸는가'가 아니라 '번호가 붙었는가'다 — 청크는 잘리지 않으므로(chunk.js
+  // CHUNK_MAX_LEN = MAX_PROMPT_ITEM_LEN) 잘림 표시로 설명하면 모델이 청구할 자리를 영영 못 찾는다.
+  assert.match(sys, /번호가 붙어 있으면/, '어떤 항목을 청구할 수 있는지 표시와 함께 말해야 한다');
+  assert.match(sys, /번호가 없는 항목은 더 받을 것이 없다/, '청구해도 소용없는 항목을 구분해 줘야 한다');
+  assert.match(sys, /같은 번호를 다시 청구하면 더 넓어진다/, '이어받기가 가능하다는 것을 말해야 한다');
   assert.match(sys, /답변에 옮겨 적지 마라/, '자료 번호가 답변으로 새지 않게 막아야 한다');
   assert.match(sys, /drop:/);
 });

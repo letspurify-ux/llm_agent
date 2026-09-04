@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { buildPrompt } from '../src/llm-openai.js';
-import { MAX_PROMPT_TOTAL_LEN, MAX_PROMPT_STEP_LEN, PROMPT_FLOORS, PROMPT_FRAME_RESERVE, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN, MAX_CELL_LEN, MAX_RESULT_COLS, MAX_ROWS, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_EXPANDED_ITEM_LEN, MAX_PROMPT_ITEM_LEN, TRUNC_MARK } from '../src/constants.js';
+import { MAX_PROMPT_TOTAL_LEN, MAX_PROMPT_STEP_LEN, PROMPT_FLOORS, PROMPT_FRAME_RESERVE, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN, MAX_CELL_LEN, MAX_RESULT_COLS, MAX_ROWS, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_DOC_LEN, MAX_PROMPT_ITEM_LEN, TRUNC_MARK } from '../src/constants.js';
 
 const big = n => 'ㄱ'.repeat(n);
 
@@ -558,12 +558,12 @@ test('번호는 잘렸고 아직 펼치지 않은 항목에만 붙는다', () =>
 });
 
 test('펼친 항목은 더 긴 상한으로 실린다', () => {
-  const body = big(MAX_EXPANDED_ITEM_LEN + 500);
+  const body = big(MAX_DOC_LEN + 500);
   const one = buildPrompt(ctx({ searched: ['knowledge'], knowledge: [{ seq: 1, title: 'K', content: body }] }));
   const two = buildPrompt(ctx({ searched: ['knowledge'], knowledge: [{ seq: 1, title: 'K', content: body, expanded: true }] }));
   const len = md => md.split('\n').find(l => l.startsWith('- ') || l.startsWith('- k')).length;
   assert.ok(len(two) > len(one) + 2000, `펼친 본문이 길어지지 않았다: ${len(one)} → ${len(two)}`);
-  assert.ok(len(two) < MAX_EXPANDED_ITEM_LEN + 300, '펼친 본문이 상한을 넘었다');
+  assert.ok(len(two) < MAX_DOC_LEN + 300, '펼친 본문이 상한을 넘었다');
 });
 
 test('버린 항목은 실리지도 세지도 않고, 버린 수는 따로 밝힌다', () => {
@@ -586,7 +586,7 @@ test('모두 버린 섹션은 (없음)으로 남는다 — 찾아본 사실은 �
 test('펼친 항목이 상한만큼 있어도 프롬프트가 예산을 넘지 않고, 그 본문이 잘리지 않는다', () => {
   // 펼친 항목은 목록 맨 앞에 온다(agent.js) — 예산이 뒤에서부터 버리므로 그 자리라야 살아남는다.
   const expanded = Array.from({ length: MAX_EXPANDS }, (_, i) => ({
-    seq: 100 + i, title: `펼친${i}`, content: big(MAX_EXPANDED_ITEM_LEN), expanded: true,
+    seq: 100 + i, title: `펼친${i}`, content: big(MAX_DOC_LEN), expanded: true,
   }));
   const p = buildPrompt(ctx({
     forceAnswer: true, searched: ['knowledge', 'qa_method', 'query'],
@@ -601,4 +601,32 @@ test('펼친 항목이 상한만큼 있어도 프롬프트가 예산을 넘지 �
     assert.ok(line, `펼친 항목 ${i}이 실리지 않았다`);
     assert.ok(!line.includes(TRUNC_MARK), `펼친 항목 ${i}의 본문이 다시 잘렸다`);
   }
+});
+
+// ===== 청크 항목의 표기 =====
+// 청크는 프롬프트 항목 상한 안이라 잘리지 않는다(chunk.js CHUNK_MAX_LEN = MAX_PROMPT_ITEM_LEN).
+// 그래서 번호를 '잘렸는가'로 붙이던 옛 규칙을 그대로 두면 긴 문서에도 번호가 한 번도 안 붙고,
+// 본문 청구 경로가 통째로 죽는다 — 오류 없이 답변만 부실해지는 형태다.
+test('청크 항목은 잘리지 않아도 더 받을 것이 남았으면 번호가 붙는다', () => {
+  const chunk = (o) => ({ seq: 12, doc_seq: 7, title: '운영 가이드', range: ' (3~7/22)', content: '가'.repeat(900), chunk_of: 22, from: 3, to: 7, ...o });
+  const at = ctx => buildPrompt(ctx).split('\n').find(l => l.startsWith('- '));
+
+  const base = { knowledge: [chunk()], qaMethods: [], queries: [], history: [], chat: [], question: 'q', searched: ['knowledge'], tried: true };
+  assert.match(at(base), /^- k12 \[운영 가이드 \(3~7\/22\)\]/, '범위 밖 청크가 남았으면 번호가 보여야 한다');
+
+  const whole = { ...base, knowledge: [chunk({ from: 1, to: 22 })] };
+  assert.match(at(whole), /^- \[운영 가이드/, '문서 전체가 실렸으면 번호를 떼어 더 받을 것이 없음을 알린다');
+
+  const capped = { ...base, knowledge: [chunk({ content: '가'.repeat(MAX_DOC_LEN) })] };
+  assert.match(at(capped), /^- \[운영 가이드/, '글자 상한에 닿았으면 청구해도 늘지 않으므로 번호를 떼야 한다');
+});
+
+test('청크 항목은 문서당 상한까지 잘리지 않고 통째로 실린다', () => {
+  const body = '가'.repeat(MAX_DOC_LEN);
+  const p = buildPrompt({
+    knowledge: [{ seq: 1, doc_seq: 1, title: '긴 지식', content: body, chunk_of: 5, from: 1, to: 5 }],
+    qaMethods: [], queries: [], history: [], chat: [], question: 'q', searched: ['knowledge'], tried: true,
+  });
+  assert.ok(p.includes(body), '문서당 상한 안의 본문이 프롬프트에서 다시 잘리면 안 된다');
+  assert.ok(!p.includes(TRUNC_MARK), '청크는 잘림 표시가 붙지 않는다');
 });

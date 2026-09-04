@@ -10,11 +10,12 @@ import {
   MAX_PROMPT_ITEM_LEN, MAX_PROMPT_SQL_LEN, MAX_PROMPT_STEP_LEN,
   MAX_PROMPT_PARAMS_LEN, MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS, PROMPT_FRAME_RESERVE,
   MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, MAX_COMPLETION_TOKENS, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_BATCH_QUERIES, MAX_RESULT_ROWS,
-  MAX_EXPANDS, MAX_EXPANDED_ITEM_LEN, ITEM_PREFIX,
+  MAX_EXPANDS, MAX_DOC_LEN, ITEM_PREFIX,
   SEARCH_TARGETS, clipText, warnOnce, targetDbNames, isPlainObject, joinUrl,
   readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_UPSTREAM_ERROR_BYTES, numEnv,
 } from './constants.js';
 import { bindNames } from './sql.js';
+import { canGrow } from './chunk.js';
 import { rowCounts } from './result.js';
 
 // 추론 강도. 기본을 low로 두는 이유: 이 에이전트가 모델에게 요구하는 건 매 스텝 결정 JSON 하나이고,
@@ -66,13 +67,15 @@ const SYSTEM_PROMPT = `당신은 사내 지식 관리 및 DB 조회 Q&A 에이�
 - text: 질문의 핵심 낱말 2~6개(시스템명·작업 ID·고객명·절차명). 후속 질문이면 최근 대화에서 대상을 복원해 적는다 (예: "그럼 김철수는?" → "김철수 고객 주문 상태").
 - 사내 시스템·업무·절차·데이터에 관한 질문은 검색 없이 답하지 마라. 검색이 0건이면 검색어를 바꿔 한 번 더 시도하고, 그래도 없으면 3의 규칙대로 답한다. 이미 검색한 검색어·대상을 반복하지 마라.
 - 인사·잡담·감사 인사, 그리고 최근 대화에 이미 있는 내용의 재정리는 검색 없이 곧바로 답한다.
-- drop: 앞서 받은 자료 중 더는 필요 없는 것의 번호를 함께 적는다 (예: ["k7","m2"]). 적은 것은 다음 단계부터 실리지 않아 그 자리를 관련 있는 자료가 쓴다. 필요 없으면 생략한다.
+- drop: 앞서 받은 자료 중 더는 필요 없는 것의 번호를 함께 적는다 (예: ["k7","m2"]). 적은 것은 다음 단계부터 실리지 않아 그 자리를 관련 있는 자료가 쓴다. 첫 검색에는 필요 없다.
+- 두 번째 검색부터는 drop을 함께 적어라. 새 결과가 목록 앞에 실리므로, 앞선 검색의 자료를 그대로 두면 길이 제한에 밀려 사라진다 — 어느 쪽이 이 질문에 필요한지는 너만 판단할 수 있다. 앞선 검색에서 아직 쓸 것이 있으면 이번 검색의 대상(targets)을 좁혀라.
 
-2. 자료의 본문이 ${TRUNC_MARK} 으로 끝나고 항목 앞에 번호가 붙어 있으면 그 전체 본문을 청구할 수 있다:
+2. 항목 앞에 번호가 붙어 있으면 그 자료를 더 청구할 수 있다:
 {"action":"expand","ids":["k12"],"drop":["k7"]}
-- ids에는 번호가 붙은 항목만 적는다. 번호가 없는 항목은 이미 본문 전체가 실려 있어 청구할 것이 없다. 한 번에 최대 ${MAX_EXPANDS}개.
-- 절차나 기준의 뒷부분이 답에 필요할 때만 청구하라. 앞부분만으로 답할 수 있으면 그대로 답한다.
-- drop은 1의 것과 같다. 펼친 본문이 자리를 많이 쓰므로 더는 필요 없는 자료를 함께 적어라.
+- 긴 지식은 여러 조각으로 나뉘어 있고 제목 끝의 (3~7/22) 가 전체 22조각 중 지금 실린 범위다. 청구하면 그 앞뒤가 이어져 실린다. 같은 번호를 다시 청구하면 더 넓어진다.
+- 번호가 없는 항목은 더 받을 것이 없다 — 범위가 문서 전체이거나 길이 상한에 닿았다는 뜻이다. 청구해도 아무것도 늘지 않는다.
+- 실린 범위 밖에 답이 있을 것 같을 때만 청구하라. 보이는 범위로 답할 수 있으면 그대로 답한다. 한 요청에 최대 ${MAX_EXPANDS}번.
+- drop은 1의 것과 같다. 넓힌 본문이 자리를 많이 쓰므로 더는 필요 없는 자료를 함께 적어라.
 
 3. 답변 전에 DB 조회가 더 필요하면:
 {"action":"run_query","query_name":"<쿼리이름>","params":{"<바인드변수명>":"<값>"},"target_db":"<대상DB이름>"}
@@ -125,6 +128,20 @@ y: 건수
 ## 대화 맥락
 현재 질문이 이전 대화를 가리키면(예: "그럼 김철수는?", "재시작은 어떻게 해?") 최근 대화를 참고해
 무엇을 묻는지 해석한 뒤 판단하라. 단, 이미 조회한 값이라도 현재 질문의 대상이 다르면 반드시 쿼리를 다시 실행하라.`;
+
+// 시스템 프롬프트의 상한. 이 문자열은 프롬프트 예산(MAX_PROMPT_TOTAL_LEN) '밖'이지만 컨텍스트에는
+// 매 스텝 실린다 — 예산 밖의 다른 두 몫(최근 대화·질문)은 상수가 묶고 있는데 이것만 관측값이라,
+// 규칙 한 줄을 더할 때마다 조용히 자라고 context.md의 최악 합계는 근거를 잃는다. 실제로 그렇게
+// 어긋나 있었다(문서 ~2k자, 실측 4.9k자). 요청마다 같은 토큰열이라 prefix caching이 재사용하므로
+// 속도에는 거의 영향이 없지만, 컨텍스트 회계에는 그대로 들어간다.
+// 로드 시점에 터뜨린다 — 예산 불변식과 같은 이유다(constants.js FLOOR_SUM 주석).
+export const MAX_SYSTEM_PROMPT_LEN = 6000;
+if (SYSTEM_PROMPT.length > MAX_SYSTEM_PROMPT_LEN) {
+  throw new Error(
+    `SYSTEM_PROMPT (${SYSTEM_PROMPT.length}) exceeds MAX_SYSTEM_PROMPT_LEN (${MAX_SYSTEM_PROMPT_LEN}) — ` +
+    `trim the prompt or raise the ceiling together with context.md's "예산 밖의 몫" table.`
+  );
+}
 
 // decide() 한 번이 쓸 수 있는 전체 시간(ms). 재시도도 이 예산을 나눠 쓴다 —
 // 시도마다 타이머를 새로 주면 느린 엔드포인트에서 2배가 되고, 그 값이 다시 스텝 수만큼 곱해진다.
@@ -489,10 +506,18 @@ export const live = list => (list ?? []).filter(o => !o?.dropped);
 // 번호가 보이게 해서, 모델이 펼칠 수 없는 것을 청구하느라 스텝을 버리지 않게 한다. 펼친 항목은 더 긴
 // 상한으로 싣고 번호를 떼는데, 번호가 없다는 것이 곧 '더 받을 것이 없다'는 표시다.
 const itemLine = (prefix, titleKey, bodyKey) => o => {
-  const max = o.expanded ? MAX_EXPANDED_ITEM_LEN : MAX_PROMPT_ITEM_LEN;
+  // 청크 항목(doc_seq가 있다)은 본문이 이미 문서당 상한 안이라 자를 것이 없다 — 청크 크기를
+  // MAX_PROMPT_ITEM_LEN과 같게 잡은 것이 그 근거다(chunk.js CHUNK_MAX_LEN). 번호를 붙일지는
+  // '길이가 잘렸는가'가 아니라 '범위 밖에 청크가 남았는가'로 정한다(canGrow) — 청크는 잘리지
+  // 않으므로 옛 판정을 그대로 두면 긴 문서에도 번호가 한 번도 붙지 않는다.
+  const chunk = o.doc_seq != null;
+  const max = chunk || o.expanded ? MAX_DOC_LEN : MAX_PROMPT_ITEM_LEN;
   const text = indent(o[bodyKey]);
-  const askable = !o.expanded && text.length > max;
-  return `- ${askable ? `${prefix}${o.seq} ` : ''}[${clip(oneLine(o[titleKey]), MAX_PROMPT_NAME_LEN)}] ${clip(text, max)}`;
+  const askable = chunk ? canGrow(o) : (!o.expanded && text.length > max);
+  // 위치 표기((3~7/22))는 제목을 자른 '뒤에' 붙인다 — 제목에 이어 붙여 넘기면 긴 제목에서 이 표기부터
+  // 잘려 나가, 정작 조각으로 나뉜 긴 문서에서 위치를 알 수 없게 된다 (chunk.js buildItems의 range).
+  const name = clip(oneLine(o[titleKey]), MAX_PROMPT_NAME_LEN) + (o.range ?? '');
+  return `- ${askable ? `${prefix}${o.seq} ` : ''}[${name}] ${clip(text, max)}`;
 };
 
 // 바인드 변수명을 SQL과 따로 싣는다 — SQL이 길어 잘리더라도 채워야 할 파라미터가 사라지지 않게.
@@ -875,46 +900,53 @@ function maxHistoryLineLen() {
   const over = n => 'x'.repeat(n + 1); // 상한을 넘겨 clip이 '상한 + TRUNC_MARK'까지 채우게 한다
   const head = { query_name: over(MAX_PROMPT_NAME_LEN), targetDb: over(MAX_TARGET_DB_NAME_LEN), params: { p: over(MAX_PROMPT_PARAMS_LEN) } };
   const rows = Array.from({ length: MAX_RESULT_ROWS }, () => ({ C: 'x'.repeat(MAX_CELL_LEN) }));
-  const resultLine = historyLine({ ...head, rows, totalRows: MAX_ROWS, capped: true }, MAX_STEPS);
+  const resultLine = historyLine({ ...head, rows, totalRows: MAX_ROWS, capped: true }, MAX_HISTORY_ROWS);
   const rowsLen = JSON.stringify(fitRows(rows, MAX_PROMPT_STEP_LEN)).length;
-  const errorLine = historyLine({ ...head, error: over(MAX_PROMPT_ITEM_LEN), hint: over(MAX_PROMPT_ITEM_LEN) }, MAX_STEPS);
+  const errorLine = historyLine({ ...head, error: over(MAX_PROMPT_ITEM_LEN), hint: over(MAX_PROMPT_ITEM_LEN) }, MAX_HISTORY_ROWS);
   return Math.max(resultLine.length - rowsLen + MAX_PROMPT_STEP_LEN, errorLine.length);
 }
-// 검색 줄의 상한. 이력에는 쿼리 줄이 최대 MAX_STEPS개, 검색 줄이 최대 MAX_SEARCHES개 온다 — 루프가 두 결정을
-// 따로 세기 때문이다(agent.js runs·searches). 반복 상한이 둘의 합이라 어떤 조합이든 이 둘을 넘지 않고,
-// 검색 줄이 쿼리 줄보다 짧으므로 '쿼리 MAX_STEPS + 검색 MAX_SEARCHES'가 최악이다.
-function maxSearchLineLen() {
+// 쿼리 결과·오류 줄이 아닌 나머지 모양의 상한. 이력에 오는 줄은 넷이다 — 쿼리 결과·오류(위),
+// 쿼리 모양의 안내(루프 가드·조회 상한), 검색, 본문 청구 실패. 뒤 셋은 결과도 오류도 없어 머리말과
+// 안내 문구뿐이라 위 상한보다 짧다. 그 줄들에 결과 줄의 상한을 매기면 이력 몫이 실제로 필요한 것보다
+// 훨씬 커져 다른 섹션을 굶긴다.
+//
+// 넷을 '모양별 개수'로 세지 않고 한 상한으로 합치는 이유: 개수가 묶여 있는 것은 쿼리 줄뿐이다.
+// 검색 줄은 MAX_SEARCHES개가 아니다 — 중복 검색·횟수 상한에 걸린 줄(agent.js의 guardNote)은 검색
+// 모양으로 이력에 남지만 searches를 올리지 않으므로, 진도가 난 검색과 번갈아 나오면 검색 모양 줄이
+// MAX_SEARCHES를 넘는다(가드는 '연속' 헛돌 때만 끊는다). 본문 청구 실패 줄도 MAX_EXPANDS와 별개다.
+// 종전 계산은 '쿼리 MAX_STEPS + 안내 1 + 검색 MAX_SEARCHES'라는 한 조합만 쟀는데, 그 조합이 최악인
+// 것은 검색 줄이 쿼리 줄보다 짧다는 사실 덕분이지 개수 회계가 성립해서가 아니었다 — 안내 문구나
+// MAX_PROMPT_SEARCH_LEN이 길어지면 검증이 통과한 채로 근거만 사라진다.
+function maxOtherLineLen() {
   const over = n => 'x'.repeat(n + 1);
-  const base = { search: over(MAX_PROMPT_SEARCH_LEN), targets: [...SEARCH_TARGETS] };
-  const step = MAX_STEPS + MAX_SEARCHES;
+  const search = { search: over(MAX_PROMPT_SEARCH_LEN), targets: [...SEARCH_TARGETS] };
+  const step = MAX_HISTORY_ROWS; // 번호는 이력 안의 절대 순번 — 자릿수가 가장 큰 값으로 잰다
   return Math.max(
-    historyLine({ ...base, hits: { knowledge: MAX_ROWS, qaMethods: MAX_ROWS, queries: MAX_ROWS } }, step).length,
-    historyLine({ ...base, failed: [...SEARCH_TARGETS] }, step).length,
-    historyLine({ ...base, note: over(MAX_PROMPT_ITEM_LEN) }, step).length,
+    historyLine({
+      query_name: over(MAX_PROMPT_NAME_LEN), targetDb: over(MAX_TARGET_DB_NAME_LEN),
+      params: { p: over(MAX_PROMPT_PARAMS_LEN) }, note: over(MAX_PROMPT_ITEM_LEN),
+    }, step).length,
+    historyLine({ ...search, hits: { knowledge: MAX_ROWS, qaMethods: MAX_ROWS, queries: MAX_ROWS } }, step).length,
+    historyLine({ ...search, failed: [...SEARCH_TARGETS] }, step).length,
+    historyLine({ ...search, note: over(MAX_PROMPT_ITEM_LEN) }, step).length,
+    historyLine({ expand: [over(MAX_PROMPT_NAME_LEN)], note: over(MAX_PROMPT_ITEM_LEN) }, step).length,
   );
 }
-// 실행하지 않은 스텝의 줄(루프 가드·상한 안내)은 결과도 오류도 없어 위 두 상한보다 짧다 — 머리말과 안내 문구뿐이다.
-// 그 줄에 결과 줄의 상한을 매기면 이력 몫이 실제로 필요한 것보다 훨씬 커져 다른 섹션을 굶긴다.
-function maxNoteLineLen() {
-  const over = n => 'x'.repeat(n + 1);
-  return historyLine({
-    query_name: over(MAX_PROMPT_NAME_LEN), targetDb: over(MAX_TARGET_DB_NAME_LEN),
-    params: { p: over(MAX_PROMPT_PARAMS_LEN) }, note: over(MAX_PROMPT_ITEM_LEN),
-  }, MAX_HISTORY_ROWS).length;
-}
 
-// 이력이 받을 수 있는 줄은 MAX_HISTORY_ROWS개이고(constants.js — agent.js가 그 수를 지킨다) 종류는 셋이다.
-// 길이로 따진 최악은 '쿼리 줄을 최대한 많이'다: 쿼리 줄은 MAX_STEPS개까지만 생기고(루프의 조회 수 상한),
-// 남는 자리 하나는 상한 안내 줄(쿼리 모양의 note 줄), 나머지는 검색 줄이다.
-// 그 합이 몫 안에 들어야 '이력은 전부 실린다'가 참이 된다 — 넘치면 가장 오래된 조회 결과가 조용히 빠진다.
-const NOTE_ROWS = MAX_HISTORY_ROWS - MAX_STEPS - MAX_SEARCHES;
+// 이력이 받을 수 있는 줄은 MAX_HISTORY_ROWS개다(constants.js — agent.js가 그 수를 지킨다).
+// 길이로 따진 최악은 '쿼리 줄을 최대한 많이'다: 쿼리 결과·오류 줄은 MAX_STEPS개까지만 생기고
+// (agent.js runs가 가드에 걸린 항목까지 함께 세므로 그 상한이 실제로 지켜진다), 남는 자리는 어떤
+// 모양이 오든 maxOtherLineLen을 넘지 않는다. 그래서 이 합은 '어떤 조합이 오더라도'의 상한이다 —
+// 모양별 개수를 세지 않으므로 루프가 줄의 구성을 바꿔도 근거가 무너지지 않는다.
+// 이 합이 몫 안에 들어야 '이력은 전부 실린다'가 참이 된다 — 넘치면 가장 오래된 조회 결과가 조용히 빠진다.
+const OTHER_ROWS = MAX_HISTORY_ROWS - MAX_STEPS;
 const HISTORY_FLOOR_NEEDED =
-  MAX_STEPS * (maxHistoryLineLen() + 1) + NOTE_ROWS * (maxNoteLineLen() + 1)
-  + MAX_SEARCHES * (maxSearchLineLen() + 1) + NOTES_RESERVE; // +1: 줄마다 개행 (lineCost)
+  MAX_STEPS * (maxHistoryLineLen() + 1) + OTHER_ROWS * (maxOtherLineLen() + 1)
+  + NOTES_RESERVE; // +1: 줄마다 개행 (lineCost)
 if (PROMPT_FLOORS.history < HISTORY_FLOOR_NEEDED) {
   throw new Error(
     `PROMPT_FLOORS.history (${PROMPT_FLOORS.history}) cannot hold MAX_HISTORY_ROWS (${MAX_HISTORY_ROWS}) full history lines ` +
-    `— ${MAX_STEPS} query + ${NOTE_ROWS} note + ${MAX_SEARCHES} search (${HISTORY_FLOOR_NEEDED} needed) — ` +
+    `— ${MAX_STEPS} query + ${OTHER_ROWS} other (${HISTORY_FLOOR_NEEDED} needed) — ` +
     `raise the floor or lower MAX_PROMPT_STEP_LEN in constants.js.`
   );
 }

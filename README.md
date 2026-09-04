@@ -89,9 +89,21 @@ mariadb --default-character-set=utf8mb4 < backend/sql/schema.sql
 > ALTER TABLE query_registry CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 > ALTER TABLE target_db      CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 > ALTER TABLE chat_log       CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
-> -- vec_store는 제외 — 유일한 텍스트 컬럼(src)이 ASCII 고정값이라 collation의 영향이 없고,
-> -- VECTOR 컬럼이 있는 테이블의 문자셋 일괄 변환은 버전에 따라 지원되지 않는다.
+> -- vec_* 테이블은 제외 — 텍스트 컬럼이 없고, VECTOR 컬럼이 있는 테이블의 문자셋 일괄 변환은
+> -- 버전에 따라 지원되지 않는다.
 > ```
+>
+> **청크 구조로의 이행**(긴 지식이 앞부분만 검색되던 문제 — `context.md` 2-5)은 별도 파일에 있다.
+> 임베딩 저장소를 소스별로 나누고 `knowledge_chunk`를 만든다:
+>
+> ```bash
+> mariadb --default-character-set=utf8mb4 < backend/sql/migrate-chunk.sql
+> cd backend && npm run embed     # 청크 생성 + 최초 임베딩
+> ```
+>
+> `npm run embed`는 지식 문서 수 × 평균 청크 수만큼 임베딩을 호출한다(문서 1,000건 × 10청크면 1만 회).
+> 서버 기동 시에도 같은 동기화가 돌지만 그때는 첫 질문이 그 시간을 그대로 기다리므로, 한산한 시간에
+> 미리 돌리는 편이 낫다. 검색이 정상인 것을 확인한 뒤 `DROP TABLE vec_store;` 로 옛 테이블을 지운다.
 
 ```bash
 mariadb --default-character-set=utf8mb4 < backend/sql/seed.sql
@@ -102,7 +114,17 @@ mariadb --default-character-set=utf8mb4 < backend/sql/seed.sql
 (문서에 고정 비밀번호를 적어 두면 저장소에 공개된 자격증명이 운영까지 그대로 따라간다):
 
 ```bash
-mariadb -e "CREATE USER IF NOT EXISTS 'agent'@'localhost' IDENTIFIED BY '<비밀번호>'; GRANT SELECT ON llm_agent.* TO 'agent'@'localhost'; GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_store TO 'agent'@'localhost'; GRANT SELECT, INSERT, DELETE ON llm_agent.chat_log TO 'agent'@'localhost';"
+mariadb -e "CREATE USER IF NOT EXISTS 'agent'@'localhost' IDENTIFIED BY '<비밀번호>';
+GRANT SELECT ON llm_agent.* TO 'agent'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.knowledge_chunk     TO 'agent'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_knowledge_chunk TO 'agent'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_qa_method       TO 'agent'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_query_registry  TO 'agent'@'localhost';
+GRANT SELECT, INSERT, DELETE ON llm_agent.chat_log TO 'agent'@'localhost';"
+
+`knowledge_chunk`에 쓰기 권한이 필요한 이유: 청크는 `embed-sync`가 원문에서 만들어 넣는 파생
+테이블이다(`context.md` 2-5). 읽기만 주면 동기화가 매 주기 실패하는데, 증상은 '지식이 하나도
+검색되지 않는다'로만 보인다.
 ```
 
 SPACE 시스템 지식 데이터도 함께 등록:
@@ -433,7 +455,7 @@ LLM_API_KEY=sk-or-...
 LLM_MODEL=anthropic/claude-sonnet-4.5
 ```
 
-프롬프트 예산(`backend/src/constants.js`의 `MAX_PROMPT_TOTAL_LEN`·`PROMPT_FLOORS`)과 출력 가드(`MAX_COMPLETION_TOKENS`)는 **128k 컨텍스트** 기준이다 — 입력 최악 ≈ 42~50k 토큰 + 출력 16k. 서버가 실제로 그 길이를 받는지는 코드가 알 수 없으니 연결 후 한 번 확인한다:
+프롬프트 예산(`backend/src/constants.js`의 `MAX_PROMPT_TOTAL_LEN`·`PROMPT_FLOORS`)과 출력 가드(`MAX_COMPLETION_TOKENS`)는 **128k 컨텍스트** 기준이다 — 입력 최악 ≈ 45~54k 토큰 + 출력 16k. 서버가 실제로 그 길이를 받는지는 코드가 알 수 없으니 연결 후 한 번 확인한다:
 
 ```bash
 curl -s $LLM_BASE_URL/models | python3 -c 'import json,sys; print([m.get("max_model_len") for m in json.load(sys.stdin)["data"]])'   # vLLM: 131072 이어야 한다
@@ -544,7 +566,12 @@ could not be initialized …`가 남고 조회는 전부 실패한다 — 이 �
   정확 키워드(BATCH001 등)는 검색어에 그대로 들어가 벡터 거리에 반영된다.
 - **임베딩 서버가 없으면 검색이 성립하지 않는다.** 그 상태는 '0건'이 아니라 **검색 불가**로 프롬프트·화면·chat_log에
   남는다 — 모델이 '등록된 자료가 없다'고 단정하지 않게 하고, 분석 SQL이 그 질문을 지식 보강 후보로 잘못 세지 않게 한다.
-- **벡터 저장**: 별도 vector DB 없이 `vec_store` 테이블. 원본 3개 테이블은 변경하지 않는 companion 구조
+- **벡터 저장**: 별도 vector DB 없이 `vec_<소스>` 테이블(`vec_knowledge_chunk`·`vec_qa_method`·`vec_query_registry`).
+  원본 테이블은 변경하지 않는 companion 구조. 소스마다 인덱스를 나눈 이유는 한 인덱스에 담고 `src`로
+  거르면 큰 소스가 상위 K건을 차지해 작은 소스의 검색이 조용히 주저앉기 때문이다
+- **지식 청킹**: 긴 지식은 `knowledge_chunk`로 나뉘어 검색된다(원문은 `knowledge`에 그대로).
+  임베딩 상한(4,000자) 때문에 긴 문서의 뒷부분이 어떤 검색어로도 걸리지 않던 문제를 없앤다 —
+  검색·병합·본문 청구 규칙은 `context.md` 2-5
 - **임베딩**: 로컬 Ollama의 OpenAI 호환 API (`embedding.js`). 기본 모델 bge-m3(1024차원). 기동 시 한 번 예열한다
 - **동기화**: `embed-sync.js`가 원본 텍스트의 MD5를 비교해 신규/변경분만 임베딩(diff, 멱등).
   서버 기동 시 1회 + `EMBED_SYNC_INTERVAL`(기본 60초) 주기 + `npm run embed` 수동.
