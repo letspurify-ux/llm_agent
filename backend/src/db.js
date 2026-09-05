@@ -108,24 +108,6 @@ export async function closePool() {
   }
 }
 
-// 쿼리 관리 테이블 로드 — 소규모(라우팅 임계치 이하)일 때만 사용.
-// limit은 호출부가 "임계치+1"을 넣어 규모 판정까지 겸한다 (agent.js selectQueries 참고).
-// limit === undefined로 판정한다 — truthy로 보면 limit=0이 "0건"이 아니라 "전체 로드"가 되어,
-// 남은 자리를 계산해 넘기는 호출부가 생기는 순간 조용히 대형 SELECT가 프롬프트 경로로 들어온다.
-//
-// ORDER BY가 반드시 있어야 한다. LIMIT만 걸면 '어떤 행이 오는가'도 '어떤 순서로 오는가'도
-// SQL이 보장하지 않는다 — 실행계획이 바뀌는 것만으로(query_name 인덱스 추가, ANALYZE, 온라인 ALTER)
-// 같은 코드가 다른 표본을 돌려준다. 규모 판정(31건 중 몇 건인가)은 그래도 성립하지만, 임계치
-// 이하에서는 이 결과가 곧 프롬프트에 실리는 목록이라 '에이전트가 도달할 수 있는 쿼리 집합'이
-// 재시작마다 달라지면서 아무 로그도 남기지 않는다.
-// 형제 로더(loadQueriesByNames)가 호출부 순서를 복원하는 것과 같은 이유다 — 그쪽만 고쳐져 있었다.
-// 정렬 키는 PK(seq) = 등록 순서다. 관련도 순서는 호출부가 검색 결과로 따로 만든다(agent.js selectQueries).
-export function loadQueryRegistry(limit) {
-  return limit === undefined
-    ? query('SELECT * FROM query_registry ORDER BY seq')
-    : query('SELECT * FROM query_registry ORDER BY seq LIMIT ?', [limit]);
-}
-
 // 지식 청크를 문서·순번 범위로 읽는다. 범위를 여럿 받아 한 문장으로 묶는 이유는 왕복 수다 —
 // 검색 한 번이 여러 문서에 걸리므로 문서마다 조회하면 그만큼 왕복이 늘고, 그 시간은 스텝마다 곱해진다.
 // 정렬을 걸어 돌려준다: 호출부(chunk.js buildItems)는 doc_seq·chunk_no로 Map을 만들지만, 정렬이
@@ -184,7 +166,7 @@ export async function loadQueriesByNames(names) {
 // 대소문자는 양쪽을 낮춰 맞춘다 — collation이 이미 무시하지만, 그 전제를 이 SQL 안에서 확정한다
 // (호출부가 본문을 낮춰 보낸다 — 낮추는 지점이 하나여야 길이 상한과 어긋나지 않는다).
 // 정렬의 2차 키는 seq다 — 같은 위치에서 시작하는 이름은 없지만, ORDER BY가 유일하지 않으면
-// 실행계획이 바뀌는 것만으로 순서가 달라진다 (loadQueryRegistry 주석과 같은 이유).
+// 실행계획이 바뀌는 것만으로(query_name 인덱스 추가, ANALYZE, 온라인 ALTER) 순서가 달라진다.
 export function loadQueriesMentionedIn(text) {
   // 빈 본문이면 왕복하지 않는다. 공백만 남은 경우까지 함께 본다 — method는 NOT NULL이지만
   // 컬럼 하나가 완화되거나 임포터가 NULL 행을 넣으면 호출부가 개행만 이어 붙인 문자열을 보낸다.

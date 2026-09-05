@@ -5,7 +5,7 @@
 // 루프의 유일한 상태는 history 배열(과 검색이 채우는 세 목록)이며, 매 반복 전체 컨텍스트를 LLM에 전달한다.
 // 대화 맥락(chat)은 서버가 저장하지 않고 클라이언트가 매 요청에 실어 보낸다 (stateless 유지).
 import { searchKnowledge, searchQaMethods, searchQueries } from './search.js';
-import { loadQueryRegistry, loadQueriesByNames, loadQueriesMentionedIn, loadChunkRanges } from './db.js';
+import { loadQueriesByNames, loadQueriesMentionedIn, loadChunkRanges } from './db.js';
 import { canGrow, buildItems } from './chunk.js';
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
@@ -230,7 +230,7 @@ export const searchKey = (text, targets) =>
 //
 // 쿼리 목록에는 펼침·버림이 없어 종전과 같이 맨 앞에 붙되, 이미 있던 행이 이번 검색의 자세한 대상(detail)으로
 // 다시 왔으면 그 표시를 옮겨 받는다 — 옮기지 않으면 두 번째 query 검색의 상위 적중이 짧은 줄로 남는다(실측).
-// 소규모 등록에서는 첫 검색이 전부를 실어 두 번째 검색이 새 항목을 하나도 넣지 못하므로 그 표시도 진도로 센다.
+// 두 검색의 상위 적중이 겹쳐 새 항목이 하나도 안 들어와도, 옮긴 표시는 진도로 센다.
 // (테스트에서 쓰므로 export 한다)
 const dedupKey = r => (r?.doc_seq != null ? `d${r.doc_seq}` : `s${r?.seq}`);
 const rangeOf = o => (Number.isInteger(o?.from) && Number.isInteger(o?.to) ? [o.from, o.to] : null);
@@ -348,7 +348,6 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
   const searched = new Set();
   const succeeded = new Set();   // 검색이 실제로 성립한 대상 — chat_log의 적중 수는 이쪽 기준이다 (아래 done 주석)
   const targetCounts = Object.fromEntries(SEARCH_TARGETS.map(t => [t, 0]));
-  let routed = null;             // 마지막 쿼리 검색의 라우팅 여부 — chat_log의 queries 적중 수 의미를 정한다
   let queriesFailed = false;     // 관리 DB에서 쿼리 목록을 못 읽었다
   let searchFailed = false;      // 어느 검색이든 성립하지 않은 대상이 있었다
   const history = [];
@@ -492,7 +491,6 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
   // 그리고 목록·검색이 성립하지 않았다는 표시. 적중 수는 '검색이 성립한 적 있는' 대상만 숫자다 —
   // 한 번도 찾지 않았거나 찾을 때마다 실패한 대상은 null이다. 0으로 적으면 '찾았는데 없다'와 섞여
   // chat_log 분석이 임베딩 장애 동안의 질문을 전부 '지식 보강 후보'로 잘못 집계한다 (README의 SQL).
-  // queries는 라우팅이 동작할 때(등록 30건 초과)만 적중 수이고, 전체를 싣는 소규모에서는 null (적중 개념 없음).
   const done = (answer, forced) => {
     const total = Date.now() - started;
     const summary = {
@@ -500,7 +498,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       targets: { ...targetCounts },
       knowledge: succeeded.has('knowledge') ? knowledge.length : null,
       qaMethods: succeeded.has('qa_method') ? qaMethods.length : null,
-      queries: succeeded.has('query') && routed ? queries.length : null,
+      queries: succeeded.has('query') ? queries.length : null,
       // 모델이 자료를 얼마나 손봤는가 — 자주 버려지는 지식은 등록 품질 신호다 (README의 운영 루프).
       ...(expands && { expanded: expands }),
       ...(drops && { dropped: drops }),
@@ -559,10 +557,10 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       if (r.queries === null) {
         if (want.has('query')) failed.push('query');
       } else {
-        // routed는 '성립한' 쿼리 검색의 판정만 기록한다. 마지막 값으로 덮어쓰면, 앞선 검색이 라우팅 규모를
-        // 확인해 목록을 채워 놓고도 뒤이은 검색이 관리 DB 실패로 null을 주는 순간 그 판정이 지워진다 —
-        // chat_log에는 '한 번도 못 찾았거나 매번 실패했다'로 남아(README의 분석 SQL) 정반대로 읽힌다.
-        if (want.has('query') && !r.directFailed) { succeeded.add('query'); routed = r.routed; }
+        // succeeded는 한 번 성립하면 계속 유지된다(Set은 덧셈만 한다) — 앞선 검색이 목록을 채워 놓고도
+        // 뒤이은 검색이 관리 DB 실패로 null을 주는 순간 지워지면, chat_log에는 '한 번도 못 찾았거나
+        // 매번 실패했다'로 남아(README의 분석 SQL) 정반대로 읽힌다.
+        if (want.has('query') && !r.directFailed) succeeded.add('query');
         // 경로A만 돈 검색(query를 찾지 않았다)에서 지목된 쿼리가 없으면 적중 수를 적지 않는다(null). '쿼리 0건'으로
         // 실리면 찾아보지 않은 대상이 '찾았는데 없다'로 보여, 모델은 query 검색을 이미 한 것으로 읽고 건너뛴다 —
         // 프롬프트가 세 상태를 가르는 이유가 정확히 그것이다(llm-openai.js section 주석, context.md 1-). 실측.
@@ -625,10 +623,9 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       // (llm-openai.js renderQueries 주석). 프롬프트 목록 밖에서 찾은 쿼리는 목록 앞에 넣는다: 뒤가 아니라 앞이다 —
       // 프롬프트 예산은 '뒤쪽일수록 관련도가 낮다'는 전제로 꼬리부터 버린다. 중복은 넣지 않고, 이 경로가
       // 늘리는 상한은 MAX_STEPS건이다. 목록 전체의 상한은 그것과 다르다 — MAX_PROMPT_QUERIES는 검색 한 번이
-      // 돌려주는 수이고(selectQueries의 slice) 목록은 검색마다 병합되므로, 라우팅 규모에서는
-      // MAX_SEARCHES × MAX_PROMPT_QUERIES + MAX_STEPS까지 자란다 (소규모 등록에서는 등록 수를 넘지 않는다 —
-      // 매 검색이 같은 전체 목록을 돌려준다). 그래도 프롬프트가 넘치지는 않는다: renderQueries가 짧은 줄부터
-      // 확보하고 남는 만큼만 자세히 올린 뒤 꼬리를 버린다.
+      // 돌려주는 수이고(selectQueries의 slice) 목록은 검색마다 병합되므로, 최악은
+      // MAX_SEARCHES × MAX_PROMPT_QUERIES + MAX_STEPS까지 자란다. 그래도 프롬프트가 넘치지는 않는다:
+      // renderQueries가 짧은 줄부터 확보하고 남는 만큼만 자세히 올린 뒤 꼬리를 버린다.
       registryRow.detail = true;
       if (!queries.includes(registryRow)) queries.unshift(registryRow);
       seenInBatch.add(dupKey);
@@ -756,7 +753,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
         const asked = t => (targets.includes(t) ? null : undefined);
         result = {
           knowledge: asked('knowledge'), qaMethods: asked('qa_method'), queries: asked('query'),
-          routed: null, queriesFailed: false, directFailed: false,
+          queriesFailed: false, directFailed: false,
         };
       }
       const { added, hits, failed } = absorb(result, targets);
@@ -1003,18 +1000,16 @@ async function runSearch(text, targets) {
     want.has('qa_method') ? searchQaMethods(text) : undefined,
     want.has('query') ? searchQueries(text) : undefined,
   ]);
-  const out = { knowledge, qaMethods, queries: undefined, routed: null, queriesFailed: false, directFailed: false };
+  const out = { knowledge, qaMethods, queries: undefined, queriesFailed: false, directFailed: false };
   if (!want.has('query') && !qaMethods?.length) return out;
   // 쿼리 목록 로드 실패로 검색 전체를 버리지 않는다 — 함께 버려지는 것이 방금 찾은 지식·처리방법이고,
   // 그중에는 DB 조회가 아예 필요 없는 순수 지식 질문도 있다. 실패는 표시로 남겨 chat_log가
   // '등록이 없어서 못 답한 질문'과 구분하게 한다 (queriesFailed).
   try {
-    const { list, routed } = await selectQueries(qaMethods ?? [], direct, want.has('query'));
-    out.queries = list;
-    out.routed = routed;
-    // 직접 검색이 성립하지 않았는데(direct === null) 등록이 소규모라 전체를 실었으면 그건 정상이다 —
-    // 목록에 없는 쿼리가 없다. 라우팅 규모에서만 '검색 불가'로 알린다 (경로A 쿼리만 실린 목록이므로).
-    out.directFailed = direct === null && routed === true;
+    out.queries = await selectQueries(qaMethods ?? [], direct);
+    // 'query'를 검색했는데 벡터 검색이 성립하지 않았으면(direct === null) 실패로 알린다 —
+    // 목록에는 경로A(절차가 지목한 쿼리)만 남으므로, 그 밖의 등록은 이 요청에서 보이지 않는다.
+    out.directFailed = direct === null && want.has('query');
   } catch (e) {
     // 상세는 로그에만 — 화면 문구는 호출부가 만들고, MariaDB 원문에는 스키마·호스트가 들어 있다.
     console.warn('[agent] failed to load the query list:', e.message);
@@ -1031,10 +1026,12 @@ const DETAIL_TOP = 5;
 // 프롬프트에 실을 쿼리 선정. 관련도 순으로 두 경로를 합친다:
 //   경로A: 찾은 qa_method 본문이 지목한 query_name (다단계 절차 보장 — 본문 등장 순서를 지킨다)
 //   경로B: 검색어로 query_registry 자체를 벡터 검색한 결과 (search.js) — qa_method 없이 등록한 쿼리도 찾는다
-// 등록 30건 이하면 검색에 걸리지 않은 나머지까지 전부 뒤에 이어 붙인다(짧은 형태) — 설명이 얇아 검색에
-// 안 걸린 쿼리도 이름은 보여야 모델이 지목할 수 있다. 초과하면 검색 결과만 싣는다(라우팅).
-// 반환: { list, routed } — routed는 'query'를 검색했을 때만 true/false이고, 경로A만 돌았으면 null.
-//
+// 이 둘의 합집합만 싣는다 — 등록 규모가 작다고 검색에 안 걸린 나머지까지 얹지 않는다. 예전에는 등록
+// 30건 이하면 벡터 거리와 무관하게 전부 붙였는데("설명이 얇아 검색에 안 걸린 쿼리도 이름은 보여야
+// 모델이 지목할 수 있다"), 그 폴백이 MAX_DIST가 '관련 없음'으로 이미 걸러낸 것까지 무효로 만들었다 —
+// 무관한 질문에도 등록된 쿼리 전부가 후보로 실려 모델이 억지로 하나를 고를 여지가 생겼다(실측: "일론
+// 머스크의 위기" 같은 질문에 업무 쿼리 5건이 그대로 붙었다). 얇은 설명으로 인한 recall 손실은 경로A가
+// 이미 절차 쪽에서 보완한다.
 // 경로A는 '본문에서 이름처럼 보이는 토큰을 뽑아 IN 절로 묻는' 방식이었다. 그 추출식이
 // /[A-Za-z_][A-Za-z0-9_]{2,}/ 라서 한글 query_name은 어떤 본문에서도 한 번도 뽑히지 않았다 —
 // query_name은 VARCHAR(100)에 문자 제한이 없고 이 코드베이스는 다른 곳에 전부 한글을 쓴다.
@@ -1045,18 +1042,12 @@ const DETAIL_TOP = 5;
 // 등장 순서대로'가 된다. method는 NOT NULL이지만 컬럼 하나가 완화되거나 임포터가 NULL을 넣는
 // 순간 여기서 죽는다 — 이 값의 다른 소비자(llm-openai clip, embed-sync toText)는 전부 NULL을 견딘다.
 // 소문자화는 자르기 전에 한다 (자른 뒤에 하면 길이가 상한을 넘을 수 있다).
-async function selectQueries(qaMethods, direct, wantDirect) {
+async function selectQueries(qaMethods, direct) {
   const routeText = clipText(
     qaMethods.map(m => String(m.method ?? '')).join('\n').toLowerCase(),
     MAX_ROUTE_TEXT_LEN
   );
-  // 상한+1건만 읽어 "전체를 실어도 되는 규모인지"를 같은 왕복에서 판정한다 (COUNT 후 다시 SELECT하면
-  // 왕복 2회). 라우팅 규모에서는 이 31행이 버려진다 — 상한이 걸린 고정 비용이라 왕복 1회 쪽이 낫다.
-  const [named, head] = await Promise.all([
-    loadQueriesMentionedIn(routeText),               // 빈 본문이면 왕복하지 않는다 (db.js)
-    wantDirect ? loadQueryRegistry(MAX_PROMPT_QUERIES + 1) : [],
-  ]);
-  const routed = wantDirect ? head.length > MAX_PROMPT_QUERIES : null;
+  const named = await loadQueriesMentionedIn(routeText);   // 빈 본문이면 왕복하지 않는다 (db.js)
 
   const seen = new Set();
   const list = [];
@@ -1068,6 +1059,5 @@ async function selectQueries(qaMethods, direct, wantDirect) {
   };
   named.forEach(q => push(q, true));                      // 절차용(경로A)이 먼저, 자세히
   (direct ?? []).forEach((q, i) => push(q, i < DETAIL_TOP));
-  if (routed === false) head.forEach(q => push(q, false)); // 소규모: 나머지 등록 전부 (짧은 형태)
-  return { list: list.slice(0, MAX_PROMPT_QUERIES), routed };
+  return list.slice(0, MAX_PROMPT_QUERIES);
 }

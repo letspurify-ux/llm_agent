@@ -732,7 +732,7 @@ WHERE JSON_VALUE(trace, '$.search.searches') > 0      -- 검색을 했는데 (�
   AND COALESCE(JSON_VALUE(trace, '$.search.knowledge'), 0) = 0   -- 찾아본 적 없으면 null, 찾았는데 없으면 0
   AND COALESCE(JSON_VALUE(trace, '$.search.qaMethods'), 0) = 0
   -- 경로B(qa_method 없이 쿼리만 등록)로 답한 질문을 후보로 잡지 않도록 쿼리 적중도 함께 본다.
-  -- 라우팅이 동작하지 않는 소규모에서는 null이므로 그때는 이 조건을 적용하지 않는다.
+  -- 'query'를 직접 검색한 적 없는 요청(경로A만 돈 요청)에서는 null이라 COALESCE가 0으로 보고 조건을 통과시킨다.
   AND COALESCE(JSON_VALUE(trace, '$.search.queries'), 0) = 0
   -- 검색이 성립하지 않았거나(임베딩 서버 없음) 관리 DB 장애로 쿼리 목록을 못 읽은 요청은 후보에서 뺀다
   -- (등록이 부족한 것이 아니다). 그 요청은 search.searchFailed / search.queriesFailed 가 true로 남는다.
