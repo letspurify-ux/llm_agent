@@ -25,7 +25,9 @@ export const CHUNK_MAX_LEN = MAX_PROMPT_ITEM_LEN;
 // chunk_no)를 유지하며 덮어쓰므로 실제로 내용이 달라진 청크만 다시 임베딩된다. 절단 위치를 고르는 규칙을
 // 고쳤으면 이 값을 올릴 것 — 안 올리면 기존 설치의 청크는 원문을 고치기 전까지 옛 규칙대로 남는다.
 //   2: 절단 위치가 서로게이트 쌍을 가르지 않는다 (alignCut)
-export const CHUNK_SPLIT_VERSION = 2;
+//   3: 경계 탐색이 CR(\r)을 개행으로 본다 — CRLF 문서의 빈 줄·문장 끝이 경계가 된다 (BOUNDARIES).
+//      LF 문서는 같은 자리에서 나뉘므로 다음 동기화가 다시 나눠도 내용이 같아 재임베딩되지 않는다.
+export const CHUNK_SPLIT_VERSION = 3;
 // 겹침. 경계에 걸친 문장이 양쪽 어디에서도 온전하지 않으면, 그 문장이 답인 질문은 두 청크 모두와
 // 어중간하게 닮아 둘 다 문턱(search.js MAX_DIST) 밖으로 밀린다.
 export const CHUNK_OVERLAP = 150;
@@ -61,9 +63,21 @@ const MIN_SEAM = 32;
 // 되어 문장이 두 줄로 갈라졌으며, 강제 절단으로 원래 공백이 없던 18자리에서는 개행이 낱말 한가운데로
 // 들어갔다 — 'Time Person of the Year (2021)'이 'Time Person of the Yea / r (2021)'로 실렸다.
 // 마지막 것이 특히 나쁘다: 겹침을 떼어 막으려던 '낱말 한가운데'가 이번에는 절단면에서 다시 생겼다.
+//
+// 뒤 청크가 서로게이트 쌍으로 시작하면 대조 상한을 **한 코드유닛 넉넉히** 잡는다. 겹침 시작(end - overlap)이
+// 쌍의 한가운데면 splitContent의 alignCut이 한 칸 앞으로 물려 다음 청크를 시작하므로, 실제 겹침이 overlap + 1
+// 코드유닛이 된다. 앞 청크의 끝에 잘려 나갈 공백이 없고(제목 경계) 뒤 청크가 이모지로 시작하는 자리가 정확히
+// 그 경우다 — 상한을 overlap으로 두던 동안 그 이음매는 어떤 n에서도 맞지 않아 한 글자도 떼지 못했고, 151자가
+// 개행까지 붙어 두 번 실렸다(퍼징으로 잡았다). 겹침을 떼는 함수가 겹침 한 칸 때문에 통째로 헛도는 셈이다.
+// 조건 없이 늘 한 칸 넉넉히 보면 안 된다 — 같은 글자가 151자 이상 이어지는 자리(구분선 '----')에서는 150자
+// 겹침에 151자가 맞아 원문 한 글자를 지운다(퍼징으로 잡았다). 쌍으로 시작하는 청크에서는 그 오판이 생기지
+// 않는다: 151번째 코드유닛이 쌍의 앞 절반이면 앞 청크가 그것으로 끝나야 하는데, 절단 위치가 쌍을 가르지
+// 않으므로(alignCut) 청크는 짝 없는 앞 절반으로 끝나는 일이 없다. 그 한 칸 너머는 보지 않는다 — alignCut이
+// 물리는 폭이 정확히 한 칸이고, 그 이상 같은 것은 겹침이 아니라 본문이 닮은 것이다.
 export function cutSeam(text, next, overlap = CHUNK_OVERLAP) {
   const floor = Math.min(MIN_SEAM, overlap);
-  const max = Math.min(overlap, text.length, next.length);
+  const aligned = isHigh(next.charCodeAt(0)) && isLow(next.charCodeAt(1)) ? 1 : 0;
+  const max = Math.min(overlap + aligned, text.length, next.length);
   for (let n = max; n >= floor; n--) if (text.endsWith(next.slice(0, n))) return next.slice(n);
   return next;
 }
@@ -85,10 +99,17 @@ export const CHUNK_GAP_FILL = 2;
 // 머리말이므로 앞 청크의 꼬리에 남으면 그 절의 내용과 떨어진다. 그러면 "## 재시작 절차"라는
 // 제목과 그 절차 본문이 서로 다른 청크에 들어가, 제목으로 검색한 질문이 정작 절차를 못 찾는다.
 // 빈 줄과 문장 끝은 반대다 — 그 표시는 앞 문단·앞 문장에 속한다.
+//
+// CR(\r)도 개행 자리로 본다. 등록 본문은 운영자가 Windows 편집기에서 붙여 넣은 CRLF(\r\n)일 수 있고, 이 저장소의
+// 다른 자리는 전부 그것을 개행으로 다룬다(constants.indentLines, llm.js cell). 여기만 LF만 보던 동안 CRLF 문서에서
+// ①과 ③이 한 번도 맞지 않았다 — '.\r\n'은 '[.!?]' 뒤가 '\r'이고, '\r\n\r\n'은 두 '\n' 사이에 '\r'이 끼어 있다.
+// 그래서 한 줄에 한 문장씩 끝나는 절차 안내문이 이음매마다 강제 절단(④)으로 떨어져 낱말 한가운데에서 갈렸다
+// (실측: 4개 이음매 전부). 오류는 남지 않고 임베딩이 흐려지고 프롬프트의 구간이 낱말 한가운데에서 시작할 뿐이다.
+// LF 문서의 절단 위치는 그대로다 — '\r'이 없는 글에서 두 정규식은 종전과 같은 자리에 맞는다.
 const BOUNDARIES = [
-  { re: /\n[ \t]*\n/g, atStart: false },   // ① 빈 줄
-  { re: /\n#{1,6}[ \t]/g, atStart: true },  // ② 마크다운 제목
-  { re: /[.!?][ \t\n]/g, atStart: false },  // ③ 문장 끝
+  { re: /\n[ \t\r]*\n/g, atStart: false },   // ① 빈 줄
+  { re: /\n#{1,6}[ \t]/g, atStart: true },    // ② 마크다운 제목
+  { re: /[.!?][ \t\r\n]/g, atStart: false },  // ③ 문장 끝
 ];
 
 // 창 안에서 마지막으로 맞는 경계의 절단 위치를 돌려준다. 없으면 -1.

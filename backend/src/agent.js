@@ -434,9 +434,12 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
   // 이미 펼쳤거나 버린 항목, 목록에 없는 식별자는 넘긴다 — 성공한 것의 목록을 돌려준다.
   // 반환: done — 실제로 펼친 식별자, saturated — 번호가 붙어 있었지만(canGrow) 창을 넓혀 읽어 보니 이웃 조각이
   // 상한에 들어가지 않아 한 글자도 늘지 않은 항목 수. 뒤의 것은 검색 시점에 이웃을 읽지 못한 항목에서만 난다.
+  // unread — 번호가 붙어 있었는데 관리 DB가 청크를 돌려주지 못한(타임아웃·접속 실패) 항목 수. 항목도 번호도
+  // 그대로 남으므로 호출부의 안내가 이 경우를 따로 말해야 한다 — 아래 루프의 note 주석.
   const applyExpand = async ids => {
     const done = [];
     let saturated = 0;
+    let unread = 0;
     for (const id of ids ?? []) {
       if (expands >= MAX_EXPANDS) break;
       const { list, i } = rowAt(id);
@@ -448,7 +451,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
         // 문서가 여러 항목으로 흩어져 mergeFront의 문서 단위 중복 제거와 어긋난다.
         if (!canGrow(row)) continue;                 // 상한에 닿았거나 범위 밖 청크가 없다
         const grown = await growItem(row, loadChunks);
-        if (!grown) continue;                        // 읽기 실패 — 판정할 근거가 없으니 아무것도 바꾸지 않는다
+        if (!grown) { unread++; continue; }          // 읽기 실패 — 판정할 근거가 없으니 아무것도 바꾸지 않는다
         // seq는 덮어쓰지 않는다. 모델이 지목한 번호가 그 스텝에 바뀌면 방금 청구한 항목을 다시
         // 청구할 수도 버릴 수도 없다 — 'seq는 요청 내내 고정'이 식별자 설계의 근거다
         // (constants.js ITEM_PREFIX). rep을 그대로 넘기므로 지금은 같은 값이 오지만, 그 계약을
@@ -476,7 +479,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       expands++;
       done.push(id);
     }
-    return { done, saturated };
+    return { done, saturated, unread };
   };
 
   // 이력 줄은 상한이 있다 — 자리가 없으면 안내를 접는다. 그때는 루프가 곧 그 상한에서 멈추므로
@@ -700,18 +703,23 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       ? applyDrop(decision.drop) : 0;
 
     if (decision.action === 'expand') {
-      const { done: grownIds, saturated } = await applyExpand(decision.ids);
+      const { done: grownIds, saturated, unread } = await applyExpand(decision.ids);
       // 펼쳤거나 버렸으면 자료가 달라졌다 — 진도로 본다. 둘 다 없으면 헛돈 스텝이다.
       if (grownIds.length || droppedNow) { guardHits = 0; continue; }
       // 번호가 붙어 있던 항목이 늘지 않은 경우는 따로 말한다 — '번호가 붙은 항목만 청구할 수 있다'는 안내는
       // 모델이 방금 그렇게 한 상황에서 모순이고, 왜 안 됐는지도 다음 행동도 담고 있지 않다.
+      // 읽기 실패(unread)가 그중 먼저다: 늘지 않은 항목(saturated)은 full이 서서 다음 프롬프트에서 번호가 사라지지만,
+      // 읽지 못한 항목은 아무것도 바뀌지 않아 번호가 그대로 남는다. 그 앞에 '번호가 붙은 항목만'을 적으면 모델은
+      // 같은 번호를 다시 청구하고, 두 번째 실패에서 강제 답변으로 넘어갔다(실측 — 관리 DB 타임아웃 한 번이면 그렇게 된다).
       pushNote({
         expand: decision.ids,
         note: expands >= MAX_EXPANDS
           ? `본문 청구 상한(${MAX_EXPANDS}건)에 닿았다 — 지금까지의 자료로 답변하라`
-          : saturated
-            ? '청구한 항목은 더 넓힐 수 없다 — 이웃 조각이 문서당 글자 상한에 들어가지 않는다. 번호가 사라진 것이 그 표시이니 지금 범위로 답변하라'
-            : '펼칠 수 있는 항목이 없다 — 번호가 붙은 항목만 청구할 수 있다',
+          : unread
+            ? '청구한 본문을 읽어 오지 못했다 (관리 DB 오류) — 같은 번호를 다시 청구하지 말고 지금 범위로 답변하라'
+            : saturated
+              ? '청구한 항목은 더 넓힐 수 없다 — 이웃 조각이 문서당 글자 상한에 들어가지 않는다. 번호가 사라진 것이 그 표시이니 지금 범위로 답변하라'
+              : '펼칠 수 있는 항목이 없다 — 번호가 붙은 항목만 청구할 수 있다',
       });
       if (++guardHits >= MAX_GUARD_HITS) break;
       continue;

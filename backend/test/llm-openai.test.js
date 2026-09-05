@@ -12,6 +12,8 @@ process.env.LLM_IDLE_TIMEOUT_MS = '150';
 
 const { openaiDecide, answerPreviewer } = await import('../src/llm-openai.js');
 const { TRUNC_MARK, MAX_COMPLETION_TOKENS } = await import('../src/constants.js');
+// 형식 경계(여기)와 크기 경계(llm.js)를 이어 본다 — 한쪽만 통과한 결정은 실제로는 아무 뜻이 없다.
+const { sanitizeDecision } = await import('../src/llm.js');
 
 const CTX = { question: 'q', chat: [], knowledge: [], qaMethods: [], queries: [], history: [] };
 
@@ -1077,12 +1079,20 @@ test('자기닫힘 사고 과정 태그가 미리보기를 통째로 죽이지 �
   assert.equal(draft.join(''), '');
 });
 
-test('본문 청구 결정을 읽는다 — 청구할 것이 없으면 결정이 아니다', async () => {
+test('본문 청구 결정을 읽는다 — 청구할 것도 버릴 것도 없으면 결정이 아니다', async () => {
   assert.deepStrictEqual(await decide('{"action":"expand","ids":["k12","m3"],"drop":["k7"]}'),
     { action: 'expand', ids: ['k12', 'm3'], drop: ['k7'] });
   assert.deepStrictEqual(await decide('{"action":"expand","ids":["k12"]}'), { action: 'expand', ids: ['k12'] });
-  assert.equal(await decide('{"action":"expand","ids":[]}'), null, '빈 목록은 청구가 아니다');
-  assert.equal(await decide('{"action":"expand","ids":"k12"}'), null, '목록이 아니면 형식이 아니다');
+  assert.equal(await decide('{"action":"expand","ids":[]}'), null, '빈 목록에 버릴 것도 없으면 청구가 아니다');
+  assert.equal(await decide('{"action":"expand"}'), null, 'ids도 drop도 없으면 청구가 아니다');
+  // ids 하나를 문자열로 쓴 청구도 받는다 — 같은 결정의 drop과 search의 targets가 그렇고, 정규화기(normalizeItemIds)도
+  // 둘 다 받는다. 목록만 받던 동안 이 결정은 null이 되어 재시도가 같은 응답(temperature=0)을 받고 강제 답변으로
+  // 넘어갔다 — 모델이 낸 정당한 청구가 남은 스텝과 함께 통째로 사라졌다(실측).
+  assert.deepStrictEqual(sanitizeDecision(await decide('{"action":"expand","ids":"k12"}')),
+    { action: 'expand', ids: ['k12'] }, '문자열 하나짜리 ids가 결정을 통째로 버렸다');
+  // 버리기만 있는 청구도 결정이다 — 버리기는 펼침과 별개의 일이라 결정 경계(llm.js)가 펼침 없이도 적용한다.
+  assert.deepStrictEqual(sanitizeDecision(await decide('{"action":"expand","ids":[],"drop":["k7"]}')),
+    { action: 'expand', ids: [], drop: ['k7'] }, '버리기만 있는 청구가 결정이 아니게 됐다');
   assert.equal(await decide('{"action":"expand","ids":["k12"]}', { ...CTX, forceAnswer: true }), null,
     '강제 답변 단계에서는 더 찾아볼 수 없다');
   // 검색에 얹힌 버리기도 그대로 통과한다 (정규화는 결정 경계의 일이다)

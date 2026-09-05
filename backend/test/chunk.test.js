@@ -52,6 +52,26 @@ test('경계는 빈 줄 > 마크다운 제목 > 문장 끝 순으로 고른다',
   assert.ok(splitContent(sentence)[0].endsWith('.'), '문장 끝에서 끊는다');
 });
 
+// 등록 본문은 Windows 편집기에서 붙여 넣은 CRLF일 수 있다. 경계 정규식이 LF만 보던 동안 '.\r\n'과 '\r\n\r\n'이
+// 한 번도 경계가 되지 못해, 한 줄에 한 문장씩 끝나는 절차 안내문이 이음매마다 강제 절단으로 떨어져 낱말 한가운데에서
+// 갈렸다(실측: 4개 이음매 전부). 이 저장소의 다른 자리(indentLines, llm.js cell)는 CRLF를 개행으로 다루므로 분할기만
+// 어긋나 있던 셈이다. 오류는 남지 않고 임베딩이 흐려지고 프롬프트의 구간이 낱말 한가운데에서 시작할 뿐이다.
+test('CRLF 문서도 빈 줄·문장 끝에서 끊는다 — 강제 절단으로 떨어지지 않는다', () => {
+  const blank = `${para(700)}\r\n\r\n${para(700)}`;
+  assert.ok(splitContent(blank)[0].endsWith(para(700)), 'CRLF 빈 줄이 경계가 아니다');
+
+  // 줄 안에 '. '가 하나도 없는 글 — 문장 끝은 전부 줄 끝(.\r\n)에 있다.
+  const lines = Array.from({ length: 80 }, (_, i) => `${i + 1}단계에서는 배치 서버에 접속해 상태를 확인하고 로그 파일을 열어 오류 코드를 기록한다.`);
+  const parts = splitContent(lines.join('\r\n'));
+  assert.ok(parts.length >= 4, `이 시나리오는 여러 청크로 나뉘어야 뜻이 있다: ${parts.length}`);
+  for (const c of parts.slice(0, -1)) assert.ok(c.endsWith('.'), `문장 끝(.\\r\\n)이 경계가 되지 않아 낱말 한가운데에서 갈렸다: …${c.slice(-12)}`);
+  // 이어 붙이면 원문 그대로다 — CR까지 포함해서.
+  const rows = parts.map((content, i) => ({ seq: i + 1, doc_seq: 1, chunk_no: i + 1, chunk_of: parts.length, title: 'T', content }));
+  const [item] = buildItems([{ doc_seq: 1, rep: 1, from: 1, to: parts.length, chunk_of: parts.length, dist: 0.3 }], rows,
+    { maxDocLen: Number.MAX_SAFE_INTEGER, grow: true });
+  assert.equal(item.content, lines.join('\r\n'));
+});
+
 test('겹침이 있어 경계에 걸친 문장이 어느 한쪽에는 온전히 남는다', () => {
   const parts = splitContent(para(3000));
   assert.ok(parts.length > 1);
@@ -295,6 +315,31 @@ test('cutSeam은 겹침만 떼고 우연한 짧은 일치는 그대로 둔다', 
   // 겹침 상한을 넘는 만큼 같아도 상한까지만 뗀다 — 그 너머는 겹침이 아니라 본문이 닮은 것이다.
   const long = '가'.repeat(CHUNK_OVERLAP + 40);
   assert.equal(cutSeam(long, long).length, long.length - CHUNK_OVERLAP);
+});
+
+// 겹침 시작(end - overlap)이 서로게이트 쌍의 한가운데면 alignCut이 한 칸 앞으로 물려 다음 청크를 시작하므로 실제 겹침이
+// CHUNK_OVERLAP + 1 코드유닛이 된다. cutSeam이 상한을 CHUNK_OVERLAP으로 두던 동안 그 이음매는 어떤 길이에서도 맞지 않아
+// 한 글자도 떼지 못했고, 151자가 개행까지 붙어 두 번 실렸다 — 앞 청크의 끝에 잘려 나갈 공백이 없는 제목 경계 앞에 이모지가
+// 있으면 그렇게 된다(퍼징으로 잡았다). '이어 붙인 구간은 원문 그대로다'가 이모지 한 줄로 깨지는 셈이다.
+test('겹침 시작이 서로게이트 쌍 한가운데라 한 칸 물려도 이음매를 뗀다', () => {
+  // 실제 분할기로 만든다 — 600자 뒤 이모지 80개(160 코드유닛)와 'Z', 그 뒤 제목 경계. 경계 앞 150 코드유닛이
+  // 이모지 한가운데에서 시작하므로 다음 청크는 한 칸 앞(쌍의 앞 절반)에서 시작한다.
+  const src = 'A'.repeat(600) + '😀'.repeat(80) + 'Z' + '\n## 제목\n' + 'B'.repeat(700);
+  const parts = splitContent(src);
+  assert.equal(parts.length, 2, '이 시나리오는 제목 경계에서 둘로 나뉘어야 뜻이 있다');
+  const [a, b] = parts;
+  assert.ok(a.endsWith('Z') && /^[\uD800-\uDBFF][\uDC00-\uDFFF]/.test(b), '앞 청크는 공백 없이 끝나고 뒤 청크는 쌍의 앞 절반에서 시작해야 한다');
+  assert.ok(a.endsWith(b.slice(0, CHUNK_OVERLAP + 1)) && !a.endsWith(b.slice(0, CHUNK_OVERLAP)),
+    '이 시나리오는 실제 겹침이 CHUNK_OVERLAP + 1 코드유닛이어야 뜻이 있다');
+  assert.equal(cutSeam(a, b), b.slice(CHUNK_OVERLAP + 1), '한 칸 물린 겹침을 떼지 못했다');
+  const rows = parts.map((content, i) => ({ seq: i + 1, doc_seq: 1, chunk_no: i + 1, chunk_of: 2, title: 'T', content }));
+  const [item] = buildItems([{ doc_seq: 1, rep: 1, from: 1, to: 2, chunk_of: 2, dist: 0.3 }], rows,
+    { maxDocLen: Number.MAX_SAFE_INTEGER, grow: true });
+  assert.equal(item.content, src, '이음매의 겹침이 두 번 실렸다');
+  // 반대로 조건 없이 한 칸 넉넉히 보면 안 된다 — 같은 글자가 151자 이상 이어지는 자리(구분선)에서는 150자 겹침에
+  // 151자가 맞아 원문 한 글자를 지운다. 쌍으로 시작하지 않는 청크에서는 상한이 그대로 CHUNK_OVERLAP이어야 한다.
+  const run = '-'.repeat(CHUNK_OVERLAP + 40);
+  assert.equal(cutSeam(run, run).length, run.length - CHUNK_OVERLAP, '반복되는 글자의 이음매에서 원문 한 글자를 지웠다');
 });
 
 // 겹침을 떼지 못한 이음매(옛 규칙으로 나뉜 청크, 겹침을 MIN_SEAM보다 짧게 설정한 설치, 재분할 도중)에만

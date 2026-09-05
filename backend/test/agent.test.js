@@ -1154,6 +1154,37 @@ test('검색 시점에 이웃을 못 읽은 항목이 청구로도 늘지 않으
   } finally { restore(); }
 });
 
+// 관리 DB가 청크를 돌려주지 못하면(타임아웃·접속 실패) 항목도 번호도 그대로 남는다. 그 자리에 '번호가 붙은 항목만
+// 청구할 수 있다'를 적으면 모델은 번호가 붙은 항목을 방금 청구하고도 그 말을 받는다 — 안내가 프롬프트와 모순되어
+// 같은 번호를 다시 청구하고, 두 번째 실패에서 강제 답변으로 넘어갔다(실측). 실패의 정체(읽지 못했다)와 다음 행동
+// (다시 청구하지 말고 지금 범위로 답하라)을 그대로 말해야 한다 — 늘지 않은 청구의 안내와 같은 이유다.
+test('본문 읽기가 실패한 청구는 "번호가 붙은 항목만"이 아니라 읽기 실패를 알린다', async () => {
+  const restore = silence();
+  const warn = console.warn;
+  console.warn = () => {};   // growItem의 실패 로그 — 이 시나리오의 정상 출력이다
+  try {
+    const rows = Array.from({ length: 22 }, (_, i) => CH(1, i + 1));
+    const [item] = buildItems(planRanges([{ doc_seq: 1, chunk_no: 5, _dist: 0.3, chunk_of: 22 }]),
+      rows.filter(r => r.chunk_no >= 4 && r.chunk_no <= 6));
+    assert.ok(canGrow(item), '이 시나리오는 번호가 붙은 항목을 청구해야 뜻이 있다');
+    const llm = scripted([
+      { action: 'search', text: 'x', targets: ['knowledge'] },
+      { action: 'expand', ids: [`k${item.seq}`] },
+      { action: 'answer', answer: '답' },
+    ]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      loadChunks: async () => { throw new Error('Query execution was interrupted (max_statement_time exceeded)'); },
+      search: async () => found({ knowledge: [item] }) } });
+    assert.equal(r.answer, '답');
+    assert.equal(r.search.expanded, undefined, '읽지 못한 청구는 펼침으로 세지 않는다');
+    assert.match(firstItemLine(llm.seen.at(-1)), new RegExp(`^- k${item.seq} `), '읽기 실패는 항목을 바꾸지 않으므로 번호가 그대로 남아야 한다');
+    const note = r.trace.find(h => h.expand !== undefined)?.note ?? '';
+    assert.doesNotMatch(note, /번호가 붙은 항목만/, '번호가 붙은 항목 앞에서 "번호가 붙은 항목만"은 모순이다');
+    assert.match(note, /읽어 오지 못했다/, `읽기 실패를 그대로 말해야 한다: ${note}`);
+    assert.match(note, /다시 청구하지 말고/, '다음 행동이 안내에 있어야 같은 번호를 다시 청구하지 않는다');
+  } finally { console.warn = warn; restore(); }
+});
+
 // 프롬프트는 '아직 안 찾음'·'찾았는데 없음'·'못 찾아봤음'을 가른다(llm-openai.js section 주석). 경로A만 돈 검색이
 // '쿼리 0건'을 적으면 찾아보지 않은 대상이 '찾았는데 없다'로 보여, 모델은 query 검색을 이미 한 것으로 읽고 건너뛴다.
 test('경로A만 돈 검색은 지목된 쿼리가 없으면 쿼리 적중 수를 적지 않는다', async () => {

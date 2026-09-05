@@ -1389,10 +1389,18 @@ function toDecision(d, answerOnly) {
     const text = typeof d.text === 'string' && d.text.trim() ? d.text : undefined;
     return { action: 'search', ...(text && { text }), targets: d.targets, ...(d.drop !== undefined && { drop: d.drop }) };
   }
-  // 본문 청구. ids가 목록이 아니거나 비어 있으면 결정이 아니다 — 청구할 것이 없는 청구다.
-  // 형식·개수 확정은 결정 경계(llm.js sanitizeDecision)가 한다. answerOnly 판정은 search와 같다.
-  if (!answerOnly && d.action === 'expand' && Array.isArray(d.ids) && d.ids.length) {
-    return { action: 'expand', ids: d.ids, ...(d.drop !== undefined && { drop: d.drop }) };
+  // 본문 청구. ids는 목록이든 하나(문자열)든 받는다 — 같은 결정의 drop과 search의 targets가 그렇고, 정규화기
+  // (constants.normalizeItemIds)도 둘 다 받는다. 목록만 받던 동안 {"ids":"k12"}는 결정이 아니게 되어 재시도가
+  // 같은 응답(temperature=0)을 받고 null로 끝났다 — 모델이 낸 정당한 청구가 강제 답변으로 넘어가며 남은 스텝을
+  // 전부 잃는 형태다(실측). 같은 슬립을 drop에서는 받아 주면서 ids에서만 요청을 버릴 이유가 없다.
+  // 청구할 것도 버릴 것도 없으면 결정이 아니다. drop만 있는 청구는 받는다 — 버리기는 펼침과 별개의 일이라
+  // 결정 경계(llm.js sanitizeDecision)가 펼침이 하나도 성립하지 않아도 그대로 적용한다.
+  // 형식·개수 확정은 그 경계가 한다. answerOnly 판정은 search와 같다.
+  if (!answerOnly && d.action === 'expand') {
+    const given = v => (Array.isArray(v) ? v.length > 0 : typeof v === 'string' && v.trim() !== '');
+    if (given(d.ids) || given(d.drop)) {
+      return { action: 'expand', ids: d.ids ?? [], ...(d.drop !== undefined && { drop: d.drop }) };
+    }
   }
   if (!answerOnly && d.action === 'run_query' && typeof d.query_name === 'string' && d.query_name.trim()) {
     // target_db는 문자열일 때만 싣는다 — 크기 확정은 결정 경계(llm.js sanitizeDecision)가 한다.
