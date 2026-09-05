@@ -195,3 +195,97 @@ test('expand로 범위를 넓혀도 항목의 seq가 바뀌지 않는다', () =>
   );
   assert.equal(grown.seq, first.seq, '범위를 넓혔더니 항목의 seq가 바뀌었다');
 });
+
+// ===== 더 받을 것이 남았는가 — 이웃 조각이 상한에 들어가는가 =====
+// 범위와 글자 수만 보면 이웃 한 조각이 상한에 안 들어가는 항목에도 번호가 남는다. 900자 청크면 네 조각(3,603자)
+// 에서 다섯째(4,504자)가 막히는데, 그 항목은 범위 밖 청크도 남아 있고 상한에도 안 닿아 옛 판정으로는 '청구할
+// 수 있다'였다. 모델이 그 번호로 청구한 expand는 한 글자도 늘리지 못하고, 안내는 '번호가 붙은 항목만 청구할 수
+// 있다'라 모순이며, 두 번이면 강제 답변으로 넘어갔다(실측).
+test('이웃 조각이 상한에 들어가지 않으면 full이 서고 번호가 사라진다', () => {
+  const rows = Array.from({ length: 22 }, (_, i) => row(1, i + 1));   // 900자 청크
+  const [item] = buildItems([{ doc_seq: 1, rep: 5, from: 5, to: 5, chunk_of: 22, dist: 0.3 }], rows, { grow: true });
+  assert.ok(item.content.length < MAX_DOC_LEN && item.to < 22, '이 시나리오는 상한에 닿지 않고 범위 밖 청크가 남아야 뜻이 있다');
+  assert.equal(item.full, true, '읽어 온 이웃이 상한에 안 들어가면 더 받을 것이 없다');
+  assert.ok(!canGrow(item), '늘지 않을 항목에 번호가 붙으면 모델이 그 번호로 청구하느라 스텝을 버린다');
+  // 같은 항목을 다시 넓혀도 한 글자도 늘지 않는다 — full이 참이어야 하는 근거다.
+  const [again] = buildItems([{ doc_seq: 1, rep: 5, from: item.from, to: item.to, chunk_of: 22, dist: 0.3 }], rows, { grow: true });
+  assert.equal(again.content.length, item.content.length);
+});
+
+test('읽어 오지 않은 이웃은 모른다 — full은 서지 않고 번호가 남는다', () => {
+  // 계획된 범위(3~4)의 행만 있고 이웃은 없다. 넓힐 수 있을지 모르므로 청구할 수 있어야 한다.
+  const [item] = buildItems(planRanges([hit(1, 3, 0.31), hit(1, 4, 0.35)]), [row(1, 3), row(1, 4)]);
+  assert.equal(item.full, false);
+  assert.ok(canGrow(item));
+  // 이웃을 함께 읽었고(search.js가 그렇게 읽는다) 그것이 들어가면 역시 청구할 수 있다 — 싣지는 않는다.
+  const [open] = buildItems(planRanges([hit(1, 3, 0.31), hit(1, 4, 0.35)]), [row(1, 2), row(1, 3), row(1, 4), row(1, 5)]);
+  assert.equal(open.full, false);
+  assert.deepStrictEqual([open.from, open.to], [3, 4], '검색은 계획된 범위 밖의 이웃을 싣지 않는다');
+  // 문서 전체가 실렸으면 이웃이 문서 밖이라 full이다.
+  const [whole] = buildItems(planRanges([hit(1, 1, 0.31, 2), hit(1, 2, 0.35, 2)]), [row(1, 1, 900, 2), row(1, 2, 900, 2)]);
+  assert.equal(whole.full, true);
+  assert.ok(!canGrow(whole));
+});
+
+test('검색 시점에 이웃을 읽었으면 그 자리에서 full이 확정된다', () => {
+  // 계획된 범위(1~4, 1,000자씩)는 꽉 찼고 이웃 5번(1,000자)은 안 들어간다 — 번호 없이 실려야 한다.
+  const rows = Array.from({ length: 5 }, (_, i) => row(1, i + 1, 1000, 8));
+  const [item] = buildItems([{ doc_seq: 1, rep: 2, from: 1, to: 4, chunk_of: 8, dist: 0.3 }], rows);
+  assert.deepStrictEqual([item.from, item.to], [1, 4]);
+  assert.equal(item.full, true);
+  assert.ok(!canGrow(item));
+});
+
+// ===== 문서당 상한은 프롬프트에 실리는 형태로 잰다 =====
+// 원문 길이로 재면 줄이 많은 본문(마크다운 목록·표)이 들여쓰기만큼 상한을 넘겨 프롬프트가 다시 자르고 잘림 표시를
+// 붙인다 — 4,499자짜리 병합 항목이 355자를 잃고 '…(생략)'을 달고 나갔다(실측). '검색된 청크는 프롬프트에서 다시
+// 잘리지 않는다'(context.md 2-5)가 이 자리에서만 깨져 있었다.
+test('줄이 많은 본문도 문서당 상한 안에서 병합되어 프롬프트에서 다시 잘리지 않는다', async () => {
+  const { buildPrompt } = await import('../src/llm-openai.js');
+  const { indentLines, TRUNC_MARK } = await import('../src/constants.js');
+  const list = (n, w) => Array.from({ length: n }, (_, i) => `- ${String(i).padStart(2, '0')} ${'가'.repeat(w - 5)}`).join('\n');
+  const rows = [1, 2, 3, 4].map(n => ({ ...row(9, n, 0, 5), content: list(40, 24) }))   // 999자·40줄
+    .concat([{ ...row(9, 5, 0, 5), content: list(20, 24) }]);                           // 499자·20줄
+  const [item] = buildItems([{ doc_seq: 9, rep: 3, from: 1, to: 5, chunk_of: 5, dist: 0.3 }], rows, { grow: true });
+  assert.ok(item.content.length < MAX_DOC_LEN, '이 시나리오는 원문으로는 상한 안이어야 뜻이 있다');
+  assert.ok(indentLines(item.content).length <= MAX_DOC_LEN, `프롬프트 형태가 상한을 넘는다: ${indentLines(item.content).length}`);
+  const p = buildPrompt({ knowledge: [item], qaMethods: [], queries: [], history: [], chat: [], question: 'q', searched: ['knowledge'], tried: true });
+  assert.ok(!p.includes(TRUNC_MARK), '청크 항목이 프롬프트에서 다시 잘렸다');
+  assert.ok(p.includes(`- ${String(19).padStart(2, '0')} `) || p.includes(`- ${String(39).padStart(2, '0')} `), '실린 범위의 마지막 줄이 사라졌다');
+});
+
+// ===== 분할 경계와 서로게이트 쌍 =====
+// 강제 절단과 겹침 시작은 임의의 코드유닛 위치라 이모지 한가운데에 떨어질 수 있다. 그러면 앞 청크는 상위
+// 서로게이트로 끝나고 다음 청크는 하위 서로게이트로 시작한다(실측) — 유효한 UTF-8이 아니라 임베딩 서버가
+// 그 행을 매 주기 거부하거나 U+FFFD로 바꿔 놓고, 프롬프트에 실리면 LLM 호출이 인코딩 단계에서 실패한다.
+// constants.clipText·stripLoneSurrogates가 막는 실패 부류가 이 경계에서만 빠져 있었다.
+test('분할은 서로게이트 쌍(이모지)을 반으로 쪼개지 않는다', async () => {
+  const { stripLoneSurrogates } = await import('../src/constants.js');
+  const intact = parts => parts.every(p => stripLoneSurrogates(p) === p);
+  // 겹침 시작(경계 - CHUNK_OVERLAP)에 이모지가 걸리는 글
+  const overlapHit = '가'.repeat(551) + '🚀' + '가'.repeat(147) + '\n\n' + '나'.repeat(1500);
+  const a = splitContent(overlapHit);
+  assert.ok(intact(a), `겹침 시작에서 쌍이 갈라졌다: ${a.map(p => p.charCodeAt(0).toString(16)).join(',')}`);
+  assert.ok(a.some(p => p.includes('🚀')), '이모지가 어느 청크에도 온전히 남지 않았다');
+  // 강제 절단(상한 자리)에 이모지가 걸리는 덩어리
+  const forcedHit = '가'.repeat(CHUNK_MAX_LEN - 1) + '🚀' + '가'.repeat(2000);
+  const b = splitContent(forcedHit);
+  assert.ok(intact(b), '강제 절단에서 쌍이 갈라졌다');
+  for (const c of b) assert.ok(c.length <= CHUNK_MAX_LEN, `상한 초과: ${c.length}`);
+  // 이모지만으로 된 글 — 모든 위치가 쌍의 안팎이다. 유한 번에 끝나고 어느 조각도 깨지지 않아야 한다.
+  const emojiOnly = '🚀'.repeat(3000);
+  const c = splitContent(emojiOnly);
+  assert.ok(c.length > 3 && c.length < 100, `청크 수가 이상하다: ${c.length}`);
+  assert.ok(intact(c), '이모지만 든 글에서 쌍이 갈라졌다');
+});
+
+// 꼬리 청크만 앞 공백을 떼지 않고 있었다 — 겹침 시작이 빈 줄 구간에 떨어지면 앞 공백이 최대 겹침 길이만큼 붙어
+// 임베딩 원문과 청크 저장소에 그대로 들어갔다(퍼징으로 잡았다). 모든 청크가 같은 모양이어야 한다.
+test('모든 청크는 앞뒤 공백 없이 저장된다 — 꼬리 청크도', () => {
+  // 경계(빈 줄) 뒤 겹침 구간이 통째로 빈 줄이라 꼬리 청크의 시작이 공백에 떨어지는 글
+  const s = '가'.repeat(800) + '\n'.repeat(200) + '나'.repeat(300);
+  const parts = splitContent(s);
+  assert.ok(parts.length >= 2, `이 시나리오는 두 청크 이상이어야 뜻이 있다: ${parts.length}`);
+  for (const [i, p] of parts.entries()) assert.equal(p, p.trim(), `${i + 1}번 청크에 앞뒤 공백이 남았다`);
+  assert.ok(parts.every(p => p.length > 0));
+});

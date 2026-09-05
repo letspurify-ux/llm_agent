@@ -13,6 +13,7 @@ import {
   MAX_EXPANDS, MAX_DOC_LEN, ITEM_PREFIX,
   SEARCH_TARGETS, clipText, warnOnce, targetDbNames, isPlainObject, joinUrl,
   readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_UPSTREAM_ERROR_BYTES, numEnv,
+  indentLines,
 } from './constants.js';
 import { bindNames } from './sql.js';
 import { canGrow } from './chunk.js';
@@ -442,7 +443,7 @@ const clip = (v, max = MAX_PROMPT_ITEM_LEN) => {
 //   indent  — 지식 본문·대화처럼 줄 구조(번호 목록·표)가 근거인 것. 이어지는 줄을 두 칸 들여
 //             markdown 목록 항목의 연속 줄로 만든다. 들여쓰기 뒤에 clip하므로 결과는 상한 안이다.
 const oneLine = v => String(v ?? '').replace(/\s+/g, ' ').trim();
-const indent = v => String(v ?? '').trim().split(/\r\n?|\n/).map((l, i) => i && l ? `  ${l}` : l).join('\n');
+const indent = indentLines;   // 정의는 constants.js — 청크 병합(chunk.js)이 같은 자로 문서당 상한(MAX_DOC_LEN)을 잰다
 
 // 제목·쿼리명처럼 '항목을 지목하는 이름'의 상한. 본문보다 짧게 잡는다 — 라벨이라 길 이유가 없다.
 // 이름에도 상한이 필요한 이유: renderItems는 예산과 무관하게 최소 1건을 싣는다(그 보장이 없으면

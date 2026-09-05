@@ -619,6 +619,15 @@ test('청크 항목은 잘리지 않아도 더 받을 것이 남았으면 번호
 
   const capped = { ...base, knowledge: [chunk({ content: '가'.repeat(MAX_DOC_LEN) })] };
   assert.match(at(capped), /^- \[운영 가이드/, '글자 상한에 닿았으면 청구해도 늘지 않으므로 번호를 떼야 한다');
+
+  // 범위 밖 청크가 남았고 상한에도 안 닿았지만 이웃 조각이 상한에 들어가지 않는 항목(chunk.js buildItems의 full) —
+  // 앞의 둘만 보던 동안 이 항목에 번호가 남아, 청구가 한 글자도 늘리지 못했다(실측).
+  const full = { ...base, knowledge: [chunk({ full: true })] };
+  assert.match(at(full), /^- \[운영 가이드/, '이웃 조각이 상한에 안 들어가면 청구해도 늘지 않으므로 번호를 떼야 한다');
+
+  // 상한은 프롬프트에 실리는 형태(들여쓰기 포함)로 잰다 — 원문 2,399자·1,200줄은 프롬프트에서 4,797자다.
+  const tall = { ...base, knowledge: [chunk({ content: Array(1200).fill('a').join('\n') })] };
+  assert.match(at(tall), /^- \[운영 가이드/, '줄이 많은 본문은 원문이 짧아도 프롬프트 형태로는 상한에 닿는다');
 });
 
 test('청크 항목은 문서당 상한까지 잘리지 않고 통째로 실린다', () => {

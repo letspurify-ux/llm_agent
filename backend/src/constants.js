@@ -370,6 +370,14 @@ export function stripLoneSurrogates(s) {
   return /[\uD800-\uDFFF]/.test(str) ? str.replace(LONE_SURROGATE_RE, '') : str;
 }
 
+// 프롬프트 항목의 본문 형태 — 항목 한 줄('- ')에 이어지는 줄을 두 칸 들여 markdown 목록의 연속 줄로 만든다
+// (llm-openai.js itemLine·최근 대화). 여기 두는 이유: MAX_DOC_LEN이 재는 것은 '한 문서가 지식 섹션에서
+// 차지하는 글자'이므로 청크 병합(chunk.js buildItems·canGrow)도 같은 자로 재야 한다. 원문 길이로 재면 줄이
+// 많은 본문(마크다운 목록·표)이 들여쓰기만큼 상한을 넘겨 프롬프트에서 다시 잘리고 잘림 표시까지 붙는다 —
+// '검색된 청크는 프롬프트에서 다시 잘리지 않는다'(context.md 2-5)가 정확히 그 자리에서 깨졌다(실측 355자).
+export const indentLines = v =>
+  String(v ?? '').trim().split(/\r\n?|\n/).map((l, i) => (i && l ? `  ${l}` : l)).join('\n');
+
 // 소유 키만 읽는 프로퍼티 접근.
 // 바인드명·쿼리명이 '__proto__'·'toString' 같은 프로토타입 멤버와 겹치면 obj[key]가 값 대신
 // Object.prototype의 멤버를 돌려준다. 그러면 '값 없음'이어야 할 자리가 다른 문자열·함수로 굳어

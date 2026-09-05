@@ -60,7 +60,11 @@ export async function searchKnowledge(text) {
   if (!hits || !hits.length) return hits;
   try {
     const plans = planRanges(hits);
-    const rows = await loadChunkRanges(plans);
+    // 계획된 범위의 앞뒤 한 조각씩을 함께 읽는다. 항목에 싣지는 않는다(buildItems가 계획된 범위 안에서만
+    // 채운다) — '더 받을 것이 남았는가'(full)를 검색 시점에 확정하는 데만 쓴다. 이웃을 모르면 번호를 붙일
+    // 수밖에 없고, 그 번호로 청구한 expand가 상한 때문에 한 글자도 늘리지 못하면 모델은 왕복 하나를
+    // 헛되이 태운다. 비용은 문서당 최대 두 행이다.
+    const rows = await loadChunkRanges(plans.map(p => ({ ...p, from: Math.max(1, p.from - 1), to: p.to + 1 })));
     // 병합한 '문서'를 상한까지 취한다. 청크를 그보다 많이 받은 이유가 여기다 (CHUNK_OVERFETCH).
     return buildItems(plans, rows, { maxDocLen: MAX_DOC_LEN }).slice(0, LIMIT);
   } catch (e) {

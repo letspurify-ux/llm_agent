@@ -11,7 +11,7 @@
 // 테스트가 유일한 방어선이고, 그러려면 DB 없이 부를 수 있어야 한다.
 // 아래 세 상수는 문서 해시에 들어간다(embed-sync.js CHUNK_RULE) — 고치면 다음 동기화가 전 문서를
 // 알아서 다시 나눈다. 손으로 비울 필요가 없고, 반대로 고쳐 놓고 잊어버릴 수도 없다.
-import { MAX_PROMPT_ITEM_LEN, MAX_DOC_LEN } from './constants.js';
+import { MAX_PROMPT_ITEM_LEN, MAX_DOC_LEN, indentLines, clipText } from './constants.js';
 
 // 청크 하나의 크기. 상한을 MAX_PROMPT_ITEM_LEN과 '같게' 두는 것이 설계의 요점이다 —
 // 검색된 청크가 프롬프트에서 다시 잘리지 않는다. 지금까지 지식 항목마다 붙던 '…(생략)'과
@@ -20,6 +20,12 @@ import { MAX_PROMPT_ITEM_LEN, MAX_DOC_LEN } from './constants.js';
 // 그 여유가 없으면 경계 탐색이 거의 항상 실패해 강제 절단으로 떨어진다.
 export const CHUNK_TARGET_LEN = 900;
 export const CHUNK_MAX_LEN = MAX_PROMPT_ITEM_LEN;
+// 분할 '방식'의 판. 크기·겹침이 같아도 절단 위치를 고르는 규칙이 바뀌면 같은 원문이 다른 청크가 되므로, 이 값도
+// 문서 해시에 들어간다(embed-sync.js CHUNK_RULE) — 올리면 다음 동기화가 전 문서를 다시 나눈다. 자리(doc_seq,
+// chunk_no)를 유지하며 덮어쓰므로 실제로 내용이 달라진 청크만 다시 임베딩된다. 절단 위치를 고르는 규칙을
+// 고쳤으면 이 값을 올릴 것 — 안 올리면 기존 설치의 청크는 원문을 고치기 전까지 옛 규칙대로 남는다.
+//   2: 절단 위치가 서로게이트 쌍을 가르지 않는다 (alignCut)
+export const CHUNK_SPLIT_VERSION = 2;
 // 겹침. 경계에 걸친 문장이 양쪽 어디에서도 온전하지 않으면, 그 문장이 답인 질문은 두 청크 모두와
 // 어중간하게 닮아 둘 다 문턱(search.js MAX_DIST) 밖으로 밀린다.
 export const CHUNK_OVERLAP = 150;
@@ -64,6 +70,17 @@ function lastBoundary(text, lo, hi) {
   return -1;
 }
 
+// 절단 위치가 서로게이트 쌍(이모지 등 BMP 밖 문자)의 한가운데면 한 칸 앞으로 옮긴다. 경계 탐색이 찾은 자리는
+// 개행·문장 부호라 쌍을 가르지 않지만, 강제 절단(hi)과 겹침 시작(end - overlap)은 임의의 코드유닛 위치다 —
+// 거기가 이모지 한가운데면 앞 청크는 상위 서로게이트로 끝나고 다음 청크는 하위 서로게이트로 시작한다(실측).
+// 그 문자열은 유효한 UTF-8이 아니라 임베딩 서버가 그 행을 매 주기 거부하거나 U+FFFD로 바꿔 놓고, 프롬프트에
+// 실리면 LLM 호출이 인코딩 단계에서 실패한다 — constants.clipText가 절단면에서 막는 것과 같은 실패다.
+// 앞으로 옮기면 끝 절단에서는 쌍이 통째로 다음 청크로 가고, 시작에서는 쌍이 온전히 그 청크에 든다.
+const isHigh = c => c >= 0xd800 && c <= 0xdbff;
+const isLow = c => c >= 0xdc00 && c <= 0xdfff;
+const alignCut = (s, i) =>
+  (i > 0 && i < s.length && isLow(s.charCodeAt(i)) && isHigh(s.charCodeAt(i - 1)) ? i - 1 : i);
+
 // 원문 → 청크 배열. 빈 문자열이면 빈 배열이 아니라 한 건을 돌려준다 —
 // 청크가 0건이면 그 문서는 vec_store에 행이 없어 검색에서 통째로 사라지는데,
 // 등록은 되어 있으므로 '등록했는데 안 나온다'가 되고 그 실패는 아무 데도 기록되지 않는다.
@@ -78,24 +95,28 @@ export function splitContent(text, {
   let at = 0;
   while (at < s.length) {
     const remain = s.length - at;
-    if (remain <= max) { out.push(s.slice(at)); break; }
+    // 꼬리도 다른 청크와 같이 앞뒤 공백을 뗀다 — 겹침 시작이 빈 줄 구간에 떨어지면 앞 공백이 최대 겹침 길이만큼
+    // 붙는데, 그 공백은 임베딩 원문과 청크 저장소에 그대로 들어가 다른 청크와 모양이 달라진다(퍼징으로 잡았다).
+    if (remain <= max) { out.push(s.slice(at).trim()); break; }
     // 창: 목표의 60% 지점부터 상한까지. 아래쪽을 열어두지 않으면 문단이 짧은 글에서
     // 경계가 창에 하나도 안 들어와 매번 강제 절단이 된다.
     const lo = at + Math.floor(target * 0.6);
     const hi = at + max;
     const cut = lastBoundary(s, lo, hi);
-    const end = cut > at ? cut : hi;
+    const end = cut > at ? cut : alignCut(s, hi);
     out.push(s.slice(at, end).trim());
     // 겹침은 '다음 청크의 시작을 당기는' 방식이다. end에서 그대로 이어가면 경계에 걸친 문장이
-    // 앞 청크에만 온전히 남는다. 진행이 멈추지 않도록 최소 1자는 전진한다.
-    const next = Math.max(at + 1, end - overlap);
+    // 앞 청크에만 온전히 남는다. 진행이 멈추지 않도록 최소 한 글자는 전진한다 — 그 글자가
+    // 서로게이트 쌍이면 두 코드유닛이다(한 코드유닛만 나가면 쌍의 가운데에서 다시 시작한다).
+    let next = alignCut(s, end - overlap);
+    if (next <= at) next = at + (isHigh(s.charCodeAt(at)) && isLow(s.charCodeAt(at + 1)) ? 2 : 1);
     at = next;
   }
   const parts = out.filter(c => c.length > 0);
   // 빈 배열을 돌려주면 안 된다. 그 문서는 청크가 0건이라 검색에 한 번도 안 나오는데, 동기화는
   // doc_hash를 저장할 행이 없어 매 주기 같은 문서를 다시 분할한다 — 조용히 안 나오면서 조용히 도는
   // 상태다. 공백만 든 슬라이스가 전부 걸러지는 경우(본문 대부분이 공백)가 그 경로다.
-  return parts.length ? parts : [s.slice(0, max)];
+  return parts.length ? parts : [clipText(s, max)];
 }
 
 // ===== 검색 결과 병합 =====
@@ -140,6 +161,11 @@ export function planRanges(hits, { gapFill = CHUNK_GAP_FILL } = {}) {
 //
 // grow=true면 범위 밖 청크까지 상한까지 끌어온다(expand). false면 계획된 범위 안에서만 채운다(검색) —
 // 검색이 먼저 상한을 채워 버리면 expand가 할 일이 없어지고, 모델이 왕복 하나를 헛되이 태운다.
+//
+// 글자 수는 프롬프트에 실리는 형태(constants.js indentLines)로 잰다 — MAX_DOC_LEN이 재는 것이 그 길이다.
+// 원문 길이로 재면 줄이 많은 본문(마크다운 목록·표)이 들여쓰기만큼 상한을 넘겨 프롬프트가 다시 자르고
+// 잘림 표시를 붙인다. 4,499자짜리 병합 항목이 355자를 잃고 '…(생략)'을 달고 나갔다(실측) —
+// '청크는 프롬프트에서 다시 잘리지 않는다'가 이 자에서만 깨져 있었다.
 export function buildItems(plans, rows, { maxDocLen = MAX_DOC_LEN, grow = false } = {}) {
   const byDoc = new Map();
   for (const r of rows) {
@@ -152,23 +178,29 @@ export function buildItems(plans, rows, { maxDocLen = MAX_DOC_LEN, grow = false 
     if (!have) continue;
     const lo = grow ? 1 : p.from;
     const hi = grow ? (p.chunk_of ?? Number.MAX_SAFE_INTEGER) : p.to;
-    const rep = have.get(p.rep) ?? have.get(p.from);
+    // 대표 행이 없으면(검색과 읽기 사이에 다시 나뉜 문서) 범위 시작을 대표로 삼는다 — 중심은 실제로 있는 행이어야 한다.
+    const repNo = have.has(p.rep) ? p.rep : p.from;
+    const rep = have.get(repNo);
     if (!rep) continue;
+    const chunkOf = rep.chunk_of;
 
-    let from = p.rep, to = p.rep;
-    let len = rep.content.length;
+    // [a, b] 구간을 이어 붙였을 때의 본문과 그 프롬프트 길이. 사이에 없는 행은 건너뛴다.
+    const joined = (a, b) => {
+      const parts = [];
+      for (let n = a; n <= b; n++) if (have.has(n)) parts.push(have.get(n).content);
+      return parts.join('\n');
+    };
+    const cost = (a, b) => indentLines(joined(a, b)).length;
+
+    let from = repNo, to = repNo;
     // 대표 청크에서 번갈아 바깥으로 넓힌다. 한쪽이 막히면 다른 쪽만 계속 넓힌다.
     const widen = (min, max) => {
       for (;;) {
         const before = from, after = to;
         for (const dir of [1, -1]) {
           const no = dir > 0 ? to + 1 : from - 1;
-          if (no < min || no > max) continue;
-          const row = have.get(no);
-          if (!row) continue;
-          const add = row.content.length + 1; // 이어 붙일 때의 개행 한 칸
-          if (len + add > maxDocLen) continue;
-          len += add;
+          if (no < min || no > max || !have.has(no)) continue;
+          if ((dir > 0 ? cost(from, no) : cost(no, to)) > maxDocLen) continue;
           if (dir > 0) to = no; else from = no;
         }
         if (from === before && to === after) break;
@@ -180,22 +212,31 @@ export function buildItems(plans, rows, { maxDocLen = MAX_DOC_LEN, grow = false 
     // 도로 가져가는 셈이라, 모델은 방금 읽은 대목이 없어진 프롬프트를 받는다.
     widen(p.from, p.to);
     if (grow) widen(lo, hi);
-    const parts = [];
-    for (let n = from; n <= to; n++) if (have.get(n)) parts.push(have.get(n).content);
-    const chunkOf = rep.chunk_of;
+
+    // 더 받을 것이 남았는가(full). 양쪽 이웃이 모두 '문서 밖'이거나 '읽어 왔는데 상한에 들어가지 않는다'면
+    // 끝이다. 읽어 오지 않은 이웃은 모른다(full=false) — 그 자리는 expand가 창을 넓혀 읽은 뒤에 다시
+    // 판정한다(agent.js growItem). 검색은 계획된 범위의 앞뒤 한 조각을 함께 읽어(search.js) 이 판정을
+    // 검색 시점에 확정한다. 범위와 글자 수만 보면(옛 canGrow) 이웃 한 조각이 상한에 안 들어가는 항목에도
+    // 번호가 남아 — 900자 청크면 네 조각(3,603자)에서 다섯째(4,504자)가 막힌다 — 모델이 그 번호로 청구한
+    // expand가 한 글자도 늘리지 못하고, 안내는 '번호가 붙은 항목만 청구할 수 있다'라 모순이며, 두 번이면
+    // 강제 답변으로 넘어갔다(실측).
+    const closed = no =>
+      no < 1 || no > chunkOf || (have.has(no) && (no > to ? cost(from, no) : cost(no, to)) > maxDocLen);
+    const full = closed(from - 1) && closed(to + 1);
+
     items.push({
       // rep(대표 청크의 순번)을 항목에 남긴다. 본문 청구가 범위를 넓힐 때 이 값을 다시 넘겨야
       // seq가 그대로 유지된다 — seq는 '가장 가까운 청크'의 것인데, 넓히면서 중심을 범위 시작으로
       // 옮기면 항목의 seq가 바뀐다. 그러면 모델이 방금 청구한 k12가 다음 스텝에 존재하지 않아
       // 다시 청구할 수도, 버릴 수도 없다 — seq가 요청 내내 고정이라는 계약이 깨지는 자리다.
-      seq: rep.seq, rep: p.rep, doc_seq: p.doc_seq, chunk_of: chunkOf, from, to,
+      seq: rep.seq, rep: repNo, doc_seq: p.doc_seq, chunk_of: chunkOf, from, to, full,
       title: rep.title,
       // 위치 표기를 제목에 이어 붙이지 않고 따로 둔다. 붙여서 넘기면 프롬프트가 제목을
       // MAX_PROMPT_NAME_LEN(100자)으로 자를 때 뒤에 있는 이 표기부터 사라진다 — 제목이 긴 문서일수록
       // '몇 번째 조각인가'를 잃는데, 그것을 알려주는 것이 이 표기의 존재 이유다(실측으로 확인).
       // llm-openai.js itemLine이 제목을 자른 '뒤에' 붙인다. 길이는 유계다(chunk_of는 SMALLINT).
       range: chunkOf > 1 ? ` (${from === to ? from : `${from}~${to}`}/${chunkOf})` : '',
-      content: parts.join('\n'),
+      content: joined(from, to),
       _dist: p.dist,
     });
   }
@@ -204,7 +245,9 @@ export function buildItems(plans, rows, { maxDocLen = MAX_DOC_LEN, grow = false 
 }
 
 // 이 항목이 본문 청구(expand)로 더 받을 것이 남았는가.
-// 두 조건이 모두 서야 한다: 문서에 범위 밖 청크가 남아 있고, 글자 상한에 아직 닿지 않았다.
-// 둘 중 하나만 보면 모델이 더 받을 수 없는 항목을 청구하느라 스텝을 버린다.
+// 세 조건이 모두 서야 한다: 문서에 범위 밖 청크가 남아 있고, 글자 상한에 아직 닿지 않았고, 이웃 조각이
+// 그 상한에 들어간다는 것이 부정되지 않았다(buildItems의 full). 하나만 빠져도 모델이 더 받을 수 없는
+// 항목을 청구하느라 스텝을 버린다 — 앞의 둘만 보던 동안 세 번째가 정확히 그렇게 새고 있었다.
+// 글자 수는 프롬프트에 실리는 형태로 잰다(buildItems와 같은 자).
 export const canGrow = (o, maxDocLen = MAX_DOC_LEN) =>
-  !!o?.doc_seq && (o.from > 1 || o.to < o.chunk_of) && String(o.content ?? '').length < maxDocLen;
+  !!o?.doc_seq && !o.full && (o.from > 1 || o.to < o.chunk_of) && indentLines(o.content).length < maxDocLen;

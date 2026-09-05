@@ -6,7 +6,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { loopGuard, paramKey, normalizeChat, fallbackAnswer, normalizeQuestion, clippedCopyDetector, answerOf, handleQuestion, searchKey, mergeFront } from '../src/agent.js';
-import { MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_ANSWER_LEN, MAX_RESULT_ROWS, MAX_RESULT_COLS, MAX_CELL_LEN, TRUNC_MARK, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_BATCH_QUERIES, MAX_EXPANDS, SEARCH_TARGETS } from '../src/constants.js';
+import { MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_ANSWER_LEN, MAX_RESULT_ROWS, MAX_RESULT_COLS, MAX_CELL_LEN, TRUNC_MARK, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_BATCH_QUERIES, MAX_EXPANDS, MAX_DOC_LEN, SEARCH_TARGETS } from '../src/constants.js';
+import { buildPrompt } from '../src/llm-openai.js';
+import { buildItems, planRanges, canGrow } from '../src/chunk.js';
 
 const ran = (name, params, rows = [{ A: 1 }]) => ({ query_name: name, params, rows, totalRows: rows.length });
 const failed = (name, params) => ({ query_name: name, params, error: 'ORA-00942' });
@@ -592,11 +594,14 @@ test('searchKey는 검색어의 대소문자·공백과 대상 순서를 흡수�
   assert.notEqual(searchKey('batch', ['knowledge']), searchKey('배치', ['knowledge']));
 });
 
-test('mergeFront는 새 항목만 앞에 넣고 넣은 수를 돌려준다', () => {
+// 이번 검색이 찾은 것은 새것이든 이미 있던 것이든 앞으로 온다 — 예산이 꼬리부터 버리므로, 있던 항목을 제자리에
+// 두면 이번 검색의 1위가 지난 검색의 꼬리에 남아 잘린다. 돌려주는 값은 새로 넣었거나 달라진 수다(순서만 바뀐 것은 아니다).
+test('mergeFront는 이번 검색이 찾은 것을 관련도 순으로 앞에 두고, 새로 넣었거나 달라진 수를 돌려준다', () => {
   const list = [K(1), K(2)];
   assert.equal(mergeFront(list, [K(2), K(3), K(3), K(4)]), 2);
-  assert.deepStrictEqual(list.map(k => k.seq), [3, 4, 1, 2]);
-  assert.equal(mergeFront(list, [K(1)]), 0);
+  assert.deepStrictEqual(list.map(k => k.seq), [2, 3, 4, 1], '다시 찾은 항목도 이번 검색의 순서로 앞에 와야 한다');
+  assert.equal(mergeFront(list, [K(1)]), 0, '순서만 바뀐 것은 진도가 아니다');
+  assert.deepStrictEqual(list.map(k => k.seq), [1, 2, 3, 4]);
 });
 
 // 본문 청구(expand)가 항목을 맨 앞으로 옮기는 것은 '예산이 뒤에서부터 버리므로 그 자리라야 살아남는다'가
@@ -625,16 +630,67 @@ test('mergeFront는 펼친 항목을 넘어서지 않는다 — 검색은 펼침
 test('mergeFront는 청크 항목을 문서 단위로 거른다 — 대표 청크가 바뀌어도', () => {
   const item = (seq, doc) => ({ seq, doc_seq: doc, title: `문서${doc}`, content: '본문' });
   const list = [item(101, 1)];
-  // 같은 문서(1)의 다른 대표(105) + 새 문서(2)
+  // 같은 문서(1)의 다른 대표(105) + 새 문서(2) — 문서 1은 항목이 하나여야 하고, 이번 검색 순서대로 앞에 온다
   assert.equal(mergeFront(list, [item(105, 1), item(201, 2)]), 1);
-  assert.deepStrictEqual(list.map(o => o.doc_seq), [2, 1]);
-  assert.deepStrictEqual(list.map(o => o.seq), [201, 101], '먼저 온 항목의 seq가 요청 내내 고정이어야 한다');
+  assert.deepStrictEqual(list.map(o => o.doc_seq), [1, 2]);
+  assert.deepStrictEqual(list.map(o => o.seq), [101, 201], '먼저 온 항목의 seq가 요청 내내 고정이어야 한다');
+});
+
+// 항목의 정체는 문서고 구간은 최신 검색을 따른다. 먼저 온 구간을 무조건 지키면 뒤 검색이 같은 문서의 다른 절을
+// 찾아도 그 절이 통째로 버려지고, 모델은 그것이 존재한다는 사실조차 볼 수 없다 — 오류 없는 오답의 전형이다.
+const CHUNK_ITEM = (seq, doc, from, to, content, over = {}) =>
+  ({ seq, doc_seq: doc, chunk_of: 22, rep: from, from, to, range: ` (${from === to ? from : `${from}~${to}`}/22)`, title: `문서${doc}`, content, full: false, ...over });
+
+test('mergeFront는 같은 문서의 다른 구간이 뒤 검색에 걸리면 seq를 지키고 구간을 바꾼다', () => {
+  const list = [CHUNK_ITEM(101, 1, 3, 3, 'A절')];
+  assert.equal(mergeFront(list, [CHUNK_ITEM(115, 1, 15, 17, 'B절')]), 1, '구간이 달라졌으면 진도다');
+  assert.equal(list.length, 1, '같은 문서가 두 항목으로 들어오면 안 된다');
+  assert.equal(list[0].seq, 101, '모델이 지목하는 번호는 요청 내내 고정이다');
+  assert.equal(list[0].content, 'B절');
+  assert.equal(list[0].range, ' (15~17/22)');
+  // 이번 구간이 이미 실린 구간 안에 들면 넓은 쪽을 둔다 — 좁혀서는 안 된다.
+  assert.equal(mergeFront(list, [CHUNK_ITEM(116, 1, 16, 16, 'B절의 한 조각')]), 0);
+  assert.equal(list[0].content, 'B절');
+});
+
+test('mergeFront는 펼친 항목의 구간과 자리를 지킨다 — 청구한 구간이 검색으로 바뀌면 안 된다', () => {
+  const pinned = CHUNK_ITEM(101, 1, 3, 7, '청구해 넓힌 절', { expanded: true });
+  const list = [pinned, K(9)];
+  assert.equal(mergeFront(list, [CHUNK_ITEM(115, 1, 15, 17, 'B절'), K(8)]), 1);
+  assert.deepStrictEqual(list.map(o => o.seq), [101, 8, 9]);
+  assert.equal(pinned.content, '청구해 넓힌 절');
+  assert.equal(pinned.range, ' (3~7/22)');
+});
+
+test('mergeFront는 버린 청크 항목에 겹치지 않는 구간이 걸리면 되살리고, 겹치면 버린 채로 둔다', () => {
+  const dropped = CHUNK_ITEM(101, 1, 3, 5, 'A절', { dropped: true });
+  const list = [K(9), dropped];
+  assert.equal(mergeFront(list, [CHUNK_ITEM(104, 1, 4, 6, 'A절 근처')]), 0, '겹치는 구간은 같은 내용이다 — 버린 것이 되살아나면 안 된다');
+  assert.equal(dropped.dropped, true);
+  assert.equal(dropped.content, 'A절');
+  assert.deepStrictEqual(list.map(o => o.seq), [9, 101], '버린 채로 둔 항목은 자리도 그대로다');
+  assert.equal(mergeFront(list, [CHUNK_ITEM(115, 1, 15, 17, 'B절')]), 1, '다른 절은 모델이 버린 것이 아니다');
+  assert.equal(dropped.dropped, false);
+  assert.equal(dropped.content, 'B절');
+  assert.equal(dropped.seq, 101);
+  assert.deepStrictEqual(list.map(o => o.seq), [101, 9], '되살아난 항목은 이번 검색의 결과로 앞에 온다');
+  // 펼쳤다가 버린 항목도 같다 — 새 구간은 핀이 아니다.
+  const pinnedDropped = CHUNK_ITEM(201, 2, 3, 7, 'X', { expanded: true, dropped: true });
+  const two = [pinnedDropped, K(9)];
+  assert.equal(mergeFront(two, [CHUNK_ITEM(215, 2, 15, 17, 'Y')]), 1);
+  assert.equal(pinnedDropped.expanded, false);
+  assert.deepStrictEqual(two.map(o => o.seq), [201, 9]);
+  // 청크가 아닌 항목(처리방법)은 같은 내용뿐이라 되살아날 길이 없다.
+  const m = { ...K(5), dropped: true };
+  const three = [m];
+  assert.equal(mergeFront(three, [K(5)]), 0);
+  assert.equal(m.dropped, true);
 });
 
 test('mergeFront의 문서 단위 판정은 청크가 아닌 항목을 건드리지 않는다', () => {
   const list = [K(1)];
   assert.equal(mergeFront(list, [K(1), K(2)]), 1);
-  assert.deepStrictEqual(list.map(k => k.seq), [2, 1]);
+  assert.deepStrictEqual(list.map(k => k.seq), [1, 2]);
 });
 
 // ===== 일괄 조회 (run_queries) =====
@@ -977,5 +1033,209 @@ test('이력 줄 수 상한은 본문 청구가 섞여도 지켜진다', async (
       run: async () => ({ rows: [{ V: n++ }], totalRows: 1, capped: false, targetDb: 'D' }),
       search: async () => found({ knowledge: [K(++n)], qaMethods: [], queries: [Q(1, 'q1')], routed: false }) } });
     assert.ok(r.trace.length <= MAX_HISTORY_ROWS, `이력이 ${r.trace.length}줄 — 상한 ${MAX_HISTORY_ROWS}을 넘었다`);
+  } finally { restore(); }
+});
+
+// ===== 청크 항목의 본문 청구 =====
+// growItem은 관리 DB에서 청크를 읽는다 — deps.loadChunks가 그 자리다. 이 판정은 양쪽으로 조용히 깨진다:
+// 늘지 않을 항목에 번호가 남으면 모델이 그 번호로 청구하느라 스텝을 버리고(두 번이면 강제 답변), 늘 수 있는
+// 항목에서 번호를 떼면 긴 문서의 뒷부분이 영영 실리지 않는다. 어느 쪽도 오류를 남기지 않는다.
+const CH = (doc, no, len = 900, of = 22) =>
+  ({ seq: doc * 1000 + no, doc_seq: doc, chunk_no: no, chunk_of: of, title: `문서${doc}`, content: '가'.repeat(len) });
+const loaderOf = rows => async ranges =>
+  rows.filter(r => ranges.some(g => g.doc_seq === r.doc_seq && r.chunk_no >= g.from && r.chunk_no <= g.to));
+const firstItemLine = ctx => buildPrompt(ctx).split('\n').find(l => l.startsWith('- '));
+
+test('청구로 넓힌 항목이 더 넓힐 수 없게 되면 번호가 사라진다 — 헛도는 청구를 막는다', async () => {
+  const restore = silence();
+  try {
+    const rows = Array.from({ length: 22 }, (_, i) => CH(1, i + 1));
+    // 검색이 돌려준 항목: 5번 적중, 이웃(4·6)을 함께 읽어 왔고 둘 다 들어간다 — 번호가 붙는다.
+    const [item] = buildItems(planRanges([{ doc_seq: 1, chunk_no: 5, _dist: 0.3, chunk_of: 22 }]),
+      rows.filter(r => r.chunk_no >= 4 && r.chunk_no <= 6));
+    assert.ok(canGrow(item), '이 시나리오는 검색 시점에 번호가 붙어야 뜻이 있다');
+    const before = item.content.length;   // 항목은 제자리에서 넓혀진다 — 비교 기준을 미리 적어 둔다
+    const llm = scripted([
+      { action: 'search', text: 'x', targets: ['knowledge'] },
+      { action: 'expand', ids: [`k${item.seq}`] },
+      { action: 'answer', answer: '답' },
+    ]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide, loadChunks: loaderOf(rows),
+      search: async () => found({ knowledge: [item] }) } });
+    assert.equal(r.answer, '답');
+    assert.equal(r.search.expanded, 1);
+    const grown = llm.seen.at(-1).knowledge[0];
+    assert.ok(grown.content.length > before, '청구가 범위를 넓히지 못했다');
+    assert.ok(grown.content.length < MAX_DOC_LEN && grown.to < 22, '이 시나리오는 상한에 닿지 않고 범위 밖 청크가 남아야 뜻이 있다');
+    assert.equal(grown.full, true, '다음 조각이 상한에 안 들어가면 더 받을 것이 없다');
+    assert.match(firstItemLine(llm.seen.at(-1)), /^- \[문서1 /, '한 글자도 늘지 않을 항목에 번호가 남았다');
+  } finally { restore(); }
+});
+
+test('검색 시점에 이웃을 못 읽은 항목이 청구로도 늘지 않으면 그 사실을 알리고 번호를 뗀다', async () => {
+  const restore = silence();
+  try {
+    const rows = Array.from({ length: 8 }, (_, i) => CH(1, i + 1, 1000, 8));
+    // 계획된 범위(1~4)만 읽힌 항목 — 이웃 5번을 모르니 번호가 붙는다. 청구해 읽어 보면 5번(1,000자)은 안 들어간다.
+    const [item] = buildItems([{ doc_seq: 1, rep: 2, from: 1, to: 4, chunk_of: 8, dist: 0.3 }], rows.slice(0, 4));
+    assert.ok(canGrow(item) && !item.full, '이 시나리오는 검색 시점에 번호가 붙어야 뜻이 있다');
+    const llm = scripted([
+      { action: 'search', text: 'x', targets: ['knowledge'] },
+      { action: 'expand', ids: [`k${item.seq}`] },
+      { action: 'answer', answer: '답' },
+    ]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide, loadChunks: loaderOf(rows),
+      search: async () => found({ knowledge: [item] }) } });
+    assert.equal(r.answer, '답');
+    assert.equal(r.search.expanded, undefined, '늘지 않은 청구는 펼침으로 세지 않는다');
+    const note = r.trace.find(h => h.expand !== undefined)?.note;
+    assert.match(note ?? '', /더 넓힐 수 없다/, '번호가 붙은 항목을 청구했는데 "번호가 붙은 항목만"이라고 답하면 모순이다');
+    const seen = llm.seen.at(-1).knowledge[0];
+    assert.equal(seen.full, true);
+    assert.match(firstItemLine(llm.seen.at(-1)), /^- \[문서1 /, '다음 프롬프트에서 번호가 사라져야 같은 청구를 반복하지 않는다');
+  } finally { restore(); }
+});
+
+// 프롬프트는 '아직 안 찾음'·'찾았는데 없음'·'못 찾아봤음'을 가른다(llm-openai.js section 주석). 경로A만 돈 검색이
+// '쿼리 0건'을 적으면 찾아보지 않은 대상이 '찾았는데 없다'로 보여, 모델은 query 검색을 이미 한 것으로 읽고 건너뛴다.
+test('경로A만 돈 검색은 지목된 쿼리가 없으면 쿼리 적중 수를 적지 않는다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([{ action: 'search', text: 'x', targets: ['qa_method'] }, { action: 'answer', answer: '답' }]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      search: async () => found({ qaMethods: [{ seq: 1, title: 'm', method: '쿼리 없음' }], queries: [], routed: null }) } });
+    assert.equal(r.trace[0].hits.queries, null, 'query를 찾지 않았고 지목된 쿼리도 없으면 null이어야 한다');
+    const line = buildPrompt(llm.seen[1]).split('\n').find(l => /^1\. 검색/.test(l));
+    assert.ok(!line.includes('쿼리'), `찾아보지 않은 대상이 이력 줄에 실렸다: ${line}`);
+    assert.deepStrictEqual(llm.seen[1].searched, ['qa_method']);
+  } finally { restore(); }
+});
+
+// 병합은 먼저 온 행을 지키므로(mergeFront) 두 번째 query 검색의 상위 적중은 새 행으로 들어오지 못한다 — 자세한
+// 표시(detail)만 옮겨 받아야 그 쿼리가 다음 스텝에 입출력·SQL과 함께 보인다. 소규모 등록에서는 첫 검색이 전부를
+// 실어 두 번째 검색이 새 항목을 하나도 넣지 못하므로, 옮긴 표시를 진도로 세지 않으면 검색어를 고쳐 다시 찾은
+// 정당한 검색이 '새 자료 없음'으로 헛돈 스텝에 들어가 두 번이면 강제 답변으로 넘어간다.
+test('두 번째 query 검색의 상위 적중은 이미 목록에 있어도 자세한 줄로 오르고, 그것을 진도로 센다', async () => {
+  const restore = silence();
+  try {
+    const QD = (seq, name, detail) => ({ ...Q(seq, name), query_desc: `${name} 용도`, ...(detail && { detail: true }) });
+    const llm = scripted([
+      { action: 'search', text: '첫 검색', targets: ['query'] },
+      { action: 'search', text: '둘째 검색', targets: ['query'] },   // 새 행은 없고 q3의 표시만 오른다
+      { action: 'search', text: '셋째 검색', targets: ['query'] },   // 아무것도 바뀌지 않는 검색 — 첫 헛돎이어야 한다
+      { action: 'answer', answer: '답' },
+    ]);
+    let n = 0;
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      search: async () => found({ routed: false,
+        queries: n++ === 0 ? [QD(1, 'q1', true), QD(2, 'q2'), QD(3, 'q3')] : [QD(3, 'q3', true), QD(1, 'q1', true), QD(2, 'q2')] }) } });
+    const after = [...llm.seen[2].queries].sort((a, b) => a.query_name.localeCompare(b.query_name));
+    assert.deepStrictEqual(after.map(q => [q.query_name, q.detail === true]), [['q1', true], ['q2', false], ['q3', true]]);
+    assert.match(buildPrompt(llm.seen[2]).split('\n').find(l => l.startsWith('- q3')), /SQL:/, 'q3가 짧은 줄로 남았다');
+    assert.equal(r.answer, '답', '표시가 오른 검색을 헛돈 스텝으로 세어 강제 답변으로 넘어갔다');
+    assert.equal(r.search.searches, 3);
+  } finally { restore(); }
+});
+
+test('폴백 답변은 모델이 버린 지식을 붙이지 않는다', () => {
+  const a = fallbackAnswer({ history: [], knowledge: [
+    { seq: 1, title: '버린 것', content: '무관한 본문', dropped: true },
+    { seq: 2, title: '남긴 것', content: '관련 본문' },
+  ] });
+  assert.ok(!a.includes('버린 것') && !a.includes('무관한 본문'), '버린 지식이 폴백 답변에 실렸다');
+  assert.ok(a.includes('남긴 것'), '남긴 지식이 버린 것에 가려졌다');
+});
+
+// 항목의 정체는 문서고 구간은 최신 검색을 따른다(mergeFront). 먼저 온 구간을 무조건 지키던 동안에는 뒤 검색이
+// 같은 문서의 다른 절을 찾아도 버려졌고, 그 검색은 '새 자료 없음'으로 헛돈 스텝에 들어가 두 번이면 강제 답변이었다.
+test('뒤 검색이 같은 문서의 다른 구간을 찾으면 그 구간이 같은 번호로 실리고 진도로 센다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', text: '설치', targets: ['knowledge'] },
+      { action: 'search', text: '재시작 절차', targets: ['knowledge'] },
+      { action: 'search', text: '점검', targets: ['knowledge'] },   // 같은 구간이 다시 온다 — 첫 헛돎이어야 한다
+      { action: 'answer', answer: '답' },
+    ]);
+    let n = 0;
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      search: async () => found({ knowledge: n++ === 0
+        ? [CHUNK_ITEM(103, 7, 3, 3, '설치 절')]
+        : [CHUNK_ITEM(115, 7, 15, 17, '재시작 절')] }) } });
+    const k = llm.seen[2].knowledge;
+    assert.equal(k.length, 1, '같은 문서가 두 항목으로 들어왔다');
+    assert.equal(k[0].seq, 103, '모델이 지목하는 번호는 요청 내내 고정이다');
+    assert.equal(k[0].content, '재시작 절', '뒤 검색이 찾은 구간이 실려야 한다');
+    assert.match(firstItemLine(llm.seen[2]), /\(15~17\/22\)\]/, '프롬프트의 위치 표기가 새 구간을 가리켜야 한다');
+    assert.equal(r.answer, '답', '구간이 달라진 검색을 헛돈 스텝으로 세어 강제 답변으로 넘어갔다');
+    assert.equal(r.search.searches, 3);
+  } finally { restore(); }
+});
+
+// 번호가 붙지 않은 항목의 청구는 프롬프트의 판정(llm-openai.js itemLine)과 같은 기준으로 거절해야 한다. 받아 주면 한
+// 글자도 늘지 않는 청구가 '성공'으로 세어져 MAX_EXPANDS 하나를 먹고, 모델은 아무 안내 없이 같은 프롬프트를 다시 받는다.
+test('번호가 붙지 않은 짧은 처리방법의 청구는 성공으로 세지 않고 안내를 남긴다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', text: 'x', targets: ['qa_method'] },
+      { action: 'expand', ids: ['m1'] },
+      { action: 'answer', answer: '답' },
+    ]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      search: async () => found({ qaMethods: [{ seq: 1, title: '짧은 방법', method: '한 줄' }, { seq: 2, title: '긴 방법', method: 'x'.repeat(2000) }] }) } });
+    assert.equal(r.answer, '답');
+    assert.equal(r.search.expanded, undefined, '늘지 않는 청구가 펼침으로 세어졌다');
+    assert.ok(!llm.seen.at(-1).qaMethods.find(m => m.seq === 1).expanded, '짧은 항목에 펼침 표시가 붙었다');
+    assert.match(r.trace.find(h => h.expand !== undefined)?.note ?? '', /번호가 붙은 항목만/, '헛돈 청구에 안내가 없다');
+    // 번호가 붙은(잘린) 항목은 종전대로 펼쳐진다 — 판정이 프롬프트와 같은 기준이어야 한다.
+    const llm2 = scripted([{ action: 'search', text: 'x', targets: ['qa_method'] }, { action: 'expand', ids: ['m2'] }, { action: 'answer', answer: '답' }]);
+    const r2 = await handleQuestion('q', [], { deps: { decide: llm2.decide,
+      search: async () => found({ qaMethods: [{ seq: 1, title: '짧은 방법', method: '한 줄' }, { seq: 2, title: '긴 방법', method: 'x'.repeat(2000) }] }) } });
+    assert.equal(r2.search.expanded, 1);
+  } finally { restore(); }
+});
+
+// 병합 실패 시 검색은 청크 원문을 그대로 돌려준다(search.js) — 그 행에는 구간(from·to)이 없다. 그것으로 있던 항목의
+// 본문을 갈아 끼우면 위치 표기는 옛 구간을, 본문은 다른 조각을 가리켜 서로 어긋난다.
+test('mergeFront는 범위를 모르는 청크 행으로 항목의 구간을 바꾸지 않는다', () => {
+  const item = CHUNK_ITEM(103, 7, 3, 5, '3~5절 본문');
+  const list = [item, K(9)];
+  const raw = { seq: 109, doc_seq: 7, chunk_no: 9, chunk_of: 22, title: '문서7', content: '9번 조각 원문', _dist: 0.3 };
+  assert.equal(mergeFront(list, [raw]), 0);
+  assert.equal(item.content, '3~5절 본문');
+  assert.equal(item.range, ' (3~5/22)');
+  assert.deepStrictEqual(list.map(o => o.seq), [103, 9], '다시 찾은 문서는 앞으로 온다');
+  // 반대 방향은 채운다 — 구간을 모르던 항목(원문 폴백)에 구간이 있는 항목이 오면 그 구간을 받는다.
+  const bare = { seq: 109, doc_seq: 7, chunk_no: 9, chunk_of: 22, title: '문서7', content: '9번 조각 원문' };
+  const list2 = [bare];
+  assert.equal(mergeFront(list2, [CHUNK_ITEM(115, 7, 15, 17, 'B절')]), 1);
+  assert.equal(bare.seq, 109);
+  assert.equal(bare.range, ' (15~17/22)');
+});
+
+// 잘린 배치의 안내는 어느 상한에 걸렸는지를 말해야 한다 — 조회를 두 번밖에 안 한 요청이 이력 줄 수에 막혔는데
+// '조회 스텝 상한 5회'라고 적으면 모델은 사실과 다른 이유를 받는다.
+test('이력 줄 수에 막혀 잘린 배치의 안내는 조회 스텝 상한이 아니라 줄 수 상한을 말한다', async () => {
+  const restore = silence();
+  try {
+    const decisions = [];
+    for (const t of ['a', 'b', 'c']) {
+      decisions.push({ action: 'search', text: t, targets: ['query'] });
+      decisions.push({ action: 'search', text: t, targets: ['query'] });   // 같은 검색 — 안내 줄 하나
+    }
+    decisions.push({ action: 'run_query', query_name: 'q1', params: { a: 1 } });
+    decisions.push({ action: 'run_query', query_name: 'q1', params: { a: 2 } });
+    decisions.push({ action: 'run_queries', queries: [{ query_name: 'q1', params: { a: 3 } }, { query_name: 'q1', params: { a: 4 } }] });
+    const llm = scripted(decisions);
+    let n = 0;
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      run: async () => ({ rows: [{ V: 1 }], totalRows: 1, capped: false, targetDb: 'D' }),
+      search: async () => found({ queries: [Q(++n, `q${n}`)], routed: false }) } });
+    assert.equal(r.trace.length, MAX_HISTORY_ROWS);
+    assert.ok(r.trace.filter(h => h.rows).length < MAX_STEPS, '이 시나리오는 조회 수 상한에 닿지 않아야 뜻이 있다');
+    const note = r.trace.at(-1)?.note ?? '';
+    assert.match(note, /줄 수 상한/, `줄 수에 막힌 배치가 다른 이유를 말했다: ${note}`);
+    assert.ok(!/조회 스텝 상한/.test(note));
   } finally { restore(); }
 });

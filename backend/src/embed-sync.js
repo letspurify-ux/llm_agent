@@ -13,7 +13,7 @@ import { query, getConnection, releaseConnection, closePool } from './db.js';
 import { embed, EMBEDDING_MODEL, isEmbeddingEnabled, warnEmbeddingFailure } from './embedding.js';
 import { SEARCH_COLUMNS, vecTable } from './search.js';
 import { MAX_EMBED_TEXT_LEN, clipText } from './constants.js';
-import { splitContent, CHUNK_TARGET_LEN, CHUNK_MAX_LEN, CHUNK_OVERLAP } from './chunk.js';
+import { splitContent, CHUNK_TARGET_LEN, CHUNK_MAX_LEN, CHUNK_OVERLAP, CHUNK_SPLIT_VERSION } from './chunk.js';
 
 // 문서 단위 staleness의 기준. 임베딩 모델명이 아니라 '분할 규칙'을 넣는다 —
 //   ① 모델을 바꾸면 벡터는 전부 다시 만들어야 하지만 청크는 그대로다. 모델명을 넣으면 그 순간
@@ -22,7 +22,8 @@ import { splitContent, CHUNK_TARGET_LEN, CHUNK_MAX_LEN, CHUNK_OVERLAP } from './
 //   ② 반대로 분할 규칙(크기·겹침)을 고치면 재분할이 필요한데, 모델명 기준으로는 아무 일도
 //      일어나지 않는다 — 규칙만 바뀌고 청크는 옛 규칙대로 남는 것이 가장 나쁜 결과다.
 // 규칙을 여기 박아 두면 상수 한 줄을 고치는 것만으로 다음 동기화가 알아서 다시 나눈다.
-const CHUNK_RULE = `chunk:${CHUNK_TARGET_LEN}:${CHUNK_MAX_LEN}:${CHUNK_OVERLAP}`;
+// 분할 방식의 판(CHUNK_SPLIT_VERSION)도 넣는다 — 크기·겹침이 같아도 절단 위치 규칙이 바뀌면 다른 청크다 (chunk.js).
+const CHUNK_RULE = `chunk:${CHUNK_TARGET_LEN}:${CHUNK_MAX_LEN}:${CHUNK_OVERLAP}:v${CHUNK_SPLIT_VERSION}`;
 
 // 임베딩 원문 — 검색 대상 컬럼(search.js)을 이어붙여 "이 행이 무엇인지"를 표현한다.
 // 검색과 같은 정의를 써야 LIKE와 벡터가 서로 다른 내용을 보지 않는다.
