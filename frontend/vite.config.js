@@ -34,6 +34,9 @@ export default defineConfig({
   // 코드·CSS도 옛 Safari를 염두에 두고 쓰여 있다(App.jsx의 fetch 주석, index.html의 overflow-wrap·
   // overflow: clip 주석). 그래서 vite 5까지의 기본값을 그대로 명시해 폭을 유지한다.
   // 넓히거나 좁히려면 여기만 고치면 되고, 그 결정이 눈에 보인다.
+  // 이 타깃은 문법만 낮춘다 — 그 안의 브라우저에 없는 런타임 API(Object.hasOwn 등)는 src/polyfills.js가 채운다.
+  // 정규식 lookbehind는 채울 수 없다: remark-gfm의 이메일 자동 링크가 그것을 쓰므로 Safari 16.3 이하에서는
+  // 답변 markdown이 그려지지 않는다(원문 폴백) — 그 폭까지 지키려면 gfm 확장을 autolink 없이 다시 조립해야 한다.
   build: { target: ['es2020', 'edge88', 'firefox78', 'chrome87', 'safari14'] },
   // `npm run build` 결과를 확인하는 preview 서버도 같은 규칙으로 연다 — 한쪽만 열어두면
   // dev에서 되던 외부 접속이 preview에서만 안 되는 이유를 찾느라 시간을 버린다.

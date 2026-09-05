@@ -1,3 +1,6 @@
+// 무엇보다 먼저 — 아래 import들이 의존하는 런타임 API를 빌드 타깃 안의 옛 브라우저에 채운다 (polyfills.js 주석 참고).
+// ES 모듈은 적힌 순서대로 평가되므로 이 줄이 맨 위에 있어야 한다.
+import './polyfills.js';
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App.jsx';

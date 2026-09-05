@@ -893,6 +893,41 @@ it('서버가 어떤 응답을 주어도 앱이 내려가지 않는다', async (
     { what: '이상한 응답들 뒤의 평범한 질문이 답을 받기' });
 });
 
+it('Object.hasOwn이 없는 브라우저(빌드 타깃 안의 Chrome 87~92·Safari 14~15.3)에서도 답변·차트·실행 과정이 그려진다', async () => {
+  // vite는 문법만 빌드 타깃으로 낮추고 런타임 API는 채우지 않는다(vite.config.js). 그런데 react-markdown과 recharts가
+  // 렌더 경로에서 Object.hasOwn(Chrome 93·Safari 15.4부터)을 부르므로, 그 API가 없는 브라우저에서는 <ReactMarkdown>이
+  // 던지고 말풍선 경계가 답변마다 '이 답변을 그리지 못했습니다' 원문 폴백을 세웠다 — 표도 차트도 실행 과정 패널도
+  // 없이(실측: 그 API를 지운 Chrome에서 그렇게 됐다). 오류는 콘솔에만 남아, 지원한다고 적어 둔 브라우저에서 화면이
+  // 통째로 퇴화한다. src/polyfills.js가 진입점보다 먼저 채운다 — 그것이 늦거나 빠지면 여기서 걸린다.
+  // 그 API를 지운 채 문서를 열어 같은 브라우저를 흉내 낸다. 새 문서마다 걸리는 스크립트라 끝나면 반드시 걷는다 —
+  // 남겨 두면 뒤의 시험들이 전부 그 브라우저를 상대로 돈다.
+  const { identifier } = await page.send('Page.addScriptToEvaluateOnNewDocument', {
+    source: 'delete Object.hasOwn; window.__hasOwnGone = typeof Object.hasOwn === "undefined";',
+  });
+  try {
+    await page.touchMode(false);
+    await page.viewport(1000, 760);
+    await page.goto(url(), '.chip');
+    assert.strictEqual(await page.eval('window.__hasOwnGone'), true, '검사의 전제: 문서가 서기 전에 Object.hasOwn을 지웠다');
+    await page.eval(`document.querySelectorAll('.chip')[0].click()`);
+    // 차트·흐름도가 서기를 기다리기 전에 답이 원문 폴백으로 떨어졌는지 먼저 본다 — 폴백이면 그 둘은 영영 서지 않아
+    // 시간 초과로 죽고, 그 말은 무엇이 잘못됐는지 말해 주지 않는다.
+    await page.until(`document.querySelectorAll('.row.assistant').length === 1 && !document.querySelector('.typing')`, { what: '답이 도착하기' });
+    assert.strictEqual(await page.eval(`document.querySelector('.row.assistant .bubble').textContent.includes('그리지 못했습니다')`), false,
+      'Object.hasOwn이 없는 브라우저에서 답변이 원문 폴백으로 떨어졌다');
+    await page.until(READY.rich, { what: '답변이 다 서기' });
+    await settled();
+    const got = await page.eval(`(() => { const b = document.querySelector('.row.assistant .bubble'); return {
+      hasOwn: typeof Object.hasOwn, 제목: b.querySelectorAll('h2').length, 표: b.querySelectorAll('table').length,
+      차트: b.querySelectorAll('figure.chart .recharts-surface').length, 흐름도: b.querySelectorAll('.mermaid svg').length,
+      패널: !!b.querySelector('details.trace') }; })()`);
+    assert.strictEqual(got.hasOwn, 'function', '폴리필이 Object.hasOwn을 채우지 않았다');
+    assert.ok(got.제목 > 0 && got.표 > 0 && got.차트 > 0 && got.흐름도 > 0 && got.패널, `답변의 일부가 그려지지 않았다: ${JSON.stringify(got)}`);
+  } finally {
+    await page.send('Page.removeScriptToEvaluateOnNewDocument', { identifier });
+  }
+});
+
 it('띄운 브라우저는 끝나면 정말 사라지고, 끊긴 연결은 기다리던 요청을 놓아준다', async () => {
   // 검사를 한 번 돌릴 때마다 브라우저가 한 벌씩 남으면 개발자의 컴퓨터가 몇 번 만에 잠긴다.
   // kill()은 신호를 보낼 뿐이라, 앱을 띄운 headless Chrome은 그것 하나로는 내려가지 않는다.
