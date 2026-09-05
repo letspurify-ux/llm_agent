@@ -5,10 +5,10 @@
 // 어느 쪽도 오류를 남기지 않아 로그로는 알 수 없다. 테스트가 유일한 방어선이다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { loopGuard, paramKey, normalizeChat, fallbackAnswer, normalizeQuestion, clippedCopyDetector, answerOf, handleQuestion, searchKey, mergeFront } from '../src/agent.js';
+import { loopGuard, paramKey, normalizeChat, fallbackAnswer, normalizeQuestion, clippedCopyDetector, answerOf, handleQuestion, searchKey, mergeFront, MAX_GUARD_HITS } from '../src/agent.js';
 import { MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_ANSWER_LEN, MAX_RESULT_ROWS, MAX_RESULT_COLS, MAX_CELL_LEN, TRUNC_MARK, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_BATCH_QUERIES, MAX_EXPANDS, MAX_DOC_LEN, SEARCH_TARGETS } from '../src/constants.js';
 import { buildPrompt } from '../src/llm-openai.js';
-import { buildItems, planRanges, canGrow } from '../src/chunk.js';
+import { buildItems, planRanges, canGrow, CHUNK_OVERLAP } from '../src/chunk.js';
 
 const ran = (name, params, rows = [{ A: 1 }]) => ({ query_name: name, params, rows, totalRows: rows.length });
 const failed = (name, params) => ({ query_name: name, params, error: 'ORA-00942' });
@@ -498,6 +498,57 @@ test('검색이 성립하지 않은 대상은 0건이 아니라 failed로 남는
     assert.deepStrictEqual(llm.seen[1].searched, ['qa_method']);
     assert.equal(llm.seen[1].tried, true);
   } finally { restore(); }
+});
+
+// '검색 불가'도 찾아본 대상에만 적는다. 경로A만 돈 검색에서 관리 DB가 쿼리 목록을 못 읽으면 종전에는 이력 줄이
+// `[처리방법] → 처리방법 1건 · 쿼리 검색 불가`로 나갔다 — 찾지도 않은 대상이 '검색이 성립하지 않았다'로 적히고,
+// 모델은 시스템 프롬프트대로 query 검색을 시도조차 않고 '확인할 수 없다'고 답했으며, chat_log에는 searchFailed가
+// 서서 임베딩 장애로 집계됐다(실측). 그 실패의 자리는 queriesFailed다.
+test('경로A만 돈 검색은 쿼리 목록 로드가 실패해도 쿼리를 검색 불가로 적지 않는다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([{ action: 'search', text: 'x', targets: ['qa_method'] }, { action: 'answer', answer: '답' }]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide, search: async () => found({
+      qaMethods: [{ seq: 1, title: 'm', method: 'q1 실행' }], queries: null, queriesFailed: true,
+    }) } });
+    assert.deepStrictEqual(r.trace[0], { search: 'x', targets: ['qa_method'], hits: { knowledge: null, qaMethods: 1, queries: null } },
+      '찾지 않은 대상은 failed에도 오르지 않는다');
+    assert.doesNotMatch(buildPrompt(llm.seen[1]), /쿼리 검색 불가/);
+    assert.equal(r.search.queriesFailed, true, '목록 로드 실패는 queriesFailed가 남긴다');
+    assert.equal(r.search.searchFailed, undefined, '검색은 성립했다 — 임베딩 장애로 집계되면 안 된다');
+    // query를 실제로 찾은 검색이면 그 목록을 못 만든 것이 곧 '검색 불가'다 — 이쪽은 그대로다
+    const llm2 = scripted([{ action: 'search', text: 'x', targets: ['qa_method', 'query'] }, { action: 'answer', answer: '답' }]);
+    const r2 = await handleQuestion('q', [], { deps: { decide: llm2.decide, search: async () => found({
+      qaMethods: [], queries: null, queriesFailed: true,
+    }) } });
+    assert.deepStrictEqual(r2.trace[0].failed, ['query']);
+    assert.equal(r2.search.searchFailed, true);
+  } finally { restore(); }
+});
+
+// 등록 SQL 자체가 실행 불가인 쿼리(FOR UPDATE)를 모델이 파라미터만 바꿔 되풀이하면 — 같은 파라미터가 아니라
+// loopGuard에 걸리지 않는다 — 실행 경계의 표시(oracle.js wastedStep)가 있어야 연속 가드가 끊는다. 표시가 없던
+// 동안 MAX_STEPS를 전부 태웠다(실측). 실행기를 그대로 써서(mock) 표시가 경계에서 루프까지 이어지는지 잰다.
+test('실행 불가 등록을 되풀이하면 MAX_STEPS가 아니라 연속 가드에서 끊긴다', async () => {
+  const restore = silence();
+  const savedMock = process.env.ORACLE_MOCK;
+  process.env.ORACLE_MOCK = '1';
+  try {
+    const { runQuery } = await import('../src/oracle.js');
+    const locky = { seq: 1, query_name: 'locky', query_desc: 'd', query_sql: 'SELECT 1 FROM T WHERE ID = :id FOR UPDATE', target_db_name: 'D' };
+    let n = 0;
+    const decide = async ctx => {
+      if (ctx.forceAnswer) return { action: 'answer', answer: '강제 답변' };
+      n++;
+      return n === 1 ? { action: 'search', text: 'x', targets: ['query'] }
+        : { action: 'run_query', query_name: 'locky', params: { id: n } };   // 매번 다른 파라미터
+    };
+    const r = await handleQuestion('q', [], { deps: { decide, run: runQuery, search: async () => found({ queries: [locky], routed: false }) } });
+    const qrows = r.trace.filter(h => h.query_name);
+    assert.equal(qrows.length, MAX_GUARD_HITS, `헛돈 조회는 연속 ${MAX_GUARD_HITS}번에서 끊겨야 한다: ${qrows.length}`);
+    assert.ok(qrows.every(h => h.error && h.hint), '실행 불가 등록은 오류와 다음 행동을 함께 남긴다');
+    assert.equal(r.answer, '강제 답변');
+  } finally { restore(); if (savedMock === undefined) delete process.env.ORACLE_MOCK; else process.env.ORACLE_MOCK = savedMock; }
 });
 
 test('처리방법이 지목한 쿼리는 query를 찾지 않았어도 목록에 실리되 query를 찾아본 것으로 세지 않는다', async () => {
@@ -1040,8 +1091,15 @@ test('이력 줄 수 상한은 본문 청구가 섞여도 지켜진다', async (
 // growItem은 관리 DB에서 청크를 읽는다 — deps.loadChunks가 그 자리다. 이 판정은 양쪽으로 조용히 깨진다:
 // 늘지 않을 항목에 번호가 남으면 모델이 그 번호로 청구하느라 스텝을 버리고(두 번이면 강제 답변), 늘 수 있는
 // 항목에서 번호를 떼면 긴 문서의 뒷부분이 영영 실리지 않는다. 어느 쪽도 오류를 남기지 않는다.
-const CH = (doc, no, len = 900, of = 22) =>
-  ({ seq: doc * 1000 + no, doc_seq: doc, chunk_no: no, chunk_of: of, title: `문서${doc}`, content: '가'.repeat(len) });
+// 본문은 이웃과 CHUNK_OVERLAP만큼 겹치게 만든다 — 저장된 청크가 그 모양이고(chunk.js splitContent),
+// 병합이 그 겹침을 떼기 때문이다(cutSeam). 통째로 같은 본문을 쓰면 '몇 조각이 문서당 상한에
+// 들어가는가'가 실제와 달라져, 여기서 재는 full 판정이 운영에서 나오지 않는 수를 검증하게 된다.
+const CH = (doc, no, len = 900, of = 22) => {
+  const at = doc * 1_000_003 + (no - 1) * (len - CHUNK_OVERLAP);
+  let content = '';
+  for (let i = 0; i < len; i++) content += String.fromCharCode(0xac00 + ((at + i) % 11172));
+  return { seq: doc * 1000 + no, doc_seq: doc, chunk_no: no, chunk_of: of, title: `문서${doc}`, content };
+};
 const loaderOf = rows => async ranges =>
   rows.filter(r => ranges.some(g => g.doc_seq === r.doc_seq && r.chunk_no >= g.from && r.chunk_no <= g.to));
 const firstItemLine = ctx => buildPrompt(ctx).split('\n').find(l => l.startsWith('- '));
@@ -1076,8 +1134,8 @@ test('검색 시점에 이웃을 못 읽은 항목이 청구로도 늘지 않으
   const restore = silence();
   try {
     const rows = Array.from({ length: 8 }, (_, i) => CH(1, i + 1, 1000, 8));
-    // 계획된 범위(1~4)만 읽힌 항목 — 이웃 5번을 모르니 번호가 붙는다. 청구해 읽어 보면 5번(1,000자)은 안 들어간다.
-    const [item] = buildItems([{ doc_seq: 1, rep: 2, from: 1, to: 4, chunk_of: 8, dist: 0.3 }], rows.slice(0, 4));
+    // 계획된 범위(1~5)만 읽힌 항목 — 이웃 6번을 모르니 번호가 붙는다. 청구해 읽어 보면 6번(1,000자)은 안 들어간다.
+    const [item] = buildItems([{ doc_seq: 1, rep: 2, from: 1, to: 5, chunk_of: 8, dist: 0.3 }], rows.slice(0, 5));
     assert.ok(canGrow(item) && !item.full, '이 시나리오는 검색 시점에 번호가 붙어야 뜻이 있다');
     const llm = scripted([
       { action: 'search', text: 'x', targets: ['knowledge'] },

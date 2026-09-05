@@ -11,7 +11,7 @@ import { MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK } from '../src/constants.js';
 
 process.env.ORACLE_MOCK = '1';
 
-const reg = (name, sql = 'SELECT 1 FROM DUAL') => ({ query_name: name, query_sql: sql, target_db_name: 'D' });
+const reg = (name, sql = 'SELECT 1 FROM DUAL', db = 'D') => ({ query_name: name, query_sql: sql, target_db_name: db });
 const withBind = sql => reg('batch_job_status', 'SELECT 1 FROM T WHERE A = :job_id');
 
 test('프로토타입 멤버와 겹치는 쿼리 이름도 safe 안내로 실패한다', async () => {
@@ -36,6 +36,25 @@ test('값 없는 바인드는 실행 전에 safe 오류로 거부된다', async 
     runQuery(withBind(), {}),
     e => !/선택하라|되물어/.test(e.message) && /확인하고/.test(e.hint)
   );
+});
+
+// 등록 SQL 자체가 실행 불가(FOR UPDATE·다중 문장·위치 바인드)면 어떤 파라미터로도 시작되지 않는다 — 대상 DB
+// 미등록과 같은 부류인데 표시(wastedStep)와 다음 행동(hint)이 빠져 있어, 모델이 파라미터만 바꿔 되풀이하자
+// MAX_STEPS를 전부 태웠다(실측: LLM 8회, 조회 줄 5개 — 미등록 DB는 2스텝). 바인드 값 문제는 표시하지 않는다: 고치면 실행된다.
+test('실행 불가 등록은 헛돈 스텝으로 표시되고 다음 행동을 함께 준다 — 바인드 값 문제는 아니다', async () => {
+  for (const sql of ['SELECT 1 FROM T FOR UPDATE', 'SELECT 1 FROM T; DELETE FROM T', 'SELECT 1 FROM T WHERE A = :1']) {
+    await assert.rejects(
+      runQuery(reg('x', sql), { id: 1 }),
+      e => e.safe === true && e.wastedStep === true && /다른 쿼리를 선택하거나/.test(e.hint),
+      `등록 실수는 wastedStep과 hint를 달아야 한다: ${sql}`
+    );
+  }
+  await assert.rejects(
+    runQuery(reg('nodb', 'SELECT 1 FROM T', ''), {}),
+    e => e.wastedStep === true && /다른 쿼리를 선택하거나/.test(e.hint)
+  );
+  // 값이 없는 것은 모델이 고칠 수 있다 — 헛돈 스텝으로 세면 값을 고칠 기회가 한 번 줄어든다
+  await assert.rejects(runQuery(withBind(), {}), e => e.safe === true && e.wastedStep === undefined);
 });
 
 test('바인드명 대소문자는 Oracle과 같이 무시한다', async () => {

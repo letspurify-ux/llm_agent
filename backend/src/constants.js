@@ -121,7 +121,8 @@ export const MAX_PROMPT_TOTAL_LEN = 64_000;
 // 합계는 반드시 MAX_PROMPT_TOTAL_LEN 이하여야 한다 (아래에서 검증한다 — 이 검증이 없어서
 // 섹션 상한과 전체 상한이 조용히 어긋났다).
 export const PROMPT_FLOORS = {
-  knowledge: 10_000, // 항목 상한(MAX_PROMPT_ITEM_LEN) 기준 10건 — 검색 후보(search.js LIMIT 20)의 절반
+  knowledge: 10_000, // 항목 하나가 '문서의 한 구간'이라 크기를 정하는 것은 MAX_PROMPT_ITEM_LEN이 아니라 MAX_DOC_LEN이다
+                     // — 실리는 건수는 등록된 글의 길이가 정한다 (1,000자면 9건, 4,500자면 2건. 실측, context.md 2-2)
   qaMethods: 10_000, // 같음
   history: 23_800,   // MAX_HISTORY_ROWS 줄이 '어떤 조합으로 오든' 각자 상한까지 차도 전부 실리는 크기 —
                      // llm-openai.js가 로드 시 검증한다. 조합을 세지 않는 이유는 그쪽 주석에 있다:

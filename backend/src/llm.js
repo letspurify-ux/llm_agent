@@ -408,7 +408,13 @@ export function renderAnswer({ knowledge, history }) {
   const content = k => String(k.content ?? '');
   const attach = knowledge.find(k => !cellValues || cellValues.some(s => content(k).includes(s)));
   if (attach) {
-    parts.push(`### 관련 지식: ${attach.title ?? ''}\n\n${content(attach)}`);
+    // 위치 표기((9~14/46))를 제목에 함께 붙인다. 지식 항목은 문서 하나가 아니라 '문서의 한 구간'이고
+    // (chunk.js buildItems) 그 구간은 낱말 한가운데에서 시작할 수 있다 — 실제로 46조각짜리 문서의
+    // 9~14번 구간이 's, continuous batching…'으로 시작했다(실측). 표기 없이 내보내면 사용자는 그것을
+    // 등록된 지식의 전부로 읽고, 못 본 뒷부분을 '없는 내용'으로 단정한다 — 프롬프트가 이 표기를 다는
+    // 이유(context.md 2-5)가 사용자에게도 그대로 성립하는 자리다. 이 답변은 LLM이 죽었을 때 사용자가
+    // 읽는 유일한 본문이라 특히 그렇다. 청크가 아닌 항목에는 range가 없어 지금까지와 같은 제목만 나간다.
+    parts.push(`### 관련 지식: ${attach.title ?? ''}${attach.range ?? ''}\n\n${content(attach)}`);
   }
   return parts.length ? parts.join('\n\n') : null;
 }

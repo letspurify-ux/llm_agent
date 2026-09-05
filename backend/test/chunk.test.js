@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import {
-  splitContent, planRanges, buildItems, canGrow,
+  splitContent, planRanges, buildItems, canGrow, cutSeam,
   CHUNK_TARGET_LEN, CHUNK_MAX_LEN, CHUNK_OVERLAP, CHUNK_GAP_FILL,
 } from '../src/chunk.js';
 import { MAX_PROMPT_ITEM_LEN, MAX_DOC_LEN } from '../src/constants.js';
@@ -92,8 +92,20 @@ test('문서 순서와 대표 청크는 최소 거리에서 나온다 — 관련
 
 // ===== 항목 조립 =====
 
+// 저장된 청크는 이웃과 CHUNK_OVERLAP만큼 겹친다 (splitContent가 다음 청크의 시작을 그만큼 당긴다).
+// 픽스처도 그 모양이어야 한다 — 통째로 같은 본문('가'의 반복)이나 겹치지 않는 본문을 쓰면 병합이
+// 겹침을 떼고 남기는 양이 실제와 달라져, 이 파일이 재는 '몇 조각이 문서당 상한에 들어가는가'가
+// 운영에서 나오지 않는 수가 된다. 한글 음절을 위치로 찍어 만든다: 겹침 구간만 정확히 일치하고
+// 나머지는 서로 다르므로, 이음매를 떼는 판정(chunk.js cutSeam)이 우연이 아니라 진짜 겹침에 걸린다.
+const chunkAt = i => String.fromCharCode(0xac00 + (i % 11172));
+const chunkText = (doc, no, len) => {
+  const at = doc * 1_000_003 + (no - 1) * (len - CHUNK_OVERLAP);
+  let s = '';
+  for (let i = 0; i < len; i++) s += chunkAt(at + i);
+  return s;
+};
 const row = (doc, no, len = 900, of = 22) =>
-  ({ seq: doc * 1000 + no, doc_seq: doc, chunk_no: no, chunk_of: of, title: `문서${doc}`, content: para(len) });
+  ({ seq: doc * 1000 + no, doc_seq: doc, chunk_no: no, chunk_of: of, title: `문서${doc}`, content: chunkText(doc, no, len) });
 
 // 범위는 title에 이어 붙이지 않고 따로 둔다. 붙여서 넘기면 프롬프트가 제목을 MAX_PROMPT_NAME_LEN으로
 // 자를 때 뒤에 있는 범위부터 사라져, 정작 조각으로 나뉜 긴 문서에서 위치를 알 수 없게 된다(실측).
@@ -228,12 +240,73 @@ test('읽어 오지 않은 이웃은 모른다 — full은 서지 않고 번호�
 });
 
 test('검색 시점에 이웃을 읽었으면 그 자리에서 full이 확정된다', () => {
-  // 계획된 범위(1~4, 1,000자씩)는 꽉 찼고 이웃 5번(1,000자)은 안 들어간다 — 번호 없이 실려야 한다.
-  const rows = Array.from({ length: 5 }, (_, i) => row(1, i + 1, 1000, 8));
-  const [item] = buildItems([{ doc_seq: 1, rep: 2, from: 1, to: 4, chunk_of: 8, dist: 0.3 }], rows);
-  assert.deepStrictEqual([item.from, item.to], [1, 4]);
+  // 계획된 범위(1~5, 1,000자씩 — 겹침을 뗀 뒤 4,412자)는 꽉 찼고 이웃 6번은 안 들어간다(5,265자).
+  // 번호 없이 실려야 한다.
+  const rows = Array.from({ length: 6 }, (_, i) => row(1, i + 1, 1000, 8));
+  const [item] = buildItems([{ doc_seq: 1, rep: 2, from: 1, to: 5, chunk_of: 8, dist: 0.3 }], rows);
+  assert.deepStrictEqual([item.from, item.to], [1, 5]);
   assert.equal(item.full, true);
   assert.ok(!canGrow(item));
+});
+
+// ===== 이음매의 겹침 =====
+// 저장된 청크는 이웃과 CHUNK_OVERLAP만큼 겹친다 — 그것은 '각 청크가 홀로 검색되게' 하려는 임베딩의 사정이지,
+// 다시 이어 붙일 때까지 두 번 실으라는 뜻이 아니다. 떼지 않고 이으면 이음매마다 150자가 되풀이된다:
+// 운영 데이터의 5청크 구간에서 3,787자 중 594자(15.7%)가 같은 문장이었고, 모델은 문장을 읽고 나서 그 문장의
+// 꼬리를 낱말 한가운데부터 다시 읽었다(실측). 손해는 셋이다 — 문서당 상한의 6분의 1이 중복에 쓰이고,
+// 그만큼 상한에 일찍 닿아 full이 서므로 본문을 덜 싣고 청구 경로까지 먼저 닫히며(그 구간은 full=true였다),
+// 폴백 답변(llm.js renderAnswer)에서는 그 되풀이가 사용자에게 그대로 나간다. 오류는 한 줄도 남지 않는다.
+//
+// 대조는 '공백을 빼고'가 아니라 글자 그대로다. 공백을 빼고 재던 동안 이음매의 공백이 조용히 바뀌고 있었다:
+// 겹침을 뗀 앞머리에서 앞 공백까지 떼고 개행 하나로 대신했기 때문에, 운영 데이터 135개 이음매에서 문단 경계
+// 30자리가 빈 줄을 잃고(제목이 앞 문단에 붙는다), 줄 안의 공백 87자리가 개행이 되어 문장이 두 줄로 갈라졌으며,
+// 강제 절단으로 원래 공백이 없던 18자리에서는 개행이 낱말 한가운데로 들어갔다 —
+// 'Time Person of the Year (2021)'이 'Time Person of the Yea / r (2021)'로 실렸다(실측).
+// 겹침을 떼어 막으려던 '낱말 한가운데'가 절단면에서 되살아난 셈이라, 이 대조는 공백까지 봐야 뜻이 있다.
+test('이어 붙인 구간은 원문 그대로다 — 공백 한 칸까지', () => {
+  // 실제 분할기가 만든 청크로 잰다. 픽스처로 겹침을 흉내내면 '무엇이 진짜 겹침인가'를 테스트가 정해버린다.
+  // 경계를 못 찾아 강제로 자르는 자리(낱말 한가운데)가 반드시 섞이도록 빈 줄 없는 긴 줄도 함께 넣는다.
+  const src = Array.from({ length: 60 }, (_, i) =>
+    `## 절 ${i}\n${i}번 절의 본문이다. 여기에는 ${'가나다라마바사'.repeat(6)} 같은 내용이 들어 있다.\n`
+    + `${'세부항목'.repeat(40)}${i}`).join('\n\n');
+  const parts = splitContent(src);
+  assert.ok(parts.length >= 5, `이 시나리오는 여러 청크로 나뉘어야 뜻이 있다: ${parts.length}`);
+  const rows = parts.map((content, i) => ({
+    seq: i + 1, doc_seq: 1, chunk_no: i + 1, chunk_of: parts.length, title: '문서1', content,
+  }));
+  const [item] = buildItems(
+    [{ doc_seq: 1, rep: 1, from: 1, to: parts.length, chunk_of: parts.length, dist: 0.3 }],
+    rows, { maxDocLen: Number.MAX_SAFE_INTEGER, grow: true }
+  );
+  assert.equal(item.content, src.trim(),
+    '병합 결과가 원문과 다르다 — 겹침이 두 번 실렸거나(길다), 본문이 지워졌거나(짧다), 이음매의 공백이 바뀌었다');
+});
+
+// 떼는 쪽으로 헐거워지면 본문이 소리 없이 사라진다 — 앞 청크의 끝 한두 글자가 뒤 청크의 첫 글자와 같은 일은
+// 흔하다(마침표·공백·조사). 그래서 '겹침이라고 부를 만큼 긴 일치'에만 걸리고, 겹침 상한 너머는 보지 않는다.
+test('cutSeam은 겹침만 떼고 우연한 짧은 일치는 그대로 둔다', () => {
+  const tail = '재시작 절차는 다음과 같다. 먼저 배치 상태를 확인하고 로그를 본다.';   // 겹침 문턱보다 길다
+  assert.ok(tail.length > 32, '이 시나리오는 일치가 문턱보다 길어야 뜻이 있다');
+  // 남는 앞머리는 원문 그대로다 — 앞 공백도 원문의 공백이므로 떼지 않는다(호출부가 구분자를 넣지 않는다).
+  assert.equal(cutSeam(`앞의 본문이 있고 ${tail}`, `${tail} 그다음 절차로 넘어간다.`), ' 그다음 절차로 넘어간다.',
+    '이웃과 겹치는 앞머리를 떼지 않았거나, 원문의 공백까지 함께 뗐다');
+  assert.equal(cutSeam('본문이 끝난다.', '본문이 이어진다.'), '본문이 이어진다.',
+    '몇 글자 우연한 일치로 본문을 지웠다 — 겹침은 그보다 훨씬 길다');
+  // 겹침 상한을 넘는 만큼 같아도 상한까지만 뗀다 — 그 너머는 겹침이 아니라 본문이 닮은 것이다.
+  const long = '가'.repeat(CHUNK_OVERLAP + 40);
+  assert.equal(cutSeam(long, long).length, long.length - CHUNK_OVERLAP);
+});
+
+// 겹침을 떼지 못한 이음매(옛 규칙으로 나뉜 청크, 겹침을 MIN_SEAM보다 짧게 설정한 설치, 재분할 도중)에만
+// 개행을 넣는다. 이 자리에서 구분자를 빼면 앞 청크의 마지막 낱말과 뒤 청크의 첫 낱말이 한 낱말로 붙는데,
+// 그것은 오류를 남기지 않고 본문만 틀리는 형태다.
+test('겹치지 않는 이음매는 개행으로 잇는다 — 두 낱말이 붙지 않게', () => {
+  const rows = [
+    { seq: 1, doc_seq: 1, chunk_no: 1, chunk_of: 3, title: 'T', content: '앞 청크의 마지막낱말' },
+    { seq: 2, doc_seq: 1, chunk_no: 2, chunk_of: 3, title: 'T', content: '뒤청크의 첫 낱말' },
+  ];
+  const [item] = buildItems([{ doc_seq: 1, rep: 1, from: 1, to: 2, chunk_of: 3, dist: 0.3 }], rows);
+  assert.equal(item.content, '앞 청크의 마지막낱말\n뒤청크의 첫 낱말');
 });
 
 // ===== 문서당 상한은 프롬프트에 실리는 형태로 잰다 =====

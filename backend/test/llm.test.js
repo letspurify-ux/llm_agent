@@ -89,6 +89,25 @@ test('조회가 전부 실패했으면 지식을 첨부한다', () => {
   assert.match(a, /관련 지식: 재시작/);
 });
 
+// 지식 항목은 문서 하나가 아니라 '문서의 한 구간'이고(chunk.js buildItems) 그 구간은 낱말 한가운데에서
+// 시작할 수 있다 — 46조각짜리 문서의 9~14번 구간이 's, continuous batching…'으로 시작했다(실측).
+// 표기 없이 내보내면 사용자는 그것을 등록된 지식의 전부로 읽고 못 본 뒷부분을 '없는 내용'으로 단정한다.
+// 이 답변은 LLM이 죽었을 때 사용자가 읽는 유일한 본문이라(agent.js fallbackAnswer) 프롬프트보다 더 그렇다.
+test('첨부한 지식이 문서의 일부이면 어느 구간인지 함께 알린다', () => {
+  const knowledge = [{
+    title: '운영 가이드', range: ' (9~14/46)', doc_seq: 7, from: 9, to: 14, chunk_of: 46,
+    content: 's, 재시작 절차는 다음과 같다',
+  }];
+  const a = renderAnswer({ knowledge, history: [{ query_name: 'q', params: {}, error: 'ORA-12541' }] });
+  assert.match(a, /### 관련 지식: 운영 가이드 \(9~14\/46\)/, '구간 표기가 사용자에게 나가지 않았다');
+  // 청크가 아닌 항목은 지금까지와 같다 — 붙일 표기가 없다.
+  const whole = renderAnswer({
+    knowledge: [{ title: '짧은 지식', content: '전부 실린 본문' }],
+    history: [{ query_name: 'q', params: {}, error: 'ORA-12541' }],
+  });
+  assert.match(whole, /### 관련 지식: 짧은 지식\n/);
+});
+
 test('한 글자 값은 지식 매칭에 쓰지 않는다', () => {
   // ''는 모든 문자열에 포함되고, 'Y'·등급 'A'는 어지간한 한국어 본문에 다 들어 있다.
   const knowledge = [{ title: '무관', content: '가나다라마바사' }];

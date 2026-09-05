@@ -26,7 +26,7 @@ const MAX_SAME_QUERY_TRIES = 2; // 같은 쿼리·파라미터의 최대 실행 
 // 앞쪽이 관련도가 높은 처리방법이고(검색 결과 순서) 절차의 첫 단계도 본문 앞쪽에 온다 —
 // 잘려도 다단계 절차의 시작은 남는다 (프롬프트 예산이 꼬리부터 버리는 것과 같은 전제다).
 const MAX_ROUTE_TEXT_LEN = 20_000;
-const MAX_GUARD_HITS = 2;       // 루프 가드가 '연속으로' 이만큼 걸리면 남은 스텝을 포기하고 강제 답변으로 간다.
+export const MAX_GUARD_HITS = 2; // 루프 가드가 '연속으로' 이만큼 걸리면 남은 스텝을 포기하고 강제 답변으로 간다. (테스트에서 쓰므로 export)
                                 // (첫 1회는 LLM이 경로를 수정할 기회, 그래도 반복하면 LLM 왕복만 낭비된다.
                                 //  조회에 성공하면 진도가 나간 것이므로 카운터를 되돌린다 — 다단계 절차 도중
                                 //  같은 쿼리를 두 번 제안했다는 이유로 정상 흐름이 끊기면 안 된다)
@@ -545,8 +545,15 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
     // 쿼리 목록은 경로A(처리방법이 지목)만으로도 실린다 — 그때는 'query'를 검색한 것이 아니므로 searched에 넣지 않는다.
     if (r.queries !== undefined) {
       if (want.has('query')) { searched.add('query'); targetCounts.query++; }
-      if (r.queries === null) failed.push('query');
-      else {
+      // '검색 불가'도 찾아본 대상에만 적는다. 경로A만 돈 검색(query를 찾지 않았다)에서 관리 DB가 목록을 못 읽으면
+      // r.queries가 null인데, 그것을 failed에 넣으면 이력 줄이 `[처리방법] → 처리방법 1건 · 쿼리 검색 불가`가 된다 —
+      // 찾지도 않은 대상이 '검색이 성립하지 않았다'로 적히고(context.md 1-), 모델은 시스템 프롬프트의 '검색 불가면
+      // 자료를 확인할 수 없다고 밝혀라'를 따라 query 검색을 시도조차 않고 답한다. chat_log에는 searchFailed가 서서
+      // 임베딩 장애로 집계된다(README의 분석 SQL). 그 실패는 queriesFailed가 따로 남기고(아래), 모델은 목록이 없는
+      // 처리방법을 보고 query를 검색하거나 이름을 지목하므로(resolveQuery) 관리 DB가 살아나면 그 자리에서 이어진다.
+      if (r.queries === null) {
+        if (want.has('query')) failed.push('query');
+      } else {
         // routed는 '성립한' 쿼리 검색의 판정만 기록한다. 마지막 값으로 덮어쓰면, 앞선 검색이 라우팅 규모를
         // 확인해 목록을 채워 놓고도 뒤이은 검색이 관리 DB 실패로 null을 주는 순간 그 판정이 지워진다 —
         // chat_log에는 '한 번도 못 찾았거나 매번 실패했다'로 남아(README의 분석 SQL) 정반대로 읽힌다.
@@ -611,8 +618,12 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       }
       // 모델이 지목한 쿼리는 다음 스텝에 자세한 형태(입출력 설명·SQL)로 보인다 — 바인드를 고칠 수 있어야 한다
       // (llm-openai.js renderQueries 주석). 프롬프트 목록 밖에서 찾은 쿼리는 목록 앞에 넣는다: 뒤가 아니라 앞이다 —
-      // 프롬프트 예산은 '뒤쪽일수록 관련도가 낮다'는 전제로 꼬리부터 버린다. 중복은 넣지 않고, 늘어나는 상한은
-      // MAX_STEPS건이다 (즉 목록은 최대 MAX_PROMPT_QUERIES + MAX_STEPS건).
+      // 프롬프트 예산은 '뒤쪽일수록 관련도가 낮다'는 전제로 꼬리부터 버린다. 중복은 넣지 않고, 이 경로가
+      // 늘리는 상한은 MAX_STEPS건이다. 목록 전체의 상한은 그것과 다르다 — MAX_PROMPT_QUERIES는 검색 한 번이
+      // 돌려주는 수이고(selectQueries의 slice) 목록은 검색마다 병합되므로, 라우팅 규모에서는
+      // MAX_SEARCHES × MAX_PROMPT_QUERIES + MAX_STEPS까지 자란다 (소규모 등록에서는 등록 수를 넘지 않는다 —
+      // 매 검색이 같은 전체 목록을 돌려준다). 그래도 프롬프트가 넘치지는 않는다: renderQueries가 짧은 줄부터
+      // 확보하고 남는 만큼만 자세히 올린 뒤 꼬리를 버린다.
       registryRow.detail = true;
       if (!queries.includes(registryRow)) queries.unshift(registryRow);
       seenInBatch.add(dupKey);
@@ -649,8 +660,9 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
         // 메시지가 비면 안 된다: error가 falsy면 프롬프트·답변 조립이 이 기록을 '오류'로 보지 않고
         // rows가 있는 정상 결과로 취급해 들어간다.
         Object.assign(entry, { error: e?.message || String(e), safe: e?.safe === true, ...(e?.hint && { hint: e.hint }) });
-        // 조회를 시작하지도 못하고 거부된 실패(oracle.js wastedStep — 대상 DB를 후보에서 못 골랐다)는 미등록 이름과
-        // 같은 부류다: DB를 건드리지 않았고, 고를 수 있는 값은 오류 문구가 이미 열거해 줬다.
+        // 조회를 시작하지도 못하고 거부된 실패(oracle.js wastedStep — 대상 DB를 못 골랐거나, 등록·설정 오류로 어떤
+        // 파라미터로도 실행이 시작되지 않는다)는 미등록 이름과 같은 부류다: 조회 DB를 건드리지 않았고, 모델이 고칠
+        // 수 있는 것은 오류 문구가 이미 열거해 줬거나 아예 없다.
         if (e?.wastedStep) wastedCount++;
         // 화면으로 나가는 문구는 trace 패널과 같은 기준이다 (result.js clientTrace) — 우리가 만든 문구만 원문으로.
         emit('run_query_done', {

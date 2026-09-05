@@ -197,10 +197,19 @@ const trimEnv = name => String(process.env[name] ?? '').trim();
 // 이 파일이 던지는 '실행 없이 헛돈' 실패의 표시.
 // 대상 DB를 후보에서 못 고른 실패는 loadTargetDb도 접속도 없이 끝난다 — 스텝 하나와 LLM 왕복
 // 하나만 태운 셈이다. agent.js가 이 표시를 보고 미등록 쿼리 이름과 같은 연속 카운터로 센다
-// (agent.js MAX_GUARD_HITS). 표시가 없으면 모델이 매번 다른 틀린 이름을 대는 동안 loopGuard의
+// (agent.js MAX_GUARD_HITS).
+// 같은 표시를 '어떤 파라미터로도 실행이 시작되지 않는' 거부 전부에 단다 — 등록 SQL 자체가 실행 불가
+// (assertReadOnly: FOR UPDATE·다중 문장·위치 바인드), 대상 DB 미등록·접속 정보 없음·지원하지 않는
+// db_type, 드라이버·비밀번호 설정 오류. 모델이 고칠 수 있는 것이 없으므로 되풀이는 전부 헛돈 스텝이다.
+// 표시가 없던 동안 FOR UPDATE로 등록된 쿼리를 모델이 파라미터만 바꿔 되풀이하자 MAX_STEPS를 전부
+// 태웠다(실측: LLM 8회, 조회 줄 5개) — 같은 부류인 대상 DB 미등록은 2스텝에서 끊긴다. 바인드 값 문제
+// (bindProblem)는 여기 들지 않는다: 값을 고치면 실행되므로 모델에게 그 기회를 줘야 한다. 표시가 없으면 모델이 매번 다른 틀린 이름을 대는 동안 loopGuard의
 // 동일 실행 판정에 한 번도 걸리지 않아 MAX_STEPS를 전부 소진한다 — 미등록 쿼리 이름에서
 // 이미 겪은 퇴화 패턴이고, 대상 DB에도 같은 카운터가 필요한 이유가 그것이다.
 const wasted = e => Object.assign(e, { wastedStep: true });
+// 실행 불가 등록·설정 오류에 붙이는 모델 전용 지침 — 위 wasted를 다는 자리들이 함께 쓴다.
+// 이 문구가 없는 거부(assertReadOnly의 등록 SQL 오류가 그랬다)는 모델에게 다음 행동을 주지 않아 되풀이를 부른다.
+const UNRUNNABLE_HINT = '이 쿼리는 실행할 수 없다 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라';
 
 // 후보 목록에 보여줄 이름들의 표시 상한. 목록은 오류 문구를 타고 프롬프트와 사용자 trace 양쪽으로
 // 나가므로, 등록 문자열이 길어져도 그 문구가 함께 커지지 않게 여기서 묶는다.
@@ -223,10 +232,7 @@ export function resolveTargetDb(registryRow, chosen) {
   if (!names.length) {
     // 운영자의 등록 실수다 — 모델이 무엇을 골라도 달라지지 않으므로 후보를 되묻지 않는다.
     warnOnce('oracle:target-db', `query_registry.target_db_name is empty for ${registryRow.query_name}`);
-    throw wasted(safeError(
-      '이 쿼리에는 조회대상 DB가 등록되어 있지 않습니다.',
-      '이 쿼리는 실행할 수 없다 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라'
-    ));
+    throw wasted(safeError('이 쿼리에는 조회대상 DB가 등록되어 있지 않습니다.', UNRUNNABLE_HINT));
   }
   // 문자열만 선택으로 인정한다. String()으로 강제 변환하면 배열 하나가 이름이 된다 —
   // JS는 String(['A'])를 'A'로 만들기 때문에 ['A']가 후보 A에 그대로 매칭됐다(실측).
@@ -265,7 +271,14 @@ const NOT_CLIPPED_COPY = () => false;
 export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLIPPED_COPY, chosenDb = null) {
   // 가드가 '실행용 SQL'까지 함께 돌려준다 — 무엇을 허용했는지 아는 쪽이 무엇을 실행할지도 정한다.
   // 실행부가 따로 문자열을 손보면 둘의 판단이 갈라진다 (sql.js assertReadOnly 주석 참고).
-  const sql = assertReadOnly(registryRow.query_sql);
+  // 등록 SQL 자체가 실행 불가면(등록 실수) 어떤 파라미터로도 시작되지 않는다 — 헛돈 스텝으로 표시하고
+  // 다음 행동을 함께 준다 (wasted 주석). 가드는 판정만 하고 hint를 모르므로 여기서 붙인다.
+  let sql;
+  try {
+    sql = assertReadOnly(registryRow.query_sql);
+  } catch (e) {
+    throw wasted(Object.assign(e, { hint: e.hint ?? UNRUNNABLE_HINT }));
+  }
 
   // SQL에 실제로 있는 바인드만 추려서 전달한다 — LLM이 여분 파라미터를 주면
   // 드라이버가 바인드 수 불일치(NJS-098)로 실패하므로 필터가 필요하다.
@@ -302,17 +315,14 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
     // 서버 쪽 이름 자체이고(constants.safeError), 등록 DB 이름이 정확히 그 부류다.
     // 상세는 로그에만 남긴다 — 모델에게도 쓸모가 없다(이름을 안다고 고칠 수 있는 실패가 아니다).
     warnOnce('oracle:target-db', `target_db row not found: ${targetDbName} (registered for ${registryRow.query_name})`);
-    throw safeError(
-      '조회대상 DB 접속 정보가 등록되어 있지 않습니다.',
-      '이 쿼리는 실행할 수 없다 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라'
-    );
+    throw wasted(safeError('조회대상 DB 접속 정보가 등록되어 있지 않습니다.', UNRUNNABLE_HINT));
   }
   // 이름 비교는 nameKey로 한다 — target_db는 대소문자를 무시하는 collation이라 db_name 조회는
   // 'order_db'로도 'ORDER_DB' 행을 찾아준다. 그런데 db_type만 JS ===로 보면 'Oracle'로 등록한
   // 순간 그 DB의 모든 조회가 '지원하지 않는 db_type'으로 죽고, 화면에 나가는 문구는 등록 철자가
   // 아니라 DB 종류를 탓하는 것처럼 읽힌다. query_name에 nameKey를 둔 것과 같은 이유·같은 방식이다.
   if (target.db_type && nameKey(target.db_type) !== 'oracle') {
-    throw safeError(`지원하지 않는 db_type: ${target.db_type} (현재 oracle만 지원)`);
+    throw wasted(safeError(`지원하지 않는 db_type: ${target.db_type} (현재 oracle만 지원)`, UNRUNNABLE_HINT));
   }
 
   // 드라이버 모드 확정은 첫 접속보다 먼저여야 한다 (initOracleClient 주석 참고).
@@ -323,10 +333,10 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
     // 상세(경로·DPI-1047 설치 안내)는 로그에만 남긴다 — 화면에 나갈 값이 아니고(constants.safeError),
     // 모델에게도 쓸모가 없다: 다른 쿼리를 골라도 같은 이유로 실패한다.
     warnOnce('oracle:client', `failed to initialize the Oracle Client for ORACLE_DRIVER=oci — install the Instant Client or set ORACLE_CLIENT_LIB_DIR in backend/.env: ${e.message}`);
-    throw safeError(
+    throw wasted(safeError(
       '조회대상 DB 드라이버를 초기화하지 못했습니다.',
       '조회는 지금 불가능하다 — 다른 쿼리로 재시도하지 말고 지금까지의 정보로 답변하라'
-    );
+    ));
   }
 
   const conn = await acquireConnection(target);
@@ -573,10 +583,10 @@ function resolvePassword(stored) {
       // 환경변수 이름도 서버 내부 식별자다 — 위 target_db 이름과 같은 이유로 화면에 내보내지 않는다.
       // 운영자가 필요로 하는 정보라 로그에는 반드시 남긴다(그게 이 실패의 유일한 단서다).
       warnOnce('oracle:target-db-password', `target DB password env var is not set: ${name}`);
-      throw safeError(
+      throw wasted(safeError(
         '조회대상 DB 접속 정보가 서버에 설정되어 있지 않습니다.',
         '설정 문제라 재시도해도 결과가 같다 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라'
-      );
+      ));
     }
     return value;
   }
