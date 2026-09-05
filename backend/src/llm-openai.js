@@ -220,12 +220,30 @@ const ANSWER_START_RE = /"action"\s*:\s*"answer"\s*,\s*"answer"\s*:\s*"/;
 // '모델이 이 표기를 한 번 쓰기 시작하면 모든 질문이 같은 이유로 실패한다'.
 const REASONING_OPEN_RE = new RegExp(`<(?:${['thinking', 'think', 'reasoning', 'reflection', 'scratchpad', 'thought'].join('|')})\\b[^>]{0,100}(?<!/)>`, 'i');
 const REASONING_CLOSE_RE = new RegExp(`</(?:${['thinking', 'think', 'reasoning', 'reflection', 'scratchpad', 'thought'].join('|')})\\s*>`, 'gi');
-const SIMPLE_ESCAPES = { n: '\n', t: '\t', r: '\r', b: '\b', f: '\f', '"': '"', '\\': '\\', '/': '/' };
 const SEEK_TAIL = 200;   // 찾는 동안 들고 있을 원문 — 시작 패턴은 이보다 짧다
+
+// 이스케이프 해독은 결정 파서와 같은 규칙을 쓴다(normalizeJsonEscapes·keepsControlMeaning). 모델은 LaTeX를 백슬래시
+// 하나로 쓰는 일이 잦고(\frac·\times·\beta·\rho·\nabla) 파서는 그것을 글자 그대로 살리는데, 미리보기가 JSON의
+// 한 글자 이스케이프 표를 그대로 적용하면 같은 답이 화면에서는 폼피드·탭·백스페이스·CR로 깨져 보이다가 done에서만
+// 바로잡힌다(실측). 판정에 뒤 글자가 필요한 자리(\t·\r은 한 글자, \n은 명령 이름 길이만큼)는 그 글자가 올 때까지
+// 조각을 들고 있다 — 미리보기가 그만큼 늦는 것은 한 낱말 폭이다.
+const CONTROL_OF = { b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' };
+// text[i]가 '\\', text[i+1]이 n일 때 keepsControlMeaning을 확정하기에 뒤 글자가 모자란가.
+// 명령 이름 상한은 부를 때 센다 — N_COMMAND_TAILS는 이 파일 뒤쪽(파서)에 있어 모듈 평가 시점에는 아직 없다.
+function escapeNeedsMore(text, i, n) {
+  if (n === 'b' || n === 'f') return false;
+  if (n === 't' || n === 'r') return text.length < i + 3;
+  const maxTail = N_COMMAND_TAILS.reduce((m, t) => Math.max(m, t.length), 0);
+  const avail = text.slice(i + 2, i + 2 + maxTail + 1);
+  if (avail.length > maxTail) return false;
+  // 영문자 아닌 글자가 하나라도 있으면 어느 명령 이름도 그 너머로 이어질 수 없다 — 지금 판정할 수 있다
+  return [...avail].every(isLetter);
+}
 
 export function answerPreviewer(onDelta) {
   let state = 'seek';   // seek → inside → done
   let tail = '';        // seek: 마지막 닫는 태그 뒤의 원문 (상한 안에서)
+  let recent = '';      // inside·done: 최근 원문 (닫는 태그가 조각에 걸쳐 올 때를 위해)
   let inThink = false;  // 열린 채인 사고 과정 태그가 있는가
   let pending = '';     // inside: 아직 끝나지 않은 이스케이프 조각
   let emitted = false;
@@ -248,33 +266,62 @@ export function answerPreviewer(onDelta) {
         if (/^[0-9a-fA-F]{4}$/.test(hex)) { s += String.fromCharCode(parseInt(hex, 16)); i += 6; continue; }
         s += '\\u'; i += 2; continue;
       }
-      s += n in SIMPLE_ESCAPES ? SIMPLE_ESCAPES[n] : `\\${n}`;
+      if (UNAMBIGUOUS_ESCAPES.includes(n)) { s += n; i += 2; continue; }
+      if ('bfnrt'.includes(n)) {
+        if (escapeNeedsMore(text, i, n)) { pending = text.slice(i); break; }
+        s += keepsControlMeaning(text, i, n) ? CONTROL_OF[n] : `\\${n}`;
+        i += 2; continue;
+      }
+      s += `\\${n}`;   // 모르는 이스케이프(\[, \alpha) — 파서와 같이 백슬래시 그대로
       i += 2;
     }
     return s;
   };
 
-  return {
-    feed(chunk) {
-      if (!chunk || state === 'done') return;
-      if (state === 'inside') { out(decode(chunk)); return; }
-      tail += chunk;
-      // 닫는 태그가 왔으면 그 뒤만 본다 — 앞은 사고 과정이다
-      let lastClose = -1;
-      REASONING_CLOSE_RE.lastIndex = 0;
-      for (let m; (m = REASONING_CLOSE_RE.exec(tail));) lastClose = m.index + m[0].length;
-      if (lastClose >= 0) { tail = tail.slice(lastClose); inThink = false; }
-      if (REASONING_OPEN_RE.test(tail)) inThink = true;
-      if (inThink) { tail = tail.slice(-SEEK_TAIL); return; }
-      const m = ANSWER_START_RE.exec(tail);
-      if (!m) { tail = tail.slice(-SEEK_TAIL); return; }
-      state = 'inside';
-      const rest = tail.slice(m.index + m[0].length);
-      tail = '';
-      out(decode(rest));
-    },
-    get emitted() { return emitted; },
+  const lastCloseEnd = text => {
+    let at = -1;
+    REASONING_CLOSE_RE.lastIndex = 0;
+    for (let m; (m = REASONING_CLOSE_RE.exec(text));) at = m.index + m[0].length;
+    return at;
   };
+
+  const feed = chunk => {
+    if (!chunk) return;
+    if (state !== 'seek') {
+      // 흘리는 도중(또는 흘리고 난 뒤)에 닫는 태그가 왔다 — 지금까지 흘린 것은 사고 과정 안의 초안이었다.
+      // 여는 태그를 프롬프트에 미리 붙이는 템플릿(Qwen3·R1)은 content에 닫는 태그만 보내므로(parseDecision ②,
+      // 오히려 더 흔한 형태) 열린 태그로는 초안을 가려낼 수 없고, 초안이 닫힌 뒤에야 그것이 초안이었음을 안다.
+      // 되돌리지 않으면 화면은 버려진 초안을 답이 올 때까지 보여주고 진짜 답은 한 글자도 미리 보이지 않는다(실측).
+      // 답변 본문이 그 태그를 글자로 담은 경우(태그를 묻는 질문)도 여기서 되돌아가 미리보기가 비게 되지만,
+      // done이 갈아 끼우므로 잃는 것은 미리보기뿐이고 그쪽은 드물다.
+      const win = recent + chunk;
+      const close = lastCloseEnd(win);
+      if (close >= 0) {
+        onDelta({ reset: true });
+        state = 'seek'; inThink = false; pending = ''; tail = ''; recent = '';
+        feed(win.slice(close));
+        return;
+      }
+      recent = win.slice(-SEEK_TAIL);
+      if (state === 'inside') out(decode(chunk));
+      return;
+    }
+    tail += chunk;
+    // 닫는 태그가 왔으면 그 뒤만 본다 — 앞은 사고 과정이다
+    const lastClose = lastCloseEnd(tail);
+    if (lastClose >= 0) { tail = tail.slice(lastClose); inThink = false; }
+    if (REASONING_OPEN_RE.test(tail)) inThink = true;
+    if (inThink) { tail = tail.slice(-SEEK_TAIL); return; }
+    const m = ANSWER_START_RE.exec(tail);
+    if (!m) { tail = tail.slice(-SEEK_TAIL); return; }
+    state = 'inside';
+    const rest = tail.slice(m.index + m[0].length);
+    tail = '';
+    recent = rest.slice(-SEEK_TAIL);
+    out(decode(rest));
+  };
+
+  return { feed, get emitted() { return emitted; } };
 }
 
 // response_format(구조화 출력, guided decoding)을 보내지 않는다. 두 가지를 재보고 내린 결론이다.

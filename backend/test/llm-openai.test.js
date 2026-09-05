@@ -948,6 +948,44 @@ test('answerPreviewer: 이스케이프가 조각 경계를 넘어도, 시작 패
   assert.equal(q.emitted, false);
 });
 
+// 미리보기의 이스케이프 해독은 결정 파서와 같은 규칙이어야 한다. 모델은 LaTeX를 백슬래시 하나로 쓰는 일이 잦고
+// 파서는 그것을 글자 그대로 살리는데(normalizeJsonEscapes), 미리보기가 JSON 이스케이프 표를 그대로 적용하면 같은 답이
+// 화면에서는 폼피드·탭·백스페이스·CR로 깨져 보이다가 done에서만 바로잡힌다(실측).
+test('미리보기는 백슬래시 하나로 쓴 LaTeX를 파서와 똑같이 글자 그대로 흘린다', async () => {
+  const raw = String.raw`{"action":"answer","answer":"$$\frac{1}{2} \times \beta + \rho \nabla f \neq 0 \to x$$\n\t끝 \tab"}`;
+  for (const size of [1, 2, 3, 7, 40, 1000]) {
+    const chunks = [];
+    for (let i = 0; i < raw.length; i += size) chunks.push(delta(raw.slice(i, i + size)));
+    globalThis.fetch = async () => sse(chunks);
+    const seen = [];
+    const d = await openaiDecide({ ...CTX, onAnswerDelta: e => seen.push(e) });
+    assert.equal(seen.map(e => e.text ?? '').join(''), d.answer, `조각 ${size}자에서 미리보기가 최종 답과 다르다`);
+  }
+  // 파서가 실제로 살렸는지도 확인한다 — 두 쪽이 같이 틀리면 위 단언이 공허하다
+  globalThis.fetch = async () => sse([delta(raw)]);
+  const d = await openaiDecide(CTX);
+  assert.ok(d.answer.includes('\\frac{1}{2} \\times \\beta + \\rho \\nabla f \\neq 0 \\to x') && d.answer.includes('\n\t끝 \\tab'), d.answer);
+});
+
+// 여는 태그를 프롬프트에 미리 붙이는 템플릿(Qwen3·R1)은 content에 닫는 태그만 보낸다(parseDecision ②, 더 흔한 형태).
+// 그 안의 초안은 닫는 태그가 온 뒤에야 초안이었음을 알 수 있다 — 되돌리지 않으면 화면은 버려진 초안을 답이 올 때까지
+// 보여주고 진짜 답은 한 글자도 미리 보이지 않는다(실측).
+test('여는 태그 없는 사고 과정 안의 초안은 닫는 태그에서 되돌리고 진짜 답을 흘린다', async () => {
+  for (const chunks of [
+    [delta('일단 {"action":"answer","answer":"버려야 할 초안"} 로 해볼까'), delta('... 아니다</think>\n'), delta('{"action":"answer","answer":"진짜 답"}')],
+    // 닫는 태그가 조각에 걸쳐 오고, 초안이 닫히지 않은 채 접힌 경우
+    [delta('{"action":"answer","answer":"닫히지 않은 초안 … 아니다</th'), delta('ink>{"action":"answer","answer":"진짜 답"}')],
+  ]) {
+    globalThis.fetch = async () => sse(chunks);
+    const seen = [];
+    const d = await openaiDecide({ ...CTX, onAnswerDelta: e => seen.push(e) });
+    assert.equal(d.answer, '진짜 답');
+    const resetAt = seen.findIndex(e => e.reset);
+    assert.ok(resetAt >= 0, `reset이 없다: ${JSON.stringify(seen)}`);
+    assert.equal(seen.slice(resetAt + 1).map(e => e.text ?? '').join(''), '진짜 답', `되돌린 뒤 진짜 답이 흘러오지 않았다: ${JSON.stringify(seen)}`);
+  }
+});
+
 test('첫 시도의 미리보기가 나갔는데 결정을 못 읽으면 reset을 알리고 재시도한다', async () => {
   let n = 0;
   globalThis.fetch = async () => (n++ === 0

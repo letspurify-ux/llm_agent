@@ -32,3 +32,26 @@ test('여는 줄이 아직 끝나지 않은 펜스도 자리 표시다 — 모�
   assert.equal(previewMarkdown('```js'), '```js');
   assert.equal(previewMarkdown('```charts'), '```charts');
 });
+
+// 여는 줄만 되풀이하는 퇴화한 응답에서 비용이 줄 수의 제곱이었다 — 답변 상한 안의 7,500줄이 한 번에 390ms였고,
+// 미리보기는 120ms마다 자라난 전체를 다시 손보므로 스트림이 끝날 때까지 화면이 멈췄다(실측). 백엔드 파서가
+// '<think' 반복에서 겪은 것과 같은 부류다.
+test('여는 펜스가 아무리 많아도 비용이 길이에 비례한다', () => {
+  const degenerate = n => '```chart\ntype: bar\n'.repeat(n);
+  const ms = n => { const t0 = performance.now(); previewMarkdown(degenerate(n)); return performance.now() - t0; };
+  ms(2000);                                   // 워밍업 (JIT 편차 제거)
+  const one = Math.max(0.5, ms(2000));
+  const four = ms(8000);
+  // 선형이면 4배 남짓, 제곱이면 16배가 된다. 느린 기계에서도 갈리도록 넉넉히 8배로 둔다.
+  assert.ok(four < one * 8, `길이가 4배인데 비용이 ${(four / one).toFixed(1)}배다 (${one.toFixed(1)}ms → ${four.toFixed(1)}ms)`);
+  // 결과도 같아야 한다 — 열린 채 끝난 블록 하나로 접힌다
+  assert.equal(previewMarkdown(degenerate(3)), PLACEHOLDER);
+});
+
+// 보통 코드 펜스 안에 적힌 '```chart'는 펜스가 아니다 — 차트 문법을 설명하는 코드블록이 자리 표시로 바뀌면 안 된다.
+test('보통 코드 펜스 안의 chart·table·mermaid 줄은 건드리지 않는다', () => {
+  const md = '```markdown\n```chart\ntype: bar\n```\n\n```chart\ndata: step 1\n```';
+  assert.equal(previewMarkdown(md), `\`\`\`markdown\n\`\`\`chart\ntype: bar\n\`\`\`\n\n${PLACEHOLDER}`);
+  // CRLF로 온 펜스도 닫힘을 알아본다
+  assert.equal(previewMarkdown('글\r\n```table\r\nstep: 1\r\n```\r\n끝'), `글\r\n${PLACEHOLDER}\n끝`);
+});
