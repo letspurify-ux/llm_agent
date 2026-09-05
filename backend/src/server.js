@@ -289,9 +289,9 @@ if (syncInterval > 0) {
     return syncEmbeddings()
       .then(r => { if (r.embedded || r.deleted || r.failed) console.log(`[embed] sync: ${syncSummary(r)}`); })
       // 삼키면 안 된다 — 임베딩 서버 쪽 실패는 embed-sync가 스스로 알리지만, 관리 DB 오류
-      // (vec_store 권한 상실·테이블 유실 등)로 query()가 던지면 그 실패는 여기로만 온다.
-      // 조용히 버리면 벡터가 낡아가는 동안 검색은 LIKE 폴백으로 계속 동작하므로 로그 말고는
-      // 단서가 없다 — 바로 위 기동 시 1회 실행은 이 실패를 알리고 있었고 주기 실행만 빠져 있었다.
+      // (vec_* 권한 상실·테이블 유실 등)로 query()가 던지면 그 실패는 여기로만 온다.
+      // 조용히 버리면 벡터가 낡아가는 동안 검색은 옛 벡터로 계속 동작하므로(벡터 단일 경로 — search.js)
+      // 로그 말고는 단서가 없다 — 바로 위 기동 시 1회 실행은 이 실패를 알리고 있었고 주기 실행만 빠져 있었다.
       // warnOnce로 억제해 매 주기 도배는 막되, 오류의 성격이 바뀌면 반드시 다시 알린다.
       .catch(e => warnOnce('embed', `periodic sync failed: ${e.message}`));
   }), syncInterval * 1000);

@@ -14,8 +14,12 @@ export const PLACEHOLDER = '_(표·차트를 준비하고 있습니다)_';
 // 줄 단위 상태 기계는 길이에 비례한다. 규칙은 markdown의 펜스와 같다 — 여는 줄의 펜스 글자와 수를 기억하고,
 // 같은 글자가 그 수 이상 놓인 빈 줄에서만 닫는다. 백틱 펜스의 여는 줄에 백틱이 더 있으면 펜스가 아니다
 // (인라인 코드). 보통 코드 펜스 안의 줄은 그대로 두므로, 그 안에 적힌 '```chart'는 펜스로 보지 않는다.
+// 언어 이름은 대소문자를 가리지 않는다 — 그리는 쪽(App.jsx codeOf)·이력(chart.js CHART_FENCE_RE)·서버(backend chart.js)가
+// 모두 그렇고, 모델은 ```Chart 라고도 쓴다. 여기만 가리던 동안에는 ```Chart 블록이 미리보기에서 자리 표시가 아니라
+// 차트로 그려져 '차트를 그리지 못했습니다: 조회 결과를 채우지 못했습니다'라는 거짓 안내가 답이 오기까지 떠 있었고,
+// 반쯤 온 ```Mermaid 는 그림으로 그려져 파스 오류 경고를 콘솔에 남겼다(실측).
 const FENCE_RE = /^([ \t]*)(`{3,}|~{3,})(.*)$/;
-const TARGET_RE = /^[ \t]*(?:chart|table|mermaid)\b/;
+const TARGET_RE = /^[ \t]*(?:chart|table|mermaid)\b/i;
 
 export function previewMarkdown(text) {
   const lines = String(text ?? '').split('\n');

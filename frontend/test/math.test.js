@@ -256,3 +256,25 @@ test('수식이 아닌 코드펜스는 그대로 코드로 남는다', () => {
   // 언어를 적지 않은 펜스도 코드다
   assert.deepStrictEqual(formulas('```\n\\frac{a}{b}\n```'), []);
 });
+
+test('여러 줄로 이어 쓴 목록 항목·인용문 안의 수식도 그려진다 — 파서가 줄 사이에서 뗀 표시가 원문에는 남아 있다', () => {
+  // 원문 조각을 통째로 파서의 값과 비교하던 동안에는 두 줄 넘게 이어 쓴 목록 항목·인용문의 수식이 하나도 그려지지
+  // 않았다(실측) — 한 줄로 쓰면 그려지는 같은 글이다. 걸린 것은 셋: 컨테이너 표시(>·들여쓰기), 소프트 줄바꿈 앞뒤의
+  // 공백, 그 둘이 CRLF와 섞인 것. 파서는 그것들을 값에서 뗐고 원문 조각에는 남아 있었다(math.js alignedRaw).
+  assert.deepStrictEqual(formulas('- 항목 $x$ 는\n  이어서 $y$'), ['x', 'y']);
+  assert.deepStrictEqual(formulas('1. 항목 \\(x\\) 는\n   이어서 \\(y\\)'), ['x', 'y']);
+  assert.deepStrictEqual(formulas('- 밖\n  - 안 $x$ 는\n    이어서 $y$'), ['x', 'y']);
+  assert.deepStrictEqual(formulas('> 첫 줄 $x$\n> 둘째 줄 $y$'), ['x', 'y']);
+  assert.deepStrictEqual(formulas('앞 줄 $a$ \n뒤 줄 $b$'), ['a', 'b']);
+  assert.deepStrictEqual(formulas('앞 줄 $a$ \r\n  뒤 줄 $b$'), ['a', 'b']);
+  assert.deepStrictEqual(formulas('> 값은 $a +\n> b$ 이다'), ['a +\nb'], '줄을 넘는 수식 안에 인용문 표시가 남지 않는다');
+  // 화면 글자에 인용문 표시가 새어 나오지 않는다
+  assert.ok(!/&gt;|>/.test(visible('> 첫 줄 $x$\n> 둘째 줄 $y$')));
+  // 이웃 노드와의 경계 공백은 값에도 있다 — 그것까지 걷어내면 그 노드가 통째로 '다르다'로 걸려 그려지지 않는다
+  assert.deepStrictEqual(formulas('*강조* 뒤 $x$ 와 $y$ *다시*'), ['x', 'y']);
+  // 인용문 안에서 수식만 있는 문단은 별행이다
+  assert.ok(isDisplay('> \\[a\\]\n> \\[b\\]'));
+  assert.deepStrictEqual(formulas('> \\[a\\]\n> \\[b\\]'), ['a', 'b']);
+  // 되돌린 원문이 값과 다른 노드(엔티티)는 여전히 건드리지 않는다 — 실패 방향은 한쪽이다
+  assert.deepStrictEqual(formulas('&amp; 와 $x$'), []);
+});

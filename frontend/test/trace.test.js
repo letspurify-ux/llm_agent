@@ -256,3 +256,27 @@ test('스텝 번호는 정수일 때만 화면으로 나간다', () => {
   assert.equal(normalizeTrace([{ step: 2, search: 'x' }])[0].step, 2);
   assert.equal(normalizeTrace([{ step: 0, query_name: 'q' }])[0].step, undefined);
 });
+
+test('대상 이름은 표가 담은 것만 안다 — 프로토타입의 이름이 오면 글자 그대로 보인다', () => {
+  // 객체의 [] 조회는 프로토타입까지 올라간다. 'constructor'가 오면 Object 함수가 '아는 이름'으로 잡혀 화면에
+  // 'function Object() { [native code] }'가 섰다(실측). 지금 서버는 대상을 정규화해 보내지만(llm.js) 이 파일은
+  // 배포가 어긋난 서버의 값도 받는 문이다.
+  assert.equal(targetsLabel(['constructor', 'toString', 'knowledge']), 'constructor·toString·지식');
+  assert.equal(progressText(applyProgress([], { type: 'search', text: 'x', targets: ['hasOwnProperty'] })[0]), '검색 "x" (hasOwnProperty)');
+});
+
+test('건수와 오류는 글자가 되는 값으로만 들어온다 — 진행 줄과 패널이 같은 모양을 받는다', () => {
+  // 객체가 그대로 통과하면 패널이 '[object Object]건'·'오류: [object Object]'를 그린다(실측). 죽지는 않지만 뜻 없는
+  // 글자다. 오류는 글자가 아니어도 '오류였다'는 사실은 남긴다 — 버리면 실행되지 못한 스텝이 '0건'으로 읽힌다.
+  const [a, b, c] = normalizeTrace([
+    { query_name: 'q', rowCount: { n: 3 }, rows: [{ a: 1 }] },
+    { query_name: 'q', error: { code: 'ORA-1' } },
+    { query_name: 'q', error: '', rowCount: 5, rows: [{ a: 1 }] },
+  ]);
+  assert.equal(stepLabel(a), '1건', '근거 없는 건수는 실린 행 수로 말한다');
+  assert.equal(stepLabel(b), '오류: {"code":"ORA-1"}');
+  assert.equal(stepLabel(c), '5건', '빈 오류는 오류가 아니다');
+  // 진행 줄도 같은 규칙이다
+  const done = applyProgress([{ kind: 'query', id: 1, query_name: 'q', pending: true }], { type: 'run_query_done', id: 1, query_name: 'q', error: { code: 'ORA-1' } });
+  assert.equal(progressText(done[0]), '조회 q → 오류: {"code":"ORA-1"}');
+});

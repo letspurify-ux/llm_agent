@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { resolveChartData, MAX_CHART_COLS, MAX_CHART_CELL_LEN, MAX_CHART_INJECT_LEN, MAX_CHART_BLOCK_ROWS } from '../src/chart.js';
+import { TRUNC_MARK, MAX_CELL_LEN } from '../src/constants.js';
 
 const rows = [
   { MONTH: '2024-01', CNT: 120, AMT: 1000.5, NOTE: 'a|b' },
@@ -113,8 +114,8 @@ test('x·y·y2로 열을 고른다 — x는 언제나 맨 앞, 이름은 대소�
 test('긴 셀과 총량 예산을 지키고, 다 싣지 못하면 차트 아래에 밝힌다', () => {
   const long = [{ K: 'a', V: 'x'.repeat(500) }];
   const out = resolveChartData(block('type: bar\ndata: step 1'), [long]);
-  const cellLen = out.split('\n')[4].split('|')[2].trim().length;
-  assert.ok(cellLen <= MAX_CHART_CELL_LEN, `${cellLen}`);
+  const shown = out.split('\n')[4].split('|')[2].trim();
+  assert.equal(shown, 'x'.repeat(MAX_CHART_CELL_LEN) + TRUNC_MARK, '상한까지 자르고 잘렸다는 표시를 붙여야 한다');
 
   // 예산은 채울 블록 수로 나눈다 — 넓은 표 셋이면 셋 다 몫만큼 실리고(앞 블록이 뒤를 굶기지 않는다), 합은 예산 안이다
   const many = Array.from({ length: 100 }, (_, i) => ({ K: `k${i}`, V: 'v'.repeat(MAX_CHART_CELL_LEN), W: 'w'.repeat(MAX_CHART_CELL_LEN), X: 'x'.repeat(MAX_CHART_CELL_LEN) }));
@@ -268,4 +269,28 @@ test('참조 없는 블록은 채울 표의 예산을 나눠 갖지 않는다', 
   const alone = count(ref);
   assert.ok(alone > 0);
   assert.equal(count([ref, refless, refless, refless, refless].join('\n\n')), alone, '참조 없는 블록이 예산을 가져갔다');
+});
+
+// 답변에 채워 넣는 표·차트의 칸은 이 저장소의 다른 절단과 같은 규칙으로 잘려야 한다 — 잘렸으면 표시가 붙는다.
+// 표시 없이 자르던 동안 사용자는 120자짜리 값을 온전한 값으로 읽었고(드라이버 경계가 200자에서 붙인 표시까지
+// 함께 잘려 나갔다), 다음 턴에 그 값을 옮겨 적은 바인드는 잘린 값 가드(agent.js clippedCopyDetector)가 표시를
+// 근거로 앞부분을 찾으므로 한 번도 걸리지 않았다 — 잘린 조각으로 조회가 실행돼 0건 오답이 됐다(실측).
+test('표·차트의 칸을 자르면 잘렸다는 표시를 붙이고, 상한 안의 값과 숫자는 건드리지 않는다', () => {
+  // 드라이버 경계에서 이미 잘린 값(200자 + 표시)도 표의 상한에서 한 번 더 잘리며 표시는 하나만 남는다
+  const fromDriver = 'd'.repeat(MAX_CELL_LEN) + TRUNC_MARK;
+  const rows = [{ EXACT: 'e'.repeat(MAX_TABLE_CELL_LEN), OVER: 'o'.repeat(MAX_TABLE_CELL_LEN + 1), DRV: fromDriver, N: 42, S: '12345678901234567' }];
+  const line = resolveTableData(tblock('step: 1'), [rows]).split('\n')[2].split('|').map(c => c.trim());
+  assert.equal(line[1], 'e'.repeat(MAX_TABLE_CELL_LEN), '상한과 같은 길이의 값은 자르지도 표시하지도 않는다');
+  assert.equal(line[2], 'o'.repeat(MAX_TABLE_CELL_LEN) + TRUNC_MARK, '한 글자만 넘어도 자르고 표시한다');
+  assert.equal(line[3], 'd'.repeat(MAX_TABLE_CELL_LEN) + TRUNC_MARK, '표시는 한 번만 붙는다');
+  assert.equal(line[4], '42', '숫자는 그대로다 — 프런트가 숫자로 읽는다');
+  assert.equal(line[5], '12345678901234567', '상한 안의 문자열은 그대로다');
+  // 차트의 칸도 같다 (상한만 다르다). 표시 뒤의 이스케이프도 그대로 지켜진다.
+  const crow = [{ K: 'k'.repeat(MAX_CHART_CELL_LEN + 5) + '|', V: 1 }, { K: 'k', V: 2 }];
+  const cline = resolveChartData(block('type: bar\ndata: step 1'), [crow]).split('\n')[4];
+  assert.ok(cline.startsWith(`| ${'k'.repeat(MAX_CHART_CELL_LEN)}${TRUNC_MARK} | 1 |`), cline);
+  // 절단 경계가 서로게이트 쌍을 가르면 한 칸 짧게 자르되 표시는 그대로다 — 가드가 아는 두 길이 중 하나다
+  const emoji = 'a'.repeat(MAX_TABLE_CELL_LEN - 1) + '😀😀';
+  const eline = resolveTableData(tblock('step: 1'), [[{ E: emoji }]]).split('\n')[2].split('|')[1].trim();
+  assert.equal(eline, 'a'.repeat(MAX_TABLE_CELL_LEN - 1) + TRUNC_MARK, '이모지 한가운데를 가르지 않는다');
 });

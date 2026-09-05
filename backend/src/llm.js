@@ -35,7 +35,7 @@ export function llmProvider() {
   // 동시에 오타인 흔한 경우(둘 다 .env의 같은 블록에 있다)에 두 문구가 번갈아 들어와
   // warnOnce가 매번 '성격이 바뀌었다'고 보고 다시 찍는다 — 요청마다 두 줄씩 무한히 쌓인다.
   // scope는 '무엇에 대한 경고인가'여야 하고, 그 안에서 메시지가 바뀔 때만 다시 알린다
-  // (search.js가 LIKE·벡터 실패를 테이블별로 나눠 잡는 것과 같은 기준).
+  // (search.js가 벡터 검색 실패를 테이블별로 나눠 잡는 것과 같은 기준).
   warnOnce('setup:llm-provider', `unknown LLM_PROVIDER ${JSON.stringify(raw)} — every answer will come from the rule-based mock (valid: ${PROVIDERS.join(', ')}). Check backend/.env.`);
   return 'mock';
 }
@@ -269,7 +269,7 @@ function plannedQueries(qaMethods, queries) {
     // 본문의 표기와 등록 철자가 대소문자만 다를 수 있으므로 양쪽을 같은 기준으로 낮춰 찾는다.
     // NULL을 견딘다 — schema.sql의 NOT NULL이 유일한 방어막이라 컬럼 하나가 완화되거나 임포터가
     // NULL 행을 넣는 순간 여기서 죽는다. 이 값의 다른 소비자(llm-openai clip, embed-sync toText,
-    // LIKE/벡터 SQL)는 전부 NULL을 견디는데 이 한 곳만 raw로 역참조하고 있었다.
+    // 벡터 검색 SQL)는 전부 NULL을 견디는데 이 한 곳만 raw로 역참조하고 있었다.
     const method = String(m.method ?? '').toLowerCase();
     const found = queries
       .map(q => ({ q, pos: method.indexOf(nameKey(q.query_name)) }))

@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { buildPrompt } from '../src/llm-openai.js';
-import { MAX_PROMPT_TOTAL_LEN, MAX_PROMPT_STEP_LEN, PROMPT_FLOORS, PROMPT_FRAME_RESERVE, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN, MAX_CELL_LEN, MAX_RESULT_COLS, MAX_ROWS, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_DOC_LEN, MAX_PROMPT_ITEM_LEN, TRUNC_MARK } from '../src/constants.js';
+import { MAX_PROMPT_TOTAL_LEN, MAX_PROMPT_STEP_LEN, PROMPT_FLOORS, PROMPT_CEILINGS, PROMPT_FRAME_RESERVE, MAX_EXPANDED_ITEM_LEN, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN, MAX_CELL_LEN, MAX_RESULT_COLS, MAX_ROWS, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_DOC_LEN, MAX_PROMPT_ITEM_LEN, TRUNC_MARK } from '../src/constants.js';
 
 const big = n => 'ㄱ'.repeat(n);
 
@@ -119,12 +119,42 @@ test('바인드가 수백 개인 SQL 등록도 쿼리 목록 예산을 뚫지 �
 const countQueryLines = s => (s.match(/^- q\d+: /gm) || []).length;
 const countDetailed = s => (s.match(/^- q\d+: .* \/ SQL: /gm) || []).length;
 
-test('앞 섹션이 짧으면 그 여유가 쿼리 목록으로 넘어간다', () => {
-  // 배분이 '섹션마다 고정'이면 지식이 비어 있어도 쿼리 목록은 최소 몫에 묶인다.
+// 섹션 본문 한 덩어리 — 제목 줄 다음부터 다음 제목 전까지.
+const sectionOf = (p, title) => {
+  // m 플래그를 쓰지 않는다 — 쓰면 $가 줄 끝마다 맞아 첫 줄에서 끊긴다.
+  const m = p.match(new RegExp(`(?:^|\\n)## ${title.replace(/[()]/g, '\\$&')} \\([^)]*\\)\\n([\\s\\S]*?)(?=\\n## |$)`));
+  assert.ok(m, `${title} 섹션이 없다`);
+  return m[1];
+};
+const countItems = (p, title) => (sectionOf(p, title).match(/^- (?!\()/gm) || []).length;
+
+test('이력·쿼리가 짧으면 그 여유가 처리방법과 지식으로 넘어간다 — 천장까지', () => {
+  // 배분이 '섹션마다 고정'이면 이력·쿼리가 비어 있어도 처리방법·지식은 최소 몫에 묶인다. 옛 순서에서는
+  // 여유가 쿼리 목록으로만 흘렀는데 그 섹션은 detail 표시 없이는 여유를 쓰지 않아 통째로 버려졌다.
+  // 이력은 줄 수 상한까지 꽉 채운다 — 조회 줄 MAX_STEPS개만으로는 이력 몫이 남아 그 여유가 처리방법까지 흘러,
+  // '기본 몫에 묶인' 쪽이 만들어지지 않는다(배분은 실사용만 뺀다).
+  const fullHistory = new Array(MAX_HISTORY_ROWS).fill(0).map((_, i) => ({
+    query_name: `h${i}`, params: { a: 1 }, rows: wideRows(20, 30), totalRows: MAX_ROWS, capped: true,
+  }));
+  const light = buildPrompt(ctx({ searched: ['knowledge', 'qa_method'], knowledge: knowledge(60), qaMethods: methods(60) }));
+  const heavy = buildPrompt(ctx({ searched: ['knowledge', 'qa_method', 'query'], knowledge: knowledge(60), qaMethods: methods(60),
+    queries: queries(35), history: fullHistory }));
+  for (const [title, key] of [['Q&A 처리 방법', 'qaMethods'], ['관련 지식', 'knowledge']]) {
+    assert.ok(countItems(light, title) > countItems(heavy, title),
+      `${title}: 뒤 섹션이 비면 더 실어야 한다 (${countItems(heavy, title)} → ${countItems(light, title)})`);
+    assert.ok(sectionOf(light, title).length <= PROMPT_CEILINGS[key], `${title}이 천장을 넘었다: ${sectionOf(light, title).length}`);
+    assert.ok(sectionOf(light, title).length > PROMPT_FLOORS[key], `${title}이 여유를 못 쓰고 있다: ${sectionOf(light, title).length}`);
+  }
+  // 여유는 처리방법이 먼저 집는다 — 처리방법이 천장에 닿아야 지식으로 넘어간다 (constants.js PROMPT_FLOORS 순서)
+  assert.ok(sectionOf(light, 'Q&A 처리 방법').length > PROMPT_CEILINGS.qaMethods - 1200, '처리방법이 천장까지 받지 못했다');
+  assert.ok(light.length <= MAX_PROMPT_TOTAL_LEN, `프롬프트가 예산을 넘었다: ${light.length}`);
+});
+
+test('쿼리 목록은 여유가 있어도 detail 표시가 붙은 것만 자세해진다', () => {
+  // 앞 섹션(이력)이 비어 여유가 쿼리 목록으로 흘러도 천장(PROMPT_CEILINGS.queries) 안이다.
   const only = buildPrompt(ctx({ queries: queries(35) }));
-  const withNoise = buildPrompt(ctx({ queries: queries(35), knowledge: knowledge(30), qaMethods: methods(30) }));
   assert.ok(countDetailed(only) > PROMPT_FLOORS.queries / 12_000, '여유를 못 쓰고 있다');
-  assert.ok(countDetailed(only) > countDetailed(withNoise), '앞 섹션이 비면 쿼리를 더 자세히 실어야 한다');
+  assert.ok(sectionOf(only, '실행 가능한 쿼리 목록').length <= PROMPT_CEILINGS.queries, '쿼리 목록이 천장을 넘었다');
 });
 
 test('예산이 모자라도 쿼리 이름은 한 건도 버리지 않는다', () => {
@@ -557,13 +587,14 @@ test('번호는 잘렸고 아직 펼치지 않은 항목에만 붙는다', () =>
   assert.match(p, /^- \[이미 펼친 것\] /m, '펼친 항목에 번호가 남았다 — 더 받을 것이 없다는 표시가 사라진다');
 });
 
-test('펼친 항목은 더 긴 상한으로 실린다', () => {
+test('펼친 항목은 더 긴 상한으로 실린다 — 청크가 아닌 항목은 문서 창이 아니라 펼침 상한까지', () => {
   const body = big(MAX_DOC_LEN + 500);
-  const one = buildPrompt(ctx({ searched: ['knowledge'], knowledge: [{ seq: 1, title: 'K', content: body }] }));
-  const two = buildPrompt(ctx({ searched: ['knowledge'], knowledge: [{ seq: 1, title: 'K', content: body, expanded: true }] }));
-  const len = md => md.split('\n').find(l => l.startsWith('- ') || l.startsWith('- k')).length;
+  const one = buildPrompt(ctx({ searched: ['qa_method'], qaMethods: [{ seq: 1, title: 'M', method: body }] }));
+  const two = buildPrompt(ctx({ searched: ['qa_method'], qaMethods: [{ seq: 1, title: 'M', method: body, expanded: true }] }));
+  const len = md => md.split('\n').find(l => l.startsWith('- ')).length;
   assert.ok(len(two) > len(one) + 2000, `펼친 본문이 길어지지 않았다: ${len(one)} → ${len(two)}`);
-  assert.ok(len(two) < MAX_DOC_LEN + 300, '펼친 본문이 상한을 넘었다');
+  assert.ok(len(two) < MAX_EXPANDED_ITEM_LEN + 300, `펼친 본문이 펼침 상한을 넘었다: ${len(two)}`);
+  assert.ok(MAX_EXPANDED_ITEM_LEN + 300 < MAX_DOC_LEN, '이 대조는 펼침 상한이 문서 창보다 작아야 뜻이 있다');
 });
 
 test('버린 항목은 실리지도 세지도 않고, 버린 수는 따로 밝힌다', () => {
@@ -585,21 +616,28 @@ test('모두 버린 섹션은 (없음)으로 남는다 — 찾아본 사실은 �
 
 test('펼친 항목이 상한만큼 있어도 프롬프트가 예산을 넘지 않고, 그 본문이 잘리지 않는다', () => {
   // 펼친 항목은 목록 맨 앞에 온다(agent.js) — 예산이 뒤에서부터 버리므로 그 자리라야 살아남는다.
+  // 지식의 펼친 항목은 청크 항목(문서 창 MAX_DOC_LEN까지), 처리방법의 펼친 항목은 청크가 아닌 항목
+  // (MAX_EXPANDED_ITEM_LEN까지) — 각자의 총량이 각자의 최소 몫 안에 들어야 한다(constants.js MAX_EXPANDS).
   const expanded = Array.from({ length: MAX_EXPANDS }, (_, i) => ({
-    seq: 100 + i, title: `펼친${i}`, content: big(MAX_DOC_LEN), expanded: true,
+    seq: 100 + i, doc_seq: 100 + i, title: `펼친${i}`, content: big(MAX_DOC_LEN), chunk_of: 12, from: 1, to: 12, expanded: true,
+  }));
+  const expandedMethods = Array.from({ length: MAX_EXPANDS }, (_, i) => ({
+    seq: 200 + i, title: `펼친방법${i}`, method: big(MAX_EXPANDED_ITEM_LEN), expanded: true,
   }));
   const p = buildPrompt(ctx({
     forceAnswer: true, searched: ['knowledge', 'qa_method', 'query'],
-    knowledge: [...expanded, ...knowledge(30)], qaMethods: methods(30), queries: queries(35),
+    knowledge: [...expanded, ...knowledge(30)], qaMethods: [...expandedMethods, ...methods(30)], queries: queries(35),
     history: new Array(MAX_STEPS).fill(0).map((_, i) => ({
       query_name: `step${i}`, params: {}, rows: wideRows(20, 30), totalRows: MAX_ROWS, capped: true,
     })),
   }));
   assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN, `프롬프트가 예산을 넘었다: ${p.length}`);
   for (let i = 0; i < MAX_EXPANDS; i++) {
-    const line = p.split('\n').find(l => l.startsWith(`- [펼친${i}]`));
-    assert.ok(line, `펼친 항목 ${i}이 실리지 않았다`);
-    assert.ok(!line.includes(TRUNC_MARK), `펼친 항목 ${i}의 본문이 다시 잘렸다`);
+    for (const name of [`펼친${i}`, `펼친방법${i}`]) {
+      const line = p.split('\n').find(l => l.startsWith(`- [${name}]`));
+      assert.ok(line, `펼친 항목 ${name}이 실리지 않았다`);
+      assert.ok(!line.includes(TRUNC_MARK), `펼친 항목 ${name}의 본문이 다시 잘렸다`);
+    }
   }
 });
 
@@ -625,8 +663,9 @@ test('청크 항목은 잘리지 않아도 더 받을 것이 남았으면 번호
   const full = { ...base, knowledge: [chunk({ full: true })] };
   assert.match(at(full), /^- \[운영 가이드/, '이웃 조각이 상한에 안 들어가면 청구해도 늘지 않으므로 번호를 떼야 한다');
 
-  // 상한은 프롬프트에 실리는 형태(들여쓰기 포함)로 잰다 — 원문 2,399자·1,200줄은 프롬프트에서 4,797자다.
-  const tall = { ...base, knowledge: [chunk({ content: Array(1200).fill('a').join('\n') })] };
+  // 상한은 프롬프트에 실리는 형태(들여쓰기 포함)로 잰다 — 'a' 한 줄은 원문 2자(글자+개행)지만 프롬프트에서는
+  // 들여쓰기 두 칸이 붙어 4자다. 원문은 상한의 절반이 안 되고 프롬프트 형태로는 상한을 넘는 줄 수를 잡는다.
+  const tall = { ...base, knowledge: [chunk({ content: Array(Math.ceil(MAX_DOC_LEN / 4) + 200).fill('a').join('\n') })] };
   assert.match(at(tall), /^- \[운영 가이드/, '줄이 많은 본문은 원문이 짧아도 프롬프트 형태로는 상한에 닿는다');
 });
 

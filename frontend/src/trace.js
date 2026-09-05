@@ -27,8 +27,12 @@ const TARGETS = Object.keys(TARGET_LABEL);
 export const isSearchStep = t => !!t && typeof t === 'object' && typeof t.search === 'string';
 
 // 대상 목록의 표기 — '지식·처리방법'. 모르는 이름은 그대로 보인다(감추면 무엇을 찾았는지 알 수 없다).
+// 표는 자기가 담은 이름만 안다 — 객체의 [] 조회는 프로토타입까지 올라가서, 'constructor' 같은 이름이 오면
+// Object 함수가 '아는 이름'으로 잡혀 화면에 'function Object() { [native code] }'가 섰다(실측). 지금 서버는
+// 대상을 정규화해 보내지만(llm.js normalizeSearchTargets) 이 파일은 배포가 어긋난 서버의 값도 받는 문이다.
+const labelOf = t => (Object.prototype.hasOwnProperty.call(TARGET_LABEL, t) ? TARGET_LABEL[t] : cellText(t));
 export const targetsLabel = targets =>
-  (Array.isArray(targets) ? targets : []).map(t => TARGET_LABEL[t] ?? cellText(t)).filter(Boolean).join('·') || '전체';
+  (Array.isArray(targets) ? targets : []).map(labelOf).filter(Boolean).join('·') || '전체';
 
 // 검색 결과 문구 — '지식 2건 · 처리방법 검색 불가'. 검색 불가는 0건과 다른 말이다: 임베딩 서버가 없어
 // 찾아보지 못한 것이지 등록이 없는 것이 아니다 (서버 프롬프트도 같은 말을 쓴다). 찾지 않은 대상은 나오지 않는다.
@@ -108,7 +112,7 @@ export function applyProgress(list, e) {
       const done = {
         kind: 'query', id: e.id, query_name: cellText(e.query_name), targetDb: cellText(e.targetDb),
         rowCount: typeof e.rowCount === 'number' || typeof e.rowCount === 'string' ? e.rowCount : undefined,
-        error: typeof e.error === 'string' && e.error ? e.error : undefined, pending: false,
+        error: errorText(e.error), pending: false,
       };
       const byId = done.id !== undefined;
       const same = byId
@@ -175,16 +179,34 @@ export function normalizeTrace(trace) {
   if (!Array.isArray(trace)) return [];
   return trace
     .filter(t => t && typeof t === 'object' && !Array.isArray(t))
-    .map(t => (isSearchStep(t)
-      ? { ...(stepNo(t.step) !== undefined && { step: stepNo(t.step) }), search: t.search, targets: strings(t.targets), hits: t.hits && typeof t.hits === 'object' ? t.hits : {}, failed: strings(t.failed) }
-      : {
-        ...t,
-        step: stepNo(t.step),
-        query_name: cellText(t.query_name),
-        targetDb: cellText(t.targetDb),
-        rows: Array.isArray(t.rows) ? t.rows : undefined,
-      }));
+    .map(t => (isSearchStep(t) ? searchStep(t) : queryStep(t)));
 }
+const searchStep = t => ({
+  ...(stepNo(t.step) !== undefined && { step: stepNo(t.step) }),
+  search: t.search, targets: strings(t.targets), hits: t.hits && typeof t.hits === 'object' ? t.hits : {}, failed: strings(t.failed),
+});
+function queryStep(t) {
+  // 건수와 오류는 글자가 되는 값이다 — 진행 줄(applyProgress run_query_done)이 받는 모양과 같아야 한다.
+  // 그대로 통과시키던 동안에는 객체가 오면 패널이 '[object Object]건'·'오류: [object Object]'를 그렸다 —
+  // 죽지는 않지만 뜻 없는 글자가 화면에 나간다. 모양이 어긋난 값은 키째로 뗀다(없는 것과 같은 모양이다).
+  const { rowCount, error, ...rest } = t;
+  const count = typeof rowCount === 'number' || typeof rowCount === 'string' ? rowCount : undefined;
+  const err = errorText(error);
+  return {
+    ...rest,
+    step: stepNo(t.step),
+    query_name: cellText(t.query_name),
+    targetDb: cellText(t.targetDb),
+    rows: Array.isArray(t.rows) ? t.rows : undefined,
+    ...(count !== undefined && { rowCount: count }),
+    ...(err !== undefined && { error: err }),
+  };
+}
+
+// 오류 문구의 모양. 서버는 글자를 주지만(result.js clientTrace) 글자가 아닌 것이 와도 '오류였다'는 사실은
+// 남겨야 한다 — 버리면 실행되지 못한 스텝이 '0건'으로 읽혀 조회 성공처럼 보인다. 비었으면 오류가 아니다.
+// 진행 줄(applyProgress)과 패널(normalizeTrace)이 같은 함수를 쓴다 — 같은 스텝이 몇 초 사이에 다른 말을 하지 않게.
+const errorText = v => (v ? cellText(v) : undefined);
 
 // 이력의 절대 순번. 화면의 자식이 되는 값이라 여기서 모양을 맞춘다 — 객체가 그대로 통과하면 React가
 // '객체는 자식이 될 수 없다'로 던지고, 이 파일이 문 앞에서 값을 맞추기로 한 이유가 정확히 그것이다.

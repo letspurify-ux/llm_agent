@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { clipText, nameKey, stripLoneSurrogates, numEnv, bindValue, warnOnce, targetDbNames, joinUrl, isPlainObject,
   readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_COMPLETION_TOKENS, normalizeSearchTargets, SEARCH_TARGETS, boundedEnv,
   MAX_SEARCHES, MAX_SEARCHES_CEILING, SEARCH_LIMIT, MAX_SEARCH_LIMIT,
-  parseItemId, normalizeItemIds, MAX_EXPANDS, MAX_DOC_LEN, PROMPT_FLOORS as FLOORS } from '../src/constants.js';
+  parseItemId, normalizeItemIds, MAX_EXPANDS, MAX_DOC_LEN, MAX_EXPANDED_ITEM_LEN, MAX_PROMPT_TOTAL_LEN, PROMPT_FRAME_RESERVE, PROMPT_FLOORS as FLOORS, PROMPT_CEILINGS } from '../src/constants.js';
 
 test('절단이 서로게이트 쌍을 쪼개지 않는다', () => {
   // 쪼개면 짝 잃은 코드유닛이 남아 JSON은 통과하지만 유효한 UTF-8이 아니게 된다 —
@@ -294,7 +294,27 @@ test('자료 식별자는 접두사와 seq로만 이뤄지고, 표기 차이는 
 
 test('펼친 본문의 최악 총량이 그 섹션의 최소 몫 안에 든다', () => {
   // 둘 다 한 섹션에 몰려도 다른 후보가 함께 실릴 자리가 남아야 한다 — 이 곱을 키우려면 몫부터 다시 본다.
+  // 지식은 문서 창(MAX_DOC_LEN), 처리방법은 청크가 아닌 항목의 펼침 상한(MAX_EXPANDED_ITEM_LEN)이 그 크기다 —
+  // 둘이 같은 값이던 동안 문서 창을 넓히려면 처리방법 몫까지 함께 키워야 했다.
   assert.ok(MAX_EXPANDS * MAX_DOC_LEN < FLOORS.knowledge,
     `펼침 총량(${MAX_EXPANDS * MAX_DOC_LEN})이 지식 몫(${FLOORS.knowledge})을 넘는다`);
-  assert.ok(MAX_EXPANDS * MAX_DOC_LEN < FLOORS.qaMethods);
+  assert.ok(MAX_EXPANDS * MAX_EXPANDED_ITEM_LEN < FLOORS.qaMethods,
+    `펼침 총량(${MAX_EXPANDS * MAX_EXPANDED_ITEM_LEN})이 처리방법 몫(${FLOORS.qaMethods})을 넘는다`);
+  assert.ok(MAX_EXPANDED_ITEM_LEN <= MAX_DOC_LEN, '처리방법 펼침 상한이 문서 창보다 클 이유가 없다');
+});
+
+test('섹션 천장은 기본 몫이 있는 섹션에만, 기본 몫 이상으로 붙는다', () => {
+  // 기본보다 낮은 천장은 배분의 min(천장, max(기본, …))이 기본 몫 보장을 조용히 누른다 — 로드 시 검증(constants.js).
+  for (const [key, cap] of Object.entries(PROMPT_CEILINGS)) {
+    assert.ok(key in FLOORS, `천장 ${key}에 기본 몫이 없다`);
+    assert.ok(cap >= FLOORS[key], `천장 ${key}(${cap})이 기본 몫(${FLOORS[key]})보다 낮다`);
+  }
+  // 천장이 뜻을 가지려면 닿을 수 있어야 한다 — 앞 섹션들이 비었을 때 받는 몫(총량 − 틀 − 뒤 섹션들의 기본 합)이
+  // 천장 이상이어야 한다. 그보다 큰 천장은 한 번도 닿지 못하는 숫자라 문서만 속인다.
+  const keys = Object.keys(FLOORS);
+  for (const [key, cap] of Object.entries(PROMPT_CEILINGS)) {
+    const later = keys.slice(keys.indexOf(key) + 1).reduce((s, k) => s + FLOORS[k], 0);
+    const reach = MAX_PROMPT_TOTAL_LEN - PROMPT_FRAME_RESERVE - later;
+    assert.ok(cap <= reach, `${key} 천장(${cap})에 닿을 수 없다: 앞이 비어도 ${reach}까지만 받는다`);
+  }
 });

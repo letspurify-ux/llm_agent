@@ -26,19 +26,22 @@ const has = (name, v) => {
 };
 
 test('context.md의 상수 값이 constants.js와 같다', () => {
-  for (const name of ['MAX_PROMPT_TOTAL_LEN', 'PROMPT_FRAME_RESERVE', 'MAX_PROMPT_ITEM_LEN', 'MAX_DOC_LEN',
+  for (const name of ['MAX_PROMPT_TOTAL_LEN', 'PROMPT_FRAME_RESERVE', 'MAX_PROMPT_ITEM_LEN', 'MAX_DOC_LEN', 'MAX_EXPANDED_ITEM_LEN',
     'MAX_PROMPT_SQL_LEN', 'MAX_PROMPT_STEP_LEN', 'MAX_PROMPT_PARAMS_LEN', 'MAX_SEARCHES', 'SEARCH_LIMIT',
     'MAX_STEPS', 'MAX_BATCH_QUERIES', 'MAX_EXPANDS', 'MAX_DROPS', 'MAX_HISTORY_ROWS', 'MAX_COMPLETION_TOKENS',
     'MAX_ANSWER_LEN', 'MAX_RESULT_ROWS', 'MAX_ROWS', 'MAX_QUESTION_LEN']) {
     has(name, c[name]);
   }
   for (const [k, v] of Object.entries(c.PROMPT_FLOORS)) has(`PROMPT_FLOORS.${k}`, v);
+  for (const [k, v] of Object.entries(c.PROMPT_CEILINGS)) has(`PROMPT_CEILINGS.${k}`, v);
 });
 
 test('context.md의 몫 합계와 여유가 실제 값과 같다', () => {
   const sum = Object.values(c.PROMPT_FLOORS).reduce((a, b) => a + b, 0) + c.PROMPT_FRAME_RESERVE;
   assert.ok(md.includes(sum.toLocaleString('en-US')), `몫 합계 ${sum}이 문서에 없다`);
-  assert.ok(md.includes(`여유 ${c.MAX_PROMPT_TOTAL_LEN - sum}자`), `여유가 문서와 다르다 (${c.MAX_PROMPT_TOTAL_LEN - sum}자)`);
+  // 여유도 합계와 같은 표기(천 단위 쉼표)로 찾는다 — 200자이던 때는 표기 차이가 없어 String()으로 충분했다.
+  const slack = (c.MAX_PROMPT_TOTAL_LEN - sum).toLocaleString('en-US');
+  assert.ok(md.includes(`여유 ${slack}자`), `여유가 문서와 다르다 (${slack}자)`);
   assert.ok(md.includes(`${c.MAX_CHAT_TURNS}턴 × ${c.MAX_CHAT_LEN.toLocaleString('en-US')}자 = ${(c.MAX_CHAT_TURNS * c.MAX_CHAT_LEN).toLocaleString('en-US')}자`),
     '대화 몫 계산이 문서와 다르다');
 });
@@ -75,6 +78,10 @@ test('context.md의 답변 천장이 세 상수의 합과 같다', async () => {
 test('context.md가 말하는 관계식이 코드에서도 참이다', () => {
   assert.equal(c.MAX_HISTORY_ROWS, c.MAX_STEPS + c.MAX_SEARCHES + 1, '이력 줄 수 식이 문서와 다르다');
   assert.ok(c.MAX_EXPANDS * c.MAX_DOC_LEN < c.PROMPT_FLOORS.knowledge, '펼침 총량이 지식 몫을 넘는다');
+  assert.ok(c.MAX_EXPANDS * c.MAX_EXPANDED_ITEM_LEN < c.PROMPT_FLOORS.qaMethods, '펼침 총량이 처리방법 몫을 넘는다');
+  // 배분 순서 — 문서의 3-1 표가 코드의 선언 순서와 같아야 한다 (앞이 여유를 먼저 집는다)
+  const floorAt = Object.keys(c.PROMPT_FLOORS).map(k => md.indexOf(`\`PROMPT_FLOORS.${k}\``));
+  assert.deepStrictEqual([...floorAt].sort((a, b) => a - b), floorAt, '문서의 몫 표 순서가 코드의 배분 순서와 다르다');
   assert.deepStrictEqual(c.ITEM_PREFIX, { knowledge: 'k', qaMethods: 'm' }, '식별자 접두사가 문서와 다르다');
   // 프롬프트 블록의 순서 — 문서의 표와 실제 조립 순서가 같아야 한다
   const order = ['관련 지식', 'Q&A 처리 방법', '실행 가능한 쿼리 목록', '실행 이력 (검색·쿼리)', '최근 대화', '사용자 질문 (현재)'];

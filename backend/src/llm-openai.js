@@ -8,9 +8,9 @@
 import {
   MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK,
   MAX_PROMPT_ITEM_LEN, MAX_PROMPT_SQL_LEN, MAX_PROMPT_STEP_LEN,
-  MAX_PROMPT_PARAMS_LEN, MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS, PROMPT_FRAME_RESERVE,
+  MAX_PROMPT_PARAMS_LEN, MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS, PROMPT_CEILINGS, PROMPT_FRAME_RESERVE,
   MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, MAX_COMPLETION_TOKENS, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_BATCH_QUERIES, MAX_RESULT_ROWS,
-  MAX_EXPANDS, MAX_DOC_LEN, ITEM_PREFIX,
+  MAX_EXPANDS, MAX_DOC_LEN, MAX_EXPANDED_ITEM_LEN, ITEM_PREFIX,
   SEARCH_TARGETS, clipText, warnOnce, targetDbNames, isPlainObject, joinUrl,
   readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_UPSTREAM_ERROR_BYTES, numEnv,
   indentLines,
@@ -559,7 +559,9 @@ const itemLine = (prefix, titleKey, bodyKey) => o => {
   // '길이가 잘렸는가'가 아니라 '범위 밖에 청크가 남았는가'로 정한다(canGrow) — 청크는 잘리지
   // 않으므로 옛 판정을 그대로 두면 긴 문서에도 번호가 한 번도 붙지 않는다.
   const chunk = o.doc_seq != null;
-  const max = chunk || o.expanded ? MAX_DOC_LEN : MAX_PROMPT_ITEM_LEN;
+  // 펼친 상한은 청크(문서 창 MAX_DOC_LEN)와 청크가 아닌 항목(처리방법 — MAX_EXPANDED_ITEM_LEN)이 다르다.
+  // 같은 값이던 동안 문서 창을 넓히려면 처리방법 몫까지 함께 키워야 했다 (constants.js MAX_EXPANDED_ITEM_LEN).
+  const max = chunk ? MAX_DOC_LEN : o.expanded ? MAX_EXPANDED_ITEM_LEN : MAX_PROMPT_ITEM_LEN;
   const text = indent(o[bodyKey]);
   const askable = chunk ? canGrow(o) : (!o.expanded && text.length > max);
   // 위치 표기((3~7/22))는 제목을 자른 '뒤에' 붙인다 — 제목에 이어 붙여 넘기면 긴 제목에서 이 표기부터
@@ -832,9 +834,11 @@ function renderHistory(history, budget) {
 }
 
 // 섹션별 예산 배분 — 전체 상한 하나를 PROMPT_FLOORS 선언 순서대로 나눠준다.
-// 각 섹션의 몫 = max(자기 최소 몫, 남은 예산 - 뒤 섹션들의 최소 몫 합).
-// 뒤 섹션들의 최소 몫을 미리 떼어놓으므로 앞 섹션이 뒤를 굶기지 못하고, 앞이 짧으면 그 여유가
-// 그대로 뒤로 넘어간다 — 그래서 가장 중요한 섹션(쿼리 목록)을 맨 뒤에 두었다(constants.js 참고).
+// 각 섹션의 몫 = min(자기 천장, max(자기 최소 몫, 남은 예산 - 뒤 섹션들의 최소 몫 합)).
+// 뒤 섹션들의 최소 몫을 미리 떼어놓으므로 앞 섹션이 뒤를 굶기지 못하고, 앞이 실제로 쓴 만큼만 빠지므로
+// 앞이 짧으면 그 여유가 그대로 뒤로 넘어간다 — 천장까지. 그래서 실사용이 스스로 묶여 있는 섹션(이력·쿼리)을
+// 앞에, 여유를 쓸 수 있는 섹션(처리방법·지식)을 뒤에 두었다(constants.js 참고). 옛 순서(지식이 맨 앞)에서는
+// 지식이 뒤 세 몫을 떼고 나면 최소 몫 + 200자에 묶여, 남는 여유가 쓰지도 않는 쿼리 목록으로만 흘렀다.
 // 이 배분 덕에 어느 섹션이 얼마나 길어지든 합계는 MAX_PROMPT_TOTAL_LEN을 넘지 않는다.
 // 배분에 앞서 고정 틀의 몫(PROMPT_FRAME_RESERVE — 제목 줄·빈 줄·지시 블록)을 뗀다. 본문만 세면
 // 네 섹션이 각자 예산에 꽉 찬 요청에서 틀의 길이만큼 정확히 전체 상한을 넘는다.
@@ -850,7 +854,8 @@ function renderSections(ctx) {
   let remaining = MAX_PROMPT_TOTAL_LEN - PROMPT_FRAME_RESERVE;
   keys.forEach((key, i) => {
     const reserved = keys.slice(i + 1).reduce((sum, k) => sum + PROMPT_FLOORS[k], 0);
-    const lines = builders[key](Math.max(PROMPT_FLOORS[key], remaining - reserved));
+    const cap = PROMPT_CEILINGS[key] ?? Infinity;
+    const lines = builders[key](Math.min(cap, Math.max(PROMPT_FLOORS[key], remaining - reserved)));
     remaining -= lines.reduce((sum, line) => sum + lineCost(line), 0); // 줄마다 개행 한 칸 (lineCost)
     out[key] = lines;
   });

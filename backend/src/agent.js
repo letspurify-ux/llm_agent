@@ -10,7 +10,7 @@ import { canGrow, buildItems } from './chunk.js';
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
 import { llm, renderAnswer, clipAnswer } from './llm.js';
-import { resolveChartData, resolveTableData } from './chart.js';
+import { resolveChartData, resolveTableData, MAX_TABLE_CELL_LEN, MAX_CHART_CELL_LEN } from './chart.js';
 import { MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_DOC_LEN, MAX_PROMPT_ITEM_LEN, MAX_RESULT_ROWS, parseItemId, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_CELL_LEN, TRUNC_MARK, SEARCH_TARGETS, nameKey, clipText, stripLoneSurrogates, bindValue, targetDbNames, indentLines } from './constants.js';
 
 // MAX_STEPS는 constants.js에 있다 — 실행 이력의 프롬프트 몫이 그 값에 묶여 있다.
@@ -282,10 +282,12 @@ export function mergeFront(list, rows) {
 
 // 청크 항목의 범위를 문서당 상한(MAX_DOC_LEN)까지 넓힌다 — 본문 청구(expand)의 실제 동작.
 // 읽어올 창은 현재 범위의 앞뒤 WINDOW개다. 문서 전체를 읽지 않는 이유: 문서는 수백 청크일 수 있고,
-// 상한이 4,500자라 그 이상은 어차피 버린다. 창을 넉넉히 잡는 것은 청크가 작을 때(문서 끝의 짧은
-// 조각)를 위한 여유다 — 상한을 채우기 전에 창이 먼저 바닥나면 모델은 '더 있는데 안 준다'를 본다.
+// 상한(MAX_DOC_LEN)을 넘는 것은 어차피 버린다. 창은 한쪽만으로도 상한을 채울 만큼 잡는다 — 문서 끝에
+// 걸린 적중은 한쪽으로만 넓힐 수 있는데, 상한을 채우기 전에 창이 먼저 바닥나면 모델은 '더 있는데 안
+// 준다'를 보고 같은 번호를 다시 청구해 MAX_EXPANDS 하나를 더 태운다. 12 × 900자(CHUNK_TARGET_LEN) = 10,800 ≥ 10,000.
+// 청크가 작을 때(문서 끝의 짧은 조각)의 여유도 같은 자리다.
 // 실패하면 null을 돌려 호출부가 '진도 없음'으로 처리하게 한다 (요청을 버리지 않는다).
-const GROW_WINDOW = 8;
+const GROW_WINDOW = 12;
 // 계측에 남길 지식 적중 수 (검색 한 번당). chat_log의 trace가 요청마다 커지지 않게 상위만 센다.
 const TOP_TRACE = 5;
 
@@ -822,9 +824,14 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
 //      마크가 붙은 셀에서 마크를 떼어 넣는다 (조회 1회당 한 번, 행 × 컬럼).
 //   ② 지난 턴의 답변 — 대화 이력으로 되돌아온 텍스트 안에 '<앞부분>…(생략)'이 그대로 들어 있다.
 //      여기서는 앞부분이 어디서 시작하는지가 텍스트만 봐서는 안 보이지만, 알 필요가 없다:
-//      그 값을 자른 것이 우리고 clipText는 정확히 두 길이만 남긴다 — MAX_CELL_LEN, 그리고
-//      절단 경계가 서로게이트 쌍을 가른 경우의 MAX_CELL_LEN-1. 마크 앞에서 그 두 길이를
-//      떼어내면 화면에 실렸던 앞부분이 그대로 복원된다.
+//      그 값을 자른 것이 우리고 clipText는 정해진 길이만 남긴다. 자르는 자리가 셋이다 —
+//      드라이버 경계(MAX_CELL_LEN, oracle.js normalizeValue)와, 답변에 채워 넣는 표·차트의 칸
+//      (MAX_TABLE_CELL_LEN·MAX_CHART_CELL_LEN, chart.js) — 그리고 각각 절단 경계가 서로게이트 쌍을
+//      가른 경우의 한 칸 짧은 길이. 마크 앞에서 그 길이들을 떼어내면 화면에 실렸던 앞부분이 그대로 복원된다.
+//      뒤의 둘을 세지 않던 동안 이 가드는 반쪽이었다: 실제 LLM의 답변에서 사용자가 보는 표는 폴백 표가
+//      아니라 chart.js가 채운 표이고, 그 칸은 120자에서 다시 잘린다. 200자 앞부분은 대화 이력 어디에도
+//      없으니 모델이 옮겨 적는 것은 120자 조각인데, 그 길이는 이 집합에 없어 조회가 그대로 실행됐다(실측 —
+//      0건이 나오고 모델은 "없다"로 읽는다). 이 집합은 '우리가 어디에서 자르는가'와 같아야 한다.
 //      (앞부분을 '마크에 붙어 있는 문자열'로 찾으면 안 된다 — 그러면 마크 바로 앞에 오는 짧고
 //       정당한 값까지 전부 잘린 조각으로 오판한다. 판정은 '값 전체가 그 앞부분과 같은가'여야 한다.)
 //      대화 턴이 MAX_CHAT_LEN으로 잘려 앞부분이 온전히 남지 않았으면 복원되지 않는다 —
@@ -834,13 +841,57 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
 // (테스트에서 쓰므로 export 한다 — 양쪽으로 조용히 깨지는 판정이다: 느슨해지면 잘린 조각으로
 //  조회해 0건 오답이 나가고, 빡빡해지면 정당한 값으로 그 쿼리를 영영 실행할 수 없다.
 //  어느 쪽도 오류를 남기지 않으므로 테스트가 유일한 방어선이다 — loopGuard와 같은 이유다.)
-const CLIPPED_PREFIX_LENS = [MAX_CELL_LEN, MAX_CELL_LEN - 1];
+//
+// 두 부류로 나눠 본다. 산문의 마크는 드라이버 경계의 길이(MAX_CELL_LEN)만 본다 — 그 값은 모델의 산문("값이
+// abc…(생략) 입니다")에도 실릴 수 있어 시작을 알 방법이 없으니 길이로 되돌아간다. 표의 칸(GFM 표 행)은 시작을 안다 —
+// 이스케이프되지 않은 '|'가 칸의 경계다 — 그래서 칸의 시작부터 마크까지를 통째로 되돌린다.
+//
+// 칸에서는 '마크에서 자른 길이만큼 되돌아가는' 방식을 쓰면 안 된다. 표·차트의 칸(chart.js tableCell·cell)과 폴백 표
+// (llm.js cell)는 값을 자른 '뒤에' GFM 이스케이프를 건다 — 역슬래시는 둘로, 파이프는 '\|'로, 개행은 공백으로. 칸에
+// 실린 글자 수가 자른 길이와 달라지므로, 값에 '|'나 '\'가 든 순간(경로·로그 메시지) 그 길이만큼 되돌아간 자리는
+// 칸의 시작이 아니다(실측 — 'a|'가 되풀이되는 300자 값에서 120자 조각도 이스케이프된 표시도 걸리지 않았다).
+// 이 함수가 존재하는 이유가 '잘린 조각으로 조회해 0건을 얻고 그것을 없다고 단정하는' 실패인데, 긴 값에 파이프·
+// 역슬래시가 드는 것은 그 실패가 가장 흔한 자리(자유 텍스트 컬럼)에서 흔하다.
+// 되돌린 값이 우리가 자르는 길이(드라이버 경계·표·차트의 칸, 각각의 서로게이트 한 칸 짧은 길이) 중 하나일 때만 넣는다.
+// 길이 조건을 남기는 이유는 종전과 같다 — 마크에 붙은 문자열이면 무엇이든 넣으면, 모델이 스스로 줄여 쓴
+// '서울시…(생략)' 같은 칸에서 '서울시'가 잘린 조각이 되어 그 정당한 값으로는 어떤 쿼리도 실행할 수 없다.
+// 이스케이프를 되돌린 값과 보이는 그대로의 값을 둘 다 넣는다 — 모델이 옮겨 적는 것이 어느 쪽인지는 정할 수 없다.
+const DRIVER_CLIP_LENS = [MAX_CELL_LEN, MAX_CELL_LEN - 1];
+const CELL_CLIP_LENS = [MAX_TABLE_CELL_LEN, MAX_CHART_CELL_LEN].flatMap(n => [n, n - 1]);
+const CLIP_LENS = new Set([...DRIVER_CLIP_LENS, ...CELL_CLIP_LENS]);
+
+// GFM 칸의 이스케이프를 되돌린다 — 쓰는 쪽(chart.js cell·tableCell, llm.js cell)과 프런트(frontend/src/chart.js
+// splitRow)가 같은 두 규칙을 쓴다. 개행을 공백으로 바꾼 것은 되돌릴 수 없다(그 값은 모델도 공백으로 본다).
+const unescapeCell = s => s.replace(/\\([\\|])/g, '$1');
+
+// 마크(markAt)가 든 GFM 표 행에서, 그 칸의 시작부터 마크 직전까지 보이는 글자. 표의 행이 아니면 null.
+// 칸의 경계는 이스케이프되지 않은 '|'다 — 앞의 연속 역슬래시가 홀수면 값 속의 파이프('\|')이고 짝수면 구분자다
+// ('\\|'는 역슬래시 하나 뒤의 구분자). 쓰는 쪽은 구분자 뒤에 공백 하나를 두므로 그 한 칸만 뗀다 — trim으로 다
+// 떼면 값 앞의 공백이 사라져 원본과 어긋난다.
+function cellShownBefore(text, markAt) {
+  const lineStart = text.lastIndexOf('\n', markAt - 1) + 1;
+  let i = markAt - 1;
+  for (; i >= lineStart; i--) {
+    if (text[i] !== '|') continue;
+    let backslashes = 0;
+    for (let j = i - 1; j >= lineStart && text[j] === '\\'; j--) backslashes++;
+    if (backslashes % 2 === 0) break;
+  }
+  if (i < lineStart) return null;
+  const shown = text.slice(i + 1, markAt);
+  return shown.startsWith(' ') ? shown.slice(1) : shown;
+}
 
 export function clippedCopyDetector(chat) {
   const clipped = new Set();
   const addFromMark = (text, markAt) => {
-    for (const len of CLIPPED_PREFIX_LENS) {
+    for (const len of DRIVER_CLIP_LENS) {
       if (markAt >= len) clipped.add(text.slice(markAt - len, markAt));
+    }
+    const shown = cellShownBefore(text, markAt);
+    if (shown) {
+      const raw = unescapeCell(shown);
+      if (CLIP_LENS.has(raw.length)) { clipped.add(raw); clipped.add(shown); }
     }
   };
   for (const { text } of chat) {

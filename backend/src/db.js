@@ -37,7 +37,7 @@ const POOL_SIZE = CONNS_PER_REQUEST * CONCURRENT_REQUESTS + RESERVED_FOR_SYNC;
 // MySQL의 max_execution_time(읽기 전용)과 달리 DML에도 걸리고, 커넥터는 커넥션마다
 // `SET max_statement_time=<초>`를 한 번 발행한다(mariadb/lib/connection.js).
 // 그래서 요청 경로 밖의 쓰기도 이 상한 안에서 끝나야 한다:
-//   embed-sync의 `REPLACE INTO vec_store` (1024차원 벡터 배치 + VECTOR INDEX 갱신)
+//   embed-sync의 `REPLACE INTO vec_<소스>` (1024차원 벡터 배치 + VECTOR INDEX 갱신 — search.js vecTable)
 //   보존 정책의 `DELETE FROM chat_log`
 // 둘 중 하나가 상한을 넘기면 'Query execution was interrupted'로 끊기고 로그에는
 // '[embed] batch store failed' / '[chat_log] cleanup failed'만 남는다 — 메시지에 타임아웃이라는
@@ -119,7 +119,7 @@ export async function closePool() {
 // 이하에서는 이 결과가 곧 프롬프트에 실리는 목록이라 '에이전트가 도달할 수 있는 쿼리 집합'이
 // 재시작마다 달라지면서 아무 로그도 남기지 않는다.
 // 형제 로더(loadQueriesByNames)가 호출부 순서를 복원하는 것과 같은 이유다 — 그쪽만 고쳐져 있었다.
-// 정렬 키는 PK(seq) = 등록 순서다. 관련도 순서는 호출부가 검색 결과로 따로 만든다(agent.js rankQueries).
+// 정렬 키는 PK(seq) = 등록 순서다. 관련도 순서는 호출부가 검색 결과로 따로 만든다(agent.js selectQueries).
 export function loadQueryRegistry(limit) {
   return limit === undefined
     ? query('SELECT * FROM query_registry ORDER BY seq')
@@ -169,7 +169,7 @@ export async function loadQueriesByNames(names) {
 // 없는데(VARCHAR(100)) 한국어는 조사가 낱말에 붙어 '배치상태조회를'이 한 낱말이므로, 공백으로
 // 나눠서는 이름의 끝을 알 수 없다. 실제로 앞선 구현의 추출식(/[A-Za-z_][A-Za-z0-9_]{2,}/)은
 // 한글 이름과 1~2자 이름을 한 번도 뽑지 못했고, 그 쿼리들은 경로A에서 통째로 빠졌다 —
-// 오류는 남지 않고 다단계 절차의 순서 보장만 조용히 사라진다 (agent.js rankQueries 주석 참고).
+// 오류는 남지 않고 다단계 절차의 순서 보장만 조용히 사라진다 (agent.js selectQueries 주석 참고).
 //
 // LIKE가 아니라 LOCATE를 쓴다. LIKE는 패턴 쪽이 컬럼이 되어 query_name 안의 '_'와 '%'가
 // 와일드카드로 살아나는데, query_name은 snake_case라 '_'가 거의 항상 들어 있다

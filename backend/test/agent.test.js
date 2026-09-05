@@ -316,6 +316,76 @@ test('잘린 셀의 앞부분만 옮겨 적은 바인드 값을 걸러낸다', (
   }
 });
 
+// 실제 LLM의 답변에서 사용자가 보는 표는 폴백 표(llm.js)가 아니라 chart.js가 채운 표다 — 그 칸은 120자에서
+// 다시 잘리고, 그 답변이 다음 턴의 대화 이력으로 되돌아온다. 그때 모델이 옮겨 적는 것은 200자가 아니라 120자
+// 조각인데, 가드가 드라이버 경계의 길이만 알던 동안 그 조각은 그대로 실행 경계를 지나 0건 오답이 됐다(실측).
+// 가드가 아는 길이는 '우리가 자르는 모든 자리'와 같아야 한다 — 표·차트의 칸과, 각각의 서로게이트 한 칸 짧은 길이.
+test('답변 표·차트에서 잘린 칸의 앞부분도 잘린 조각으로 걸러낸다', async () => {
+  const { resolveTableData, resolveChartData, MAX_TABLE_CELL_LEN, MAX_CHART_CELL_LEN } = await import('../src/chart.js');
+  const { normalizeCells } = await import('../src/oracle.js');
+  // 조회 DB의 값 500자 → 드라이버 경계가 200자로 자르고, 답변 표가 다시 120자로 자른다
+  const rows = [normalizeCells({ ID: 'A1', MEMO: 'm'.repeat(500), NOTE: 'n'.repeat(MAX_CHART_CELL_LEN + 30) })];
+  const answer = resolveChartData(
+    resolveTableData('결과:\n```table\nstep: 1\n```\n```chart\ntype: bar\ntitle: t\nx: NOTE\ny: ID\ndata: step 1\n```', [rows]), [rows]);
+  const d = clippedCopyDetector([{ role: 'assistant', text: answer }]);
+  assert.equal(d.isCopy('m'.repeat(MAX_TABLE_CELL_LEN)), true, '표의 칸에서 잘린 120자 앞부분을 옮겨 적은 값');
+  assert.equal(d.isCopy('n'.repeat(MAX_CHART_CELL_LEN)), true, '차트의 칸에서 잘린 60자 앞부분을 옮겨 적은 값');
+  assert.equal(d.isCopy('m'.repeat(MAX_CELL_LEN)), false, '200자 앞부분은 이 답변 어디에도 실리지 않았다 — 이력에 없는 조각을 지어낼 수는 없다');
+  // 서로게이트 경계에서 한 칸 짧게 잘린 칸도 같은 집합에 든다
+  const short = 'a'.repeat(MAX_TABLE_CELL_LEN - 1) + '😀😀';
+  const d2 = clippedCopyDetector([{ role: 'assistant', text: resolveTableData('```table\nstep: 1\n```', [[{ E: short }]]) }]);
+  assert.equal(d2.isCopy('a'.repeat(MAX_TABLE_CELL_LEN - 1)), true);
+  // 자른 적 없는 값은 길이가 같아도 통과한다 — 길이 판정으로 되돌아가면 정당한 값을 영영 거부한다
+  for (const n of [MAX_TABLE_CELL_LEN, MAX_TABLE_CELL_LEN - 1, MAX_CHART_CELL_LEN, MAX_CHART_CELL_LEN - 1]) {
+    assert.equal(d.isCopy('z'.repeat(n)), false, `자른 적 없는 ${n}자 값은 통과해야 한다`);
+  }
+  // 실행 경계까지 — 표의 120자 조각으로는 조회가 시작되지 않는다
+  const { runQuery } = await import('../src/oracle.js');
+  process.env.ORACLE_MOCK = '1';
+  const row = { query_name: 'find_customer_id', query_sql: 'SELECT 1 FROM T WHERE CUSTOMER_NAME = :customer_name', target_db_name: 'D' };
+  await assert.rejects(
+    runQuery(row, { customer_name: 'm'.repeat(MAX_TABLE_CELL_LEN) }, d.isCopy),
+    e => e.safe === true && /잘린 값/.test(e.message),
+    '표의 120자 조각이 실행 경계를 그대로 지났다'
+  );
+});
+
+// 표·차트의 칸과 폴백 표는 값을 자른 '뒤에' GFM 이스케이프를 건다(역슬래시 둘, 파이프 '\\|', 개행은 공백) —
+// 칸에 실린 글자 수가 자른 길이와 달라진다. 마크에서 자른 길이만큼 되돌아가 '| '를 확인하던 판정은 값에 '|'나 '\\'가
+// 들면 칸의 시작에 닿지 못해 앞부분을 하나도 넣지 못했다(실측 — 'a|'가 되풀이되는 300자 값에서 120자 조각도
+// 보이는 그대로의 표시도 통과했다). 경로·로그 메시지 같은 자유 텍스트가 정확히 그 값이고, 그것이 잘린 채 바인드로
+// 되돌아오면 0건 오답이 된다. 칸의 경계(이스케이프되지 않은 '|')에서 시작해 이스케이프를 되돌린 값으로 판정한다.
+test('파이프·역슬래시가 든 잘린 칸도 앞부분을 걸러낸다 — 보이는 그대로도, 되돌린 값도', async () => {
+  const { resolveTableData, resolveChartData, MAX_TABLE_CELL_LEN, MAX_CHART_CELL_LEN } = await import('../src/chart.js');
+  const { normalizeCells } = await import('../src/oracle.js');
+  const { renderAnswer } = await import('../src/llm.js');
+  const piped = 'a|'.repeat(150);                       // 300자 — 드라이버가 200자로, 표가 120자로, 차트가 60자로 자른다
+  const slashed = 'C:\\dir\\'.repeat(40);                 // 280자 — 역슬래시가 칸에서 둘로 늘어난다
+  const rows = [normalizeCells({ P: piped, S: slashed })];
+  const answer = resolveChartData(
+    resolveTableData('```table\nstep: 1\n```\n```chart\ntype: bar\ntitle: t\nx: P\ny: S\ndata: step 1\n```', [rows]), [rows]);
+  const d = clippedCopyDetector([{ role: 'assistant', text: answer }]);
+  for (const [label, raw, n] of [['표', piped, MAX_TABLE_CELL_LEN], ['표', slashed, MAX_TABLE_CELL_LEN], ['차트', piped, MAX_CHART_CELL_LEN], ['차트', slashed, MAX_CHART_CELL_LEN]]) {
+    const prefix = raw.slice(0, n);
+    assert.equal(d.isCopy(prefix), true, `${label}의 칸에서 잘린 ${n}자 앞부분(되돌린 값)`);
+    assert.equal(d.isCopy(prefix.replace(/\\/g, '\\\\').replace(/\|/g, '\\|')), true, `${label}의 칸에 보이는 그대로의 앞부분`);
+  }
+  // 폴백 표(llm.js)는 드라이버 경계의 값(200자 + 표시)을 그대로 싣는다 — 같은 이스케이프, 같은 판정
+  const fallback = renderAnswer({ knowledge: [], history: [{ query_name: 'q', rows }] });
+  const d2 = clippedCopyDetector([{ role: 'assistant', text: fallback }]);
+  assert.equal(d2.isCopy(piped.slice(0, MAX_CELL_LEN)), true, '폴백 표의 200자 앞부분(되돌린 값)');
+  assert.equal(d2.isCopy(slashed.slice(0, MAX_CELL_LEN)), true);
+  // 길이 판정은 그대로다 — 모델이 스스로 줄여 쓴 칸의 앞부분은 잘린 조각이 아니다. 그 값으로 조회할 수 있어야 한다.
+  const d3 = clippedCopyDetector([{ role: 'assistant', text: `| C-1001 | 서울시${TRUNC_MARK} |\n| a\\|b${TRUNC_MARK} | x |` }]);
+  assert.equal(d3.isCopy('서울시'), false, '모델이 줄여 쓴 칸');
+  assert.equal(d3.isCopy('a|b'), false, '되돌린 길이가 우리가 자르는 길이가 아니면 넣지 않는다');
+  // 산문의 마크는 종전과 같이 드라이버 경계의 길이만 본다 — 칸이 아니므로 시작을 알 수 없다
+  const prose = `값은 ${'z'.repeat(MAX_CELL_LEN)}${TRUNC_MARK} 입니다`;
+  const d4 = clippedCopyDetector([{ role: 'assistant', text: prose }]);
+  assert.equal(d4.isCopy('z'.repeat(MAX_CELL_LEN)), true);
+  assert.equal(d4.isCopy('z'.repeat(MAX_TABLE_CELL_LEN)), false, '산문에서 짧은 길이를 잡으면 마크 앞의 정당한 값을 거부한다');
+});
+
 test('잘린 값 판정이 실행 경계와 이어져 있다', async () => {
   // 판정자를 만드는 곳(agent)과 쓰는 곳(oracle)이 갈라지면 가드가 통째로 무력해지는데,
   // 그 실패는 '조회가 0건'으로만 보여 오류를 남기지 않는다.
@@ -1133,10 +1203,15 @@ test('청구로 넓힌 항목이 더 넓힐 수 없게 되면 번호가 사라�
 test('검색 시점에 이웃을 못 읽은 항목이 청구로도 늘지 않으면 그 사실을 알리고 번호를 뗀다', async () => {
   const restore = silence();
   try {
-    const rows = Array.from({ length: 8 }, (_, i) => CH(1, i + 1, 1000, 8));
-    // 계획된 범위(1~5)만 읽힌 항목 — 이웃 6번을 모르니 번호가 붙는다. 청구해 읽어 보면 6번(1,000자)은 안 들어간다.
-    const [item] = buildItems([{ doc_seq: 1, rep: 2, from: 1, to: 5, chunk_of: 8, dist: 0.3 }], rows.slice(0, 5));
+    // 1,000자 청크(겹침 150자를 떼면 이음매마다 850자)로 문서 창(MAX_DOC_LEN)을 거의 채우는 범위를 잡는다 —
+    // 10,000자 창이면 11개(9,500자)가 들고 12번째(10,350자)는 안 들어간다. 창을 바꾸면 이 수부터 다시 본다.
+    const planned = 11;
+    const rows = Array.from({ length: planned + 3 }, (_, i) => CH(1, i + 1, 1000, planned + 3));
+    // 계획된 범위(1~planned)만 읽힌 항목 — 다음 이웃을 모르니 번호가 붙는다. 청구해 읽어 보면 그 이웃은 안 들어간다.
+    const [item] = buildItems([{ doc_seq: 1, rep: 2, from: 1, to: planned, chunk_of: planned + 3, dist: 0.3 }], rows.slice(0, planned));
     assert.ok(canGrow(item) && !item.full, '이 시나리오는 검색 시점에 번호가 붙어야 뜻이 있다');
+    assert.ok(item.content.length < MAX_DOC_LEN && item.content.length + 850 > MAX_DOC_LEN,
+      `이 시나리오는 범위가 창을 거의 채워야 뜻이 있다: ${item.content.length} / ${MAX_DOC_LEN}`);
     const llm = scripted([
       { action: 'search', text: 'x', targets: ['knowledge'] },
       { action: 'expand', ids: [`k${item.seq}`] },

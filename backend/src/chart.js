@@ -15,7 +15,7 @@
 // 실패는 한쪽으로만 열린다: 참조를 채우지 못하면 블록을 짧은 안내 문장으로 바꾼다 — 채우지 못한 블록을
 // 그대로 두면 프런트가 설정 줄만 든 코드블록을 보여주고, 사용자는 그것이 무엇인지 알 수 없다.
 
-import { nameKey, clipText } from './constants.js';
+import { nameKey, clipText, TRUNC_MARK } from './constants.js';
 
 // x·y·y2 지정이 없을 때 싣는 열 수. 넓은 결과(SELECT *)를 그대로 실으면 표가 화면을 넘고, 프런트도
 // 시리즈 6개까지만 그린다.
@@ -49,9 +49,21 @@ const CONFIG_RE = /^\s*(type|title|x|y|y2|xtype|data)\s*:\s*(.*?)\s*$/i;
 // 역슬래시는 GFM의 이스케이프 글자라 그것부터 두 개로 만든다 — 값 `a\|b`를 파이프만 바꿔 `a\\|b`로 적으면
 // GFM은 `\\`를 역슬래시 하나로 읽고 남은 `|`에서 칸을 갈라 '표로 보기'의 열이 밀린다(프런트 splitRow는
 // 이 두 이스케이프를 GFM과 같은 규칙으로 되돌린다).
+//
+// 자른 셀에는 TRUNC_MARK를 붙인다 — 이 저장소의 다른 절단(oracle.js normalizeValue, llm-openai.js clip)과 같은
+// 규칙이다. 표시 없이 자르던 동안 두 가지가 조용히 어긋났다(실측). ① 사용자는 표의 값을 온전한 값으로 읽는다 —
+// 드라이버 경계는 200자에서 표시를 붙이는데 그 표시까지 여기서 함께 잘려 나갔다. ② 그 답변은 다음 턴의 대화 이력으로
+// 되돌아오고, 모델이 표의 값을 바인드로 옮겨 적으면 잘린 값 가드(agent.js clippedCopyDetector)는 표시를 근거로
+// 앞부분을 찾으므로 표시가 없는 이 절단은 한 번도 인식하지 못했다 — 잘린 조각으로 조회가 실행돼 0건이 나오고
+// 모델은 그것을 "없다"로 읽는다. 표시가 붙으면 모델은 시스템 프롬프트의 규칙(표시로 끝나는 값은 바인드로 쓰지
+// 마라)을 받고, 앞부분만 옮겨 적어도 가드가 이 길이(MAX_TABLE_CELL_LEN·MAX_CHART_CELL_LEN)의 앞부분을 안다.
+const marked = (v, max) => {
+  const s = String(v);
+  return s.length > max ? clipText(s, max) + TRUNC_MARK : s;
+};
 const cell = v => {
   if (v === null || v === undefined) return '';
-  const s = typeof v === 'number' ? String(v) : clipText(String(v), MAX_CHART_CELL_LEN);
+  const s = typeof v === 'number' ? String(v) : marked(v, MAX_CHART_CELL_LEN);
   return s.replace(/\r\n?|\n/g, ' ').replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
 };
 
@@ -168,10 +180,10 @@ export const MAX_TABLE_INJECT_LEN = 30_000;  // 답변 하나에 채워 넣는 �
 const TABLE_FENCE_RE = /^([ \t]*)((`|~)\3{2,})[ \t]*table(?:[ \t]+[^\r\n]*)?\r?\n(?:([\s\S]*?)\r?\n)??[ \t]*\2\3*[ \t]*\r?$/gim;
 const TABLE_CONFIG_RE = /^\s*(step|data|cols|limit)\s*:\s*(.*?)\s*$/i;
 
-// 표의 칸 — 차트의 cell과 같은 이스케이프, 상한만 다르다.
+// 표의 칸 — 차트의 cell과 같은 이스케이프·같은 절단 표시, 상한만 다르다 (cell 주석 참고).
 const tableCell = v => {
   if (v === null || v === undefined) return '';
-  const s = typeof v === 'number' ? String(v) : clipText(String(v), MAX_TABLE_CELL_LEN);
+  const s = typeof v === 'number' ? String(v) : marked(v, MAX_TABLE_CELL_LEN);
   return s.replace(/\r\n?|\n/g, ' ').replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
 };
 

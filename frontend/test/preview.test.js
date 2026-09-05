@@ -55,3 +55,13 @@ test('보통 코드 펜스 안의 chart·table·mermaid 줄은 건드리지 않�
   // CRLF로 온 펜스도 닫힘을 알아본다
   assert.equal(previewMarkdown('글\r\n```table\r\nstep: 1\r\n```\r\n끝'), `글\r\n${PLACEHOLDER}\n끝`);
 });
+
+// 언어 이름의 대소문자. 그리는 쪽(App.jsx codeOf)·이력(chart.js CHART_FENCE_RE)·서버(backend chart.js)가 모두 가리지
+// 않는데 여기만 가리면, ```Chart 블록이 미리보기에서 자리 표시가 아니라 차트로 그려져 '조회 결과를 채우지 못했습니다'라는
+// 거짓 안내가 답이 오기까지 떠 있고, 반쯤 온 ```Mermaid 는 그림으로 그려져 파스 오류 경고를 콘솔에 남긴다(실측).
+test('펜스의 언어 이름은 대소문자를 가리지 않는다 — 그리는 쪽과 같은 규칙이다', () => {
+  assert.equal(previewMarkdown('글\n\n```Chart\ntype: bar\ndata: step 1\n```'), `글\n\n${PLACEHOLDER}`);
+  assert.equal(previewMarkdown('글\n\n```MERMAID\nflowchart LR\n  A --'), `글\n\n${PLACEHOLDER}`);
+  assert.equal(previewMarkdown('~~~Table\nstep: 1\n~~~'), PLACEHOLDER);
+  assert.equal(previewMarkdown('```Charts\nx'), '```Charts\nx', '이어지는 낱말은 여전히 다른 언어다');
+});

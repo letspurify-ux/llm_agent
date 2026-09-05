@@ -12,8 +12,10 @@
 // 핵심은 '언제' 판정하느냐다. 원문을 우리가 먼저 훑으면 파서가 이미 아는 것(여기는 코드다, 여기는
 // 링크 주소다, 이 줄은 인용문이다)을 전부 다시 알아내야 한다 — 코드펜스·인라인 코드·URL·링크 목적지·
 // 인용문 접두사·CRLF를 하나씩 따로 막아야 하고, 빠뜨린 자리마다 조용한 버그가 된다(전부 실측했다).
-// 그래서 파싱이 끝난 뒤 '순수 텍스트 노드' 안에서만 판정한다. 코드·주소·인용문 표시는 그 시점에
-// 이미 다른 노드로 갈라져 있어 우리 눈에 들어오지도 않는다. 남는 판정은 금액과 수식을 가르는 것뿐이다.
+// 그래서 파싱이 끝난 뒤 '순수 텍스트 노드' 안에서만 판정한다. 코드·주소는 그 시점에 이미 다른 노드로
+// 갈라져 있어 우리 눈에 들어오지도 않는다. 노드가 여러 줄에 걸치면 원문 조각의 줄 앞뒤에 파서가 뗀 것
+// (인용문의 >, 목록의 들여쓰기, 소프트 줄바꿈의 공백)이 남는데, 그것은 아래 alignedRaw가 파서와 같은 규칙으로
+// 떼어 낸다. 남는 판정은 금액과 수식을 가르는 것뿐이다.
 //
 // 판정에는 원문이 필요하다(node.position). 파서가 만든 값에서는 \( 의 백슬래시가 이미 떨어져 나가
 // 평범한 '('와 구별되지 않기 때문이다.
@@ -111,16 +113,36 @@ const escapedAt = (raw, i) => {
   return n % 2 === 1;
 };
 
+// 텍스트 노드의 원문을 파서가 만든 값과 줄 단위로 맞춘다. 파서는 줄 사이에서 셋을 뗀다 — 컨테이너 표시(인용문의 >,
+// 목록 항목의 들여쓰기), 소프트 줄바꿈 앞뒤의 공백, 백슬래시 이스케이프. 원문 조각을 통째로 값과 비교하던 동안에는
+// 앞의 둘이 든 노드가 전부 '다르다'로 걸려, 두 줄 넘게 이어 쓴 목록 항목·인용문 안의 수식이 하나도 그려지지
+// 않았다(실측: '- 항목 $x$ 는\n  이어서 $y$'에서 둘 다 원문으로 남았다 — 한 줄로 쓰면 그려지는 같은 글이다).
+// 줄마다 파서가 뗀 것을 원문에서도 떼어 값과 같은 모양으로 만든 뒤 비교한다. 첫 줄의 앞과 마지막 줄의 뒤는
+// 손대지 않는다 — 그 자리의 공백은 이웃 노드(*강조* 뒤의 ' b')와의 경계라 값에도 그대로 있다.
+// 되돌린 원문이 값과 다르면(엔티티 등) null — 그 노드는 건드리지 않는다. 원문 조각을 그대로 내보내면 &amp; 같은
+// 것이 화면에 그대로 보인다.
+function alignedRaw(raw, value) {
+  const rawLines = raw.split('\n');
+  const valLines = String(value ?? '').split('\n');
+  if (rawLines.length !== valLines.length) return null;
+  const last = rawLines.length - 1;
+  const lines = rawLines.map((line, i) => {
+    if (i > 0) line = line.replace(/^[ \t>]*/, '');
+    if (i < last) line = line.replace(/[ \t]+(\r?)$/, '$1');
+    return line;
+  });
+  return lines.every((line, i) => unescapeMd(line) === valLines[i]) ? lines.join('\n') : null;
+}
+
 // 텍스트 노드 하나를 [글자, 수식, 글자, …]로 쪼갠다. 쪼갤 것이 없으면 null.
 function splitText(node, source) {
   const from = node.position?.start?.offset;
   const to = node.position?.end?.offset;
   if (from === undefined || to === undefined) return null;
-  const raw = source.slice(from, to);
-  if (!raw.includes('$') && !raw.includes('\\')) return null;
-  // 원문을 글자로 되돌린 것이 파서가 만든 값과 다르면(엔티티 등) 이 노드는 건드리지 않는다 —
-  // 원문 조각을 그대로 내보내면 &amp; 같은 것이 화면에 그대로 보인다.
-  if (unescapeMd(raw) !== node.value) return null;
+  const slice = source.slice(from, to);
+  if (!slice.includes('$') && !slice.includes('\\')) return null;
+  const raw = alignedRaw(slice, node.value);
+  if (raw === null) return null;
 
   const parts = [];
   let last = 0;
@@ -181,7 +203,10 @@ function displayParagraph(node, source) {
       continue;
     }
     if (child.type !== 'text') return null;
-    const raw = source.slice(from, child.position.end.offset);
+    // 인용문·목록 안에서는 원문 줄 앞에 컨테이너 표시가 남아 있다 — 값과 맞춘 원문으로 본다(alignedRaw).
+    // 그러지 않으면 '> \[a\]\n> \[b\]'의 둘째 줄 앞 '>'가 '덩어리 밖의 글자'로 읽혀 별행이 되지 못한다.
+    const raw = alignedRaw(source.slice(from, child.position.end.offset), child.value);
+    if (raw === null) return null;
     if (!raw.trim()) continue; // 수식 사이의 줄바꿈·공백
     const parts = [...raw.matchAll(BRACKET_ALL_RE)].filter(m => m[1].trim());
     // 덩어리 밖에 글자가 남으면 그것은 문장이다

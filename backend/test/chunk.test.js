@@ -182,13 +182,15 @@ test('expand는 대표를 중심으로 양쪽으로 넓히고 문서당 상한�
 // 보여준 청크가 새로 딸려온 것에 밀려 사라진다 — 모델은 방금 읽은 대목이 없어진 프롬프트를 받는다.
 test('expand는 이미 실린 범위를 절대 줄이지 않는다', () => {
   // 청크가 커서(1,000자) 상한 4,500자에 네 개면 꽉 찬다 — 균형을 다시 잡으면 뒤쪽이 밀려난다.
+  // 상한을 일부러 빠듯하게 준다(기본 MAX_DOC_LEN은 더 넓어 이 시나리오가 성립하지 않는다).
+  const tight = 4500;
   const rows = Array.from({ length: 22 }, (_, i) => row(1, i + 1, 1000));
   const [item] = buildItems(
     [{ doc_seq: 1, rep: 10, from: 10, to: 13, chunk_of: 22, dist: 0.3 }],
-    rows, { grow: true }
+    rows, { grow: true, maxDocLen: tight }
   );
   assert.ok(item.from <= 10 && item.to >= 13, `이미 실린 10~13이 줄었다: ${item.from}~${item.to}`);
-  assert.ok(item.content.length <= MAX_DOC_LEN);
+  assert.ok(item.content.length <= tight);
 });
 
 test('문서 끝에 붙은 범위는 남은 한쪽으로만 넓힌다', () => {
@@ -260,10 +262,10 @@ test('읽어 오지 않은 이웃은 모른다 — full은 서지 않고 번호�
 });
 
 test('검색 시점에 이웃을 읽었으면 그 자리에서 full이 확정된다', () => {
-  // 계획된 범위(1~5, 1,000자씩 — 겹침을 뗀 뒤 4,412자)는 꽉 찼고 이웃 6번은 안 들어간다(5,265자).
-  // 번호 없이 실려야 한다.
+  // 상한을 일부러 빠듯하게 준다(4,500 — 기본 MAX_DOC_LEN은 더 넓다). 계획된 범위(1~5, 1,000자씩 — 겹침을 뗀 뒤
+  // 4,412자)는 꽉 찼고 이웃 6번은 안 들어간다(5,265자). 번호 없이 실려야 한다.
   const rows = Array.from({ length: 6 }, (_, i) => row(1, i + 1, 1000, 8));
-  const [item] = buildItems([{ doc_seq: 1, rep: 2, from: 1, to: 5, chunk_of: 8, dist: 0.3 }], rows);
+  const [item] = buildItems([{ doc_seq: 1, rep: 2, from: 1, to: 5, chunk_of: 8, dist: 0.3 }], rows, { maxDocLen: 4500 });
   assert.deepStrictEqual([item.from, item.to], [1, 5]);
   assert.equal(item.full, true);
   assert.ok(!canGrow(item));

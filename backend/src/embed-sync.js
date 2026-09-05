@@ -26,7 +26,7 @@ import { splitContent, CHUNK_TARGET_LEN, CHUNK_MAX_LEN, CHUNK_OVERLAP, CHUNK_SPL
 const CHUNK_RULE = `chunk:${CHUNK_TARGET_LEN}:${CHUNK_MAX_LEN}:${CHUNK_OVERLAP}:v${CHUNK_SPLIT_VERSION}`;
 
 // 임베딩 원문 — 검색 대상 컬럼(search.js)을 이어붙여 "이 행이 무엇인지"를 표현한다.
-// 검색과 같은 정의를 써야 LIKE와 벡터가 서로 다른 내용을 보지 않는다.
+// 검색 대상 컬럼의 단일 정의(search.js)를 여기서도 쓴다 — 두 곳이 갈라지면 벡터가 담은 내용과 검색이 맞추려는 내용이 어긋난다.
 // 원문 상한을 여기서 적용한다 — 모델 입력 한도를 넘는 행 하나가 배치 전체(32건)를 실패시키는 것을
 // 애초에 막는다. 원본 컬럼은 TEXT(최대 64KB)라 등록만으로 한도를 넘길 수 있다.
 // 변경 감지 해시는 자르기 전의 원문 전체로 DB가 계산한다(hashExpr) — 상한 밖(4000자 이후)만 바뀐
