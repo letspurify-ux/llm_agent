@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { splitContent, buildItems, planRanges } from '../src/chunk.js';
+import { splitContent, buildItems, planRanges, canGrow } from '../src/chunk.js';
 import { knowledgeView } from '../src/context-items.js';
 import { handleQuestion, mergeFront } from '../src/agent.js';
 import { buildPrompt } from '../src/llm-openai.js';
@@ -52,6 +52,62 @@ test('병합이 문서 표시 상한을 넘겨도 보관한 청크를 잃지 않
   assert.ok(view.reduce((n, r) => n + indentLines(r.content).length, 0) <= MAX_DOC_LEN);
   const visible = view.flatMap(r => r.chunks.map(c => c.seq));
   assert.equal(new Set(visible).size, visible.length);
+});
+
+// 검색은 계획된 범위의 앞뒤 한 조각을 함께 읽어 '이웃이 문서당 상한에 들어가지 않는다'(full)를 확정한다(search.js).
+// 같은 구간이 다음 검색에 다시 적중하면 병합(absorbKnowledge)이 그 판정을 지운 채 두 구간의 청크만으로 다시 세웠고 —
+// 이웃을 모르니 false — '(확대 가능)'이 되살아났다. 그 표시를 따라 청구한 모델은 한 글자도 늘지 않은 채
+// '더 넓힐 수 없다' 안내와 헛돈 스텝을 받았다(실측). 한쪽이 full이면 합친 구간도 full이다(합친 구간이 그쪽을 품는다).
+test('같은 구간을 다시 검색해도 검색이 확정한 full 판정과 확대 표시 없음은 유지된다', async () => {
+  const rows = source();
+  // 한 절(10~25번)이 통째로 적중 → 계획 범위가 상한(MAX_DOC_LEN)에 닿아 full이 선다
+  const hitSpan = (from, to) => {
+    const hits = rows.slice(from - 1, to).map((r, i) => ({ ...r, _dist: .3 + i / 1000 }));
+    const plans = planRanges(hits);
+    const loaded = rows.filter(r => plans.some(p => r.chunk_no >= p.from - 1 && r.chunk_no <= p.to + 1));
+    return buildItems(plans, loaded, { maxDocLen: MAX_DOC_LEN });
+  };
+  const [first] = hitSpan(10, 25);
+  assert.equal(first.full, true, '전제: 검색이 이웃을 읽어 full을 확정했다');
+  assert.equal(canGrow(first), false);
+
+  // 단위: 같은 구간·부분 구간의 재검색은 판정을 지우지 않는다
+  const list = [first];
+  mergeFront(list, hitSpan(10, 25));
+  assert.equal(list.length, 1);
+  assert.equal(list[0].full, true, '같은 구간의 재검색이 full을 지웠다');
+  assert.equal(list[0].rep, first.rep, '대표 청크가 바뀌었다');
+  mergeFront(list, hitSpan(14, 18));
+  assert.equal(list[0].full, true, '부분 구간의 재검색이 full을 지웠다');
+  assert.equal(canGrow(list[0]), false);
+
+  // 끝에서 끝까지: 두 번째 검색 뒤의 프롬프트에 그 항목의 '(확대 가능)'이 되살아나지 않는다
+  const other = { seq: 9001, doc_seq: 2, chunk_no: 1, chunk_of: 1, rep: 1, from: 1, to: 1, full: true, title: '문서2', content: '다른 문서',
+    chunks: [{ seq: 9001, doc_seq: 2, chunk_no: 1, chunk_of: 1, content: '다른 문서' }], _dist: .4 };
+  let turn = 0;
+  const result = await handleQuestion('절차', [], { deps: {
+    loadChunks: async () => assert.fail('확대 표시가 없으면 청구도 없다 — DB를 읽을 일이 없다'),
+    search: async text => ({ knowledge: [...hitSpan(10, 25), ...(text === 'b' ? [other] : [])] }),
+    decide: async c => {
+      if (c.forceAnswer) assert.fail('헛돈 스텝 없이 답해야 한다');
+      const prompt = buildPrompt(c);
+      const k = c.knowledge.find(r => r.doc_seq === 1);
+      const line = prompt.split('\n').find(l => l.startsWith(`- k${k?.seq} [`));
+      switch (turn++) {
+        case 0: return { action: 'search', text: 'a', targets: ['knowledge'] };
+        case 1:
+          assert.equal(k.full, true);
+          assert.doesNotMatch(line, /\(확대 가능\)/);
+          return { action: 'search', text: 'b', targets: ['knowledge'] };
+        default:
+          assert.equal(k.full, true, '재검색이 full을 지웠다');
+          assert.doesNotMatch(line, /\(확대 가능\)/, `재검색 뒤 확대 표시가 되살아났다:\n${line}`);
+          return { action: 'answer', answer: '확대 표시 없음 → 바로 답' };
+      }
+    },
+  } });
+  assert.equal(result.answer, '확대 표시 없음 → 바로 답');
+  assert.equal(result.trace.length, 2);
 });
 
 test('펼친 구간과 겹치는 후보도 같은 청크를 두 번 표시하지 않는다', () => {
@@ -177,6 +233,43 @@ test('결과 읽기는 범위·정확한 컬럼명·횟수를 검사하고 새 D
   } });
   assert.equal(result.search.resultReads, MAX_RESULT_READS);
   assert.equal(decisions, MAX_RESULT_READS + 1);
+});
+
+// 실행한 쿼리는 뒤 검색이 후보를 얹어도 목록 앞에 남아 SQL과 함께 보여야 한다(context.md 3 — 선택된 쿼리의 상세를 먼저 배정).
+// 검색 결과가 목록 맨 앞에 오는 규칙만 있던 동안, 입력 설명이 긴 등록(한 줄 1,300자 남짓)에서는 뒤 검색 한 번이 후보 30건을
+// 그 앞에 쌓아 실행한 쿼리가 섹션 천장에 걸려 이름조차 사라졌다(퍼저로 잡았다 — 43건 중 20번째). 모델은 방금 실행한 쿼리를
+// '목록에 없는 이름'으로 읽어 같은 쿼리를 다른 값으로 다시 실행하는 절차나 오류 뒤 바인드 수정에 근거를 잃는다.
+test('실행한 쿼리는 뒤 검색이 긴 후보 30건을 얹어도 목록에 SQL과 함께 남는다', async () => {
+  const registry = n => Array.from({ length: n }, (_, i) => ({
+    seq: 100 + i, query_name: `candidate_${i}`, query_desc: '용도 '.repeat(40), input_desc: 'x'.repeat(1000),
+    output_desc: '출력', query_sql: 'SELECT 1 FROM dual WHERE a = :a', target_db_name: 'OPS',
+  }));
+  const ran = { seq: 1, query_name: 'first_step', query_desc: '1단계', input_desc: 'job_id: 작업 ID', output_desc: '상태',
+    query_sql: 'SELECT status FROM jobs WHERE id = :job_id', target_db_name: 'OPS' };
+  let turn = 0;
+  const result = await handleQuestion('절차', [], { deps: {
+    search: async text => ({ queries: text === 'a' ? [ran] : registry(30) }),
+    run: async () => ({ rows: [{ STATUS: 'OK' }], totalRows: 1, targetDb: 'OPS' }),
+    decide: async c => {
+      const lineOf = name => buildPrompt(c).split('\n').find(l => l.startsWith(`- ${name}:`));
+      switch (turn++) {
+        case 0: return { action: 'search', text: 'a', targets: ['query'] };
+        case 1: return { action: 'run_query', query_name: 'first_step', params: { job_id: 'J1' } };
+        case 2:
+          assert.match(lineOf('first_step'), / \/ SQL: /, '실행 직후에는 SQL과 함께 보인다');
+          return { action: 'search', text: 'b', targets: ['query'] };
+        default: {
+          assert.equal(c.queries.length, 31);
+          assert.equal(c.queries[0].query_name, 'first_step', '실행한 쿼리가 뒤 검색의 후보에 밀렸다');
+          const line = lineOf('first_step');
+          assert.ok(line, `실행한 쿼리가 프롬프트에서 사라졌다:\n${buildPrompt(c).split('## 실행 가능한 쿼리 목록')[1]?.slice(0, 300)}`);
+          assert.match(line, / \/ SQL: /);
+          return { action: 'answer', answer: '완료' };
+        }
+      }
+    },
+  } });
+  assert.equal(result.answer, '완료');
 });
 
 test('짧은 쿼리에도 입력 형식과 대상 DB를 표시하고 선택 전 SQL은 생략한다', () => {

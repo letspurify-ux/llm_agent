@@ -228,7 +228,14 @@ export function mergeFront(list, rows) {
       }
     }
   }
-  const pinned = list.filter(r => r.expanded && !r.dropped);
+  // 앞에 고정하는 것 둘: 펼친 항목(expanded — 지식·처리방법)과 모델이 실행한 쿼리(selected — runBatch가 세운다).
+  // 실행한 쿼리도 고정하는 이유: 이 검색의 결과가 목록 맨 앞에 오므로, 고정하지 않으면 뒤 검색 한 번이 후보 30건을 그 앞에
+  // 쌓아 실행한 쿼리가 목록 스무 번째 뒤로 밀린다. 쿼리 목록은 짧은 줄부터 앞에서 채우고 섹션 천장(PROMPT_CEILINGS.queries)
+  // 에서 꼬리를 버리므로, 입력 설명이 긴 등록(한 줄 1,300자 남짓)이면 열댓 줄에서 끝나 실행한 쿼리가 SQL·바인드는커녕
+  // 이름조차 프롬프트에서 사라진다(실측 — 퍼저, 43건 중 20번째). 모델은 방금 실행한 쿼리를 '목록에 없는 이름'으로 읽고,
+  // 같은 쿼리를 다른 값으로 다시 실행하는 정상 절차(서울 다음 부산)나 오류 뒤 바인드 수정에 근거를 잃는다 —
+  // context.md 3절이 '선택된 쿼리의 상세 표시는 다른 후보보다 먼저 예산을 배정한다'고 적은 계약이 정확히 이 자리다.
+  const pinned = list.filter(r => (r.expanded || r.selected) && !r.dropped);
   const moving = [...front].filter(r => !pinned.includes(r));
   list.splice(0, list.length, ...pinned, ...moving,
     ...list.filter(r => !pinned.includes(r) && !front.has(r)));

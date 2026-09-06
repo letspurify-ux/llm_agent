@@ -31,8 +31,18 @@ export function absorbKnowledge(list, row) {
       const merged = parts([...byNo.values()], Math.min(old._dist, row._dist));
       if (merged.length === 1 && contains(merged[0], old) && contains(merged[0], row) && cost(merged[0]) <= MAX_DOC_LEN) {
         const progress = merged[0].content !== old.content ? 1 : 0;
-        const seq = old.seq;
-        Object.assign(old, merged[0], { seq });
+        // full(더 받을 것이 없다)은 지운 채 다시 세우지 않는다. 병합은 두 구간의 청크만 손에 들고 있어 이웃을 모르므로
+        // buildItems가 세운 full은 문서 경계에서만 참이다 — 그대로 덮어쓰면 검색이 이웃 한 조각을 함께 읽어 확정한
+        // '이웃이 문서당 상한에 들어가지 않는다'(chunk.js buildItems의 closed)가 같은 구간의 재검색 한 번에 사라지고,
+        // 그 항목에 '(확대 가능)'이 되살아난다. 모델이 그 표시를 따라 청구하면 한 글자도 늘지 않은 채 '더 넓힐 수 없다'
+        // 안내와 헛돈 스텝을 받는다(실측 — 상한 근처까지 찬 절 하나가 두 검색에 연속 적중하는 경우). 한쪽이 full이면
+        // 합친 구간도 full이다: 합친 구간은 그쪽을 품고, 이어 붙인 본문의 길이는 구간이 넓어질수록 줄지 않으므로
+        // 그쪽 이웃이 들어가지 않았으면 합친 구간의 이웃도 들어가지 않는다(문서 경계도 그대로다).
+        // rep(대표 청크)도 지킨다 — seq가 그 청크의 것이라 둘은 함께 움직여야 한다(chunk.js buildItems의 rep 주석).
+        Object.assign(old, merged[0], {
+          seq: old.seq, rep: old.rep ?? merged[0].rep,
+          full: Boolean(old.full || row.full || merged[0].full),
+        });
         return { front, added: [], progress };
       }
     }
