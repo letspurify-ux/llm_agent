@@ -87,6 +87,13 @@ export function cutSeam(text, next, overlap = CHUNK_OVERLAP) {
 // 무엇이 있었는지 모른 채 읽는다. 절차라면 단계 하나를 건너뛴 것으로 읽는다.
 export const CHUNK_GAP_FILL = 2;
 
+// 같은 청크 번호라도 동기화가 원문을 갱신했으면 다른 근거다.
+// doc_hash는 적중 본문 밖의 변경도 감지한다. 본문 비교는 해시 없는 호출에도 적용한다.
+export const sameChunk = (a, b) => !!a && !!b
+  && a.doc_seq === b.doc_seq && a.chunk_no === b.chunk_no
+  && a.doc_hash === b.doc_hash && a.chunk_of === b.chunk_of
+  && a.title === b.title && a.content === b.content;
+
 // 문단 경계를 우선순위대로 찾는다. 앞에 있는 것일수록 '뜻이 끊기지 않는' 경계다.
 //   ① 빈 줄        문단 경계. 글쓴이가 직접 그은 선이라 가장 믿을 만하다.
 //   ② 마크다운 제목 절 경계. 등록된 지식 상당수가 마크다운이다.

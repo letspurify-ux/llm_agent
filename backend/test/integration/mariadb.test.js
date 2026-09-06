@@ -9,9 +9,10 @@ import { once } from 'node:events';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import mariadb from 'mariadb';
-import { closePool } from '../../src/db.js';
+import { closePool, loadChunkRanges } from '../../src/db.js';
 import { syncEmbeddings } from '../../src/embed-sync.js';
 import { handleQuestion } from '../../src/agent.js';
+import { buildItems } from '../../src/chunk.js';
 
 const exec = promisify(execFile);
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -123,6 +124,36 @@ test('제목과 본문 사이 개행 이동도 원문 변경으로 감지해 청
   const rows = await conn.query('SELECT title, content FROM knowledge_chunk WHERE doc_seq = 1');
   assert.deepEqual([...rows], [{ title: '제목', content: '첫 문단\n둘째 문단' }]);
   assert.equal((await syncEmbeddings()).chunks, 0, '갱신 후에는 다시 나누지 않는다');
+});
+
+test('실제 동기화로 문서 뒤쪽만 바뀌어도 이전 판본의 검색 근거를 확대하지 않는다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  const prefix = '가'.repeat(1000) + '나'.repeat(1000);
+  await conn.query('INSERT INTO knowledge (title, content) VALUES (?, ?)', ['절차', prefix + '다'.repeat(1000)]);
+  await syncEmbeddings();
+  const chunks = await loadChunkRanges([{ doc_seq: 1, from: 1, to: 10 }]);
+  assert.match(chunks[0].doc_hash, /^[a-f0-9]{32}$/);
+  const [first] = buildItems([{ doc_seq: 1, rep: 1, from: 1, to: 1, dist: .1 }], chunks);
+  await conn.query('UPDATE knowledge SET content = ? WHERE seq = 1', [prefix + '라'.repeat(1000)]);
+  await syncEmbeddings();
+  const current = await loadChunkRanges([{ doc_seq: 1, from: 1, to: 1 }]);
+  assert.equal(current[0].content, chunks[0].content);
+  assert.notEqual(current[0].doc_hash, chunks[0].doc_hash);
+  const decisions = [
+    { action: 'search', text: '절차', targets: ['knowledge'] },
+    { action: 'expand', ids: [`k${first.seq}`] },
+  ];
+  let snapshot;
+  const result = await handleQuestion('전체 절차', [], { deps: {
+    search: async () => ({ knowledge: [first] }),
+    decide: async c => {
+      if (decisions.length) return decisions.shift();
+      snapshot = structuredClone(c.knowledge);
+      return { action: 'answer', answer: '확보한 구간으로 답변' };
+    },
+  } });
+  assert.equal(snapshot[0].content, chunks[0].content);
+  assert.match(result.trace.find(h => h.expand)?.note ?? '', /변경/);
 });
 
 test('동기화 CLI는 부분 저장 실패·청크 실패·DB 오류를 실패 코드로 알리고 풀을 닫는다', async t => {

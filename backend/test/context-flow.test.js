@@ -17,6 +17,41 @@ const window = (rows, from, to = from) => buildItems([
   { doc_seq: rows[0].doc_seq, rep: from, from, to, chunk_of: rows.length, dist: .3 },
 ], rows)[0];
 
+test('재검색의 판본이 달라지면 기존 ID와 근거를 지키고 새 절은 따로 보관한다', () => {
+  const original = [1, 2, 3].map(n => ({ seq: n, doc_seq: 1, chunk_no: n, chunk_of: 3,
+    title: '절차', doc_hash: 'old', content: `기존 절차 ${n}` }));
+  const current = original.map(c => ({ ...c, doc_hash: 'new', content: `개정 절차 ${c.chunk_no}` }));
+  const first = window(original, 1, 2);
+  const before = structuredClone(first);
+  const list = [first];
+  mergeFront(list, [window(current, 2, 3)]);
+  assert.deepEqual(list.find(item => item.seq === before.seq), before);
+  assert.ok(list.some(item => item.from === 3 && item.to === 3 && item.content === '개정 절차 3'));
+  assert.ok(knowledgeView(list).every(item => new Set(item.chunks.map(c => c.doc_hash)).size === 1));
+});
+
+test('적중 청크의 글자가 같아도 문서 해시가 바뀐 판본으로 확대하지 않는다', async () => {
+  const original = [1, 2, 3].map(n => ({ seq: n, doc_seq: 1, chunk_no: n, chunk_of: 3,
+    title: '절차', doc_hash: 'old', content: `기존 절차 ${n}` }));
+  const current = original.map(c => ({ ...c, doc_hash: 'new',
+    content: c.chunk_no === 2 ? c.content : `개정 절차 ${c.chunk_no}` }));
+  const first = window(original, 2);
+  let turn = 0;
+  let snapshot;
+  const result = await handleQuestion('절차', [], { deps: {
+    search: async () => ({ knowledge: [first] }),
+    loadChunks: async () => current,
+    decide: async c => {
+      if (turn++ === 0) return { action: 'search', text: '절차', targets: ['knowledge'] };
+      if (turn === 2) return { action: 'expand', ids: ['k2'] };
+      snapshot = structuredClone(c.knowledge);
+      return { action: 'answer', answer: '확보한 근거로 답변' };
+    },
+  } });
+  assert.equal(snapshot[0].content, '기존 절차 2');
+  assert.match(result.trace.find(h => h.expand)?.note ?? '', /변경/);
+});
+
 test('검색된 두 절을 중간 본문 없이 함께 표시한다', () => {
   const rows = source();
   const hits = [rows[2], rows[44]].map((r, i) => ({ ...r, _dist: .3 + i / 100 }));

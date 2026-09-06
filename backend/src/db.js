@@ -118,7 +118,7 @@ export function loadChunkRanges(ranges) {
   if (!rs.length) return Promise.resolve([]);
   const where = rs.map(() => '(doc_seq = ? AND chunk_no BETWEEN ? AND ?)').join(' OR ');
   return query(
-    `SELECT seq, doc_seq, chunk_no, chunk_of, title, content FROM knowledge_chunk
+    `SELECT seq, doc_seq, chunk_no, chunk_of, doc_hash, title, content FROM knowledge_chunk
      WHERE ${where} ORDER BY doc_seq, chunk_no`,
     rs.flatMap(r => [r.doc_seq, r.from, r.to])
   );

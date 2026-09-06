@@ -43,6 +43,26 @@ const lastRowsJson = p => {
   return p.slice(start, end < 0 ? undefined : end);
 };
 
+test('넓은 결과의 128자 컬럼명을 자르거나 같은 접두사끼리 덮어쓰지 않는다', () => {
+  const prefix = 'C'.repeat(127);
+  const names = [`${prefix}A`, `${prefix}B`];
+  const row = { [names[0]]: 'first', [names[1]]: 'second', ...wideRows(1, 20)[0] };
+  const p = buildPrompt(ctx({ history: [{ query_name: 'wide', rows: [row], totalRows: 1 }] }));
+  const json = lastRowsJson(p);
+  const [shown] = JSON.parse(json);
+  assert.equal(shown[names[0]], 'first');
+  assert.equal(shown[names[1]], 'second');
+  assert.ok(json.length <= MAX_PROMPT_STEP_LEN);
+});
+
+test('긴 바인드명도 실행 이력에서 원래 이름과 값의 짝을 유지한다', () => {
+  const prefix = 'P'.repeat(127);
+  const params = { [`${prefix}A`]: 'first', [`${prefix}B`]: 'second' };
+  const p = buildPrompt(ctx({ history: [{ query_name: 'binds', params, rows: [], totalRows: 0 }] }));
+  const shown = JSON.parse(/params=(\{[^\n]*\}) →/.exec(p)[1]);
+  assert.deepEqual(shown, params);
+});
+
 test('한 섹션이 아무리 길어도 프롬프트 전체가 예산을 넘지 않는다', () => {
   // 네 섹션이 동시에 예산을 꽉 채우는 최악 — 예전에는 섹션마다 독립 상한이라 합계가 그대로 더해졌다
   const p = buildPrompt(ctx({

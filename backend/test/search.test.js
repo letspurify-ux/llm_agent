@@ -27,6 +27,23 @@ async function withSearchDb(context, query, run) {
   }
 }
 
+test('검색과 보충 조회 사이 문서가 바뀌면 다른 판본의 중간 청크를 섞지 않는다', async context => {
+  const original = [1, 2, 3].map(n => ({ seq: n, doc_seq: 1, chunk_no: n, chunk_of: 3,
+    doc_hash: 'old', title: '절차', content: `기존 근거 ${n}`, _dist: n / 10 }));
+  const current = original.map(row => ({ ...row, doc_hash: 'new',
+    // 적중 청크의 글자가 같아도 중간 내용이 바뀌면 다른 문서 판본이다.
+    content: row.chunk_no === 2 ? '개정된 중간 절차' : row.content }));
+  await withSearchDb(context, async sql => {
+    if (sql.includes('vec_knowledge_chunk')) return [original[0], original[2]];
+    if (sql.includes('FROM knowledge_chunk')) return current;
+    assert.fail(sql);
+  }, async () => {
+    const items = await searchKnowledge('갱신 중인 문서의 두 근거');
+    assert.deepEqual(items.flatMap(item => item.chunks.map(c => c.seq)), [1, 3]);
+    assert.ok(items.every(item => !item.content.includes('개정된 중간 절차')));
+  });
+});
+
 test('청크 보충 읽기가 실패해도 같은 문서의 떨어진 적중을 모두 보존한다', async context => {
   const hits = [1, 3].map((n, i) => ({
     seq: n, doc_seq: 1, chunk_no: n, chunk_of: 5, title: '절차', content: `근거 ${n}`, _dist: 0.1 + i * 0.1,

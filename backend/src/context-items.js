@@ -1,5 +1,5 @@
 // 요청 안의 자료 보관과 프롬프트 표시를 분리한다. 보관한 청크는 검색 순서가 바뀌어도 잃지 않는다.
-import { buildItems, planRanges, canGrow } from './chunk.js';
+import { buildItems, planRanges, canGrow, sameChunk } from './chunk.js';
 import { MAX_DOC_LEN, indentLines } from './constants.js';
 
 const overlaps = (a, b) => a.doc_seq === b.doc_seq && a.from <= b.to && b.from <= a.to;
@@ -27,8 +27,12 @@ export function absorbKnowledge(list, row) {
   if (row.chunks?.length) {
     if (matched.length === 1 && !matched[0].dropped && !matched[0].expanded && matched[0].chunks?.length) {
       const old = matched[0];
+      const original = new Map(old.chunks.map(c => [c.chunk_no, c]));
+      const sameVersion = row.chunks.every(c =>
+        c.doc_hash === old.chunks[0].doc_hash
+        && (!original.has(c.chunk_no) || sameChunk(c, original.get(c.chunk_no))));
       const byNo = new Map([...row.chunks, ...old.chunks].map(c => [c.chunk_no, c]));
-      const merged = parts([...byNo.values()], Math.min(old._dist, row._dist));
+      const merged = sameVersion ? parts([...byNo.values()], Math.min(old._dist, row._dist)) : [];
       if (merged.length === 1 && contains(merged[0], old) && contains(merged[0], row) && cost(merged[0]) <= MAX_DOC_LEN) {
         const progress = merged[0].content !== old.content ? 1 : 0;
         // full(더 받을 것이 없다)은 지운 채 다시 세우지 않는다. 병합은 두 구간의 청크만 손에 들고 있어 이웃을 모르므로

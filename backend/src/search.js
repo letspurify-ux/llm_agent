@@ -3,7 +3,7 @@
 import { query, loadChunkRanges, loadQueriesByNames } from './db.js';
 import { embed, isEmbeddingEnabled, warnEmbeddingFailure } from './embedding.js';
 import { warnOnce, SEARCH_LIMIT, MAX_DOC_LEN } from './constants.js';
-import { planRanges, buildItems } from './chunk.js';
+import { planRanges, buildItems, sameChunk } from './chunk.js';
 
 const LIMIT = SEARCH_LIMIT; // 검색 한 번이 돌려주는 최대 후보 수 — 기본 20, 환경변수로 낮춘다 (constants.js SEARCH_LIMIT)
 const EF_SEARCH = 150;    // MHNSW 탐색 깊이. 기본값(20)은 1024차원에서 recall이 크게 떨어진다
@@ -60,7 +60,11 @@ export async function searchKnowledge(text) {
     // 병합한 '문서'를 상한까지 취한다. 청크를 그보다 많이 받은 이유가 여기다 (CHUNK_OVERFETCH).
     // 검색에서 확보한 원문은 보충 읽기가 일부 행만 반환해도 보존한다.
     // 같은 청크는 검색 시점의 본문을 우선한다.
-    const available = new Map([...rows, ...hits].map(row => [`${row.doc_seq}:${row.chunk_no}`, row]));
+    const key = row => `${row.doc_seq}:${row.chunk_no}`;
+    const current = new Map(rows.map(row => [key(row), row]));
+    const changed = new Set(hits.filter(hit => !sameChunk(hit, current.get(key(hit)))).map(hit => hit.doc_seq));
+    // 변경·삭제된 문서는 확보한 적중만 보관한다. 다른 문서의 정상 보충은 계속 사용한다.
+    const available = new Map([...rows.filter(row => !changed.has(row.doc_seq)), ...hits].map(row => [key(row), row]));
     return searchItems(plans, [...available.values()], hits).slice(0, LIMIT);
   } catch (e) {
     warnOnce('search:merge', `chunk merge failed — falling back to matched chunks: ${e.message}`);

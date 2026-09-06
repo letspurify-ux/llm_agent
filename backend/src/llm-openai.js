@@ -772,7 +772,9 @@ function fitCols(row, budget) {
     return Object.fromEntries(notes.length ? [...kept, [OMIT_KEY, notes.join(' / ')]] : kept);
   };
   for (const [k0, v0] of cols) {
-    const k = clip(k0, 100);
+    // 식별자는 자르면 다른 컬럼과 충돌하고 read_result로 다시 읽을 수도 없다.
+    // 완전한 이름의 비용을 재고, 예산에 안 들어가면 컬럼 전체를 생략한다.
+    const k = k0;
     const v = clipDisplayValue(v0);
     kept.push([k, v]);
     if (JSON.stringify(withOmissions()).length > budget) {
@@ -790,7 +792,7 @@ function fitCols(row, budget) {
 // 값 단위로 먼저 잘라 JSON을 유효하게 유지하고(중간에서 자르면 모델이 조각을 값으로 되읽는다),
 // 여러 값의 합이 그래도 크면 전체를 한 번 더 자른다.
 function paramsJson(params) {
-  const entries = Object.entries(params || {}).map(([k, v]) => [clip(k, 100), clipDisplayValue(v)]);
+  const entries = Object.entries(params || {}).map(([k, v]) => [k, clipDisplayValue(v)]);
   return clip(JSON.stringify(Object.fromEntries(entries)), MAX_PROMPT_PARAMS_LEN);
 }
 

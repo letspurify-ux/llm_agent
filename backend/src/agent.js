@@ -6,7 +6,7 @@
 // 대화 맥락(chat)은 서버가 저장하지 않고 클라이언트가 매 요청에 실어 보낸다 (stateless 유지).
 import { searchKnowledge, searchQaMethods, searchQueries } from './search.js';
 import { loadQueriesByNames, loadQueriesMentionedIn, loadChunkRanges } from './db.js';
-import { canGrow, buildItems, CHUNK_TARGET_LEN, CHUNK_OVERLAP } from './chunk.js';
+import { canGrow, buildItems, sameChunk, CHUNK_TARGET_LEN, CHUNK_OVERLAP } from './chunk.js';
 import { absorbKnowledge, knowledgeView } from './context-items.js';
 import { normalizeResultRead, readStoredResult } from './read-result.js';
 import { runQuery } from './oracle.js';
@@ -271,10 +271,7 @@ async function growItem(row, loadChunks = loadChunkRanges) {
     // 동기화가 요청 도중 원문을 갱신할 수 있다. 이미 확보한 청크가
     // 바뀌었으면 다른 판본으로 확대하지 않고 기존 근거를 보존한다.
     const byNo = new Map(rows.map(chunk => [chunk.chunk_no, chunk]));
-    if (row.chunks?.some(chunk => {
-      const current = byNo.get(chunk.chunk_no);
-      return !current || current.content !== chunk.content || current.title !== chunk.title;
-    })) return null;
+    if (row.chunks?.some(chunk => !sameChunk(chunk, byNo.get(chunk.chunk_no)))) return null;
     // buildItems에 grow=true를 주면 계획된 범위를 넘어 상한까지 채운다. 대표 청크(rep)를 그대로
     // 넘기는 것이 중요하다: 중심이 옮겨 다니면 두 번째 청구가 첫 번째가 준 구간을 되밟고, 무엇보다
     // 항목의 seq가 대표 청크의 것이라 중심이 바뀌면 seq도 바뀐다 — 모델이 방금 청구한 번호가

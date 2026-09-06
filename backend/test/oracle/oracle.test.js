@@ -11,8 +11,9 @@ import { runQuery, closeOraclePools } from '../../src/oracle.js';
 import { closePool } from '../../src/db.js';
 import { bindNames, assertReadOnly } from '../../src/sql.js';
 import { MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK } from '../../src/constants.js';
-import { openaiDecide } from '../../src/llm-openai.js';
+import { openaiDecide, buildPrompt } from '../../src/llm-openai.js';
 import { sanitizeDecision } from '../../src/llm.js';
+import { readStoredResult } from '../../src/read-result.js';
 
 const exec = promisify(execFile);
 const container = `backend-oracle-test-${randomUUID().slice(0, 8)}`;
@@ -70,6 +71,21 @@ after(async () => {
 });
 
 const registry = query_sql => ({ query_name: 'fixture', query_sql, target_db_name: 'DISPOSABLE_ORACLE' });
+
+test('실제 Oracle의 128자 컬럼·바인드를 프롬프트와 결과 추가 읽기까지 보존한다', async () => {
+  const names = ['A', 'B'].map(last => 'P'.repeat(127) + last);
+  const params = { [names[0]]: 'first', [names[1]]: 'second' };
+  const cols = names.map(name => `:${name} AS "${name}"`);
+  const filler = Array.from({ length: 20 }, (_, i) => `RPAD('x', 200, 'x') AS C${i}`);
+  const result = await runQuery(registry(`SELECT ${[...cols, ...filler].join(', ')} FROM DUAL`), params);
+  const prompt = buildPrompt({ question: '상세 조회', chat: [], knowledge: [], qaMethods: [], queries: [],
+    history: [{ query_name: 'fixture', params, ...result }] });
+  const shown = JSON.parse(/결과 1건[^\n]*: (\[[^\n]*\])/.exec(prompt)[1])[0];
+  assert.equal(shown[names[0]], 'first');
+  assert.equal(shown[names[1]], 'second');
+  assert.deepEqual(JSON.parse(/params=(\{[^\n]*\}) →/.exec(prompt)[1]), params);
+  assert.deepEqual(readStoredResult(result.rows, { step: 1, cols: names }).rows, [params]);
+});
 
 test('LLM이 숫자로 준 17자리 ID로 실제 Oracle의 정확한 행을 조회한다', async t => {
   const query = registry(`WITH ids AS (
