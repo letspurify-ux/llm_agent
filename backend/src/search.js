@@ -1,15 +1,6 @@
-// 지식/Q&A처리방법/쿼리 검색 — 벡터 검색(MariaDB VECTOR 인덱스, 코사인 거리) 단일 경로.
-// 검색 구현은 이 파일에만 있다.
-//
-// LIKE 검색을 걷어낸 이유. 앞선 구현은 LIKE 관련도와 벡터를 병렬로 돌려 RRF로 합쳤다. LIKE는
-// 인덱스를 못 쓰는 '%…%' 스캔이라 비용이 (행 수 × 낱말 수 × 조사 변형 × 컬럼 수 × 본문 길이)에
-// 비례했고, 질문 낱말 30개면 행마다 LIKE를 180번 평가했다 — 지식이 만 건이면 검색 한 번이 초
-// 단위였다. 검색어를 이제 모델이 핵심 낱말 몇 개로 쓰므로(llm-openai.js 시스템 프롬프트) 표현 차이는
-// 벡터가 흡수하고, 정확 키워드는 검색어 자체에 들어가 벡터 거리에도 그대로 반영된다.
-// 대가: 임베딩 서버가 없으면 검색이 성립하지 않는다. 그 상태를 '0건'으로 뭉개지 않고 null로 돌려
-// 호출부(agent.js)가 '못 찾아봤다'를 모델과 chat_log에 남기게 한다 — 조용히 빈 결과가 되면
-// 모델은 '등록된 자료가 없다'고 단정하고, 그 오답은 어디에도 기록되지 않는다.
-import { query, loadChunkRanges } from './db.js';
+// 검색 경계: 소스별 벡터 검색 + query_name 정확 일치.
+// 빈 배열은 성공·0건, null은 검색 실패다. 정확한 쿼리명은 임베딩 없이도 찾는다.
+import { query, loadChunkRanges, loadQueriesByNames } from './db.js';
 import { embed, isEmbeddingEnabled, warnEmbeddingFailure } from './embedding.js';
 import { warnOnce, SEARCH_LIMIT, MAX_DOC_LEN } from './constants.js';
 import { planRanges, buildItems } from './chunk.js';
@@ -58,20 +49,21 @@ export const vecTable = table => `vec_${table}`;
 export async function searchKnowledge(text) {
   const hits = await vectorSearch('knowledge_chunk', text, LIMIT * CHUNK_OVERFETCH);
   if (!hits || !hits.length) return hits;
+  const plans = planRanges(hits);
+  const fallback = buildItems(plans, hits, { maxDocLen: MAX_DOC_LEN });
   try {
-    const plans = planRanges(hits);
     // 계획된 범위의 앞뒤 한 조각씩을 함께 읽는다. 항목에 싣지는 않는다(buildItems가 계획된 범위 안에서만
     // 채운다) — '더 받을 것이 남았는가'(full)를 검색 시점에 확정하는 데만 쓴다. 이웃을 모르면 번호를 붙일
     // 수밖에 없고, 그 번호로 청구한 expand가 상한 때문에 한 글자도 늘리지 못하면 모델은 왕복 하나를
     // 헛되이 태운다. 비용은 문서당 최대 두 행이다.
     const rows = await loadChunkRanges(plans.map(p => ({ ...p, from: Math.max(1, p.from - 1), to: p.to + 1 })));
     // 병합한 '문서'를 상한까지 취한다. 청크를 그보다 많이 받은 이유가 여기다 (CHUNK_OVERFETCH).
-    return buildItems(plans, rows, { maxDocLen: MAX_DOC_LEN }).slice(0, LIMIT);
+    const hydrated = new Map(buildItems(plans, rows, { maxDocLen: MAX_DOC_LEN })
+      .map(item => [`${item.doc_seq}:${item.rep}`, item]));
+    return fallback.map(item => hydrated.get(`${item.doc_seq}:${item.rep}`) ?? item).slice(0, LIMIT);
   } catch (e) {
-    // 병합에 실패하면 청크 원문을 그대로 싣는다. 다만 그 행들은 문서 단위로 접히지 않았으므로
-    // 목록 병합(agent.js mergeFront)이 문서당 하나만 남긴다 — 얕지만 틀리지는 않은 상태다.
-    warnOnce('search:merge', `chunk merge failed — falling back to raw chunks: ${e.message}`);
-    return hits.slice(0, LIMIT);
+    warnOnce('search:merge', `chunk merge failed — falling back to matched chunks: ${e.message}`);
+    return fallback.slice(0, LIMIT);
   }
 }
 
@@ -80,7 +72,18 @@ export function searchQaMethods(text) {
 }
 
 // 쿼리 직접 검색 — qa_method 등록 없이도 검색어로 쿼리를 찾는 경로 (agent.js 라우팅의 경로B)
-export function searchQueries(text) {
+export async function searchQueries(text) {
+  const name = String(text ?? '').trim();
+  if (!name) return [];
+  // query_name의 UNIQUE 인덱스로 정확한 이름을 먼저 해석한다. 적중하면 임베딩도 필요 없다.
+  if (name.length <= 100) {
+    try {
+      const exact = await loadQueriesByNames([name]);
+      if (exact.length) return exact.map(row => ({ ...row, exact: true }));
+    } catch (e) {
+      warnOnce('search:query-name', `exact query lookup failed: ${e.message}`);
+    }
+  }
   return vectorSearch('query_registry', text);
 }
 
@@ -110,7 +113,7 @@ const EMBED_CACHE_MAX = 100;
 function embedText(text) {
   if (!isEmbeddingEnabled()) {
     // 설정상 검색이 없는 상태다. 오류는 아니지만 '검색 불가'가 매 요청 조용히 반복되므로 한 번은 알린다.
-    warnOnce('search:embedding', 'EMBEDDING_URL is not set — every search returns nothing (vector search is the only search path). Set it in backend/.env.');
+    warnOnce('search:embedding', 'EMBEDDING_URL is not set — vector search is unavailable; exact query-name lookup still works. Set it in backend/.env.');
     return null;
   }
   const hit = embedCache.get(text);

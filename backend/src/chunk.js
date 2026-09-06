@@ -15,7 +15,7 @@ import { MAX_PROMPT_ITEM_LEN, MAX_DOC_LEN, indentLines, clipText } from './const
 
 // 청크 하나의 크기. 상한을 MAX_PROMPT_ITEM_LEN과 '같게' 두는 것이 설계의 요점이다 —
 // 검색된 청크가 프롬프트에서 다시 잘리지 않는다. 지금까지 지식 항목마다 붙던 '…(생략)'과
-// 본문 청구 번호가 이 등식 덕분에 사라진다(llm-openai.js itemLine).
+// 청크 본문이 다시 잘리지 않는다(llm-openai.js itemLine).
 // 목표를 상한보다 낮게 두는 이유: 경계를 문단·문장에서 찾으려면 여유가 있어야 한다.
 // 그 여유가 없으면 경계 탐색이 거의 항상 실패해 강제 절단으로 떨어진다.
 export const CHUNK_TARGET_LEN = 900;
@@ -178,19 +178,8 @@ export function splitContent(text, {
   return parts.length ? parts : [clipText(s, max)];
 }
 
-// ===== 검색 결과 병합 =====
-//
-// 왜 개수로 자르지 않는가. 관련도 순으로 뽑아 놓고 '문서당 3건'처럼 개수로 깎으면 더 가까운 것을
-// 버리고 더 먼 것을 싣게 된다 — 임베딩이 제 일을 했다면 한 문서가 상위를 차지하는 것은 정답이다.
-// 고칠 것은 '몇 개를 버릴까'가 아니라 '흩어진 조각을 어떻게 다시 붙일까'다. 조각 사이의 구멍은
-// 관련도 문제가 아니라 청킹이 만든 인공물이므로, 그것만 메운다.
-//
-// 문서당 글자 상한(MAX_DOC_LEN)은 남긴다. 이유는 하나뿐이다 — '이 문서가 답'이라는 판정이
-// 틀렸을 때의 보험이다. 그 요청에 다른 문서가 하나도 안 보이면 모델은 대안을 볼 수 없고,
-// 그 오답은 오류를 남기지 않는다. 원칙이 아니라 튜닝 값이다 (계측 근거는 context.md 8-).
-
-// ① 검색 적중 → 문서별로 읽어와야 할 청크 범위. 순수 함수라 DB 왕복 전에 계획이 확정된다.
-// hits는 관련도 순(거리 오름차순)이어야 한다 — 문서의 순서와 대표 청크가 그 순서에서 나온다.
+// 검색된 구간 계획. 가까운 적중은 연결하고 떨어진 적중은 각각 보존한다.
+// 입력 hits는 거리순이며, 각 구간의 첫 적중이 그 구간의 대표다.
 export function planRanges(hits, { gapFill = CHUNK_GAP_FILL } = {}) {
   const byDoc = new Map();
   for (const h of hits) {
@@ -199,19 +188,21 @@ export function planRanges(hits, { gapFill = CHUNK_GAP_FILL } = {}) {
     // 첫 적중이 곧 그 문서의 최소 거리다(입력이 거리 순이므로) — 대표 청크이자 문서 정렬 키.
     byDoc.set(h.doc_seq, { doc_seq: h.doc_seq, rep: h.chunk_no, dist: h._dist, chunk_of: h.chunk_of, nos: [h.chunk_no] });
   }
-  return [...byDoc.values()].map(d => {
+  return [...byDoc.values()].flatMap(d => {
     const nos = [...new Set(d.nos)].sort((a, b) => a - b);
-    // 간격이 gapFill 이하인 것끼리 이어 하나의 범위로. 그보다 멀면 대표가 있는 쪽만 남긴다 —
-    // 한 문서에서 동떨어진 두 구간을 다 실으면 글자 상한을 그 둘이 나눠 갖느라 양쪽 다 얕아진다.
+    // 간격이 gapFill 이하인 것끼리 연결한다. 떨어진 절은 별도 범위다.
     const runs = [];
     for (const n of nos) {
       const last = runs[runs.length - 1];
       if (last && n - last.to <= gapFill + 1) last.to = n;
       else runs.push({ from: n, to: n });
     }
-    const run = runs.find(r => r.from <= d.rep && d.rep <= r.to) ?? runs[0];
-    return { doc_seq: d.doc_seq, rep: d.rep, dist: d.dist, chunk_of: d.chunk_of, from: run.from, to: run.to };
-  });
+    // 떨어진 적중도 보존한다. 각 구간의 대표는 그 구간 안에서 가장 가까운 청크다.
+    return runs.map(run => {
+      const best = hits.find(h => h.doc_seq === d.doc_seq && h.chunk_no >= run.from && h.chunk_no <= run.to);
+      return { doc_seq: d.doc_seq, rep: best.chunk_no, dist: best._dist, chunk_of: d.chunk_of, ...run };
+    });
+  }).sort((a, b) => a.dist - b.dist);
 }
 
 // ② 읽어온 청크 행 → 프롬프트 항목. 대표 청크에서 바깥으로 번갈아 넓히며 글자 상한을 채운다.
@@ -314,6 +305,8 @@ export function buildItems(plans, rows, { maxDocLen = MAX_DOC_LEN, grow = false 
       // llm-openai.js itemLine이 제목을 자른 '뒤에' 붙인다. 길이는 유계다(chunk_of는 SMALLINT).
       range: chunkOf > 1 ? ` (${from === to ? from : `${from}~${to}`}/${chunkOf})` : '',
       content: joined(from, to),
+      // 요청 중 중복 제거와 부분 재표시용 원본. 프롬프트나 chat_log에는 직접 직렬화하지 않는다.
+      chunks: [...have.values()].filter(r => r.chunk_no >= from && r.chunk_no <= to),
       _dist: p.dist,
     });
   }

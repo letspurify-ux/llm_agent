@@ -5,12 +5,39 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { resolveChartData, MAX_CHART_COLS, MAX_CHART_CELL_LEN, MAX_CHART_INJECT_LEN, MAX_CHART_BLOCK_ROWS } from '../src/chart.js';
 import { TRUNC_MARK, MAX_CELL_LEN } from '../src/constants.js';
+import { parseChartBlock } from '../../frontend/src/chart.js';
 
 const rows = [
   { MONTH: '2024-01', CNT: 120, AMT: 1000.5, NOTE: 'a|b' },
   { MONTH: '2024-02', CNT: null, AMT: 2500, NOTE: 'x\ny' },
 ];
 const block = (body, indent = '') => `${indent}\`\`\`chart\n${body}\n${indent}\`\`\``;
+
+test('긴 컬럼 이름을 셀처럼 잘라 차트 축과 표 헤더를 혼동하지 않는다', () => {
+  const first = `${'METRIC_'.repeat(17)}_FIRST`;
+  const second = `${'METRIC_'.repeat(17)}_SECOND`;
+  const steps = [[{ LABEL: 'A', [first]: 10, [second]: 100 }]];
+  const chart = resolveChartData(block(`type: bar\nx: LABEL\ny: ${first}\ny2: ${second}\ndata: step 1`), steps);
+  const parsed = parseChartBlock(chart.split('\n').slice(1, -1).join('\n'));
+  assert.equal(parsed.ok, true);
+  assert.deepEqual(parsed.spec.series.map(series => series.axis), ['left', 'right']);
+  for (const output of [chart, resolveTableData('```table\nstep: 1\n```', steps)]) {
+    assert.ok(output.includes(`| LABEL | ${first} | ${second} |`));
+    assert.ok(output.includes('| A | 10 | 100 |'));
+  }
+});
+
+test('잘못된 스텝 참조에서 숫자 일부만 뽑아 다른 조회 결과를 채우지 않는다', () => {
+  const steps = [[{ NAME: 'first_result', VALUE: 1 }], [{ NAME: 'second_result', VALUE: 2 }]];
+  for (const reference of ['step -1', 'step 1.5', 'step 1e2', 'step 1 or 2', '1~2', '1번과 2번', '9007199254740993']) {
+    const chart = resolveChartData(block(`type: bar\ndata: ${reference}`), steps);
+    const table = resolveTableData(`\`\`\`table\nstep: ${reference}\n\`\`\``, steps);
+    for (const output of [chart, table]) {
+      assert.doesNotMatch(output, /first_result|second_result/, reference);
+      assert.match(output, /못했습니다/);
+    }
+  }
+});
 
 test('data: step N 을 그 스텝의 전체 행으로 만든 표로 바꾼다', () => {
   const out = resolveChartData(`앞\n\n${block('type: bar\ntitle: 월별\ndata: step 1')}\n\n뒤`, [rows]);

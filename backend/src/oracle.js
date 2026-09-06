@@ -263,9 +263,13 @@ export function resolveTargetDb(registryRow, chosen) {
   // (bindProblem)이 그러듯 여기서도 받아주지 않아야 한다.
   // 문자열이 아니면 '고르지 않음'으로 둔다: 후보가 하나면 그대로 실행되고(고를 것이 없다),
   // 여럿이면 아래에서 후보 목록과 함께 되묻는다 — 어느 쪽도 조용히 엉뚱한 DB로 가지 않는다.
-  // 이름이 길면 자르고 계속한다 — '등록되지 않은 대상 DB' 문구가 후보 목록과 함께 나가므로
-  // 모델이 스스로 고칠 수 있다 (constants.MAX_TARGET_DB_NAME_LEN 주석 참고).
-  const want = typeof chosen === 'string' ? nameKey(clipText(chosen, MAX_TARGET_DB_NAME_LEN)) : '';
+  if (typeof chosen === 'string' && chosen.trim().length > MAX_TARGET_DB_NAME_LEN) {
+    throw wasted(safeError(
+      `조회대상 DB 이름이 너무 깁니다 (상한: ${MAX_TARGET_DB_NAME_LEN}자, 후보: ${dbListText(names)}).`,
+      'target_db는 후보 목록에 있는 이름이어야 한다 — 그중 하나를 골라 다시 실행하라'
+    ));
+  }
+  const want = typeof chosen === 'string' ? nameKey(chosen) : '';
   if (!want) {
     // 후보가 하나뿐이면 고를 것이 없다 — 목록형을 쓰지 않는 기존 등록은 전부 지금까지와 같이 돈다.
     if (names.length === 1) return names[0];

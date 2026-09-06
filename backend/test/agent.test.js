@@ -458,6 +458,51 @@ function scripted(decisions) {
 const found = over => ({ knowledge: undefined, qaMethods: undefined, queries: undefined, routed: null, queriesFailed: false, directFailed: false, ...over });
 const silence = () => { const orig = console.log; console.log = () => {}; return () => { console.log = orig; }; };
 
+test('목록 꼬리에서 지목한 쿼리는 다음 프롬프트에 전체 정의를 복구한다', async () => {
+  for (const width of [20, 70, 90]) {
+    const binds = Array.from({ length: 20 }, (_, index) => `param_${index}_${'x'.repeat(width)}`);
+    const queries = Array.from({ length: 30 }, (_, index) => ({
+      ...Q(index + 1, `query_${index + 1}`),
+      query_sql: `SELECT 1 FROM t WHERE ${binds.map(name => `a = :${name}`).join(' AND ')}`,
+      input_desc: `입력 안내 ${index + 1}`,
+    }));
+    const prompts = [];
+    const decisions = [
+      { action: 'search', text: '조회', targets: ['query'] },
+      { action: 'run_query', query_name: 'query_30', params: {} },
+      { action: 'answer', answer: '답' },
+    ];
+    await handleQuestion('조회', [], { deps: {
+      search: async () => found({ queries }),
+      run: async () => { throw new Error('바인드 값을 확인해야 한다'); },
+      decide: async ctx => { prompts.push(buildPrompt(ctx)); return decisions.shift(); },
+    } });
+    assert.doesNotMatch(prompts[1], /입력 안내 30/);
+    assert.match(prompts[2], /입력 안내 30/, `바인드 길이 ${width}`);
+  }
+});
+
+test('본문 확장에서 기존 구간의 청크가 누락되면 확보한 본문을 보존한다', async () => {
+  const rows = Array.from({ length: 4 }, (_, index) => ({
+    seq: index + 1, doc_seq: 10, chunk_no: index + 1, chunk_of: 4,
+    title: '절차', content: `단계 ${index + 1} ${'본문'.repeat(100)}`,
+  }));
+  const [original] = buildItems([{ doc_seq: 10, rep: 2, from: 1, to: 3, dist: 0.2 }], rows);
+  const before = structuredClone(original);
+  const llm = scripted([
+    { action: 'search', text: '절차', targets: ['knowledge'] },
+    { action: 'expand', ids: ['k2'] },
+    { action: 'answer', answer: '답' },
+  ]);
+  const result = await handleQuestion('절차', [], { deps: {
+    decide: llm.decide, search: async () => found({ knowledge: [original] }),
+    loadChunks: async () => rows.slice(1),
+  } });
+  assert.deepStrictEqual(llm.seen.at(-1).knowledge[0], before);
+  assert.equal(result.search.expanded, undefined);
+  assert.match(result.trace.at(-1).note, /읽어 오지 못했다/);
+});
+
 test('인사는 검색 없이 LLM 호출 한 번으로 끝난다', async () => {
   const restore = silence();
   try {
@@ -762,50 +807,31 @@ test('mergeFront는 청크 항목을 문서 단위로 거른다 — 대표 청�
 const CHUNK_ITEM = (seq, doc, from, to, content, over = {}) =>
   ({ seq, doc_seq: doc, chunk_of: 22, rep: from, from, to, range: ` (${from === to ? from : `${from}~${to}`}/22)`, title: `문서${doc}`, content, full: false, ...over });
 
-test('mergeFront는 같은 문서의 다른 구간이 뒤 검색에 걸리면 seq를 지키고 구간을 바꾼다', () => {
+test('mergeFront는 같은 문서의 떨어진 구간과 각 ID를 함께 보관한다', () => {
   const list = [CHUNK_ITEM(101, 1, 3, 3, 'A절')];
-  assert.equal(mergeFront(list, [CHUNK_ITEM(115, 1, 15, 17, 'B절')]), 1, '구간이 달라졌으면 진도다');
-  assert.equal(list.length, 1, '같은 문서가 두 항목으로 들어오면 안 된다');
-  assert.equal(list[0].seq, 101, '모델이 지목하는 번호는 요청 내내 고정이다');
-  assert.equal(list[0].content, 'B절');
-  assert.equal(list[0].range, ' (15~17/22)');
-  // 이번 구간이 이미 실린 구간 안에 들면 넓은 쪽을 둔다 — 좁혀서는 안 된다.
+  assert.equal(mergeFront(list, [CHUNK_ITEM(115, 1, 15, 17, 'B절')]), 1);
+  assert.deepEqual(list.map(r => [r.seq, r.content]), [[115, 'B절'], [101, 'A절']]);
   assert.equal(mergeFront(list, [CHUNK_ITEM(116, 1, 16, 16, 'B절의 한 조각')]), 0);
-  assert.equal(list[0].content, 'B절');
+  assert.deepEqual(list.map(r => r.content), ['B절', 'A절']);
 });
 
 test('mergeFront는 펼친 항목의 구간과 자리를 지킨다 — 청구한 구간이 검색으로 바뀌면 안 된다', () => {
   const pinned = CHUNK_ITEM(101, 1, 3, 7, '청구해 넓힌 절', { expanded: true });
   const list = [pinned, K(9)];
-  assert.equal(mergeFront(list, [CHUNK_ITEM(115, 1, 15, 17, 'B절'), K(8)]), 1);
-  assert.deepStrictEqual(list.map(o => o.seq), [101, 8, 9]);
+  assert.equal(mergeFront(list, [CHUNK_ITEM(115, 1, 15, 17, 'B절'), K(8)]), 2);
+  assert.deepStrictEqual(list.map(o => o.seq), [101, 115, 8, 9]);
   assert.equal(pinned.content, '청구해 넓힌 절');
   assert.equal(pinned.range, ' (3~7/22)');
 });
 
-test('mergeFront는 버린 청크 항목에 겹치지 않는 구간이 걸리면 되살리고, 겹치면 버린 채로 둔다', () => {
-  const dropped = CHUNK_ITEM(101, 1, 3, 5, 'A절', { dropped: true });
-  const list = [K(9), dropped];
-  assert.equal(mergeFront(list, [CHUNK_ITEM(104, 1, 4, 6, 'A절 근처')]), 0, '겹치는 구간은 같은 내용이다 — 버린 것이 되살아나면 안 된다');
-  assert.equal(dropped.dropped, true);
-  assert.equal(dropped.content, 'A절');
-  assert.deepStrictEqual(list.map(o => o.seq), [9, 101], '버린 채로 둔 항목은 자리도 그대로다');
-  assert.equal(mergeFront(list, [CHUNK_ITEM(115, 1, 15, 17, 'B절')]), 1, '다른 절은 모델이 버린 것이 아니다');
-  assert.equal(dropped.dropped, false);
-  assert.equal(dropped.content, 'B절');
-  assert.equal(dropped.seq, 101);
-  assert.deepStrictEqual(list.map(o => o.seq), [101, 9], '되살아난 항목은 이번 검색의 결과로 앞에 온다');
-  // 펼쳤다가 버린 항목도 같다 — 새 구간은 핀이 아니다.
-  const pinnedDropped = CHUNK_ITEM(201, 2, 3, 7, 'X', { expanded: true, dropped: true });
-  const two = [pinnedDropped, K(9)];
-  assert.equal(mergeFront(two, [CHUNK_ITEM(215, 2, 15, 17, 'Y')]), 1);
-  assert.equal(pinnedDropped.expanded, false);
-  assert.deepStrictEqual(two.map(o => o.seq), [201, 9]);
-  // 청크가 아닌 항목(처리방법)은 같은 내용뿐이라 되살아날 길이 없다.
-  const m = { ...K(5), dropped: true };
-  const three = [m];
-  assert.equal(mergeFront(three, [K(5)]), 0);
-  assert.equal(m.dropped, true);
+test('숨긴 구간은 보관하고 새 구간은 별도 ID로 추가한다', () => {
+  const hidden = CHUNK_ITEM(101, 1, 3, 5, 'A절', { dropped: true });
+  const list = [hidden];
+  assert.equal(mergeFront(list, [CHUNK_ITEM(103, 1, 3, 4, 'A절 일부')]), 0);
+  assert.equal(mergeFront(list, [CHUNK_ITEM(115, 1, 15, 17, 'B절')]), 1);
+  assert.equal(hidden.dropped, true);
+  assert.equal(hidden.content, 'A절');
+  assert.deepEqual(list.map(r => r.seq), [115, 101]);
 });
 
 test('mergeFront의 문서 단위 판정은 청크가 아닌 항목을 건드리지 않는다', () => {
@@ -1100,7 +1126,7 @@ test('펼칠 것이 없는 청구는 안내를 남기고 헛돈 스텝으로 센
     assert.equal(r.answer, '강제 답변');
     const notes = r.trace.filter(h => h.expand !== undefined);
     assert.equal(notes.length, 2);
-    assert.match(notes[0].note, /번호가 붙은 항목만/);
+    assert.match(notes[0].note, /표시할 새 내용이 없다/);
   } finally { restore(); }
 });
 
@@ -1126,7 +1152,7 @@ test('청구 상한을 넘으면 더 펼치지 않고 그 사실을 알린다', 
 // 모델은 시스템 프롬프트의 '번호가 붙어 있으면 청구할 수 있다'를 따라 셋째 문서를 청구했고 받은 것은 '상한에
 // 닿았다'는 안내와 헛돈 스텝 하나였다(퍼징으로 잡았다 — 두 번이면 강제 답변). 버리기를 함께 적은 청구는 진도로
 // 세어져 그 안내조차 남지 않았다. '청구할 수 있는 자리에만 번호가 보인다'(context.md 2-3)는 상한에서도 서야 한다.
-test('청구 상한을 다 쓰면 남은 항목의 번호가 전부 사라진다 — 모델은 상한을 볼 수 없다', async () => {
+test('청구 상한을 다 써도 ID는 유지하고 확대 표시를 없앤다', async () => {
   const restore = silence();
   try {
     const seqs = Array.from({ length: MAX_EXPANDS + 1 }, (_, i) => i + 1);
@@ -1148,8 +1174,9 @@ test('청구 상한을 다 쓰면 남은 항목의 번호가 전부 사라진다
     assert.equal(last.canExpand, false);
     assert.ok(last.knowledge.some(k => !k.expanded), '이 시나리오는 아직 펼치지 않은 항목이 남아야 뜻이 있다');
     const after = buildPrompt(last);
-    assert.doesNotMatch(after, /^- [km]\d+ \[/m, `상한을 다 썼는데 번호가 남았다:\n${after.split('\n').filter(l => /^- [km]\d+ /.test(l)).join('\n')}`);
-    assert.match(after, /^- \[K3/m, '번호만 떼고 항목은 그대로 실려야 한다');
+    assert.match(after, /^- k3 \[K3/m);
+    assert.doesNotMatch(after, /확대 가능/);
+    assert.match(after, /자료 확대·복구 기회를 다 썼다/);
   } finally { restore(); }
 });
 
@@ -1307,7 +1334,7 @@ test('청구로 넓힌 항목이 더 넓힐 수 없게 되면 번호가 사라�
     assert.ok(grown.content.length > before, '청구가 범위를 넓히지 못했다');
     assert.ok(grown.content.length < MAX_DOC_LEN && grown.to < 22, '이 시나리오는 상한에 닿지 않고 범위 밖 청크가 남아야 뜻이 있다');
     assert.equal(grown.full, true, '다음 조각이 상한에 안 들어가면 더 받을 것이 없다');
-    assert.match(firstItemLine(llm.seen.at(-1)), /^- \[문서1 /, '한 글자도 늘지 않을 항목에 번호가 남았다');
+    assert.doesNotMatch(firstItemLine(llm.seen.at(-1)), /확대 가능/, '한 글자도 늘지 않을 항목에 번호가 남았다');
   } finally { restore(); }
 });
 
@@ -1334,7 +1361,7 @@ test('문서 시작에 걸린 목표 크기 조각은 한 번의 청구로 창�
       const shown = indentLines(grown.content).length;
       assert.ok(shown <= MAX_DOC_LEN && shown > MAX_DOC_LEN - len, `${len}자 조각: 한 번의 청구가 창을 채우지 못했다 (${shown}/${MAX_DOC_LEN})`);
       assert.equal(grown.full, true, `${len}자 조각: 창이 먼저 바닥나 full을 확정하지 못했다 — 다음 청구가 헛돈다`);
-      assert.match(firstItemLine(llm.seen.at(-1)), /^- \[문서1 /, `${len}자 조각: 늘릴 수 없는 항목에 번호가 남았다`);
+      assert.doesNotMatch(firstItemLine(llm.seen.at(-1)), /확대 가능/, `${len}자 조각: 늘릴 수 없는 항목에 번호가 남았다`);
     }
     // 창의 근거가 되는 식이 상수와 함께 움직인다 — 문서 창이나 청크 크기·겹침을 바꾸면 창도 따라 커진다.
     assert.ok(GROW_WINDOW * (CHUNK_TARGET_LEN - CHUNK_OVERLAP) >= MAX_DOC_LEN, `창 ${GROW_WINDOW}조각의 순증이 문서 창에 못 미친다`);
@@ -1366,7 +1393,7 @@ test('검색 시점에 이웃을 못 읽은 항목이 청구로도 늘지 않으
     assert.match(note ?? '', /더 넓힐 수 없다/, '번호가 붙은 항목을 청구했는데 "번호가 붙은 항목만"이라고 답하면 모순이다');
     const seen = llm.seen.at(-1).knowledge[0];
     assert.equal(seen.full, true);
-    assert.match(firstItemLine(llm.seen.at(-1)), /^- \[문서1 /, '다음 프롬프트에서 번호가 사라져야 같은 청구를 반복하지 않는다');
+    assert.doesNotMatch(firstItemLine(llm.seen.at(-1)), /확대 가능/, '다음 프롬프트에서 번호가 사라져야 같은 청구를 반복하지 않는다');
   } finally { restore(); }
 });
 
@@ -1436,7 +1463,7 @@ test('두 번째 query 검색의 상위 적중은 이미 목록에 있어도 자
         queries: n++ === 0 ? [QD(1, 'q1', true), QD(2, 'q2'), QD(3, 'q3')] : [QD(3, 'q3', true), QD(1, 'q1', true), QD(2, 'q2')] }) } });
     const after = [...llm.seen[2].queries].sort((a, b) => a.query_name.localeCompare(b.query_name));
     assert.deepStrictEqual(after.map(q => [q.query_name, q.detail === true]), [['q1', true], ['q2', false], ['q3', true]]);
-    assert.match(buildPrompt(llm.seen[2]).split('\n').find(l => l.startsWith('- q3')), /SQL:/, 'q3가 짧은 줄로 남았다');
+    assert.match(buildPrompt(llm.seen[2]).split('\n').find(l => l.startsWith('- q3')), /출력\(/, 'q3가 짧은 줄로 남았다');
     assert.equal(r.answer, '답', '표시가 오른 검색을 헛돈 스텝으로 세어 강제 답변으로 넘어갔다');
     assert.equal(r.search.searches, 3);
   } finally { restore(); }
@@ -1453,7 +1480,7 @@ test('폴백 답변은 모델이 버린 지식을 붙이지 않는다', () => {
 
 // 항목의 정체는 문서고 구간은 최신 검색을 따른다(mergeFront). 먼저 온 구간을 무조건 지키던 동안에는 뒤 검색이
 // 같은 문서의 다른 절을 찾아도 버려졌고, 그 검색은 '새 자료 없음'으로 헛돈 스텝에 들어가 두 번이면 강제 답변이었다.
-test('뒤 검색이 같은 문서의 다른 구간을 찾으면 그 구간이 같은 번호로 실리고 진도로 센다', async () => {
+test('뒤 검색의 새 구간과 이전 근거가 모두 남고 진도로 센다', async () => {
   const restore = silence();
   try {
     const llm = scripted([
@@ -1468,8 +1495,10 @@ test('뒤 검색이 같은 문서의 다른 구간을 찾으면 그 구간이 �
         ? [CHUNK_ITEM(103, 7, 3, 3, '설치 절')]
         : [CHUNK_ITEM(115, 7, 15, 17, '재시작 절')] }) } });
     const k = llm.seen[2].knowledge;
-    assert.equal(k.length, 1, '같은 문서가 두 항목으로 들어왔다');
-    assert.equal(k[0].seq, 103, '모델이 지목하는 번호는 요청 내내 고정이다');
+    assert.equal(k.length, 2, '이전 구간도 보관해야 한다');
+    assert.equal(k[0].seq, 115);
+    assert.equal(k[1].seq, 103);
+    assert.equal(k[1].content, '설치 절');
     assert.equal(k[0].content, '재시작 절', '뒤 검색이 찾은 구간이 실려야 한다');
     assert.match(firstItemLine(llm.seen[2]), /\(15~17\/22\)\]/, '프롬프트의 위치 표기가 새 구간을 가리켜야 한다');
     assert.equal(r.answer, '답', '구간이 달라진 검색을 헛돈 스텝으로 세어 강제 답변으로 넘어갔다');
@@ -1492,7 +1521,7 @@ test('번호가 붙지 않은 짧은 처리방법의 청구는 성공으로 세�
     assert.equal(r.answer, '답');
     assert.equal(r.search.expanded, undefined, '늘지 않는 청구가 펼침으로 세어졌다');
     assert.ok(!llm.seen.at(-1).qaMethods.find(m => m.seq === 1).expanded, '짧은 항목에 펼침 표시가 붙었다');
-    assert.match(r.trace.find(h => h.expand !== undefined)?.note ?? '', /번호가 붙은 항목만/, '헛돈 청구에 안내가 없다');
+    assert.match(r.trace.find(h => h.expand !== undefined)?.note ?? '', /표시할 새 내용이 없다/, '헛돈 청구에 안내가 없다');
     // 번호가 붙은(잘린) 항목은 종전대로 펼쳐진다 — 판정이 프롬프트와 같은 기준이어야 한다.
     const llm2 = scripted([{ action: 'search', text: 'x', targets: ['qa_method'] }, { action: 'expand', ids: ['m2'] }, { action: 'answer', answer: '답' }]);
     const r2 = await handleQuestion('q', [], { deps: { decide: llm2.decide,
@@ -1516,7 +1545,9 @@ test('mergeFront는 범위를 모르는 청크 행으로 항목의 구간을 바
   const list2 = [bare];
   assert.equal(mergeFront(list2, [CHUNK_ITEM(115, 7, 15, 17, 'B절')]), 1);
   assert.equal(bare.seq, 109);
-  assert.equal(bare.range, ' (15~17/22)');
+  assert.equal(bare.range, undefined);
+  assert.equal(list2[0].range, ' (15~17/22)');
+  assert.equal(list2[1].content, '9번 조각 원문');
 });
 
 // 잘린 배치의 안내는 어느 상한에 걸렸는지를 말해야 한다 — 조회를 두 번밖에 안 한 요청이 이력 줄 수에 막혔는데

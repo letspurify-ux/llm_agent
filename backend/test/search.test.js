@@ -4,7 +4,75 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
+import mariadb from 'mariadb';
+import { closePool } from '../src/db.js';
+import { handleQuestion } from '../src/agent.js';
+import { buildPrompt } from '../src/llm-openai.js';
+import { canGrow } from '../src/chunk.js';
 import { searchKnowledge, searchQaMethods, searchQueries, warmUpEmbedding, SEARCH_COLUMNS, vecTable, CHUNK_OVERFETCH } from '../src/search.js';
+
+async function withSearchDb(context, query, run) {
+  const saved = process.env.EMBEDDING_URL;
+  process.env.EMBEDDING_URL = 'http://test.invalid/v1';
+  context.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({
+    data: [{ index: 0, embedding: [1, 0] }],
+  })));
+  context.mock.method(mariadb, 'createPool', () => ({
+    getConnection: async () => ({ query, release: async () => {} }),
+    end: async () => {},
+  }));
+  try { await run(); } finally {
+    await closePool();
+    if (saved === undefined) delete process.env.EMBEDDING_URL; else process.env.EMBEDDING_URL = saved;
+  }
+}
+
+test('처리방법 라우팅 조회가 실패해도 성공한 직접 쿼리 검색은 보존한다', async context => {
+  await withSearchDb(context, async sql => {
+    if (sql.includes('vec_qa_method')) return [{ seq: 1, title: '절차', method: 'direct_query 실행' }];
+    if (sql.includes('vec_query_registry')) return [{ seq: 2, query_name: 'direct_query', query_sql: 'SELECT 1 FROM dual' }];
+    if (sql.includes('LOCATE')) throw new Error('routing timeout');
+    if (sql.includes('query_name IN')) return [];
+    assert.fail(`예상 밖 SQL: ${sql}`);
+  }, async () => {
+    let snapshot;
+    const result = await handleQuestion('라우팅 장애', [], { deps: {
+      decide: async ctx => {
+        if (!ctx.history.length) return { action: 'search', text: '라우팅 장애', targets: ['qa_method', 'query'] };
+        snapshot = ctx;
+        return { action: 'answer', answer: '답' };
+      },
+    } });
+    assert.deepStrictEqual(snapshot.queries.map(row => row.query_name), ['direct_query']);
+    assert.equal(snapshot.queries[0].detail, true);
+    assert.equal(result.search.queries, 1);
+    assert.equal(result.search.queriesFailed, true);
+    assert.equal(result.search.searchFailed, undefined);
+    assert.doesNotMatch(buildPrompt(snapshot), /쿼리 검색 불가/);
+  });
+});
+
+test('청크 보충 읽기가 실패하거나 빈 결과여도 적중 본문과 청구 경로를 보존한다', async context => {
+  let mode = 'throw';
+  const hit = { seq: 7, doc_seq: 3, chunk_no: 2, chunk_of: 5, title: '긴 지식', content: '검색된 본문', _dist: 0.2 };
+  await withSearchDb(context, async sql => {
+    if (sql.includes('vec_knowledge_chunk')) return [hit];
+    if (sql.includes('FROM knowledge_chunk')) {
+      if (mode === 'throw') throw new Error('chunk read timeout');
+      return [];
+    }
+    assert.fail(`예상 밖 SQL: ${sql}`);
+  }, async () => {
+    for (mode of ['throw', 'empty']) {
+      const items = await searchKnowledge(`청크 보충 ${mode}`);
+      assert.equal(items.length, 1, mode);
+      assert.equal(items[0].content, hit.content);
+      assert.equal(items[0].from, 2, mode);
+      assert.equal(items[0].to, 2, mode);
+      assert.equal(canGrow(items[0]), true, mode);
+    }
+  });
+});
 
 test('임베딩이 설정되지 않았으면 검색은 null(검색 불가)이고 관리 DB를 건드리지 않는다', async () => {
   // DB 풀이 없는 환경에서 돈다 — 검색이 DB를 만지면 여기서 접속 오류로 죽는다. 빈 배열을 돌려주면 안 된다:
@@ -14,7 +82,7 @@ test('임베딩이 설정되지 않았으면 검색은 null(검색 불가)이고
   try {
     assert.equal(await searchKnowledge('배치 재시작'), null);
     assert.equal(await searchQaMethods('배치 재시작'), null);
-    assert.equal(await searchQueries('배치 재시작'), null);
+    // 정확 이름 조회의 임베딩 없는 경로는 별도 테스트에서 검증한다.
     assert.equal(await warmUpEmbedding(), false, '미설정이면 예열도 하지 않는다');
   } finally {
     if (saved !== undefined) process.env.EMBEDDING_URL = saved;
@@ -32,6 +100,44 @@ test('빈 검색어는 검색 불가가 아니라 0건이다', async () => {
   } finally {
     if (saved === undefined) delete process.env.EMBEDDING_URL; else process.env.EMBEDDING_URL = saved;
   }
+});
+
+test('정확한 쿼리 이름은 임베딩 없이 찾고 실행 명세를 보존한다', async context => {
+  await withSearchDb(context, async (sql, params) => {
+    assert.match(sql, /query_name IN/);
+    assert.deepEqual(params, ['daily_count']);
+    return [{ seq: 9, query_name: 'daily_count', query_sql: 'SELECT :day FROM dual', input_desc: 'day: YYYYMMDD' }];
+  }, async () => {
+    delete process.env.EMBEDDING_URL;
+    context.mock.method(globalThis, 'fetch', async () => assert.fail('정확 일치에는 임베딩이 필요 없다'));
+    const rows = await searchQueries(' daily_count ');
+    assert.equal(rows[0].query_name, 'daily_count');
+    assert.equal(rows[0].input_desc, 'day: YYYYMMDD');
+    assert.equal(rows[0].exact, true);
+  });
+});
+
+test('정확한 이름이 없으면 벡터 검색으로 이어진다', async context => {
+  await withSearchDb(context, async sql => {
+    if (sql.includes('query_name IN')) return [];
+    assert.match(sql, /vec_query_registry/);
+    return [{ seq: 4, query_name: 'semantic_match' }];
+  }, async () => {
+    assert.equal((await searchQueries('작업별 처리량'))[0].query_name, 'semantic_match');
+  });
+});
+
+test('한 문서의 두 검색 구간이 보충 읽기 뒤에도 각각 남는다', async context => {
+  const chunks = [3, 45].map((no, i) => ({ seq: 100 + no, doc_seq: 1, chunk_no: no, chunk_of: 60,
+    title: '운영 규칙', content: no === 3 ? 'A 절 근거' : 'B 절 근거', _dist: .3 + i / 100 }));
+  await withSearchDb(context, async sql => {
+    if (sql.includes('vec_knowledge_chunk')) return chunks;
+    if (sql.includes('FROM knowledge_chunk')) return chunks;
+    assert.fail(sql);
+  }, async () => {
+    const items = await searchKnowledge('두 정책 비교');
+    assert.deepEqual(items.map(r => [r.from, r.content]), [[3, 'A 절 근거'], [45, 'B 절 근거']]);
+  });
 });
 
 test('임베딩 원문 컬럼은 세 소스 모두 제목/이름이 첫 컬럼이다', () => {
@@ -67,7 +173,7 @@ test('지식 검색은 문서 상한보다 많은 청크를 받는다 — 병합
   assert.match(fn, /\.slice\(0, LIMIT\)/, '병합한 문서를 상한까지 잘라야 한다');
   // 나머지 두 소스는 병합이 없으므로 배수를 쓰지 않는다 — 쓰면 프롬프트만 커진다.
   for (const name of ['searchQaMethods', 'searchQueries']) {
-    const other = new RegExp(`export function ${name}[\\s\\S]*?\\n}`).exec(src)[0];
+    const other = new RegExp(`export (?:async )?function ${name}[\\s\\S]*?\\n}`).exec(src)[0];
     assert.ok(!/CHUNK_OVERFETCH/.test(other), `${name}에는 배수가 필요 없다`);
   }
 });

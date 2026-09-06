@@ -136,12 +136,10 @@ export const PROMPT_FLOORS = {
                      // 개수가 묶여 있는 것은 쿼리 결과·오류 줄(MAX_STEPS)뿐이고 검색 줄은 그렇지 않다.
                      // 20,000이면 MAX_PROMPT_STEP_LEN을 2,000으로 낮춰야 든다(필요 18,552) — 조회 결과를 덜 보여주는
                      // 대가라 올리는 쪽을 골랐다.
-  queries: 15_000,   // 등록 30건(agent.js MAX_PROMPT_QUERIES)의 짧은 줄이 최악(이름 100자·바인드 8개·대상DB 둘)으로
-                     // 10,506자 — '목록에 오른 쿼리는 한 건도 사라지지 않는다'(llm-openai.js renderQueries)가
-                     // 그 최악에서도 서는 5천 단위 값. 자세한 줄 30건(~18k)은 천장(20,000)이 맡는다.
+  queries: 15_000,   // 입력 설명을 포함한 실행 명세부터 채운다. 설명이 긴 후보는 예산에 따라 생략될 수 있다.
   qaMethods: 10_000, // 항목 1,000자(MAX_PROMPT_ITEM_LEN)면 9건. 펼침 총량 MAX_EXPANDS × MAX_EXPANDED_ITEM_LEN(9,000)이 이 안에 든다.
   knowledge: 25_000, // 항목 하나가 '문서의 한 구간'이라 크기를 정하는 것은 MAX_PROMPT_ITEM_LEN이 아니라 MAX_DOC_LEN이다
-                     // — 실리는 건수는 등록된 글의 길이가 정한다 (1,000자면 20건 전부, 10,000자면 2건. context.md 2-2).
+                     // — 실리는 건수는 등록된 글의 길이가 정한다 (1,000자면 20건 전부, 10,000자면 2건. context.md 2절).
                      // 펼침 총량 MAX_EXPANDS × MAX_DOC_LEN(20,000)이 이 안에 들어야 한다.
 };
 
@@ -150,7 +148,7 @@ export const PROMPT_FLOORS = {
 // 프롬프트가 두세 배가 되고 그 prefill이 스텝마다 곱해진다. 예산 불변식과는 무관하다(총량 안에서 남은 것만
 // 받는다) — 이 값은 오로지 응답 속도의 손잡이다. [llm] usage prompt= 와 [agent] timing llm= 이 느려지면
 // 여기부터 낮춘다.
-//   쿼리 목록 20,000 — 등록 30건이 전부 자세한 줄(~600자)이어도 든다.
+//   쿼리 목록 20,000 — 입력 설명·후보 수에 따라 실제 표시 건수가 달라진다.
 //   처리방법 20,000 — 검색 한 번의 후보 20건이 1,000자 항목이어도 19건까지 실린다(줄마다 제목·번호가 붙는다. 실측).
 //   지식     40,000 — 10,000자 매뉴얼 창 4건, 또는 1,000자 글이면 후보 20건 전부(20k에서 멈춘다).
 export const PROMPT_CEILINGS = { queries: 20_000, qaMethods: 20_000, knowledge: 40_000 };
@@ -248,19 +246,21 @@ export function normalizeItemIds(raw, max) {
   return out;
 }
 
-// 한 요청에서 본문을 '넓힌' 횟수와, 한 문서가 지식 섹션에서 차지할 수 있는 글자 상한.
+// 한 요청에서 자료를 확대·복구·우선 표시한 횟수와 문서별 표시 글자 상한.
 // 횟수 × 펼침 상한이 그 섹션의 최소 몫 안에 들어야 한다 — 지식은 MAX_EXPANDS × MAX_DOC_LEN(20,000자)
 // < PROMPT_FLOORS.knowledge, 처리방법은 MAX_EXPANDS × MAX_EXPANDED_ITEM_LEN(9,000자) < PROMPT_FLOORS.qaMethods.
 // 둘 다 한 섹션에 몰려도 다른 후보 몇 건이 함께 실릴 자리가 남는다. 이 곱을 키우려면 그 몫부터 다시 본다.
 //
-// 세는 단위는 '항목 하나를 한 번 넓힌 것'이다 — 항목 수도, 결정(expand 행동) 수도 아니다.
+// 세는 단위는 '항목 하나를 한 번 확대·복구·우선 표시한 것'이다. 한 결정에 두 ID가 있으면 둘로 센다.
 // 항목 수가 아닌 이유: 청크 구조에서 expand는 항목을 새로 펼치는 것이 아니라 이미 있는 항목의 '범위를
 // 넓히는' 일이다(chunk.js buildItems, agent.js applyExpand). 항목 수로 세면 같은 항목을 두 번 넓히는 것이
 // 한 개로 세어져 상한이 걸리지 않고, 그 사이 프롬프트만 계속 커진다.
 // 결정 수가 아닌 이유: 한 결정의 ids 둘이 다 넓혀지면 둘로 센다(llm.js sanitizeDecision이 ids를 이 값까지만
 // 받는다). 결정 수로 세면 결정 하나에 실린 항목 수만큼 위 곱이 조용히 커진다.
 export const MAX_EXPANDS = 2;
-// 한 문서(= 한 항목)의 글자 상한. 검색은 이 값을 채우지 않는다 — 적중한 구간과 그 사이 구멍만
+// 저장된 조회 결과를 다시 읽는 횟수. DB 실행 수와 별도로 세며 루프 시간·프롬프트 예산은 공유한다.
+export const MAX_RESULT_READS = 2;
+// 한 문서의 모든 표시 구간을 합한 본문 상한. 검색은 적중한 구간과 그 사이 구멍만
 // 싣고, 여기까지 넓히는 것은 expand의 몫이다. 검색이 먼저 채워 버리면 expand가 할 일이 없어지고
 // 모델이 왕복 하나를 헛되이 태운다 (chunk.js buildItems의 grow 인자).
 //
@@ -451,10 +451,7 @@ export const MAX_BIND_NAME_LEN = 128;
 export const nameKey = s => String(s ?? '').trim().toLowerCase();
 
 // 조회대상 DB 이름 상한. target_db.db_name이 VARCHAR(100)이므로 그보다 긴 이름은 어떤 등록 DB와도
-// 대응할 수 없다. 바인드명(MAX_BIND_NAME_LEN)은 상한을 넘으면 자르지 않고 버리는데, 여기서는 자른다 —
-// 두 실패가 모델에게 보이는 모습이 다르기 때문이다. 버리면 '고르지 않았다'가 되어 모델은 자기가
-// 이름을 적었다는 사실과 어긋나는 오류를 받지만, 자르면 '등록되지 않은 대상 DB: xxx (후보: …)'가
-// 되어 무엇을 어떻게 고칠지가 그 문구 안에 다 들어 있다 (DB 후보는 목록이 있어 자가 교정이 된다).
+// 대응할 수 없다.
 export const MAX_TARGET_DB_NAME_LEN = 100;
 
 // 조회대상 DB 목록의 단일 해석 지점.

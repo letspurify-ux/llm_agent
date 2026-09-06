@@ -6,8 +6,8 @@ import assert from 'node:assert';
 import oracledb from 'oracledb';
 import { runQuery, normalizeCells, numberFromString, oracleMock, oracleDriver, resolveTargetDb, localDateTime } from '../src/oracle.js';
 import { targetDbNames } from '../src/constants.js';
-import { llmProvider } from '../src/llm.js';
-import { MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK } from '../src/constants.js';
+import { llmProvider, sanitizeDecision } from '../src/llm.js';
+import { MAX_CELL_LEN, MAX_RESULT_COLS, MAX_TARGET_DB_NAME_LEN, TRUNC_MARK } from '../src/constants.js';
 
 process.env.ORACLE_MOCK = '1';
 
@@ -348,6 +348,24 @@ test('mock 생성기도 바인드명 표기에 좌우되지 않는다', async ()
 
 // --- 조회대상 DB 선택 (target_db_name의 ';' 목록) ---------------------------------
 const multi = list => ({ query_name: 'batch_job_status', query_sql: 'SELECT 1 FROM DUAL', target_db_name: list });
+
+test('긴 대상 DB 이름을 잘라 접두사가 같은 등록 DB에서 실행하지 않는다', async () => {
+  const registered = 'D'.repeat(MAX_TARGET_DB_NAME_LEN);
+  const registry = multi(registered);
+  const decide = target_db => sanitizeDecision({ action: 'run_query', query_name: registry.query_name, params: {}, target_db });
+  const valid = decide(` ${registered.toLowerCase()} `);
+  assert.equal(resolveTargetDb(registry, valid.target_db), registered);
+  for (const chosen of [`${registered}_ARCHIVE`, ` ${registered}_ARCHIVE `]) {
+    for (const targetDb of [chosen, decide(chosen).target_db]) {
+      await assert.rejects(runQuery(registry, {}, undefined, targetDb), error => {
+        assert.equal(error.safe, true);
+        assert.equal(error.wastedStep, true);
+        assert.match(error.hint, /target_db/);
+        return true;
+      });
+    }
+  }
+});
 
 test('후보가 하나면 고르지 않아도 그 DB로 실행된다', () => {
   // 목록형을 쓰지 않는 기존 등록은 전부 지금까지와 똑같이 돌아야 한다 —

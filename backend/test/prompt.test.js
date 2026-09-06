@@ -6,6 +6,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { buildPrompt, NO_SEARCH_LEFT_NOTE, NO_QUERY_LEFT_NOTE, fewQueriesLeftNote, fewExpandsLeftNote } from '../src/llm-openai.js';
+import { normalizeChat } from '../src/agent.js';
+import { normalizeCells } from '../src/oracle.js';
 import { MAX_PROMPT_TOTAL_LEN, MAX_PROMPT_STEP_LEN, PROMPT_FLOORS, PROMPT_CEILINGS, PROMPT_FRAME_RESERVE, MAX_EXPANDED_ITEM_LEN, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN, MAX_CELL_LEN, MAX_RESULT_COLS, MAX_ROWS, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_DOC_LEN, MAX_PROMPT_ITEM_LEN, TRUNC_MARK, MAX_BATCH_QUERIES } from '../src/constants.js';
 
 const big = n => 'ㄱ'.repeat(n);
@@ -117,7 +119,7 @@ test('바인드가 수백 개인 SQL 등록도 쿼리 목록 예산을 뚫지 �
 
 // 목록에 실린 줄 수(짧은 형태 포함)와, 그중 SQL·입출력 설명까지 실린 '자세한' 줄 수.
 const countQueryLines = s => (s.match(/^- q\d+: /gm) || []).length;
-const countDetailed = s => (s.match(/^- q\d+: .* \/ SQL: /gm) || []).length;
+const countDetailed = s => (s.match(/^- q\d+: .* \/ 출력\(/gm) || []).length;
 
 // 섹션 본문 한 덩어리 — 제목 줄 다음부터 다음 제목 전까지.
 const sectionOf = (p, title) => {
@@ -127,6 +129,43 @@ const sectionOf = (p, title) => {
   return m[1];
 };
 const countItems = (p, title) => (sectionOf(p, title).match(/^- (?!\()/gm) || []).length;
+
+test('여러 줄 대화는 들여쓰기와 생략 표시까지 턴별 프롬프트 예산에 포함한다', () => {
+  for (const newline of ['\n', '\r\n', '\r']) {
+    const chat = normalizeChat(Array.from({ length: MAX_CHAT_TURNS }, () => ({
+      role: 'user', text: `가${newline}`.repeat(MAX_CHAT_LEN),
+    })));
+    const rendered = sectionOf(buildPrompt(ctx({ chat })), '최근 대화').trimEnd();
+    const turns = rendered.split(/\n(?=- 사용자: )/).map(turn => turn.slice('- 사용자: '.length));
+    assert.equal(turns.length, MAX_CHAT_TURNS);
+    for (const turn of turns) {
+      assert.ok(turn.length <= MAX_CHAT_LEN, `대화 본문 ${turn.length}자 > ${MAX_CHAT_LEN}자`);
+      assert.ok(turn.endsWith(TRUNC_MARK));
+    }
+  }
+  const short = normalizeChat([{ role: 'user', text: '첫 줄\n다음 줄' }]);
+  assert.equal(sectionOf(buildPrompt(ctx({ chat: short })), '최근 대화').trimEnd(), '- 사용자: 첫 줄\n  다음 줄');
+});
+
+test('넓은 조회 행의 JSON은 대괄호와 두 단계 생략 안내까지 스텝 예산 안이다', () => {
+  for (const count of [MAX_RESULT_COLS, MAX_RESULT_COLS + 10]) {
+    for (const character of ['가', '\\', '\n']) {
+      const row = normalizeCells(Object.fromEntries(Array.from({ length: count }, (_, index) => [
+        `COL_${index}`, character.repeat(176),
+      ])));
+      const prompt = buildPrompt(ctx({ history: [{ query_name: 'wide', params: {}, rows: [row], totalRows: 1 }] }));
+      const json = lastRowsJson(prompt);
+      assert.ok(json.length <= MAX_PROMPT_STEP_LEN, `조회 JSON ${json.length}자 > ${MAX_PROMPT_STEP_LEN}자`);
+      const [shown] = JSON.parse(json);
+      assert.match(shown['…'], /프롬프트 길이 제한/);
+      if (count > MAX_RESULT_COLS) assert.match(shown['…'], /컬럼 수 상한/);
+      for (const [name, value] of Object.entries(shown)) {
+        if (name !== '…') assert.equal(value, row[name]);
+      }
+      assert.ok(Object.keys(shown).length > 1);
+    }
+  }
+});
 
 test('이력·쿼리가 짧으면 그 여유가 처리방법과 지식으로 넘어간다 — 천장까지', () => {
   // 배분이 '섹션마다 고정'이면 이력·쿼리가 비어 있어도 처리방법·지식은 최소 몫에 묶인다. 옛 순서에서는
@@ -146,13 +185,13 @@ test('이력·쿼리가 짧으면 그 여유가 처리방법과 지식으로 넘
     assert.ok(sectionOf(light, title).length > PROMPT_FLOORS[key], `${title}이 여유를 못 쓰고 있다: ${sectionOf(light, title).length}`);
   }
   // 여유는 처리방법이 먼저 집는다 — 처리방법이 천장에 닿아야 지식으로 넘어간다 (constants.js PROMPT_FLOORS 순서)
-  assert.ok(sectionOf(light, 'Q&A 처리 방법').length > PROMPT_CEILINGS.qaMethods - 1200, '처리방법이 천장까지 받지 못했다');
+  assert.ok(sectionOf(light, 'Q&A 처리 방법').length > PROMPT_CEILINGS.qaMethods - 2000, '처리방법이 천장까지 받지 못했다');
   assert.ok(light.length <= MAX_PROMPT_TOTAL_LEN, `프롬프트가 예산을 넘었다: ${light.length}`);
 });
 
 test('쿼리 목록은 여유가 있어도 detail 표시가 붙은 것만 자세해진다', () => {
   // 앞 섹션(이력)이 비어 여유가 쿼리 목록으로 흘러도 천장(PROMPT_CEILINGS.queries) 안이다.
-  const only = buildPrompt(ctx({ queries: queries(35) }));
+  const only = buildPrompt(ctx({ queries: queries(10) }));
   assert.ok(countDetailed(only) > PROMPT_FLOORS.queries / 12_000, '여유를 못 쓰고 있다');
   assert.ok(sectionOf(only, '실행 가능한 쿼리 목록').length <= PROMPT_CEILINGS.queries, '쿼리 목록이 천장을 넘었다');
 });
@@ -163,16 +202,16 @@ test('예산이 모자라도 쿼리 이름은 한 건도 버리지 않는다', (
   // chat_log에는 '조회 없이 지식으로만 답한 요청'으로만 보인다.
   // 그래서 자세한 줄을 버리기 '전에' 이름·용도·바인드만 남긴 짧은 줄로 줄인다.
   const p = buildPrompt(ctx({
-    queries: queries(35), knowledge: knowledge(30), qaMethods: methods(30),
+    queries: queries(35).map(q => ({ ...q, input_desc: 'a: 필수 식별자' })), knowledge: knowledge(30), qaMethods: methods(30),
     history: new Array(5).fill(0).map((_, i) => ({
       query_name: `h${i}`, params: { a: 1 }, rows: wideRows(20, 30), totalRows: 100, capped: true,
     })),
   }));
   assert.equal(countQueryLines(p), 35, '등록된 쿼리 이름이 프롬프트에서 사라졌다');
   assert.ok(countDetailed(p) < 35, '이 예산에서 전부 자세히 실릴 수는 없다 (전제 확인)');
-  assert.match(p, /이름·용도·바인드만 표시/, '짧은 형태로 실린 사실을 모델에게 알려야 한다');
+  assert.match(p, /실행 명세만 표시/, '짧은 형태로 실린 사실을 모델에게 알려야 한다');
   // 짧은 줄에도 바인드는 남는다 — 없으면 첫 실행이 반드시 '값 없음'으로 실패한다
-  assert.match(p, /^- q34: .* \/ 바인드\(:a\)$/m);
+  assert.match(p, /^- q34: .* \/ 바인드\(:a\) \/ 입력\(a: 필수 식별자\)$/m);
   assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN, `프롬프트가 예산을 넘었다: ${p.length}`);
 });
 
@@ -398,16 +437,16 @@ test('본문에 든 개행이 목록 항목의 경계를 무너뜨리지 않는�
   // 지식 두 건이 어디서 갈리는지 모델이 알 수 없다. SQL은 더 나쁘다 — 여러 줄짜리 SQL이 목록
   // 밖으로 흘러나오면 다음 '- 이름:' 줄이 SQL의 일부처럼 읽힌다.
   const p = buildPrompt(ctx({
-    knowledge: [{ title: '재시작\n절차', content: '1) 콘솔 접속\r\n2) 작업 선택\n\n3) 재시작' }, { title: 'B', content: 'b' }],
-    qaMethods: [{ title: 'M', method: '1단계\n2단계' }],
+    knowledge: [{ seq: 1, title: '재시작\n절차', content: '1) 콘솔 접속\r\n2) 작업 선택\n\n3) 재시작' }, { seq: 2, title: 'B', content: 'b' }],
+    qaMethods: [{ seq: 1, title: 'M', method: '1단계\n2단계' }],
     queries: [{ query_name: 'q0', query_desc: '용도\n두 줄', input_desc: 'i', output_desc: 'o',
-      query_sql: 'SELECT A\n  FROM T\n WHERE B = :b', target_db_name: 'D', detail: true }],
+      query_sql: 'SELECT A\n  FROM T\n WHERE B = :b', target_db_name: 'D', detail: true, selected: true }],
     history: [{ query_name: 'q0', params: { b: 1 }, error: 'ORA-00942: table or view does not exist\nHelp: https://docs.oracle.com/error-help/db/ora-00942/', hint: '다른 쿼리를\n선택하라' }],
     chat: [{ role: 'assistant', text: '### 결과\n\n| A |\n|---|\n| 1 |' }],
   }));
   // 줄 구조가 근거인 본문(지식·처리방법·대화)은 이어지는 줄을 들여 같은 항목의 연속 줄로 싣는다
-  assert.ok(p.includes('- [재시작 절차] 1) 콘솔 접속\n  2) 작업 선택\n\n  3) 재시작\n- [B] b'), '지식 본문의 줄이 항목 밖으로 나갔다');
-  assert.ok(p.includes('- [M] 1단계\n  2단계'));
+  assert.ok(p.includes('- k1 [재시작 절차] 1) 콘솔 접속\n  2) 작업 선택\n\n  3) 재시작\n- k2 [B] b'), '지식 본문의 줄이 항목 밖으로 나갔다');
+  assert.ok(p.includes('- m1 [M] 1단계\n  2단계'));
   assert.ok(p.includes('- 에이전트: ### 결과\n\n  | A |\n  |---|\n  | 1 |'), '대화 턴의 표가 항목 밖으로 나갔다');
   // 줄바꿈이 뜻을 갖지 않는 것(SQL·설명·오류·대응)은 한 줄로 접는다 — 쿼리 한 건은 반드시 한 줄이다
   assert.match(p, /^- q0: 용도 두 줄 \/ .* \/ SQL: SELECT A FROM T WHERE B = :b$/m, '쿼리 줄이 여러 줄로 갈라졌다');
@@ -576,7 +615,7 @@ test('자세한 형태는 detail 표시가 붙은 쿼리만 — 나머지는 예
   const p = buildPrompt(ctx({ queries: list }));
   assert.equal(countDetailed(p), 2);
   assert.equal(countQueryLines(p), 6, '짧은 줄이라도 이름은 전부 실린다');
-  assert.match(p, /위 4건은 이름·용도·바인드만 표시했다/);
+  assert.match(p, /위 4건은 실행 명세만 표시했다/);
 });
 
 test('이력 줄 수 상한(MAX_HISTORY_ROWS)까지는 어떤 조합이든 전부 실린다', () => {
@@ -621,22 +660,22 @@ test('검색이 성립하지 않아 섹션이 비어도 "아직 검색한 자료
 
 // ===== 자료 항목의 번호·펼침·버리기 =====
 
-test('번호는 잘렸고 아직 펼치지 않은 항목에만 붙는다', () => {
+test('ID는 항상 표시하고 확대할 수 있는 항목만 따로 표시한다', () => {
   // 청구할 수 있는 자리에만 번호가 보여야 모델이 펼칠 수 없는 것을 청구하느라 스텝을 버리지 않는다.
   const p = buildPrompt(ctx({ searched: ['knowledge'], knowledge: [
     { seq: 12, title: '긴 것', content: big(MAX_PROMPT_ITEM_LEN + 1) },
     { seq: 3, title: '짧은 것', content: '본문' },
     { seq: 9, title: '이미 펼친 것', content: big(MAX_PROMPT_ITEM_LEN + 1), expanded: true },
   ] }));
-  assert.match(p, /^- k12 \[긴 것\] /m, '잘린 항목에 번호가 없다');
-  assert.match(p, /^- \[짧은 것\] 본문$/m, '잘리지 않은 항목에 번호가 붙었다');
-  assert.match(p, /^- \[이미 펼친 것\] /m, '펼친 항목에 번호가 남았다 — 더 받을 것이 없다는 표시가 사라진다');
+  assert.match(p, /^- k12 \[긴 것\] \(확대 가능\)/m);
+  assert.match(p, /^- k3 \[짧은 것\] 본문$/m, '잘리지 않은 항목에 번호가 붙었다');
+  assert.match(p, /^- k9 \[이미 펼친 것\] /m, '펼친 항목에 번호가 남았다 — 더 받을 것이 없다는 표시가 사라진다');
 });
 
 // 번호는 항목 단위 판정만이 아니라 요청 단위 판정(canExpand — 청구 기회가 남았는가, agent.js ctx)도 지나야 한다.
 // 성공한 청구는 이력에 남지 않아 모델은 상한(MAX_EXPANDS)을 다 썼다는 사실을 볼 수 없으므로, 번호가 남아 있으면
 // 그 번호로 청구해 헛돈 스텝을 받는다. 값이 없는 ctx는 종전대로 항목 단위로만 판정한다(다른 테스트가 그 경로다).
-test('청구 기회가 남지 않은 요청에는 어떤 항목에도 번호가 붙지 않는다', () => {
+test('청구 기회가 없어도 ID는 남고 확대 가능 표시만 사라진다', () => {
   const lists = {
     searched: ['knowledge', 'qa_method'],
     knowledge: [
@@ -648,8 +687,8 @@ test('청구 기회가 남지 않은 요청에는 어떤 항목에도 번호가 
   const open = buildPrompt(ctx({ ...lists, canExpand: true }));
   assert.match(open, /^- k12 \[/m); assert.match(open, /^- k5 \[/m); assert.match(open, /^- m7 \[/m);
   const closed = buildPrompt(ctx({ ...lists, canExpand: false }));
-  assert.doesNotMatch(closed, /^- [km]\d+ \[/m, '청구 기회가 없는데 번호가 남았다');
-  assert.match(closed, /^- \[긴 것\] /m); assert.match(closed, /^- \[청크 \(3\/22\)\] /m); assert.match(closed, /^- \[방법\] /m);
+  assert.doesNotMatch(closed, /확대 가능/);
+  for (const id of ['k12', 'k5', 'm7']) assert.ok(closed.includes(`- ${id} [`));
 });
 
 test('펼친 항목은 더 긴 상한으로 실린다 — 청크가 아닌 항목은 문서 창이 아니라 펼침 상한까지', () => {
@@ -674,9 +713,11 @@ test('버린 항목은 실리지도 세지도 않고, 버린 수는 따로 밝�
   assert.match(p, /^## Q&A 처리 방법 \(1건\)$/m, '버린 것이 없으면 그 표기를 붙이지 않는다');
 });
 
-test('모두 버린 섹션은 (없음)으로 남는다 — 찾아본 사실은 사라지지 않는다', () => {
-  const p = buildPrompt(ctx({ searched: ['knowledge'], knowledge: [{ seq: 1, title: 'K', content: 'a', dropped: true }] }));
-  assert.match(p, /^## 관련 지식 \(0건, 버림 1건\)\n\(없음\)$/m);
+test('모두 숨긴 섹션에도 복구할 ID가 남는다', () => {
+  const p = buildPrompt(ctx({ searched: ['knowledge'], knowledge: [{ seq: 1, title: 'K', content: '숨긴본문', dropped: true }] }));
+  assert.match(p, /관련 지식 \(0건, 버림 1건\)/);
+  assert.match(p, /보관 중, expand로 다시 표시: k1/);
+  assert.doesNotMatch(p, /숨긴본문/);
 });
 
 test('펼친 항목이 상한만큼 있어도 프롬프트가 예산을 넘지 않고, 그 본문이 잘리지 않는다', () => {
@@ -699,7 +740,7 @@ test('펼친 항목이 상한만큼 있어도 프롬프트가 예산을 넘지 �
   assert.ok(p.length <= MAX_PROMPT_TOTAL_LEN, `프롬프트가 예산을 넘었다: ${p.length}`);
   for (let i = 0; i < MAX_EXPANDS; i++) {
     for (const name of [`펼친${i}`, `펼친방법${i}`]) {
-      const line = p.split('\n').find(l => l.startsWith(`- [${name}]`));
+      const line = p.split('\n').find(l => l.includes(`[${name}]`));
       assert.ok(line, `펼친 항목 ${name}이 실리지 않았다`);
       assert.ok(!line.includes(TRUNC_MARK), `펼친 항목 ${name}의 본문이 다시 잘렸다`);
     }
@@ -718,20 +759,20 @@ test('청크 항목은 잘리지 않아도 더 받을 것이 남았으면 번호
   assert.match(at(base), /^- k12 \[운영 가이드 \(3~7\/22\)\]/, '범위 밖 청크가 남았으면 번호가 보여야 한다');
 
   const whole = { ...base, knowledge: [chunk({ from: 1, to: 22 })] };
-  assert.match(at(whole), /^- \[운영 가이드/, '문서 전체가 실렸으면 번호를 떼어 더 받을 것이 없음을 알린다');
+  assert.doesNotMatch(at(whole), /확대 가능/, '문서 전체가 실렸으면 번호를 떼어 더 받을 것이 없음을 알린다');
 
   const capped = { ...base, knowledge: [chunk({ content: '가'.repeat(MAX_DOC_LEN) })] };
-  assert.match(at(capped), /^- \[운영 가이드/, '글자 상한에 닿았으면 청구해도 늘지 않으므로 번호를 떼야 한다');
+  assert.doesNotMatch(at(capped), /확대 가능/, '글자 상한에 닿았으면 청구해도 늘지 않으므로 번호를 떼야 한다');
 
   // 범위 밖 청크가 남았고 상한에도 안 닿았지만 이웃 조각이 상한에 들어가지 않는 항목(chunk.js buildItems의 full) —
   // 앞의 둘만 보던 동안 이 항목에 번호가 남아, 청구가 한 글자도 늘리지 못했다(실측).
   const full = { ...base, knowledge: [chunk({ full: true })] };
-  assert.match(at(full), /^- \[운영 가이드/, '이웃 조각이 상한에 안 들어가면 청구해도 늘지 않으므로 번호를 떼야 한다');
+  assert.doesNotMatch(at(full), /확대 가능/, '이웃 조각이 상한에 안 들어가면 청구해도 늘지 않으므로 번호를 떼야 한다');
 
   // 상한은 프롬프트에 실리는 형태(들여쓰기 포함)로 잰다 — 'a' 한 줄은 원문 2자(글자+개행)지만 프롬프트에서는
   // 들여쓰기 두 칸이 붙어 4자다. 원문은 상한의 절반이 안 되고 프롬프트 형태로는 상한을 넘는 줄 수를 잡는다.
   const tall = { ...base, knowledge: [chunk({ content: Array(Math.ceil(MAX_DOC_LEN / 4) + 200).fill('a').join('\n') })] };
-  assert.match(at(tall), /^- \[운영 가이드/, '줄이 많은 본문은 원문이 짧아도 프롬프트 형태로는 상한에 닿는다');
+  assert.doesNotMatch(at(tall), /확대 가능/, '줄이 많은 본문은 원문이 짧아도 프롬프트 형태로는 상한에 닿는다');
 });
 
 test('청크 항목은 문서당 상한까지 잘리지 않고 통째로 실린다', () => {

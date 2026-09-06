@@ -79,6 +79,9 @@ export async function embed(texts, signal) {
     if (items.length !== texts.length) {
       throw new EmbeddingError(`임베딩 응답 개수 불일치: 요청 ${texts.length}건, 응답 ${items.length}건`, false);
     }
+    if (items.some((item, index) => item?.index !== index)) {
+      throw new EmbeddingError('임베딩 응답 index가 중복되거나 누락되거나 범위를 벗어났습니다', false);
+    }
     const vectors = items.map(d => d.embedding);
     if (vectors.some(v => !Array.isArray(v) || v.length === 0)) {
       throw new EmbeddingError('임베딩 응답에 유효하지 않은 벡터가 포함되어 있습니다', false);

@@ -7,18 +7,20 @@
 import { searchKnowledge, searchQaMethods, searchQueries } from './search.js';
 import { loadQueriesByNames, loadQueriesMentionedIn, loadChunkRanges } from './db.js';
 import { canGrow, buildItems, CHUNK_TARGET_LEN, CHUNK_OVERLAP } from './chunk.js';
+import { absorbKnowledge, knowledgeView } from './context-items.js';
+import { normalizeResultRead, readStoredResult } from './read-result.js';
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
 import { llm, renderAnswer, clipAnswer } from './llm.js';
 import { resolveChartData, resolveTableData, MAX_TABLE_CELL_LEN, MAX_CHART_CELL_LEN } from './chart.js';
-import { MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_DOC_LEN, MAX_PROMPT_ITEM_LEN, MAX_RESULT_ROWS, parseItemId, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_CELL_LEN, TRUNC_MARK, SEARCH_TARGETS, nameKey, clipText, stripLoneSurrogates, bindValue, targetDbNames, indentLines } from './constants.js';
+import { MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_RESULT_READS, MAX_DOC_LEN, MAX_PROMPT_ITEM_LEN, MAX_RESULT_ROWS, parseItemId, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_CELL_LEN, TRUNC_MARK, SEARCH_TARGETS, nameKey, clipText, stripLoneSurrogates, bindValue, targetDbNames, indentLines } from './constants.js';
 
 // MAX_STEPS는 constants.js에 있다 — 실행 이력의 프롬프트 몫이 그 값에 묶여 있다.
 const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포함). 초과하면 남은 스텝을 포기하고 강제 답변으로 간다.
                                // (스텝 상한과 별개로 필요하다 — 스텝 수는 LLM/조회가 얼마나 느린지를 모른다)
                                // 요청 전체 상한 = 이 값 + 마지막 LLM 호출(120초) + 강제 답변(120초) ≈ 420초.
                                // 프런트(App.jsx REQUEST_TIMEOUT_MS)가 이 계산에 맞춰져 있으니 함께 고칠 것.
-const MAX_PROMPT_QUERIES = 30; // 프롬프트에 싣는 쿼리 상한 (~2.2k토큰)
+const MAX_PROMPT_QUERIES = 30; // 검색 한 번의 쿼리 후보 수. 실제 표시는 별도 예산으로 제한한다.
 const MAX_SAME_QUERY_TRIES = 2; // 같은 쿼리·파라미터의 최대 실행 시도 (1회 실패는 일시 오류일 수 있어 재시도 허용)
 // 경로A(qa_method 본문이 지목한 쿼리)에서 관리 DB로 보내는 본문 길이 상한.
 // qa_method.method는 TEXT(64KB)이고 검색은 최대 20건을 돌려주므로, 상한이 없으면 요청마다
@@ -204,79 +206,32 @@ export const normalizeQuestion = raw => stripLoneSurrogates(raw).trim();
 export const searchKey = (text, targets) =>
   JSON.stringify([nameKey(text), SEARCH_TARGETS.filter(t => (targets ?? []).includes(t))]);
 
-// 검색 결과를 컨텍스트 목록에 합친다. 이번 검색이 찾은 것은 — 새 항목이든 이미 있던 항목이든 — 검색 결과의
-// 순서(관련도 순)대로 목록 맨 앞에 온다. 방금 요청한 검색이 가장 관련 높다는 전제이고, 프롬프트 예산
-// (llm-openai.js renderItems)이 꼬리부터 버리기 때문이다: 이미 있던 항목을 제자리에 두면 이번 검색의 1위가
-// 지난 검색의 꼬리에 남아 잘린다. 돌려주는 값은 '진도' — 새로 넣었거나 내용이 달라진 항목 수다. 순서만 바뀐
-// 것은 세지 않는다(모델이 새로 얻은 것이 없다).
-//
-// 항목의 정체는 seq가 아니라 문서다 (dedupKey — 청크 항목은 doc_seq). 청크 항목의 seq는 '가장 가까운 청크'의
-// 것이라(chunk.js buildItems) 두 번째 검색에서 다른 청크가 대표가 되면 값이 달라지는데, seq로만 거르면 같은
-// 문서가 두 항목으로 들어와 지식 몫을 두 번 먹는다. 같은 문서가 다시 오면 항목을 새로 만들지 않고 그 항목의
-// '구간'을 이번 검색의 것으로 바꾼다 — seq는 그대로다(모델이 이미 지목한 번호가 요청 도중 다른 것을 가리키면
-// 안 된다는 것이 식별자 설계의 근거다, constants.js ITEM_PREFIX). 이번 구간이 이미 실린 구간 안에 들면 넓은
-// 쪽을 둔다. 먼저 온 구간을 무조건 지키던 동안에는 뒤 검색이 같은 문서의 다른 절(3번 청크 → 15~17번)을
-// 찾아도 그 절이 통째로 버려지고, 모델은 그것이 존재한다는 사실조차 볼 수 없었다 — 오류 없는 오답의 전형이다.
-//
-// 예외 둘.
-//   펼친 항목(expanded) — 모델이 청구해 넓힌 구간이다. 자리도 구간도 지킨다: 목록 앞머리의 펼침 구간 뒤에
-//     끼운다(applyExpand가 unshift로만 옮기므로 펼친 항목은 목록의 접두사를 이룬다). 그러지 않으면 본문 청구가
-//     통째로 헛돈다 — 뒤이은 검색 한 번이 후보 SEARCH_LIMIT건을 그 앞에 쌓으면 펼친 본문(MAX_DOC_LEN)이 섹션 몫
-//     밖으로 밀려나는데, 펼친 항목에는 번호가 붙지 않으므로 모델은 그것이 사라진 것을 볼 수도 다시 청구할 수도
-//     없고 MAX_EXPANDS만 하나 잃는다(실측). 다른 구간이 필요하면 버리고(drop) 다시 찾으면 아래 규칙으로 실린다.
-//   버린 항목(dropped) — 같은 내용은 되살아나지 않는다(context.md 2-4, 목록에서 지우지 않고 표시만 세우는
-//     이유가 그것이다). 단 청크 항목에 '겹치지 않는' 다른 구간이 걸리면 그 구간으로 되살린다: 모델이 버린 것은
-//     그 구간이지 문서가 아니고, 되살리지 않으면 관련 있는 절이 이 요청 안에서 영영 실리지 않는다.
-//
-// 쿼리 목록에는 펼침·버림이 없어 종전과 같이 맨 앞에 붙되, 이미 있던 행이 이번 검색의 자세한 대상(detail)으로
-// 다시 왔으면 그 표시를 옮겨 받는다 — 옮기지 않으면 두 번째 query 검색의 상위 적중이 짧은 줄로 남는다(실측).
-// 두 검색의 상위 적중이 겹쳐 새 항목이 하나도 안 들어와도, 옮긴 표시는 진도로 센다.
-// (테스트에서 쓰므로 export 한다)
-const dedupKey = r => (r?.doc_seq != null ? `d${r.doc_seq}` : `s${r?.seq}`);
+// 검색은 보관된 근거를 교체하지 않고 추가한다. 펼친 항목은 표시 우선순위를 유지한다.
 const rangeOf = o => (Number.isInteger(o?.from) && Number.isInteger(o?.to) ? [o.from, o.to] : null);
-const within = (a, b) => !!(a && b) && a[0] >= b[0] && a[1] <= b[1];   // a ⊆ b
-const apart = (a, b) => !!(a && b) && (a[1] < b[0] || a[0] > b[1]);    // 겹치지 않는다
-// 청크 항목의 구간을 이번 검색의 것으로 바꾼다. seq·expanded·dropped는 건드리지 않는다 (applyExpand가 넓힐 때와 같은 키).
-const RANGE_KEYS = ['rep', 'doc_seq', 'chunk_of', 'from', 'to', 'full', 'title', 'range', 'content', '_dist'];
-const adopt = (had, r) => { for (const k of RANGE_KEYS) if (k in r) had[k] = r[k]; };
+const within = (a, b) => !!(a && b) && a[0] >= b[0] && a[1] <= b[1];
 
 export function mergeFront(list, rows) {
-  const byKey = new Map(list.map(o => [dedupKey(o), o]));
-  const front = [];
-  const seen = new Set();
+  const front = new Set();
   let progress = 0;
-  for (const r of rows) {
-    const key = dedupKey(r);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const had = byKey.get(key);
-    if (!had) { byKey.set(key, r); front.push(r); progress++; continue; }
-    const chunk = r?.doc_seq != null;
-    if (had.dropped) {
-      if (!(chunk && apart(rangeOf(r), rangeOf(had)))) continue;   // 같은 내용(겹치는 구간)은 버린 채로 둔다
-      adopt(had, r);
-      had.dropped = false;
-      had.expanded = false;                                       // 펼쳤던 구간은 버려졌다 — 새 구간은 핀이 아니다
-      progress++;
-    } else if (had.expanded) {
-      continue;                                                   // 청구한 구간은 자리도 내용도 지킨다
+  for (const row of rows) {
+    if (row.doc_seq != null) {
+      const result = absorbKnowledge(list, row);
+      list.push(...result.added);
+      result.front.forEach(r => front.add(r));
+      progress += result.progress;
     } else {
-      // 범위를 모르는 행(병합 실패 시의 청크 원문, search.js 폴백)은 구간을 바꾸지 않는다 — 본문만 갈아 끼우면
-      // 위치 표기는 옛 구간을 가리키고 본문은 다른 조각이 되어 서로 어긋난다(실측).
-      if (chunk && rangeOf(r) && !within(rangeOf(r), rangeOf(had))) {
-        const before = had.content;
-        adopt(had, r);
-        if (had.content !== before) progress++;
+      const old = list.find(r => r.doc_seq == null && r.seq === row.seq);
+      if (!old) { list.push(row); front.add(row); progress++; }
+      else if (!old.dropped) {
+        if (row.detail && !old.detail) { old.detail = true; progress++; }
+        front.add(old);
       }
-      if (r.detail && !had.detail) { had.detail = true; progress++; }
     }
-    front.push(had);
   }
-  // 앞으로 옮길 기존 항목을 제자리에서 뺀 뒤, 남은 펼침 접두사 뒤에 이번 검색 순서대로 끼운다.
-  const moving = new Set(front);
-  for (let i = list.length - 1; i >= 0; i--) if (moving.has(list[i])) list.splice(i, 1);
-  const pinned = list.findIndex(o => !o?.expanded);
-  list.splice(pinned < 0 ? list.length : pinned, 0, ...front);
+  const pinned = list.filter(r => r.expanded && !r.dropped);
+  const moving = [...front].filter(r => !pinned.includes(r));
+  list.splice(0, list.length, ...pinned, ...moving,
+    ...list.filter(r => !pinned.includes(r) && !front.has(r)));
   return progress;
 }
 
@@ -314,7 +269,7 @@ async function growItem(row, loadChunks = loadChunkRanges) {
       [{ doc_seq: row.doc_seq, rep: row.rep ?? row.from, from: row.from, to: row.to, chunk_of: row.chunk_of, dist: row._dist }],
       rows, { maxDocLen: MAX_DOC_LEN, grow: true }
     );
-    return item ?? null;
+    return item && within(rangeOf(row), rangeOf(item)) ? item : null;
   } catch (e) {
     console.warn('[agent] chunk expand failed:', e?.message ?? e);
     return null;
@@ -361,30 +316,17 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
   let queriesFailed = false;     // 관리 DB에서 쿼리 목록을 못 읽었다
   let searchFailed = false;      // 어느 검색이든 성립하지 않은 대상이 있었다
   const history = [];
-  // ctx.searched에 담기는 것은 succeeded다 — 이름은 '찾아본 대상'이지만 뜻은 '찾아낸 대상'이다.
-  // 프롬프트의 자료 섹션은 '검색이 성립한' 대상만 보인다(succeeded). 검색해 봤지만 성립하지 않은 대상까지
-  // 넣으면 그 섹션이 '(없음)'으로 실려 모델이 '등록된 자료가 없다'로 읽는다 — 프롬프트가 '비어 있음'과
-  // '누락됨'을 가르는 이유가 정확히 그것인데, 검색 불가를 '없음' 쪽에 세우면 그 구분이 뒤집힌다.
-  // tried는 '한 번이라도 찾아봤는가'다 — '아직 아무것도 안 찾아봤다'는 안내를 붙일지만 가른다(검색이
-  // 성립하지 않아 섹션이 없는 요청에 '먼저 찾으라'고 다시 말하면 남은 검색 기회를 그대로 태운다).
-  // canExpand: 이 요청에 청구 기회가 남았는가. 프롬프트가 이 값으로 청구 번호를 통째로 뗀다(llm-openai.js itemLine) —
-  // 성공한 청구는 이력에 남지 않으므로(applyExpand) 모델은 자기가 상한(MAX_EXPANDS)을 다 썼다는 사실을 프롬프트
-  // 어디에서도 볼 수 없다. 번호가 그대로 남아 있던 동안 모델은 시스템 프롬프트의 '번호가 붙어 있으면 청구할 수
-  // 있다'를 따라 셋째 문서를 청구했고, 받은 것은 '상한에 닿았다'는 안내와 헛돈 스텝 하나였다(퍼징으로 잡았다 —
-  // 두 번이면 강제 답변). '청구할 수 있는 자리에만 번호가 보인다'(context.md 2-3)가 상한에서만 깨져 있던 셈이다.
-  // canSearch도 같은 부류다 — 실행한 검색은 이력에 남지만 상한(MAX_SEARCHES)은 프롬프트 어디에도 없어, 생산적인 검색
-  // 셋 뒤에 모델이 낸 넷째 검색은 '상한에 닿았다'는 안내와 헛돈 스텝으로 끝났다(실측). 지시 블록이 이 값으로 한 줄을 붙인다.
-  // queriesLeft — 이 요청에서 더 실행할 수 있는 조회 수. 조회 수 상한(MAX_STEPS)과 이력 줄 수 상한(MAX_HISTORY_ROWS)
-  // 중 먼저 닿는 쪽이다(아래 루프의 take 계산과 같은 두 상한). 0이면 모델의 run_query 결정은 아래 `runs >= MAX_STEPS`에서
-  // 버려지고 강제 답변 호출이 하나 더 나간다 — 조회 5건 뒤 6번째 결정이 정확히 그렇게 왕복 하나를 태웠다(실측). 지시 블록이
-  // 0이면 '더 조회할 수 없다'를, 한 결정에 담을 수 있는 수(MAX_BATCH_QUERIES)보다 적으면 남은 수를 말한다.
+  // 프롬프트에는 성공한 검색 대상과 남은 행동 수를 전달한다.
+  // 조회 원본·실행 이력은 유지하고 resultViews로 해당 실행의 표시 범위만 교체한다.
   const ctx = () => ({
-    question, chat, knowledge, qaMethods, queries, history,
+    question, chat, knowledge, qaMethods, queries,
+    history: history.map(h => resultViews.has(h) ? { ...h, ...resultViews.get(h) } : h),
+    contextNote, resultReadsLeft: Math.max(0, MAX_RESULT_READS - resultReads),
     searched: [...succeeded], tried: searched.size > 0,
     canExpand: expands < MAX_EXPANDS, canSearch: searches < MAX_SEARCHES,
     queriesLeft: Math.max(0, Math.min(MAX_STEPS - runs, MAX_HISTORY_ROWS - history.length)),
     // expandsLeft — 남은 청구 수. 상한보다 적어지면 지시 블록이 그 수를 말한다: 하나 남은 자리에 번호 둘을 적은 결정에서
-    // 둘째 번호가 안내 한 줄 없이 버려졌다(applyExpand의 break — 실측). 다음 프롬프트에는 번호가 전부 사라져 되돌릴 수도 없다.
+    // 둘째 번호가 안내 한 줄 없이 버려졌다(applyExpand의 break — 실측). 다음 프롬프트에서 남은 수를 알려야 한다.
     expandsLeft: Math.max(0, MAX_EXPANDS - expands),
   });
   // 성공한 조회의 전체 행(≤MAX_ROWS). history에는 capRows로 자른 20행만 싣는다 — history는 프롬프트와
@@ -393,6 +335,10 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
   // (server.js → result.js clientTrace — 사용자가 조회된 행 전부를 보는 유일한 자리다). 둘 다 이 요청의
   // 응답 안에서 끝나므로 history와 나란히 들고 있다가 함께 돌려준다.
   const fullRows = new Map();
+  const resultViews = new Map();
+  const readKeys = new Map();
+  let resultReads = 0;
+  let contextNote = '';
   // 답변이 나가는 두 출구(모델의 answer, 강제 답변)가 같은 마무리를 지난다 — 표 참조(```table step: N)와 차트 참조
   // (data: step N)를 실제 행으로 채운다. 스텝 번호는 history의 1-based 절대 인덱스(프롬프트의 'N.'과 같다 —
   // 검색 줄도 번호를 차지한다, chart.js 주석 참고).
@@ -412,7 +358,12 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
     try {
       return await decide({
         ...c,
-        onUsage: u => Object.assign(entry, { prompt: u.prompt_tokens, completion: u.completion_tokens }),
+        onUsage: u => {
+          // 파싱 실패 뒤 재시도까지 실제 사용량에 합산한다.
+          for (const [key, value] of [['prompt', u.prompt_tokens], ['completion', u.completion_tokens], ['cached', u.prompt_tokens_details?.cached_tokens]]) {
+            if (Number.isFinite(value) && value >= 0) entry[key] = (entry[key] ?? 0) + value;
+          }
+        },
         // 듣는 쪽이 없으면 훅을 주지 않는다 — provider는 이 훅이 있을 때만 답변 미리보기를 조립하므로
         // (llm-openai.js answerPreviewer), 스트림을 요청하지 않은 요청에서 그 해독을 조각마다 헛돌게 하지 않는다.
         ...(onEvent && {
@@ -425,7 +376,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
   };
   let guardHits = 0;
   let queryEventSeq = 0;         // 조회 진행 이벤트의 짝 번호 (아래 emit 주석)
-  let expands = 0;               // 본문을 펼친 항목 수 (≤ MAX_EXPANDS)
+  let expands = 0;               // 확대·복구·우선 표시 수 (≤ MAX_EXPANDS)
   let drops = 0;                 // 모델이 버린 항목 수
   let searches = 0;              // 실제로 실행한 검색 수 (≤ MAX_SEARCHES)
   const topHits = [];            // 지식 적중의 (문서, 거리) — 계측 전용 (absorb 주석)
@@ -440,9 +391,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
     return list ? { list, i: list.findIndex(o => o.seq === at.seq) } : { list: null, i: -1 };
   };
 
-  // 버리기 — 자료를 늘리는 결정(search·expand)에 얹혀 온다. 표시만 세우고 목록에서 지우지 않는다:
-  // 병합이 seq로 중복을 거르므로(mergeFront) 남겨 두어야 같은 항목이 재검색으로 되살아나지 않는다.
-  // 효력은 이 요청 안에서만이다 — 다음 질문까지 남기면 한 번의 오판이 계속 따라다니고 보이지 않는다.
+  // 숨김은 search·expand에 붙인다. 요청 안의 원본과 ID를 남겨 재검색으로 되살아나지 않게 한다.
   const applyDrop = ids => {
     let n = 0;
     for (const id of ids ?? []) {
@@ -455,14 +404,8 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
     return n;
   };
 
-  // 본문 청구 — 잘린 항목의 전체 본문을 다음 스텝부터 싣는다. 목록 앞으로 옮기는 것이 중요하다:
-  // 프롬프트 예산은 뒤에서부터 버리므로, 그냥 두면 정작 펼친 항목이 잘려 나간다.
-  // 그 자리는 이후 검색이 와도 지켜진다 — mergeFront가 펼침 구간 뒤에 끼운다(위 주석).
-  // 이미 펼쳤거나 버린 항목, 목록에 없는 식별자는 넘긴다 — 성공한 것의 목록을 돌려준다.
-  // 반환: done — 실제로 펼친 식별자, saturated — 번호가 붙어 있었지만(canGrow) 창을 넓혀 읽어 보니 이웃 조각이
-  // 상한에 들어가지 않아 한 글자도 늘지 않은 항목 수. 뒤의 것은 검색 시점에 이웃을 읽지 못한 항목에서만 난다.
-  // unread — 번호가 붙어 있었는데 관리 DB가 청크를 돌려주지 못한(타임아웃·접속 실패) 항목 수. 항목도 번호도
-  // 그대로 남으므로 호출부의 안내가 이 경우를 따로 말해야 한다 — 아래 루프의 note 주석.
+  // 확대·복구한 항목은 앞에 고정한다. 이후 검색도 이 우선순위를 유지한다.
+  // done은 성공한 ID, saturated는 읽어도 본문이 늘지 않은 수, unread는 DB 읽기 실패 수다.
   const applyExpand = async ids => {
     const done = [];
     let saturated = 0;
@@ -470,13 +413,30 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
     for (const id of ids ?? []) {
       if (expands >= MAX_EXPANDS) break;
       const { list, i } = rowAt(id);
-      if (i < 0 || list[i].dropped) continue;
+      if (i < 0) continue;
       const row = list[i];
+      // 숨긴 자료의 복원은 저장된 본문으로 끝낸다. DB 읽기나 재검색이 필요 없다.
+      if (row.dropped || (row.expanded && i > 0)) {
+        row.dropped = false;
+        row.expanded = true;
+        list.splice(i, 1);
+        list.unshift(row);
+        expands++;
+        done.push(id);
+        continue;
+      }
       if (row.doc_seq != null) {
-        // 청크 항목 — 범위를 넓힌다. 항목을 새로 만들지 않는 이유: 항목이 곧 '문서의 한 구간'이라
-        // 같은 항목을 다시 청구하는 것이 자연스러운 이어받기가 된다. 별도 항목으로 넣으면 같은
-        // 문서가 여러 항목으로 흩어져 mergeFront의 문서 단위 중복 제거와 어긋난다.
-        if (!canGrow(row)) continue;                 // 상한에 닿았거나 범위 밖 청크가 없다
+        // 청구한 구간의 ID를 유지하며 앞뒤 청크를 읽는다. 다른 구간은 캐시에 그대로 남는다.
+        if (!canGrow(row)) {
+          // 표시 예산에 밀린 구간도 같은 ID로 앞으로 가져올 수 있다.
+          if (i === 0) continue;
+          row.expanded = true;
+          list.splice(i, 1);
+          list.unshift(row);
+          expands++;
+          done.push(id);
+          continue;
+        }
         const grown = await growItem(row, loadChunks);
         if (!grown) { unread++; continue; }          // 읽기 실패 — 판정할 근거가 없으니 아무것도 바꾸지 않는다
         // seq는 덮어쓰지 않는다. 모델이 지목한 번호가 그 스텝에 바뀌면 방금 청구한 항목을 다시
@@ -485,7 +445,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
         // 호출 인자에 기대지 않고 여기서 구조로 못 박는다.
         const { seq: _ignored, ...widened } = grown;
         const progressed = grown.content.length > row.content.length;
-        // 늘지 않았어도 판정(full)은 받아 적는다 — 그래야 다음 프롬프트에서 번호가 사라진다. 이 표시를 세우지
+        // 늘지 않았어도 판정(full)은 받아 적는다 — 그래야 다음 프롬프트에서 확대 표시가 사라진다. 이 표시를 세우지
         // 않으면 모델은 같은 번호를 다시 청구하고, 그 헛도는 스텝이 둘이면 강제 답변으로 넘어간다(실측).
         Object.assign(row, widened);
         if (!progressed) { saturated++; continue; }   // 늘지 않았으면 진도가 아니다
@@ -494,10 +454,8 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
         row.expanded = true;
       } else {
         if (row.expanded) continue;                  // 청크가 아닌 항목(qa_method)은 한 번만 펼친다
-        // 번호가 붙지 않은(잘리지 않은) 항목은 청구할 것이 없다 — 프롬프트와 같은 판정이다(llm-openai.js itemLine:
-        // 프롬프트에 실리는 형태가 항목 상한을 넘어야 번호가 붙는다). 받아 주면 한 글자도 늘지 않는 청구가
-        // '성공'으로 세어져 MAX_EXPANDS 하나를 먹고, 모델은 아무 안내 없이 같은 프롬프트를 다시 받는다(실측).
-        if (indentLines(list === qaMethods ? row.method : row.content).length <= MAX_PROMPT_ITEM_LEN) continue;
+        // 이미 맨 앞에 온 짧은 항목은 확대도 우선순위 변경도 할 필요가 없다.
+        if (i === 0 && indentLines(list === qaMethods ? row.method : row.content).length <= MAX_PROMPT_ITEM_LEN) continue;
         row.expanded = true;
       }
       // 펼친 항목은 목록 맨 앞으로. 예산이 뒤에서부터 버리므로 그 자리라야 살아남는다.
@@ -528,6 +486,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       // 모델이 자료를 얼마나 손봤는가 — 자주 버려지는 지식은 등록 품질 신호다 (README의 운영 루프).
       ...(expands && { expanded: expands }),
       ...(drops && { dropped: drops }),
+      ...(resultReads && { resultReads }),
       ...(topHits.length && { top: topHits }),
       ...(queriesFailed && { queriesFailed: true }),
       ...(searchFailed && { searchFailed: true }),
@@ -558,13 +517,11 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       if (rows === null) { failed.push(target); return; }   // 검색이 성립하지 않았다 — 0건과 다르다
       succeeded.add(target);
       hits[HIT_KEY[target]] = rows.length;
-      // 지식 적중의 거리 분포를 남긴다 — 문서당 글자 상한(MAX_DOC_LEN)이 옳은지는 논증이 아니라
-      // 이 숫자로 갈린다: 한 문서가 상위를 차지할 때 거리가 촘촘하게 낮으면(0.30~0.40) 그 문서가
-      // 정답이니 상한을 올릴 근거이고, 문턱 근처에 흩어져 있으면(0.48~0.55) 긴 문서가 청크 수로
-      // 밀고 들어온 것이니 유지할 근거다. 상위 몇 건만 센다 — chat_log가 요청마다 커지면 안 된다.
+      // 거리·구간·청크 수를 함께 기록한다. 정답 여부는 평가셋으로 판단한다.
       if (target === 'knowledge') {
         for (const r of rows.slice(0, TOP_TRACE)) {
-          if (r?.doc_seq != null) topHits.push({ doc: r.doc_seq, d: Math.round(r._dist * 1000) / 1000 });
+          if (r?.doc_seq != null) topHits.push({ doc: r.doc_seq, d: Math.round(r._dist * 1000) / 1000,
+            from: r.from, to: r.to, chunks: r.chunks?.length });
         }
       }
       added += mergeFront(list, rows);
@@ -653,7 +610,10 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       // MAX_SEARCHES × MAX_PROMPT_QUERIES + MAX_STEPS까지 자란다. 그래도 프롬프트가 넘치지는 않는다:
       // renderQueries가 짧은 줄부터 확보하고 남는 만큼만 자세히 올린 뒤 꼬리를 버린다.
       registryRow.detail = true;
-      if (!queries.includes(registryRow)) queries.unshift(registryRow);
+      registryRow.selected = true;
+      const previousIndex = queries.indexOf(registryRow);
+      if (previousIndex >= 0) queries.splice(previousIndex, 1);
+      queries.unshift(registryRow);
       seenInBatch.add(dupKey);
       const entry = { ...base };
       history.push(entry);
@@ -702,7 +662,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
     return { progressed, wasted: !progressed && wastedCount === batch.length };
   };
 
-  for (let i = 0; i < MAX_STEPS + MAX_SEARCHES + MAX_EXPANDS; i++) {
+  for (let i = 0; i < MAX_STEPS + MAX_SEARCHES + MAX_EXPANDS + MAX_RESULT_READS; i++) {
     // 이력 줄 수도 상한이다 — 결정 하나가 조회 여럿을 만들 수 있으므로(일괄 조회) 반복 수만으로는 줄 수가
     // 묶이지 않는다. 넘기면 프롬프트의 이력 몫이 보장하는 '전부 실린다'가 깨져 가장 오래된 조회 결과가
     // 조용히 빠진다 (constants.MAX_HISTORY_ROWS).
@@ -710,6 +670,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
     // 스텝 수만으로는 소요 시간이 묶이지 않는다 — 느린 LLM 엔드포인트에서는
     // 스텝마다 LLM 타임아웃이 통째로 쌓여 요청 하나가 수십 분씩 워커를 점유한다.
     if (Date.now() > deadline) break;
+
     const decision = await decideSafe(ctx());
     if (!decision) break; // 결정을 얻지 못했다 — 아래 강제 답변/폴백으로 간다
     if (decision.action === 'answer') {
@@ -722,6 +683,30 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
     // 검색·조회까지 더 태우면 프런트가 먼저 끊는 지점을 넘긴다.
     if (Date.now() > deadline) break;
 
+    if (decision.action === 'read_result') {
+      if (resultReads >= MAX_RESULT_READS) {
+        contextNote = '조회 결과 추가 읽기 기회를 다 썼다. 현재 표시된 결과로 답변하라';
+        if (++guardHits >= MAX_GUARD_HITS) break;
+        continue;
+      }
+      resultReads++;
+      const request = normalizeResultRead(decision);
+      const key = JSON.stringify(request);
+      try {
+        const entry = history[request.step - 1];
+        if (readKeys.get(entry) === key) throw new Error('같은 결과 범위를 이미 읽었다. 다른 행·컬럼을 지정하거나 표시된 결과로 답변하라');
+        const view = readStoredResult(fullRows.get(entry), request);
+        resultViews.set(entry, view);
+        readKeys.set(entry, key);
+        contextNote = '';
+        guardHits = 0;
+      } catch (e) {
+        contextNote = clipText(`결과 추가 읽기 불가: ${e.message}`, 200);
+        if (++guardHits >= MAX_GUARD_HITS) break;
+      }
+      continue;
+    }
+
     // 자료를 늘리는 결정만 자료를 줄일 수 있다 (search·expand). 검색보다 '먼저' 적용한다 —
     // 새 결과가 병합되기 전에 표시가 서 있어야 방금 버린 것이 그 검색으로 되살아나지 않는다.
     const droppedNow = decision.action === 'search' || decision.action === 'expand'
@@ -733,7 +718,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       if (grownIds.length || droppedNow) { guardHits = 0; continue; }
       // 번호가 붙어 있던 항목이 늘지 않은 경우는 따로 말한다 — '번호가 붙은 항목만 청구할 수 있다'는 안내는
       // 모델이 방금 그렇게 한 상황에서 모순이고, 왜 안 됐는지도 다음 행동도 담고 있지 않다.
-      // 읽기 실패(unread)가 그중 먼저다: 늘지 않은 항목(saturated)은 full이 서서 다음 프롬프트에서 번호가 사라지지만,
+      // 읽기 실패(unread)가 그중 먼저다: 늘지 않은 항목(saturated)은 full이 서서 다음 프롬프트에서 확대 표시가 사라지지만,
       // 읽지 못한 항목은 아무것도 바뀌지 않아 번호가 그대로 남는다. 그 앞에 '번호가 붙은 항목만'을 적으면 모델은
       // 같은 번호를 다시 청구하고, 두 번째 실패에서 강제 답변으로 넘어갔다(실측 — 관리 DB 타임아웃 한 번이면 그렇게 된다).
       pushNote({
@@ -743,8 +728,8 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
           : unread
             ? '청구한 본문을 읽어 오지 못했다 (관리 DB 오류) — 같은 번호를 다시 청구하지 말고 지금 범위로 답변하라'
             : saturated
-              ? '청구한 항목은 더 넓힐 수 없다 — 이웃 조각이 문서당 글자 상한에 들어가지 않는다. 번호가 사라진 것이 그 표시이니 지금 범위로 답변하라'
-              : '펼칠 수 있는 항목이 없다 — 번호가 붙은 항목만 청구할 수 있다',
+              ? '청구한 항목은 더 넓힐 수 없다 — 이웃 조각이 문서당 글자 상한에 들어가지 않는다. 지금 범위로 답변하라'
+              : '표시할 새 내용이 없다 — 확대 가능하거나 보관 목록에 있는 항목을 청구하라',
       });
       if (++guardHits >= MAX_GUARD_HITS) break;
       continue;
@@ -966,7 +951,7 @@ const LLM_FAILED_NOTE = '*LLM 응답을 받지 못해, 조회 결과와 등록�
 export function fallbackAnswer(ctx) {
   // 버린 항목은 여기서도 뺀다. 프롬프트에서 뺀 것(llm-openai.js live)을 폴백이 '관련 지식'으로 붙이면, 모델이
   // 무관하다고 판정한 본문이 그 판정을 무시한 채 사용자에게 나가고 정작 남긴 지식은 그 뒤에 가려진다(실측).
-  const rendered = renderAnswer({ ...ctx, knowledge: (ctx.knowledge ?? []).filter(k => !k?.dropped) });
+  const rendered = renderAnswer({ ...ctx, knowledge: knowledgeView(ctx.knowledge ?? []).filter(k => !k?.dropped && !k.viewOmitted) });
   return rendered ? clipAnswer(`${LLM_FAILED_NOTE}\n\n${rendered}`) : LLM_FAILED;
 }
 
@@ -1026,26 +1011,23 @@ async function runSearch(text, targets) {
     want.has('qa_method') ? searchQaMethods(text) : undefined,
     want.has('query') ? searchQueries(text) : undefined,
   ]);
-  const out = { knowledge, qaMethods, queries: undefined, queriesFailed: false, directFailed: false };
+  const out = { knowledge, qaMethods, queries: undefined, queriesFailed: false, directFailed: direct === null && want.has('query') };
   if (!want.has('query') && !qaMethods?.length) return out;
   // 쿼리 목록 로드 실패로 검색 전체를 버리지 않는다 — 함께 버려지는 것이 방금 찾은 지식·처리방법이고,
   // 그중에는 DB 조회가 아예 필요 없는 순수 지식 질문도 있다. 실패는 표시로 남겨 chat_log가
   // '등록이 없어서 못 답한 질문'과 구분하게 한다 (queriesFailed).
   try {
     out.queries = await selectQueries(qaMethods ?? [], direct);
-    // 'query'를 검색했는데 벡터 검색이 성립하지 않았으면(direct === null) 실패로 알린다 —
-    // 목록에는 경로A(절차가 지목한 쿼리)만 남으므로, 그 밖의 등록은 이 요청에서 보이지 않는다.
-    out.directFailed = direct === null && want.has('query');
   } catch (e) {
     // 상세는 로그에만 — 화면 문구는 호출부가 만들고, MariaDB 원문에는 스키마·호스트가 들어 있다.
     console.warn('[agent] failed to load the query list:', e.message);
-    out.queries = null;
+    out.queries = direct == null ? null : await selectQueries([], direct);
     out.queriesFailed = true;
   }
   return out;
 }
 
-// 직접 검색(경로B)의 상위 몇 건까지 자세한 형태(입출력 설명·SQL)로 보일지. 나머지는 이름·용도·바인드만
+// 직접 검색(경로B)의 상위 몇 건까지 자세한 형태(입출력 설명·SQL)로 보일지. 나머지도 이름·용도·바인드·입력 설명을
 // 보인다 — 고르는 데는 그것이면 되고, 지목하면 다음 스텝에 자세히 실린다 (llm-openai.js renderQueries).
 const DETAIL_TOP = 5;
 
@@ -1083,7 +1065,8 @@ async function selectQueries(qaMethods, direct) {
     if (detail) q.detail = true;
     list.push(q);
   };
-  named.forEach(q => push(q, true));                      // 절차용(경로A)이 먼저, 자세히
+  (direct ?? []).filter(q => q.exact).forEach(q => push(q, true));
+  named.forEach(q => push(q, true));
   (direct ?? []).forEach((q, i) => push(q, i < DETAIL_TOP));
   return list.slice(0, MAX_PROMPT_QUERIES);
 }

@@ -97,11 +97,10 @@ test('같은 문서의 흩어진 적중을 하나의 범위로 잇고 사이 구
   assert.deepStrictEqual({ from: p.from, to: p.to, rep: p.rep }, { from: 3, to: 6, rep: 3 });
 });
 
-test('간격이 상한보다 멀면 잇지 않고 대표가 있는 쪽만 남긴다', () => {
+test('떨어진 적중은 각각의 구간으로 모두 보존한다', () => {
   const far = CHUNK_GAP_FILL + 5;
-  const [p] = planRanges([hit(1, 3, 0.31), hit(1, 3 + far, 0.36)]);
-  assert.equal(p.from, 3);
-  assert.ok(p.to < 3 + far, '동떨어진 두 구간을 다 실으면 글자 상한을 나눠 갖느라 양쪽 다 얕아진다');
+  const plans = planRanges([hit(1, 3, .31), hit(1, 3 + far, .36)]);
+  assert.deepEqual(plans.map(p => [p.from, p.to]), [[3, 3], [3 + far, 3 + far]]);
 });
 
 test('문서 순서와 대표 청크는 최소 거리에서 나온다 — 관련도 순을 보존한다', () => {

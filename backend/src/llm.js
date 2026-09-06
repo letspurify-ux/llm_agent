@@ -15,6 +15,7 @@ import { openaiDecide } from './llm-openai.js';
 import { bindNames } from './sql.js';
 import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, MAX_SEARCH_TEXT_LEN, MAX_BATCH_QUERIES, MAX_EXPANDS, MAX_DROPS, SEARCH_TARGETS, normalizeSearchTargets, normalizeItemIds, clipText, nameKey, ownProp, warnOnce, targetDbNames, isPlainObject } from './constants.js';
 import { rowCounts } from './result.js';
+import { normalizeResultRead } from './read-result.js';
 
 // LLM provider 선택의 단일 해석 지점.
 // 정확한 문자열 일치만 보면 'OpenAI'·'openai '(뒤 공백)·'vllm'·'openrouter' 같은 값이 전부
@@ -119,6 +120,7 @@ function openFence(text) {
 // 출처(질문·조회 결과 셀)는 전부 MAX_BIND_LEN 안이므로 이 절단이 정상 값을 건드리는 일은 없다.
 export function sanitizeDecision(d) {
   if (!d) return d;
+  if (d.action === 'read_result') return normalizeResultRead(d);
   // answer도 여기서 크기를 확정한다 (constants.MAX_ANSWER_LEN 주석 참고).
   // 상한을 요청의 max_tokens가 아니라 여기에 두는 이유: 완성을 토큰 수로 끊으면 JSON이 중간에서
   // 잘려 파싱 자체가 실패하고, 그 스텝의 결정이 통째로 버려진다 — 자를 곳은 파싱이 끝난 뒤다.
@@ -199,10 +201,10 @@ function sanitizeRunQuery(d) {
   // target_db가 조용히 사라진다 — 실행 경계는 '고르지 않았다'고 보고하고, 모델은 자기가 이름을
   // 적었다는 사실과 어긋나는 오류를 받아 같은 시도를 반복한다.
   // 문자열이 아니면 버린다(형식 검증은 llm-openai toDecision) — 여기 일은 크기 확정이다.
-  // 상한을 넘으면 자르되 실행 경계가 후보 목록과 함께 거부한다 (constants.MAX_TARGET_DB_NAME_LEN 참고).
-  const targetDb = typeof d.target_db === 'string'
-    ? clipText(d.target_db.trim(), MAX_TARGET_DB_NAME_LEN)
-    : '';
+  const rawTargetDb = typeof d.target_db === 'string' ? d.target_db.trim() : '';
+  const targetDb = rawTargetDb.length > MAX_TARGET_DB_NAME_LEN
+    ? clipText(rawTargetDb, MAX_TARGET_DB_NAME_LEN) + TRUNC_MARK
+    : rawTargetDb;
   // trim: 이름 앞뒤 공백은 등록 철자와의 비교(agent.js resolveQuery)를 어긋내는 것 외에 아무 역할이 없다.
   // 이름이 없으면(일괄 조회의 형식 아닌 항목을 위 sanitizeDecision이 빈 항목으로 바꿔 넘긴다) 빈 이름으로 둔다 —
   // String(undefined)는 'undefined'라는 글자를 만들어, 모델이 낸 적 없는 "undefined"라는 쿼리가 이력·프롬프트·

@@ -6,6 +6,16 @@ import assert from 'node:assert';
 process.env.EMBEDDING_URL = 'http://test.invalid/v1';
 const { embed, EmbeddingError } = await import('../src/embedding.js');
 
+test('임베딩 index 중복·누락·범위 오류는 원문과 벡터를 잘못 짝짓지 않는다', async () => {
+  for (const indices of [[0, 0], [1, 2], [-1, 0], [0, 0.5], [undefined, undefined]]) {
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      data: indices.map((index, position) => ({ index, embedding: [position + 1] })),
+    }));
+    await assert.rejects(embed(['a', 'b']), error =>
+      error instanceof EmbeddingError && error.retriable === false, JSON.stringify(indices));
+  }
+});
+
 test('접속 실패는 fetch failed 뒤에 원인이 붙고 재시도 대상이다', async () => {
   const cause = Object.assign(new AggregateError([new Error('connect ECONNREFUSED 127.0.0.1:11434')], ''), { code: 'ECONNREFUSED' });
   globalThis.fetch = async () => { throw Object.assign(new TypeError('fetch failed'), { cause }); };

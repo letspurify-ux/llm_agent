@@ -10,13 +10,14 @@ import {
   MAX_PROMPT_ITEM_LEN, MAX_PROMPT_SQL_LEN, MAX_PROMPT_STEP_LEN,
   MAX_PROMPT_PARAMS_LEN, MAX_PROMPT_TOTAL_LEN, PROMPT_FLOORS, PROMPT_CEILINGS, PROMPT_FRAME_RESERVE,
   MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, MAX_COMPLETION_TOKENS, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_BATCH_QUERIES, MAX_RESULT_ROWS,
-  MAX_EXPANDS, MAX_DOC_LEN, MAX_EXPANDED_ITEM_LEN, ITEM_PREFIX,
+  MAX_EXPANDS, MAX_DOC_LEN, MAX_EXPANDED_ITEM_LEN, MAX_CHAT_LEN, ITEM_PREFIX,
   SEARCH_TARGETS, clipText, warnOnce, targetDbNames, isPlainObject, joinUrl,
   readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_UPSTREAM_ERROR_BYTES, numEnv,
   indentLines, errorText,
 } from './constants.js';
 import { bindNames } from './sql.js';
 import { canGrow } from './chunk.js';
+import { knowledgeView } from './context-items.js';
 import { rowCounts } from './result.js';
 
 // 추론 강도. 기본을 low로 두는 이유: 이 에이전트가 모델에게 요구하는 건 매 스텝 결정 JSON 하나이고,
@@ -59,23 +60,23 @@ const IDLE_TIMEOUT_MS = numEnv('LLM_IDLE_TIMEOUT_MS', 30_000);
 // 여기 한 글자가 바뀌면 모든 요청·모든 스텝이 시스템 프롬프트부터 다시 계산한다.
 const SYSTEM_PROMPT = `당신은 사내 지식 관리 및 DB 조회 Q&A 에이전트다.
 지금까지 검색·실행해서 확보한 자료(관련 지식, Q&A 처리 방법, 실행 가능한 쿼리 목록, 실행 이력), 최근 대화, 그리고 사용자의 현재 질문이 이 순서로 주어진다. 자료는 처음에는 없고 네가 search로 요청해야 채워진다.
-반드시 아래 세 형식 중 하나의 JSON 객체 하나만으로 응답하라. 다른 텍스트를 붙이지 마라.
+반드시 아래 행동 중 하나의 JSON 객체 하나만으로 응답하라. 다른 텍스트를 붙이지 마라.
 생각을 적어야 한다면 <think> 와 </think> 사이에만 적어라. 그 블록 밖에는 위 JSON 하나만 남긴다.
 
 1. 사내 자료가 필요하면 먼저 검색한다:
 {"action":"search","text":"<검색어>","targets":["knowledge","qa_method","query"]}
 - targets: knowledge = 사내 지식(개념·정책·절차·안내문), qa_method = 질문 유형별 처리 방법(어떤 쿼리를 어떤 순서로 실행해 답하는지), query = 조회 DB에 실행할 수 있는 쿼리 목록(현재 상태·수치·이력 조회). 필요한 것만 고르되, 무엇이 필요한지 확실하지 않으면 셋 다 넣는다. qa_method를 찾으면 그 본문이 지목한 쿼리는 함께 실린다.
-- text: 질문의 핵심 낱말 2~6개(시스템명·작업 ID·고객명·절차명). 후속 질문이면 최근 대화에서 대상을 복원해 적는다 (예: "그럼 김철수는?" → "김철수 고객 주문 상태").
+- text: 질문의 핵심 낱말 2~6개. 후속 질문이면 대화에서 대상을 복원한다. 정확한 쿼리명을 알면 그 이름만 검색하라 — 정확 일치를 먼저 찾는다.
 - 사내 시스템·업무·절차·데이터에 관한 질문은 검색 없이 답하지 마라. 검색이 0건이면 검색어를 바꿔 한 번 더 시도하고, 그래도 없으면 3의 규칙대로 답한다. 이미 검색한 검색어·대상을 반복하지 마라. 한 요청에 검색은 최대 ${MAX_SEARCHES}번 — 다 쓰면 지시 블록이 그 사실을 말한다.
 - 인사·잡담·감사 인사, 그리고 최근 대화에 이미 있는 내용의 재정리는 검색 없이 곧바로 답한다.
-- drop: 앞서 받은 자료 중 더는 필요 없는 것의 번호를 함께 적는다 (예: ["k7","m2"]). 적은 것은 다음 단계부터 실리지 않아 그 자리를 관련 있는 자료가 쓴다. 첫 검색에는 필요 없다.
-- 두 번째 검색부터는 drop을 함께 적어라. 새 결과가 목록 앞에 실리므로, 앞선 검색의 자료를 그대로 두면 길이 제한에 밀려 사라진다 — 어느 쪽이 이 질문에 필요한지는 너만 판단할 수 있다. 앞선 검색에서 아직 쓸 것이 있으면 이번 검색의 대상(targets)을 좁혀라.
+- drop: 더는 필요 없는 자료 ID를 선택적으로 적는다 (예: ["k7","m2"]). 본문을 숨길 뿐 보관된 자료는 지우지 않는다. 필요해지면 expand로 복구한다.
+- 검색은 앞선 근거를 보관한다. 같은 문서의 떨어진 구간도 별도 ID로 남는다. 보관 목록의 ID는 재검색 없이 expand로 표시할 수 있다.
 
-2. 항목 앞에 번호가 붙어 있으면 그 자료를 더 청구할 수 있다:
+2. 자료를 확대하거나 보관된 자료를 다시 표시하려면:
 {"action":"expand","ids":["k12"],"drop":["k7"]}
-- 긴 지식은 여러 조각으로 나뉘어 있고 제목 끝의 (3~7/22) 가 전체 22조각 중 지금 실린 범위다. 청구하면 그 앞뒤가 이어져 실린다. 같은 번호를 다시 청구하면 더 넓어진다.
-- 번호가 없는 항목은 더 받을 것이 없다 — 범위가 문서 전체이거나 길이 상한에 닿았거나, 이 요청의 청구 횟수를 다 썼다는 뜻이다. 청구해도 아무것도 늘지 않는다.
-- 실린 범위 밖에 답이 있을 것 같을 때만 청구하라. 보이는 범위로 답할 수 있으면 그대로 답한다. 한 요청에 최대 ${MAX_EXPANDS}번 — 남은 수가 적어지면 지시 블록이 말하고, 다 쓰면 모든 번호가 사라진다.
+- 자료 ID는 항상 유지된다. 제목의 (3~7/22)는 전체 22청크 중 표시한 구간이다. '확대 가능'이면 앞뒤 청크를 더 읽을 수 있다.
+- 보관 목록의 ID를 청구하면 저장된 본문을 다시 우선 표시한다. 이미 보이는 자료는 '확대 가능' 또는 '보관 구간 더 있음'일 때만 청구하라.
+- 확대와 복구를 합해 한 요청에 최대 ${MAX_EXPANDS}건이다. 남은 수는 지시 블록을 따른다. 횟수를 다 써도 ID는 유지된다.
 - drop은 1의 것과 같다. 넓힌 본문이 자리를 많이 쓰므로 더는 필요 없는 자료를 함께 적어라.
 
 3. 답변 전에 DB 조회가 더 필요하면:
@@ -92,7 +93,11 @@ const SYSTEM_PROMPT = `당신은 사내 지식 관리 및 DB 조회 Q&A 에이�
   최대 ${MAX_BATCH_QUERIES}개. 앞 조회의 결과가 다음 조회의 값이 되는 절차(처리 방법의 1단계→2단계)는 여기 담지 말고 run_query로 하나씩 실행한다.
 - 한 요청에 조회는 최대 ${MAX_STEPS}건 — 남은 수가 적어지면 지시 블록이 말한다.
 
-4. 답변이 가능하면:
+4. 조회 결과의 생략된 행이나 컬럼이 필요하면 DB 재실행 대신 보관된 결과를 읽는다:
+{"action":"read_result","step":2,"cols":["JOB_ID","STATUS"],"offset":20,"limit":5}
+- step은 실행 이력 번호, offset은 0부터 시작하는 행 위치다. cols는 정확한 컬럼명 목록(생략하면 전체), limit은 최대 ${MAX_RESULT_ROWS}행이다. 기존 실행의 표시 범위만 바뀌며 실행 번호와 표·차트 참조는 유지된다. 셀 자체가 잘린 값은 복원되지 않는다.
+
+5. 답변이 가능하면:
 {"action":"answer","answer":"<사용자에게 보여줄 최종 답변>"}
 - k12·m3 같은 자료 번호는 내부 표기다 — 답변에 옮겨 적지 마라.
 - 관련 지식이나 쿼리 실행 결과가 있으면 반드시 그것에 근거해서 답하라.
@@ -557,52 +562,55 @@ const earlierOmittedNote = n => `(${n === 1 ? '1번' : `1~${n}번`} 스텝은 �
 // 예산 밖으로 새지 않는 것이 목적이지 마지막 한 자를 아끼는 것이 목적이 아니다.
 const NOTES_RESERVE = 200;
 
-// 검색 결과는 관련도 순으로 정렬돼 있으므로 예산을 넘기면 뒤(덜 관련된 것)부터 버린다.
-// 최소 1건은 반드시 싣는다 — 항목별 clip이 이미 1건의 크기를 묶어두었으므로 그래도 예산을 크게 벗어나지 않는다.
-// 몇 건을 버렸는지 모델에게 알린다: '이게 전부'라고 읽으면 없는 것을 없다고 단정한다.
-function renderItems(items, render, budget) {
-  const usable = Math.max(0, budget - NOTES_RESERVE);
+// 우선순위대로 본문을 채운다. 들어가지 않는 항목은 ID 목록에 남기고 다음 후보를 본다.
+// 첫 본문 한 건은 반드시 싣는다. 개별 상한이 섹션의 기본 몫보다 작다는 불변식이 이를 보장한다.
+function renderItems(items, render, budget, canRead = true) {
+  // 본문이 생략되어도 안정적인 ID 목록을 남긴다. 복구는 재검색 대신 같은 ID를 사용한다.
+  const refs = [...new Set(items.map(item => render(item).match(/^- ([km]\d+)/)?.[1]).filter(Boolean))];
+  const pinnedCost = items.filter(item => item.expanded && !item.dropped && !item.viewOmitted)
+    .reduce((n, item) => n + lineCost(render(item)), 0);
+  const refReserve = refs.length ? Math.min(3000, refs.join(', ').length + 40,
+    Math.max(0, budget - NOTES_RESERVE - pinnedCost)) : 0;
+  const usable = Math.max(0, budget - NOTES_RESERVE - refReserve);
   const lines = [];
+  const omitted = new Set();
   let used = 0;
   for (const item of items) {
     const line = render(item);
-    if (lines.length > 0 && used + lineCost(line) > usable) break;
+    if (item.dropped || item.viewOmitted || (lines.length > 0 && used + lineCost(line) > usable)) {
+      const id = line.match(/^- ([km]\d+)/)?.[1];
+      if (id) omitted.add(id);
+      continue;
+    }
     lines.push(line);
     used += lineCost(line);
   }
-  if (lines.length < items.length) {
-    lines.push(omittedNote(items.length - lines.length));
+  if (omitted.size) {
+    const ids = [...omitted];
+    let count = ids.length;
+    const note = () => `- (보관 중, ${canRead ? 'expand로 다시 표시' : '이번 요청의 복구 기회 없음'}: ${ids.slice(0, count).join(', ')}${count < ids.length ? `; 나머지 ${ids.length - count}개 ID 생략` : ''})`;
+    while (count > 0 && lineCost(note()) > refReserve + NOTES_RESERVE) count--;
+    lines.push(note()); // ID 중간에서는 자르지 않는다.
   }
   return lines;
 }
 
-// 버린 자료는 프롬프트에서 빠진다. 목록에서 지우지는 않는다 — 병합이 seq로 중복을 거르므로(agent.js
-// mergeFront) 표시만 세워 두면 같은 항목이 재검색으로 되살아나지 않는다.
+// 숨긴 자료는 본문에서만 빠지고 보관 목록에는 남는다.
 export const live = list => (list ?? []).filter(o => !o?.dropped);
 
-// 자료 항목 한 줄. 본문이 잘렸고 아직 펼치지 않았으면 앞에 식별자를 붙인다 — 청구할 수 있는 자리에만
-// 번호가 보이게 해서, 모델이 펼칠 수 없는 것을 청구하느라 스텝을 버리지 않게 한다. 펼친 항목은 더 긴
-// 상한으로 싣고 번호를 떼는데, 번호가 없다는 것이 곧 '더 받을 것이 없다'는 표시다.
-// canExpand는 요청 단위의 판정이다 — 청구 기회(MAX_EXPANDS)를 다 썼으면 항목이 어떤 상태든 번호를 붙이지 않는다.
-// 성공한 청구는 이력에 남지 않으므로 모델은 자기가 몇 번 청구했는지 프롬프트에서 알 수 없다. 항목 단위 판정만
-// 보던 동안 상한을 다 쓴 뒤에도 남은 문서에 번호가 그대로 붙어, 모델은 시스템 프롬프트의 '번호가 붙어 있으면
-// 청구할 수 있다'를 따라 청구했고 '상한에 닿았다'는 안내와 헛돈 스텝만 받았다(agent.js ctx 주석). 이 값이 없는
-// ctx(테스트·직접 호출)는 종전과 같이 항목 단위로만 판정한다.
+// ID는 항상 표시한다. 확대 가능 여부는 요청의 남은 수와 자료 상태로 별도 표시한다.
 const itemLine = (prefix, titleKey, bodyKey, canExpand = true) => o => {
-  // 청크 항목(doc_seq가 있다)은 본문이 이미 문서당 상한 안이라 자를 것이 없다 — 청크 크기를
-  // MAX_PROMPT_ITEM_LEN과 같게 잡은 것이 그 근거다(chunk.js CHUNK_MAX_LEN). 번호를 붙일지는
-  // '길이가 잘렸는가'가 아니라 '범위 밖에 청크가 남았는가'로 정한다(canGrow) — 청크는 잘리지
-  // 않으므로 옛 판정을 그대로 두면 긴 문서에도 번호가 한 번도 붙지 않는다.
+  // 청크는 knowledgeView가 문서별 상한을 적용했다. 확대 표시는 범위 밖 본문이 남았는지로 정한다.
   const chunk = o.doc_seq != null;
   // 펼친 상한은 청크(문서 창 MAX_DOC_LEN)와 청크가 아닌 항목(처리방법 — MAX_EXPANDED_ITEM_LEN)이 다르다.
   // 같은 값이던 동안 문서 창을 넓히려면 처리방법 몫까지 함께 키워야 했다 (constants.js MAX_EXPANDED_ITEM_LEN).
   const max = chunk ? MAX_DOC_LEN : o.expanded ? MAX_EXPANDED_ITEM_LEN : MAX_PROMPT_ITEM_LEN;
   const text = indent(o[bodyKey]);
-  const askable = canExpand && (chunk ? canGrow(o) : (!o.expanded && text.length > max));
+  const askable = canExpand && (chunk ? (o.more ?? canGrow(o)) : (!o.expanded && text.length > max));
   // 위치 표기((3~7/22))는 제목을 자른 '뒤에' 붙인다 — 제목에 이어 붙여 넘기면 긴 제목에서 이 표기부터
   // 잘려 나가, 정작 조각으로 나뉜 긴 문서에서 위치를 알 수 없게 된다 (chunk.js buildItems의 range).
   const name = clip(oneLine(o[titleKey]), MAX_PROMPT_NAME_LEN) + (o.range ?? '');
-  return `- ${askable ? `${prefix}${o.seq} ` : ''}[${name}] ${clip(text, max)}`;
+  return `- ${prefix}${o.seq} [${name}]${askable ? ' (확대 가능)' : ''}${o.moreStored && canExpand ? ' (보관 구간 더 있음)' : ''} ${clip(text, max)}`;
 };
 
 // 바인드 변수명을 SQL과 따로 싣는다 — SQL이 길어 잘리더라도 채워야 할 파라미터가 사라지지 않게.
@@ -642,68 +650,59 @@ const hasDbChoice = q => targetDbNames(q.target_db_name).length > 1;
 
 const queryItem = q =>
   `- ${clip(q.query_name, MAX_PROMPT_NAME_LEN)}: ${clip(oneLine(q.query_desc))}` +
-  ` / 입력(${clip(oneLine(q.input_desc), 300)}) / 출력(${clip(oneLine(q.output_desc), 300)})` +
+  ` / 입력(${clip(oneLine(q.input_desc)) || '설명 미등록 — 값의 의미·형식을 추측하지 말 것'}) / 출력(${clip(oneLine(q.output_desc), 300)})` +
   ` / 바인드(${bindList(q)}) / 대상DB(${dbList(q)})` +
-  ` / SQL: ${clip(oneLine(q.query_sql), MAX_PROMPT_SQL_LEN)}`;
+  (q.selected ? ` / SQL: ${clip(oneLine(q.query_sql), MAX_PROMPT_SQL_LEN)}` : '');
 
-// 예산이 모자랄 때 쓰는 짧은 형태 — 실행에 반드시 필요한 것만 남긴다.
-//   이름   : 이것이 없으면 그 쿼리를 지목할 방법 자체가 없다
-//   용도   : 어떤 질문에 쓰는 쿼리인지 고르는 근거
-//   바인드 : 무엇을 채워야 하는지 (없으면 첫 실행이 반드시 '값 없음'으로 실패한다)
-//   대상DB : 후보가 둘 이상일 때만. 고르지 않으면 실행 경계가 거부하므로 바인드와 같은 부류다 —
-//            후보가 하나뿐인 쿼리에는 붙이지 않는다 (고를 것이 없으면 실행에 필요하지 않다).
-// 입출력 설명과 SQL 원문은 뺀다 — 있으면 좋지만, 없다고 그 쿼리를 못 쓰게 되지는 않는다.
+// 짧은 형태에서도 입력 의미·형식은 보존한다. 대상 DB는 선택지가 여러 개인 경우 표시한다.
 const MAX_PROMPT_SHORT_DESC_LEN = 120;
 const queryItemShort = q =>
   `- ${clip(q.query_name, MAX_PROMPT_NAME_LEN)}: ${clip(oneLine(q.query_desc), MAX_PROMPT_SHORT_DESC_LEN)} / 바인드(${bindList(q)})` +
+  ` / 입력(${clip(oneLine(q.input_desc)) || '설명 미등록 — 값의 의미·형식을 추측하지 말 것'})` +
   (hasDbChoice(q) ? ` / 대상DB(${dbList(q)})` : '');
 
-// 짧은 형태로 실린 쿼리도 그대로 실행할 수 있다는 사실을 모델에게 알린다 —
-// 이 안내가 없으면 모델은 설명이 얇은 항목을 '정보가 부족한 쿼리'로 읽고 후보에서 뺀다.
+// 설명이 없거나 잘린 부분을 추측해 실행하지 않도록 안내한다.
 const shortFormNote = n =>
-  `- (위 ${n}건은 이름·용도·바인드만 표시했다 — 그대로 실행할 수 있고,` +
-  ` 지목하면 전체 정의가 다음 단계에 실린다)`;
+  `- (위 ${n}건은 실행 명세만 표시했다. 입력 설명이 없거나 잘렸으면 값을 추측하지 말고 필요한 입력을 확인하라)`;
 
-// 쿼리 목록만 renderItems와 다른 규칙으로 싣는다. 손해의 크기가 다르기 때문이다.
-//   지식·처리방법 — 꼬리를 버리면 '덜 관련된 근거'가 빠져 답이 부실해진다. 회복 경로가 필요 없다.
-//   쿼리 목록     — 버려진 쿼리는 모델이 이름을 댈 수 없으므로 그 조회를 아예 못 한다.
-//                   오류도 남지 않아 chat_log에는 '조회 없이 지식으로만 답한 요청'으로만 보인다.
-// 그래서 '버리기 전에 줄인다': 먼저 모든 쿼리의 짧은 줄을 확보하고, 남는 여유만큼만 앞에서부터
-// 자세한 줄로 올린다(목록은 관련도 순이다 — agent.js selectQueries). 짧은 줄만 있어도 모델은 이름을
-// 지목할 수 있고, 지목하면 agent.js resolveQuery가 등록 원문을 다시 찾아 다음 스텝의 목록 맨 앞에
-// 자세한 형태로 넣어준다 — 복구 경로가 이미 있고, 이 렌더가 그 입구를 열어둔다.
-// 짧은 줄로도 다 못 실을 만큼 예산이 모자라면 그때는 꼬리부터 버린다(기존 동작).
+// 선택한 쿼리의 상세 → 후보의 실행 명세 → 남는 예산으로 상세 설명을 배정한다.
+// SQL은 선택한 쿼리에만 싣고, 상세 대상이 아니면 여유가 있어도 표시를 늘리지 않는다.
 function renderQueries(queries, budget) {
   const short = queries.map(queryItemShort);
   // 줄 비용과 안내 몫은 다른 섹션과 같은 규칙을 쓴다 (lineCost·NOTES_RESERVE 주석 참고).
   const cost = lineCost;
   const usable = Math.max(0, budget - NOTES_RESERVE);
   let used = 0;
+  const lines = [];
+  const detailed = new Set();
   // ① 짧은 줄만이라도 최대한 많이 — 첫 항목은 예산과 무관하게 싣는다(renderItems와 같은 보장).
   let kept = 0;
   for (; kept < short.length; kept++) {
-    if (kept > 0 && used + cost(short[kept]) > usable) break;
-    used += cost(short[kept]);
+    const selected = queries[kept].selected === true && queries[kept].detail === true
+      ? queryItem(queries[kept]) : null;
+    const useDetail = selected !== null && used + cost(selected) <= usable;
+    const line = useDetail ? selected : short[kept];
+    if (kept > 0 && used + cost(line) > usable) break;
+    lines.push(line);
+    used += cost(line);
+    if (useDetail) detailed.add(kept);
   }
   // ② 자세한 줄로 올릴 대상은 detail 표시가 붙은 것뿐이다 — 경로A가 지목한 절차용 쿼리, 직접 검색의
   //    상위 몇 건, 모델이 이름을 대서 찾아낸 쿼리(agent.js). 나머지는 짧은 줄로 충분하다: 고르는 근거는
-  //    이름·용도·바인드이고, 지목하면 다음 스텝에 자세히 실리며, 실행하면 결과 컬럼이 이력에 보인다.
+  //    이름·용도·바인드·입력 설명이고, 지목하면 다음 스텝에 자세히 실리며, 실행하면 결과 컬럼이 이력에 보인다.
   //    예전에는 예산이 남는 만큼 앞에서부터 전부 올렸는데, 검색이 요청 시에만 도는 구조에서는 예산이
   //    늘 남아 등록 30건 × SQL 원문이 스텝마다 그대로 실렸다 — prefill이 스텝 수만큼 곱해지는 자리다.
-  //    여기서는 강제 보장을 두지 않는다 — ①이 이미 '모든 항목이 최소 한 줄'을 보장했으므로,
-  //    예산을 넘겨서까지 올릴 이유가 없다.
-  const lines = short.slice(0, kept);
-  let detailed = 0;
+  //    상세 설명은 남는 예산 안에서만 추가한다.
   for (let i = 0; i < kept; i++) {
-    if (queries[i].detail !== true) continue;
+    if (queries[i].detail !== true || detailed.has(i)) continue;
     const line = queryItem(queries[i]);
     const extra = line.length - short[i].length;
     if (used + extra > usable) break;
     used += extra;
     lines[i] = line;
-    detailed++;
+    detailed.add(i);
   }
-  if (detailed < kept) lines.push(shortFormNote(kept - detailed));
+  if (detailed.size < kept) lines.push(shortFormNote(kept - detailed.size));
   if (kept < queries.length) lines.push(omittedNote(queries.length - kept));
   return lines;
 }
@@ -720,7 +719,7 @@ function fitRows(rows, budget) {
     used += JSON.stringify(rows[i]).length + (i ? 1 : 0); // 구분자 ','
     if (used > budget) {
       // 첫 행부터 예산을 넘으면 행 단위로는 더 줄일 수 없다 — 컬럼 단위로 줄인다.
-      return i === 0 ? [fitCols(rows[0], budget)] : rows.slice(0, i);
+      return i === 0 ? [fitCols(rows[0], budget - 2)] : rows.slice(0, i);
     }
   }
   return rows;
@@ -743,23 +742,23 @@ function fitCols(row, budget) {
   const upstream = entries.find(([k]) => k === OMIT_KEY)?.[1];
   const cols = entries.filter(([k]) => k !== OMIT_KEY);
   const kept = [];
-  let used = 2; // '{}'
-  for (const [k0, v0] of cols) {
-    const k = clip(k0, 100);
-    const v = clipDisplayValue(v0);
-    const len = JSON.stringify(k).length + (JSON.stringify(v) ?? 'null').length + 2; // ':' + ','
-    if (kept.length > 0 && used + len > budget) break;
-    kept.push([k, v]);
-    used += len;
-  }
-  const omitted = cols.length - kept.length;
-  if (omitted > 0 || upstream !== undefined) {
+  const withOmissions = () => {
+    const omitted = cols.length - kept.length;
     const notes = [];
     if (omitted > 0) notes.push(`외 ${omitted}개 컬럼 생략 (프롬프트 길이 제한)`);
     if (upstream !== undefined) notes.push(String(clipDisplayValue(upstream)));
-    kept.push([OMIT_KEY, notes.join(' / ')]);
+    return Object.fromEntries(notes.length ? [...kept, [OMIT_KEY, notes.join(' / ')]] : kept);
+  };
+  for (const [k0, v0] of cols) {
+    const k = clip(k0, 100);
+    const v = clipDisplayValue(v0);
+    kept.push([k, v]);
+    if (JSON.stringify(withOmissions()).length > budget) {
+      kept.pop();
+      break;
+    }
   }
-  return Object.fromEntries(kept);
+  return withOmissions();
 }
 
 // params 표시 — query_name과 함께 이 줄에서 유일하게 LLM이 만든(상한 없는) 값이다.
@@ -842,10 +841,11 @@ function historyLine(h, step) {
   const { rows, totalRows, capped } = rowCounts(h);
   const printedRows = fitRows(rows, MAX_PROMPT_STEP_LEN);
   const printed = printedRows.length;
+  const window = h.resultRead ? ` (추가 읽기: ${h.rowOffset + 1}행부터 ${printed}행)` : '';
   const note = capped
     ? ` (조회 상한 ${MAX_ROWS}건 도달 — 실제 총 건수는 더 많을 수 있음, 처음 ${printed}건만 표시)`
     : totalRows > printed ? ` (총 ${totalRows}건 중 처음 ${printed}건만 표시)` : '';
-  return `${head} → 결과 ${totalRows}${capped ? '+' : ''}건${note}: ${JSON.stringify(printedRows)}`;
+  return `${head} → 결과 ${totalRows}${capped ? '+' : ''}건${h.resultRead ? window : note}: ${JSON.stringify(printedRows)}`;
 }
 
 // 실행 이력은 다른 섹션과 반대로 '뒤에서부터' 채운다 — 최신 기록이 가장 중요하기 때문이다.
@@ -878,11 +878,11 @@ function renderHistory(history, budget) {
 // 배분에 앞서 고정 틀의 몫(PROMPT_FRAME_RESERVE — 제목 줄·빈 줄·지시 블록)을 뗀다. 본문만 세면
 // 네 섹션이 각자 예산에 꽉 찬 요청에서 틀의 길이만큼 정확히 전체 상한을 넘는다.
 function renderSections(ctx) {
-  const canExpand = ctx.canExpand !== false;   // 청구 기회가 남았는가 (agent.js ctx) — 없으면 두 섹션 모두 번호를 뗀다
+  const canExpand = ctx.canExpand !== false && !ctx.forceAnswer;
   const builders = {
-    knowledge: budget => renderItems(live(ctx.knowledge), itemLine(ITEM_PREFIX.knowledge, 'title', 'content', canExpand), budget),
-    qaMethods: budget => renderItems(live(ctx.qaMethods), itemLine(ITEM_PREFIX.qaMethods, 'title', 'method', canExpand), budget),
-    history: budget => renderHistory(ctx.history, budget),
+    knowledge: budget => renderItems(knowledgeView(ctx.knowledge), itemLine(ITEM_PREFIX.knowledge, 'title', 'content', canExpand), budget, canExpand),
+    qaMethods: budget => renderItems(ctx.qaMethods, itemLine(ITEM_PREFIX.qaMethods, 'title', 'method', canExpand), budget, canExpand),
+    history: budget => [...renderHistory(ctx.history, budget - 220), ...(ctx.contextNote ? [clip(oneLine(ctx.contextNote), 200)] : [])],
     queries: budget => renderQueries(ctx.queries, budget),
   };
   const keys = Object.keys(PROMPT_FLOORS);
@@ -935,8 +935,7 @@ export function buildPrompt(ctx, now = new Date()) {
   //   ① 모델은 마지막에 읽은 것을 가장 강하게 붙든다(recency). 결정해야 할 것은 현재 질문이므로
   //      그것이 자료 4천 자 앞에 묻혀 있으면 안 된다 — 특히 후속 질문("그럼 김철수는?")은 짧아서
   //      앞에 두면 그대로 파묻힌다.
-  //   ② 한 요청 안에서 스텝마다 바뀌는 것은 실행 이력과 지시(forceAnswer)뿐이다(목록 밖 쿼리를
-  //      지목해 agent.js resolveQuery가 목록 앞에 끼워 넣는 드문 스텝은 예외). 요청마다 바뀌는 것
+  //   ② 자료를 바꾸지 않은 스텝에서는 앞부분을 재사용할 수 있다. 요청마다 바뀌는 것
   //      (질문·대화·시각)까지 뒤로 몰면, 앞부분(시스템 프롬프트·지식·처리 방법·쿼리 목록)이 스텝
   //      사이에 같은 토큰열로 남아 vLLM prefix caching이 그만큼을 재사용한다.
   // 대화와 질문은 예산 밖이다: 각각 MAX_CHAT_TURNS×MAX_CHAT_LEN과 서버의 2,000자 제한으로
@@ -956,11 +955,16 @@ export function buildPrompt(ctx, now = new Date()) {
   const nothingYet = !ctx.tried
     && !show('knowledge', kn) && !show('qa_method', qa) && !show('query', ctx.queries);
   const blocks = [
-    show('knowledge', kn) && section('관련 지식', kn.length, s.knowledge, '건', ctx.knowledge.length - kn.length),
-    show('qa_method', qa) && section('Q&A 처리 방법', qa.length, s.qaMethods, '건', ctx.qaMethods.length - qa.length),
+    show('knowledge', ctx.knowledge) && section('관련 지식', kn.length, s.knowledge, '건', ctx.knowledge.length - kn.length),
+    show('qa_method', ctx.qaMethods) && section('Q&A 처리 방법', qa.length, s.qaMethods, '건', ctx.qaMethods.length - qa.length),
     show('query', ctx.queries) && section('실행 가능한 쿼리 목록', ctx.queries.length, s.queries),
     section('실행 이력 (검색·쿼리)', ctx.history.length, s.history),
-    section('최근 대화', chat.length, chat.map(m => `- ${m.role === 'user' ? '사용자' : '에이전트'}: ${indent(m.text)}`), '턴'),
+    section('최근 대화', chat.length, chat.map(turn => {
+      const text = indent(turn.text);
+      const shown = text.length > MAX_CHAT_LEN
+        ? clipText(text, MAX_CHAT_LEN - TRUNC_MARK.length) + TRUNC_MARK : text;
+      return `- ${turn.role === 'user' ? '사용자' : '에이전트'}: ${shown}`;
+    }), '턴'),
     `## 사용자 질문 (현재)\n${ctx.question}`,
     // 지시는 항상 싣는다 — 마지막 스텝에만 붙으면 모델은 그 전까지 '지시가 없는 프롬프트'를 받아
     // 무엇을 하라는 것인지를 시스템 프롬프트에서 다시 찾아야 한다. 현재 시각도 여기 둔다: 질문과
@@ -968,11 +972,12 @@ export function buildPrompt(ctx, now = new Date()) {
     // 아직 아무것도 찾아보지 않은 첫 스텝에는 그 사실을 한 줄 더 적는다 — 자료 섹션이 통째로 없는
     // 프롬프트를 모델이 '자료가 없는 질문'으로 읽지 않게.
     // 검색 기회를 다 썼으면 그 사실도 여기 적는다 — 실행한 검색은 이력에 남지만 상한은 어디에도 없어, 모델은 넷째 검색을
-    // 내고 안내와 헛돈 스텝만 받았다(실측). 청구 번호를 떼는 것(itemLine의 canExpand)과 같은 이유다. 값이 없는 ctx는 종전대로.
+    // 내고 안내와 헛돈 스텝만 받았다(실측). 확대 가능 표시(itemLine의 canExpand)과 같은 이유다. 값이 없는 ctx는 종전대로.
     `## 지시\n현재 시각: ${formatNow(now)}\n` + (ctx.forceAnswer
       ? '더 이상 검색하거나 쿼리를 실행할 수 없다. 지금까지의 정보만으로 action="answer"로 최종 답변하라.'
       : (nothingYet ? `${NOT_SEARCHED_NOTE}\n` : '') + (ctx.canSearch === false ? `${NO_SEARCH_LEFT_NOTE}\n` : '')
         + expandsLeftNote(ctx.expandsLeft) + queriesLeftNote(ctx.queriesLeft)
+        + (Number.isInteger(ctx.resultReadsLeft) ? `조회 결과 추가 읽기 남음: ${ctx.resultReadsLeft}회.\n` : '')
         + '위 자료를 근거로 현재 질문에 대한 다음 행동 하나를 JSON으로 결정하라.'),
   ].filter(Boolean);
   return blocks.join('\n\n');
@@ -995,7 +1000,7 @@ const queriesLeftNote = n =>
 // 버려졌다(agent.js applyExpand의 break — 실측). 성공한 청구는 이력에 남지 않으므로 모델은 남은 수를 달리 알 길이 없다.
 export const fewExpandsLeftNote = n =>
   `이 요청에서 본문 청구는 ${n}건까지만 더 할 수 있다 — 한 번에 그보다 많은 번호를 적으면 나머지는 청구되지 않는다.`;
-const expandsLeftNote = n => (Number.isInteger(n) && n > 0 && n < MAX_EXPANDS ? `${fewExpandsLeftNote(n)}\n` : '');
+const expandsLeftNote = n => n === 0 ? '자료 확대·복구 기회를 다 썼다.\n' : (Number.isInteger(n) && n > 0 && n < MAX_EXPANDS ? `${fewExpandsLeftNote(n)}\n` : '');
 
 // ===== 예산 불변식 — 모듈 로드 시 검증 =====
 // 실행 이력의 최소 몫(constants.js PROMPT_FLOORS.history)은 'MAX_STEPS 스텝이 각자 상한까지 차도 전부
@@ -1052,7 +1057,7 @@ function maxOtherLineLen() {
 const OTHER_ROWS = MAX_HISTORY_ROWS - MAX_STEPS;
 const HISTORY_FLOOR_NEEDED =
   MAX_STEPS * (maxHistoryLineLen() + 1) + OTHER_ROWS * (maxOtherLineLen() + 1)
-  + NOTES_RESERVE; // +1: 줄마다 개행 (lineCost)
+  + NOTES_RESERVE + 220; // +1: 줄마다 개행. 추가 읽기 실패 안내도 이력 몫에 포함한다.
 if (PROMPT_FLOORS.history < HISTORY_FLOOR_NEEDED) {
   throw new Error(
     `PROMPT_FLOORS.history (${PROMPT_FLOORS.history}) cannot hold MAX_HISTORY_ROWS (${MAX_HISTORY_ROWS}) full history lines ` +
@@ -1450,6 +1455,9 @@ function toDecision(d, answerOnly) {
   if (!answerOnly && d.action === 'search') {
     const text = typeof d.text === 'string' && d.text.trim() ? d.text : undefined;
     return { action: 'search', ...(text && { text }), targets: d.targets, ...(d.drop !== undefined && { drop: d.drop }) };
+  }
+  if (!answerOnly && d.action === 'read_result') {
+    return { action: 'read_result', step: d.step, cols: d.cols, offset: d.offset, limit: d.limit };
   }
   // 본문 청구. ids는 목록이든 하나(문자열)든 받는다 — 같은 결정의 drop과 search의 targets가 그렇고, 정규화기
   // (constants.normalizeItemIds)도 둘 다 받는다. 목록만 받던 동안 {"ids":"k12"}는 결정이 아니게 되어 재시도가

@@ -61,10 +61,11 @@ const marked = (v, max) => {
   const s = String(v);
   return s.length > max ? clipText(s, max) + TRUNC_MARK : s;
 };
+const escapeCell = value => String(value ?? '').replace(/\r\n?|\n/g, ' ').replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
 const cell = v => {
   if (v === null || v === undefined) return '';
   const s = typeof v === 'number' ? String(v) : marked(v, MAX_CHART_CELL_LEN);
-  return s.replace(/\r\n?|\n/g, ' ').replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
+  return escapeCell(s);
 };
 
 const splitNames = v => String(v ?? '').split(/[,;]/).map(s => s.trim()).filter(Boolean);
@@ -104,7 +105,11 @@ function splitBlock(body) {
 
 // `data:` 값에서 스텝 번호를. 'step 2' · '2' · '실행 2' · '#2' 를 모두 받는다 — 모델이 프롬프트의
 // '실행 N' 표기를 그대로 옮기는 일이 있다. 숫자가 없으면 null.
-const stepOf = v => { const m = /(\d+)/.exec(String(v ?? '')); return m ? Number(m[1]) : null; };
+const stepOf = value => {
+  const match = /^(?:(?:step|실행)\s*|#\s*)?(\d+)$/i.exec(String(value ?? '').trim());
+  const step = match ? Number(match[1]) : NaN;
+  return Number.isSafeInteger(step) ? step : null;
+};
 
 // 안내 문장은 펜스가 있던 자리(목록 안이면 그 들여쓰기)에 놓는다.
 const note = (config, why, indent = '') => {
@@ -144,7 +149,7 @@ export function resolveChartData(answer, steps) {
     if (allow <= 0) return note(config, '답변에 실을 수 있는 표의 양을 넘었습니다', indent);
 
     const cols = pickColumns(config, keys);
-    const table = [`${indent}| ${cols.map(cell).join(' | ')} |`, `${indent}|${' --- |'.repeat(cols.length)}`];
+    const table = [`${indent}| ${cols.map(escapeCell).join(' | ')} |`, `${indent}|${' --- |'.repeat(cols.length)}`];
     let used = table[0].length + table[1].length + 2;
     let taken = 0;
     for (const r of rows) {
@@ -184,7 +189,7 @@ const TABLE_CONFIG_RE = /^\s*(step|data|cols|limit)\s*:\s*(.*?)\s*$/i;
 const tableCell = v => {
   if (v === null || v === undefined) return '';
   const s = typeof v === 'number' ? String(v) : marked(v, MAX_TABLE_CELL_LEN);
-  return s.replace(/\r\n?|\n/g, ' ').replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
+  return escapeCell(s);
 };
 
 const tableNote = (why, indent = '') => `${indent}_표를 채우지 못했습니다: ${why}_`;
@@ -237,7 +242,7 @@ export function resolveTableData(answer, steps) {
     const limitRaw = Number.parseInt(String(config.limit ?? ''), 10);
     const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, MAX_TABLE_BLOCK_ROWS) : DEFAULT_TABLE_ROWS;
 
-    const table = [`${indent}| ${cols.map(tableCell).join(' | ')} |`, `${indent}|${' --- |'.repeat(cols.length)}`];
+    const table = [`${indent}| ${cols.map(escapeCell).join(' | ')} |`, `${indent}|${' --- |'.repeat(cols.length)}`];
     let used = table[0].length + table[1].length + 2;
     let taken = 0;
     for (const r of rows) {
