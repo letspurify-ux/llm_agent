@@ -6,19 +6,37 @@ import oracledb from 'oracledb';
 import { createHash } from 'node:crypto';
 import { loadTargetDb } from './db.js';
 import { bindNames, assertReadOnly } from './sql.js';
-import { MAX_ROWS, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK, MAX_TARGET_DB_NAME_LEN, MAX_BATCH_QUERIES, numEnv, nameKey, safeError, clipText, warnOnce, ownProp, bindValue, targetDbNames } from './constants.js';
+import { MAX_ROWS, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK, MAX_TARGET_DB_NAME_LEN, MAX_BATCH_QUERIES, numEnv, nameKey, safeError, clipText, warnOnce, ownProp, bindValue, targetDbNames, isPlainObject } from './constants.js';
 
 // 드라이버 경계에서 타입을 확정한다. LOB은 기본값이 Lob 스트림 객체라 커넥션을 닫으면 무효가 되고
 // JSON 직렬화 시 순환 참조로 예외가 난다 — CLOB만이 아니라 NCLOB/BLOB도 같은 위험이므로 전부 다룬다.
-// 날짜류를 문자열로 받는 이유는 아래 NLS_SESSION_FORMATS 주석 참고.
 //
-// LOB·날짜에 fetchTypeHandler로 직접 타입을 지정하지 않는 이유: 핸들러가 돌려준 타입은 드라이버가
+// LOB에 fetchTypeHandler로 직접 타입을 지정하지 않는 이유: 핸들러가 돌려준 타입은 드라이버가
 // 매핑 없이 그대로 쓰기 때문에, CLOB에 VARCHAR(oracledb.STRING)를 주면 VARCHAR 한도에서 잘린다.
 // fetchAsString/fetchAsBuffer는 드라이버가 각 타입의 올바른 대상(CLOB→LONG, NCLOB→LONG_NVARCHAR,
-// BLOB→LONG_RAW, DATE/TIMESTAMP/TZ/LTZ→VARCHAR)을 스스로 계산한다.
-// (NUMBER만 아래에서 fetchTypeHandler를 쓴다 — 그쪽은 STRING 매핑이 정확히 의도한 동작이다.)
-oracledb.fetchAsString = [oracledb.CLOB, oracledb.NCLOB, oracledb.DATE];
+// BLOB→LONG_RAW)을 스스로 계산한다.
+//
+// 날짜류는 여기 넣지 않는다. 한때 oracledb.DATE를 넣어 'DB가 세션 포맷(NLS_SESSION_FORMATS)으로 만든
+// 문자열'을 받는다고 믿었는데, 그것은 Thick(OCI)에서만 참이다 — thin 드라이버(기본)는 fetchAsString의
+// 날짜류를 JS Date로 받은 뒤 `v.toString()`으로 바꾼다(node-oracledb lib/impl/resultset.js). 그래서 DATE·
+// TIMESTAMP 셀이 "Sun Sep 06 2026 12:34:56 GMT+0900 (Korean Standard Time)"으로 프롬프트·답변 표·trace·
+// chat_log에 실렸고(실 Oracle로 실측), 모델이 그 값을 다음 스텝의 바인드로 되돌리면 세션 포맷과 맞지 않아
+// ORA-01861로 실패했다 — 아래 NLS_SESSION_FORMATS가 막겠다고 적어둔 바로 그 실패다. 등록 데모 쿼리가 전부
+// TO_CHAR를 써서 드러나지 않았을 뿐, 날짜 컬럼을 그대로 SELECT하는 등록(가장 흔한 형태)에서는 항상 그랬다.
+// 그래서 날짜류는 JS Date로 받아 아래 fetchTypeHandler가 세션 포맷과 같은 글자로 확정한다 — 두 드라이버
+// 모드가 같은 글자를 내고, 그 글자는 바인드로 되돌아가도 같은 세션 포맷으로 변환된다.
+oracledb.fetchAsString = [oracledb.CLOB, oracledb.NCLOB];
 oracledb.fetchAsBuffer = [oracledb.BLOB];
+
+// 날짜류 컬럼의 텍스트 확정 — NLS_SESSION_FORMATS와 글자 단위로 같아야 한다(바인드 왕복의 근거).
+//   DATE·TIMESTAMP(시간대 없음): 드라이버가 저장된 벽시계 값 그대로 프로세스 로컬 시각의 Date를 만들므로,
+//     로컬 getter로 되돌리면 프로세스 TZ와 무관하게 그 벽시계가 나온다 (UTC 컨테이너 ↔ KST DB여도 같다).
+//   TIMESTAMP WITH (LOCAL) TIME ZONE: 드라이버가 절대 시각(instant)으로 주므로 프로세스 TZ의 벽시계와
+//     그 오프셋(TZH:TZM)을 함께 적는다 — 저장된 오프셋 표기는 잃지만 시각은 같고, 오프셋이 붙어야
+//     NLS_TIMESTAMP_TZ_FORMAT으로 되돌아간다. 소수점 초는 세션 포맷에 없으므로 여기서도 적지 않는다.
+const DATE_TYPES = new Set([oracledb.DB_TYPE_DATE, oracledb.DB_TYPE_TIMESTAMP]);
+const DATE_TZ_TYPES = new Set([oracledb.DB_TYPE_TIMESTAMP_TZ, oracledb.DB_TYPE_TIMESTAMP_LTZ]);
+const dateTimeText = withOffset => v => (v instanceof Date ? localDateTime(v, withOffset) : v);
 
 // NUMBER는 기본 매핑(JS number)이 배정밀도라 16자리부터 조용히 반올림된다 — 18자리 채번 키가
 // 끝자리만 다른 값으로 답변되고, 그 값이 다음 스텝의 바인드로도 흘러가 0건 오답까지 만든다.
@@ -39,6 +57,9 @@ oracledb.fetchTypeHandler = md => {
   if (md.dbType === oracledb.DB_TYPE_NUMBER && !(md.precision >= 1 && md.precision <= 15 && md.scale >= 0)) {
     return { type: oracledb.STRING, converter: numberFromString };
   }
+  // 날짜류 — 타입은 바꾸지 않고(JS Date 그대로 받는다) 글자만 확정한다 (위 dateTimeText 주석).
+  if (DATE_TZ_TYPES.has(md.dbType)) return { converter: dateTimeText(true) };
+  if (DATE_TYPES.has(md.dbType)) return { converter: dateTimeText(false) };
 };
 
 // 문자열로 받은 NUMBER를, JS number로 정밀도 손실 없이 왕복될 때만 숫자로 되돌린다.
@@ -502,9 +523,26 @@ function normalizeValue(v) {
   // chat_log 기록이 함께 죽는다 (드라이버가 큰 NUMBER를 BigInt로 주도록 설정이 바뀌는 경우).
   if (typeof v === 'bigint') return v.toString();
   if (Buffer.isBuffer(v)) return `<binary ${v.length} bytes>`;
-  // fetchTypeHandler가 날짜류를 문자열로 받으므로 정상 경로에서는 Date가 오지 않는다.
-  // 드라이버 매핑이 바뀌더라도 JSON.stringify가 UTC로 직렬화해 시각이 어긋나는 일이 없게 방어한다.
+  // fetchTypeHandler가 날짜류를 세션 포맷의 글자로 확정하므로 정상 경로에서는 Date가 오지 않는다.
+  // 드라이버 매핑이 바뀌더라도 JSON.stringify가 UTC로 직렬화해 시각이 어긋나는 일이 없게 같은 글자로 방어한다.
   if (v instanceof Date) return localDateTime(v);
+  // INTERVAL DAY TO SECOND / YEAR TO MONTH — 드라이버(6.5+)가 IntervalDS/IntervalYM 객체로 준다. 아래 '지원하지 않는
+  // 컬럼 타입' 자리로 떨어뜨리던 동안 소요 시간·기간 컬럼의 값이 통째로 사라졌고(실 Oracle 실측), 모델이 그 표시를
+  // 바인드로 되돌리면 ORA-01867이었다. Oracle의 문자열→INTERVAL 암묵 변환이 받는 표기('2 03:04:05.678', '-1-6')로
+  // 적어 값이 보이고 바인드로도 되돌아가게 한다. 부호는 성분 전부에 실려 오므로(음수면 전부 음수 또는 0) 하나로 모은다.
+  if (v instanceof oracledb.IntervalDS) return intervalDsText(v);
+  if (v instanceof oracledb.IntervalYM) return intervalYmText(v);
+  // JSON 컬럼(객체·배열로 온다)과 VECTOR(Float32Array 등 타입 배열)는 JSON 글자로 — 다른 셀과 같은 상한으로 자른다.
+  // 객체라는 이유로 '지원하지 않는 타입'으로 뭉개면 JSON 컬럼의 값이 전부 사라진다(실측). 프로토타입이 Object(또는 없음)인
+  // 진짜 평범한 객체만 받는다 — 드라이버 객체(DbObject·Lob·ResultSet)는 클래스 인스턴스라 여기 걸리지 않고 아래 자리로
+  // 간다(직렬화하면 '{}'나 내부 필드가 새고, 순환 참조면 던진다). 직렬화가 던지면(BigInt 등) 역시 아래 자리로 넘긴다.
+  const plain = isPlainObject(v) && [Object.prototype, null].includes(Object.getPrototypeOf(v));
+  if (Array.isArray(v) || plain || ArrayBuffer.isView(v)) {
+    try {
+      const s = JSON.stringify(ArrayBuffer.isView(v) ? Array.from(v) : v);
+      if (typeof s === 'string') return s.length > MAX_CELL_LEN ? clipText(s, MAX_CELL_LEN) + TRUNC_MARK : s;
+    } catch { /* 직렬화할 수 없는 값 — 아래 자리 */ }
+  }
   // 남은 것은 전부 드라이버 객체다 — LOB 스트림, 객체/컬렉션 타입(DbObject), 중첩 커서(ResultSet).
   // 이 함수가 '드라이버 경계에서 한 번' 정규화한다고 해놓고 문자열·이진값만 다루면 그 약속이 깨진다:
   // 이 값들은 커넥션에 묶여 있어 아래 finally의 close() 뒤에는 무효이고, JSON.stringify가
@@ -513,10 +551,31 @@ function normalizeValue(v) {
   return `<${v?.constructor?.name ?? typeof v} 값 — 지원하지 않는 컬럼 타입>`;
 }
 
-function localDateTime(d) {
+// INTERVAL 값의 텍스트 — Oracle이 문자열에서 INTERVAL로 암묵 변환할 때 받는 표기다 ('[-]D HH:MI:SS[.FF]', '[-]Y-M').
+// 소수점 초는 나노초(fseconds)를 자릿수 맞춰 적고 뒤의 0은 뗀다. (테스트에서 쓰므로 export)
+export function intervalDsText(v) {
+  const parts = [v.days, v.hours, v.minutes, v.seconds, v.fseconds].map(n => Number(n ?? 0));
+  const neg = parts.some(n => n < 0);
+  const [d, h, m, s, f] = parts.map(Math.abs);
   const p = n => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
-         `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  const frac = f ? `.${String(f).padStart(9, '0').replace(/0+$/, '')}` : '';
+  return `${neg ? '-' : ''}${d} ${p(h)}:${p(m)}:${p(s)}${frac}`;
+}
+export function intervalYmText(v) {
+  const y = Number(v.years ?? 0), m = Number(v.months ?? 0);
+  return `${y < 0 || m < 0 ? '-' : ''}${Math.abs(y)}-${Math.abs(m)}`;
+}
+
+// 'YYYY-MM-DD HH24:MI:SS' — NLS_SESSION_FORMATS의 DATE·TIMESTAMP 포맷과 같은 글자. withOffset이면 뒤에
+// ' TZH:TZM'(예: ' +09:00')을 붙여 NLS_TIMESTAMP_TZ_FORMAT과 같게 한다. (테스트에서 쓰므로 export)
+export function localDateTime(d, withOffset = false) {
+  const p = n => String(n).padStart(2, '0');
+  const text = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+               `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  if (!withOffset) return text;
+  const off = -d.getTimezoneOffset();   // 분 단위, 동쪽이 양수 (getTimezoneOffset은 반대 부호다)
+  const abs = Math.abs(off);
+  return `${text} ${off < 0 ? '-' : '+'}${p(Math.floor(abs / 60))}:${p(abs % 60)}`;
 }
 
 // 바인드로 쓸 수 없는 값이면 그 이유를 돌려준다 (쓸 수 있으면 null).

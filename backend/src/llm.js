@@ -203,10 +203,14 @@ function sanitizeRunQuery(d) {
   const targetDb = typeof d.target_db === 'string'
     ? clipText(d.target_db.trim(), MAX_TARGET_DB_NAME_LEN)
     : '';
-  // trim: 이름 앞뒤 공백은 등록 철자와의 비교(agent.js resolveQuery)를 어긋내는 것 외에 아무 역할이 없다
+  // trim: 이름 앞뒤 공백은 등록 철자와의 비교(agent.js resolveQuery)를 어긋내는 것 외에 아무 역할이 없다.
+  // 이름이 없으면(일괄 조회의 형식 아닌 항목을 위 sanitizeDecision이 빈 항목으로 바꿔 넘긴다) 빈 이름으로 둔다 —
+  // String(undefined)는 'undefined'라는 글자를 만들어, 모델이 낸 적 없는 "undefined"라는 쿼리가 이력·프롬프트·
+  // 화면 trace에 '등록되지 않은 쿼리'로 실렸다. 빈 이름은 같은 길(resolveQuery → 미등록)로 소리 나게 실패하되
+  // 있지도 않은 이름을 지어내지는 않는다.
   return {
     action: 'run_query',
-    query_name: clipText(String(d.query_name).trim(), 200),
+    query_name: clipText(String(d.query_name ?? '').trim(), 200),
     params,
     // 빈 값은 키 자체를 두지 않는다 — 실행 경계가 '고르지 않음'을 undefined 하나로만 판정하게
     // 해서, ''와 없음이 서로 다른 경로를 타는 일이 생기지 않게 한다.
@@ -230,10 +234,14 @@ async function mockDecide(ctx) {
       return { action: 'search', text: ctx.question, targets: [...SEARCH_TARGETS] };
     }
     // "그럼 김철수는?" 같은 후속 질문은 그 문장만으로는 검색되지 않는다. 실제 LLM은 대화에서 대상을
-    // 복원해 검색어를 쓰지만 Mock은 그럴 수 없으므로, 첫 검색이 지식·처리방법을 하나도 못 찾았을 때만
+    // 복원해 검색어를 쓰지만 Mock은 그럴 수 없으므로, 첫 검색이 처리방법을 하나도 못 찾았을 때만
     // 직전 질문을 덧붙여 한 번 더 찾는다 (앞선 구조에서 agent.js가 모든 provider에 대해 하던 특례를
     // Mock 안으로 옮긴 것이다 — 평소에는 현재 질문만 쓰므로 검색 정확도가 떨어지지 않는다).
-    if (searches.length === 1 && !ctx.knowledge.length && !qaMethods.length) {
+    // 판정은 처리방법만 본다. Mock이 쿼리를 계획하는 근거가 처리방법뿐이기 때문이다(plannedQueries) — 지식까지
+    // 조건에 넣었던 동안, 무관한 장문 문서의 청크 하나가 벡터 문턱 아래로 걸리기만 해도 "빈손이 아니다"가 되어
+    // 재검색이 막히고, 처리방법 없이 그 무관한 지식만 붙은 답이 나갔다(실측: "그럼 BATCH002는?"에 다른 문서의 조각).
+    // README 데모 표가 약속한 후속 질문 행이 등록 문서 하나로 조용히 깨지는 셈이다.
+    if (searches.length === 1 && !qaMethods.length) {
       const prev = (ctx.chat || []).filter(m => m.role === 'user').slice(-2).map(m => m.text).join(' ');
       if (prev) return { action: 'search', text: `${prev} ${ctx.question}`, targets: [...SEARCH_TARGETS] };
     }

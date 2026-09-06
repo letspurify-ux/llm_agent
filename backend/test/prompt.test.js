@@ -587,6 +587,25 @@ test('번호는 잘렸고 아직 펼치지 않은 항목에만 붙는다', () =>
   assert.match(p, /^- \[이미 펼친 것\] /m, '펼친 항목에 번호가 남았다 — 더 받을 것이 없다는 표시가 사라진다');
 });
 
+// 번호는 항목 단위 판정만이 아니라 요청 단위 판정(canExpand — 청구 기회가 남았는가, agent.js ctx)도 지나야 한다.
+// 성공한 청구는 이력에 남지 않아 모델은 상한(MAX_EXPANDS)을 다 썼다는 사실을 볼 수 없으므로, 번호가 남아 있으면
+// 그 번호로 청구해 헛돈 스텝을 받는다. 값이 없는 ctx는 종전대로 항목 단위로만 판정한다(다른 테스트가 그 경로다).
+test('청구 기회가 남지 않은 요청에는 어떤 항목에도 번호가 붙지 않는다', () => {
+  const lists = {
+    searched: ['knowledge', 'qa_method'],
+    knowledge: [
+      { seq: 12, title: '긴 것', content: big(MAX_PROMPT_ITEM_LEN + 1) },
+      { seq: 5, doc_seq: 1, rep: 3, from: 3, to: 3, chunk_of: 22, full: false, title: '청크', range: ' (3/22)', content: big(900) },
+    ],
+    qaMethods: [{ seq: 7, title: '방법', method: big(MAX_PROMPT_ITEM_LEN + 1) }],
+  };
+  const open = buildPrompt(ctx({ ...lists, canExpand: true }));
+  assert.match(open, /^- k12 \[/m); assert.match(open, /^- k5 \[/m); assert.match(open, /^- m7 \[/m);
+  const closed = buildPrompt(ctx({ ...lists, canExpand: false }));
+  assert.doesNotMatch(closed, /^- [km]\d+ \[/m, '청구 기회가 없는데 번호가 남았다');
+  assert.match(closed, /^- \[긴 것\] /m); assert.match(closed, /^- \[청크 \(3\/22\)\] /m); assert.match(closed, /^- \[방법\] /m);
+});
+
 test('펼친 항목은 더 긴 상한으로 실린다 — 청크가 아닌 항목은 문서 창이 아니라 펼침 상한까지', () => {
   const body = big(MAX_DOC_LEN + 500);
   const one = buildPrompt(ctx({ searched: ['qa_method'], qaMethods: [{ seq: 1, title: 'M', method: body }] }));

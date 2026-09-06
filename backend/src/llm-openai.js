@@ -13,7 +13,7 @@ import {
   MAX_EXPANDS, MAX_DOC_LEN, MAX_EXPANDED_ITEM_LEN, ITEM_PREFIX,
   SEARCH_TARGETS, clipText, warnOnce, targetDbNames, isPlainObject, joinUrl,
   readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_UPSTREAM_ERROR_BYTES, numEnv,
-  indentLines,
+  indentLines, errorText,
 } from './constants.js';
 import { bindNames } from './sql.js';
 import { canGrow } from './chunk.js';
@@ -74,8 +74,8 @@ const SYSTEM_PROMPT = `당신은 사내 지식 관리 및 DB 조회 Q&A 에이�
 2. 항목 앞에 번호가 붙어 있으면 그 자료를 더 청구할 수 있다:
 {"action":"expand","ids":["k12"],"drop":["k7"]}
 - 긴 지식은 여러 조각으로 나뉘어 있고 제목 끝의 (3~7/22) 가 전체 22조각 중 지금 실린 범위다. 청구하면 그 앞뒤가 이어져 실린다. 같은 번호를 다시 청구하면 더 넓어진다.
-- 번호가 없는 항목은 더 받을 것이 없다 — 범위가 문서 전체이거나 길이 상한에 닿았다는 뜻이다. 청구해도 아무것도 늘지 않는다.
-- 실린 범위 밖에 답이 있을 것 같을 때만 청구하라. 보이는 범위로 답할 수 있으면 그대로 답한다. 한 요청에 최대 ${MAX_EXPANDS}번.
+- 번호가 없는 항목은 더 받을 것이 없다 — 범위가 문서 전체이거나 길이 상한에 닿았거나, 이 요청의 청구 횟수를 다 썼다는 뜻이다. 청구해도 아무것도 늘지 않는다.
+- 실린 범위 밖에 답이 있을 것 같을 때만 청구하라. 보이는 범위로 답할 수 있으면 그대로 답한다. 한 요청에 최대 ${MAX_EXPANDS}번 — 다 쓰면 모든 번호가 사라진다.
 - drop은 1의 것과 같다. 넓힌 본문이 자리를 많이 쓰므로 더는 필요 없는 자료를 함께 적어라.
 
 3. 답변 전에 DB 조회가 더 필요하면:
@@ -193,7 +193,8 @@ export async function openaiDecide(ctx) {
         `hasBrace=${content.includes('{')} hasThinkTag=${/<\/?think\b/i.test(content)}`
       );
     } catch (e) {
-      console.warn(`[llm] call failed (attempt ${attempt + 1}/2):`, e.message);
+      // 원인 사슬까지 남긴다 — fetch의 접속 거부·DNS·TLS 실패는 message가 전부 'fetch failed'다 (constants.errorText).
+      console.warn(`[llm] call failed (attempt ${attempt + 1}/2):`, errorText(e));
       if (preview?.emitted) ctx.onAnswerDelta({ reset: true });
     }
   }
@@ -387,9 +388,22 @@ async function chatCompletion(userPrompt, timeoutMs, { onContent } = {}) {
       throw new Error(`LLM API ${res.status}: ${detail}`);
     }
     const streamed = /text\/event-stream/i.test(res.headers.get('content-type') ?? '') && res.body?.getReader;
-    const { content, usage, finish } = streamed
+    const { content, usage, finish, error } = streamed
       ? await readEventStream(res, ctl.signal, armIdle, onContent)
       : fromJson(JSON.parse(await readCapped(res, MAX_UPSTREAM_JSON_BYTES, 'LLM')), onContent);
+    // 상류가 HTTP 200 '뒤에' 실어 보내는 오류. 스트림은 헤더가 먼저 나가므로 생성 도중의 실패(제공자 장애·과부하·
+    // 중도 거절)는 상태 코드로 올 수 없고, OpenRouter는 그것을 `data: {"error":…}` 이벤트나 choices[0].error
+    // (finish_reason=error)로 보낸다 — 프록시에 따라서는 200에 JSON 본문 {"error":…}로도 온다. 위 `!res.ok` 분기는
+    // 이 셋을 하나도 보지 못했고, 본문은 빈 content가 되어 아래 파싱이 '결정 없음'으로 실패했다. 그 로그
+    // ("no decision JSON found … length=0")는 모델의 출력 형식을 가리키므로 운영자는 제공자 장애를 의심할 수 없다
+    // (실측: 네 가지 모양 모두 상류 문구가 어디에도 남지 않았다). HTTP 오류와 같은 모양으로 던져 같은 재시도·같은
+    // 로그를 타게 한다. 본문이 일부라도 왔으면 버리지 않는다 — 결정이 온전히 끝난 뒤 붙은 오류 이벤트로 정당한 결정을
+    // 잃을 수는 없다. 잘린 본문은 어차피 파싱이 실패하고, 그 앞에 남긴 이 경고가 원인을 말한다.
+    if (error) {
+      const text = `${error.code !== undefined ? `${error.code}: ` : ''}${clipText(String(error.message ?? ''), 300)}`;
+      if (!content.trim()) throw new Error(`LLM API error (HTTP 200): ${text}`);
+      console.warn(`[llm] upstream reported an error after ${content.length} chars of content — the decision below may be cut short: ${text}`);
+    }
     // 실측을 남긴다 — 프롬프트 예산(constants.js)은 문자 기준 추정이고 토큰 수는 서버만 안다.
     // 예산을 다시 잡을 때 필요한 숫자가 이 한 줄이다 (usage를 주지 않는 서버에서는 남길 것이 없다).
     if (usage) console.log(`[llm] usage prompt=${usage.prompt_tokens} completion=${usage.completion_tokens} finish=${finish ?? '?'}`);
@@ -414,7 +428,20 @@ function fromJson(data, onContent) {
   const choice = data.choices?.[0];
   const content = choice?.message?.content ?? '';
   if (content) onContent?.(content);
-  return { content, usage: data.usage, finish: choice?.finish_reason };
+  return { content, usage: data.usage, finish: choice?.finish_reason, error: upstreamError(data, choice) };
+}
+
+// 응답 '본문'에 실려 온 오류를 읽는다 (chatCompletion의 HTTP 200 오류 주석 참고). 두 자리를 본다 — 최상위 error
+// (OpenRouter의 스트림 오류 이벤트·JSON 오류 본문)와 choices[0].error (제공자가 생성을 오류로 끝낸 조각). 오류
+// 객체 없이 finish_reason=error만 오는 형태도 오류다. 없으면 undefined — 두 읽기 경로(스트림·JSON)가 같은 판정을 쓴다.
+function upstreamError(obj, choice) {
+  const e = obj?.error ?? choice?.error;
+  if (e !== undefined && e !== null) {
+    return typeof e === 'object'
+      ? { code: e.code ?? e.status, message: String(e.message ?? JSON.stringify(e)) }
+      : { message: String(e) };
+  }
+  return choice?.finish_reason === 'error' ? { message: 'finish_reason=error' } : undefined;
 }
 
 // SSE(text/event-stream)를 읽는다. 한 줄 `data: {…}`에 조각 하나, `data: [DONE]`이 끝이다.
@@ -437,6 +464,7 @@ async function readEventStream(res, signal, onChunk, onContent) {
   let content = '';
   let usage;
   let finish;
+  let error;   // 상류가 이벤트로 실어 보낸 오류 — 마지막 것을 남긴다 (upstreamError)
   const takeLine = line => {
     if (!line.startsWith('data:')) return;
     const payload = line.slice(5).trim();
@@ -448,6 +476,7 @@ async function readEventStream(res, signal, onChunk, onContent) {
     if (typeof delta === 'string' && delta) { content += delta; onContent?.(delta); }
     if (choice?.finish_reason) finish = choice.finish_reason;
     if (obj?.usage) usage = obj.usage;
+    error = upstreamError(obj, choice) ?? error;
   };
   try {
     for (;;) {
@@ -470,7 +499,7 @@ async function readEventStream(res, signal, onChunk, onContent) {
   } finally {
     await reader.cancel().catch(() => { /* 이미 닫혔다 */ });
   }
-  return { content, usage, finish };
+  return { content, usage, finish, error };
 }
 
 // 검색 결과 본문(knowledge.content / qa_method.method / query_sql)은 전부 TEXT라 그 자체로는 상한이 없다.
@@ -553,7 +582,12 @@ export const live = list => (list ?? []).filter(o => !o?.dropped);
 // 자료 항목 한 줄. 본문이 잘렸고 아직 펼치지 않았으면 앞에 식별자를 붙인다 — 청구할 수 있는 자리에만
 // 번호가 보이게 해서, 모델이 펼칠 수 없는 것을 청구하느라 스텝을 버리지 않게 한다. 펼친 항목은 더 긴
 // 상한으로 싣고 번호를 떼는데, 번호가 없다는 것이 곧 '더 받을 것이 없다'는 표시다.
-const itemLine = (prefix, titleKey, bodyKey) => o => {
+// canExpand는 요청 단위의 판정이다 — 청구 기회(MAX_EXPANDS)를 다 썼으면 항목이 어떤 상태든 번호를 붙이지 않는다.
+// 성공한 청구는 이력에 남지 않으므로 모델은 자기가 몇 번 청구했는지 프롬프트에서 알 수 없다. 항목 단위 판정만
+// 보던 동안 상한을 다 쓴 뒤에도 남은 문서에 번호가 그대로 붙어, 모델은 시스템 프롬프트의 '번호가 붙어 있으면
+// 청구할 수 있다'를 따라 청구했고 '상한에 닿았다'는 안내와 헛돈 스텝만 받았다(agent.js ctx 주석). 이 값이 없는
+// ctx(테스트·직접 호출)는 종전과 같이 항목 단위로만 판정한다.
+const itemLine = (prefix, titleKey, bodyKey, canExpand = true) => o => {
   // 청크 항목(doc_seq가 있다)은 본문이 이미 문서당 상한 안이라 자를 것이 없다 — 청크 크기를
   // MAX_PROMPT_ITEM_LEN과 같게 잡은 것이 그 근거다(chunk.js CHUNK_MAX_LEN). 번호를 붙일지는
   // '길이가 잘렸는가'가 아니라 '범위 밖에 청크가 남았는가'로 정한다(canGrow) — 청크는 잘리지
@@ -563,7 +597,7 @@ const itemLine = (prefix, titleKey, bodyKey) => o => {
   // 같은 값이던 동안 문서 창을 넓히려면 처리방법 몫까지 함께 키워야 했다 (constants.js MAX_EXPANDED_ITEM_LEN).
   const max = chunk ? MAX_DOC_LEN : o.expanded ? MAX_EXPANDED_ITEM_LEN : MAX_PROMPT_ITEM_LEN;
   const text = indent(o[bodyKey]);
-  const askable = chunk ? canGrow(o) : (!o.expanded && text.length > max);
+  const askable = canExpand && (chunk ? canGrow(o) : (!o.expanded && text.length > max));
   // 위치 표기((3~7/22))는 제목을 자른 '뒤에' 붙인다 — 제목에 이어 붙여 넘기면 긴 제목에서 이 표기부터
   // 잘려 나가, 정작 조각으로 나뉜 긴 문서에서 위치를 알 수 없게 된다 (chunk.js buildItems의 range).
   const name = clip(oneLine(o[titleKey]), MAX_PROMPT_NAME_LEN) + (o.range ?? '');
@@ -843,9 +877,10 @@ function renderHistory(history, budget) {
 // 배분에 앞서 고정 틀의 몫(PROMPT_FRAME_RESERVE — 제목 줄·빈 줄·지시 블록)을 뗀다. 본문만 세면
 // 네 섹션이 각자 예산에 꽉 찬 요청에서 틀의 길이만큼 정확히 전체 상한을 넘는다.
 function renderSections(ctx) {
+  const canExpand = ctx.canExpand !== false;   // 청구 기회가 남았는가 (agent.js ctx) — 없으면 두 섹션 모두 번호를 뗀다
   const builders = {
-    knowledge: budget => renderItems(live(ctx.knowledge), itemLine(ITEM_PREFIX.knowledge, 'title', 'content'), budget),
-    qaMethods: budget => renderItems(live(ctx.qaMethods), itemLine(ITEM_PREFIX.qaMethods, 'title', 'method'), budget),
+    knowledge: budget => renderItems(live(ctx.knowledge), itemLine(ITEM_PREFIX.knowledge, 'title', 'content', canExpand), budget),
+    qaMethods: budget => renderItems(live(ctx.qaMethods), itemLine(ITEM_PREFIX.qaMethods, 'title', 'method', canExpand), budget),
     history: budget => renderHistory(ctx.history, budget),
     queries: budget => renderQueries(ctx.queries, budget),
   };

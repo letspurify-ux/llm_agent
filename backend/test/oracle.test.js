@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import oracledb from 'oracledb';
-import { runQuery, normalizeCells, numberFromString, oracleMock, oracleDriver, resolveTargetDb } from '../src/oracle.js';
+import { runQuery, normalizeCells, numberFromString, oracleMock, oracleDriver, resolveTargetDb, localDateTime } from '../src/oracle.js';
 import { targetDbNames } from '../src/constants.js';
 import { llmProvider } from '../src/llm.js';
 import { MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK } from '../src/constants.js';
@@ -440,4 +440,62 @@ test('대상 DB 선택은 어떤 입력에도 후보 하나로만 확정된다',
       }
     }
   }
+});
+
+test('날짜류 컬럼은 세션 포맷과 같은 글자로 확정된다 — thin 드라이버의 Date.toString()이 아니라', () => {
+  // fetchAsString에 oracledb.DATE를 두면 thin 드라이버(기본)는 세션 포맷이 아니라 JS Date.toString()을 준다
+  // ("Sun Sep 06 2026 12:34:56 GMT+0900 (Korean Standard Time)" — 실 Oracle 실측). 그 값은 프롬프트·답변 표·
+  // trace에 그대로 실리고, 모델이 다음 스텝의 바인드로 되돌리면 세션 포맷과 맞지 않아 ORA-01861로 실패했다.
+  // 날짜류는 JS Date로 받아 fetchTypeHandler의 변환기가 NLS_SESSION_FORMATS와 같은 글자를 만든다.
+  assert.ok(!oracledb.fetchAsString.includes(oracledb.DATE), 'fetchAsString에 DATE가 있으면 thin 모드에서 Date.toString()이 실린다');
+  const convert = (dbType, v) => {
+    const h = oracledb.fetchTypeHandler({ dbType });
+    assert.ok(h && typeof h.converter === 'function' && h.type === undefined, `${dbType}: 타입은 바꾸지 않고 변환기만 둔다`);
+    return h.converter(v);
+  };
+  // 로컬 구성 요소로 만든 Date는 프로세스 TZ와 무관하게 같은 벽시계로 돌아온다 (드라이버가 DATE를 그렇게 만든다)
+  const d = new Date(2026, 8, 6, 12, 34, 56, 789);
+  assert.equal(convert(oracledb.DB_TYPE_DATE, d), '2026-09-06 12:34:56');
+  assert.equal(convert(oracledb.DB_TYPE_TIMESTAMP, d), '2026-09-06 12:34:56', '소수점 초는 세션 포맷에 없다');
+  // 시간대 있는 타입은 오프셋을 붙인다 — NLS_TIMESTAMP_TZ_FORMAT('… TZH:TZM')으로 되돌아가야 한다
+  assert.match(convert(oracledb.DB_TYPE_TIMESTAMP_TZ, d), /^2026-09-06 12:34:56 [+-]\d\d:\d\d$/);
+  assert.match(convert(oracledb.DB_TYPE_TIMESTAMP_LTZ, d), /^2026-09-06 12:34:56 [+-]\d\d:\d\d$/);
+  // NULL과 Date가 아닌 값은 손대지 않는다
+  assert.strictEqual(convert(oracledb.DB_TYPE_DATE, null), null);
+  assert.strictEqual(convert(oracledb.DB_TYPE_TIMESTAMP_TZ, 'x'), 'x');
+  // 문자열 컬럼에는 변환기가 없다
+  assert.equal(oracledb.fetchTypeHandler({ dbType: oracledb.DB_TYPE_VARCHAR }), undefined);
+  // 드라이버 매핑이 바뀌어 Date가 그대로 와도 같은 글자로 정규화된다
+  assert.equal(normalizeCells({ D: d }).D, '2026-09-06 12:34:56');
+  // 오프셋 표기는 두 자리씩, 부호 포함 (getTimezoneOffset의 반대 부호)
+  const off = -d.getTimezoneOffset();
+  const sign = off < 0 ? '-' : '+';
+  const hh = String(Math.floor(Math.abs(off) / 60)).padStart(2, '0');
+  const mm = String(Math.abs(off) % 60).padStart(2, '0');
+  assert.equal(localDateTime(d, true), `2026-09-06 12:34:56 ${sign}${hh}:${mm}`);
+});
+
+test('INTERVAL·JSON·VECTOR 컬럼은 값이 보이는 글자로 확정된다 — "지원하지 않는 컬럼 타입"이 아니라', () => {
+  // 드라이버는 INTERVAL을 IntervalDS/IntervalYM 객체로, JSON 컬럼을 객체·배열로, VECTOR를 타입 배열로 준다. 셋 다
+  // 드라이버 객체 자리로 떨어져 값이 통째로 사라졌다(실 Oracle 실측). INTERVAL 표기는 Oracle의 문자열→INTERVAL 암묵
+  // 변환이 받는 형식이라 모델이 그대로 바인드로 되돌릴 수 있다(실 Oracle에서 등식 확인).
+  const ds = o => new oracledb.IntervalDS(o);
+  assert.equal(normalizeCells({ A: ds({ days: 2, hours: 3, minutes: 4, seconds: 5, fseconds: 678000000 }) }).A, '2 03:04:05.678');
+  assert.equal(normalizeCells({ A: ds({ days: -2, hours: -3, minutes: -4, seconds: -5, fseconds: -500000000 }) }).A, '-2 03:04:05.5');
+  assert.equal(normalizeCells({ A: ds({ days: 0, hours: 0, minutes: 0, seconds: 0, fseconds: -250000000 }) }).A, '-0 00:00:00.25');
+  assert.equal(normalizeCells({ A: ds({ days: 11, hours: 13, minutes: 46, seconds: 40, fseconds: 0 }) }).A, '11 13:46:40');
+  assert.equal(normalizeCells({ A: new oracledb.IntervalYM({ years: 1, months: 6 }) }).A, '1-6');
+  assert.equal(normalizeCells({ A: new oracledb.IntervalYM({ years: -1, months: -6 }) }).A, '-1-6');
+  // JSON 컬럼 — 객체·배열은 JSON 글자, 셀 상한을 넘으면 다른 셀과 같이 표시를 붙여 자른다
+  assert.equal(normalizeCells({ J: [1, 'a', { b: true, d: null }] }).J, '[1,"a",{"b":true,"d":null}]');
+  assert.equal(normalizeCells({ J: { k: 'v' } }).J, '{"k":"v"}');
+  const big = normalizeCells({ J: { s: 'x'.repeat(MAX_CELL_LEN) } }).J;
+  assert.ok(big.endsWith(TRUNC_MARK) && big.length === MAX_CELL_LEN + TRUNC_MARK.length, big);
+  // VECTOR — 타입 배열은 숫자 배열의 JSON
+  assert.equal(normalizeCells({ V: new Float32Array([1.5, 2.5]) }).V, '[1.5,2.5]');
+  // 드라이버 객체(클래스 인스턴스)는 여전히 정체를 남긴 표시다 — 값처럼 직렬화하면 순환·커넥션 종속 값이 샌다
+  class DbObject {}
+  assert.match(normalizeCells({ D: new DbObject() }).D, /^<DbObject 값 — 지원하지 않는 컬럼 타입>$/);
+  // 직렬화할 수 없는 값(BigInt 포함)도 죽지 않는다
+  assert.match(normalizeCells({ B: { n: 10n } }).B, /지원하지 않는 컬럼 타입/);
 });

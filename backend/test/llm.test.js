@@ -419,7 +419,7 @@ test('Mock은 검색 기록이 없으면 셋 다 검색부터 요청한다', asy
   assert.deepStrictEqual(d, { action: 'search', text: '배치 재시작 방법', targets: ['knowledge', 'qa_method', 'query'] });
 });
 
-test('Mock은 첫 검색이 지식·처리방법을 못 찾았을 때만 직전 질문을 덧붙여 한 번 더 찾는다', async () => {
+test('Mock은 첫 검색이 처리방법을 못 찾았을 때만 직전 질문을 덧붙여 한 번 더 찾는다', async () => {
   delete process.env.LLM_PROVIDER;
   const once = { search: '그럼 김철수는?', targets: ['knowledge', 'qa_method', 'query'], hits: { knowledge: 0, qaMethods: 0, queries: 0 } };
   const chat = [{ role: 'user', text: '홍길동 고객 주문 상태 알려줘' }, { role: 'assistant', text: '(표)' }];
@@ -432,6 +432,20 @@ test('Mock은 첫 검색이 지식·처리방법을 못 찾았을 때만 직전 
   // 두 번째 검색도 빈손이면 더 찾지 않는다
   const twice = await llm.decide({ question: '그럼 김철수는?', chat, knowledge: [], qaMethods: [], queries: [], history: [once, { ...once, search: '재검색' }] });
   assert.equal(twice.action, 'answer');
+  // 무관한 지식 한 건이 벡터 문턱 아래로 걸려도 재검색은 막히지 않는다 — Mock이 쿼리를 계획하는 근거는 처리방법뿐이라,
+  // 지식까지 '빈손' 조건에 넣으면 등록 문서 하나가 후속 질문의 조회를 통째로 없애고 그 무관한 지식만 답에 붙는다(실측).
+  const noisy = { search: '그럼 김철수는?', targets: ['knowledge', 'qa_method', 'query'], hits: { knowledge: 1, qaMethods: 0, queries: 0 } };
+  const stray = [{ seq: 9, title: '무관한 문서', content: '엉뚱한 내용', _dist: 0.54 }];
+  const d2 = await llm.decide({ question: '그럼 김철수는?', chat, knowledge: stray, qaMethods: [], queries: [], history: [noisy] });
+  assert.equal(d2.action, 'search', '무관한 지식 한 건이 재검색을 막았다');
+  assert.equal(d2.text, '홍길동 고객 주문 상태 알려줘 그럼 김철수는?');
+  // 처리방법을 찾았으면 재검색하지 않고 그 절차로 간다 (조회 계획으로 넘어가거나 답한다)
+  const found = { ...noisy, hits: { knowledge: 1, qaMethods: 1, queries: 1 } };
+  const qm = [{ seq: 1, title: '고객 주문 상태 확인', method: 'find_customer_id 뒤 order_status_by_customer' }];
+  const q = [{ seq: 2, query_name: 'find_customer_id', query_sql: 'SELECT 1 FROM CUSTOMERS WHERE CUSTOMER_NAME = :customer_name', target_db_name: 'ORDER_DB' }];
+  const d3 = await llm.decide({ question: '그럼 김철수는?', chat, knowledge: stray, qaMethods: qm, queries: q, history: [found] });
+  assert.equal(d3.action, 'run_query', '처리방법이 있는데 다시 검색했다');
+  assert.equal(d3.params.customer_name, '김철수');
 });
 
 test('일괄 조회의 항목은 단일 조회와 같은 경계를 지나고, 개수는 상한에서 잘린다', () => {
@@ -444,6 +458,11 @@ test('일괄 조회의 항목은 단일 조회와 같은 경계를 지나고, �
   assert.ok(!('action' in d.queries[0]), '항목에 action이 남으면 안 된다');
   // 항목이 객체가 아니면 빈 항목으로 — 결정 자체를 버리지 않는다 (미등록 처리로 소리 나게 실패한다)
   assert.deepStrictEqual(sanitizeDecision({ action: 'run_queries', queries: 'x' }), { action: 'run_queries', queries: [] });
+  // 빈 항목의 이름은 빈 문자열이다 — String(undefined)가 만든 'undefined'라는 글자가 모델이 낸 적 없는
+  // 쿼리 이름으로 이력·프롬프트·화면 trace에 '등록되지 않은 쿼리'로 실렸다.
+  const nameless = sanitizeDecision({ action: 'run_queries', queries: ['bad', null, { params: { a: 1 } }] });
+  assert.deepStrictEqual(nameless.queries.map(q => q.query_name), ['', '', ''], '이름 없는 항목이 "undefined"라는 이름을 얻으면 안 된다');
+  assert.equal(sanitizeDecision({ action: 'run_query', params: {} }).query_name, '');
 });
 
 test('결정 경계가 본문 청구와 버리기의 식별자를 정규화한다', () => {

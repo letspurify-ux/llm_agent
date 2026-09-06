@@ -532,6 +532,23 @@ export function warnOnce(scope, message) {
 // 내부 지시문이 safe 표시를 타고 화면까지 나간다 — note와 error를 나눈 것과 같은 이유로 필드를 나눈다.
 export const safeError = (msg, hint) => Object.assign(new Error(msg), { safe: true, ...(hint && { hint }) });
 
+// 로그에 남길 오류 문구 — 원인 사슬(cause)까지 편다.
+// Node의 fetch(undici)는 접속 거부·DNS 실패·TLS 오류·인증서 만료를 전부 `TypeError: fetch failed` 하나로 던지고
+// 진짜 원인은 e.cause에만 둔다. e.message만 남기면 LLM·임베딩 로그가 "call failed: fetch failed" 한 줄이 되어
+// 'Ollama가 내려갔다'(ECONNREFUSED)와 'LLM_BASE_URL 호스트 오타'(ENOTFOUND)와 'https를 http 포트에 붙였다'
+// (ERR_SSL_WRONG_VERSION_NUMBER)가 구분되지 않았다(실측 — 세 경우 모두 같은 줄). 그 로그가 장애의 유일한 단서다.
+// 접속 거부는 cause가 메시지 없는 AggregateError(주소마다 하나씩 errors[])라 첫 원인을 꺼내고, code가 문구에
+// 없으면 앞에 붙인다. 원문이 길 수 있어(OpenSSL 문구) 상한을 둔다.
+export function errorText(e) {
+  const head = String(e?.message || e);
+  const c = e?.cause;
+  if (c === undefined || c === null) return head;
+  const inner = Array.isArray(c.errors) && c.errors.length ? c.errors[0] : c;
+  const detail = clipText(String(inner?.message || '').trim() || String(inner?.code || inner), 300);
+  const code = c.code && !detail.includes(String(c.code)) ? `${c.code}: ` : '';
+  return `${head} — ${code}${detail}`;
+}
+
 // base URL 뒤에 경로를 붙인다. 끝의 '/' 유무는 설정하는 사람마다 다르고(`…/v1`과 `…/v1/`), 그대로
 // 이으면 `…/v1//chat/completions`가 된다 — 대부분의 서버는 받아주지만 경로를 엄격히 대조하는
 // 프록시는 404를 내고, 화면에는 'LLM 호출 실패'만 남아 .env의 슬래시 하나를 의심하기 어렵다.

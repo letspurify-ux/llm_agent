@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import {
   parseChartBlock, chartBlocksToTables, chartTableMarkdown, toNumber, toTime, pieSlices, clip, sliceSafe,
-  chartNotes, fmtNum, pieLabelsOverflow, fitText, MAX_CHART_ROWS, MAX_SERIES, MAX_LABEL_LEN, MAX_NAME_LEN, MAX_PIE_SLICES,
+  chartNotes, fmtNum, pieLabelsOverflow, fitText, chartFences, CHART_FENCE_RE, MAX_CHART_ROWS, MAX_SERIES, MAX_LABEL_LEN, MAX_NAME_LEN, MAX_PIE_SLICES,
 } from '../src/chart.js';
 
 const TABLE = '| 월 | 건수 | 금액 |\n|---|---|---|\n| 2024-01 | 120 | 1,000 |\n| 2024-02 | 80 | 2,500 |';
@@ -449,4 +449,52 @@ test('차트의 숫자 표기: 소수 두 자리로 담기지 않는 작은 값�
   // 값이 없는 칸은 빈 글자다 — 결측을 0으로 그리지 않는다는 규칙이 표기에서도 같아야 한다
   // (툴팁은 toNumber가 null로 둔 칸을 그대로 받는다)
   for (const v of [null, undefined, NaN, Infinity, -Infinity, '3', {}]) assert.strictEqual(fmtNum(v), '');
+});
+
+// 줄 단위 탐색(chartFences)은 CHART_FENCE_RE와 같은 블록을 찾아야 한다 — 정규식은 서버(backend chart.js)와 나누는 '모양'이고
+// 탐색은 그것을 길이에 비례하게 다시 쓴 것이라, 둘이 갈리면 화면·이력·서버가 서로 다른 블록을 본다. 무작위 문서로
+// 대조한다: 펜스 글자·길이·들여쓰기(탭·4칸 포함)·덧말·CRLF·닫히지 않은 펜스·다른 언어의 펜스·목록·인용문을 섞는다.
+test('chartFences는 CHART_FENCE_RE와 같은 블록을 찾는다 (무작위 문서 대조)', () => {
+  let seed = 20260906;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const pick = a => a[Math.floor(rnd() * a.length)];
+  const int = (a, b) => a + Math.floor(rnd() * (b - a + 1));
+  const doc = () => {
+    const parts = [];
+    for (let b = 0; b < int(1, 4); b++) {
+      const ch = pick(['`', '~']); const f = ch.repeat(int(3, 5));
+      parts.push(`${pick(['', ' ', '  ', '   ', '    ', '\t', '> '])}${f}${pick(['', ' '])}${pick(['chart', 'Chart', 'CHART', 'charts', 'mermaid', 'js', ''])}${pick(['', '', ' 월별', ' x `y`', '\t덧말', ' '])}`);
+      for (let j = 0; j < int(0, 4); j++) parts.push(pick(['type: bar', '| a | b |', '|---|---|', '| x | 1 |', '  | y | 2 |', '', '글', '```', '~~~', '````', '- 목록', 'data: step 1', '```chart']));
+      if (rnd() < 0.85) parts.push(`${pick(['', ' ', '   ', '    ', '\t'])}${rnd() < 0.8 ? f : pick(['```', '~~~', '````', '~~~~'])}${pick(['', ' ', '\t', ' x'])}`);
+      parts.push(pick(['', '문장', '> 인용']));
+    }
+    return parts.join(pick(['\n', '\n', '\r\n'])) + pick(['', '\n', '\r\n']);
+  };
+  const byRe = md => [...md.matchAll(CHART_FENCE_RE)].map(m => ({ indent: m[1], fence: m[2], ch: m[3], body: m[4], at: m.index }));
+  const byScan = md => { const { lines, blocks } = chartFences(md); let off = 0; const starts = lines.map(l => { const o = off; off += l.length + 1; return o; });
+    return blocks.map(b => ({ indent: b.indent, fence: b.fence, ch: b.ch, body: b.body, at: starts[b.start] })); };
+  for (let i = 0; i < 3000; i++) {
+    const md = doc();
+    assert.deepStrictEqual(byScan(md), byRe(md), `블록이 갈렸다: ${JSON.stringify(md)}`);
+  }
+  // 정규식으로 바꿔 넣은 것과 탐색으로 바꿔 넣은 것도 같아야 한다 (바꿔 넣는 범위까지)
+  const viaRe = md => md.replace(CHART_FENCE_RE, (_, indent, _f, _c, body = '') => `[${indent}|${body}]`);
+  const viaScan = md => { const { lines, blocks } = chartFences(md); const out = []; let at = 0;
+    for (const b of blocks) { out.push(...lines.slice(at, b.start), `[${b.indent}|${b.body ?? ''}]`); at = b.end + 1; } out.push(...lines.slice(at)); return out.join('\n'); };
+  for (let i = 0; i < 1000; i++) { const md = doc(); assert.strictEqual(viaScan(md), viaRe(md), `바꿔 넣은 범위가 갈렸다: ${JSON.stringify(md)}`); }
+});
+
+// 닫히지 않은 여는 펜스가 되풀이되는 퇴화한 답변에서 정규식은 '여는 줄 수 × 길이'였다(실측: 상한 안의 7,500줄에 487ms,
+// 길이 두 배에 네 배). 이력 변환은 그 답변이 최근 여섯 턴에 있는 동안 매 전송마다 다시 도므로 질문마다 반초씩 멈췄다.
+test('chartBlocksToTables는 닫히지 않은 펜스가 아무리 많아도 비용이 길이에 비례한다', () => {
+  const degenerate = n => '```chart\n'.repeat(n);
+  const ms = n => { const t0 = performance.now(); chartBlocksToTables(degenerate(n)); return performance.now() - t0; };
+  ms(2000);
+  const one = Math.max(0.5, ms(2000));
+  const four = ms(8000);
+  assert.ok(four < one * 8, `길이가 4배인데 비용이 ${(four / one).toFixed(1)}배다 (${one.toFixed(1)}ms → ${four.toFixed(1)}ms)`);
+  // 결과도 같아야 한다 — 닫히지 않은 펜스는 블록이 아니라 그대로 남는다
+  assert.strictEqual(chartBlocksToTables(degenerate(3)), degenerate(3));
+  // dead 표시는 '이 길이 이상의 닫는 펜스가 끝까지 없다'일 뿐이다 — 더 짧은 여는 줄은 여전히 제 닫는 줄을 찾는다
+  assert.strictEqual(chartBlocksToTables('````chart\n글\n```chart\n| a | b |\n| x | 1 |\n```'), '````chart\n글\n| a | b |\n| --- | --- |\n| x | 1 |');
 });

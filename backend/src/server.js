@@ -362,7 +362,8 @@ async function shutdown(reason, code = 0) {
   // 하려던 일(풀 정리)이 타이머에 밀려 실행되지 않는다.
   // Node 19+는 close()가 idle 연결을 스스로 닫아주므로 지금 런타임에서는 이 호출이 동작을
   // 바꾸지 않는다(실측 확인). 그래도 명시하는 이유는 이 보장이 런타임 버전에 딸려 오는 것이라
-  // Node 18에서는 그대로 사라지기 때문이다 — engines 제약이 없어 그 버전으로도 뜬다.
+  // 그 동작에 기대지 않고 '무엇을 닫는가'를 여기 적어 두기 위해서다. (하한은 Node 20이다 — package.json
+  // engines. mariadb 커넥터가 그 아래에서는 로드를 거부해 Node 18로는 기동 자체가 안 된다, 실측.)
   // 처리 중인 요청의 연결은 건드리지 않고 idle 연결만 닫는다.
   const closed = new Promise(resolve => server.close(resolve));
   server.closeIdleConnections();

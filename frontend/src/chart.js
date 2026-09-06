@@ -467,6 +467,41 @@ export const chartTableMarkdown = text => chartTableMarkdownFrom(splitBlock(text
 // (실측: 빈 블록 뒤의 설명 문장이 이력에서 사라졌다). 빈 본문을 먼저 시도해야(??) 그 짝짓기가 생기지 않는다.
 export const CHART_FENCE_RE = /^([ \t]*)((`|~)\3{2,})[ \t]*chart(?:[ \t]+[^\r\n]*)?\r?\n(?:([\s\S]*?)\r?\n)??[ \t]*\2\3*[ \t]*\r?$/gim;
 
+// 위 정규식을 줄 단위로 다시 쓴 것 — 답변 하나를 훑는 비용이 길이에 비례하게. 정규식은 여는 펜스마다 닫는 펜스를
+// 끝까지 찾아 닫히지 않은 펜스가 많으면 '여는 줄 수 × 길이'가 된다(실측: 답변 상한 안의 '```chart' 7,500줄에 487ms,
+// 길이를 두 배로 하면 네 배). 이력 변환(chartBlocksToTables)은 그 답변이 최근 여섯 턴에 남아 있는 동안 매 전송마다
+// 다시 도므로, 퇴화한 답변 하나가 그 뒤 세 번의 질문을 저마다 반초씩 멈추게 했다 — preview.js가 같은 이유로
+// 줄 단위 상태 기계가 된 것과 같은 결이다. 찾는 규칙은 정규식과 정확히 같아야 한다(회귀 테스트가 둘을 대조한다):
+//   여는 줄: 들여쓰기·같은 글자 셋 이상의 펜스·chart(대소문자 무관)·덧말, 그리고 그 뒤에 줄바꿈이 있어야 한다.
+//   닫는 줄: 여는 펜스와 같은 글자가 그 수 이상, 앞뒤 공백뿐. 여는 줄 다음부터 처음 나오는 그런 줄이다.
+//   본문: 그 사이의 줄들. 닫는 줄 바로 앞의 \r 하나는 정규식의 \r?\n이 그렇듯 본문에 넣지 않는다.
+//   닫히지 않는 여는 줄은 블록이 아니고, 그다음 줄부터 다시 찾는다. 찾은 블록의 닫는 줄 다음부터 다시 찾는다.
+// 비용이 비례하는 이유: 같은 글자·같은 길이 이상의 닫는 펜스가 어느 줄부터 끝까지 없다는 것을 한 번 알면(dead),
+// 그 뒤의 같은 모양 여는 줄은 다시 훑지 않는다 — 퇴화한 답변은 같은 여는 줄의 반복이라 한 번만 끝까지 간다.
+const OPEN_LINE_RE = /^([ \t]*)((`|~)\3{2,})[ \t]*chart(?:[ \t]+[^\r\n]*)?\r?$/i;
+const CLOSE_LINE_RE = /^[ \t]*((`|~)\2{2,})[ \t]*\r?$/;
+export function chartFences(md) {
+  const lines = String(md ?? '').split('\n');
+  const blocks = [];
+  const dead = { '`': Infinity, '~': Infinity };
+  for (let i = 0; i < lines.length - 1; i++) {
+    const m = OPEN_LINE_RE.exec(lines[i]);
+    if (!m) continue;
+    const [, indent, fence, ch] = m;
+    if (fence.length >= dead[ch]) continue;
+    let j = i + 1;
+    for (; j < lines.length; j++) {
+      const c = CLOSE_LINE_RE.exec(lines[j]);
+      if (c && c[2] === ch && c[1].length >= fence.length) break;
+    }
+    if (j === lines.length) { dead[ch] = Math.min(dead[ch], fence.length); continue; }
+    const body = j === i + 1 ? undefined : lines.slice(i + 1, j).join('\n').replace(/\r$/, '');
+    blocks.push({ start: i, end: j, indent, fence, ch, body });
+    i = j;
+  }
+  return { lines, blocks };
+}
+
 // 대화 이력으로 보낼 때 차트 블록을 평범한 표로 되돌린다. 모델의 다음 턴에 필요한 것은 '무슨 값을
 // 보여줬는가'이지 그것을 어떻게 그렸는가가 아니다 — 펜스와 설정 줄을 그대로 돌려보내면 이력
 // 상한(HISTORY_LEN)의 일부를 그 글자가 먹고, 모델은 그 모양을 답변마다 흉내 낸다.
@@ -476,7 +511,13 @@ export const CHART_FENCE_RE = /^([ \t]*)((`|~)\3{2,})[ \t]*chart(?:[ \t]+[^\r\n]
 // 블록의 제목이 목록 밖의 문단이 되어 항목이 거기서 끊기고 뒤의 표는 목록에서 떨어져 나간다(실측:
 // `1. 항목` 아래 4칸 들여 쓴 블록의 이력이 `목록 안\n    | a | b |…`로 나가 목록이 끝났다).
 export function chartBlocksToTables(md) {
-  return String(md ?? '').replace(CHART_FENCE_RE, (_, indent, _fence, _ch, body = '') => {
+  const { lines, blocks } = chartFences(md);
+  if (!blocks.length) return String(md ?? '');
+  const out = [];
+  let at = 0;
+  for (const { start, end, indent, body = '' } of blocks) {
+    out.push(...lines.slice(at, start));
+    at = end + 1;
     const { config, table } = splitBlock(body);
     const t = normalizeTable(table);
     // 표도 `data:` 참조도 없는 블록은 차트가 아니다 — 모델이 펜스를 다른 용도로 쓴 것이고, 화면은
@@ -485,14 +526,16 @@ export function chartBlocksToTables(md) {
     // 다음 질문의 '## 최근 대화'는 있지도 않은 침묵을 모델의 지난 턴으로 싣는다(실측: ```chart
     // 안에 쓴 문장 하나가 이력에서 통째로 사라졌고, 화면에는 그대로 남아 있었다).
     // 본문의 들여쓰기는 원문 그대로 둔다 — 아래에서 우리가 새로 적는 줄만 여는 펜스를 따른다.
-    if (!t && config.data === undefined) return body;
+    if (!t && config.data === undefined) { out.push(body); continue; }
     const title = String(config.title ?? '').trim();
-    const out = [];
-    if (title) out.push(indent + title);
+    const rep = [];
+    if (title) rep.push(indent + title);
     if (t) {
-      out.push(t.header, t.sep, ...t.rows.slice(0, HISTORY_TABLE_ROWS));
-      if (t.rows.length > HISTORY_TABLE_ROWS) out.push(`${indent}(외 ${t.rows.length - HISTORY_TABLE_ROWS}행)`);
+      rep.push(t.header, t.sep, ...t.rows.slice(0, HISTORY_TABLE_ROWS));
+      if (t.rows.length > HISTORY_TABLE_ROWS) rep.push(`${indent}(외 ${t.rows.length - HISTORY_TABLE_ROWS}행)`);
     }
-    return out.join('\n');
-  });
+    out.push(rep.join('\n'));
+  }
+  out.push(...lines.slice(at));
+  return out.join('\n');
 }

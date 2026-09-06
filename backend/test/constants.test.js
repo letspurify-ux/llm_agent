@@ -318,3 +318,22 @@ test('섹션 천장은 기본 몫이 있는 섹션에만, 기본 몫 이상으�
     assert.ok(cap <= reach, `${key} 천장(${cap})에 닿을 수 없다: 앞이 비어도 ${reach}까지만 받는다`);
   }
 });
+
+test('오류 문구는 원인 사슬까지 편다 — fetch의 "fetch failed" 뒤에 진짜 원인이 붙는다', async () => {
+  const { errorText } = await import('../src/constants.js');
+  // undici가 던지는 세 모양(실측): 접속 거부는 메시지 없는 AggregateError(주소마다 errors[]), DNS·TLS는 cause.message
+  const refused = Object.assign(new TypeError('fetch failed'), {
+    cause: Object.assign(new AggregateError([new Error('connect ECONNREFUSED ::1:11434'), new Error('connect ECONNREFUSED 127.0.0.1:11434')], ''), { code: 'ECONNREFUSED' }),
+  });
+  assert.equal(errorText(refused), 'fetch failed — connect ECONNREFUSED ::1:11434');
+  const dns = Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('getaddrinfo ENOTFOUND no-such-host.invalid'), { code: 'ENOTFOUND' }) });
+  assert.equal(errorText(dns), 'fetch failed — getaddrinfo ENOTFOUND no-such-host.invalid');
+  // 코드가 문구에 없으면 앞에 붙인다 (OpenSSL 원문은 코드를 담지 않는다), 긴 원문은 상한에서 자른다
+  const tls = Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('x'.repeat(1000)), { code: 'ERR_SSL_WRONG_VERSION_NUMBER' }) });
+  const t = errorText(tls);
+  assert.ok(t.startsWith('fetch failed — ERR_SSL_WRONG_VERSION_NUMBER: xxx') && t.length < 400, t);
+  // 원인이 없으면 message 그대로, 메시지 없는 원인은 code로
+  assert.equal(errorText(new Error('plain')), 'plain');
+  assert.equal(errorText(Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNRESET' } })), 'fetch failed — ECONNRESET');
+  assert.equal(errorText('문자열'), '문자열');
+});

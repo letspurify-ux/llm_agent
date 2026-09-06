@@ -278,3 +278,21 @@ test('여러 줄로 이어 쓴 목록 항목·인용문 안의 수식도 그려�
   // 되돌린 원문이 값과 다른 노드(엔티티)는 여전히 건드리지 않는다 — 실패 방향은 한쪽이다
   assert.deepStrictEqual(formulas('&amp; 와 $x$'), []);
 });
+
+// 닫히지 않은 \(·\[가 되풀이되는 퇴화한 답변에서 비탐욕 매치는 '여는 표시 수 × 길이'였다(실측: 답변 상한 안의 '\( x '
+// 되풀이가 319ms, 길이 두 배에 네 배). 미리보기는 120ms마다 자라난 전체를 다시 그리므로 그 비용이 스트림 끝까지 쌓인다.
+test('닫히지 않은 \\(·\\[가 아무리 많아도 렌더 비용이 길이에 비례한다 — 한 덩어리의 길이를 묶어서', () => {
+  for (const unit of ['\\( x ', '\\[ x ']) {
+    const ms = n => { const t0 = performance.now(); render(unit.repeat(n)); return performance.now() - t0; };
+    ms(1000);
+    const one = Math.max(1, ms(2000));
+    const four = ms(8000);
+    assert.ok(four < one * 8, `${JSON.stringify(unit)}: 길이가 4배인데 비용이 ${(four / one).toFixed(1)}배다 (${one.toFixed(0)}ms → ${four.toFixed(0)}ms)`);
+  }
+  // 상한 안의 긴 수식은 그대로 조판되고, 넘는 것은 원문으로 남되 던지지 않는다 (실패 방향은 원문 쪽이다)
+  const long = n => `\\[ ${'x+'.repeat(n / 2)}y \\]`;
+  assert.strictEqual(formulas(long(4000)).length, 1, '4,000자 수식이 조판되지 않았다');
+  assert.deepStrictEqual(formulas(long(6000)), [], '상한을 넘는 수식이 조판됐다 — 비용 상한이 사라졌다');
+  assert.ok(visible(long(6000)).includes('x+x+'), '상한을 넘는 수식의 원문이 화면에서 사라졌다');
+  assert.deepStrictEqual(formulas(`\\( ${'a+'.repeat(2000)}b \\) 와 $c$`), [`${'a+'.repeat(2000)}b`, 'c']);
+});

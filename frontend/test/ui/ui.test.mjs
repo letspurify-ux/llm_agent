@@ -767,7 +767,8 @@ it('모델이 쓴 주소는 저절로 불려 나가지 않는다 (그림·흐름
   // mermaidimg는 흐름도의 그림 노드(`A@{ img: "주소" }`), mermaidstyle은 지시문의 themeCSS·fontFamily에 든
   // url(…)이다 — 둘 다 mermaid가 그리는 도중에 그 주소를 불러오므로 그리기 전에 알아보고 그리지 않아야
   // 한다(markdown.js mermaidLoadsImage·mermaidFetchesViaStyle). 원문 코드가 남는다.
-  for (const c of ['images', 'mermaidhtml', 'mermaiddirective', 'mermaidimg', 'mermaidstyle', 'tableimg']) {
+  // mermaidescape는 그 두 판정을 이스케이프로 비켜 가던 표기다(fixtures.js) — 판정이 원문 글자만 보면 여기서 요청이 난다.
+  for (const c of ['images', 'mermaidhtml', 'mermaiddirective', 'mermaidimg', 'mermaidstyle', 'mermaidescape', 'tableimg']) {
     await answered(900, 760, { c });
     const got = await page.eval(`(() => ({
       요청: performance.getEntriesByType('resource').map(e => e.name).filter(n => /__probe-pixel/.test(n)).length,
@@ -781,7 +782,7 @@ it('모델이 쓴 주소는 저절로 불려 나가지 않는다 (그림·흐름
     assert.ok(!got.중첩앵커, `${c}: 링크 안에 링크가 생겼다`);
     // 그림 노드는 그리지 않은 것이지 앱이 죽거나 빈칸이 된 것이 아니다 — 원문이 코드로 남는다(READY가
     // 그것을 기다린다). 그림이 서지 않았다는 것까지 못 박는다: 서면 그 주소는 이미 불려 나간 뒤다.
-    if (c === 'mermaidimg' || c === 'mermaidstyle') assert.strictEqual(await page.eval(`!document.querySelector('.mermaid svg')`), true, `${c}: 그리는 도중에 주소를 부르는 흐름도를 그렸다`);
+    if (c === 'mermaidimg' || c === 'mermaidstyle' || c === 'mermaidescape') assert.strictEqual(await page.eval(`!document.querySelector('.mermaid svg')`), true, `${c}: 그리는 도중에 주소를 부르는 흐름도를 그렸다`);
   }
   // 열어 주지 않았을 뿐, 셀이 무엇을 가리키는지는 남아야 한다 (표에서도 본문과 같은 모양이다)
   const 셀 = await page.eval(`(() => { const a = [...document.querySelectorAll('.md table a')]
@@ -901,8 +902,11 @@ it('Object.hasOwn이 없는 브라우저(빌드 타깃 안의 Chrome 87~92·Safa
   // 통째로 퇴화한다. src/polyfills.js가 진입점보다 먼저 채운다 — 그것이 늦거나 빠지면 여기서 걸린다.
   // 그 API를 지운 채 문서를 열어 같은 브라우저를 흉내 낸다. 새 문서마다 걸리는 스크립트라 끝나면 반드시 걷는다 —
   // 남겨 두면 뒤의 시험들이 전부 그 브라우저를 상대로 돈다.
+  // Array·String.prototype.at(Chrome 92·Safari 15.4부터)도 함께 지운다 — mermaid가 클래스·상태·ER 다이어그램의 파서에서
+  // 부르므로, 없으면 그 종류만 원문 코드로 남아 한 답변 안에서 그림이 종류에 따라 되고 안 되고가 갈렸다(실측).
   const { identifier } = await page.send('Page.addScriptToEvaluateOnNewDocument', {
-    source: 'delete Object.hasOwn; window.__hasOwnGone = typeof Object.hasOwn === "undefined";',
+    source: 'delete Object.hasOwn; delete Array.prototype.at; delete String.prototype.at; '
+      + 'window.__hasOwnGone = typeof Object.hasOwn === "undefined" && typeof [].at === "undefined";',
   });
   try {
     await page.touchMode(false);
@@ -923,6 +927,12 @@ it('Object.hasOwn이 없는 브라우저(빌드 타깃 안의 Chrome 87~92·Safa
       패널: !!b.querySelector('details.trace') }; })()`);
     assert.strictEqual(got.hasOwn, 'function', '폴리필이 Object.hasOwn을 채우지 않았다');
     assert.ok(got.제목 > 0 && got.표 > 0 && got.차트 > 0 && got.흐름도 > 0 && got.패널, `답변의 일부가 그려지지 않았다: ${JSON.stringify(got)}`);
+    // 흐름도는 .at 없이도 그려지므로 위로는 모자란다 — 그 API를 실제로 부르는 클래스 다이어그램으로 본다
+    await page.goto(url('classdiagram'), '.chip');
+    await page.eval(`document.querySelectorAll('.chip')[0].click()`);
+    await page.until(`document.querySelectorAll('.row.assistant').length === 1 && !document.querySelector('.typing')`, { what: '클래스 다이어그램 답이 도착하기' });
+    await page.until(READY.classdiagram, { what: '클래스 다이어그램이 그려지기' })
+      .catch(e => assert.fail(`Array.prototype.at이 없는 브라우저에서 클래스 다이어그램이 원문 코드로 남았다 (${e.message.slice(0, 80)})`));
   } finally {
     await page.send('Page.removeScriptToEvaluateOnNewDocument', { identifier });
   }
@@ -994,7 +1004,7 @@ it('기다림은 오타를 곧바로 알리고, 지나가는 오류는 그 글�
 
 it('렌더링 중 콘솔에 예외도 오류도 오르지 않는다', async () => {
   // 로그는 시험마다 afterEach가 확인하고 비운다 — 이 시험이 보는 것은 아래 네 화면이 낸 것뿐이다.
-  for (const c of ['rich', 'images', 'mermaidhtml', 'mermaiddirective', 'mermaidclick', 'mermaidimg', 'mermaidstyle', 'tableimg', 'pielong']) await answered(1000, 760, { c });
+  for (const c of ['rich', 'images', 'mermaidhtml', 'mermaiddirective', 'mermaidclick', 'mermaidimg', 'mermaidstyle', 'mermaidescape', 'tableimg', 'pielong']) await answered(1000, 760, { c });
   assert.deepStrictEqual(page.logs, []);
   // 듣고 있다는 것까지 확인한다 — 귀를 닫은 검사는 무엇이 나가도 늘 통과한다(React는 렌더의
   // 문제를 예외가 아니라 console.error로 말하므로, 그 귀가 이 검사의 전부다).

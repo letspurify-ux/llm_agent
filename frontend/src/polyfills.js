@@ -20,3 +20,19 @@ if (typeof Object.hasOwn !== 'function') {
     writable: true, configurable: true, enumerable: false,
   });
 }
+
+// Array.prototype.at·String.prototype.at (Chrome 92·Safari 15.4부터). 우리 코드는 쓰지 않지만 mermaid가 클래스·상태·ER
+// 다이어그램과 markdown 라벨의 파서에서 부른다 — 없는 브라우저에서는 그 종류만 '문법 오류'처럼 원문 코드로 남고
+// 흐름도·시퀀스·간트는 그려진다(실측: Chrome 87~91 흉내). 한 답변 안에서 그림 종류에 따라 되고 안 되고가 갈리면
+// 사용자는 모델이 틀린 것으로 읽는다. 명세대로: 정수로 바꾼 index가 음수면 뒤에서 세고, 범위 밖이면 undefined.
+// (structuredClone은 채우지 않는다 — 일반 구현이 크고, 쓰는 자리가 mermaid의 pie 하나뿐이라 원문 코드로 남는 쪽을 택했다.)
+const at = function at(index) {
+  const o = Object(this);
+  const len = Math.min(Math.max(Math.trunc(Number(o.length)) || 0, 0), Number.MAX_SAFE_INTEGER);
+  const rel = Math.trunc(Number(index)) || 0;
+  const k = rel >= 0 ? rel : len + rel;
+  return k < 0 || k >= len ? undefined : o[k];
+};
+for (const proto of [Array.prototype, String.prototype]) {
+  if (typeof proto.at !== 'function') Object.defineProperty(proto, 'at', { value: at, writable: true, configurable: true, enumerable: false });
+}

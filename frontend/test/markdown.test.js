@@ -202,3 +202,69 @@ test('그림 노드 판정은 닫는 }까지만 보지 않고, 따옴표 친 키
   assert.strictEqual(rawLinkTarget('  https://ex.test/x  ').url, 'https://ex.test/x');
   assert.strictEqual(rawLinkTarget(' \tjavascript:alert(1)').url, '');
 });
+
+test('흐름도 설정·그림 노드 판정은 mermaid가 해독하는 이스케이프(JSON \\u·YAML \\x·CSS \\75)를 풀고 본다', () => {
+  // 원문 글자만 보던 동안에는 아래 표기 전부가 검사를 지나 같은 출처 요청을 냈다(화면 재현으로 확인).
+  // 지시문의 값은 JSON이 \u0075를 u로, 그 값이 <style>에 들어간 뒤에는 CSS가 \75·\r을 u·r로 푼다.
+  assert.ok(mermaidFetchesViaStyle('%%{init: {"fontFamily": "x; background-image: \\u0075rl(/p.png)"}}%%\nflowchart LR\n A-->B'));
+  assert.ok(mermaidFetchesViaStyle('%%{init: {"fontFamily": "x; background-image: \\\\75rl(/p.png)"}}%%\nflowchart LR'));
+  assert.ok(mermaidFetchesViaStyle('%%{init: {"fontFamily": "x; background-image: \\\\75 rl(/p.png)"}}%%\nflowchart LR'), 'CSS 이스케이프 뒤의 공백 하나는 이스케이프의 일부다');
+  assert.ok(mermaidFetchesViaStyle('%%{init: {"fontFamily": "x; background-image: u\\\\rl(/p.png)"}}%%\nflowchart LR'), 'CSS는 \\r을 r로 읽는다');
+  assert.ok(mermaidFetchesViaStyle('%%{init: {"fontFamily": "x; background-image: \\u005c75rl(/p.png)"}}%%\nflowchart LR'), '겹쳐 쓴 이스케이프(\\u005c → \\, 그다음 \\75 → u)');
+  // url() 말고도 그림을 불러오는 CSS 함수가 있다
+  assert.ok(mermaidFetchesViaStyle('%%{init: {"fontFamily": "x; background-image: image-set(\\"/p.png\\" 1x)"}}%%\nflowchart LR'));
+  assert.ok(mermaidFetchesViaStyle('%%{init: {"fontFamily": "x; background-image: -webkit-image-set(\\"/p.png\\" 1x)"}}%%\nflowchart LR'));
+  assert.ok(mermaidFetchesViaStyle('%%{init: {"fontFamily": "x; background-image: IMAGE-SET(\\"/p.png\\" 1x)"}}%%\nflowchart LR'));
+  // 머리말은 YAML이 \x75·\u0075를 푼다
+  assert.ok(mermaidFetchesViaStyle('---\nconfig:\n  fontFamily: "x; background-image: \\x75rl(/p.png)"\n---\nflowchart LR'));
+  assert.ok(mermaidFetchesViaStyle('---\nconfig:\n  themeCSS: "svg{background:\\u0075rl(/p.png)}"\n---\nflowchart LR'));
+  // 설정 자리의 경계는 mermaid처럼 원문에서 잡는다 — 해독한 뒤에 잡으면 값 안의 \u007d%%가 닫는 표시가 되어 뒤의 url(이 검사 밖으로 나간다
+  assert.ok(mermaidFetchesViaStyle('%%{init: {"fontFamily": "\\u007d%% ; background:url(/p.png)"}}%%\nflowchart LR'));
+  // 그림 노드의 키도 YAML이 푼다
+  assert.ok(mermaidLoadsImage('flowchart LR\n  A@{ "\\x69mg": "/p.png", label: "x" } --> B'));
+  assert.ok(mermaidLoadsImage('flowchart LR\n  A@{ "\\u0069mg": "/p.png" } --> B'));
+  assert.ok(mermaidLoadsImage("flowchart LR\n  A@{ '\\x69mg': '/p.png' } --> B"), '홑따옴표 YAML은 풀지 않지만 넓게 잡는다 — 그리지 않는 쪽으로만 틀린다');
+  // 평범한 설정·라벨은 여전히 그린다 (해독이 있는 것을 없다고 하지 않는다)
+  assert.ok(!mermaidFetchesViaStyle('%%{init: {"theme": "dark", "themeVariables": {"fontFamily": "Pretendard, \\"Noto Sans KR\\", sans-serif", "primaryColor": "#f00"}}}%%\nflowchart LR\n A[url(x) 라벨]-->B'));
+  assert.ok(!mermaidLoadsImage('flowchart LR\n  A@{ shape: rect, label: "\\x69mg 없음" } --> B'));
+  assert.ok(!mermaidLoadsImage('flowchart LR\n  A["\\x69mg: 라벨"] --> B'));
+});
+
+// 되찾는 정규식은 `@{`·`%%{`가 되풀이되는 퇴화한 원문에서 '되풀이 수 × 길이'였다(실측: 답변 상한 안에서 43ms·152ms, 길이 두 배에 네 배).
+test('흐름도 판정 둘은 원문이 아무리 퇴화해도 비용이 길이에 비례한다 — 답은 그대로다', () => {
+  const ratio = (fn, unit) => { const ms = n => { const t0 = performance.now(); fn(unit.repeat(n)); return performance.now() - t0; }; ms(2000); const one = Math.max(0.5, ms(4000)); return [one, ms(16000) / one]; };
+  for (const [name, fn, unit] of [['mermaidLoadsImage', mermaidLoadsImage, 'A@{ } '], ['mermaidFetchesViaStyle', mermaidFetchesViaStyle, '%%{ ']]) {
+    const [one, r] = ratio(fn, unit);
+    assert.ok(r < 8, `${name}: 길이가 4배인데 비용이 ${r.toFixed(1)}배다 (${one.toFixed(1)}ms)`);
+  }
+  // 답은 되찾는 정규식과 같다: 첫 `@{` 뒤 어디든 img 키가 오면 그림이고, 앞에 오면 아니다
+  assert.ok(mermaidLoadsImage('A@{ } '.repeat(50) + '@{ label: "x", img: "/p.png" }'));
+  assert.ok(!mermaidLoadsImage('img: "/p.png"\n' + 'A@{ } '.repeat(50)));
+  // 닫히지 않은 지시문도 자리다 — mermaid의 directiveRegex는 닫는 `}%%`를 선택으로 두어, 문서 끝에 `}%%` 없이 둔
+  // 지시문이 JSON만 성립하면 적용된다(실측: 그 한 줄로 요청이 나갔다. `}%%`를 요구하던 앞선 판정이 놓친 자리다).
+  assert.ok(mermaidFetchesViaStyle('flowchart LR\n A-->B\n%%{init: {"fontFamily": "url(/p.png)"}'));
+  assert.ok(mermaidFetchesViaStyle('%%{init: {"fontFamily": "url(/p.png)"}}\nflowchart LR\n A-->B'));
+  // 자리는 겹칠 수 있다 — 앞의 빈 지시문이 첫 `}%%`를 차지해도 뒤의 지시문을 놓치지 않는다
+  assert.ok(mermaidFetchesViaStyle('%%{}%%{init: {"fontFamily": "url(/p.png)"}}%%\nflowchart LR'));
+  assert.ok(!mermaidFetchesViaStyle('%%{init: {"theme": "dark"}}%%\nflowchart LR\n A[url(x)]-->B\n%%{wrap}%%'));
+  assert.ok(mermaidFetchesViaStyle('%%{ }%%'.repeat(50) + '%%{init: {"fontFamily": "url(/p.png)"}}%%\nflowchart LR'));
+  assert.ok(!mermaidFetchesViaStyle('%%{init: {"theme": "dark"}}%%\nflowchart LR\n A[url(x)]-->B'));
+});
+
+// 머리말의 경계는 mermaid의 frontMatterRegex를 따라야 한다. `---\r?\n`만 보던 동안에는 아래 네 모양의 머리말이 검사를
+// 지나 같은 출처 요청을 냈다(화면 재현으로 확인): 여는 `---` 뒤의 공백·탭, 들여쓴 머리말, 홀로 선 \r 줄바꿈.
+test('흐름도 머리말 판정은 mermaid가 받는 모양을 모두 받는다 — 여는 --- 뒤 공백·탭, 들여쓰기, CR 줄바꿈', () => {
+  const cfg = 'config:\n  fontFamily: "x; background-image: url(/p.png)"';
+  assert.ok(mermaidFetchesViaStyle(`--- \n${cfg}\n---\nflowchart LR\n A-->B`));
+  assert.ok(mermaidFetchesViaStyle(`---\t\n${cfg}\n---\nflowchart LR\n A-->B`));
+  assert.ok(mermaidFetchesViaStyle(`  ---\n${cfg.replace(/^/gm, '  ')}\n  ---\nflowchart LR\n A-->B`));
+  assert.ok(mermaidFetchesViaStyle(`---\r${cfg.replace(/\n/g, '\r')}\r---\rflowchart LR\r A-->B`));
+  assert.ok(mermaidFetchesViaStyle(`---\r\n${cfg.replace(/\n/g, '\r\n')}\r\n---\r\nflowchart LR`));
+  assert.ok(mermaidFetchesViaStyle(`---\n\n${cfg}\n---\nflowchart LR`), '여는 --- 뒤의 빈 줄');
+  assert.ok(mermaidFetchesViaStyle(`---\n${cfg}\n---  \nflowchart LR`), '닫는 --- 뒤의 공백');
+  // 들여쓰기가 다른 `---`는 닫는 줄이 아니다 — 그것을 닫는 줄로 읽으면 뒤의 진짜 설정이 검사 밖으로 나간다
+  assert.ok(mermaidFetchesViaStyle(`---\nconfig:\n  theme: dark\n ---\n${cfg}\n---\nflowchart LR`));
+  // 라벨의 url(은 여전히 그린다 — 머리말은 문서 첫머리에서만 시작한다
+  assert.ok(!mermaidFetchesViaStyle(`---\ntitle: 제목\n---\nflowchart LR\n A[url(x)]-->B`));
+  assert.ok(!mermaidFetchesViaStyle(`flowchart LR\n A-->B\n---\n${cfg}\n---`), '첫머리가 아닌 ---는 머리말이 아니다');
+});

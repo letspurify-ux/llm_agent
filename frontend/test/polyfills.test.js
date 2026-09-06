@@ -83,3 +83,30 @@ test('진입점은 무엇보다 먼저 폴리필을 읽는다 (main.jsx)', async
   assert.ok(imports.length > 1, '진입점에 import가 없다 (검사의 전제)');
   assert.match(imports[0], /polyfills\.js/, `첫 import가 폴리필이 아니다: ${imports[0]}`);
 });
+
+test('폴리필의 Array·String.prototype.at은 명세와 같다 — 뒤에서 세고, 범위 밖은 undefined, 원래 있으면 손대지 않는다', async () => {
+  // mermaid가 클래스·상태·ER 다이어그램과 markdown 라벨의 파서에서 부른다 — 없는 브라우저(Chrome 87~91·Safari 14~15.3)에서는
+  // 그 종류만 원문 코드로 남아 한 답변 안에서 그림이 종류에 따라 되고 안 되고가 갈렸다(실측).
+  const got = await inChild(`
+    delete Array.prototype.at; delete String.prototype.at;
+    const before = [typeof [].at, typeof ''.at];
+    await import('./src/polyfills.js');
+    const a = ['x', 'y', 'z'];
+    const cases = {
+      before, after: [typeof [].at, typeof ''.at],
+      first: a.at(0), last: a.at(-1), secondLast: a.at(-2), out: String(a.at(3)), outNeg: String(a.at(-4)),
+      frac: a.at(1.7), nan: a.at('nope'), str: '가🙂'.at(-1) === '\\uDE42', strFirst: 'abc'.at(0), strOut: String('abc'.at(5)),
+      arrayLike: Array.prototype.at.call({ length: 2, 0: 'p', 1: 'q' }, -1),
+      enumerable: Object.prototype.propertyIsEnumerable.call(Array.prototype, 'at') || Object.prototype.propertyIsEnumerable.call(String.prototype, 'at'),
+    };
+    const marker = function () { return 'native'; }; Array.prototype.at = marker;
+    await import('./src/polyfills.js?again');
+    cases.keepsExisting = Array.prototype.at === marker;
+    process.stdout.write(JSON.stringify(cases));
+  `);
+  assert.deepStrictEqual(got, {
+    before: ['undefined', 'undefined'], after: ['function', 'function'],
+    first: 'x', last: 'z', secondLast: 'y', out: 'undefined', outNeg: 'undefined', frac: 'y', nan: 'x', str: true, strFirst: 'a', strOut: 'undefined',
+    arrayLike: 'q', enumerable: false, keepsExisting: true,
+  });
+});

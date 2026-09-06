@@ -5,7 +5,7 @@
 // 미설정은 실패가 아니라 설정상의 선택이므로 호출부가 isEmbeddingEnabled()로 먼저 갈라낸다
 // (다만 그 구성에서는 검색이 성립하지 않는다 — search.js 머리말).
 // 모델명은 embed-sync의 embed_hash에도 들어간다(모델 교체 시 자동 재임베딩) — 한 곳에서만 정의한다
-import { warnOnce, joinUrl, readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_UPSTREAM_ERROR_BYTES } from './constants.js';
+import { warnOnce, joinUrl, readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_UPSTREAM_ERROR_BYTES, errorText } from './constants.js';
 
 export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'bge-m3';
 
@@ -42,13 +42,17 @@ export function warnEmbeddingFailure(e) {
 // 타임아웃만 있으면 종료 시각과 무관하게 최대 60초를 더 기다려야 하는데, 그동안 embed-sync가
 // GET_LOCK 전용 커넥션을 쥐고 있어 closePool()이 끝나지 않고 종료가 강제 타이머로 밀린다
 // (server.js shutdown, embed-sync requestSyncStop 주석).
-// AbortSignal.any는 Node 20.3+에만 있어 쓰지 않는다 — 이 저장소는 engines 제약이 없어
-// Node 18에서도 뜨고, 거기서는 그 한 줄이 모든 임베딩을 TypeError로 죽인다.
+// AbortSignal.any는 Node 20.3+에만 있어 쓰지 않는다 — 이 저장소의 하한은 Node 20.0이고(package.json engines;
+// mariadb 커넥터가 그 아래에서는 로드조차 거부한다 — Node 18로 띄우면 'please upgrade node'로 기동이 죽는다,
+// 실측), 20.0~20.2에서는 그 한 줄이 모든 임베딩을 TypeError로 죽인다.
 export async function embed(texts, signal) {
   const base = process.env.EMBEDDING_URL;
   if (!base) throw new EmbeddingError('EMBEDDING_URL이 설정되지 않았습니다', false);
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+  // 우리가 끊은 이유를 남긴다 — AbortError의 message는 'This operation was aborted'뿐이라, 그대로 로그에 실리면
+  // 임베딩 서버가 60초 동안 답하지 않은 것(모델 콜드 로드·과부하)인지 다른 실패인지 알 수 없다 (llm-openai.js의 why와 같다).
+  let why = null;
+  const timer = setTimeout(() => { why = `임베딩 응답이 ${Math.round(TIMEOUT_MS / 1000)}초 안에 끝나지 않았습니다`; ctl.abort(); }, TIMEOUT_MS);
   const onAbort = () => ctl.abort();
   if (signal?.aborted) ctl.abort();
   else signal?.addEventListener('abort', onAbort, { once: true });
@@ -82,10 +86,13 @@ export async function embed(texts, signal) {
     return vectors;
   } catch (e) {
     if (e instanceof EmbeddingError) throw e;
+    // 우리 타이머가 끊은 것은 그 이유로 말한다 (외부 signal의 중단은 호출부가 stopRequested로 가려낸다).
+    if (why && (e?.name === 'AbortError' || ctl.signal.aborted)) throw new EmbeddingError(why, true);
     // fetch 자체가 던진 것 — 접속 실패·타임아웃·중단. 서버에 닿지 못했으므로 재시도 대상이다.
     // 본문이 상한을 넘어 끊은 것(tooLarge)만 예외다: 같은 입력에 같은 응답이 돌아오므로
     // 재시도해도 결과가 같고, 호출부(embed-sync)는 그 행을 갈라내야 한다.
-    throw new EmbeddingError(e.message, !e.tooLarge);
+    // 문구는 원인 사슬까지 편다 — fetch의 message는 접속 거부든 DNS 실패든 'fetch failed'뿐이다 (constants.errorText).
+    throw new EmbeddingError(errorText(e), !e.tooLarge);
   } finally {
     // 타이머와 리스너를 반드시 건다 — 남겨두면 타이머가 이벤트 루프를 붙잡아 CLI(npm run embed)의
     // 종료가 최대 60초 늦어지고, 리스너는 signal이 살아 있는 동안 호출 수만큼 쌓인다.

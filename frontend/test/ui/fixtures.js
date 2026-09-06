@@ -2,7 +2,7 @@
 // 같은 것을 봐야 하므로 JSX가 없는 이 파일에 둔다 — 재는 쪽이 픽스처를 눈대중으로 베껴 적으면,
 // 픽스처를 고친 날 검사는 조용히 다른 것을 재게 된다.
 import { MAX_PIE_SLICES, MAX_CHARTS_PER_MESSAGE, MAX_SERIES, MAX_NAME_LEN, MAX_LABEL_LEN, MAX_TITLE_LEN,
-  CHART_FENCE_RE } from '../../src/chart.js';
+  chartFences } from '../../src/chart.js';
 import { stepLabel, searchLabel, traceSummary } from '../../src/trace.js';
 
 // 원그래프 조각 수의 상한을 늘 넘겨 둔다 — '기타'로 모으는 길이 실제로 밟힌다. 정해진 목록을
@@ -120,6 +120,22 @@ export const CASES = {
   mermaidstyle: ['```mermaid',
     '%%{init: {"themeCSS": ".node rect { background: url(/__probe-pixel.png?t=8) }", "fontFamily": "x; background-image: url(/__probe-pixel.png?g=9)"}}%%',
     'flowchart LR', '  A[하나] --> B[둘]', '```'].join('\n'),
+  // 흐름도 설정·그림 노드의 이스케이프 우회. mermaid는 지시문을 JSON으로, 머리말·노드 속성을 YAML로, 그 값을 다시 CSS로
+  // 해독하므로 원문 글자만 보던 검사(markdown.js)를 '\u0075rl('·'\75rl('·image-set(·"\x69mg"가 지나 요청이 나갔다(실측).
+  // 아홉 블록 모두 그리지 않고 원문 코드가 남아야 한다.
+  mermaidescape: [
+    '```mermaid', '%%{init: {"fontFamily": "x; background-image: \\u0075rl(/__probe-pixel.png?u=1)"}}%%', 'flowchart LR', '  A --> B', '```', '',
+    '```mermaid', '%%{init: {"fontFamily": "x; background-image: \\\\75rl(/__probe-pixel.png?u=2)"}}%%', 'flowchart LR', '  A --> B', '```', '',
+    '```mermaid', '%%{init: {"fontFamily": "x; background-image: image-set(\\"/__probe-pixel.png?u=3\\" 1x)"}}%%', 'flowchart LR', '  A --> B', '```', '',
+    '```mermaid', '---', 'config:', '  fontFamily: "x; background-image: \\x75rl(/__probe-pixel.png?u=4)"', '---', 'flowchart LR', '  A --> B', '```', '',
+    '```mermaid', 'flowchart LR', '  A@{ "\\x69mg": "/__probe-pixel.png?u=5", label: "그림", w: 60, h: 60 } --> B', '```', '',
+    // 닫는 `}%%` 없이 문서 끝에 둔 지시문 — mermaid는 JSON만 성립하면 적용한다(실측: 이 한 줄로 요청이 나갔다)
+    '```mermaid', 'flowchart LR', '  A --> B', '%%{init: {"fontFamily": "x; background-image: url(/__probe-pixel.png?u=6)"}', '```', '',
+    // 머리말의 여는 `---` 뒤 공백·들여쓴 머리말·홀로 선 \r 줄바꿈 — mermaid는 셋 다 받는다(실측: 셋 다 요청이 나갔다)
+    '```mermaid', '--- ', 'config:', '  fontFamily: "x; background-image: url(/__probe-pixel.png?u=7)"', '---', 'flowchart LR', '  A --> B', '```', '',
+    '```mermaid', '  ---', '  config:', '    fontFamily: "x; background-image: url(/__probe-pixel.png?u=8)"', '  ---', 'flowchart LR', '  A --> B', '```', '',
+    '```mermaid', '---\rconfig:\r  fontFamily: "x; background-image: url(/__probe-pixel.png?u=9)"\r---\rflowchart LR\r  A --> B', '```',
+  ].join('\n'),
   pielong: pieOf(PIE_LONG_NAMES),
   pieshort: pieOf(PIE_SHORT_NAMES),
   // 조회 결과의 셀·열 이름이 그대로 차트의 이름이 되는 답변. 그 길이를 묶지 않으면 툴팁 상자가 그만큼
@@ -143,6 +159,9 @@ export const CASES = {
   footnote: ['본문에 각주가 있습니다[^1].', '', '[^1]: 각주 내용입니다.'].join('\n'),
   // 눕힌 막대(범주 13개 이상, Chart.jsx HORIZONTAL_FROM)와 세로 막대 한 벌 — 툴팁이 마우스 자리의 행을 맞게
   // 찾는지 두 방향 모두에서 본다. 눕힌 쪽은 범주 축이 YAxis(yAxisId="left")라 툴팁이 축을 따로 받아야 한다.
+  // mermaid의 클래스 다이어그램 파서는 Array.prototype.at을 부른다 — 그 API가 없는 브라우저(빌드 타깃 안의 Chrome 87~91·
+  // Safari 14~15.3)에서 흐름도는 그려지는데 이것만 원문 코드로 남았다(실측). src/polyfills.js가 채운다.
+  classdiagram: ['```mermaid', 'classDiagram', '  class Animal {', '    +String name', '    +speak()', '  }', '  Animal <|-- Dog', '```'].join('\n'),
   bars: ['```chart', 'type: bar', 'title: 눕힌 막대', '| 항목 | 값 |', '|---|---|',
     ...Array.from({ length: 15 }, (_, i) => `| 항목${i + 1} | ${(i * 37) % 90 + 10} |`), '```', '',
     '```chart', 'type: bar', 'title: 세로 막대', '| 항목 | 값 |', '|---|---|',
@@ -190,10 +209,10 @@ export const ERROR_LABEL = stepLabel(TRACE.find(t => t.error));
 // 검사는 반쯤 그려진 화면을 재게 되므로, 답변을 가진 이 파일이 직접 낸다.
 // 그리는 차트 수는 블록 수가 아니라 한 답변의 예산까지 본다(App.jsx ChartBlock) — 예산을 넘겨
 // 픽스처를 늘린 날, 오지 않을 다섯 번째 차트를 기다리다 검사가 통째로 시간 초과로 죽지 않게.
-// 차트 블록은 앱이 쓰는 그 정규식으로 센다(CHART_FENCE_RE) — 여기서 '```chart' 한 줄로 다시 적으면
+// 차트 블록은 앱이 쓰는 그 탐색으로 센다(chartFences) — 여기서 '```chart' 한 줄로 다시 적으면
 // 앱이 차트로 받는 것(들여쓴 펜스, ```chart 뒤의 덧말)을 검사만 못 알아본다. 그러면 마지막 차트가
 // 아직 서는 중에 '다 그려졌다'가 되어, 뒤의 검사들이 자라는 화면을 6px로 재며 애먼 자리를 탓한다.
-const 그릴차트수 = Math.min((CASES.rich.match(CHART_FENCE_RE) ?? []).length, MAX_CHARTS_PER_MESSAGE);
+const 그릴차트수 = Math.min(chartFences(CASES.rich).blocks.length, MAX_CHARTS_PER_MESSAGE);
 // 주소로 찾는 선택자. 따옴표를 직접 붙이면 주소에 따옴표가 하나만 섞여도 페이지 안에서 문법 오류가
 // 되어, 기다리는 대신 낯선 SyntaxError로 죽는다 (driver.mjs goto·ui.test.mjs seen과 같은 규칙).
 export const 주소를_가리키는_링크 = url => JSON.stringify(`.md a[href=${JSON.stringify(url)}]`);
@@ -209,6 +228,7 @@ export const READY = {
   // 그리지 않는 것이 맞는 답이다 — 원문 코드가 선 것으로 '다 그려졌다'를 안다
   mermaidimg: `document.querySelector('.bubble.assistant pre code')`,
   mermaidstyle: `document.querySelector('.bubble.assistant pre code')`,
+  mermaidescape: `document.querySelectorAll('.bubble.assistant pre code').length === 9`,
   wideprint: `document.querySelector('.md table')`,
   pielong: `document.querySelector('figure.chart .recharts-pie-sector')`,
   pieshort: `document.querySelector('figure.chart .recharts-pie-sector')`,
@@ -219,6 +239,7 @@ export const READY = {
     && [...document.querySelectorAll('figure.chart')].every(f => f.querySelector('.recharts-wrapper svg'))`,
   longtitle: `document.querySelector('figure.chart .recharts-surface') && document.querySelector('.md strong')`,
   footnote: `document.querySelector('.md .footnotes')`,
+  classdiagram: `document.querySelector('.mermaid svg')`,
   bars: `document.querySelectorAll('figure.chart').length === 2 && [...document.querySelectorAll('figure.chart')].every(f => f.querySelector('.recharts-bar-rectangle .recharts-rectangle'))`,
   // 차트가 서고 '표로 보기'의 표까지 붙은 뒤라야 셀 안의 그림을 볼 수 있다(접혀 있어도 DOM에는
   // 있고, 브라우저는 접힌 <details> 안의 <img>도 불러온다).

@@ -1111,3 +1111,59 @@ test('시스템 프롬프트가 본문 청구와 버리기를 설명한다', asy
   assert.match(sys, /답변에 옮겨 적지 마라/, '자료 번호가 답변으로 새지 않게 막아야 한다');
   assert.match(sys, /drop:/);
 });
+
+// ===== 상류가 HTTP 200 '뒤에' 실어 보내는 오류 =====
+// 스트림은 헤더가 먼저 나가므로 생성 도중의 실패는 상태 코드로 올 수 없다 — OpenRouter는 `data: {"error":…}`
+// 이벤트나 choices[0].error(finish_reason=error)로 보내고, 프록시에 따라 200에 JSON 오류 본문으로도 온다.
+// 네 모양 모두 빈 본문이 되어 '결정 없음(length=0)'으로만 남았다 — 그 로그는 모델의 출력 형식을 가리키므로
+// 운영자는 제공자 장애를 의심할 수 없었다(실측). 사용자 문구(폴백)는 그대로이고, 로그에 원인이 남는 것이 이 검사다.
+test('상류가 HTTP 200 뒤에 실어 보낸 오류는 문구가 로그에 남고 HTTP 오류와 같은 길(재시도 → null)을 탄다', async () => {
+  const warns = [];
+  const orig = console.warn;
+  console.warn = (...a) => warns.push(a.join(' '));
+  try {
+    // ① 최상위 error 이벤트 (OpenRouter의 중도 실패) — 본문 없음
+    globalThis.fetch = async () => sse([': OPENROUTER PROCESSING\n\n', data({ error: { message: 'Provider X is down', code: 502 } }), 'data: [DONE]\n\n']);
+    assert.equal(await openaiDecide(CTX), null);
+    assert.ok(warns.some(l => /call failed/.test(l) && /502: Provider X is down/.test(l)), JSON.stringify(warns));
+    assert.ok(!warns.some(l => /no decision JSON found/.test(l)), '원인이 있는 실패를 형식 오류로 보고했다: ' + JSON.stringify(warns));
+    warns.length = 0;
+    // ② choices[0].error + finish_reason=error — 본문 일부가 먼저 왔다. 잘린 본문은 파싱에 실패하고, 그 앞에 원인이 남는다
+    globalThis.fetch = async () => sse([delta('{"action":"ans'), data({ choices: [{ delta: {}, finish_reason: 'error', error: { message: 'upstream failed mid-stream' } }] }), 'data: [DONE]\n\n']);
+    assert.equal(await openaiDecide(CTX), null);
+    assert.ok(warns.some(l => /upstream reported an error/.test(l) && /upstream failed mid-stream/.test(l)), JSON.stringify(warns));
+    warns.length = 0;
+    // ③ 오류 객체 없이 finish_reason=error만 온 경우도 오류다
+    globalThis.fetch = async () => sse([data({ choices: [{ delta: {}, finish_reason: 'error' }] }), 'data: [DONE]\n\n']);
+    assert.equal(await openaiDecide(CTX), null);
+    assert.ok(warns.some(l => /call failed/.test(l) && /finish_reason=error/.test(l)), JSON.stringify(warns));
+    warns.length = 0;
+    // ④ 스트림이 아닌 JSON 본문의 오류 (HTTP 200)
+    globalThis.fetch = async () => 응답({ error: { message: 'bad gateway (json body)', code: 502 } });
+    assert.equal(await openaiDecide(CTX), null);
+    assert.ok(warns.some(l => /call failed/.test(l) && /502: bad gateway \(json body\)/.test(l)), JSON.stringify(warns));
+    warns.length = 0;
+    // ⑤ 결정이 온전히 끝난 뒤에 붙은 오류 이벤트 — 정당한 결정을 잃지 않는다 (경고만 남긴다)
+    globalThis.fetch = async () => sse([delta('{"action":"answer","answer":"완성"}'), data({ error: { message: 'late error' } }), 'data: [DONE]\n\n']);
+    assert.deepStrictEqual(await openaiDecide(CTX), { action: 'answer', answer: '완성' });
+    assert.ok(warns.some(l => /late error/.test(l)), JSON.stringify(warns));
+    // ⑥ 문구는 상한 안에서만 남긴다 — 오류 본문이 아무리 커도 로그 한 줄이다 (HTTP 오류 본문의 300자와 같다)
+    warns.length = 0;
+    globalThis.fetch = async () => sse([data({ error: { message: 'x'.repeat(5000) } }), 'data: [DONE]\n\n']);
+    assert.equal(await openaiDecide(CTX), null);
+    assert.ok(warns.every(l => l.length < 600), '오류 문구가 잘리지 않았다');
+  } finally { console.warn = orig; }
+});
+
+test('LLM 접속 실패는 fetch failed 뒤에 원인(접속 거부·DNS)이 로그에 남는다', async () => {
+  // undici는 접속 거부·DNS·TLS 실패를 전부 'fetch failed'로 던지고 원인은 cause에만 둔다 — message만 남기면
+  // 'vLLM이 내려갔다'와 'LLM_BASE_URL 오타'가 같은 한 줄이 된다 (실측). 사용자 문구(폴백)는 그대로다.
+  const warns = [];
+  const orig = console.warn;
+  console.warn = (...a) => warns.push(a.join(' '));
+  try {
+    globalThis.fetch = async () => { throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:8000'), { code: 'ECONNREFUSED' }) }); };
+    assert.equal(await openaiDecide(CTX), null);
+    assert.ok(warns.some(l => /call failed/.test(l) && /ECONNREFUSED 127\.0\.0\.1:8000/.test(l)), JSON.stringify(warns));
+  } finally { console.warn = orig; }
+});

@@ -6,7 +6,7 @@
 // 대화 맥락(chat)은 서버가 저장하지 않고 클라이언트가 매 요청에 실어 보낸다 (stateless 유지).
 import { searchKnowledge, searchQaMethods, searchQueries } from './search.js';
 import { loadQueriesByNames, loadQueriesMentionedIn, loadChunkRanges } from './db.js';
-import { canGrow, buildItems } from './chunk.js';
+import { canGrow, buildItems, CHUNK_TARGET_LEN, CHUNK_OVERLAP } from './chunk.js';
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
 import { llm, renderAnswer, clipAnswer } from './llm.js';
@@ -281,13 +281,23 @@ export function mergeFront(list, rows) {
 }
 
 // 청크 항목의 범위를 문서당 상한(MAX_DOC_LEN)까지 넓힌다 — 본문 청구(expand)의 실제 동작.
-// 읽어올 창은 현재 범위의 앞뒤 WINDOW개다. 문서 전체를 읽지 않는 이유: 문서는 수백 청크일 수 있고,
+// 읽어올 창은 현재 범위의 앞뒤 GROW_WINDOW개다. 문서 전체를 읽지 않는 이유: 문서는 수백 청크일 수 있고,
 // 상한(MAX_DOC_LEN)을 넘는 것은 어차피 버린다. 창은 한쪽만으로도 상한을 채울 만큼 잡는다 — 문서 끝에
-// 걸린 적중은 한쪽으로만 넓힐 수 있는데, 상한을 채우기 전에 창이 먼저 바닥나면 모델은 '더 있는데 안
-// 준다'를 보고 같은 번호를 다시 청구해 MAX_EXPANDS 하나를 더 태운다. 12 × 900자(CHUNK_TARGET_LEN) = 10,800 ≥ 10,000.
-// 청크가 작을 때(문서 끝의 짧은 조각)의 여유도 같은 자리다.
+// 걸린 적중은 한쪽으로만 넓힐 수 있는데, 상한을 채우기 전에 창이 먼저 바닥나면 이웃을 읽지 못해 full을
+// 확정할 수 없고(chunk.js buildItems), 번호가 남은 항목을 모델이 다시 청구하면 그 청구는 한 글자도 늘리지
+// 못한 채 MAX_EXPANDS 하나와 왕복 하나를 태운다.
+//
+// 조각 하나의 순증은 CHUNK_TARGET_LEN이 아니라 CHUNK_TARGET_LEN − CHUNK_OVERLAP이다 — 이어 붙일 때 이음매마다
+// 겹침을 떼기 때문이다(chunk.js cutSeam). 12로 두고 "12 × 900 = 10,800 ≥ 10,000"으로 세던 동안 실제로는 13조각
+// 9,900자에서 창이 바닥났다: 14번째 조각을 읽지 않았으니 '들어가지 않는다'를 알 수 없어 full이 서지 않고 번호가
+// 남았고, 두 번째 청구가 그 조각을 읽어 보고서야 '더 넓힐 수 없다'로 끝났다(실측 — 합성 900자 청크와 마크다운
+// 문단 문서의 실제 분할(평균 866자) 모두). 1,000자 청크에서만 우연히 창이 맞았다(11조각 9,500자 + 12번째 읽힘).
+// 그래서 상수에서 파생한다: 첫 조각 뒤로 창을 채우는 데 드는 조각 수, +1은 상한에 들어가지 않는 첫 이웃까지
+// 읽어 그 자리에서 full을 확정하기 위한 것, +1은 목표보다 조금 짧은 조각의 여유다(짧을수록 순증이 준다 —
+// 800자면 650자). 그보다 훨씬 짧은 조각(경계를 못 찾아 540자까지 내려간 문서)은 두 번째 청구가 이어받는다.
 // 실패하면 null을 돌려 호출부가 '진도 없음'으로 처리하게 한다 (요청을 버리지 않는다).
-const GROW_WINDOW = 12;
+// (테스트에서 쓰므로 export 한다)
+export const GROW_WINDOW = Math.ceil((MAX_DOC_LEN - CHUNK_TARGET_LEN) / (CHUNK_TARGET_LEN - CHUNK_OVERLAP)) + 2;
 // 계측에 남길 지식 적중 수 (검색 한 번당). chat_log의 trace가 요청마다 커지지 않게 상위만 센다.
 const TOP_TRACE = 5;
 
@@ -357,9 +367,14 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
   // '누락됨'을 가르는 이유가 정확히 그것인데, 검색 불가를 '없음' 쪽에 세우면 그 구분이 뒤집힌다.
   // tried는 '한 번이라도 찾아봤는가'다 — '아직 아무것도 안 찾아봤다'는 안내를 붙일지만 가른다(검색이
   // 성립하지 않아 섹션이 없는 요청에 '먼저 찾으라'고 다시 말하면 남은 검색 기회를 그대로 태운다).
+  // canExpand: 이 요청에 청구 기회가 남았는가. 프롬프트가 이 값으로 청구 번호를 통째로 뗀다(llm-openai.js itemLine) —
+  // 성공한 청구는 이력에 남지 않으므로(applyExpand) 모델은 자기가 상한(MAX_EXPANDS)을 다 썼다는 사실을 프롬프트
+  // 어디에서도 볼 수 없다. 번호가 그대로 남아 있던 동안 모델은 시스템 프롬프트의 '번호가 붙어 있으면 청구할 수
+  // 있다'를 따라 셋째 문서를 청구했고, 받은 것은 '상한에 닿았다'는 안내와 헛돈 스텝 하나였다(퍼징으로 잡았다 —
+  // 두 번이면 강제 답변). '청구할 수 있는 자리에만 번호가 보인다'(context.md 2-3)가 상한에서만 깨져 있던 셈이다.
   const ctx = () => ({
     question, chat, knowledge, qaMethods, queries, history,
-    searched: [...succeeded], tried: searched.size > 0,
+    searched: [...succeeded], tried: searched.size > 0, canExpand: expands < MAX_EXPANDS,
   });
   // 성공한 조회의 전체 행(≤MAX_ROWS). history에는 capRows로 자른 20행만 싣는다 — history는 프롬프트와
   // chat_log(steps)로 흘러가므로 거기에 전체를 실으면 둘이 함께 다섯 배 커진다.

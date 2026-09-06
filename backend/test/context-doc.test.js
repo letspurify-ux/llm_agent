@@ -117,3 +117,22 @@ test('이력 몫은 줄의 조합과 무관하게 검증된다', () => {
   assert.ok(!/MAX_SEARCHES \* \(maxSearchLineLen/.test(src2),
     '이력 몫 검증이 검색 줄을 MAX_SEARCHES개로 세고 있다 — 그 개수는 묶여 있지 않다');
 });
+
+// Node 하한 — 코드 주석이 'engines 제약이 없어 Node 18에서도 뜬다'고 전제하고 설계 판단을 했지만, 관리 DB 커넥터(mariadb)는
+// Node 20 아래에서 로드를 거부한다(실측: 'please upgrade node'로 기동 실패). 선언(package.json engines)이 의존성의 하한보다
+// 낮으면 그 거짓 전제가 되살아나고, README가 그 숫자를 말하지 않으면 운영자는 커넥터의 한 줄로 원인을 찾아야 한다.
+test('package.json의 Node 하한은 의존성의 하한 이상이고 README가 그 값을 말한다', () => {
+  const pkg = JSON.parse(readFileSync(join(ROOT, 'backend', 'package.json'), 'utf8'));
+  const floor = s => { const m = /(\d+)/.exec(String(s ?? '')); return m ? Number(m[1]) : 0; };
+  const ours = floor(pkg.engines?.node);
+  assert.ok(ours >= 20, `engines.node가 없거나 20보다 낮다: ${JSON.stringify(pkg.engines)}`);
+  for (const dep of Object.keys(pkg.dependencies)) {
+    const depPkg = JSON.parse(readFileSync(join(ROOT, 'backend', 'node_modules', dep, 'package.json'), 'utf8'));
+    const need = floor(depPkg.engines?.node);
+    assert.ok(need <= ours, `${dep}의 하한(${depPkg.engines?.node})이 우리 선언(${pkg.engines.node})보다 높다 — engines와 README를 올릴 것`);
+  }
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+  assert.ok(new RegExp(`Node\\.js \\*\\*${ours} 이상\\*\\*`).test(readme), `README가 Node ${ours} 이상을 말하지 않는다`);
+  // 코드 주석에 옛 전제가 남아 있으면 안 된다
+  for (const f of ['embedding.js', 'server.js']) assert.ok(!/engines 제약이 없어/.test(src(f)), `${f}: 'engines 제약이 없어'라는 옛 전제가 남아 있다`);
+});

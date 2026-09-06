@@ -5,10 +5,10 @@
 // 어느 쪽도 오류를 남기지 않아 로그로는 알 수 없다. 테스트가 유일한 방어선이다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { loopGuard, paramKey, normalizeChat, fallbackAnswer, normalizeQuestion, clippedCopyDetector, answerOf, handleQuestion, searchKey, mergeFront, MAX_GUARD_HITS } from '../src/agent.js';
-import { MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_ANSWER_LEN, MAX_RESULT_ROWS, MAX_RESULT_COLS, MAX_CELL_LEN, TRUNC_MARK, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_BATCH_QUERIES, MAX_EXPANDS, MAX_DOC_LEN, SEARCH_TARGETS } from '../src/constants.js';
+import { loopGuard, paramKey, normalizeChat, fallbackAnswer, normalizeQuestion, clippedCopyDetector, answerOf, handleQuestion, searchKey, mergeFront, MAX_GUARD_HITS, GROW_WINDOW } from '../src/agent.js';
+import { MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_ANSWER_LEN, MAX_RESULT_ROWS, MAX_RESULT_COLS, MAX_CELL_LEN, TRUNC_MARK, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_BATCH_QUERIES, MAX_EXPANDS, MAX_DOC_LEN, SEARCH_TARGETS, indentLines } from '../src/constants.js';
 import { buildPrompt } from '../src/llm-openai.js';
-import { buildItems, planRanges, canGrow, CHUNK_OVERLAP } from '../src/chunk.js';
+import { buildItems, planRanges, canGrow, CHUNK_OVERLAP, CHUNK_TARGET_LEN } from '../src/chunk.js';
 
 const ran = (name, params, rows = [{ A: 1 }]) => ({ query_name: name, params, rows, totalRows: rows.length });
 const failed = (name, params) => ({ query_name: name, params, error: 'ORA-00942' });
@@ -1121,6 +1121,38 @@ test('청구 상한을 넘으면 더 펼치지 않고 그 사실을 알린다', 
   } finally { restore(); }
 });
 
+// 성공한 청구는 이력에 남지 않으므로(위 테스트) 모델은 자기가 상한을 다 썼다는 사실을 프롬프트 어디에서도 볼 수 없다.
+// 그런데 항목 단위 판정(canGrow)만으로 번호를 붙이던 동안 상한을 다 쓴 뒤에도 남은 문서에 번호가 그대로 붙어,
+// 모델은 시스템 프롬프트의 '번호가 붙어 있으면 청구할 수 있다'를 따라 셋째 문서를 청구했고 받은 것은 '상한에
+// 닿았다'는 안내와 헛돈 스텝 하나였다(퍼징으로 잡았다 — 두 번이면 강제 답변). 버리기를 함께 적은 청구는 진도로
+// 세어져 그 안내조차 남지 않았다. '청구할 수 있는 자리에만 번호가 보인다'(context.md 2-3)는 상한에서도 서야 한다.
+test('청구 상한을 다 쓰면 남은 항목의 번호가 전부 사라진다 — 모델은 상한을 볼 수 없다', async () => {
+  const restore = silence();
+  try {
+    const seqs = Array.from({ length: MAX_EXPANDS + 1 }, (_, i) => i + 1);
+    const llm = scripted([
+      { action: 'search', text: 'x', targets: ['knowledge', 'qa_method'] },
+      ...seqs.slice(0, MAX_EXPANDS).map(seq => ({ action: 'expand', ids: [`k${seq}`] })),   // 한 번에 하나씩, 상한까지
+      { action: 'answer', answer: '답' },
+    ]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      search: async () => found({ knowledge: seqs.map(seq => LONG(seq, `K${seq}`)), qaMethods: [{ ...LONG(7, 'M7'), method: LONG(7, 'M7').content }] }) } });
+    assert.equal(r.answer, '답');
+    assert.equal(r.search.expanded, MAX_EXPANDS);
+    // 상한에 닿기 전까지는 번호가 붙는다 — 이 대조가 뜻을 가지려면 그래야 한다.
+    const before = buildPrompt(llm.seen.at(-2));
+    assert.match(before, /^- k\d+ \[/m, '상한 전인데 번호가 없다');
+    assert.match(before, /^- m7 \[/m, '상한 전인데 처리방법에 번호가 없다');
+    // 상한을 다 쓴 다음 프롬프트: 아직 펼치지 않은 지식(k3)·처리방법(m7)이 남아 있어도 번호가 하나도 없다.
+    const last = llm.seen.at(-1);
+    assert.equal(last.canExpand, false);
+    assert.ok(last.knowledge.some(k => !k.expanded), '이 시나리오는 아직 펼치지 않은 항목이 남아야 뜻이 있다');
+    const after = buildPrompt(last);
+    assert.doesNotMatch(after, /^- [km]\d+ \[/m, `상한을 다 썼는데 번호가 남았다:\n${after.split('\n').filter(l => /^- [km]\d+ /.test(l)).join('\n')}`);
+    assert.match(after, /^- \[K3/m, '번호만 떼고 항목은 그대로 실려야 한다');
+  } finally { restore(); }
+});
+
 test('버리기만 한 청구도 진도로 본다 — 자료가 달라졌다', async () => {
   const restore = silence();
   try {
@@ -1197,6 +1229,36 @@ test('청구로 넓힌 항목이 더 넓힐 수 없게 되면 번호가 사라�
     assert.ok(grown.content.length < MAX_DOC_LEN && grown.to < 22, '이 시나리오는 상한에 닿지 않고 범위 밖 청크가 남아야 뜻이 있다');
     assert.equal(grown.full, true, '다음 조각이 상한에 안 들어가면 더 받을 것이 없다');
     assert.match(firstItemLine(llm.seen.at(-1)), /^- \[문서1 /, '한 글자도 늘지 않을 항목에 번호가 남았다');
+  } finally { restore(); }
+});
+
+// 창(GROW_WINDOW)은 한쪽으로만 넓힐 수 있는 적중(문서 시작·끝)에서도 한 번의 청구로 문서 창을 채우고 full을 확정해야
+// 한다. "12 × 900 = 10,800 ≥ 10,000"으로 세던 동안 이음매의 겹침 제거(cutSeam)를 빼먹어 순증이 750자였고, 900자 청크에서
+// 첫 청구가 13조각 9,900자에서 창이 바닥나 14번째 조각을 읽지 못했다 — full이 서지 않아 번호가 남았고, 모델이 그 번호로
+// 다시 청구하면 한 글자도 늘지 않은 채 '더 넓힐 수 없다'로 끝났다(실측). 두 번째 청구 자체가 헛돈 왕복이다.
+test('문서 시작에 걸린 목표 크기 조각은 한 번의 청구로 창을 채우고 full이 확정된다 — 두 번째 청구가 헛돌지 않는다', async () => {
+  const restore = silence();
+  try {
+    for (const len of [900, 850, 1000]) {
+      const rows = Array.from({ length: 40 }, (_, i) => CH(1, i + 1, len, 40));
+      const [item] = buildItems(planRanges([{ doc_seq: 1, chunk_no: 1, _dist: 0.3, chunk_of: 40 }]), rows.filter(r => r.chunk_no <= 2));
+      assert.ok(canGrow(item) && item.to === 1, '이 시나리오는 문서 시작의 한 조각에 번호가 붙어야 뜻이 있다');
+      const llm = scripted([
+        { action: 'search', text: 'x', targets: ['knowledge'] },
+        { action: 'expand', ids: [`k${item.seq}`] },
+        { action: 'answer', answer: '답' },
+      ]);
+      const r = await handleQuestion('q', [], { deps: { decide: llm.decide, loadChunks: loaderOf(rows),
+        search: async () => found({ knowledge: [item] }) } });
+      assert.equal(r.search.expanded, 1);
+      const grown = llm.seen.at(-1).knowledge[0];
+      const shown = indentLines(grown.content).length;
+      assert.ok(shown <= MAX_DOC_LEN && shown > MAX_DOC_LEN - len, `${len}자 조각: 한 번의 청구가 창을 채우지 못했다 (${shown}/${MAX_DOC_LEN})`);
+      assert.equal(grown.full, true, `${len}자 조각: 창이 먼저 바닥나 full을 확정하지 못했다 — 다음 청구가 헛돈다`);
+      assert.match(firstItemLine(llm.seen.at(-1)), /^- \[문서1 /, `${len}자 조각: 늘릴 수 없는 항목에 번호가 남았다`);
+    }
+    // 창의 근거가 되는 식이 상수와 함께 움직인다 — 문서 창이나 청크 크기·겹침을 바꾸면 창도 따라 커진다.
+    assert.ok(GROW_WINDOW * (CHUNK_TARGET_LEN - CHUNK_OVERLAP) >= MAX_DOC_LEN, `창 ${GROW_WINDOW}조각의 순증이 문서 창에 못 미친다`);
   } finally { restore(); }
 });
 

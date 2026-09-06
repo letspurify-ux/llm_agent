@@ -112,29 +112,83 @@ export function linkTarget(href) {
   return { url, attrs: 걷어낸것의_속성(url) };
 }
 
+// mermaid는 원문을 한 번 더 해독한다 — 지시문(`%%{init: …}%%`)의 값은 JSON으로(\u0075 → u), 머리말(`---`)과 그림
+// 노드 속성(`@{ … }`)은 YAML로(\x75·\u0075 → u), 그 값이 <style>에 들어간 뒤에는 CSS가 또 한 번(\75 → u, \r → r).
+// 원문 글자만 보면 'url('이 '\u0075rl('로, 'img' 키가 "\x69mg"로 적힌 것을 놓친다(실측: 그 표기들이 아래 두 검사를
+// 지나 같은 출처 요청을 냈다). 그래서 판정 전에 그 세 겹의 이스케이프를 모두 풀어 놓고 본다. 겹쳐 쓴 것(\u005c75 →
+// \75 → u)까지 풀리도록 바뀌지 않을 때까지 되풀이하되 세 번으로 묶는다. 이 해독은 mermaid의 것보다 넓다 — 홑따옴표
+// YAML이나 라벨 글자까지 푼다 — 그렇게 틀리는 쪽은 그리지 않는 것(원문 코드로 남는 것)뿐이다.
+const ESCAPE_RE = /\\u\{([0-9a-f]{1,6})\}|\\u([0-9a-f]{4})|\\U([0-9a-f]{8})|\\x([0-9a-f]{2})|\\([0-9a-f]{1,6})[ \t\n\r\f]?|\\([^\n\r\f])/gi;
+const unescaped = s => {
+  let cur = String(s ?? '');
+  for (let i = 0; i < 3; i++) {
+    const next = cur.replace(ESCAPE_RE, (m, u1, u2, u3, x, css, ch) => {
+      if (ch !== undefined) return ch;
+      const cp = parseInt(u1 ?? u2 ?? u3 ?? x ?? css, 16);
+      return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '�';
+    });
+    if (next === cur) break;
+    cur = next;
+  }
+  return cur;
+};
+
 // 흐름도 원문에 그림 노드(`A@{ img: "주소" }`)가 있는가. mermaid는 이 노드의 크기를 재려고 그리는 도중에
 // 그 주소를 new Image()로 불러온다 — 사용자가 누르기도 전에, 그리고 그림이 화면에 서기도 전에 요청이
 // 나간다(실측: 같은 출처 요청 1건이 먼저 나가고, 다른 출처는 CSP에 막힌 뒤에야 멈춘다). 설정으로 끄는
 // 길이 없으므로 그리기 전에 원문에서 알아보고 그리지 않는다(Mermaid.jsx) — 원문 코드가 남는다. 이 화면이
 // 답변의 그림을 링크로만 남기는 것(App.jsx AltImage)과 같은 규칙이다. 판정은 mermaid의 노드 속성 문법
 // (`@{ … }` 안의 `img:` 키)을 본다 — 줄을 넘어 적어도, 다른 속성 뒤에 와도, 키를 따옴표로 감싸도(YAML이
-// 허용한다 — `"img":`) 걸린다. 닫는 `}`를 찾아 그 안만 보지 않는다: 속성값의 따옴표 안에 `}`가 있으면
-// (`label: "a } b", img: …`) 그 앞에서 멈춰 뒤의 img를 놓친다(실측: 그 둘로 요청이 나갔다). 그래서 `@{`
-// 뒤에 오는 것은 어디까지든 본다. 라벨의 글자에 같은 모양이 있으면 그리지 않는 쪽으로 틀리는데, 그
-// 손해는 흐름도 하나가 코드로 남는 것뿐이다.
-export const mermaidLoadsImage = text => /@\s*\{[\s\S]*?["']?\bimg\b["']?\s*:/i.test(String(text ?? ''));
+// 허용한다 — `"img":`), 따옴표 안에서 이스케이프로 적어도(`"\x69mg":` — 위 unescaped) 걸린다. 닫는 `}`를 찾아
+// 그 안만 보지 않는다: 속성값의 따옴표 안에 `}`가 있으면 (`label: "a } b", img: …`) 그 앞에서 멈춰 뒤의 img를
+// 놓친다(실측: 그 둘로 요청이 나갔다). 그래서 `@{` 뒤에 오는 것은 어디까지든 본다. 라벨의 글자에 같은 모양이
+// 있으면 그리지 않는 쪽으로 틀리는데, 그 손해는 흐름도 하나가 코드로 남는 것뿐이다.
+// 첫 `@{` 뒤 어디에든 img 키가 오는가. `@{` 하나하나에서 끝까지 되찾는 정규식(/@\s*\{[\s\S]*?img/)은 `@{`가
+// 되풀이되는 퇴화한 원문에서 '`@{` 수 × 길이'였다(실측: 상한 안에서 43ms, 길이 두 배에 네 배) — 답은 같다.
+export const mermaidLoadsImage = text => {
+  const s = unescaped(text);
+  const at = s.search(/@\s*\{/);
+  return at >= 0 && /["']?\bimg\b["']?\s*:/i.test(s.slice(at));
+};
 
-// 흐름도 원문의 설정 자리(지시문 `%%{…}%%`, 머리말 `---…---`)가 바깥을 부르는 CSS(url(…)·@import)를 담고
-// 있는가. mermaid는 그 자리의 글자(themeCSS·fontFamily·fontSize·themeVariables)를 그대로 <style>에 넣고,
-// 그리는 도중에 그 SVG를 문서에 넣어 크기를 잰다 — 그 순간 `background: url(주소)`가 요청이 된다(실측:
-// 같은 출처 요청이 나갔고 다른 출처는 CSP가 막았다. 그린 뒤 <style>에서 걷어내 보았으나 요청은 이미
-// 나간 뒤였다). 그래서 위 그림 노드와 같이 그리기 전에 알아보고 그리지 않는다(Mermaid.jsx). 라벨의
-// 글자는 보지 않는다 — 라벨은 CSS가 아니다. 색·테마를 바꾸는 지시문은 그대로 그려진다.
+// 흐름도 원문의 설정 자리(지시문 `%%{…}%%`, 머리말 `---…---`)가 바깥을 부르는 CSS를 담고 있는가. mermaid는 그
+// 자리의 글자(themeCSS·fontFamily·fontSize·themeVariables)를 그대로 <style>에 넣고, 그리는 도중에 그 SVG를 문서에
+// 넣어 크기를 잰다 — 그 순간 `background: url(주소)`가 요청이 된다(실측: 같은 출처 요청이 나갔고 다른 출처는 CSP가
+// 막았다. 그린 뒤 <style>에서 걷어내 보았으나 요청은 이미 나간 뒤였다). 그래서 위 그림 노드와 같이 그리기 전에
+// 알아보고 그리지 않는다(Mermaid.jsx). 라벨의 글자는 보지 않는다 — 라벨은 CSS가 아니다. 색·테마를 바꾸는 지시문은
+// 그대로 그려진다.
+// 부르는 CSS는 url()만이 아니다 — image-set()(-webkit- 접두사 포함)·image()·src()도 그림을 불러오고, @import는
+// 스타일시트를 불러온다(실측: image-set( 한 줄로 요청이 나갔다).
+// 설정 자리의 경계는 해독하기 '전'의 원문에서 잡는다 — mermaid가 그렇게 한다. 해독한 뒤에 잡으면 값 안에 적힌
+// }%%가 닫는 표시가 되어 그 뒤의 url(이 검사 밖으로 나간다.
+const FETCHING_CSS_RE = /url\s*\(|src\s*\(|image\s*\(|image-set\s*\(|@import\b/i;
+// 지시문 자리들 — 각 `%%{`에서 그 뒤 첫 `}%%`까지, 그것이 없으면 원문 끝까지. mermaid의 directiveRegex가 그렇다:
+// 닫는 `}%%`는 선택이라 `%%{init: {"fontFamily": "…url(…)"}`처럼 닫지 않고 문서 끝에 둔 지시문도 JSON만 성립하면
+// 적용된다(실측: 그 한 줄로 요청이 나갔다 — `}%%`를 요구하던 앞선 판정은 그것을 자리로 치지 않았다). 뒤에 흐름도가
+// 이어지면 그것까지 삼켜 그림이 서지 않지만, 판정은 mermaid가 무엇을 읽는가를 따라야지 그 결과를 짐작해서는 안 된다.
+// 자리는 겹칠 수 있다 — `%%{`마다 시작하되, 첫 `}%%`는 지나칠 때만 다시 찾으므로 비용은 길이에 비례한다. 되찾는
+// 정규식(/%%\{[\s\S]*?\}%%/g)은 `%%{`가 되풀이되는 퇴화한 원문에서 제곱이었다(실측: 상한 안에서 152ms, 두 배에 네 배).
+const directives = s => {
+  const out = [];
+  let q = -1;
+  for (let p = s.indexOf('%%{'); p >= 0; p = s.indexOf('%%{', p + 3)) {
+    if (q < p + 3) q = s.indexOf('}%%', p + 3);
+    if (q < 0) { out.push(s.slice(p)); break; }
+    out.push(s.slice(p, q + 3));
+  }
+  return out;
+};
+// 머리말 자리 — mermaid의 frontMatterRegex(/^([^\S\n\r]*)-{3}\s*[\n\r](.*?)[\n\r]\1-{3}\s*[\n\r]+/s)와 같은 경계로 잡는다.
+// 여는 `---` 뒤의 공백·탭, 들여쓴 머리말(닫는 `---`는 같은 들여쓰기여야 한다), 홀로 선 \r 줄바꿈(mermaid는 CR·CRLF를
+// 먼저 \n으로 바꾼다)을 mermaid는 받는데, `---\r?\n`만 보던 앞선 정규식은 넷 다 놓쳐 그 머리말의 url(이 검사 밖에서
+// 요청을 냈다(실측). 닫는 줄의 들여쓰기가 다른 `---`는 mermaid에게 닫는 줄이 아니므로 여기서도 아니다 — 그것을 닫는 줄로
+// 읽으면 그 뒤의 진짜 설정이 검사 밖으로 나간다. 닫는 줄 뒤의 줄바꿈은 mermaid가 요구하지만 여기서는 요구하지 않는다(넓게).
+const FRONTMATTER_RE = /^([^\S\n]*)---\s*\n([\s\S]*?)\n\1---[^\S\n]*(?:\n|$)/;
+const frontmatter = s => FRONTMATTER_RE.exec(s.replace(/\r\n?/g, '\n'))?.[2] ?? '';
 export const mermaidFetchesViaStyle = text => {
   const s = String(text ?? '');
-  const config = [...s.matchAll(/%%\{[\s\S]*?\}%%/g)].map(m => m[0]).join('\n')
-    + '\n' + (/^\s*---\r?\n([\s\S]*?)\r?\n---/.exec(s)?.[1] ?? '');
-  return /url\s*\(|@import\b/i.test(config);
+  const config = `${directives(s).join('\n')}\n${frontmatter(s)}`;
+  return FETCHING_CSS_RE.test(unescaped(config));
 };
 
 // react-markdown을 거치지 않은 링크(흐름도의 `click` 링크 — mermaid가 SVG 안에 <a>로 만든다). 위
