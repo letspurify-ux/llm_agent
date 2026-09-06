@@ -65,12 +65,15 @@ const hmOf = d => `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 const timeAxis = rows => {
   const xs = rows.map(r => r.x);
   const span = xs.length > 1 ? xs[xs.length - 1] - xs[0] : 0;
-  const dateOnly = xs.every(x => { const d = new Date(x); return d.getHours() === 0 && d.getMinutes() === 0 && d.getSeconds() === 0; });
+  const dateOnly = xs.every(x => { const d = new Date(x); return d.getHours() === 0 && d.getMinutes() === 0 && d.getSeconds() === 0 && d.getMilliseconds() === 0; });
   const sameDay = ymdOf(new Date(xs[0])) === ymdOf(new Date(xs[xs.length - 1]));
   const tickFormatter = t => {
     const d = new Date(t);
     if (dateOnly || span >= 240 * HOUR) return ymdOf(d);
-    const time = span < 10 * MIN ? `${hmOf(d)}:${pad2(d.getSeconds())}` : hmOf(d);
+    const seconds = `${hmOf(d)}:${pad2(d.getSeconds())}`;
+    // 짧은 범위의 눈금은 초 사이에도 선다. 초까지만 쓰면 서로 다른 눈금이 같은 시각으로 보인다.
+    const time = span < 10_000 ? `${seconds}.${String(d.getMilliseconds()).padStart(3, '0')}`
+      : span < 10 * MIN ? seconds : hmOf(d);
     if (xs.length < 2) return `${ymdOf(d)} ${time}`;
     return sameDay ? time : `${ymdOf(d).slice(5)} ${time}`;
   };

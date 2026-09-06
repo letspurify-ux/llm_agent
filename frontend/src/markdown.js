@@ -6,6 +6,33 @@
 // 바깥으로 나가는 요청이 된다.
 import { defaultUrlTransform } from 'react-markdown';
 
+// 각 markdown 렌더의 ID 공간을 분리한다. 같은 번호의 각주가 여러 답변에 있어도
+// 본문·각주·되돌아가기·접근성 설명이 그 답변 안에서 연결되어야 한다.
+export const scopeMarkdownIds = prefix => tree => {
+  const elements = [];
+  const pending = [tree];
+  while (pending.length) {
+    const node = pending.pop();
+    if (node.type === 'element') elements.push(node);
+    for (const child of node.children ?? []) pending.push(child);
+  }
+  const ids = new Map();
+  for (const node of elements) {
+    const p = node.properties;
+    if (typeof p?.id === 'string' && p.id) {
+      const scoped = `${prefix}${p.id}`;
+      ids.set(p.id, scoped);
+      p.id = scoped;
+    }
+  }
+  for (const { properties: p } of elements) {
+    if (!p) continue;
+    if (typeof p.href === 'string' && p.href.startsWith('#') && ids.has(p.href.slice(1)))
+      p.href = `#${ids.get(p.href.slice(1))}`;
+    if (Array.isArray(p.ariaDescribedBy)) p.ariaDescribedBy = p.ariaDescribedBy.map(id => ids.get(id) ?? id);
+  }
+};
+
 // react-markdown이 주소를 손보는 규칙. 링크(href)는 기본 규칙 그대로 둔다 — javascript: 같은 주소를
 // 빈 문자열로 바꿔 주고, 빈 href는 NewTabLink가 글자로만 남긴다.
 // 그림(<img>의 src)만 원문 그대로 받는다. 기본 규칙은 http(s)·mailto가 아닌 주소를 통째로 지우는데,

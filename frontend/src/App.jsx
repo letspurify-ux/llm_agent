@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useLayoutEffect, memo, lazy, Suspense, Component, createContext, useContext } from 'react';
+import { useState, useRef, useEffect, useLayoutEffect, useMemo, useId, memo, lazy, Suspense, Component, createContext, useContext } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 // 수식 표기의 계약(무엇이 수식인가 + 그것을 어떻게 그리는가)은 전부 math.js에 있다.
@@ -6,13 +6,19 @@ import { REMARK_PLUGINS, REHYPE_PLUGINS } from './math.js';
 // 차트 블록의 계약(무엇을 차트로 받는가 + 이력으로 되돌릴 때의 모양)은 chart.js에 있다.
 import { parseChartBlock, splitBlock, chartTableMarkdownFrom, chartBlocksToTables, sliceSafe, clip, MAX_CHARTS_PER_MESSAGE, MAX_TITLE_LEN } from './chart.js';
 // trace 패널의 계약(열·셀 표기·CSV)은 trace.js에 있다.
-import { columnsOf, cellText, toCsv, csvFileName, stepLabel, normalizeTrace, isSearchStep, targetsLabel, traceSummary,
+import { columnsOf, cellValue, cellText, toCsv, csvFileName, stepLabel, normalizeTrace, isSearchStep, targetsLabel, traceSummary,
   applyProgress, progressText } from './trace.js';
 // 응답 스트림(진행 이벤트 + 마지막 답)을 읽는 계약은 stream.js에, 답변 미리보기의 손질은 preview.js에 있다.
 import { readEvents } from './stream.js';
-import { previewMarkdown } from './preview.js';
+import { previewMarkdown, isPreviewBlock, PLACEHOLDER_TEXT } from './preview.js';
 // 답변 속 주소를 어떻게 다룰지의 판정은 markdown.js에 있다 (순수 함수라 회귀 테스트가 붙는다).
-import { linkTarget, imageTarget, mdProps } from './markdown.js';
+import { linkTarget, imageTarget, mdProps, scopeMarkdownIds } from './markdown.js';
+
+const NO_REHYPE = [];
+function useMarkdownPlugins(base = NO_REHYPE) {
+  const id = useId();
+  return useMemo(() => [...base, [scopeMarkdownIds, `md-${id}-`]], [base, id]);
+}
 
 // 그리는 쪽(recharts·mermaid)은 첫 차트·흐름도가 나올 때 내려받는다 — 둘을 합치면 앱 본체의 몇 배라,
 // 글과 표뿐인 대부분의 대화가 그 값을 치를 이유가 없다. 내려받는 동안과 실패했을 때는 표·코드가 보인다.
@@ -62,6 +68,7 @@ const TABLE_MD = mdProps({ a: NewTabLink, img: AltImage });
 // block은 부르는 쪽(ChartBlock)이 한 번 갈라 둔 것이다 — 같은 블록을 표로 두 번 그리므로
 // 여기서 다시 가르면 한 답변에 같은 글자를 몇 번씩 훑게 된다.
 function ChartTable({ text, block, withTitle = false }) {
+  const rehypePlugins = useMarkdownPlugins();
   const md = chartTableMarkdownFrom(block);
   // 제목은 그리는 쪽과 같은 길이로 묶는다(chart.js MAX_TITLE_LEN). 여기서만 자르지 않으면, 같은
   // 블록이 그려질 때는 80자짜리 제목을 달고 그리지 못할 때는 모델이 쓴 글이 통째로 제목이 된다 —
@@ -75,7 +82,7 @@ function ChartTable({ text, block, withTitle = false }) {
   return (
     <>
       {withTitle && title && <p><strong>{title}</strong></p>}
-      <ReactMarkdown remarkPlugins={TABLE_PLUGINS} {...TABLE_MD}>{md}</ReactMarkdown>
+      <ReactMarkdown remarkPlugins={TABLE_PLUGINS} rehypePlugins={rehypePlugins} {...TABLE_MD}>{md}</ReactMarkdown>
     </>
   );
 }
@@ -168,6 +175,12 @@ function PreOrBlock({ node, children, ...props }) {
   if (code?.lang === 'mermaid') return <MermaidBlock text={code.text} />;
   return <pre {...props}>{children}</pre>;
 }
+// 인용문·목록의 펜스는 markdown 파서가 컨테이너를 벗긴 뒤 판정한다.
+// 미리보기에서는 참조를 채우거나 흐름도 렌더를 시작할 수 없다.
+function PreviewPre({ node, children, ...props }) {
+  if (isPreviewBlock(codeOf(node)?.lang)) return <p><em>{PLACEHOLDER_TEXT}</em></p>;
+  return <pre {...props}>{children}</pre>;
+}
 // 답변 속 링크는 새 탭에서 연다 — 같은 탭에서 열리면 대화가 통째로 사라진다(이력은 서버에 없다).
 // 페이지 안 앵커(#…)만 제자리에서 연다. noopener는 새 탭이 이 창(window.opener)을 만지지 못하게,
 // noreferrer는 사내 URL이 링크 대상에 referer로 새지 않게 한다.
@@ -212,6 +225,7 @@ function AltImage({ node, src, alt, title }) {
 // 플러그인 배열과 마찬가지로 모듈 상수여야 한다 — 새 객체를 넘기면 매 렌더가 파이프라인 재구축이다.
 // (urlTransform과 img를 한 벌로 묶는 이유는 위 TABLE_MD 참고)
 const MAIN_MD = mdProps({ pre: PreOrBlock, a: NewTabLink, img: AltImage });
+const PREVIEW_MD = mdProps({ pre: PreviewPre, a: NewTabLink, img: AltImage });
 
 // 입력창 타이핑마다 전체 대화가 다시 렌더되지 않도록 메시지 하나를 분리해 memo한다
 // (assistant 답변은 markdown 파싱 비용이 있어 대화가 길어질수록 체감된다)
@@ -299,7 +313,7 @@ function TraceGrid({ rows }) {
             <tr key={i}>
               <td className="idx">{i + 1}</td>
               {cols.map(c => {
-                const v = r?.[c];
+                const v = cellValue(r, c);
                 return <td key={c} className={typeof v === 'number' ? 'num' : v == null ? 'null' : undefined}><div className="cell">{cellText(v)}</div></td>;
               })}
             </tr>
@@ -358,6 +372,7 @@ function ProgressList({ items }) {
 }
 
 const Message = memo(function Message({ role, text, trace }) {
+  const rehypePlugins = useMarkdownPlugins(REHYPE_PLUGINS);
   // 말풍선 하나가 던져도 나머지 대화는 남는다 (Boundary 참고). 경계를 memo 안에 두는 이유는
   // 바깥에 두면 대화가 늘 때마다 경계가 다시 렌더되기 때문이다 — 여기 두면 memo가 함께 막는다.
   return (
@@ -369,7 +384,7 @@ const Message = memo(function Message({ role, text, trace }) {
                 {/* 플러그인 배열은 math.js의 상수를 그대로 쓴다 — react-markdown은 렌더마다 options로
                     파이프라인을 다시 조립하므로, 여기서 새 배열 리터럴을 만들면 매 렌더가 프로세서 재구축이 된다. */}
                 <ChartBudget.Provider value={{ n: 0 }}>
-                  <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS}
+                  <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={rehypePlugins}
                                  {...MAIN_MD}>{text}</ReactMarkdown>
                 </ChartBudget.Provider>
               </div>
@@ -401,6 +416,7 @@ const BUSY_MS = 600;
 const SCROLL_KEYS = new Set(['PageUp', 'PageDown', 'ArrowUp', 'ArrowDown', 'Home', 'End', ' ']);
 
 export default function App() {
+  const previewPlugins = useMarkdownPlugins(REHYPE_PLUGINS);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
@@ -630,7 +646,7 @@ export default function App() {
     };
     const onMove = e => {
       const d = dragRef.current;
-      if (!d) return;
+      if (!d || e.pointerId !== d.id) return;
       // 놓은 것을 놓치는 경로가 있다: 오른쪽 클릭 메뉴가 뜬 사이의 pointerup, 창 밖에서 뗀 단추.
       // 눌린 단추 없이 오는 마우스 움직임이 곧 '이미 놓았다'는 뜻이다 — 여기서 끝낸 것으로 친다.
       // 놓친 채로 두면 dragRef가 영영 남아 새로고침할 때까지 따라가기가 죽는다.
@@ -976,8 +992,8 @@ export default function App() {
       // 이 화면에서 '대화가 통째로 사라진다'와 같은 말이다(실측: answer가 숫자·객체이면 백지가 됐다).
       // Boundary가 마지막 그물이지만, 그물에 걸린 말풍선은 원문만 남는다 — 여기서 맞출 수 있는
       // 것은 맞춰서 제대로 보이게 한다. 글자로 쓸 수 있는 것만 글자로 받는다.
-      const answerText = typeof data?.answer === 'string' ? data.answer : '';
-      const errorText = typeof data?.error === 'string' ? data.error : '';
+      const answerText = typeof data?.answer === 'string' && data.answer.trim() ? data.answer : '';
+      const errorText = typeof data?.error === 'string' && data.error.trim() ? data.error : '';
       // ??가 아니라 ||인 이유: 빈 문자열도 걸러야 한다. undefined는 이력에 들어가면 다음 전송을 깨고,
       // ''는 빈 말풍선으로 렌더된 뒤 그 빈 턴이 다음 질문의 맥락으로 서버에 되돌아간다.
       // 답이 비어 있는 것과 통신하지 못한 것은 다르다 — 서버가 답한 것을 '통신하지 못했습니다'로
@@ -1089,8 +1105,8 @@ export default function App() {
                   <Boundary what="preview" fallback={<pre className="preview-raw">{preview}</pre>}>
                     <div className="md preview">
                       <ChartBudget.Provider value={{ n: 0 }}>
-                        <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS}
-                                       {...MAIN_MD}>{previewMd}</ReactMarkdown>
+                        <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={previewPlugins}
+                                       {...PREVIEW_MD}>{previewMd}</ReactMarkdown>
                       </ChartBudget.Provider>
                     </div>
                   </Boundary>

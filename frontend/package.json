@@ -8,7 +8,8 @@
     "preview": "vite preview",
     "test": "node --test test/*.test.js",
     "test:ui": "node --test --test-concurrency=1 test/ui/ui.test.mjs",
-    "test:all": "npm test && npm run test:ui"
+    "test:production": "node --test test/ui/production.test.mjs",
+    "test:all": "npm test && npm run test:ui && npm run test:production"
   },
   "dependencies": {
     "katex": "^0.16.47",

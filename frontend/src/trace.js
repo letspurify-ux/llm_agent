@@ -225,6 +225,10 @@ export function columnsOf(rows) {
   return cols;
 }
 
+// 열의 합집합에 있어도 이 행에 없는 셀은 빈칸이다. __proto__ 등 상속된 값은 조회 결과가 아니다.
+export const cellValue = (row, column) => row != null && Object.prototype.hasOwnProperty.call(row, column)
+  ? row[column] : undefined;
+
 // 셀의 표기. null·undefined는 빈칸(문자열 'null'이 값처럼 보이지 않게), 숫자는 그대로,
 // 객체가 오면(드라이버 경계가 막지만) JSON으로 — [object Object]로 뭉개지지 않게.
 export function cellText(v) {
@@ -252,7 +256,7 @@ export function toCsv(rows, cols = columnsOf(rows)) {
     return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   const line = vals => vals.map(field).join(',');
-  return '﻿' + [line(cols), ...(rows ?? []).map(r => line(cols.map(c => r?.[c])))].join('\r\n') + '\r\n';
+  return '﻿' + [line(cols), ...(rows ?? []).map(r => line(cols.map(c => cellValue(r, c))))].join('\r\n') + '\r\n';
 }
 
 // 내려받을 파일 이름. 쿼리 이름은 등록자가 정한 문자열이라 파일 이름에 못 쓰는 글자가 섞일 수 있다.

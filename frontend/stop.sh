@@ -4,9 +4,8 @@ cd "$(dirname "$0")"
 
 PID_FILE=.frontend.pid
 
-# Same check as start.sh — a live PID alone does not prove it is *our vite*.
-# Killing without this check would hit an unrelated process that reused a stale PID, with -9 at worst.
-is_ours() { [ -n "${1:-}" ] && ps -p "$1" -o command= 2>/dev/null | grep -q "vite/bin/vite.js"; }
+# Same command and project-directory check as start.sh.
+source ./process.sh
 
 if [ ! -f "$PID_FILE" ]; then
   echo "[frontend] no running process found (.frontend.pid missing)."

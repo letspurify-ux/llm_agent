@@ -3,6 +3,13 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { previewMarkdown, PLACEHOLDER } from '../src/preview.js';
 
+test('언어 이름이 chart·table·mermaid로 시작할 뿐이면 일반 코드로 보존한다', () => {
+  for (const lang of ['chart-js', 'mermaid.example', 'table+html']) {
+    const md = `\`\`\`${lang}\n설명 코드\n\`\`\``;
+    assert.equal(previewMarkdown(md), md);
+  }
+});
+
 test('닫힌 chart·table·mermaid 펜스는 자리 표시로 바뀌고, 보통 코드와 글은 그대로다', () => {
   const md = '## 현황\n\n```chart\ntype: bar\ndata: step 1\n```\n\n글\n\n~~~table\nstep: 2\n~~~\n\n```js\ncode\n```\n\n```mermaid\nflowchart LR\n  A --> B\n```\n끝';
   assert.equal(previewMarkdown(md), `## 현황\n\n${PLACEHOLDER}\n\n글\n\n${PLACEHOLDER}\n\n\`\`\`js\ncode\n\`\`\`\n\n${PLACEHOLDER}\n끝`);

@@ -11,6 +11,30 @@ import {
 const TABLE = '| 월 | 건수 | 금액 |\n|---|---|---|\n| 2024-01 | 120 | 1,000 |\n| 2024-02 | 80 | 2,500 |';
 const spec = text => { const r = parseChartBlock(text); assert.ok(r.ok, r.reason); return r.spec; };
 
+test('일반 코드펜스 안의 차트 문법 예시는 대화 이력에서 그대로 남는다', () => {
+  for (const fence of ['````markdown', '~~~text']) {
+    const close = fence.startsWith('`') ? '````' : '~~~';
+    const md = `${fence}\n\`\`\`chart\ntype: bar\n${TABLE}\n\`\`\`\n${close}`;
+    assert.equal(chartBlocksToTables(md), md);
+  }
+});
+
+test('소수 초가 다른 시각은 서로 다른 x로 남아 선 그래프가 그려진다', () => {
+  const base = toTime('2026-09-06 12:30:45');
+  for (const [fraction, ms] of [['1', 100], ['12', 120], ['123', 123], ['123456', 123]]) {
+    assert.equal(toTime(`2026-09-06 12:30:45.${fraction}`), base + ms);
+  }
+  const s = spec('type: line\n| 시각 | 값 |\n|---|---|\n| 2026-09-06 12:30:45.100 | 1 |\n| 2026-09-06 12:30:45.200 | 2 |');
+  assert.equal(s.xKind, 'time');
+  assert.equal(s.rows[1].x - s.rows[0].x, 100);
+});
+
+test('두 자리 이하의 연도도 그 해의 윤년 규칙으로 판정한다', () => {
+  assert.equal(new Date(toTime('0000-02-29')).getFullYear(), 0);
+  assert.equal(new Date(toTime('0096-02-29')).getDate(), 29);
+  assert.equal(toTime('0099-02-29'), null);
+});
+
 test('설정 줄 + GFM 표를 차트 명세로 읽는다', () => {
   const s = spec(`type: bar\ntitle: 월별 처리\n${TABLE}`);
   assert.strictEqual(s.type, 'bar');

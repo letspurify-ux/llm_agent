@@ -5,6 +5,43 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { eventOf, isFinal, readEvents } from '../src/stream.js';
 
+test('JSON 응답은 들여쓰기와 여러 줄이 있어도 객체 전체를 읽는다', async () => {
+  const data = { answer: '정상 답변', trace: [{ rows: [{ VALUE: 7 }] }] };
+  for (const body of [true, false]) {
+    const headers = new Headers({ 'Content-Type': 'application/json; charset=utf-8' });
+    const res = body ? new Response(JSON.stringify(data, null, 2), { headers })
+      : { ...chunked([JSON.stringify(data, null, 2)], { body }), headers };
+    assert.deepStrictEqual(await readEvents(res), data);
+  }
+});
+
+test('done 뒤 연결이 열려 있어도 답을 반환하고 스트림을 정리한다', async () => {
+  let cancelled = false;
+  const res = { body: new ReadableStream({
+    start(c) { c.enqueue(new TextEncoder().encode('{"type":"done","answer":"완료"}\n')); },
+    cancel() { cancelled = true; },
+  }) };
+  let timer;
+  try {
+    const final = await Promise.race([
+      readEvents(res),
+      new Promise(resolve => { timer = setTimeout(() => resolve('응답 대기 중'), 500); }),
+    ]);
+    assert.deepStrictEqual(final, { type: 'done', answer: '완료' });
+    assert.ok(cancelled, '완료한 응답의 스트림이 남았다');
+    assert.equal(res.body.locked, false);
+  } finally { clearTimeout(timer); }
+});
+
+test('마지막 이벤트 뒤의 줄은 완성된 답을 덮거나 진행 상태를 바꾸지 않는다', async () => {
+  const seen = [];
+  const final = await readEvents(chunked([
+    '{"type":"done","answer":"완료"}\n{"type":"answer_delta","text":"늦은 조각"}\n{"error":"늦은 오류"}\n',
+  ]), e => seen.push(e));
+  assert.deepStrictEqual(final, { type: 'done', answer: '완료' });
+  assert.deepStrictEqual(seen, []);
+});
+
 // 바이트 조각들을 주는 가짜 응답. 진짜 Response도 쓸 수 있지만, 조각 경계를 정확히 정하려면 스트림을 직접 만든다.
 const chunked = (chunks, { body = true } = {}) => {
   const enc = new TextEncoder();

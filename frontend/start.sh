@@ -7,11 +7,8 @@ cd "$(dirname "$0")"
 PID_FILE=.frontend.pid
 LOG_FILE=logs/frontend.log
 
-# Verify that the process in the PID file is really *our vite* by checking its command line —
-# judging by kill -0 (liveness) alone, a stale PID reused by an unrelated process makes this
-# script misreport "already running", and stop.sh would even force-kill (-9) that process.
-# The two scripts must share this check — if you change the pattern, change stop.sh too.
-is_ours() { [ -n "${1:-}" ] && ps -p "$1" -o command= 2>/dev/null | grep -q "vite/bin/vite.js"; }
+# Verify both the command and project directory, using the same check as stop.sh.
+source ./process.sh
 
 if [ -f "$PID_FILE" ] && is_ours "$(cat "$PID_FILE")"; then
   echo "[frontend] already running (PID $(cat "$PID_FILE")) — log: $LOG_FILE"

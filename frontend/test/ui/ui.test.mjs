@@ -154,6 +154,147 @@ const seen = sel => page.eval(`(() => { const e = document.querySelector(${JSON.
 // Chrome이 없으면 그 자리에서 건너뛴다 (before가 돈 뒤에야 알 수 있으므로 시험 안에서 판단한다)
 const it = (name, fn) => test(name, async t => { if (skip) return t.skip(skip); await fn(t); });
 
+async function sendQuestion(text, answers) {
+  await page.eval(`document.querySelector('textarea').focus()`);
+  await page.send('Input.insertText', { text });
+  await page.key('Enter', 'Enter', 13);
+  await page.until(`document.querySelectorAll('.row.assistant').length === ${answers} && !document.querySelector('.typing')`);
+}
+
+it('회귀: 인용문 속 차트도 미리보기에서는 준비 중으로 남긴다', async () => {
+  await page.goto(url(), '.chip');
+  const preview = '> ```chart\n> data: step 1\n> ```';
+  await page.eval(`window.fetch = async () => new Response(new ReadableStream({
+    start(c) { window.__previewStream = c; c.enqueue(new TextEncoder().encode(JSON.stringify({ type: 'answer_delta', text: ${JSON.stringify(preview)} }) + '\\n')); }
+  }), { headers: { 'Content-Type': 'application/x-ndjson' } }); document.querySelector('.chip').click()`);
+  await page.until(`document.querySelector('.preview')`);
+  const text = await page.eval(`document.querySelector('.preview').textContent`);
+  await page.eval(`window.__previewStream.enqueue(new TextEncoder().encode('{"type":"done","answer":"완료"}\\n'))`);
+  await page.until(`!document.querySelector('.typing')`);
+  assert.match(text, /표·차트를 준비하고 있습니다/);
+  assert.doesNotMatch(text, /그리지 못했습니다|data: step/);
+});
+
+it('회귀: 소수 초 차트의 시간 눈금은 서로 다른 시각을 구별한다', async () => {
+  await page.goto(url(), '.chip');
+  const answer = '```chart\ntype: line\n| 시각 | 값 |\n|---|---|\n| 2026-09-06 12:30:45.100 | 1 |\n| 2026-09-06 12:30:45.200 | 2 |\n```';
+  await page.eval(`window.fetch = async () => new Response(JSON.stringify({ answer: ${JSON.stringify(answer)} }),
+    { headers: { 'Content-Type': 'application/json' } })`);
+  await sendQuestion('시각별 측정값', 1);
+  await page.until(`document.querySelectorAll('.recharts-xAxis-tick-labels text').length > 1`);
+  const ticks = await page.eval(`[...document.querySelectorAll('.recharts-xAxis-tick-labels text')].map(t => t.textContent)`);
+  assert.equal(new Set(ticks).size, ticks.length, `서로 다른 눈금이 같은 글자로 보인다: ${ticks}`);
+});
+
+it('회귀: 공백뿐인 답은 실패 안내로 표시하고 다음 질문의 답변 이력에 넣지 않는다', async () => {
+  await page.goto(url(), '.chip');
+  await page.eval(`window.__requests = []; window.fetch = async (url, opts) => {
+    window.__requests.push(JSON.parse(opts.body));
+    return new Response(JSON.stringify({ answer: window.__requests.length === 1 ? ' \\n\\t' : '정상 답' }),
+      { headers: { 'Content-Type': 'application/json' } });
+  }`);
+  await sendQuestion('첫 질문', 1);
+  const first = await page.eval(`document.querySelector('.bubble.assistant').textContent.trim()`);
+  await sendQuestion('다음 질문', 2);
+  assert.equal(first, '답변을 만들지 못했습니다.');
+  assert.deepStrictEqual(await page.eval(`window.__requests[1].history`), [{ role: 'user', text: '첫 질문' }]);
+});
+
+it('요청 이력은 최근 대화로 제한되고 차트의 값이 남으며 중복 제출은 한 번만 전송된다', async () => {
+  await page.goto(url(), '.chip');
+  const answer = '```chart\ntype: bar\ntitle: 매출\n| 월 | 값 |\n|---|---|\n| 9월 | 123 |\n```\n' + '설명'.repeat(1000);
+  await page.eval(`window.__requests = []; window.fetch = async (url, opts) => {
+    window.__requests.push(JSON.parse(opts.body));
+    return new Response(JSON.stringify({ answer: ${JSON.stringify(answer)} }), { headers: { 'Content-Type': 'application/json' } });
+  }`);
+  for (let i = 1; i <= 5; i++) await sendQuestion('질문 ' + i, i);
+  const history = await page.eval(`window.__requests[4].history`);
+  assert.equal(history.length, 6);
+  assert.equal(history[0].text, '질문 2');
+  for (const turn of history.filter(m => m.role === 'assistant')) {
+    assert.ok(turn.text.length <= 1500);
+    assert.match(turn.text, /9월.*123/);
+    assert.doesNotMatch(turn.text, /```chart|type: bar/);
+  }
+  await page.eval(`(() => { const ta = document.querySelector('textarea');
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, '한 번만');
+    ta.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+  await page.eval(`(() => { const form = document.querySelector('form');
+    form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); })()`);
+  await page.until(`document.querySelectorAll('.row.user').length === 6 && !document.querySelector('.typing')`);
+  assert.equal(await page.eval(`window.__requests.length`), 6);
+});
+
+it('홈 이후 옛 스트림이 늦게 도착해도 새 대화와 진행 중 상태를 바꾸지 않는다', async () => {
+  await page.goto(url(), '.chip');
+  await page.eval(`window.__streams = []; window.fetch = async () => new Response(new ReadableStream({
+    start(c) { window.__streams.push(c); }
+  }), { headers: { 'Content-Type': 'application/x-ndjson' } });
+  window.__emit = (n, event) => window.__streams[n].enqueue(new TextEncoder().encode(JSON.stringify(event) + '\\n'));
+  document.querySelector('.chip').click()`);
+  await page.until(`window.__streams.length === 1 && document.querySelector('.typing')`);
+  await page.eval(`window.__emit(0, { type: 'answer_delta', text: '옛 답 미리보기' })`);
+  await page.until(`document.querySelector('.preview')`);
+  await page.eval(`document.querySelector('.home-btn').click()`);
+  await page.eval(`document.querySelector('.chip').click()`);
+  await page.until(`window.__streams.length === 2 && document.querySelector('.typing')`);
+  await page.eval(`window.__emit(0, { type: 'answer_delta', text: '늦은 조각' });
+    window.__emit(0, { type: 'done', answer: '옛 답' });`);
+  await sleep(250);
+  assert.deepStrictEqual(await page.eval(`({ waiting: !!document.querySelector('.typing'),
+    old: /옛 답|늦은 조각/.test(document.querySelector('.chat').textContent), users: document.querySelectorAll('.row.user').length })`),
+    { waiting: true, old: false, users: 1 });
+  await page.eval(`window.__emit(1, { type: 'done', answer: '새 답' })`);
+  await page.until(`!document.querySelector('.typing') && document.querySelector('.bubble.assistant')?.textContent === '새 답'`);
+});
+
+it('회귀: 여러 답변의 각주와 되돌아가기 링크는 자기 답변 안을 가리킨다', async () => {
+  await answered(1000, 760, { c: 'footnote' });
+  await page.eval(`document.querySelector('textarea').focus()`);
+  await page.send('Input.insertText', { text: '두 번째 각주 질문' });
+  await page.key('Enter', 'Enter', 13);
+  await page.until(`document.querySelectorAll('.footnotes').length === 2 && !document.querySelector('.typing')`);
+  const got = await page.eval(`(() => {
+    const bubbles = [...document.querySelectorAll('.bubble.assistant')];
+    const links = bubbles.flatMap(b => [...b.querySelectorAll('[data-footnote-ref], [data-footnote-backref]')]
+      .map(a => b.contains(document.getElementById(a.getAttribute('href').slice(1)))));
+    const labels = bubbles.map(b => b.contains(document.getElementById(b.querySelector('[data-footnote-ref]').getAttribute('aria-describedby'))));
+    const ids = bubbles.flatMap(b => [...b.querySelectorAll('[id]')].map(e => e.id));
+    return { links, labels, unique: new Set(ids).size === ids.length };
+  })()`);
+  assert.deepStrictEqual(got, { links: [true, true, true, true], labels: [true, true], unique: true });
+});
+
+it('회귀: trace 표에 없는 프로토타입 이름의 열은 빈칸이다', async () => {
+  await page.goto(url(), '.chip');
+  await page.eval(`window.fetch = async () => new Response(JSON.stringify({ answer: '조회 완료', trace: [{
+    query_name: '특수 열', rows: [JSON.parse('{"__proto__":"실제 값","constructor":"생성자"}'), {}]
+  }] }), { headers: { 'Content-Type': 'application/json' } })`);
+  await page.eval(`document.querySelector('.chip').click()`);
+  await page.until(`document.querySelector('.trace')`);
+  await page.eval(`document.querySelector('.trace summary').click()`);
+  await page.until(`document.querySelectorAll('.trace-grid tbody tr').length === 2`);
+  assert.deepStrictEqual(await page.eval(`[...document.querySelectorAll('.trace-grid tbody tr')]
+    .map(r => [...r.querySelectorAll('.cell')].map(c => c.textContent))`), [['실제 값', '생성자'], ['', '']]);
+});
+
+it('회귀: 다른 포인터의 움직임은 누르기만 한 포인터를 드래그로 바꾸지 않는다', async () => {
+  await answered();
+  await page.eval(`(() => {
+    const chat = document.querySelector('.chat');
+    chat.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerId: 41, pointerType: 'touch', isPrimary: true, clientX: 100, clientY: 100 }));
+    window.dispatchEvent(new PointerEvent('pointermove', { pointerId: 42, pointerType: 'touch', isPrimary: false, clientX: 300, clientY: 300 }));
+  })()`);
+  try {
+    await grow(300);
+    await sleep(900);
+    assert.ok((await state()).rest < 8, '다른 포인터가 따라가기를 끊었다');
+  } finally {
+    await page.eval(`window.dispatchEvent(new PointerEvent('pointerup', { pointerId: 41, pointerType: 'touch' }))`);
+  }
+});
+
 it('답이 오면 차트·흐름도가 뒤늦게 서도 끝까지 따라간다', async () => {
   await answered();
   assert.ok((await state()).rest < 8, '답의 끝이 입력창 뒤에 남았다');
@@ -597,7 +738,7 @@ it('각주 묶음도 한국어로 적힌다 (기본값은 영어라 화면에 �
   // 각주 제목이 소리 없이 사라진다 (markdown.js FOOTNOTE_OPTIONS).
   await answered(1000, 760, { c: 'footnote' });
   const got = await page.eval(`(() => { const md = document.querySelector('.bubble.assistant .md');
-    const h = md.querySelector('#footnote-label');
+    const h = md.querySelector('.footnotes h2');
     return { 제목: h?.textContent ?? null, 클래스: h?.className ?? null,
              보임: h ? h.getBoundingClientRect().height > 0 : false,
              되돌아가기: [...md.querySelectorAll('a[data-footnote-backref]')].map(a => a.getAttribute('aria-label')) }; })()`);

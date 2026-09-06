@@ -5,7 +5,8 @@
 // 그래서 세 종류의 펜스(닫힌 것도, 아직 안 닫힌 마지막 것도)를 자리 표시 한 줄로 바꾼다. 나머지 markdown은 그대로
 // 그린다 — 반쯤 온 표나 목록은 그 자체로 읽을 수 있다.
 // App.jsx가 아니라 여기 있는 이유는 chart.js·trace.js와 같다: 순수 함수라 node:test가 붙는다.
-export const PLACEHOLDER = '_(표·차트를 준비하고 있습니다)_';
+export const PLACEHOLDER_TEXT = '(표·차트를 준비하고 있습니다)';
+export const PLACEHOLDER = `_${PLACEHOLDER_TEXT}_`;
 
 // 한 번만 훑는다. 앞서는 닫힌 펜스와 열린 꼬리를 정규식 둘로 바꿨는데, 닫힌 펜스 쪽이 여는 줄마다 닫는 줄을
 // 끝까지 찾는 꼴이라 비용이 '여는 줄 수 × 길이'였다. 여는 줄만 되풀이하는 퇴화한 응답(temperature=0에서
@@ -19,7 +20,8 @@ export const PLACEHOLDER = '_(표·차트를 준비하고 있습니다)_';
 // 차트로 그려져 '차트를 그리지 못했습니다: 조회 결과를 채우지 못했습니다'라는 거짓 안내가 답이 오기까지 떠 있었고,
 // 반쯤 온 ```Mermaid 는 그림으로 그려져 파스 오류 경고를 콘솔에 남겼다(실측).
 const FENCE_RE = /^([ \t]*)(`{3,}|~{3,})(.*)$/;
-const TARGET_RE = /^[ \t]*(?:chart|table|mermaid)\b/i;
+const TARGET_RE = /^[ \t]*(?:chart|table|mermaid)(?:\s|$)/i;
+export const isPreviewBlock = language => TARGET_RE.test(language ?? '');
 
 export function previewMarkdown(text) {
   const lines = String(text ?? '').split('\n');
@@ -40,7 +42,7 @@ export function previewMarkdown(text) {
       continue;
     }
     if (m && !(m[2][0] === '`' && m[3].includes('`'))) {
-      open = { ch: m[2][0], len: m[2].length, indent: m[1], target: TARGET_RE.test(m[3]) };
+      open = { ch: m[2][0], len: m[2].length, indent: m[1], target: isPreviewBlock(m[3]) };
       if (!open.target) out.push(line);
       continue;
     }

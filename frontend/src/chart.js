@@ -121,20 +121,22 @@ export function toNumber(cell) {
 // 시간으로 찍으므로 왕복이 맞아야 '2024-01-01'이 '2023-12-31'로 보이지 않는다.
 // 뒤의 Z·+09:00 은 읽되 무시한다 — Oracle의 TIMESTAMP WITH TIME ZONE 표기(NLS_TIMESTAMP_TZ_FORMAT)가 그렇게
 // 오고, 그 오프셋은 조회한 DB 자신의 시간대라 지역 시간으로 읽는 것과 같은 축에 놓인다.
-const DATE_RE = /^(\d{4})[-./](\d{1,2})(?:[-./](\d{1,2}))?(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?)?(?:\s*(?:Z|[-+]\d{2}:?\d{2}))?$/;
+const DATE_RE = /^(\d{4})[-./](\d{1,2})(?:[-./](\d{1,2}))?(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?)?(?:\s*(?:Z|[-+]\d{2}:?\d{2}))?$/;
 const COMPACT_DATE_RE = /^(\d{4})(\d{2})(\d{2})?$/;
 export function toTime(cell, explicit = false) {
   const s = String(cell ?? '').trim();
   let m = DATE_RE.exec(s);
   if (!m && explicit) m = COMPACT_DATE_RE.exec(s) || (/^\d{4}$/.test(s) ? [s, s, '1'] : null);
   if (!m) return null;
-  const [, y, mo, d, h, mi, sec] = m;
+  const [, y, mo, d, h, mi, sec, fraction = ''] = m;
   // 시각도 범위를 넘으면 날짜가 아니다. Date는 12:99를 13:39로 조용히 넘겨 버려(실측), 잘못 적힌
   // 시각이 축의 엉뚱한 자리에 찍힌다 — 아래 날짜 확인은 하루를 넘길 때만 걸린다.
   if (+(h ?? 0) > 23 || +(mi ?? 0) > 59 || +(sec ?? 0) > 59) return null;
-  const t = new Date(+y, +mo - 1, +(d ?? 1), +(h ?? 0), +(mi ?? 0), +(sec ?? 0));
-  // 생성자는 0~99년을 1900년대로 올린다 — 네 자리로 적힌 해는 적힌 그대로다.
-  t.setFullYear(+y);
+  // 연·월·일을 함께 놓아 0~99년도 그 해의 윤년으로 판정한다.
+  const t = new Date(0);
+  t.setFullYear(+y, +mo - 1, +(d ?? 1));
+  // Date의 해상도인 밀리초까지 보존한다. 소수 초를 버리면 서로 다른 x가 중복된다.
+  t.setHours(+(h ?? 0), +(mi ?? 0), +(sec ?? 0), +fraction.slice(0, 3).padEnd(3, '0'));
   // 2024-13-45 같은 값은 Date가 조용히 다음 달로 넘겨 버린다 — 넘긴 것은 날짜가 아니었다.
   return t.getMonth() === +mo - 1 && t.getDate() === +(d ?? 1) && +mo >= 1 && +mo <= 12 ? t.getTime() : null;
 }
@@ -502,6 +504,25 @@ export function chartFences(md) {
   return { lines, blocks };
 }
 
+// 펜스 탐색 전에 일반 코드블록을 가린다. 그 안에 적힌 ```chart는 문법 예시이며
+// 화면에서도 코드 그대로다. 줄 수를 유지해 변환하지 않은 원문은 그대로 이어 붙인다.
+function maskLiteralFences(lines) {
+  let open = null;
+  return lines.map(line => {
+    const m = /^[ \t]*(`{3,}|~{3,})([^\r\n]*)\r?$/.exec(line);
+    if (open) {
+      const result = open.literal ? '' : line;
+      if (m && m[1][0] === open.ch && m[1].length >= open.len && !m[2].trim()) open = null;
+      return result;
+    }
+    if (m && !(m[1][0] === '`' && m[2].includes('`'))) {
+      open = { ch: m[1][0], len: m[1].length, literal: !/^[ \t]*chart(?:\s|$)/i.test(m[2]) };
+      if (open.literal) return '';
+    }
+    return line;
+  });
+}
+
 // 대화 이력으로 보낼 때 차트 블록을 평범한 표로 되돌린다. 모델의 다음 턴에 필요한 것은 '무슨 값을
 // 보여줬는가'이지 그것을 어떻게 그렸는가가 아니다 — 펜스와 설정 줄을 그대로 돌려보내면 이력
 // 상한(HISTORY_LEN)의 일부를 그 글자가 먹고, 모델은 그 모양을 답변마다 흉내 낸다.
@@ -511,7 +532,8 @@ export function chartFences(md) {
 // 블록의 제목이 목록 밖의 문단이 되어 항목이 거기서 끊기고 뒤의 표는 목록에서 떨어져 나간다(실측:
 // `1. 항목` 아래 4칸 들여 쓴 블록의 이력이 `목록 안\n    | a | b |…`로 나가 목록이 끝났다).
 export function chartBlocksToTables(md) {
-  const { lines, blocks } = chartFences(md);
+  const lines = String(md ?? '').split('\n');
+  const { blocks } = chartFences(maskLiteralFences(lines).join('\n'));
   if (!blocks.length) return String(md ?? '');
   const out = [];
   let at = 0;

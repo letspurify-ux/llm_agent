@@ -4,6 +4,11 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { columnsOf, cellText, toCsv, csvFileName, countLabel, stepLabel, normalizeTrace, isSearchStep, searchLabel, targetsLabel, traceSummary, applyProgress, progressText } from '../src/trace.js';
 
+test('행에 없는 열은 프로토타입 이름과 같아도 CSV에서 빈칸이다', () => {
+  const rows = JSON.parse('[{"__proto__":"실제 값","constructor":"생성자","toString":"문자열"},{}]');
+  assert.equal(toCsv(rows), '\uFEFF__proto__,constructor,toString\r\n실제 값,생성자,문자열\r\n,,\r\n');
+});
+
 test('열은 첫 등장 순서의 합집합이다', () => {
   assert.deepStrictEqual(columnsOf([{ B: 1, A: 2 }, { A: 3, C: 4 }, null, 'x']), ['B', 'A', 'C']);
   assert.deepStrictEqual(columnsOf([]), []);
