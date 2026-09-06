@@ -5,8 +5,8 @@
 // 가장 큰 페이로드인 실행 이력에는 상한이 아예 없었다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { buildPrompt } from '../src/llm-openai.js';
-import { MAX_PROMPT_TOTAL_LEN, MAX_PROMPT_STEP_LEN, PROMPT_FLOORS, PROMPT_CEILINGS, PROMPT_FRAME_RESERVE, MAX_EXPANDED_ITEM_LEN, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN, MAX_CELL_LEN, MAX_RESULT_COLS, MAX_ROWS, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_DOC_LEN, MAX_PROMPT_ITEM_LEN, TRUNC_MARK } from '../src/constants.js';
+import { buildPrompt, NO_SEARCH_LEFT_NOTE, NO_QUERY_LEFT_NOTE, fewQueriesLeftNote, fewExpandsLeftNote } from '../src/llm-openai.js';
+import { MAX_PROMPT_TOTAL_LEN, MAX_PROMPT_STEP_LEN, PROMPT_FLOORS, PROMPT_CEILINGS, PROMPT_FRAME_RESERVE, MAX_EXPANDED_ITEM_LEN, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN, MAX_CELL_LEN, MAX_RESULT_COLS, MAX_ROWS, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_DOC_LEN, MAX_PROMPT_ITEM_LEN, TRUNC_MARK, MAX_BATCH_QUERIES } from '../src/constants.js';
 
 const big = n => 'ㄱ'.repeat(n);
 
@@ -257,11 +257,57 @@ test('섹션 최소 몫 합계가 전체 예산을 넘지 않는다', () => {
 test('고정 틀(제목·빈 줄·지시 블록)이 자기 몫 안에 든다', () => {
   // 섹션 본문은 배분이 세지만 제목 줄·블록 사이 빈 줄·질문 제목·지시 블록은 세지 않는다 —
   // 그 몫을 미리 떼는데, 떼는 값이 실제 틀보다 작으면 꽉 찬 요청에서 그 차이만큼 넘친다.
-  // 틀이 가장 긴 형태(forceAnswer 지시문)로, 본문을 전부 비워 틀만 남긴 길이를 잰다.
-  const empty = { question: '', chat: [], knowledge: [], qaMethods: [], queries: [], history: [], forceAnswer: true };
-  const frame = buildPrompt(empty).length - 5 * '(없음)'.length;
+  // 지시 블록의 모양 셋(강제 답변 / 아직 검색 전 / 검색 기회 소진)을 전부 재서 가장 긴 것을 쓴다 — 한 모양만 재면
+  // 다른 모양에 붙는 안내 한 줄이 몫 밖으로 새어도 아무 데서도 드러나지 않는다(forceAnswer만 재던 동안 '아직 검색 전'
+  // 모양이 이미 그보다 50자 길었다).
+  const base = { question: '', chat: [], knowledge: [], qaMethods: [], queries: [], history: [] };
+  const forms = [
+    { ...base, forceAnswer: true },
+    { ...base, tried: false, searched: [] },
+    { ...base, tried: true, searched: ['knowledge'], canSearch: false, queriesLeft: 0 },
+    { ...base, tried: true, searched: ['knowledge'], canSearch: false, queriesLeft: 1, expandsLeft: 1 },
+  ];
+  const frame = Math.max(...forms.map(f => buildPrompt(f).length - 5 * '(없음)'.length));
   // 건수 자릿수 여유(섹션 다섯 곳 × 4자리)까지 더해도 몫 안이어야 한다
   assert.ok(frame + 20 <= PROMPT_FRAME_RESERVE, `틀이 몫을 넘는다: ${frame} + 20 > ${PROMPT_FRAME_RESERVE}`);
+});
+
+// 실행한 검색은 이력에 남지만 상한(MAX_SEARCHES)은 프롬프트 어디에도 없었다 — 생산적인 검색 셋 뒤 모델이 낸 넷째 검색은
+// '상한에 닿았다'는 안내와 헛돈 스텝으로 끝났다(실측). 청구 번호를 떼는 것과 같은 이유로 지시 블록이 그 사실을 말한다.
+test('검색 기회를 다 쓴 요청의 지시 블록은 더 검색할 수 없다고 말한다', () => {
+  const left = buildPrompt(ctx({ searched: ['knowledge'], canSearch: true }));
+  assert.ok(!left.includes(NO_SEARCH_LEFT_NOTE), '기회가 남았는데 소진 안내가 붙었다');
+  const none = buildPrompt(ctx({ searched: ['knowledge'], canSearch: false }));
+  const instr = none.slice(none.indexOf('## 지시'));
+  assert.ok(instr.includes(NO_SEARCH_LEFT_NOTE), '검색 기회를 다 썼는데 지시 블록이 말하지 않는다');
+  assert.ok(instr.endsWith('다음 행동 하나를 JSON으로 결정하라.'), '결정 요구 줄은 마지막이어야 한다');
+  // 강제 답변 스텝에는 붙지 않는다 — 그 지시문이 이미 검색을 막는다.
+  const forced = buildPrompt(ctx({ searched: ['knowledge'], canSearch: false, forceAnswer: true }));
+  assert.ok(!forced.includes(NO_SEARCH_LEFT_NOTE));
+});
+
+// 조회도 같다 — 조회 5건 뒤 모델이 낸 6번째 run_query는 루프가 버리고 강제 답변 호출이 하나 더 나갔다(실측). 남은 수가
+// 한 결정에 담을 수 있는 수보다 적으면 그 수를 말한다 — 더 담은 배치는 꼬리가 잘려 안내만 남기기 때문이다.
+test('남은 조회 수가 적거나 없으면 지시 블록이 그 수를 말한다', () => {
+  const instr = over => { const p = buildPrompt(ctx({ searched: ['query'], ...over })); return p.slice(p.indexOf('## 지시')); };
+  assert.ok(instr({ queriesLeft: 0 }).includes(NO_QUERY_LEFT_NOTE), '조회 기회가 없는데 지시 블록이 말하지 않는다');
+  assert.ok(instr({ queriesLeft: 1 }).includes(fewQueriesLeftNote(1)), '남은 수가 적은데 말하지 않는다');
+  assert.ok(instr({ queriesLeft: MAX_BATCH_QUERIES - 1 }).includes(fewQueriesLeftNote(MAX_BATCH_QUERIES - 1)));
+  for (const n of [MAX_BATCH_QUERIES, MAX_BATCH_QUERIES + 1, undefined]) {
+    const s = instr({ queriesLeft: n });
+    assert.ok(!s.includes(NO_QUERY_LEFT_NOTE) && !/조회는 \d+건까지만/.test(s), `남은 수 ${n}에 안내가 붙었다`);
+  }
+  assert.ok(!instr({ queriesLeft: 0, forceAnswer: true }).includes(NO_QUERY_LEFT_NOTE), '강제 답변 스텝에는 붙지 않는다');
+});
+
+// 청구도 같다 — 하나 남은 자리에 번호 둘을 적은 결정에서 둘째가 안내 없이 버려졌다(실측). 0이면 번호가 전부 사라지는 것이
+// 표시라 따로 말하지 않고, 상한 이상이면 한 결정에 다 적을 수 있으니 말할 것이 없다.
+test('남은 청구 수가 상한보다 적으면 지시 블록이 그 수를 말한다', () => {
+  const instr = over => { const p = buildPrompt(ctx({ searched: ['knowledge'], ...over })); return p.slice(p.indexOf('## 지시')); };
+  assert.ok(MAX_EXPANDS >= 2, '이 대조는 청구 상한이 둘 이상이어야 뜻이 있다');
+  assert.ok(instr({ expandsLeft: 1 }).includes(fewExpandsLeftNote(1)), '남은 청구 수를 말하지 않는다');
+  for (const n of [MAX_EXPANDS, 0, undefined]) assert.ok(!/본문 청구는 \d+건까지만/.test(instr({ expandsLeft: n })), `남은 수 ${n}에 안내가 붙었다`);
+  assert.ok(!instr({ expandsLeft: 1, forceAnswer: true }).includes(fewExpandsLeftNote(1)), '강제 답변 스텝에는 붙지 않는다');
 });
 
 test('제목이 길어져도 지식·처리방법 줄이 예산을 뚫지 못한다', () => {

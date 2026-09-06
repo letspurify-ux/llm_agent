@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { loopGuard, paramKey, normalizeChat, fallbackAnswer, normalizeQuestion, clippedCopyDetector, answerOf, handleQuestion, searchKey, mergeFront, MAX_GUARD_HITS, GROW_WINDOW } from '../src/agent.js';
 import { MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_ANSWER_LEN, MAX_RESULT_ROWS, MAX_RESULT_COLS, MAX_CELL_LEN, TRUNC_MARK, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_BATCH_QUERIES, MAX_EXPANDS, MAX_DOC_LEN, SEARCH_TARGETS, indentLines } from '../src/constants.js';
-import { buildPrompt } from '../src/llm-openai.js';
+import { buildPrompt, NO_SEARCH_LEFT_NOTE, NO_QUERY_LEFT_NOTE, fewQueriesLeftNote, fewExpandsLeftNote } from '../src/llm-openai.js';
 import { buildItems, planRanges, canGrow, CHUNK_OVERLAP, CHUNK_TARGET_LEN } from '../src/chunk.js';
 
 const ran = (name, params, rows = [{ A: 1 }]) => ({ query_name: name, params, rows, totalRows: rows.length });
@@ -1150,6 +1150,85 @@ test('청구 상한을 다 쓰면 남은 항목의 번호가 전부 사라진다
     const after = buildPrompt(last);
     assert.doesNotMatch(after, /^- [km]\d+ \[/m, `상한을 다 썼는데 번호가 남았다:\n${after.split('\n').filter(l => /^- [km]\d+ /.test(l)).join('\n')}`);
     assert.match(after, /^- \[K3/m, '번호만 떼고 항목은 그대로 실려야 한다');
+  } finally { restore(); }
+});
+
+// 검색도 같다 — 실행한 검색은 이력에 남지만 상한(MAX_SEARCHES)은 프롬프트 어디에도 없어, 생산적인 검색 셋 뒤 모델이 낸
+// 넷째 검색은 '상한에 닿았다'는 안내와 헛돈 스텝으로 끝났다(실측). 새 자료가 없는 검색은 가드가 먼저 끊으므로 이 자리는
+// 매번 새 자료를 얻은 검색에서만 열린다 — 그래서 시나리오도 검색마다 다른 지식을 돌려준다.
+test('검색 기회를 다 쓰면 다음 프롬프트의 지시 블록이 그 사실을 말한다 — 모델은 상한을 볼 수 없다', async () => {
+  const restore = silence();
+  try {
+    let n = 0;
+    const llm = scripted([
+      ...Array.from({ length: MAX_SEARCHES }, (_, i) => ({ action: 'search', text: `검색${i}`, targets: ['knowledge'] })),
+      { action: 'answer', answer: '답' },
+    ]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide, search: async () => found({ knowledge: [K(++n)] }) } });
+    assert.equal(r.answer, '답');
+    assert.equal(r.search.searches, MAX_SEARCHES);
+    const before = llm.seen.at(-2);   // 마지막 검색을 내기 직전 — 기회가 하나 남아 있다
+    assert.equal(before.canSearch, true);
+    assert.ok(!buildPrompt(before).includes(NO_SEARCH_LEFT_NOTE), '기회가 남았는데 소진 안내가 붙었다');
+    const after = llm.seen.at(-1);    // 상한을 다 쓴 다음 프롬프트
+    assert.equal(after.canSearch, false);
+    assert.ok(buildPrompt(after).includes(NO_SEARCH_LEFT_NOTE), '검색 기회를 다 썼는데 지시 블록이 말하지 않는다');
+  } finally { restore(); }
+});
+
+// 조회도 같다 — 조회 MAX_STEPS건 뒤 모델이 낸 다음 run_query는 루프가 `runs >= MAX_STEPS`에서 버리고 강제 답변 호출이 하나
+// 더 나갔다(실측: 7번으로 끝날 요청에 LLM 호출 8번). 상한은 프롬프트 어디에도 없었다. 남은 수는 조회 수 상한과 이력 줄 수
+// 상한 중 먼저 닿는 쪽이고, 한 결정에 담을 수 있는 수보다 적어지면 그 수를 말한다 — 더 담은 배치는 꼬리가 잘리기 때문이다.
+test('남은 조회 수를 지시 블록이 말한다 — 다 쓰면 더 조회할 수 없다고', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', text: 'x', targets: ['query'] },
+      ...Array.from({ length: MAX_STEPS }, (_, i) => ({ action: 'run_query', query_name: 'q1', params: { a: i } })),
+      { action: 'answer', answer: '답' },
+    ]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      run: async (row, params) => ({ rows: [{ V: params.a }], totalRows: 1, capped: false, targetDb: 'D' }),
+      search: async () => found({ queries: [Q(1, 'q1')] }) } });
+    assert.equal(r.answer, '답');
+    assert.equal(r.trace.filter(h => h.rows).length, MAX_STEPS);
+    // 검색 직후: 남은 조회 수는 MAX_STEPS — 한 결정에 담을 수 있는 수 이상이면 아무 말도 붙지 않는다.
+    const first = llm.seen[1];
+    assert.equal(first.queriesLeft, Math.min(MAX_STEPS, MAX_HISTORY_ROWS - 1));
+    // 조회를 두 번 한 뒤: MAX_STEPS − 2건이 남았고, 그 수가 배치 상한보다 적으면 지시 블록이 그 수를 말한다.
+    const mid = llm.seen[3];
+    assert.equal(mid.queriesLeft, MAX_STEPS - 2);
+    assert.ok(MAX_STEPS - 2 < MAX_BATCH_QUERIES, '이 대조는 남은 수가 배치 상한보다 적어야 뜻이 있다');
+    assert.ok(buildPrompt(mid).includes(fewQueriesLeftNote(MAX_STEPS - 2)), '남은 조회 수를 말하지 않는다');
+    // 다 쓴 뒤: 더 조회할 수 없다고 말한다 — 이 프롬프트를 받은 모델이 run_query를 내면 그 결정은 버려진다.
+    const last = llm.seen.at(-1);
+    assert.equal(last.queriesLeft, 0);
+    assert.ok(buildPrompt(last).includes(NO_QUERY_LEFT_NOTE), '조회 기회를 다 썼는데 지시 블록이 말하지 않는다');
+  } finally { restore(); }
+});
+
+// 청구 기회가 하나 남았을 때 번호 둘을 적으면 둘째는 applyExpand의 break에서 안내 없이 버려진다 — 그 자체는 상한의 동작이지만,
+// 모델은 남은 수를 볼 수 없었다(성공한 청구는 이력에 남지 않는다). 다음 프롬프트에는 번호가 전부 사라져 되돌릴 수도 없다(실측).
+// 그래서 남은 수가 상한보다 적어지면 지시 블록이 그 수를 말한다 — 검색·조회 상한과 같은 규칙이다.
+test('청구 기회가 상한보다 적게 남으면 다음 프롬프트의 지시 블록이 그 수를 말한다', async () => {
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', text: 'x', targets: ['knowledge'] },
+      { action: 'expand', ids: ['k1'] },
+      { action: 'answer', answer: '답' },
+    ]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      search: async () => found({ knowledge: [LONG(1, 'A'), LONG(2, 'B'), LONG(3, 'C')] }) } });
+    assert.equal(r.answer, '답');
+    assert.equal(r.search.expanded, 1);
+    const before = llm.seen[1];   // 검색 직후 — 청구 기회가 전부 남아 있다
+    assert.equal(before.expandsLeft, MAX_EXPANDS);
+    assert.ok(!/본문 청구는 \d+건까지만/.test(buildPrompt(before)), '기회가 전부 남았는데 안내가 붙었다');
+    const after = llm.seen.at(-1);  // 한 번 청구한 뒤 — 남은 수가 상한보다 적다
+    assert.equal(after.expandsLeft, MAX_EXPANDS - 1);
+    assert.ok(buildPrompt(after).includes(fewExpandsLeftNote(MAX_EXPANDS - 1)), '남은 청구 수를 말하지 않는다');
+    assert.match(buildPrompt(after), /^- k[23] \[/m, '이 대조는 아직 청구할 수 있는 번호가 남아 있어야 뜻이 있다');
   } finally { restore(); }
 });
 

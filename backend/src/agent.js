@@ -372,9 +372,20 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
   // 어디에서도 볼 수 없다. 번호가 그대로 남아 있던 동안 모델은 시스템 프롬프트의 '번호가 붙어 있으면 청구할 수
   // 있다'를 따라 셋째 문서를 청구했고, 받은 것은 '상한에 닿았다'는 안내와 헛돈 스텝 하나였다(퍼징으로 잡았다 —
   // 두 번이면 강제 답변). '청구할 수 있는 자리에만 번호가 보인다'(context.md 2-3)가 상한에서만 깨져 있던 셈이다.
+  // canSearch도 같은 부류다 — 실행한 검색은 이력에 남지만 상한(MAX_SEARCHES)은 프롬프트 어디에도 없어, 생산적인 검색
+  // 셋 뒤에 모델이 낸 넷째 검색은 '상한에 닿았다'는 안내와 헛돈 스텝으로 끝났다(실측). 지시 블록이 이 값으로 한 줄을 붙인다.
+  // queriesLeft — 이 요청에서 더 실행할 수 있는 조회 수. 조회 수 상한(MAX_STEPS)과 이력 줄 수 상한(MAX_HISTORY_ROWS)
+  // 중 먼저 닿는 쪽이다(아래 루프의 take 계산과 같은 두 상한). 0이면 모델의 run_query 결정은 아래 `runs >= MAX_STEPS`에서
+  // 버려지고 강제 답변 호출이 하나 더 나간다 — 조회 5건 뒤 6번째 결정이 정확히 그렇게 왕복 하나를 태웠다(실측). 지시 블록이
+  // 0이면 '더 조회할 수 없다'를, 한 결정에 담을 수 있는 수(MAX_BATCH_QUERIES)보다 적으면 남은 수를 말한다.
   const ctx = () => ({
     question, chat, knowledge, qaMethods, queries, history,
-    searched: [...succeeded], tried: searched.size > 0, canExpand: expands < MAX_EXPANDS,
+    searched: [...succeeded], tried: searched.size > 0,
+    canExpand: expands < MAX_EXPANDS, canSearch: searches < MAX_SEARCHES,
+    queriesLeft: Math.max(0, Math.min(MAX_STEPS - runs, MAX_HISTORY_ROWS - history.length)),
+    // expandsLeft — 남은 청구 수. 상한보다 적어지면 지시 블록이 그 수를 말한다: 하나 남은 자리에 번호 둘을 적은 결정에서
+    // 둘째 번호가 안내 한 줄 없이 버려졌다(applyExpand의 break — 실측). 다음 프롬프트에는 번호가 전부 사라져 되돌릴 수도 없다.
+    expandsLeft: Math.max(0, MAX_EXPANDS - expands),
   });
   // 성공한 조회의 전체 행(≤MAX_ROWS). history에는 capRows로 자른 20행만 싣는다 — history는 프롬프트와
   // chat_log(steps)로 흘러가므로 거기에 전체를 실으면 둘이 함께 다섯 배 커진다.
