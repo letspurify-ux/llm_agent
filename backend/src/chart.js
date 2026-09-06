@@ -94,7 +94,14 @@ const marked = (v, max) => {
   const s = String(v);
   return s.length > max ? clipText(s, max) + TRUNC_MARK : s;
 };
-const escapeCell = value => String(value ?? '').replace(/\r\n?|\n/g, ' ').replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
+// 개행은 '문자 하나에 공백 하나'로 바꾼다 — CRLF를 공백 한 칸으로 접으면 안 된다.
+// 잘린 값 가드(agent.js clippedCopyDetector)는 칸에 보인 앞부분을 '우리가 자른 길이'(MAX_TABLE_CELL_LEN·
+// MAX_CHART_CELL_LEN·MAX_CELL_LEN, 각각의 서로게이트 한 칸 짧은 길이)와 대조해 알아본다. 이스케이프는
+// unescapeCell이 정확히 되돌리지만 개행 접기는 되돌릴 수 없으므로, 두 글자를 한 글자로 접는 순간 그 길이가
+// 어긋나 가드가 자기가 보여준 앞부분을 못 알아본다 — CRLF가 둘만 들어 있어도 그렇다(실측: 120자 칸이 117자로
+// 보여 대조를 비켜 갔다). 그러면 모델이 그 조각으로 조회해 0건을 받고 "없다"로 단정하는, 이 가드가 막기로 한
+// 실패가 그대로 난다. 공백 두 칸은 markdown이 한 칸으로 렌더하므로 화면은 달라지지 않는다.
+const escapeCell = value => String(value ?? '').replace(/[\r\n]/g, ' ').replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
 const cell = v => {
   if (v === null || v === undefined) return '';
   const s = typeof v === 'number' ? String(v) : marked(v, MAX_CHART_CELL_LEN);

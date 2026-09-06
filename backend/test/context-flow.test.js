@@ -145,6 +145,65 @@ test('같은 구간을 다시 검색해도 검색이 확정한 full 판정과 �
   assert.equal(result.trace.length, 2);
 });
 
+test('겹치는 두 검색이 합쳐져 문서 상한에 닿으면 확대 표시가 남지 않는다', async () => {
+  // 검색은 계획 범위의 앞뒤 한 조각을 함께 읽어 '더 받을 것이 있는가'(full)를 그 자리에서 확정한다(search.js).
+  // 그런데 겹치는 두 구간을 합칠 때는 두 구간의 청크만 손에 들고 다시 세우므로, 그 이웃을 잃으면 판정을
+  // 되세울 근거가 없어 full이 false로 되돌아간다. 합친 구간은 양쪽보다 넓어 이웃이 들어갈 여지가 더 작은데도
+  // '(확대 가능)'이 되살아나고, 모델이 그 번호로 청구하면 한 글자도 늘지 않은 채 청구 기회 하나(둘 중 하나)와
+  // 왕복 하나를 버린다 — 번호가 붙은 항목만 청구하라는 안내를 그대로 따랐는데도 그렇다.
+  const rows = source();
+  const hitSpan = (from, to) => {
+    const hits = rows.slice(from - 1, to).map((r, i) => ({ ...r, _dist: .3 + i / 1000 }));
+    const plans = planRanges(hits);
+    const loaded = rows.filter(r => plans.some(p => r.chunk_no >= p.from - 1 && r.chunk_no <= p.to + 1));
+    return buildItems(plans, loaded, { maxDocLen: MAX_DOC_LEN })[0];
+  };
+  const A = hitSpan(3, 8);
+  const B = hitSpan(7, 18);
+  assert.equal(A.full, false, '전제: 각 구간은 그 자체로는 더 넓힐 수 있다');
+  assert.equal(B.full, false);
+  assert.ok(canGrow(A) && canGrow(B));
+
+  const list = [structuredClone(A)];
+  mergeFront(list, [structuredClone(B)]);
+  assert.equal(list.length, 1, '겹치는 구간은 같은 ID로 합쳐진다');
+  const merged = list[0];
+  assert.equal(merged.seq, A.seq, '합쳐도 ID는 유지된다');
+  assert.deepEqual([merged.from, merged.to], [3, 18]);
+  assert.ok(indentLines(merged.content).length < MAX_DOC_LEN, '전제: 합친 본문은 상한 안이다');
+
+  // 실제로 한 조각도 더 넣을 수 없다 — 확대(grow=true)가 범위를 넓히지 못한다
+  const [grown] = buildItems(
+    [{ doc_seq: 1, rep: merged.rep, from: merged.from, to: merged.to, chunk_of: rows.length, dist: .3 }],
+    rows, { maxDocLen: MAX_DOC_LEN, grow: true });
+  assert.deepEqual([grown.from, grown.to], [merged.from, merged.to], '전제: 이웃 조각이 상한에 들어가지 않는다');
+
+  assert.equal(merged.full, true, '병합이 검색의 이웃 판정을 잃어 full이 되돌아갔다');
+  assert.equal(canGrow(merged), false);
+
+  // 끝에서 끝까지: 두 검색 뒤의 프롬프트에 그 항목의 확대 표시가 없고, 그래서 청구도 일어나지 않는다.
+  let turn = 0;
+  const result = await handleQuestion('절차', [], { deps: {
+    loadChunks: async () => assert.fail('확대 표시가 없으면 청구도 없다 — 본문을 읽을 일이 없다'),
+    search: async text => ({ knowledge: [structuredClone(text === 'a' ? A : B)] }),
+    decide: async c => {
+      if (c.forceAnswer) assert.fail('헛돈 스텝 없이 답해야 한다');
+      const k = c.knowledge.find(o => o.doc_seq === 1);
+      const line = buildPrompt(c).split('\n').find(l => l.startsWith(`- k${k?.seq} [`));
+      switch (turn++) {
+        case 0: return { action: 'search', text: 'a', targets: ['knowledge'] };
+        case 1: return { action: 'search', text: 'b', targets: ['knowledge'] };
+        default:
+          assert.deepEqual([k.from, k.to], [3, 18], '두 검색이 한 구간으로 합쳐졌다');
+          assert.doesNotMatch(line, /\(확대 가능\)/, `합친 뒤 확대 표시가 되살아났다:\n${line}`);
+          return { action: 'answer', answer: '확대 표시 없음 → 바로 답' };
+      }
+    },
+  } });
+  assert.equal(result.answer, '확대 표시 없음 → 바로 답');
+  assert.equal(result.trace.length, 2, '헛돈 청구 줄이 남지 않는다');
+});
+
 test('펼친 구간과 겹치는 후보도 같은 청크를 두 번 표시하지 않는다', () => {
   const rows = source();
   const view = knowledgeView([{ ...window(rows, 3, 8), expanded: true }, window(rows, 6, 10)]);
@@ -333,4 +392,50 @@ test('모델 응답 재시도의 토큰 사용량도 요청 합계에 포함한�
   assert.equal(result.timing.llm[0].prompt, 220);
   assert.equal(result.timing.llm[0].completion, 30);
   assert.equal(result.timing.llm[0].cached, 170);
+});
+
+test('확대가 다른 보관 구간을 삼켜도 한 항목은 한 줄이다 — 같은 ID의 줄이 둘이 되지 않는다', async () => {
+  // 확대(expand)는 대표 청크에서 문서 상한까지 넓히므로 같은 문서의 다른 보관 구간을 통째로 삼킬 수 있다.
+  // 그 삼켜진 구간이 뒤이어 숨김 복구로 목록 앞에 오면, 넓힌 항목에 남는 청크가 앞뒤 두 도막이 된다 —
+  // 그 둘을 다 실으면 같은 번호의 줄이 프롬프트에 두 개 실려 모델이 어느 쪽을 지목하는지 적을 수 없고,
+  // 섹션 머리말의 건수(항목 수)보다 본문 줄이 많아진다.
+  const rows = source();
+  const narrow = window(rows, 12, 13);   // 숨겼다 복구해 앞으로 오는 좁은 구간
+  const seed = window(rows, 10);         // 확대하면 12~13을 가운데 두고 양쪽으로 넘어서는 구간
+  const script = [
+    { action: 'search', text: '앞', targets: ['knowledge'] },
+    { action: 'search', text: '뒤', targets: ['knowledge'], drop: [`k${narrow.seq}`] },
+    { action: 'expand', ids: [`k${seed.seq}`] },
+    { action: 'expand', ids: [`k${narrow.seq}`] },
+  ];
+  let last;
+  await handleQuestion('운영 안내', [], { deps: {
+    decide: async c => { last = c; return script.shift() ?? { action: 'answer', answer: '끝' }; },
+    loadChunks: async ranges => rows.filter(r => ranges.some(g => r.chunk_no >= g.from && r.chunk_no <= g.to)),
+    search: async text => ({ knowledge: [structuredClone(text === '앞' ? narrow : seed)] }),
+  } });
+
+  const grown = last.knowledge.find(o => o.seq === seed.seq);
+  assert.ok(grown.from < narrow.from && grown.to > narrow.to,
+    `확대 구간이 좁은 구간을 가운데 두고 넘어서야 이 회귀가 성립한다: ${grown.from}~${grown.to}`);
+  assert.equal(grown.chunks.length, grown.to - grown.from + 1, '표시 제한이 보관한 청크를 지우지 않는다');
+
+  const shown = knowledgeView(last.knowledge).filter(o => !o.dropped && !o.viewOmitted);
+  assert.equal(shown.filter(o => o.seq === seed.seq).length, 1, '한 항목은 한 줄이다');
+  const line = shown.find(o => o.seq === seed.seq);
+  assert.ok(line.from <= grown.rep && grown.rep <= line.to, '싣는 구간은 대표 청크가 든 쪽이다');
+  assert.ok(line.moreStored, '싣지 못한 보관 구간이 있으면 그 사실을 알린다');
+
+  const prompt = buildPrompt(last);
+  const section = prompt.split('## 관련 지식')[1].split('\n## ')[0];
+  const ids = [...section.matchAll(/^- (k\d+) \[/gm)].map(m => m[1]);
+  assert.deepEqual(ids, [...new Set(ids)], `같은 ID의 줄이 둘이다: ${ids}`);
+  assert.equal(ids.length, last.knowledge.filter(o => !o.dropped).length, '본문 줄 수가 머리말의 건수와 같다');
+  // 청구 기회가 남아 있으면 보관 구간이 더 있다는 사실이 프롬프트에도 실린다 (다 썼으면 표시가 사라진다).
+  assert.match(buildPrompt({ ...last, canExpand: true }), /\(보관 구간 더 있음\)/);
+
+  // 싣지 못한 구간은 지워진 것이 아니다 — 같은 ID를 앞으로 가져오면 보관한 범위가 전부 실린다.
+  const front = knowledgeView([grown, last.knowledge.find(o => o.seq === narrow.seq)]);
+  assert.deepEqual([front[0].seq, front[0].from, front[0].to], [seed.seq, grown.from, grown.to]);
+  assert.ok(front[1].viewOmitted, '앞선 항목이 다 실으면 삼켜진 구간은 보관 목록으로 물러난다');
 });

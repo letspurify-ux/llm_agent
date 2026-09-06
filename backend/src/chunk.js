@@ -305,6 +305,14 @@ export function buildItems(plans, rows, { maxDocLen = MAX_DOC_LEN, grow = false 
       // 옮기면 항목의 seq가 바뀐다. 그러면 모델이 방금 청구한 k12가 다음 스텝에 존재하지 않아
       // 다시 청구할 수도, 버릴 수도 없다 — seq가 요청 내내 고정이라는 계약이 깨지는 자리다.
       seq: rep.seq, rep: repNo, doc_seq: p.doc_seq, chunk_of: chunkOf, from, to, full,
+      // 범위 바로 밖의 조각. 본문에는 싣지 않는다 — full 판정의 근거로만 들고 다닌다.
+      // 검색은 계획 범위의 앞뒤 한 조각을 함께 읽어 full을 그 자리에서 확정하는데(search.js), 그 근거를
+      // 항목이 들고 있지 않으면 나중에 두 구간을 합칠 때(context-items.js absorbKnowledge) 다시 세울 수가 없다.
+      // 합친 구간은 양쪽보다 넓으므로 이웃이 들어갈 여지도 더 작은데, 근거가 없으면 full이 false로 되돌아가
+      // '(확대 가능)'이 되살아난다 — 모델이 그 번호로 청구하면 한 글자도 늘지 않고 청구 기회 하나를 버린다
+      // (실측: 3~8과 7~13이 합쳐 3~13 9,450자가 되면 이웃 두 조각 모두 상한을 넘는데 표시는 남아 있었다).
+      // 두 줄이면 충분하다: full이 보는 것이 정확히 '범위 바로 밖의 한 조각'이기 때문이다.
+      edges: [have.get(from - 1), have.get(to + 1)].filter(Boolean),
       title: rep.title,
       // 위치 표기를 제목에 이어 붙이지 않고 따로 둔다. 붙여서 넘기면 프롬프트가 제목을
       // MAX_PROMPT_NAME_LEN(100자)으로 자를 때 뒤에 있는 이 표기부터 사라진다 — 제목이 긴 문서일수록

@@ -355,6 +355,49 @@ test('답변 표·차트에서 잘린 칸의 앞부분도 잘린 조각으로 �
 // 들면 칸의 시작에 닿지 못해 앞부분을 하나도 넣지 못했다(실측 — 'a|'가 되풀이되는 300자 값에서 120자 조각도
 // 보이는 그대로의 표시도 통과했다). 경로·로그 메시지 같은 자유 텍스트가 정확히 그 값이고, 그것이 잘린 채 바인드로
 // 되돌아오면 0건 오답이 된다. 칸의 경계(이스케이프되지 않은 '|')에서 시작해 이스케이프를 되돌린 값으로 판정한다.
+test('CRLF가 든 잘린 칸의 앞부분도 걸러낸다 — 칸의 개행이 글자 수를 줄이지 않는다', async () => {
+  // 자유 텍스트 컬럼(장애 메모·주소·로그)은 Windows 편집기에서 들어와 줄바꿈이 CRLF인 경우가 흔하다.
+  // 칸은 개행을 공백으로 바꿔 보여주는데, CRLF 두 글자를 공백 '한 칸'으로 접으면 칸에 보인 앞부분의
+  // 글자 수가 우리가 자른 길이(MAX_TABLE_CELL_LEN·MAX_CHART_CELL_LEN·MAX_CELL_LEN)와 어긋난다.
+  // 이 가드는 그 길이로 '우리가 보여준 조각'을 알아보므로, 어긋나는 순간 자기가 보여준 조각을 못 알아본다 —
+  // 모델이 그 조각으로 조회하면 반드시 0건이 나오고 그것을 "그런 데이터가 없다"로 단정한다.
+  // 오류가 한 줄도 남지 않는 오답이라 이 저장소가 가장 나쁘게 보는 형태이고, 실측으로 재현됐다
+  // (CRLF 세 개가 든 값에서 120자 칸이 117자로 보여 대조를 통째로 비켜 갔다).
+  const { resolveTableData, resolveChartData, MAX_TABLE_CELL_LEN, MAX_CHART_CELL_LEN } = await import('../src/chart.js');
+  const { normalizeCells, runQuery } = await import('../src/oracle.js');
+  const { renderAnswer } = await import('../src/llm.js');
+  const { clipText } = await import('../src/constants.js');
+  const memo = ['장애 보고서', '원인: 배치 지연', '조치: 재기동', '비고: ' + '상세 '.repeat(120)].join('\r\n');
+  const [row] = [normalizeCells({ MEMO: memo, ID: 'R1' })];
+  assert.ok(row.MEMO.endsWith(TRUNC_MARK) && /\r\n/.test(row.MEMO), '전제: 드라이버 경계가 자른 셀에 CRLF가 남아 있다');
+
+  const answer = resolveChartData(
+    resolveTableData('```table\nstep: 1\n```\n```chart\ntype: bar\ntitle: t\nx: MEMO\ny: ID\ndata: step 1\n```', [[row]]), [[row]]);
+  assert.ok(!/[\r\n]\|/.test(answer.replace(/\n\|/g, '')) && !answer.includes('\r'), '칸에 개행이 남으면 그 행이 둘로 갈라진다');
+
+  // 모델이 칸에서 볼 수 있는 앞부분 — 개행 자리는 공백으로 보인다.
+  const seenInCell = n => clipText(row.MEMO, n).replace(/[\r\n]/g, ' ');
+  const d = clippedCopyDetector([{ role: 'assistant', text: answer }]);
+  assert.equal(d.isCopy(seenInCell(MAX_TABLE_CELL_LEN)), true, '표의 칸에서 옮겨 적은 앞부분');
+  assert.equal(d.isCopy(seenInCell(MAX_CHART_CELL_LEN)), true, '차트의 칸에서 옮겨 적은 앞부분');
+
+  // 폴백 표(llm.js)는 드라이버 경계의 값을 그대로 싣는다 — 같은 규칙, 같은 판정
+  const fallback = renderAnswer({ knowledge: [], history: [{ query_name: 'q', rows: [row] }] });
+  const d2 = clippedCopyDetector([{ role: 'assistant', text: fallback }]);
+  assert.equal(d2.isCopy(seenInCell(MAX_CELL_LEN)), true, '폴백 표의 200자 앞부분');
+
+  // 실행 경계까지 — 그 조각으로는 조회가 시작되지 않는다
+  process.env.ORACLE_MOCK = '1';
+  await assert.rejects(
+    runQuery({ query_name: 'q', query_sql: 'SELECT 1 FROM T WHERE MEMO = :memo', target_db_name: 'D' },
+      { memo: seenInCell(MAX_TABLE_CELL_LEN) }, d.isCopy),
+    e => e.safe === true && /잘린 값/.test(e.message),
+    '표의 칸 조각이 실행 경계를 그대로 지났다'
+  );
+  // 길이 판정은 그대로다 — 자른 적 없는 정당한 값은 막히지 않는다
+  assert.equal(d.isCopy('상세 '.repeat(24)), false);
+});
+
 test('파이프·역슬래시가 든 잘린 칸도 앞부분을 걸러낸다 — 보이는 그대로도, 되돌린 값도', async () => {
   const { resolveTableData, resolveChartData, MAX_TABLE_CELL_LEN, MAX_CHART_CELL_LEN } = await import('../src/chart.js');
   const { normalizeCells } = await import('../src/oracle.js');

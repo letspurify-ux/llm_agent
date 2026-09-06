@@ -221,6 +221,30 @@ function AltImage({ node, src, alt, title }) {
 const MAIN_MD = mdProps({ pre: PreOrBlock, a: NewTabLink, img: AltImage });
 const PREVIEW_MD = mdProps({ pre: PreviewPre, a: NewTabLink, img: AltImage });
 
+// 미리보기 본문도 memo 뒤에 둔다 — 완성된 답을 Message(memo)로 감싼 것과 같은 이유이고, 다른 것은
+// 이쪽이 '살아 있는 화면'이라 값을 치르는 순간이 하필 사용자가 무언가를 하고 있을 때라는 점뿐이다.
+// react-markdown은 렌더마다 markdown 전체를 다시 파싱한다(v10 Markdown()은 runSync(parse(file))를
+// 그대로 부른다 — 안에 memo도 useMemo도 없다). 이 자리는 App의 렌더 안에 있으므로, 조각이 하나도
+// 오지 않아도 App이 다시 렌더될 때마다 그 파싱이 한 번씩 돈다. App을 다시 렌더시키는 것 중 사용자가
+// 답을 기다리는 동안 실제로 하는 일이 하나 있다: 다음 질문을 입력창에 치는 것(setInput)이다.
+// 그래서 글자 하나마다 미리보기 전체가 다시 파싱되고 입력이 그만큼 멈춘다 — 실측(Chrome, 키 입력
+// 하나의 동기 비용): 미리보기 6.6k자 25ms, 20k자 67ms, 63k자 200ms. 답변 상한이 70,000자
+// (backend MAX_ANSWER_LEN)이므로 긴 답을 기다리는 동안에는 글자마다 0.2초씩 얼어붙는다.
+// 한글은 조합 중에도 input 이벤트가 자모마다 오므로 그만큼 더 자주 치른다.
+// (같은 글이 done 뒤 memo된 말풍선에 들어가면 같은 키 입력이 0~2ms다 — 비용은 markdown 파싱이지
+//  화면 크기가 아니다.)
+// text·rehypePlugins가 그대로면 memo가 파싱까지 함께 막는다 — 플러그인 배열은 useMarkdownPlugins가
+// useMemo로 붙들고 있고(위 NO_REHYPE 참고), 나머지는 모듈 상수다.
+const PreviewBody = memo(function PreviewBody({ text, rehypePlugins }) {
+  return (
+    <div className="md preview">
+      <ChartBudget.Provider value={{ n: 0 }}>
+        <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={rehypePlugins} {...PREVIEW_MD}>{text}</ReactMarkdown>
+      </ChartBudget.Provider>
+    </div>
+  );
+});
+
 // 입력창 타이핑마다 전체 대화가 다시 렌더되지 않도록 메시지 하나를 분리해 memo한다
 // (assistant 답변은 markdown 파싱 비용이 있어 대화가 길어질수록 체감된다)
 // 조회된 행을 CSV 파일로 내려준다. 클립보드가 아닌 파일인 이유: navigator.clipboard는 https·localhost
@@ -612,7 +636,16 @@ export default function App() {
     // 여기서도 떼 버리면 답을 기다리며 패널을 접은 사람은 바닥에 있으면서도 도착한 답을 못 본다
     // (답은 붙어 있을 때만 따라가므로 화면 밑에 놓인다).
     const el = chatRef.current;
-    const unstick = () => { stuckRef.current = false; };
+    // 떼는 것만으로는 모자라다 — 이미 도는 미끄러짐도 함께 멈춰야 한다. glide의 step은 매 프레임
+    // target()을 다시 재므로(그래야 내려가는 동안 늦게 서는 차트까지 따라간다), 그 사이에 무언가를
+    // 펼치면 펼쳐서 자란 높이가 그대로 새 목표가 되어 사용자를 바닥까지 끌고 간다. 떼어 둔 표시는
+    // '앞으로 시작할' 미끄러짐만 막지, 이미 도는 것에는 닿지 않는다.
+    // 실측: 답이 온 뒤 600ms 안에 ⚡ 패널을 펼치면 패널의 머리가 화면 위로 513px 밀려났고, 질문을
+    // 보내자마자(내 말은 언제나 바닥으로 따라간다) 앞 답변의 패널을 펼치면 2,437px 끌려갔다 —
+    // 펼친 것을 보려던 사용자가 엉뚱한 자리에 남는다.
+    // 사용자의 개입에서 도는 미끄러짐을 멈추는 것은 이 파일의 다른 자리와 같은 처방이다
+    // (끌기 시작·안쪽 스크롤·대화 밖 휠이 모두 stopGlide를 부른다).
+    const unstick = () => { stuckRef.current = false; stopGlide(); };
     const onSummaryClick = e => { const d = e.target.closest?.('summary')?.parentElement; if (d && !d.open) unstick(); };
     const onToggle = e => { if (e.target.open) unstick(); };
     el?.addEventListener('click', onSummaryClick, true);
@@ -899,6 +932,14 @@ export default function App() {
   // 조합 중인 입력창의 값을 건드려도 되는 상태로 만드는 방법이 이것뿐이다.
   // (조합 중에 값을 갈아끼우면 뒤늦은 확정이 그 위에 덮여 글자가 뒤엉킨다)
   function endComposition(el) {
+    // 밀어 둔 Enter는 여기서 없앤다. 이 함수를 부르는 자리는 줄바꿈뿐이고(아래 onKeyDown의 Alt·Shift),
+    // 줄을 바꾸겠다는 것은 그 전에 눌린 Enter를 무르겠다는 뜻이다. 지우지 않으면 바로 아래 blur가
+    // 조합을 확정시키며 compositionend를 내는데 — 그 이벤트는 blur '앞'에 온다(실측: Chrome이
+    // compositionstart → compositionend → blur → focus 순으로 냈다) — 그것을 받는 쪽(onCompositionEnd)이
+    // 밀린 Enter를 갚아 쓰다 만 질문이 그대로 나간다. 사용자가 누른 것은 줄바꿈인데 질문이 전송되고,
+    // 입력창에는 방금 넣은 줄바꿈 하나만 남는다(실측: 값이 '\n' 하나였다).
+    // onBlur의 같은 지우기로는 막지 못한다 — 그쪽은 compositionend '뒤'에 오기 때문이다.
+    pendingSendRef.current = false;
     const { selectionStart, selectionEnd } = el;
     el.blur();
     el.focus();
@@ -933,6 +974,17 @@ export default function App() {
 
   async function ask(message) {
     if (!message || !canSend()) return;
+    // 보낸 뒤에도 키보드가 살아 있어야 한다. 마우스로 전송 단추를 누르면 그 단추가 초점을 받는데
+    // 바로 다음 렌더에서 disabled가 되고(loading), 예시 칩은 아예 사라진다 — 브라우저는 초점을
+    // 잃은 자리를 <body>로 되돌리고, 그 뒤로는 친 글자가 아무 데도 들어가지 않는다. 사용자는
+    // 질문마다 입력창을 다시 클릭해야 하고, 그 사실을 알려 주는 것은 아무것도 없다
+    // (실측: 전송 단추·예시 칩을 마우스로 누른 뒤 진짜 키 입력이 입력창에 닿지 못했다. 답이
+    //  도착해도 돌아오지 않는다 — 초점을 되돌리는 자리가 goHome 하나뿐이었다).
+    // 그래서 초점을 잃기 전에 여기서 입력창으로 옮긴다. Enter로 보낸 길에서는 이미 입력창에
+    // 초점이 있어 아무 일도 하지 않고, 세 갈래(Enter·단추·칩)가 같은 자리에서 끝나게 된다.
+    // 부르는 쪽의 클릭 처리 안에서 동기로 불러야 한다 — 초점이 <body>로 떨어진 뒤에 되돌리면
+    // 휴대폰에서는 자판이 닫혔다 다시 열린다.
+    inputRef.current?.focus();
     let answer = '서버와 통신하지 못했습니다.';
     let trace;
     let answered = false; // 서버가 실제로 '답'을 돌려줬는가 (통신 실패·타임아웃·서버 오류와 구분)
@@ -1086,12 +1138,7 @@ export default function App() {
                     코드블록 렌더러가 자리 표시를 그린다(preview.js). 반쯤 온 글이 렌더러를 던지게 해도 답을 잃지 않게 경계로 감싼다. */}
                 {preview && (
                   <Boundary what="preview" fallback={<pre className="preview-raw">{preview}</pre>}>
-                    <div className="md preview">
-                      <ChartBudget.Provider value={{ n: 0 }}>
-                        <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={previewPlugins}
-                                       {...PREVIEW_MD}>{preview}</ReactMarkdown>
-                      </ChartBudget.Provider>
-                    </div>
+                    <PreviewBody text={preview} rehypePlugins={previewPlugins} />
                   </Boundary>
                 )}
               </div>

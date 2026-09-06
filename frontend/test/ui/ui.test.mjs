@@ -161,6 +161,25 @@ async function sendQuestion(text, answers) {
   await page.until(`document.querySelectorAll('.row.assistant').length === ${answers} && !document.querySelector('.typing')`);
 }
 
+// 이 파일의 스크롤 검사 절반은 '움직이지 않는다'를 단언한다(휠로 올려 읽는 중·펼침·빈 첫 화면·표를
+// 굴리는 동안). 그 검사들이 뜻을 가지려면 '가만히 두면 움직였을 것'이 참이어야 하는데, 화면을 움직이는
+// 것은 App.jsx glide의 requestAnimationFrame이다 — rAF가 돌지 않는 환경에서는 앱이 한 프레임도 놓지
+// 못해 무엇을 해도 화면이 그대로다. 그러면 그 검사들은 고장난 앱에서도, 아무 앱에서도 통과한다.
+// 실측(2026-09-06): 같은 Chrome을 쓰는 실험용 하네스에서 탭이 visibilityState:'hidden'으로 서 있어
+// 1초에 rAF가 한 번만 돌았고, '답이 오면 바닥으로 따라간다'가 아예 일어나지 않는데도 '움직이지
+// 않는다' 쪽 단언은 전부 참이었다. 전제를 검사 밖에 두면 그런 초록불을 아무도 보지 못한다.
+// 그래서 다른 검사들보다 먼저 여기서 못 박는다. 깨지면 앱이 아니라 이 검사 환경을 먼저 볼 것
+// (헤드리스 플래그·CI의 창 관리 — driver.mjs launchChrome).
+it('검사 환경 전제: 화면이 보이는 상태이고 rAF가 실제로 돈다 (아니면 스크롤 검사들이 헛돈다)', async () => {
+  await page.goto(url(), '.chip');
+  assert.equal(await page.eval(`document.visibilityState`), 'visible',
+    '탭이 숨은 상태다 — glide의 rAF가 얼어 스크롤 검사가 전부 헛돈다');
+  await page.eval(`(window.__rafTicks = 0, (function tick() { window.__rafTicks++; requestAnimationFrame(tick); })(), 1)`);
+  await sleep(400);
+  const ticks = await page.eval(`window.__rafTicks`);
+  assert.ok(ticks > 5, `400ms 동안 rAF가 ${ticks}번만 돌았다 — 화면이 그려지지 않는 환경이라 스크롤 검사를 믿을 수 없다`);
+});
+
 it('회귀: 시간대가 다른 두 시각은 같은 시계 표시라도 선 그래프로 그려진다', async () => {
   await page.goto(url(), '.chip');
   const answer = '```chart\ntype: line\n| 시각 | 값 |\n|---|---|\n| 2026-09-06 12:00:00 +00:00 | 2 |\n| 2026-09-06 12:00:00 +09:00 | 1 |\n```';
@@ -171,6 +190,33 @@ it('회귀: 시간대가 다른 두 시각은 같은 시계 표시라도 선 그
   await page.until(`document.querySelectorAll('.recharts-line-dot').length === 2`);
   const points = await page.eval(`[...document.querySelectorAll('.recharts-line-dot')].map(e => Number(e.getAttribute('cx')))`);
   assert.ok(points[1] > points[0], `두 순간의 x 좌표가 겹친다: ${points}`);
+});
+
+// 서머타임을 쓰는 PC에서는 한 해에 한 번 지역 시간에 '없는 한 시간'이 생긴다(America/New_York의
+// 2024-03-10 02:00~02:59). Date는 그런 값을 거절하지 않고 다음 시각으로 옮기므로, 02:30 행이 03:30 행과
+// 같은 순간이 되어 '같은 x에 행이 여럿'으로 차트가 통째로 표가 됐다(실측). 조회 결과가 브라우저와 같은
+// 시간대일 이유는 없다 — 한국 DB의 평범한 한 줄이 그 PC에서 이 자리에 걸린다.
+// 단위 시험(test/chart.test.js)이 판정 자체를 못 박고, 여기서는 '진짜 브라우저의 시간대에서도 그림이
+// 그려지는가'를 잰다 — 시간대 계산은 브라우저의 ICU가 하고, 화면에서 보이는 손해는 '차트가 사라진다'다.
+it('회귀: 서머타임으로 없어진 시각이 섞여도 차트가 표로 주저앉지 않는다', async () => {
+  await page.goto(url(), '.chip');
+  await page.send('Emulation.setTimezoneOverride', { timezoneId: 'America/New_York' });
+  try {
+    const answer = '```chart\ntype: line\nxtype: time\n| 일시 | 값 |\n|---|---|'
+      + '\n| 2024-03-10 01:30 | 1 |\n| 2024-03-10 02:30 | 2 |\n| 2024-03-10 03:30 | 3 |\n```';
+    await page.eval(`window.fetch = async () => new Response(JSON.stringify({ answer: ${JSON.stringify(answer)} }),
+      { headers: { 'Content-Type': 'application/json' } })`);
+    await sendQuestion('없는 시각이 섞인 측정값', 1);
+    await page.until(`document.querySelectorAll('.recharts-line-dot').length === 2`,
+      { what: '없는 시각을 뺀 두 점이 그려지기 (예전에는 차트가 통째로 표가 됐다)' });
+    const points = await page.eval(`[...document.querySelectorAll('.recharts-line-dot')].map(e => Number(e.getAttribute('cx')))`);
+    assert.ok(points[1] > points[0], `두 순간의 x 좌표가 겹친다: ${points}`);
+    // 빠진 행은 조용히 사라지지 않고 그림 아래에 밝혀진다 (chart.js chartNotes)
+    const note = await page.eval(`[...document.querySelectorAll('.chart-note')].map(e => e.textContent).join(' | ')`);
+    assert.match(note, /x를 시간으로 읽지 못한 1행/);
+  } finally {
+    await page.send('Emulation.setTimezoneOverride', { timezoneId: '' });
+  }
 });
 
 it('회귀: 인용문 속 차트도 미리보기에서는 준비 중으로 남긴다', async () => {
@@ -230,6 +276,276 @@ it('회귀: 공백뿐인 답은 실패 안내로 표시하고 다음 질문의 �
   await sendQuestion('다음 질문', 2);
   assert.equal(first, '답변을 만들지 못했습니다.');
   assert.deepStrictEqual(await page.eval(`window.__requests[1].history`), [{ role: 'user', text: '첫 질문' }]);
+});
+
+// 마우스로 보낸 뒤에도 키보드가 살아 있는가.
+// 전송 단추는 눌린 순간 초점을 받고 바로 다음 렌더에서 disabled가 되며(loading), 예시 칩은 눌리면
+// 사라진다 — 브라우저는 그 초점을 <body>로 되돌리고, 그 뒤로 친 글자는 아무 데도 들어가지 않는다.
+// 사용자는 질문마다 입력창을 다시 클릭해야 하는데, 그 사실을 알려 주는 것은 아무것도 없다
+// (App.jsx ask의 focus 참고. 초점을 되돌리는 자리가 goHome 하나뿐이었다).
+//
+// 이 시험은 반드시 '진짜' 마우스와 '진짜' 키로 재야 한다 — 그러지 않으면 고장난 화면에서도 초록불이 난다:
+//   el.click()은 초점을 옮기지 않는다(그래서 단추가 초점을 받았다가 잃는 그 순간이 아예 생기지 않는다).
+//   Input.insertText는 초점과 무관하게 페이지에 글자를 넣는다(초점이 <body>여도 입력창에 글자가 들어간다).
+// 실제로 이 결함은 앞선 검토들이 그 둘로 재는 동안 열 번 넘게 지나쳤다.
+it('회귀: 마우스로 보낸 뒤에도(전송 단추·예시 칩) 키보드로 바로 다음 질문을 쓸 수 있다', async () => {
+  const 가운데 = async sel => JSON.parse(await page.eval(`(() => { const e = document.querySelector(${JSON.stringify(sel)});
+    if (!e) return 'null'; const r = e.getBoundingClientRect();
+    return JSON.stringify({ x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }); })()`));
+  // 글자를 내는 키 입력 (page.key는 text가 없어 글자를 넣지 않는다 — 스크롤 키 전용이다)
+  const 글자 = async ch => {
+    await page.send('Input.dispatchKeyEvent', { type: 'keyDown', text: ch, unmodifiedText: ch });
+    await page.send('Input.dispatchKeyEvent', { type: 'keyUp' });
+  };
+  for (const [무엇, 보내기] of [
+    ['예시 칩', async () => { const p = await 가운데('.chip'); await page.press(p.x, p.y); }],
+    ['전송 단추', async () => {
+      await page.eval(`document.querySelector('.composer textarea').focus()`);
+      await 글자('질'); await 글자('문');
+      const p = await 가운데('button.send');
+      await page.press(p.x, p.y);
+    }],
+  ]) {
+    await page.viewport(1000, 760);
+    await page.goto(url(), '.chip');
+    await page.viewport(1000, 760);
+    await page.eval(`window.fetch = async () => new Response(JSON.stringify({ answer: '답' }),
+      { headers: { 'Content-Type': 'application/json' } })`);
+    await 보내기();
+    await page.until(`document.querySelectorAll('.row.assistant').length === 1 && !document.querySelector('.typing')`,
+      { what: `${무엇}으로 보낸 답이 도착하기` });
+    await 글자('다'); await 글자('음');
+    // 없는 일을 기다리는 자리라 page.until을 쓸 수 없다 — 고장난 화면에서는 영영 오지 않는다.
+    await sleep(300);
+    const [값, 초점] = JSON.parse(await page.eval(`JSON.stringify([document.querySelector('.composer textarea').value,
+      document.activeElement ? document.activeElement.tagName : 'none'])`));
+    assert.equal(값, '다음', `${무엇}으로 보낸 뒤 친 글자가 입력창에 들어가지 않았다 (초점: ${초점})`);
+  }
+});
+
+// 서버가 흘려보내는 이벤트 중 answer_reset·error는 단위 검사만 있었다 — 화면까지 오는 길은 여기서 지킨다.
+// answer_reset은 모델이 답을 쓰다 되돌릴 때 온다(backend agent.js onAnswerDelta). 미리보기를 비우지 못하면
+// 버려진 앞부분이 다시 쓴 답 앞에 남아, 사용자는 답이 도착하기까지 모델이 취소한 글을 읽는다.
+it('회귀: answer_reset이 오면 미리보기를 비우고 그 뒤에 온 조각만 그린다', async () => {
+  await page.goto(url(), '.chip');
+  await page.eval(`window.fetch = async () => new Response(new ReadableStream({
+    start(c) { window.__line = o => c.enqueue(new TextEncoder().encode(JSON.stringify(o) + '\\n')); }
+  }), { headers: { 'Content-Type': 'application/x-ndjson' } }); document.querySelector('.chip').click()`);
+  await page.eval(`window.__line({ type: 'answer_delta', text: '모델이 버린 앞부분' })`);
+  await page.until(`document.querySelector('.preview')`, { what: '첫 조각이 미리보기에 서기' });
+  await page.eval(`window.__line({ type: 'answer_reset' })`);
+  await page.until(`!document.querySelector('.preview')`, { what: 'answer_reset이 미리보기를 비우기' });
+  await page.eval(`window.__line({ type: 'answer_delta', text: '다시 쓴 답변' })`);
+  await page.until(`document.querySelector('.preview')`, { what: '다시 쓴 조각이 서기' });
+  const text = await page.eval(`document.querySelector('.preview').textContent`);
+  await page.eval(`window.__line({ type: 'done', answer: '다시 쓴 답변' })`);
+  await page.until(`!document.querySelector('.typing')`);
+  assert.equal(text, '다시 쓴 답변', `되돌린 앞부분이 미리보기에 남았다: ${text}`);
+});
+
+// 답을 기다리는 동안 사용자가 실제로 하는 일 하나가 '다음 질문을 미리 쳐 두는 것'이다. 그 타이핑은
+// setInput으로 App을 다시 렌더시키는데, react-markdown은 렌더마다 markdown 전체를 다시 파싱한다
+// (v10 Markdown()에는 memo도 useMemo도 없다). 미리보기가 App의 렌더 안에 그대로 있으면 조각이 하나도
+// 오지 않아도 글자마다 그 파싱이 한 번씩 돌아 입력이 그만큼 멈춘다 — 실측(수정 전, 키 하나의 동기 비용):
+// 미리보기 6.6k자 25ms, 20k자 67ms, 63k자 200ms. 답변 상한이 70,000자라 긴 답을 기다리는 동안에는
+// 글자마다 0.2초씩 얼어붙고, 한글은 자모마다 input이 오므로 더 잦다. 완성된 답이 Message(memo) 뒤에
+// 있는 것과 같은 이유로 미리보기 본문도 memo 뒤에 있어야 한다 (App.jsx PreviewBody).
+//
+// 재는 방법: React 18은 input을 discrete로 그 자리에서 flush 하므로, 값을 넣고 input을 디스패치하는
+// 동안의 시간이 곧 '키 하나의 비용'이다. 절대값은 기계마다 다르니 같은 글·같은 화면의 done 뒤
+// (memo된 말풍선) 비용을 같은 실행에서 재어 기준으로 삼는다 — 느린 기계에서는 둘 다 함께 커진다.
+it('회귀: 답을 기다리는 동안 입력창에 쳐도 미리보기 전체가 다시 파싱되지 않는다', async () => {
+  // 표·수식·링크가 섞인 현실적인 긴 답변 (약 2만 자)
+  const answer = Array.from({ length: 120 }, (_, i) =>
+    `## 절 ${i + 1}\n\n설명 문장입니다. 값은 $v_${i} = d/t$ 이고 **강조**와 [링크](https://example.com/a${i}) 가 있습니다.\n\n`
+    + `| 항목 | 값 | 비고 |\n|---|---|---|\n| 가${i} | ${i * 7} | 설명 ${i} |\n| 나${i} | ${i * 13} | 설명 ${i} |\n\n- 목록 ${i}\n`).join('\n');
+  // 키 하나의 동기 비용(ms)의 중앙값. 첫 번째는 다른 준비가 섞이므로 여러 번 재어 가운데를 쓴다.
+  const 키비용 = `(() => {
+    const ta = document.querySelector('.composer textarea');
+    const set = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    const ms = [];
+    for (let i = 0; i < 5; i++) {
+      const t0 = performance.now();
+      set.call(ta, ta.value + 'x');
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+      ms.push(performance.now() - t0);
+    }
+    set.call(ta, '');
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    return String(Math.round(ms.sort((a, b) => a - b)[2]));
+  })()`;
+
+  await page.goto(url(), '.chip');
+  await page.eval(`window.__answer = ${JSON.stringify(answer)};
+    window.fetch = async () => new Response(new ReadableStream({
+      start(c) { window.__line = o => c.enqueue(new TextEncoder().encode(JSON.stringify(o) + '\\n')); window.__close = () => c.close(); }
+    }), { headers: { 'Content-Type': 'application/x-ndjson' } }); document.querySelector('.chip').click()`);
+  await page.eval(`window.__line({ type: 'answer_delta', text: window.__answer })`);
+  await page.until(`(document.querySelector('.preview')?.textContent ?? '').length > 5000`, { what: '긴 미리보기가 서기' });
+  await settled();
+  const 스트리밍중 = Number(await page.eval(키비용));
+
+  // 같은 글이 done 뒤에는 memo된 말풍선에 들어간다 — 이 화면의 키 비용이 기준이다.
+  await page.eval(`window.__line({ type: 'done', answer: window.__answer }); window.__close()`);
+  await page.until(`!document.querySelector('.typing') && !document.querySelector('.preview')`, { what: '최종 답이 서기', timeoutMs: 30_000 });
+  await settled();
+  const 완료후 = Number(await page.eval(키비용));
+
+  assert.ok(스트리밍중 <= 완료후 + 30,
+    `답을 기다리는 동안 키 하나가 ${스트리밍중}ms 걸린다 (같은 글이 done 뒤에는 ${완료후}ms) — 미리보기가 타이핑마다 다시 파싱되고 있다`);
+});
+
+// error 이벤트는 모델이 한 말이 아니다 — 화면에는 그 문구를 보이되 다음 질문의 이력에는 넣지 않는다.
+// 넣으면 클라이언트가 받은 오류 문구가 모델의 지난 턴으로 서버에 되돌아가 모델이 자기가 한 말로 읽는다.
+// 두 모양을 함께 잰다. 오류만 온 것(answer 없음)은 answer가 비어 있다는 사실만으로도 이력에서 빠지지만,
+// 답과 오류가 '함께' 온 것은 error를 보는 가드(App.jsx answered의 !data?.error)만이 걸러 낸다 —
+// 그 모양을 재지 않으면 가드를 지워도 검사가 통과해, 지키는 줄 없이 초록불만 남는다.
+it('회귀: 오류 응답은 그 문구를 답 자리에 보이되, 답이 함께 와도 다음 질문의 답변 이력에는 넣지 않는다', async () => {
+  await page.goto(url(), '.chip');
+  await page.eval(`window.__requests = []; window.fetch = async (url, opts) => {
+    window.__requests.push(JSON.parse(opts.body));
+    const nth = window.__requests.length;
+    const enc = new TextEncoder();
+    const event = nth === 1 ? { type: 'error', error: '조회 중 오류가 발생했습니다.' }
+      : nth === 2 ? { type: 'done', answer: '반쯤 만든 답', error: '조회에 실패했습니다.' }
+      : { type: 'done', answer: '정상 답' };
+    return new Response(new ReadableStream({ start(c) {
+      c.enqueue(enc.encode(JSON.stringify(event) + '\\n'));
+      c.close();
+    } }), { headers: { 'Content-Type': 'application/x-ndjson' } });
+  }`);
+  await sendQuestion('첫 질문', 1);
+  const 오류만 = await page.eval(`document.querySelector('.bubble.assistant').textContent.trim()`);
+  await sendQuestion('둘째 질문', 2);
+  const 답과오류 = await page.eval(`document.querySelectorAll('.bubble.assistant')[1].textContent.trim()`);
+  await sendQuestion('셋째 질문', 3);
+  assert.equal(오류만, '조회 중 오류가 발생했습니다.');
+  // 답이 함께 오면 그 답을 보인다 — 서버가 답한 것을 '통신하지 못했습니다'로 뭉개지 않는다.
+  assert.equal(답과오류, '반쯤 만든 답');
+  assert.deepStrictEqual(await page.eval(`window.__requests[1].history`), [{ role: 'user', text: '첫 질문' }]);
+  assert.deepStrictEqual(await page.eval(`window.__requests[2].history`),
+    [{ role: 'user', text: '첫 질문' }, { role: 'user', text: '둘째 질문' }]);
+});
+
+// 조합 중에 눌린 Enter는 조합이 확정될 때 갚는다(한글은 마지막 글자가 늘 조합 중이라 그 Enter를 버리면
+// 언제나 두 번 눌러야 한다). 그런데 그 Enter가 조합을 확정하지 못한 채 삼켜지고 사용자가 입력창을 떠나면,
+// 한참 뒤 엉뚱한 조합이 끝나는 순간 질문이 저절로 나간다 — App.jsx onBlur가 그 표시를 지운다.
+// headless 탭은 문서에 초점이 없어 blur 이벤트가 나지 않으므로 초점 에뮬레이션을 켜고 잰다(끝나면 끈다).
+// 앞부분(확정되면 보낸다)을 함께 재는 이유: 그것이 없으면 '아무것도 보내지 않았다'가 onBlur 때문인지
+// 조합 경로가 통째로 죽어서인지 가릴 수 없어, 검사가 헛돌면서 초록불을 낸다.
+it('회귀: 조합 중 눌린 Enter는 확정되면 보내지만, 그 전에 입력창을 떠나면 없던 일이 된다', async () => {
+  await page.goto(url(), '.chip');
+  await page.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+  try {
+    await page.eval(`window.__sent = 0; window.fetch = async () => { window.__sent++;
+      return new Response(JSON.stringify({ answer: '답' }), { headers: { 'Content-Type': 'application/json' } }); }`);
+    // 입력창에 조합 중인 글자를 놓고 Enter를 누른다 (IME가 아직 확정하지 않았다).
+    const compose = text => page.eval(`(() => {
+      const ta = document.querySelector('.composer textarea');
+      ta.focus();
+      ta.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, ${JSON.stringify('X')});
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+      ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+      return true;
+    })()`);
+    const end = () => page.eval(`(document.querySelector('.composer textarea')
+      .dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: 'X' })), true)`);
+
+    await compose();
+    assert.equal(await page.eval(`window.__sent`), 0, '조합 중의 Enter가 확정을 기다리지 않고 곧바로 나갔다');
+    await end();
+    await page.until(`window.__sent === 1`, { what: '조합이 확정되어 밀린 Enter가 나가기' });
+
+    // 이번에는 확정하기 전에 입력창을 떠난다 — 뒤늦은 확정은 아무것도 보내지 않아야 한다.
+    await compose();
+    await page.eval(`document.querySelector('.composer textarea').blur()`);
+    await page.until(`document.activeElement !== document.querySelector('.composer textarea')`,
+      { what: '입력창이 초점을 잃기 (초점 에뮬레이션이 켜져 있어야 한다)' });
+    await end();
+    await sleep(300);
+    assert.equal(await page.eval(`window.__sent`), 1, '입력창을 떠난 뒤의 조합 확정이 질문을 보냈다');
+  } finally {
+    await page.send('Emulation.setFocusEmulationEnabled', { enabled: false });
+  }
+});
+
+// 위 시험이 밀어 둔 그 Enter가 아직 남아 있는 채로 사용자가 Alt·Shift+Enter로 줄을 바꾸면 어떻게 되는가.
+// 줄바꿈은 조합 중인 입력창의 값을 건드려야 하므로 조합을 우리가 직접 끝낸다(App.jsx endComposition —
+// blur 뒤 focus). 그런데 그 blur는 브라우저가 조합을 확정하게 만들고, 확정의 compositionend는 blur '앞'에
+// 온다(실측한 순서: compositionstart → compositionend → blur → focus). 밀어 둔 Enter를 그대로 두면
+// 그 compositionend를 받는 쪽이 'IME가 확정했다'로 읽고 쓰다 만 질문을 보낸다 — 사용자가 누른 것은
+// 줄바꿈인데 질문이 나가고, 입력창에는 방금 넣은 줄바꿈 하나만 남는다(실측: 값이 '\n'이었다).
+// onBlur의 지우기로는 막지 못한다(그쪽은 compositionend 뒤다) — endComposition이 직접 지운다.
+//
+// 흉내 낸 CompositionEvent로는 이 시험이 헛돈다: blur가 조합을 확정시키는 순간 자체가 생기지 않는다.
+// 그래서 CDP의 Input.imeSetComposition으로 렌더러에 진짜 조합을 걸고, 초점 에뮬레이션을 켜
+// blur가 실제로 나게 한다(headless 탭은 문서에 초점이 없어 그대로는 나지 않는다 — 위 시험과 같은 이유).
+it('회귀: 밀어 둔 Enter가 있어도 Alt·Shift+Enter는 줄만 바꾼다 (전송하지 않는다)', async () => {
+  await page.goto(url(), '.chip');
+  await page.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+  try {
+    await page.eval(`window.__sent = 0; window.fetch = async () => { window.__sent++;
+      return new Response(JSON.stringify({ answer: '답' }), { headers: { 'Content-Type': 'application/json' } }); }`);
+    // Alt와 Shift 둘 다 줄바꿈 조합이다(App.jsx onKeyDown) — 한쪽만 재면 다른 쪽이 조용히 남는다.
+    for (const [이름, modifiers] of [['Alt', 1], ['Shift', 8]]) {
+      await page.eval(`(() => {
+        const ta = document.querySelector('.composer textarea');
+        ta.focus();
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, '');
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      })()`);
+      // 진짜 조합을 건다 — 이 뒤로 입력창은 '확정되지 않은 한 글자'를 들고 있다.
+      await page.send('Input.imeSetComposition', { text: '한', selectionStart: 1, selectionEnd: 1 });
+      await page.until(`document.querySelector('.composer textarea').value === '한'`,
+        { what: `조합이 걸리기 (${이름})` });
+      // 조합 중의 Enter — 확정될 때까지 밀어 둔다(위 시험이 보증하는 동작이다).
+      await page.key('Enter', 'Enter', 13);
+      await sleep(150);
+      assert.equal(await page.eval(`window.__sent`), 0, `${이름}: 조합 중의 Enter가 곧바로 나갔다 (이 시험의 전제가 깨졌다)`);
+      // 이제 줄바꿈. 보내서는 안 된다.
+      await page.key('Enter', 'Enter', 13, modifiers);
+      await sleep(400);
+      assert.equal(await page.eval(`window.__sent`), 0, `${이름}+Enter로 줄을 바꿨는데 쓰다 만 질문이 나갔다`);
+      assert.equal(await page.eval(`document.querySelectorAll('.row.user').length`), 0,
+        `${이름}+Enter로 줄을 바꿨는데 질문 말풍선이 섰다`);
+      assert.equal(await page.eval(`document.querySelector('.composer textarea').value`), '한\n',
+        `${이름}+Enter가 조합 중이던 글자를 지키며 줄을 바꾸지 않았다`);
+    }
+  } finally {
+    await page.send('Emulation.setFocusEmulationEnabled', { enabled: false });
+  }
+});
+
+// 산점도와 오른쪽 축(y2)은 단위 검사만 있었다 — 실제로 그려지는지는 브라우저에서만 알 수 있다.
+// 축 하나가 상자를 먹거나 격자가 자기 축을 못 찾으면 오류 없이 '그림이 없는 답변'이 된다.
+it('산점도는 점으로, y2는 오른쪽 축의 선으로 그려진다', async () => {
+  for (const [무엇, answer, expected] of [
+    ['산점도',
+      '```chart\ntype: scatter\nx: 온도\ny: 수율\n| 온도 | 수율 |\n|---|---|\n| 21.5 | 91.2 |\n| 23 | 93.8 |\n| 25.5 | 88.1 |\n```',
+      { marks: '.recharts-scatter-symbol', n: 3, axes: 2, lines: 0 }],
+    ['오른쪽 축',
+      '```chart\ntype: bar\nx: 월\ny: 건수\ny2: 비율\n| 월 | 건수 | 비율 |\n|---|---|---|\n| 1월 | 120 | 0.12 |\n| 2월 | 180 | 0.21 |\n```',
+      { marks: '.recharts-bar-rectangle', n: 2, axes: 3, lines: 1 }],
+  ]) {
+    await page.goto(url(), '.chip');
+    await page.eval(`window.fetch = async () => new Response(JSON.stringify({ answer: ${JSON.stringify(answer)} }),
+      { headers: { 'Content-Type': 'application/json' } })`);
+    await sendQuestion(`${무엇} 질문`, 1);
+    await page.until(`document.querySelectorAll(${JSON.stringify(expected.marks)}).length === ${expected.n}`,
+      { what: `${무엇}의 표식 ${expected.n}개가 서기` });
+    const got = JSON.parse(await page.eval(`JSON.stringify({
+      axes: document.querySelectorAll('.recharts-cartesian-axis').length,
+      lines: document.querySelectorAll('.recharts-line-curve').length,
+      grid: document.querySelectorAll('.recharts-cartesian-grid line').length,
+      table: !!document.querySelector('.chart-table'),
+    })`));
+    assert.equal(got.axes, expected.axes, `${무엇}: 축의 수가 다르다 (${JSON.stringify(got)})`);
+    assert.equal(got.lines, expected.lines, `${무엇}: 오른쪽 축의 선이 그려지지 않았다 (${JSON.stringify(got)})`);
+    assert.ok(got.grid > 2, `${무엇}: 값 축의 눈금선이 상자 경계 둘뿐이다 (${JSON.stringify(got)})`);
+    assert.ok(got.table, `${무엇}: 차트 곁의 '표로 보기'가 없다`);
+  }
 });
 
 it('요청 이력은 최근 대화로 제한되고 차트의 값이 남으며 중복 제출은 한 번만 전송된다', async () => {
@@ -461,6 +777,49 @@ it('펼침(⚡ 실행된 쿼리·표로 보기)은 보던 화면을 그대로 �
   await page.eval(`document.querySelector('.md .chart-table > summary').click()`);
   await sleep(900);
   assert.ok(Math.abs((await seen('.md .chart-table > summary')) - sum) < 6, '펼치자 보던 자리가 움직였다');
+});
+
+// 위 시험은 '잠잠한 화면에서 펼치면 그대로 있는가'를 본다. 그런데 이 화면에서 펼침은 대개 잠잠할 때가
+// 아니라 **따라가기가 도는 중에** 눌린다 — 답이 막 도착했거나, 방금 질문을 보냈거나(내 말은 언제나 바닥으로
+// 미끄러진다), 늦게 서는 차트를 따라가는 중이다. glide의 step은 매 프레임 target()을 다시 재므로(그래야
+// 내려가는 동안 자라는 것까지 따라간다), 그 사이에 펼치면 펼쳐서 자란 높이가 그대로 새 목표가 되어
+// 사용자를 바닥까지 끌고 간다. 떼어 둔 표시(stuckRef)는 '앞으로 시작할' 미끄러짐만 막지 이미 도는 것에는
+// 닿지 않아서, App.jsx unstick이 stopGlide까지 함께 부른다.
+// 실측(고치기 전): 펼치는 순간을 기준으로 1,197~2,408px 끌려갔고 패널의 머리가 화면 위 1,813px로 사라졌다.
+// 재는 자리를 '펼치는 그 순간'으로 잡는 것이 이 시험의 핵심이다 — 그 전의 움직임은 내가 보낸 말을 따라간
+// 정당한 것이라 빼야 하고, 그것까지 세면 고쳐도 실패한다(처음에 그렇게 재어 헛다리를 짚었다).
+it('회귀: 따라가기가 도는 동안 펼쳐도 보던 자리는 그대로다', async () => {
+  await answered();
+  await settled();
+  // 두 번째 질문의 답은 오지 않게 둔다 — 재는 동안 움직이는 것을 '내 말을 따라가는 미끄러짐' 하나로 묶는다.
+  await page.eval(`window.fetch = () => new Promise(() => {})`);
+  await page.eval(`(() => {
+    window.__펼침 = {};
+    const sum = () => document.querySelector('details.trace > summary');
+    const el = document.querySelector('.chat');
+    const ta = document.querySelector('.composer textarea');
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, '두 번째 질문');
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    window.__펼침.보낼때 = Math.round(el.scrollTop);
+    document.querySelector('.composer').requestSubmit();
+    // 사람이 누를 수 있는 간격. 그동안 따라가기(350ms)는 돌고 있다.
+    setTimeout(() => {
+      window.__펼침.전 = { 머리: Math.round(sum().getBoundingClientRect().top), top: Math.round(el.scrollTop) };
+      sum().click();
+      setTimeout(() => {
+        window.__펼침.후 = { 머리: Math.round(sum().getBoundingClientRect().top),
+          rest: Math.round(el.scrollHeight - el.scrollTop - el.clientHeight) };
+      }, 1100);
+    }, 150);
+    return true;
+  })()`);
+  await page.until(`window.__펼침.후`, { what: '펼친 뒤의 자리를 재기' });
+  const r = await page.eval(`window.__펼침`);
+  // 전제: 펼치기 전에 따라가기가 실제로 돌고 있었다. 이것이 없으면 잠잠한 화면을 재는 위 시험과 같아진다.
+  assert.notStrictEqual(r.전.top, r.보낼때, '펼치기 전에 따라가기가 돌지 않았다 — 이 시험의 전제가 깨졌다');
+  assert.ok(Math.abs(r.후.머리 - r.전.머리) < 6,
+    `따라가기 중에 펼치자 보던 자리가 ${r.후.머리 - r.전.머리}px 움직였다 (펼치는 순간 기준)`);
+  assert.ok(r.후.rest > 100, '따라가기 중에 펼치자 바닥으로 끌려가 패널의 끝이 보인다');
 });
 
 it('답을 기다리는 동안 폈다 접은 패널은 따라가기를 되돌려 놓는다', async () => {
@@ -1106,6 +1465,38 @@ it('Object.hasOwn이 없는 브라우저(빌드 타깃 안의 Chrome 87~92·Safa
     await page.until(`document.querySelectorAll('.row.assistant').length === 1 && !document.querySelector('.typing')`, { what: '클래스 다이어그램 답이 도착하기' });
     await page.until(READY.classdiagram, { what: '클래스 다이어그램이 그려지기' })
       .catch(e => assert.fail(`Array.prototype.at이 없는 브라우저에서 클래스 다이어그램이 원문 코드로 남았다 (${e.message.slice(0, 80)})`));
+  } finally {
+    await page.send('Page.removeScriptToEvaluateOnNewDocument', { identifier });
+  }
+});
+
+// 같은 부류의 셋째 자리. mermaid는 그림 안의 링크(flowchart의 `click`, classDiagram의 `link`)를 정화하면서
+// formatUrl → @braintree/sanitize-url → isValidUrl → URL.canParse를 부른다 — securityLevel이 'loose'가 아니면
+// (우리는 'strict'다) http(s) 링크는 늘 그 길을 지난다. URL.canParse는 Chrome 120·Safari 17·Firefox 115부터라
+// 빌드 타깃(chrome87·safari14·firefox78) 밖이고, 없는 브라우저에서는 mermaid.render가 거부되어 **링크가 든
+// 그림만** 원문 코드로 남았다(실측: 'URL.canParse is not a function'. 링크 없는 그림은 멀쩡했다).
+// 오류는 콘솔에만 남으므로 사용자에게는 '어떤 그림만' 소리 없이 안 그려진다.
+// 링크가 살아 있는지까지 함께 본다 — 폴리필이 그림을 그리게 하고도 주소를 잃으면 반쪽이다.
+it('URL.canParse가 없는 브라우저(빌드 타깃 안의 Chrome 87~119·Safari 14~16)에서도 링크가 든 흐름도가 그려진다', async () => {
+  const { identifier } = await page.send('Page.addScriptToEvaluateOnNewDocument', {
+    source: 'delete URL.canParse; window.__canParseGone = typeof URL.canParse === "undefined";',
+  });
+  try {
+    await page.touchMode(false);
+    await page.viewport(1000, 760);
+    await page.goto(url(), '.chip');
+    assert.strictEqual(await page.eval('window.__canParseGone'), true, '검사의 전제: 문서가 서기 전에 URL.canParse를 지웠다');
+    const answer = '```mermaid\nflowchart TD\n  A[사내 위키] --> B[끝]\n  click A "https://wiki.example.invalid/page"\n```';
+    await page.eval(`window.fetch = async () => new Response(JSON.stringify({ answer: ${JSON.stringify(answer)} }),
+      { headers: { 'Content-Type': 'application/json' } })`);
+    await sendQuestion('링크가 든 흐름도', 1);
+    await page.until(`document.querySelector('.md .mermaid svg')`,
+      { what: '링크가 든 흐름도가 그려지기 (예전에는 원문 코드로 남았다)' });
+    const got = await page.eval(`(() => { const a = document.querySelector('.md .mermaid a'); return {
+      canParse: typeof URL.canParse, href: a && a.getAttribute('href'), target: a && a.getAttribute('target') }; })()`);
+    assert.strictEqual(got.canParse, 'function', '폴리필이 URL.canParse를 채우지 않았다');
+    assert.strictEqual(got.href, 'https://wiki.example.invalid/page', '그림 안의 링크 주소가 사라졌다');
+    assert.strictEqual(got.target, '_blank', '그림 안의 링크가 새 탭 규칙을 잃었다');
   } finally {
     await page.send('Page.removeScriptToEvaluateOnNewDocument', { identifier });
   }

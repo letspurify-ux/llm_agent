@@ -69,6 +69,47 @@ const decide = async (content, ctx = CTX) => {
   return openaiDecide(ctx);
 };
 
+// 모델도 짝 잃은 서로게이트를 낸다 — JSON 문자열 안의 '\ud83d' 반쪽 이스케이프를 JSON.parse가 그대로 되살린다
+// (이모지가 토큰 상한에서 끊기거나, 모델이 원문의 이스케이프를 옮겨 적는 경우). 클라이언트 입력에는 이미 같은
+// 가드가 서 있는데(server.js·agent.js normalizeChat) 모델 출력에는 없었다.
+test('모델이 낸 짝 잃은 서로게이트가 프롬프트와 임베딩 요청으로 새어 나가지 않는다', async () => {
+  const { buildPrompt } = await import('../src/llm-openai.js');
+  const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  // 직렬화하면 이스케이프되어 사라지므로 문자열 값 자체를 본다
+  const strings = o => (o && typeof o === 'object' ? Object.values(o).flatMap(strings) : typeof o === 'string' ? [o] : []);
+
+  for (const [label, content] of [
+    ['검색어', '{"action":"search","text":"배치 재시작 \\ud83d","targets":["knowledge"]}'],
+    ['query_name', '{"action":"run_query","query_name":"job_\\ud83d","params":{}}'],
+    ['target_db', '{"action":"run_query","query_name":"q","params":{},"target_db":"DB_\\ud83d"}'],
+    ['read_result의 cols', '{"action":"read_result","step":1,"cols":["COL_\\ud83d"]}'],
+  ]) {
+    const parsed = await decide(content);
+    assert.ok(strings(parsed).some(v => lone.test(v)), `전제: ${label}에 반쪽 코드유닛이 실제로 도달한다`);
+    const safe = sanitizeDecision(parsed);
+    assert.ok(!strings(safe).some(v => lone.test(v)), `${label}이 결정 경계를 그대로 지났다`);
+  }
+
+  // 이력 줄은 이 셋을 '원문 그대로' 싣는다(historyLine·searchLine) — 걸러지지 않으면 그 요청의 남은
+  // 모든 LLM 호출에 따라 들어가고, 검색어는 임베딩 서버 요청 본문으로도 나간다. UTF-8로 인코딩되는
+  // 순간 그 자리가 U+FFFD가 되고(조용한 훼손), 엄격한 서버는 400으로 거부한다.
+  const search = sanitizeDecision(await decide('{"action":"search","text":"재시작 \\ud83d","targets":["knowledge"]}'));
+  const run = sanitizeDecision(await decide('{"action":"run_query","query_name":"job_\\ud83d","params":{},"target_db":"DB_\\ud83d"}'));
+  const prompt = buildPrompt({
+    ...CTX,
+    history: [
+      { search: search.text, targets: search.targets, hits: { knowledge: 0, qaMethods: null, queries: null } },
+      { query_name: run.query_name, targetDb: run.target_db, params: {}, error: '등록되지 않은 쿼리', safe: true },
+    ],
+  });
+  assert.ok(!lone.test(prompt), '프롬프트의 이력 줄에 반쪽 코드유닛이 실렸다');
+  // 임베딩 요청 본문에 실리는 것도 같은 값이다 (search.js가 이 text를 그대로 embed에 넘긴다)
+  assert.ok(!lone.test(JSON.stringify({ input: [search.text] })) && !lone.test(search.text));
+  // 정상 이모지는 건드리지 않는다
+  const kept = sanitizeDecision(await decide('{"action":"search","text":"재시작 \\ud83d\\ude00","targets":["knowledge"]}'));
+  assert.equal(kept.text, '재시작 \u{1F600}');
+});
+
 test('숫자로 출력한 큰 ID·고정밀 소수는 JSON 파싱에서 다른 바인드 값으로 반올림되지 않는다', async () => {
   for (const raw of ['12345678901234567', '-9007199254740993', '0.10000000000000001', '1.234567890123456789e20', '2e-324', '1e400']) {
     const decision = sanitizeDecision(await decide(`{"action":"run_query","query_name":"by_id","params":{"id":${raw}}}`));
@@ -1360,6 +1401,51 @@ test('완성된 답 뒤에 오는 사고 과정 태그가 미리보기를 지우
     `${answer}<think>x</think>{"action":"answer","answer":"B"}</think>{"action":"answer","answer":"C"}`,
     `${answer}</think>{"decision":{"action":"answer","answer":"안쪽 답"}}`,
   ]) {
+    for (const size of [1, 7, 1000]) {
+      let visible = '';
+      const p = answerPreviewer(e => { visible = e.reset ? '' : visible + e.text; });
+      for (let i = 0; i < raw.length; i += size) p.feed(raw.slice(i, i + size));
+      assert.equal(visible, (await decide(raw)).answer, `조각 ${size}자: ${raw}`);
+    }
+  }
+});
+
+test('추정 구간이 둘이면 미리보기도 최종 파서와 같이 앞의 답을 남긴다', async () => {
+  // 닫는 태그만 온 구간(②)의 답은 '블록 밖의 답'에만 진다. 뒤의 답 다음에도 닫는 태그가 오면 그 답 역시
+  // 추정 구간으로 내려앉으므로, 최종 파서는 2순위 안에서 '처음' 유효한 답(앞의 것)을 채택한다.
+  // 미리보기가 뒤의 답을 붙들고 있으면 사용자는 최종 답이 아닌 글을 끝까지 읽다가 done에서 통째로 바뀐 답을 본다
+  // (실측: '{답A}</think>{답B}</think>'에서 미리보기가 B, 최종은 A였다).
+  // 닫는 태그를 되풀이하는 퇴화한 응답이 이 모양을 만든다 (scanCandidates의 MAX_UNMATCHED_TOTAL 주석).
+  const A = '{"action":"answer","answer":"앞의 답"}';
+  const B = '{"action":"answer","answer":"뒤의 답"}';
+  const C = '{"action":"answer","answer":"블록 밖의 답"}';
+  for (const raw of [
+    `${A}</think>${B}</think>`,
+    `</think>${A}</think>${B}</think>`,
+    `<think>초안</think>${A}</think>${B}</think>`,
+    `${A}</think>${B}</think>${C}`,          // 뒤에 블록 밖의 답이 오면 그것이 1순위다
+    `${A}</think>${B}</think>${C}</think>`,  // 그마저 추정으로 내려앉으면 다시 앞의 답이다
+    `${A}</think></think></think>`,          // 같은 답에 닫는 태그가 거듭 와도 거두지 않는다
+  ]) {
+    for (const size of [1, 7, 1000]) {
+      let visible = '';
+      const p = answerPreviewer(e => { visible = e.reset ? '' : visible + e.text; });
+      for (let i = 0; i < raw.length; i += size) p.feed(raw.slice(i, i + size));
+      assert.equal(visible, (await decide(raw)).answer, `조각 ${size}자: ${raw}`);
+    }
+  }
+});
+
+test('추정 구간의 답 뒤에 온 후보가 완성되지 못하면 미리보기는 비지 않고 그 답으로 돌아간다', async () => {
+  // 뒤의 후보가 닫히기 전에 사고 과정이 닫히면 그것은 초안이다 — 최종 파서는 앞의 답을 2순위로 채택하는데,
+  // 미리보기만 비우면 done까지 빈 화면을 보여주다 답이 튀어나온다(실측: 미리보기가 비었고 최종은 앞의 답이었다).
+  const A = '{"action":"answer","answer":"앞의 답"}';
+  for (const tail of [
+    '{"action":"answer","answer":"미완성"</think>',   // 중괄호가 닫히지 않았다
+    '{"action":"answer",</think>',                     // 값도 오기 전에 닫혔다
+    '{깨진</think>',
+  ]) {
+    const raw = `${A}</think>${tail}`;
     for (const size of [1, 7, 1000]) {
       let visible = '';
       const p = answerPreviewer(e => { visible = e.reset ? '' : visible + e.text; });

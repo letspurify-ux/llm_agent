@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -70,4 +70,25 @@ test('production 빌드에서도 대화·수식·차트·흐름도·조회 표�
   await page.eval(`document.querySelector('.home-btn').click()`);
   await page.until(`document.querySelector('.empty') && !document.querySelector('.row')`);
   assert.deepEqual(page.logs, [], 'production 화면 콘솔에 오류가 남았다');
+});
+
+// 그림을 부르지 못하게 막는 정책(index.html의 CSP meta)은 브라우저가 그 줄을 읽은 '뒤에' 시작되는
+// 요청부터 다스린다 — 자원을 부르는 요소(link·script·img)가 그 위에 오면 그것만 정책 밖에 선다.
+// 그러고도 아무 오류가 나지 않는다. 원본에서는 charset 다음 자리에 두었지만 실제로 배포되는 것은
+// vite가 스크립트와 스타일시트를 끼워 넣은 dist/index.html이고, 그 삽입 자리는 우리가 정하지 않는다.
+// 그래서 원본이 아니라 빌드 결과에서 못 박는다 (원본 쪽 실수도 같이 걸린다).
+// 주석은 먼저 걷어낸다 — 그 안에 설명으로 적힌 '<img>' 글자가 진짜 태그로 잡혀 검사가 거짓으로 깨진다.
+test('production 빌드에서도 CSP가 자원을 부르는 어떤 태그보다 앞에 온다', { timeout: 90_000 }, async () => {
+  const indexPath = join(ROOT, 'dist', 'index.html');
+  // 앞 시험이 빌드해 두었더라도 여기서 다시 빌드한다. '있으면 그대로 읽는' 방식은 앞 시험이
+  // 건너뛰거나(Chrome 없음) 이름으로 걸러졌을 때 낡은 dist를 검사하게 되고, 그러면 원본을
+  // 고쳐 놓고도 통과한다 — 실측으로 그렇게 초록불이 났다. 검사가 무엇을 읽는지는 검사가 정해야 한다.
+  await promisify(execFile)(process.execPath, [VITE, 'build'], { cwd: ROOT, timeout: 60_000 });
+  const bare = (await readFile(indexPath, 'utf8')).replace(/<!--[\s\S]*?-->/g, '');
+  const csp = bare.search(/<meta[^>]+http-equiv=["']?Content-Security-Policy/i);
+  assert.ok(csp >= 0, 'dist/index.html에 CSP meta가 없다 — 모델이 쓴 주소가 그림으로 불려 나가는 마지막 그물이 사라졌다');
+  assert.match(bare.slice(csp, csp + 200), /img-src/i, 'CSP가 img-src를 제한하지 않는다');
+  const first = bare.search(/<(?:link|script|img|iframe|style)\b/i);
+  assert.ok(first < 0 || csp < first,
+    `자원을 부르는 태그가 CSP보다 앞에 있어 그 요청만 정책 밖에 선다: ${JSON.stringify(bare.slice(first, first + 90))}`);
 });

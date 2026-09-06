@@ -297,6 +297,7 @@ export function answerPreviewer(onDelta) {
   let recoveryDepth = 0;
   let literalTag = '';
   let shown = false;
+  let firstAssumed = null;   // 추정 구간(닫는 태그만 온 구간)에서 처음으로 완성된 답 (아래 closeBlock)
 
   const flush = () => {
     if (!rawDelta) return;
@@ -325,16 +326,39 @@ export function answerPreviewer(onDelta) {
     clearPreview();
     clearParse();
   };
+  // 앞서 추정 구간에서 채택했던 답으로 화면을 되돌린다. 원문(answer.raw)을 들고 있으므로 같은 디코더로 다시 낸다.
+  const restore = frame => {
+    clearPreview();
+    selected = frame;
+    rawDelta = frame.answer.raw;
+    flush();
+  };
   // 사고 과정 블록이 닫혔다 — 그 앞에서 읽던 미완성 후보는 초안이었다. 다만 이미 완성된 답은 최종 파서도 채택한다:
   // 여는 태그가 있었으면 블록 밖의 1순위이고, 닫는 태그만 왔으면 추정 구간의 2순위다(parseDecision). 그 답을 화면에서
   // 거두면 모델이 답 뒤에 검토를 덧붙일 때마다 보이던 답이 사라졌다가 done에서야 되살아난다(실측). 2순위인 답은 뒤에
   // 오는 블록 밖의 결정에 지므로 표시는 두되 교체될 수 있다고 표시한다(assumed). 닫힌 블록 뒤의 답은 그 뒤의 닫는
   // 태그만으로는 2순위가 되지 않는다(sealed) — 최종 파서가 구간을 나누는 방식과 같다(scanCandidates의 pending).
+  // 2순위 안에서는 '처음' 유효한 답이 이긴다 — 뒤에 온 답이 앞의 추정 구간의 답을 밀어낼 수 있는 것은 그것이
+  // 블록 밖(1순위)에 있는 동안뿐이고, 그 답 뒤에도 닫는 태그가 오면 그 답 역시 추정 구간으로 내려앉아 앞의 답에
+  // 진다(parseDecision은 순위 안에서 처음 것을 채택한다). 되돌리지 않으면 화면은 최종 답이 아닌 뒤의 답을
+  // 끝까지 보여주다 done에서 통째로 바뀐다 — 실측: '{답A}</think>{답B}</think>'에서 미리보기가 B, 최종은 A였다.
+  // (닫는 태그를 되풀이하는 퇴화한 응답이 이 모양을 만든다 — scanCandidates의 MAX_UNMATCHED_TOTAL 주석 참고.)
   const closeBlock = opened => {
-    if (!selected?.complete) { reset(); return; }
+    if (!selected?.complete) {
+      reset();
+      // 읽던 후보가 완성되지 못했으면 그것은 초안이다. 앞의 추정 구간에 완성된 답이 있으면 화면을 비운 채
+      // 두지 않고 그 답으로 되돌린다 — 최종 파서는 그 답을 2순위로 채택하므로, 비워 두면 done까지 빈 화면을
+      // 보여주다 답이 튀어나온다(실측: '{답A}</think>{깨진 답B}</think>'에서 미리보기가 비었고 최종은 A였다).
+      if (firstAssumed) restore(firstAssumed);
+      return;
+    }
     flush();
     if (opened) selected.sealed = true;
-    else if (!selected.sealed) selected.assumed = true;
+    else if (!selected.sealed) {
+      selected.assumed = true;
+      if (firstAssumed && firstAssumed !== selected) restore(firstAssumed);
+      else firstAssumed ??= selected;
+    }
     clearParse();
   };
   const inside = (child, parent) => {

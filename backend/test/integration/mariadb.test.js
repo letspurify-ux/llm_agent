@@ -10,7 +10,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import mariadb from 'mariadb';
 import { closePool, loadChunkRanges } from '../../src/db.js';
-import { syncEmbeddings } from '../../src/embed-sync.js';
+import { syncEmbeddings, syncSummary, SKIP } from '../../src/embed-sync.js';
 import { handleQuestion } from '../../src/agent.js';
 import { buildItems } from '../../src/chunk.js';
 
@@ -19,6 +19,13 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const sqlFile = name => readFile(new URL(`../../sql/${name}`, import.meta.url), 'utf8');
 let dir, server, conn;
 let embeddedTexts = [];
+// 임베딩 서버의 응답 모양. 'ok' 외의 값은 아래 실패 갈래 테스트가 try/finally로 되돌린다 —
+// 이 대역이 모든 테스트에 공유되므로 되돌리지 않으면 뒤 테스트가 남의 고장을 물려받는다.
+let embedMode = 'ok';
+let embedCalls = 0;
+// 대역이 만드는 벡터의 one-hot 위치 — 텍스트만으로 정해진다. 응답 순서가 뒤바뀌어도 어느 행의
+// 벡터인지 이 값으로 되짚을 수 있다 (embedding.js가 index로 짝짓는 것을 검증하는 근거).
+const slotOf = text => createHash('sha256').update(text).digest().readUInt16BE(0) % 1024;
 
 before(async () => {
   // 기존 서버·.env의 DB는 사용하지 않는다. TCP도 열지 않는 임시 DB다.
@@ -44,11 +51,17 @@ before(async () => {
   process.env.ORACLE_MOCK = '1';
   mock.method(globalThis, 'fetch', async (_url, init) => {
     const { input } = JSON.parse(init.body);
+    embedCalls++;
+    // 5xx는 서버 사정(재시도 가치 있음), 400은 이 입력의 거부(재시도해도 같다) — embedding.js가 그 둘을 가른다.
+    if (embedMode === 'down') return new Response('{"error":"boom"}', { status: 503 });
+    if (embedMode.startsWith('reject:') && input.some(text => text.includes(embedMode.slice(7)))) {
+      return new Response('{"error":"rejected"}', { status: 400 });
+    }
     embeddedTexts.push(...input);
-    return new Response(JSON.stringify({ data: input.map((text, index) => {
-      const slot = createHash('sha256').update(text).digest().readUInt16BE(0) % 1024;
-      return { index, embedding: Array.from({ length: 1024 }, (_, i) => Number(i === slot)) };
-    }) }));
+    const data = input.map((text, index) =>
+      ({ index, embedding: Array.from({ length: 1024 }, (_, i) => Number(i === slotOf(text))) }));
+    // vLLM·TEI의 continuous batching은 실제로 응답 순서를 바꾼다 (index는 그대로다).
+    return new Response(JSON.stringify({ data: embedMode === 'shuffle' ? data.slice().reverse() : data }));
   });
 }, { timeout: 60_000 });
 
@@ -176,5 +189,75 @@ test('동기화 CLI는 부분 저장 실패·청크 실패·DB 오류를 실패 
       assert.equal(result.code, 1, `실패를 종료 코드로 알려야 한다: ${mode}`);
       assert.match(result.stdout, /\[test\] pool closed/, '실패 경로도 커넥션 풀을 닫아야 한다');
     });
+  }
+});
+
+// 임베딩 실패는 성격이 둘로 갈리고 호출부가 해야 할 일이 정반대다 (embedding.js EmbeddingError).
+// 한 갈래로 뭉개지면 결과가 둘 다 나쁘다: 입력 한 건이 거부된 것을 '서버가 죽었다'로 읽으면 성한
+// 행까지 매 주기 되풀이되며 뒤쪽 테이블의 고아 정리까지 멈추고, 반대로 서버 장애를 '이 행이 나쁘다'로
+// 읽으면 멀쩡한 행이 실패로 집계된다. 둘 다 로그 말고는 드러나는 곳이 없어 회귀가 보이지 않는다.
+test('임베딩 서버의 행 거부와 서버 장애를 갈라 다룬다 — 거부는 그 행만, 5xx는 회차를 접고 다음에 잇는다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  await conn.query("INSERT INTO qa_method (title, method) VALUES ('정상 A', '본문 A'), ('거부될 행', 'REJECTME 표식'), ('정상 B', '본문 B')");
+  const stored = async () => Number((await conn.query('SELECT COUNT(*) AS n FROM vec_qa_method'))[0].n);
+  try {
+    // ① 서버가 이 입력만 거부한다(400) — 배치를 갈라 성한 행은 진도를 내고 그 행만 실패로 센다.
+    embedMode = 'reject:REJECTME';
+    const rejected = await syncEmbeddings();
+    assert.equal(rejected.failed, 1, '거부된 행만 실패로 세어야 한다');
+    assert.equal(rejected.embedded, 2, '같은 배치의 성한 행은 저장돼야 한다');
+    assert.equal(rejected.skipped, SKIP.NONE, '서버가 살아 있으므로 회차를 접지 않는다');
+    assert.match(syncSummary(rejected), /skipped 1/, '요약이 건너뛴 행 수를 알려야 한다');
+    assert.equal(await stored(), 2);
+    // 해시가 갱신되지 않으므로 원본을 고치기 전까지 매 주기 다시 잡힌다.
+    assert.equal((await syncEmbeddings()).failed, 1, '실패한 행은 다음 주기에 되돌아와야 한다');
+
+    // ② 서버가 5xx — 이번 회차만 접는다. 아무것도 저장하지 않고 재시도 대상으로 남긴다.
+    await conn.query("INSERT INTO qa_method (title, method) VALUES ('정상 C', '본문 C')");
+    embedMode = 'down';
+    embedCalls = 0;
+    const down = await syncEmbeddings();
+    // 죽은 서버에 행마다 매달리지 않는다 — 배치 한 번에 접는다. 매달리면 회차 하나가
+    // 임베딩 타임아웃(60초) × 행 수만큼 늘어지고 그동안 GET_LOCK 커넥션을 쥔 채로 있다.
+    assert.equal(embedCalls, 1, '닿지 못한 서버에 배치 한 번만 시도해야 한다');
+    assert.equal(down.skipped, SKIP.UNAVAILABLE, '서버 장애는 행 문제와 다르게 보고해야 한다');
+    assert.equal(down.embedded, 0);
+    assert.equal(down.failed, 0, '서버가 죽은 것은 행의 실패가 아니다');
+    assert.match(syncSummary(down), /could not reach/);
+    assert.equal(await stored(), 2);
+  } finally {
+    embedMode = 'ok';
+  }
+  // ③ 서버가 돌아오면 거부됐던 행과 그 사이 들어온 행이 함께 이어진다.
+  const recovered = await syncEmbeddings();
+  assert.equal(recovered.skipped, SKIP.NONE);
+  assert.equal(recovered.failed, 0);
+  assert.equal(recovered.embedded, 2, '남겨둔 행을 다음 실행이 이어받아야 한다');
+  assert.equal(await stored(), 4);
+});
+
+// 응답 항목에 index가 있는 이유가 순서를 보장하지 않기 때문이다 (vLLM/TEI의 continuous batching).
+// 위치로 짝지으면 텍스트와 벡터가 어긋난 채 '올바른' 해시와 함께 저장돼 이후 동기화가 영영 고치지
+// 못한다 — 검색이 엉뚱한 문서를 돌려주는 것으로만 드러나므로 오류가 한 줄도 남지 않는다.
+test('임베딩 응답 순서가 뒤바뀌어도 index로 짝지어 행과 벡터가 어긋나지 않는다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  await conn.query("INSERT INTO qa_method (title, method) VALUES ('첫째', '본문 하나'), ('둘째', '본문 둘'), ('셋째', '본문 셋')");
+  embeddedTexts = [];
+  try {
+    embedMode = 'shuffle';
+    assert.equal((await syncEmbeddings()).failed, 0);
+  } finally {
+    embedMode = 'ok';
+  }
+  // 배치 한 번으로 끝나야 한다. index로 정렬하지 않으면 정합성 검사(index !== 위치)가 배치를 거부해
+  // 행 단위 재시도로 물러나는데, 그때도 결과는 맞아서 저장된 벡터만 보면 구분되지 않는다 —
+  // 세 행짜리 동기화가 임베딩 왕복 네 번이 되는 것이 유일한 흔적이다.
+  assert.deepEqual(embeddedTexts, ['첫째\n본문 하나', '둘째\n본문 둘', '셋째\n본문 셋']);
+  const rows = await conn.query(
+    'SELECT q.title, q.method, VEC_ToText(v.embedding) AS vec FROM qa_method q JOIN vec_qa_method v USING (seq) ORDER BY q.seq');
+  assert.equal(rows.length, 3);
+  for (const row of rows) {
+    const hot = JSON.parse(row.vec).findIndex(x => x > 0.5);
+    assert.equal(hot, slotOf(`${row.title}\n${row.method}`), `${row.title}에 다른 행의 벡터가 저장됐다`);
   }
 });

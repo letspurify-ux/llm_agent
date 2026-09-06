@@ -110,3 +110,41 @@ test('폴리필의 Array·String.prototype.at은 명세와 같다 — 뒤에서 
     arrayLike: 'q', enumerable: false, keepsExisting: true,
   });
 });
+
+test('폴리필의 URL.canParse는 명세와 같다 — 만들 수 있으면 true, 아니면 false, 원래 있으면 손대지 않는다', async () => {
+  // mermaid가 그림 안의 링크(flowchart의 `click`, classDiagram의 `link`)를 정화할 때 부른다:
+  // formatUrl → @braintree/sanitize-url → isValidUrl → URL.canParse. securityLevel이 'loose'가 아니면(우리는
+  // 'strict'다 — Mermaid.jsx) 늘 그 길을 지난다. URL.canParse는 Chrome 120·Safari 17·Firefox 115부터라
+  // 빌드 타깃(chrome87·safari14·firefox78) 밖이고, 없는 브라우저에서는 http(s) 링크가 든 그림만
+  // 'URL.canParse is not a function'으로 원문 코드가 됐다(실측). 링크 없는 그림은 멀쩡해서 사용자에게는
+  // 그림 종류가 아니라 '어떤 그림만' 안 그려지는 것으로 보인다 — Array.prototype.at 때와 같은 모양이다.
+  // 빈 문자열 base는 '없음'이 아니라 파싱 실패다(네이티브도 false) — base를 넘길지 말지로 가른다.
+  const got = await inChild(`
+    const native = URL.canParse;
+    // 열거 여부는 지우기 '전에' 재야 한다 — 지운 뒤에 재면 폴리필을 재는 것이라 무엇도 보증하지 않는다.
+    const 네이티브도열거되는가 = Object.prototype.propertyIsEnumerable.call(URL, 'canParse');
+    delete URL.canParse;
+    const before = typeof URL.canParse;
+    await import('./src/polyfills.js');
+    const p = URL.canParse;
+    const 표본 = [['https://ex.test/a'], ['없는주소'], ['/a'], ['/a', 'https://ex.test'], ['/a', '깨진base'],
+      ['mailto:a@b.test'], [''], ['https://ex.test/a', undefined], ['https://ex.test/a', ''], ['HTTP://EX.test'], ['//ex.test/a', 'https://b.test']];
+    const cases = {
+      before, after: typeof p,
+      값: 표본.map(args => p(...args)),
+      네이티브와같은가: 표본.every(args => p(...args) === native(...args)),
+      // 위의 둘(ECMAScript 내장)과 달리 WebIDL의 정적 연산은 열거된다 — 폴리필도 네이티브를 따라야 한다.
+      enumerable: Object.prototype.propertyIsEnumerable.call(URL, 'canParse'),
+      네이티브도열거되는가,
+    };
+    const marker = () => 'native'; URL.canParse = marker;
+    await import('./src/polyfills.js?again');
+    cases.keepsExisting = URL.canParse === marker;
+    process.stdout.write(JSON.stringify(cases));
+  `);
+  assert.deepStrictEqual(got, {
+    before: 'undefined', after: 'function',
+    값: [true, false, false, true, false, true, false, true, false, true, true],
+    네이티브와같은가: true, enumerable: true, 네이티브도열거되는가: true, keepsExisting: true,
+  });
+});

@@ -13,7 +13,7 @@
 // agent.js는 provider가 바뀌어도 변경되지 않는다.
 import { openaiDecide } from './llm-openai.js';
 import { bindNames } from './sql.js';
-import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, MAX_SEARCH_TEXT_LEN, MAX_BATCH_QUERIES, MAX_EXPANDS, MAX_DROPS, SEARCH_TARGETS, normalizeSearchTargets, normalizeItemIds, clipText, nameKey, ownProp, warnOnce, targetDbNames, isPlainObject } from './constants.js';
+import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, MAX_SEARCH_TEXT_LEN, MAX_BATCH_QUERIES, MAX_EXPANDS, MAX_DROPS, SEARCH_TARGETS, normalizeSearchTargets, normalizeItemIds, clipText, nameKey, ownProp, warnOnce, targetDbNames, isPlainObject, stripLoneSurrogates} from './constants.js';
 import { rowCounts } from './result.js';
 import { normalizeResultRead } from './read-result.js';
 
@@ -118,6 +118,18 @@ function openFence(text) {
 // 잘린 문자열에는 TRUNC_MARK를 붙인다 — 바인드 가드(oracle.js bindProblem)가 실행 전에 거부해,
 // 조용히 잘린 값으로 조회해 0건 오답을 만드는 대신 소리 나게 실패한다. 정당한 바인드 값의
 // 출처(질문·조회 결과 셀)는 전부 MAX_BIND_LEN 안이므로 이 절단이 정상 값을 건드리는 일은 없다.
+//
+// 크기와 함께 '짝 잃은 서로게이트'도 여기서 걷어낸다. 클라이언트 입력에는 이미 같은 가드가 서 있는데
+// (server.js·agent.js normalizeChat) 모델의 출력에는 없었다 — 그런데 모델도 짝 잃은 코드유닛을 낸다:
+// 출력이 토큰 상한에서 이모지 한가운데로 끊기면 서버는 그 반쪽을 '\udXXX' 이스케이프로 직렬화하고
+// JSON.parse가 그대로 되살린다. 자유 텍스트 셋(검색어·query_name·target_db)이 그 통로다 — 셋 다
+// 이력 줄에 '원문 그대로' 실려(llm-openai.js historyLine·searchLine) 그 요청의 남은 모든 LLM 호출에
+// 따라 들어가고, 검색어는 임베딩 서버 요청 본문으로도 나간다. 실측: UTF-8로 인코딩되는 순간 그 자리가
+// U+FFFD가 되고(조용한 훼손), 엄격한 서버는 400으로 거부해 그 검색이 통째로 '검색 불가'가 된다.
+// params 값은 여기 넣지 않는다 — 그쪽은 JSON.stringify를 거쳐 실리므로(llm-openai.js paramsJson)
+// 이스케이프되고, 값을 말없이 고치면 '잘린 값으로 조회해 0건을 없다고 단정하는' 실패를 이 경계가
+// 스스로 만들게 된다. 답변도 건드리지 않는다: 이 경계의 일은 크기 확정이지 타입 정규화가 아니고,
+// 답변은 다음 턴에 대화 이력으로 돌아올 때 normalizeChat이 같은 가드를 건다.
 export function sanitizeDecision(d) {
   if (!d) return d;
   if (d.action === 'read_result') return normalizeResultRead(d);
@@ -136,7 +148,8 @@ export function sanitizeDecision(d) {
     // 검색어는 자르기만 한다(MAX_SEARCH_TEXT_LEN 주석). 비면 키를 두지 않는다 — 호출부(agent.js)가
     // 현재 질문으로 대신하는데, 그 판정을 ''와 없음 두 값으로 하게 두면 한쪽이 빠진다.
     // 대상은 여기서 정규화해 배열로 확정한다 — 이 값이 이력·프롬프트·chat_log로 그대로 나간다.
-    const text = clipText(String(d.text ?? '').trim(), MAX_SEARCH_TEXT_LEN);
+    // 짝 잃은 코드유닛은 걷어낸다 (아래 머리말) — 검색어는 임베딩 서버 요청 본문으로도 나간다.
+    const text = clipText(stripLoneSurrogates(d.text).trim(), MAX_SEARCH_TEXT_LEN);
     const drop = normalizeItemIds(d.drop, MAX_DROPS);
     return { action: 'search', ...(text && { text }), targets: normalizeSearchTargets(d.targets), ...(drop.length && { drop }) };
   }
@@ -201,7 +214,7 @@ function sanitizeRunQuery(d) {
   // target_db가 조용히 사라진다 — 실행 경계는 '고르지 않았다'고 보고하고, 모델은 자기가 이름을
   // 적었다는 사실과 어긋나는 오류를 받아 같은 시도를 반복한다.
   // 문자열이 아니면 버린다(형식 검증은 llm-openai toDecision) — 여기 일은 크기 확정이다.
-  const rawTargetDb = typeof d.target_db === 'string' ? d.target_db.trim() : '';
+  const rawTargetDb = typeof d.target_db === 'string' ? stripLoneSurrogates(d.target_db).trim() : '';
   const targetDb = rawTargetDb.length > MAX_TARGET_DB_NAME_LEN
     ? clipText(rawTargetDb, MAX_TARGET_DB_NAME_LEN) + TRUNC_MARK
     : rawTargetDb;
@@ -212,7 +225,7 @@ function sanitizeRunQuery(d) {
   // 있지도 않은 이름을 지어내지는 않는다.
   return {
     action: 'run_query',
-    query_name: clipText(String(d.query_name ?? '').trim(), 200),
+    query_name: clipText(stripLoneSurrogates(d.query_name).trim(), 200),
     params,
     // 빈 값은 키 자체를 두지 않는다 — 실행 경계가 '고르지 않음'을 undefined 하나로만 판정하게
     // 해서, ''와 없음이 서로 다른 경로를 타는 일이 생기지 않게 한다.
@@ -440,7 +453,10 @@ export function renderAnswer({ knowledge, history }) {
 const cell = v => String(v ?? '')
   .replace(/\\/g, '\\\\')
   .replace(/\|/g, '\\|')
-  .replace(/\r\n?|\n/g, ' ');
+  // 문자 하나에 공백 하나로 바꾼다 — CRLF를 한 칸으로 접으면 잘린 값 가드가 칸에 보인 앞부분의 길이를
+  // 알아보지 못한다 (chart.js escapeCell에 같은 이유를 적어 두었다). 이 폴백 표도 다음 턴의 대화 이력으로
+  // 되돌아가 모델이 값을 옮겨 적는 자리다.
+  .replace(/[\r\n]/g, ' ');
 
 // 컬럼은 모든 행의 합집합으로 잡는다(등장 순서 유지). 첫 행만 보면 뒤 행에만 있는 컬럼의 값이
 // 표에서 조용히 사라진다 — 드라이버가 주는 행은 보통 동종이지만, 값이 사라지는 실패는 오류를

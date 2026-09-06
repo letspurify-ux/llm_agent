@@ -320,9 +320,11 @@ export class Page {
     await sleep(120);
   }
 
-  async key(key, code = key, vk = 0) {
-    await this.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
-    await this.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
+  // modifiers는 CDP의 비트값이다: Alt 1 · Ctrl 2 · Meta 4 · Shift 8. 수식키를 따로 누르지 않고
+  // 조합키 자체를 보낸다 — 수식키의 keydown이 먼저 오는 순서까지 재려면 이 함수를 두 번 부른다.
+  async key(key, code = key, vk = 0, modifiers = 0) {
+    await this.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers });
+    await this.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers });
   }
 
   // 누르고 → 놓는다. move는 '클릭 중의 손떨림'을 흉내 낸다(그것이 따라가기를 끊어서는 안 된다).

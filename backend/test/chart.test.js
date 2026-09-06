@@ -150,10 +150,15 @@ test('0건·열 부족은 안내 문장으로 바꾸고, 참조가 없는 블록
   );
 });
 
-test('셀의 줄바꿈은 어떤 표기든 공백이 된다 — 홀로 선 CR도 markdown은 줄 끝으로 읽는다', () => {
+test('셀의 줄바꿈은 어떤 표기든 공백이 된다 — 홀로 선 CR도, 그리고 글자 수는 보존된다', () => {
+  // CRLF는 공백 두 칸이 된다(글자 하나에 공백 하나). 한 칸으로 접으면 칸에 보인 앞부분의 길이가
+  // 우리가 자른 길이와 어긋나, 잘린 값 가드(agent.js clippedCopyDetector)가 자기가 보여준 조각을
+  // 못 알아본다 — 그 조각으로 조회가 실행돼 0건이 나오고 모델은 "없다"로 단정한다.
+  // markdown은 연속 공백을 한 칸으로 렌더하므로 화면은 달라지지 않는다.
   const out = resolveChartData(block('type: bar\ndata: step 1'), [[{ K: 'a', V: 1, NOTE: 'p\rq\r\nr\ns' }]]);
-  assert.match(out, /\| a \| 1 \| p q r s \|/);
+  assert.match(out, /\| a \| 1 \| p q {2}r s \|/);
   assert.ok(!out.includes('\r'));
+  assert.ok(!out.includes('\n| a |'.slice(1) + '\n'), '표가 한 행으로 남는다');
 });
 
 test('x·y·y2로 열을 고른다 — x는 언제나 맨 앞, 이름은 대소문자 무시, 없는 이름은 버린다', () => {
