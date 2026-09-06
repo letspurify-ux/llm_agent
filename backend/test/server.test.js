@@ -31,11 +31,16 @@ const 살아있나 = () => !!proc && proc.exitCode === null && proc.signalCode =
 
 before(async () => {
   port = await freePort();
+  const deadPort = await freePort();
   proc = spawn(process.execPath, [join(ROOT, 'src', 'server.js')], {
     cwd: ROOT,
     // 관리 DB·LLM·임베딩은 쓰지 않는다. 주기 작업을 꺼 두는 이유는 이 검사가 보는 것이
     // 요청 경로뿐이고, 켜 두면 실패 로그가 그 위를 덮기 때문이다.
-    env: { ...process.env, PORT: String(port), ORACLE_MOCK: '1', LLM_PROVIDER: '', EMBED_SYNC_INTERVAL: '0' },
+    env: {
+      ...process.env, PORT: String(port), ORACLE_MOCK: '1', LLM_PROVIDER: '', EMBED_SYNC_INTERVAL: '0',
+      EMBEDDING_URL: '', MARIADB_HOST: '127.0.0.1', MARIADB_PORT: String(deadPort),
+      MARIADB_USER: 'backend_test', MARIADB_PASSWORD: '', MARIADB_DATABASE: 'backend_test',
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   proc.stdout.on('data', d => { 로그 += d; });
@@ -225,7 +230,7 @@ describe('진행 상황 스트림', () => {
     sproc?.kill('SIGTERM');
     for (let i = 0; i < 40 && 살아있나2(); i++) await sleep(100);
     sproc?.kill('SIGKILL');
-    await new Promise(r => llm?.close(r));
+    if (llm) await new Promise(r => llm.close(r));
   });
 
   const lines = text => text.split('\n').filter(l => l.trim()).map(l => JSON.parse(l));

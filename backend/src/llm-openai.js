@@ -19,6 +19,7 @@ import { bindNames } from './sql.js';
 import { canGrow } from './chunk.js';
 import { knowledgeView } from './context-items.js';
 import { rowCounts } from './result.js';
+import { numberFromString } from './numbers.js';
 
 // 추론 강도. 기본을 low로 두는 이유: 이 에이전트가 모델에게 요구하는 건 매 스텝 결정 JSON 하나이고,
 // 판단 근거(지식·처리방법·실행 이력)는 프롬프트에 이미 다 들어가 있다. 길게 생각할수록
@@ -471,10 +472,15 @@ async function readEventStream(res, signal, onChunk, onContent) {
   let usage;
   let finish;
   let error;   // 상류가 이벤트로 실어 보낸 오류 — 마지막 것을 남긴다 (upstreamError)
-  const takeLine = line => {
-    if (!line.startsWith('data:')) return;
-    const payload = line.slice(5).trim();
-    if (!payload || payload === '[DONE]') return;
+  let finished = false;
+  let dataLines = [];
+  let afterCR = false;
+  const takeEvent = () => {
+    if (finished) return;
+    const payload = dataLines.join('\n').trim();
+    dataLines = [];
+    if (payload === '[DONE]') { finished = true; return; }
+    if (!payload) return;
     let obj;
     try { obj = JSON.parse(payload); } catch { return; }
     const choice = obj?.choices?.[0];
@@ -483,6 +489,21 @@ async function readEventStream(res, signal, onChunk, onContent) {
     if (choice?.finish_reason) finish = choice.finish_reason;
     if (obj?.usage) usage = obj.usage;
     error = upstreamError(obj, choice) ?? error;
+  };
+  const takeLine = line => {
+    if (finished) return;
+    if (!line) { takeEvent(); return; }
+    if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+  };
+  const takeText = text => {
+    if (!text) return;
+    // CR은 그 자체로 줄 끝이다. 다음 조각의 LF만 CRLF의 나머지로 건너뛴다.
+    if (afterCR && text.startsWith('\n')) text = text.slice(1);
+    afterCR = text.endsWith('\r');
+    buffer += text;
+    const lines = buffer.split(/\r\n|\r|\n/);
+    buffer = lines.pop();
+    for (const line of lines) takeLine(line);
   };
   try {
     for (;;) {
@@ -495,13 +516,14 @@ async function readEventStream(res, signal, onChunk, onContent) {
         e.tooLarge = true;
         throw e;
       }
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop();
-      for (const line of lines) takeLine(line);
+      takeText(decoder.decode(value, { stream: true }));
+      // DONE이 생성 완료를 확정한다. 프록시의 HTTP EOF까지 기다리면
+      // 정상 답변을 유휴 타임아웃으로 버리고 같은 요청을 재실행하게 된다.
+      if (finished) break;
     }
-    buffer += decoder.decode();
+    takeText(decoder.decode());
     if (buffer) takeLine(buffer);
+    takeEvent();
   } finally {
     await reader.cancel().catch(() => { /* 이미 닫혔다 */ });
   }
@@ -1226,6 +1248,7 @@ const CONTROL_ESCAPES = { '\n': '\\n', '\r': '\\r', '\t': '\\t', '\b': '\\b', '\
 const escapeControl = c => CONTROL_ESCAPES[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`;
 
 const isLetter = c => c !== undefined && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'));
+const JSON_NUMBER_RE = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
 
 // text[i+1]이 n일 때, 그 이스케이프를 '제어문자'로 볼지(true) 'LaTeX 명령'으로 볼지(false).
 function keepsControlMeaning(text, i, n) {
@@ -1240,7 +1263,26 @@ function normalizeJsonEscapes(text, literalBackslashBeforeQuote = false) {
   let out = '', inStr = false;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
-    if (!inStr) { if (c === '"') inStr = true; out += c; continue; }
+    if (!inStr) {
+      if (c === '"') inStr = true;
+      // JSON.parse가 먼저 반올림하면 원래 ID를 복구할 수 없다. 숫자 토큰인 동안
+      // 왕복 정밀도를 확인해, 손실이 있는 값만 문자열로 보존한다 (Oracle 결과와 같은 규칙).
+      // 문자열 안의 숫자·이스케이프에는 이 변환을 적용하지 않는다.
+      if (c === '-' || (c >= '0' && c <= '9')) {
+        JSON_NUMBER_RE.lastIndex = i;
+        const raw = JSON_NUMBER_RE.exec(text)?.[0];
+        if (raw) {
+          let end = i + raw.length;
+          while (end < text.length && ' \t\r\n'.includes(text[end])) end++;
+          // 잘못된 숫자 키를 따옴표로 감싸 정상 객체로 복구하지는 않는다.
+          out += text[end] !== ':' && typeof numberFromString(raw) === 'string' ? JSON.stringify(raw) : raw;
+          i += raw.length - 1;
+          continue;
+        }
+      }
+      out += c;
+      continue;
+    }
     if (c === '"') { inStr = false; out += c; continue; }
     if (c < ' ') { out += escapeControl(c); continue; }
     if (c !== '\\') { out += c; continue; }

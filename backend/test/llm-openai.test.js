@@ -17,6 +17,45 @@ const { sanitizeDecision } = await import('../src/llm.js');
 
 const CTX = { question: 'q', chat: [], knowledge: [], qaMethods: [], queries: [], history: [] };
 
+test('SSE의 여러 data 줄과 CR·CRLF 경계를 나눠 받은 응답을 읽는다', async context => {
+  for (const newline of ['\n', '\r', '\r\n']) {
+    const decision = { action: 'answer', answer: '여러 줄 이벤트' };
+    const event = JSON.stringify({ choices: [{ delta: { content: JSON.stringify(decision) }, finish_reason: 'stop' }] }, null, 2)
+      .split('\n').map(line => `data: ${line}`).join(newline);
+    const body = `${event}${newline}${newline}data: [DONE]${newline}${newline}`;
+    context.mock.method(globalThis, 'fetch', async () => new Response(new ReadableStream({
+      start(controller) {
+        // 한 바이트씩 보내 CRLF와 UTF-8 경계가 모두 조각 사이에 걸리게 한다.
+        for (const byte of new TextEncoder().encode(body)) controller.enqueue(Uint8Array.of(byte));
+        controller.close();
+      },
+    }), { headers: { 'Content-Type': 'text/event-stream' } }));
+    assert.deepEqual(await openaiDecide(CTX), decision, JSON.stringify(newline));
+  }
+});
+
+test('SSE DONE을 받으면 연결 EOF를 기다리지 않고 답과 usage를 반환한다', async context => {
+  let calls = 0, cancelled = 0;
+  context.mock.method(globalThis, 'fetch', async () => {
+    calls++;
+    return new Response(new ReadableStream({
+      start(controller) {
+        const content = JSON.stringify({ action: 'answer', answer: '완료된 답' });
+        controller.enqueue(new TextEncoder().encode(
+          `data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: 'stop' }], usage: { prompt_tokens: 12 } })}\n\ndata: [DONE]\n\n`
+        ));
+        // 프록시가 본문 연결을 열어 둬도 DONE이 생성 완료를 확정한다.
+      },
+      cancel() { cancelled++; },
+    }), { headers: { 'Content-Type': 'text/event-stream' } });
+  });
+  let usage;
+  assert.deepEqual(await openaiDecide({ ...CTX, onUsage: value => { usage = value; } }), { action: 'answer', answer: '완료된 답' });
+  assert.equal(calls, 1);
+  assert.equal(cancelled, 1);
+  assert.equal(usage.prompt_tokens, 12);
+});
+
 // fetch를 스텁해 모델 응답 문자열만 갈아끼운다.
 // 진짜 Response를 돌려준다 — 본문을 상한 안에서 스트림으로 읽으므로(constants.readCapped),
 // json()만 흉내 낸 더블은 실제와 다른 길을 타고 그 상한을 한 번도 지나지 않는다.
@@ -29,6 +68,29 @@ const decide = async (content, ctx = CTX) => {
   reply(content);
   return openaiDecide(ctx);
 };
+
+test('숫자로 출력한 큰 ID·고정밀 소수는 JSON 파싱에서 다른 바인드 값으로 반올림되지 않는다', async () => {
+  for (const raw of ['12345678901234567', '-9007199254740993', '0.10000000000000001', '1.234567890123456789e20', '2e-324', '1e400']) {
+    const decision = sanitizeDecision(await decide(`{"action":"run_query","query_name":"by_id","params":{"id":${raw}}}`));
+    assert.strictEqual(decision.params.id, raw, raw);
+  }
+  const ordinary = sanitizeDecision(await decide('{"action":"run_query","query_name":"by_id","params":{"id":42,"ratio":0.5,"exponent":1e3,"text":"12345678901234567"}}'));
+  assert.deepEqual(ordinary.params, { id: 42, ratio: 0.5, exponent: 1000, text: '12345678901234567' });
+});
+
+test('SSE 조각 사이의 큰 숫자와 배치 조회도 원래 바인드 값을 보존한다', async t => {
+  const content = '{"action":"run_queries","queries":[{"query_name":"by_id","params":{"id":12345678901234567}},{"query_name":"by_id","params":{"id":9007199254740993}}]}';
+  const events = [...content].map(content => `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\n`).join('');
+  t.mock.method(globalThis, 'fetch', async () => new Response(`${events}data: [DONE]\n\n`, { headers: { 'Content-Type': 'text/event-stream' } }));
+  const decision = sanitizeDecision(await openaiDecide(CTX));
+  assert.deepEqual(decision.queries.map(q => q.params.id), ['12345678901234567', '9007199254740993']);
+});
+
+test('숫자 정밀도 보존이 잘못된 JSON 숫자 표기나 키를 실행 가능한 결정으로 바꾸지 않는다', async () => {
+  for (const params of ['{"id":012345678901234567}', '{"id":12345678901234567e}', '{12345678901234567:1}']) {
+    assert.equal(await decide(`{"action":"run_query","query_name":"by_id","params":${params}}`), null, params);
+  }
+});
 
 test('결과 추가 읽기를 파싱하고 강제 답변과 추론 초안에서는 실행하지 않는다', async () => {
   const action = { action: 'read_result', step: 2, cols: ['NEXT_JOB_ID'], offset: 20, limit: 5 };

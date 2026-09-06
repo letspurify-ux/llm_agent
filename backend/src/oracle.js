@@ -3,6 +3,8 @@
 // oci(node-oracledb Thick 모드, 설치된 Oracle Client 라이브러리 경유). 아래 oracleDriver 참고.
 // ORACLE_MOCK=1 이면 실제 접속 없이 하단 MOCK_DATA의 stub 결과를 반환한다.
 import oracledb from 'oracledb';
+import { numberFromString } from './numbers.js';
+export { numberFromString } from './numbers.js';
 import { createHash } from 'node:crypto';
 import { loadTargetDb } from './db.js';
 import { bindNames, assertReadOnly } from './sql.js';
@@ -61,60 +63,6 @@ oracledb.fetchTypeHandler = md => {
   if (DATE_TZ_TYPES.has(md.dbType)) return { converter: dateTimeText(true) };
   if (DATE_TYPES.has(md.dbType)) return { converter: dateTimeText(false) };
 };
-
-// 문자열로 받은 NUMBER를, JS number로 정밀도 손실 없이 왕복될 때만 숫자로 되돌린다.
-// 전부 문자열로 두면 mock(숫자 리터럴)과 실제가 JSON 표기부터 달라져, mock으로 검증한 시나리오가
-// 실제 배포에서 재현되지 않는다(MOCK_DATA 주석과 같은 원칙). 왕복이 어긋나는 값(16자리+)만
-// 문자열 그대로 남아 정확한 자릿수를 지킨다. (테스트에서 쓰므로 export)
-//
-// 판정 기준은 '값이 보존되는가'이지 '표기가 같은가'가 아니다. 앞선 구현(String(n) === v)은 표기를
-// 물었고, 그래서 Oracle의 지극히 정상적인 표기를 전부 손실로 오판했다 — 실측: '.5'(앞의 0을 생략),
-// '1.0'·'0.10'(선언된 scale만큼 0을 유지)이 모두 문자열로 남았다. 그런데 이 변환기를 타는 열은
-// '선언된 precision이 없는 NUMBER', 즉 SUM()·AVG()·비율 같은 모든 식의 결과다. 결과적으로 집계값이
-// {"AVG_AMOUNT":".5"}처럼 따옴표 붙은 채로 프롬프트·답변·chat_log에 들어가, 모델은 mock(숫자
-// 리터럴)에서와 다른 타입을 놓고 추론하게 된다 — 이 함수가 막겠다고 적어둔 바로 그 어긋남이다.
-//
-// 무손실 여부를 자릿수로 어림하지 않고 직접 증명한다. 두 표기를 같은 정규형으로 바꿔 비교하면
-// '표기는 달라도 값이 같은가'라는, 이 함수가 원래 물었어야 할 질문에 정확히 답할 수 있다.
-//
-// "유효숫자 15자리 이하면 배정밀도를 왕복해도 안전하다"는 어림은 정규수(normal)에서만 성립한다.
-// 2^-1022(약 2.2e-308) 아래의 비정규수(subnormal)는 가수 비트가 점점 줄어 5e-324에서는 한 비트만
-// 남으므로, 유효숫자가 몇 자리든 값이 뭉개진다 (실측: '20980e-326' → 2.08e-322,
-// '7765e-327' → 1e-323). 자릿수만 세는 판정은 이 구간을 통째로 놓친다.
-// (Oracle NUMBER의 범위는 1e-130~9.99e125라 실무에서 이 구간에 닿지는 않지만, 이 함수의 존재
-//  이유가 '왕복이 정확한 값만 숫자로'이므로 어림이 아니라 증명으로 판정한다.)
-//
-// 정규형은 (부호, 앞뒤 0을 뗀 유효숫자, 10의 지수)다 — '1.0'·'1'·'0.1e1'·'10e-1'이 모두 '1e0'이 된다.
-// String(n)은 그 double로 되돌아오는 '가장 짧은 표기'이므로, 두 정규형이 같다는 것은
-// JSON으로 나가는 값도 다음 스텝의 바인드로 되돌린 값도 원본과 같은 값이라는 뜻이다.
-const DECIMAL_RE = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/;
-
-function decimalParts(s) {
-  const m = DECIMAL_RE.exec(s);
-  if (!m) return null;
-  const frac = m[3] ?? '';
-  let digits = (m[2] ?? '') + frac;
-  if (!digits) return null;                     // 숫자가 한 자리도 없다 ('', '+', '.', 'e5')
-  let exp = Number(m[4] || 0) - frac.length;
-  digits = digits.replace(/^0+/, '');           // 앞의 0은 유효숫자가 아니다
-  const trimmed = digits.replace(/0+$/, '');    // 뒤의 0은 지수로 옮긴다
-  exp += digits.length - trimmed.length;
-  // 값이 0이면 부호·지수와 무관하게 정규형이 하나다 ('0', '-0', '0.000', '0e10')
-  return trimmed ? `${m[1] === '-' ? '-' : ''}${trimmed}e${exp}` : '0';
-}
-
-export function numberFromString(v) {
-  if (v === null || typeof v !== 'string') return v;
-  const s = v.trim();
-  const want = decimalParts(s);
-  // 숫자 표기가 아니면 손대지 않는다 (빈 문자열, 'Infinity', 서버 로케일이 넣은 구분기호 등)
-  if (want === null) return v;
-  const n = Number(s);
-  // 표현 범위를 벗어나면 값을 통째로 잃는다 (1e400 → Infinity). 아래 비교로도 걸리지만,
-  // String(Infinity)는 정규형을 갖지 않으므로 뜻이 분명한 자리에서 먼저 갈라둔다.
-  if (!Number.isFinite(n)) return v;
-  return decimalParts(String(n)) === want ? n : v;
-}
 
 // 날짜/시각은 JS Date로 받지 않고 DB가 직접 포맷한 문자열로 받는다.
 //   - JS Date를 로컬 getter로 다시 렌더링하면 TIMESTAMP WITH (LOCAL) TIME ZONE에서
@@ -364,7 +312,7 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
     ));
   }
 
-  const conn = await acquireConnection(target);
+  const { conn, release } = await acquireConnection(target);
   try {
     // 조회 타임아웃 — 느린 쿼리(락 대기, 잘못된 실행계획)가 요청을 무한 대기시키지 않게.
     // 초과 시 오류가 나고 agent가 history에 기록해 LLM이 안내 답변한다.
@@ -385,7 +333,7 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
     return capResult(result.rows ?? [], targetDbName);
   } finally {
     // 풀 커넥션의 close()는 반납이다. 실패가 원본 쿼리 오류를 덮어쓰지 않게 삼킨다.
-    await conn.close().catch(() => {});
+    await release();
   }
 }
 
@@ -398,7 +346,8 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
 // 30개)가 함께 붙어 같은 등록 쿼리의 재실행은 소프트 파싱도 준다.
 // 대가: 프로세스가 조회 DB의 세션을 쥐고 있게 된다. 그래서 작게 잡고(POOL_MAX) 유휴 세션은 정리한다
 // (POOL_TIMEOUT_S) — 조회 DB는 운영 DB이고, 이 에이전트의 조회는 요청당 순차라 동시 질문 수만큼이면 된다.
-const pools = new Map();          // 풀 키 → Promise<Pool>
+const pools = new Map();          // 풀 키 → { pending, users, retired, closing }
+const allPools = new Set();       // 교체됐지만 아직 기존 요청이 쓰고 있는 풀도 종료 시 정리한다.
 // 대상 DB 하나의 최대 세션 수. 요청 하나가 세션을 겹쳐 쓴다 — 일괄 조회(agent.js run_queries)는 최대
 // MAX_BATCH_QUERIES개를 병렬로 돌리기 때문이다. '요청당 하나'를 전제로 동시 질문 수만큼(4) 잡았던 값을
 // 그 배수로 되돌린다: 일괄 조회를 하는 요청 둘이 겹쳐도 기다리지 않는다. 그보다 몰리면 큐에서 기다리고
@@ -419,17 +368,19 @@ function poolKey(target) {
 
 async function acquireConnection(target) {
   const key = poolKey(target);
-  let pending = pools.get(key);
-  if (!pending) {
+  let entry = pools.get(key);
+  if (!entry) {
     // 같은 이름의 옛 풀(등록이 바뀌었다)은 닫는다 — 열린 채 두면 옛 접속정보로 세션을 쥐고 있게 된다.
     const prefix = key.slice(0, key.indexOf('\n') + 1);
     for (const [k, old] of pools) {
       if (k !== key && k.startsWith(prefix)) {
         pools.delete(k);
-        old.then(p => p.close(0)).catch(() => { /* 이미 닫혔거나 만들어지지 못했다 */ });
+        old.retired = true;
+        if (!old.users) void closePoolEntry(old);
       }
     }
-    pending = oracledb.createPool({
+    entry = { users: 0, retired: false };
+    entry.pending = oracledb.createPool({
       user: target.db_user,
       password: resolvePassword(target.db_password),
       connectString: target.connection_info,
@@ -458,22 +409,48 @@ async function acquireConnection(target) {
       homogeneous: true,
     }).catch(e => {
       // 생성 실패는 캐시하지 않는다 — 다음 조회가 다시 시도한다 (접속정보를 고친 뒤 재기동하지 않아도 된다).
-      if (pools.get(key) === pending) pools.delete(key);
+      if (pools.get(key) === entry) pools.delete(key);
+      allPools.delete(entry);
       throw e;
     });
-    pools.set(key, pending);
+    pools.set(key, entry);
+    allPools.add(entry);
   }
-  const pool = await pending;
-  return pool.getConnection();
+  // 풀 생성과 커넥션 획득을 기다리는 요청도 사용자다. 교체 시 close(0)을
+  // 즉시 부르면 진행 중인 조회뿐 아니라 아직 접속 중인 요청도 실패한다.
+  entry.users++;
+  try {
+    const pool = await entry.pending;
+    const conn = await pool.getConnection();
+    return { conn, release: async () => {
+      try { await conn.close(); } catch { /* 원래 조회 결과를 보존한다 */ }
+      finally { await releasePoolEntry(entry); }
+    } };
+  } catch (e) {
+    await releasePoolEntry(entry);
+    throw e;
+  }
+}
+
+function releasePoolEntry(entry) {
+  entry.users--;
+  if (entry.retired && !entry.users) return closePoolEntry(entry);
+}
+
+function closePoolEntry(entry) {
+  entry.closing ??= entry.pending.then(pool => pool.close(0))
+    .catch(() => { /* 이미 닫혔거나 만들어지지 못했다 */ })
+    .finally(() => allPools.delete(entry));
+  return entry.closing;
 }
 
 // 정상 종료용 — 열린 풀을 전부 닫는다 (server.js shutdown). 세션을 쥔 채 프로세스가 내려가면 DB 쪽에
 // 끊긴 세션이 남아 정리될 때까지 자리를 차지한다. 진행 중인 조회는 기다리지 않는다(drainTime 0) —
 // 종료 경로는 이미 요청을 다 보낸 뒤다.
 export async function closeOraclePools() {
-  const open = [...pools.values()];
+  const open = [...allPools];
   pools.clear();
-  await Promise.all(open.map(p => p.then(pool => pool.close(0)).catch(() => { /* 이미 닫혔거나 만들어지지 못했다 */ })));
+  await Promise.all(open.map(closePoolEntry));
 }
 
 // 세션 포맷 고정은 표기 품질을 위한 것이지 조회의 전제 조건이 아니다 —
@@ -482,6 +459,9 @@ export async function closeOraclePools() {
 // 포맷 불일치(ORA-01861) 가능성이 남는다. 풀의 sessionCallback이 세션마다 한 번 부른다.
 async function setSessionFormats(conn) {
   try {
+    // 이 SQL은 runQuery가 커넥션을 받기 전에 실행된다.
+    // 여기서도 설정해야 접속 중인 세션 초기화가 무제한으로 남지 않는다.
+    conn.callTimeout = TIMEOUT_MS;
     await conn.execute(NLS_SESSION_FORMATS);
   } catch (e) {
     // 억제는 warnOnce에 맡긴다 (search.js의 벡터 검색 경고와 같은 이유) — '한 번만' 플래그로 두면

@@ -33,14 +33,47 @@ export const MAX_CHART_BLOCK_ROWS = 100;
 // 예산은 채울 블록 수로 나눠 준다(아래 resolveChartData) — 먼저 온 블록이 다 쓰면 뒤 블록은 표를 잃는다.
 export const MAX_CHART_INJECT_LEN = 30_000;
 
-// frontend/src/chart.js CHART_FENCE_RE와 같은 모양(왜 이렇게 너그러운지도 거기 적혀 있다). 여기서 놓친 블록은
-// 채워지지 않은 `data:` 참조로 화면에 간다 — 프런트는 markdown이 펜스로 읽는 것을 다 차트로 그리므로, 백틱 셋만
-// 받던 때에는 ~~~chart·````chart로 적힌 참조가 '조회 결과를 채우지 못했습니다'로 화면에 갔다(실측).
-// 들여쓰기(목록 안의 펜스)는 m[1]로 받아 채워 넣는 줄에도 붙이고, 펜스(m[2])는 다시 쓸 때 그대로 쓴다.
-// 닫는 펜스는 markdown과 같이 여는 펜스에 그 글자(m[3])가 더 붙은 것까지다 — 글자가 섞인 줄은 끝이 아니다. 본문은 m[4],
-// 빈 블록(```chart 바로 아래 ```)이면 undefined다. 본문 한 줄을 요구하던 때에는 빈 블록의 여는 펜스가 다음 차트 블록의
-// 닫는 펜스와 짝이 되어 그 사이의 문장을 삼킨 채 표로 다시 써 답변에서 지웠다(실측). 빈 본문을 먼저 시도한다(??).
-const FENCE_RE = /^([ \t]*)((`|~)\3{2,})[ \t]*chart(?:[ \t]+[^\r\n]*)?\r?\n(?:([\s\S]*?)\r?\n)??[ \t]*\2\3*[ \t]*\r?$/gim;
+// 백틱·물결표 3개 이상의 펜스를 받으며 들여쓰기와 여는 펜스를 보존한다.
+// 닫는 펜스는 같은 글자이고 여는 펜스 이상 길이여야 한다. 빈 본문도 독립 블록으로 처리한다.
+// 바깥 펜스의 종류·길이를 추적해 다른 코드블록 안의 예시를 실제 참조로 실행하지 않는다.
+// 반환 항목은 [전체 블록, 들여쓰기, 여는 펜스, 펜스 글자, 본문]과 원문 index다.
+function fencedBlocks(text, language) {
+  const blocks = [];
+  let open = null;
+  for (const line of text.matchAll(/([^\r\n]*)(\r\n|\r|\n|$)/g)) {
+    if (!line[0]) continue;
+    const mark = /^([ \t]*)((`|~)\3{2,})(.*)$/.exec(line[1]);
+    if (!mark) continue;
+    if (open) {
+      if (mark[3] === open.ch && mark[2].length >= open.fence.length && !mark[4].trim()) {
+        if (open.language === language) {
+          const end = line.index + line[1].length + (line[2] === '\r\n' ? 1 : 0);
+          const block = [text.slice(open.index, end), open.indent,
+            open.fence, open.ch, text.slice(open.bodyStart, line.index).replace(/(?:\r\n|\r|\n)$/, '')];
+          block.index = open.index;
+          blocks.push(block);
+        }
+        open = null;
+      }
+      continue;
+    }
+    if (mark[3] === '`' && mark[4].includes('`')) continue;
+    open = { index: line.index, bodyStart: line.index + line[0].length,
+      indent: mark[1], fence: mark[2], ch: mark[3], language: mark[4].trim().split(/\s+/)[0].toLowerCase() };
+  }
+  return blocks;
+}
+
+function replaceBlocks(text, blocks, replace) {
+  const parts = [];
+  let at = 0;
+  for (const block of blocks) {
+    parts.push(text.slice(at, block.index), replace(...block));
+    at = block.index + block[0].length;
+  }
+  parts.push(text.slice(at));
+  return parts.join('');
+}
 const CONFIG_RE = /^\s*(type|title|x|y|y2|xtype|data)\s*:\s*(.*?)\s*$/i;
 
 // 셀 값을 표의 칸으로. 숫자는 천 단위 구분 없이 그대로(프런트가 숫자로 읽는다), 파이프와 줄바꿈은
@@ -127,9 +160,10 @@ export function resolveChartData(answer, steps) {
   const text = String(answer ?? '');
   if (!/(?:```|~~~)[ \t]*chart/i.test(text)) return text;
   const needsFill = body => { const b = splitBlock(body); return b.config.data !== undefined && !b.hasTable; };
-  let blocksLeft = [...text.matchAll(FENCE_RE)].filter(m => needsFill(m[4] ?? '')).length;
+  const blocks = fencedBlocks(text, 'chart');
+  let blocksLeft = blocks.filter(m => needsFill(m[4] ?? '')).length;
   let budget = MAX_CHART_INJECT_LEN;
-  return text.replace(FENCE_RE, (whole, indent, fence, _ch, body = '') => {
+  return replaceBlocks(text, blocks, (whole, indent, fence, _ch, body = '') => {
     const { config, lines, hasTable } = splitBlock(body);
     if (config.data === undefined) return whole;
     // 표가 함께 있으면 표가 우선이다 — data 줄만 지운다 (프런트는 어차피 무시하지만, 이력으로
@@ -181,8 +215,7 @@ export const MAX_TABLE_COLS = 10;            // cols를 적지 않았을 때 싣
 export const MAX_TABLE_CELL_LEN = 120;       // 표의 칸. 프롬프트 셀 상한(200)보다 짧고 차트(60)보다 길다
 export const MAX_TABLE_INJECT_LEN = 30_000;  // 답변 하나에 채워 넣는 표의 총 글자 수 (차트 예산과 별도 — 둘 다 MAX_ANSWER_LEN 위에 얹힌다)
 
-// FENCE_RE와 같은 모양, 언어만 table이다 (왜 이렇게 너그러운지는 FENCE_RE 주석).
-const TABLE_FENCE_RE = /^([ \t]*)((`|~)\3{2,})[ \t]*table(?:[ \t]+[^\r\n]*)?\r?\n(?:([\s\S]*?)\r?\n)??[ \t]*\2\3*[ \t]*\r?$/gim;
+// chart와 같은 fencedBlocks 경계 판정을 사용한다.
 const TABLE_CONFIG_RE = /^\s*(step|data|cols|limit)\s*:\s*(.*?)\s*$/i;
 
 // 표의 칸 — 차트의 cell과 같은 이스케이프·같은 절단 표시, 상한만 다르다 (cell 주석 참고).
@@ -211,9 +244,10 @@ export function resolveTableData(answer, steps) {
   // 예산은 '채울 블록'에만 나눈다 — 참조 없는 블록까지 세면 아무것도 쓰지 않는 블록이 몫을 가져가
   // 정작 채우는 표가 잘린다 (실측: 참조 없는 블록 넷이 섞이자 87행이 17행이 됐다).
   // 차트 쪽(resolveChartData)이 needsFill로 미리 거르는 것과 같은 이유·같은 방식이다.
-  let blocksLeft = [...text.matchAll(TABLE_FENCE_RE)].filter(m => refOf(m[4] ?? '').ref !== undefined).length;
+  const blocks = fencedBlocks(text, 'table');
+  let blocksLeft = blocks.filter(m => refOf(m[4] ?? '').ref !== undefined).length;
   let budget = MAX_TABLE_INJECT_LEN;
-  return text.replace(TABLE_FENCE_RE, (whole, indent, _fence, _ch, body = '') => {
+  return replaceBlocks(text, blocks, (whole, indent, _fence, _ch, body = '') => {
     const { config, ref } = refOf(body);
     // 참조가 없을 때 할 일이 두 경우에 다르다.
     //   cols·limit 같은 이 블록의 설정 줄이 있다 — 모델이 이 블록을 쓰려다 step만 빠뜨린 것이다. 본문을

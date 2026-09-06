@@ -1,0 +1,95 @@
+# Backend 검토 기록
+
+2026-09-06. 요청 범위는 backend 전체 코드 검토, 결함 재현 후 수정, 수정 후 정상 동작 검증,
+production 결함의 정식 회귀 테스트 추가다. 시작 시 backend 변경 사항은 없었고 기존 frontend·README 변경은 보존했다.
+
+`backend/src` 16개 모듈, SQL 5개 파일, 환경 설정·패키지·실행 스크립트를 읽고 현재 계약인
+`context.md`와 대조했다. 기존 테스트는 417개가 모두 통과했지만 아래 새 재현 테스트에서 결함이 확인됐다.
+
+같은 날 후속 검토에서는 기존 수정 상태에서 442개 전체 테스트를 다시 통과시킨 뒤 전체 소스와
+실행·SQL 파일을 재검토했다. 숫자 정밀도와 문서 해시 경계에서 추가 결함 2개를 실제 DB로 재현했다.
+공유 숫자 변환 모듈 `numbers.js`를 포함한 최종 검토 대상은 `backend/src` 17개 모듈이다.
+
+| 결함 | 수정 전 재현 결과 | 수정 | 정식 테스트 |
+|---|---|---|---|
+| LLM 완료 신호 처리 | SSE `[DONE]` 뒤 연결이 열려 있으면 정상 답을 버리고 재시도 후 null 반환 | 완료 신호에서 읽기를 종료하고 스트림 취소 | `llm-openai.test.js` |
+| SSE 이벤트 조립 | 여러 `data:` 줄로 된 정상 이벤트에서 답을 찾지 못함 | 이벤트 단위 조립, LF·CR·CRLF 및 바이트 경계 처리 | `llm-openai.test.js` |
+| 임베딩 응답 검증 | 잘못된 구조를 일시 장애로 분류하고 숫자가 아닌 벡터를 허용 | 응답 구조·index·유한 숫자 검증 | `embedding.test.js` |
+| 검색 근거 누락 | 같은 문서의 1·3번 청크가 적중해도 보충 조회 실패 시 1번만 반환 | 확보한 적중을 보존하고 누락 구간을 독립 항목으로 반환 | `search.test.js` |
+| 동기화 해시 경쟁 | 해시 조회와 본문 조회 사이 변경·원복 시 다른 본문의 청크와 벡터를 계속 최신으로 판단 | 실제 본문과 해시를 같은 SELECT에서 읽어 저장 | `embed-sync.test.js` |
+| 확대 중 근거 교체 | 검색 후 원문 변경 시 expand가 기존 근거를 교체 | 확보한 청크와 달라진 판본으로 확대하지 않고 기존 근거 유지 | `agent.test.js` |
+| Oracle 풀 교체 | 접속 정보 변경 시 기존 풀의 획득 대기·조회 요청을 중간에 종료 | 획득 대기부터 반납까지 사용자 수를 추적하고 마지막 반납 후 이전 풀 정리 | `oracle-pool.test.js` |
+| Oracle 초기화 타임아웃 | ALTER SESSION 실행 시 callTimeout이 0 | 세션 초기화부터 조회 타임아웃 적용 | `oracle-pool.test.js` |
+| 서버 PID 소유 확인 | 다른 프로젝트의 src/server.js를 이미 실행 중인 서버로 판단하거나 종료 | Node 실행 파일·진입점·작업 디렉터리 확인을 공통화 | `launchers.test.js` |
+| 마이그레이션 재실행 | vec_store 제거 후 실제 MariaDB에서 오류 1146으로 중단 | 구 테이블 존재 시에만 벡터 복사 SQL 실행 | `integration/mariadb.test.js` |
+| 동기화 CLI 실패 처리 | 벡터·청크 저장 실패에도 종료 코드 0, DB 예외 경로에서는 풀 정리 누락 | 부분 실패 집계·실패 종료 코드·finally 정리 | `integration/mariadb.test.js` |
+| 롤백된 삭제 집계 | 커밋 실패로 롤백한 2건을 삭제 성공으로 보고 | 커밋 성공 후에만 성공 건수 누적 | `embed-sync.test.js` |
+| 코드 예시 훼손 | 바깥 코드블록 안의 table/chart 예시를 실제 조회 데이터로 바꿈 | 바깥 코드블록 경계를 추적해 독립 참조만 처리 | `chart.test.js` |
+| LLM 숫자 ID 반올림 | 숫자 `12345678901234567`을 파싱하면 `12345678901234568`로 바뀌어 실제 Oracle에서 다른 행 조회 | 숫자 토큰이 JS 숫자로 왕복될 때 값이 달라지면 원문 문자열 보존. Oracle 결과와 정밀도 판정 공유 | `llm-openai.test.js`, `oracle/oracle.test.js` |
+| 문서 해시의 필드 경계 소실 | 제목 `제목\n첫 문단`·본문 `둘째 문단`을 제목 `제목`·본문 `첫 문단\n둘째 문단`으로 바꿔도 실제 MariaDB에서 옛 청크 유지 | 문서 해시를 JSON 배열로 계산해 제목·본문 경계 보존 | `integration/mariadb.test.js` |
+
+테스트 파일은 모두 `backend/test` 아래에 있다. 재현은 production 함수와 실제 Response/ReadableStream,
+드라이버 경계의 제어 가능한 대역, 별도 MariaDB, 별도 Oracle 컨테이너, 실제 시작·종료 프로세스를 사용했다.
+롤백 집계는 원래 HEAD 소스를 임시 복사해 새 테스트의 `2 !== 0` 실패를 확인하고 임시 복사본을 제거했다.
+숫자 ID 테스트는 수정 전 실제 Oracle에서 `LABEL: 'rounded'`, 수정 후 `LABEL: 'exact'`를 확인했다.
+숫자 파서 회귀 테스트는 큰 정수·고정밀 소수·지수·표현 범위 밖 값, 일반 숫자와 문자열,
+SSE 조각·일괄 조회, 잘못된 JSON 거부를 함께 검증한다. 문서 해시 테스트는 수정 전 옛 제목·본문이
+남는 실패와 수정 후 원문 일치, 그 다음 동기화의 무변경 판정을 확인했다.
+
+검토·검증 범위:
+
+- `server.js`: HTTP 입력·오류·NDJSON 응답, 비동기 로그, 시작·종료와 백그라운드 작업.
+- `agent.js`, `context-items.js`, `read-result.js`, `result.js`: 행동 예산·중복 실행·입력 정규화,
+  안정적인 자료 ID·근거 보존·확대·숨김·결과 재표시, 사용자 trace의 오류 가림.
+- `llm.js`, `llm-openai.js`, `chart.js`, `constants.js`, `numbers.js`: 결정 파싱과 숫자 정밀도, 프롬프트 예산,
+  JSON·이스케이프·SSE, 표·차트 주입, 문자열·행·열·응답 상한.
+- `sql.js`, `oracle.js`: 주석·리터럴·바인드·읽기 전용 가드, 대상 DB 선택,
+  풀 수명, 숫자·날짜·문자열·바이너리·객체 정규화.
+- `db.js`, `search.js`, `embedding.js`, `embed-sync.js`, `chunk.js`: 검색 실패와 0건 구분,
+  정확 쿼리명 검색, 청크 보충·병합, 임베딩 검증·캐시, 동기화 락·트랜잭션·변경 감지·고아 정리.
+- SQL·실행 도구: 스키마와 시드 재적용, 마이그레이션, CLI 실패·정리, PID 소유 판정과 환경 파일 생성.
+
+실제 Oracle에서 단독 CR은 SQL 한 줄 주석을 끝내지 않는다는 점도 확인했다.
+이 부분은 결함 후보였으나 기존 가드가 엔진과 일치하므로 수정하지 않았고, 실측 계약을 테스트로 남겼다.
+SSE의 여러 data 줄과 줄 끝 규칙은 [WHATWG 표준](https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation)을 대조했다.
+SQL 주석은 [Oracle 문서](https://docs.oracle.com/en/database/oracle/oracle-database/21/sqlrf/Comments.html)와 실제 엔진을 함께 확인했다.
+
+테스트 재실행:
+
+```bash
+cd backend
+npm test                 # 단위·회귀·HTTP·프로세스 테스트
+npm run test:integration # 자체 임시 MariaDB의 SQL·동기화·CLI 검증
+npm run test:oracle      # 자체 임시 Oracle 컨테이너의 실제 드라이버·조회 검증
+npm run test:all         # 위 세 명령을 순서대로 실행
+```
+
+MariaDB 통합 테스트는 `mariadb-install-db`, `mariadbd`를 사용한다. 필요하면 `MARIADB_INSTALL_DB`,
+`MARIADBD`로 실행 파일을 지정한다. 데이터 디렉터리와 Unix 소켓은 임시 경로에 만들고 TCP 포트는 열지 않는다.
+Oracle 테스트에는 실행 중인 Docker와 로컬 `gvenzl/oracle-free:latest` 이미지가 필요하다.
+`ORACLE_TEST_IMAGE`로 호환 이미지를 지정할 수 있으며 테스트가 이미지를 자동 다운로드하지는 않는다.
+각 테스트는 자기 DB·컨테이너를 생성하고 종료·제거한다. 기존 `.env`의 운영 DB에는 접속하지 않는다.
+
+검증 환경은 macOS, Node 25.9.0, MariaDB 12.2.2, 로컬 Oracle Free 이미지의 Thin 드라이버다.
+OCI/Thick 및 Windows 배치 스크립트의 실제 실행은 이번 환경에서 검증하지 않았다.
+LLM과 임베딩 API는 프로토콜·실패·스트림 경계를 검증하는 대역을 사용하며 업무 데이터의 모델 정확도 평가는 별개다.
+
+커버리지 계측 실행은 파서 성능 테스트의 고정 시간 상한을 초과했다(계측 시 약 4.7초).
+일반 실행에서는 통과하며, 커버리지 계측 실패를 정상 검증 결과로 집계하지 않았다.
+커버리지 수치만으로 전체 검토 완료나 결함 부재를 판단하지 않았다.
+
+최종 전체 검증 결과(2026-09-06): `npm run test:all` 종료 코드 0.
+
+| 검증 | 통과 | 실패 | 건너뜀 |
+|---|---:|---:|---:|
+| 단위·회귀·HTTP·프로세스 | 434 | 0 | 0 |
+| 실제 MariaDB 통합 | 8 | 0 | 0 |
+| 실제 Oracle 통합 | 5 | 0 | 0 |
+| 합계 | 447 | 0 | 0 |
+
+`git diff --check`와 POSIX 실행 스크립트 구문 검사도 통과했다. 테스트용 Oracle 컨테이너가
+남아 있지 않은 것을 확인했다. 확인된 15개 결함 유형은 모두 수정하고 정식 테스트로 남겼다.
+이 결과는 위 환경과 검토 범위의 검증 기록이며 모든 운영 환경에서의 결함 부재를 보증하지는 않는다.
+
+문서 해시 형식이 바뀌므로 적용 후 첫 동기화에서는 기존 문서를 한 번 재분할한다.
+운영 DB에 대한 배포·동기화 실행은 하지 않았다.

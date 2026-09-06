@@ -7,7 +7,10 @@
     "start": "node src/server.js",
     "dev": "node scripts/ensure-env.js && node src/server.js",
     "embed": "node src/embed-sync.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "test:integration": "node --test test/integration/*.test.js",
+    "test:oracle": "node --test test/oracle/*.test.js",
+    "test:all": "npm test && npm run test:integration && npm run test:oracle"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

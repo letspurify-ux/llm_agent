@@ -74,7 +74,10 @@ export async function embed(texts, signal) {
     // 응답 항목에 index가 있는 이유가 순서를 보장하지 않기 때문이다 (vLLM/TEI의 continuous batching은
     // 실제로 순서를 바꾼다). 위치로 짝지으면 텍스트와 벡터가 어긋난 채 올바른 해시와 함께 저장돼
     // 이후 동기화가 영영 고치지 못한다 — 반드시 index로 정렬하고 개수도 확인한다.
-    const items = [...(data.data ?? [])].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+    if (!Array.isArray(data?.data) || data.data.some(item => !item || typeof item !== 'object')) {
+      throw new EmbeddingError('임베딩 응답 data는 벡터 항목 배열이어야 합니다', false);
+    }
+    const items = [...data.data].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
     // 응답 정합성 문제는 같은 입력을 다시 보내도 같은 결과다 — 재시도 대상이 아니다.
     if (items.length !== texts.length) {
       throw new EmbeddingError(`임베딩 응답 개수 불일치: 요청 ${texts.length}건, 응답 ${items.length}건`, false);
@@ -83,7 +86,7 @@ export async function embed(texts, signal) {
       throw new EmbeddingError('임베딩 응답 index가 중복되거나 누락되거나 범위를 벗어났습니다', false);
     }
     const vectors = items.map(d => d.embedding);
-    if (vectors.some(v => !Array.isArray(v) || v.length === 0)) {
+    if (vectors.some(v => !Array.isArray(v) || v.length === 0 || v.some(n => !Number.isFinite(n)))) {
       throw new EmbeddingError('임베딩 응답에 유효하지 않은 벡터가 포함되어 있습니다', false);
     }
     return vectors;

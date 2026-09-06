@@ -3,6 +3,23 @@
 // 번호를 어긋나게 읽으면 다른 조회의 표가 '그 질문의 답'으로 그려진다.
 import { test } from 'node:test';
 import assert from 'node:assert';
+
+test('코드 예시 안의 표·차트 참조는 실행하지 않고 바깥의 실제 참조만 채운다', () => {
+  for (const [language, resolve, body] of [
+    ['chart', resolveChartData, 'type: bar\ndata: step 1'],
+    ['table', resolveTableData, 'step: 1'],
+  ]) {
+    const inner = `\`\`\`${language}\n${body}\n\`\`\``;
+    for (const fence of ['````', '~~~~']) {
+      const example = `${fence}markdown\n${inner}\n${fence}`;
+      const rows = [[{ NAME: '실제 데이터', VALUE: 7 }]];
+      assert.equal(resolve(example, rows), example, `${language}: 코드 예시가 바뀌었다`);
+      const output = resolve(`${example}\n\n${inner}`, rows);
+      assert.ok(output.startsWith(`${example}\n\n`));
+      assert.match(output.slice(example.length), /실제 데이터/);
+    }
+  }
+});
 import { resolveChartData, MAX_CHART_COLS, MAX_CHART_CELL_LEN, MAX_CHART_INJECT_LEN, MAX_CHART_BLOCK_ROWS } from '../src/chart.js';
 import { TRUNC_MARK, MAX_CELL_LEN } from '../src/constants.js';
 import { parseChartBlock } from '../../frontend/src/chart.js';

@@ -287,7 +287,7 @@ const syncInterval = numEnv('EMBED_SYNC_INTERVAL', 60, { allowZero: true });
 if (syncInterval > 0) {
   everyMs(() => runJob(() => {
     return syncEmbeddings()
-      .then(r => { if (r.embedded || r.deleted || r.failed) console.log(`[embed] sync: ${syncSummary(r)}`); })
+      .then(r => { if (r.embedded || r.deleted || r.failed || r.chunksFailed) console.log(`[embed] sync: ${syncSummary(r)}`); })
       // 삼키면 안 된다 — 임베딩 서버 쪽 실패는 embed-sync가 스스로 알리지만, 관리 DB 오류
       // (vec_* 권한 상실·테이블 유실 등)로 query()가 던지면 그 실패는 여기로만 온다.
       // 조용히 버리면 벡터가 낡아가는 동안 검색은 옛 벡터로 계속 동작하므로(벡터 단일 경로 — search.js)

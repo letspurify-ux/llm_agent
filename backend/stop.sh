@@ -5,9 +5,8 @@ cd "$(dirname "$0")"
 
 PID_FILE=.backend.pid
 
-# Same check as start.sh — a live PID alone does not prove it is *our server*.
-# Killing without this check would hit an unrelated process that reused a stale PID, with -9 at worst.
-is_ours() { [ -n "${1:-}" ] && ps -p "$1" -o command= 2>/dev/null | grep -q "src/server.js"; }
+# Same ownership check as start.sh, including the checkout directory.
+source ./process.sh
 
 if [ ! -f "$PID_FILE" ]; then
   echo "[backend] no running process found (.backend.pid missing)."

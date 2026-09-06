@@ -27,6 +27,20 @@ async function withSearchDb(context, query, run) {
   }
 }
 
+test('청크 보충 읽기가 실패해도 같은 문서의 떨어진 적중을 모두 보존한다', async context => {
+  const hits = [1, 3].map((n, i) => ({
+    seq: n, doc_seq: 1, chunk_no: n, chunk_of: 5, title: '절차', content: `근거 ${n}`, _dist: 0.1 + i * 0.1,
+  }));
+  await withSearchDb(context, async sql => {
+    if (sql.includes('vec_knowledge_chunk')) return hits;
+    if (sql.includes('FROM knowledge_chunk')) throw new Error('chunk read timeout');
+    assert.fail(`예상 밖 SQL: ${sql}`);
+  }, async () => {
+    const items = await searchKnowledge('같은 문서의 두 근거');
+    assert.deepEqual(items.flatMap(item => item.chunks.map(chunk => chunk.seq)), [1, 3]);
+  });
+});
+
 test('처리방법 라우팅 조회가 실패해도 성공한 직접 쿼리 검색은 보존한다', async context => {
   await withSearchDb(context, async sql => {
     if (sql.includes('vec_qa_method')) return [{ seq: 1, title: '절차', method: 'direct_query 실행' }];

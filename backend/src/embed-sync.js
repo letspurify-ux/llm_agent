@@ -24,6 +24,9 @@ import { splitContent, CHUNK_TARGET_LEN, CHUNK_MAX_LEN, CHUNK_OVERLAP, CHUNK_SPL
 // 규칙을 여기 박아 두면 상수 한 줄을 고치는 것만으로 다음 동기화가 알아서 다시 나눈다.
 // 분할 방식의 판(CHUNK_SPLIT_VERSION)도 넣는다 — 크기·겹침이 같아도 절단 위치 규칙이 바뀌면 다른 청크다 (chunk.js).
 const CHUNK_RULE = `chunk:${CHUNK_TARGET_LEN}:${CHUNK_MAX_LEN}:${CHUNK_OVERLAP}:v${CHUNK_SPLIT_VERSION}`;
+// 청크는 제목과 본문을 따로 사용한다. 개행으로만 연결하면 제목 끝의 문장을 본문으로
+// 옮겨도 같은 해시가 되어 옛 청크가 남는다. JSON 배열로 각 필드의 경계를 보존한다.
+const DOC_HASH_EXPR = 'MD5(JSON_ARRAY(?, title, content))';
 
 // 임베딩 원문 — 검색 대상 컬럼(search.js)을 이어붙여 "이 행이 무엇인지"를 표현한다.
 // 검색 대상 컬럼의 단일 정의(search.js)를 여기서도 쓴다 — 두 곳이 갈라지면 벡터가 담은 내용과 검색이 맞추려는 내용이 어긋난다.
@@ -95,7 +98,8 @@ export function syncSummary(r) {
   // 청크 재생성은 0건일 때 적지 않는다 — 평상시 주기는 늘 0이라, 매번 적으면 '아무 일도 없던 주기'와
   // '문서가 실제로 바뀐 주기'를 운영자가 구분할 수 없게 된다 (cleaned up을 실제 삭제 수로 세는 것과 같은 이유).
   const chunks = r.chunks ? `, rechunked ${r.chunks} (replacing ${r.chunksDropped})` : '';
-  return `created/updated ${r.embedded}, cleaned up ${r.deleted}${chunks}${failed}${note ? ` — ${note}` : ''}`;
+  const chunkFailures = r.chunksFailed ? `, chunk failures ${r.chunksFailed}` : '';
+  return `created/updated ${r.embedded}, cleaned up ${r.deleted}${chunks}${failed}${chunkFailures}${note ? ` — ${note}` : ''}`;
 }
 
 // 중첩 실행 가드 — 초기 대량 동기화(수 분)가 도는 동안 다른 실행이 겹쳐 같은 행을
@@ -165,24 +169,24 @@ export async function syncEmbeddings() {
 // 임베딩이 꺼져 있어도 이 단계는 돈다 — 청크는 임베딩과 무관한 원문 파생이고, 여기서 건너뛰면
 // 임베딩을 다시 켰을 때 청크가 없어 지식이 통째로 검색되지 않는다.
 async function rebuildChunks() {
-  let built = 0, dropped = 0;
+  let built = 0, dropped = 0, failed = 0;
   // 문서 단위 해시. 컬럼 목록은 knowledge의 검색 대상과 같아야 한다 — 제목만 고친 수정도
   // 청크의 title 복사본에 반영되어야 하기 때문이다.
-  const docs = await query(`SELECT seq, ${hashExpr(['title', 'content'])} AS h FROM knowledge`, [CHUNK_RULE]);
+  const docs = await query(`SELECT seq, ${DOC_HASH_EXPR} AS h FROM knowledge`, [CHUNK_RULE]);
   const have = new Map(
     (await query('SELECT doc_seq, MIN(doc_hash) AS h FROM knowledge_chunk GROUP BY doc_seq'))
       .map(r => [r.doc_seq, r.h])
   );
-  const stale = docs.filter(d => have.get(d.seq) !== d.h).map(d => ({ seq: d.seq, hash: d.h }));
-  const byHash = new Map(stale.map(d => [d.seq, d.hash]));
+  const stale = docs.filter(d => have.get(d.seq) !== d.h).map(d => d.seq);
   // 원본이 사라진 청크는 FK ON DELETE CASCADE가 이미 거둔다 — 여기서 다시 지우지 않는다.
   // (그 벡터는 ②의 고아 정리가 거둔다: 청크가 없어지면 vec 쪽이 stored에 고아로 남는다.)
 
-  for (const seqs of chunked(stale.map(d => d.seq), IN_CHUNK)) {
+  for (const seqs of chunked(stale, IN_CHUNK)) {
     if (stopRequested) break;
     const rows = await query(
-      `SELECT seq, title, content FROM knowledge WHERE seq IN (${seqs.map(() => '?').join(',')})`,
-      seqs
+      `SELECT seq, title, content, ${DOC_HASH_EXPR} AS h
+       FROM knowledge WHERE seq IN (${seqs.map(() => '?').join(',')})`,
+      [CHUNK_RULE, ...seqs]
     );
     for (const row of rows) {
       // 문서마다 확인한다. IN_CHUNK가 1,000이라 덩어리 경계에서만 보면 종료 요청 뒤에도 문서
@@ -204,16 +208,17 @@ async function rebuildChunks() {
              VALUES (?, ?, ?, ?, ?, ?)
              ON DUPLICATE KEY UPDATE chunk_of = VALUES(chunk_of), doc_hash = VALUES(doc_hash),
                                      title = VALUES(title), content = VALUES(content)`,
-            [row.seq, i + 1, parts.length, byHash.get(row.seq), row.title, content]
+            [row.seq, i + 1, parts.length, row.h, row.title, content]
           );
         }
         // 문서가 짧아졌으면 남는 꼬리를 거둔다. 두지 않으면 지워진 대목이 검색에 계속 살아 있다.
         const del = await conn.query('DELETE FROM knowledge_chunk WHERE doc_seq = ? AND chunk_no > ?',
           [row.seq, parts.length]);
-        dropped += Number(del?.affectedRows ?? 0);
         await conn.commit();
+        dropped += Number(del?.affectedRows ?? 0);
         built += parts.length;
       } catch (e) {
+        failed++;
         await conn.rollback().catch(() => { /* 이미 끊긴 커넥션 */ });
         // 행 하나의 실패로 동기화 전체를 버리지 않는다 — 다음 주기에 해시가 여전히 불일치하므로
         // 자동으로 다시 잡힌다 (embedRows가 행별 실패를 다루는 것과 같은 방식).
@@ -223,7 +228,7 @@ async function rebuildChunks() {
       }
     }
   }
-  return { built, dropped };
+  return { built, dropped, failed };
 }
 
 async function doSync() {
@@ -232,7 +237,7 @@ async function doSync() {
   // 건너뛰면 삭제된 지식의 벡터가 남아, 임베딩을 다시 켤 때까지 검색에 노출된다.
   const enabled = isEmbeddingEnabled();
   let embedded = 0, deleted = 0, failed = 0, skipped = enabled ? SKIP.NONE : SKIP.UNCONFIGURED;
-  let chunked_built = 0, chunked_dropped = 0;
+  let chunked_built = 0, chunked_dropped = 0, chunksFailed = 0;
   // 임베딩 서버가 도중에 끊기면 임베딩만 멈추고 루프는 끝까지 돈다.
   // 여기서 return하면 뒤쪽 테이블의 고아 벡터 정리가 통째로 빠지는데, 그 정리는 이 함수에만 있어
   // 삭제된 qa_method/query_registry의 벡터가 다음 성공 동기화까지 검색에 남는다.
@@ -246,7 +251,9 @@ async function doSync() {
     const c = await rebuildChunks();
     chunked_built = c.built;
     chunked_dropped = c.dropped;
+    chunksFailed = c.failed;
   } catch (e) {
+    chunksFailed++;
     console.warn(`[embed] chunk rebuild failed — vector sync continues with existing chunks: ${e.message}`);
   }
 
@@ -296,10 +303,13 @@ async function doSync() {
     // 읽기는 이미 IN_CHUNK 단위로 나뉘어 있었으므로, 그 덩어리를 그대로 넘기면 최고점이 IN_CHUNK로 묶인다.
     for (const seqs of chunked([...staleHash.keys()], IN_CHUNK)) {
       const contentRows = await query(
-        `SELECT seq, ${cols.join(', ')} FROM ${src} WHERE seq IN (${seqs.map(() => '?').join(',')})`,
-        seqs
+        `SELECT seq, ${cols.join(', ')}, ${hashExpr(cols)} AS h
+         FROM ${src} WHERE seq IN (${seqs.map(() => '?').join(',')})`,
+        [EMBEDDING_MODEL, ...seqs]
       );
-      const stale = contentRows.map(r => ({ seq: r.seq, text: toText(cols, r), hash: staleHash.get(r.seq) }));
+      // 최초 스캔 이후 원문이 바뀔 수 있다. 저장할 해시는 실제 읽은
+      // 본문과 같은 SELECT에서 계산해야 다음 동기화의 변경 감지가 정확하다.
+      const stale = contentRows.map(r => ({ seq: r.seq, text: toText(cols, r), hash: r.h }));
       const r = await embedStale(src, stale);
       embedded += r.embedded;
       failed += r.failed;
@@ -310,7 +320,7 @@ async function doSync() {
     }
   }
   return {
-    embedded, deleted, failed, chunks: chunked_built, chunksDropped: chunked_dropped,
+    embedded, deleted, failed, chunks: chunked_built, chunksDropped: chunked_dropped, chunksFailed,
     skipped: stopped ? SKIP.STOPPED : unavailable ? SKIP.UNAVAILABLE : skipped,
   };
 }
@@ -418,21 +428,21 @@ async function storeBatch(src, batch, vectors) {
 // CLI: npm run embed
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const t = Date.now();
-  const r = await syncEmbeddings();
-  // stdout이 파이프(tee, CI 로그, docker build 등)면 console.log는 비동기라 아래 process.exit에
-  // 잘려 나간다 — 이 명령의 존재 이유가 프로비저닝 스크립트에 결과를 알리는 것이므로 동기로 쓴다.
-  // try/catch는 필수다: 논블로킹 파이프에서 writeSync는 EAGAIN을 던지는데, 그게 새어 나가면
-  // 아래 process.exit가 실행되지 않아 성공한 동기화가 0이 아닌 종료 코드로 보고된다.
-  // (server.js의 uncaughtException 핸들러가 같은 이유로 같은 형태를 쓴다)
-  const summary = `embedding sync complete: ${syncSummary(r)}, ${((Date.now() - t) / 1000).toFixed(1)}s\n`;
-  try { writeSync(1, summary); } catch { /* 로그 실패가 종료 코드를 바꾸지 않게 */ }
-  // 풀을 닫고 나간다 — process.exit는 풀에 남은 커넥션을 정리하지 않고 소켓째 끊으므로,
-  // 프로비저닝 진입점인 이 명령을 돌릴 때마다 MariaDB 에러 로그에 커넥션 수만큼
-  // 'Aborted connection … Got an error reading communication packets'가 쌓인다.
-  // server.js의 정상 종료가 closePool을 부르는 것과 같은 이유인데 이쪽 종료 경로만 빠져 있었다.
-  await closePool().catch(e => console.warn('[embed] failed to close connection pool:', e.message));
-  // 실패로 종료하는 것은 "쓰려고 했는데 안 된" 경우뿐이다 — 임베딩을 끄고 쓰는 것은 설정상의
-  // 선택이라(그 구성에서는 검색이 없다) 프로비저닝 스크립트가 이 명령의 종료 코드로 그것을
-  // 실패로 판정하면 안 된다.
-  process.exit(r.skipped === SKIP.UNAVAILABLE ? 1 : 0);
+  let code = 1;
+  try {
+    const r = await syncEmbeddings();
+    // 종료 직전 파이프 출력이 유실되지 않도록 요약은 동기로 쓴다.
+    const summary = `embedding sync complete: ${syncSummary(r)}, ${((Date.now() - t) / 1000).toFixed(1)}s\n`;
+    try { writeSync(1, summary); } catch { /* 로그 실패가 동기화 결과를 바꾸지 않게 */ }
+    // 일부 행이나 청크만 실패해도 프로비저닝은 성공으로 보고하면 안 된다.
+    // 명시적으로 임베딩을 끈 구성과 다른 동기화의 락 점유는 정상 건너뛰기다.
+    code = r.failed || r.chunksFailed || r.skipped === SKIP.UNAVAILABLE ? 1 : 0;
+  } catch (e) {
+    console.error('[embed] sync failed:', e?.message ?? e);
+  } finally {
+    // 본문 조회가 던진 경로도 풀을 정리하고 나간다.
+    try { await closePool(); }
+    catch (e) { console.warn('[embed] failed to close connection pool:', e.message); code = 1; }
+  }
+  process.exit(code);
 }

@@ -268,6 +268,13 @@ async function growItem(row, loadChunks = loadChunkRanges) {
   const hi = Math.min(row.chunk_of, row.to + GROW_WINDOW);
   try {
     const rows = await loadChunks([{ doc_seq: row.doc_seq, from: lo, to: hi }]);
+    // 동기화가 요청 도중 원문을 갱신할 수 있다. 이미 확보한 청크가
+    // 바뀌었으면 다른 판본으로 확대하지 않고 기존 근거를 보존한다.
+    const byNo = new Map(rows.map(chunk => [chunk.chunk_no, chunk]));
+    if (row.chunks?.some(chunk => {
+      const current = byNo.get(chunk.chunk_no);
+      return !current || current.content !== chunk.content || current.title !== chunk.title;
+    })) return null;
     // buildItems에 grow=true를 주면 계획된 범위를 넘어 상한까지 채운다. 대표 청크(rep)를 그대로
     // 넘기는 것이 중요하다: 중심이 옮겨 다니면 두 번째 청구가 첫 번째가 준 구간을 되밟고, 무엇보다
     // 항목의 seq가 대표 청크의 것이라 중심이 바뀌면 seq도 바뀐다 — 모델이 방금 청구한 번호가
@@ -733,7 +740,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
         note: expands >= MAX_EXPANDS
           ? `본문 청구 상한(${MAX_EXPANDS}건)에 닿았다 — 지금까지의 자료로 답변하라`
           : unread
-            ? '청구한 본문을 읽어 오지 못했다 (관리 DB 오류) — 같은 번호를 다시 청구하지 말고 지금 범위로 답변하라'
+            ? '청구한 본문을 읽어 오지 못했다 (관리 DB 오류 또는 검색 이후 본문 변경) — 같은 번호를 다시 청구하지 말고 지금 범위로 답변하라'
             : saturated
               ? '청구한 항목은 더 넓힐 수 없다 — 이웃 조각이 문서당 글자 상한에 들어가지 않는다. 지금 범위로 답변하라'
               : '표시할 새 내용이 없다 — 확대 가능하거나 보관 목록에 있는 항목을 청구하라',

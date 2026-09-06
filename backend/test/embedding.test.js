@@ -6,6 +6,20 @@ import assert from 'node:assert';
 process.env.EMBEDDING_URL = 'http://test.invalid/v1';
 const { embed, EmbeddingError } = await import('../src/embedding.js');
 
+test('잘못된 응답 구조와 숫자가 아닌 벡터를 영구 응답 오류로 거부한다', async () => {
+  const invalid = [
+    null, { data: {} }, { data: [null] },
+    ...[[null], ['1'], [true], [0, {}], []].map(embedding => ({ data: [{ index: 0, embedding }] })),
+  ];
+  for (const body of invalid) {
+    globalThis.fetch = async () => new Response(JSON.stringify(body));
+    await assert.rejects(embed(['a']), e => e instanceof EmbeddingError && e.retriable === false, JSON.stringify(body));
+  }
+  // JSON 문법상 유효한 큰 지수도 JS에서는 Infinity가 된다.
+  globalThis.fetch = async () => new Response('{"data":[{"index":0,"embedding":[1e400]}]}');
+  await assert.rejects(embed(['a']), e => e instanceof EmbeddingError && e.retriable === false);
+});
+
 test('임베딩 index 중복·누락·범위 오류는 원문과 벡터를 잘못 짝짓지 않는다', async () => {
   for (const indices of [[0, 0], [1, 2], [-1, 0], [0, 0.5], [undefined, undefined]]) {
     globalThis.fetch = async () => new Response(JSON.stringify({

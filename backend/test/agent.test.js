@@ -1312,6 +1312,25 @@ const loaderOf = rows => async ranges =>
   rows.filter(r => ranges.some(g => g.doc_seq === r.doc_seq && r.chunk_no >= g.from && r.chunk_no <= g.to));
 const firstItemLine = ctx => buildPrompt(ctx).split('\n').find(l => l.startsWith('- '));
 
+test('확대 중 원문이 바뀌어도 검색에서 확보한 근거를 덮어쓰지 않는다', async () => {
+  const rows = [1, 2, 3].map(no => CH(1, no, 100, 3));
+  const [item] = buildItems(planRanges([{ ...rows[0], _dist: 0.1 }]), [rows[0]]);
+  const original = item.content;
+  const llm = scripted([
+    { action: 'search', text: '원문 변경', targets: ['knowledge'] },
+    { action: 'expand', ids: [`k${item.seq}`] },
+    { action: 'answer', answer: '답' },
+  ]);
+  const result = await handleQuestion('q', [], { deps: {
+    decide: llm.decide,
+    search: async () => found({ knowledge: [item] }),
+    loadChunks: async () => rows.map(row => row.chunk_no === 1 ? { ...row, content: '교체된 원문' } : row),
+  } });
+  assert.equal(llm.seen.at(-1).knowledge[0].content, original);
+  assert.equal(result.search.expanded, undefined);
+  assert.match(result.trace.find(h => h.expand)?.note ?? '', /변경/);
+});
+
 test('청구로 넓힌 항목이 더 넓힐 수 없게 되면 번호가 사라진다 — 헛도는 청구를 막는다', async () => {
   const restore = silence();
   try {

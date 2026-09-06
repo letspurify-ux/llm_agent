@@ -50,7 +50,7 @@ export async function searchKnowledge(text) {
   const hits = await vectorSearch('knowledge_chunk', text, LIMIT * CHUNK_OVERFETCH);
   if (!hits || !hits.length) return hits;
   const plans = planRanges(hits);
-  const fallback = buildItems(plans, hits, { maxDocLen: MAX_DOC_LEN });
+  const fallback = searchItems(plans, hits, hits);
   try {
     // 계획된 범위의 앞뒤 한 조각씩을 함께 읽는다. 항목에 싣지는 않는다(buildItems가 계획된 범위 안에서만
     // 채운다) — '더 받을 것이 남았는가'(full)를 검색 시점에 확정하는 데만 쓴다. 이웃을 모르면 번호를 붙일
@@ -58,13 +58,30 @@ export async function searchKnowledge(text) {
     // 헛되이 태운다. 비용은 문서당 최대 두 행이다.
     const rows = await loadChunkRanges(plans.map(p => ({ ...p, from: Math.max(1, p.from - 1), to: p.to + 1 })));
     // 병합한 '문서'를 상한까지 취한다. 청크를 그보다 많이 받은 이유가 여기다 (CHUNK_OVERFETCH).
-    const hydrated = new Map(buildItems(plans, rows, { maxDocLen: MAX_DOC_LEN })
-      .map(item => [`${item.doc_seq}:${item.rep}`, item]));
-    return fallback.map(item => hydrated.get(`${item.doc_seq}:${item.rep}`) ?? item).slice(0, LIMIT);
+    // 검색에서 확보한 원문은 보충 읽기가 일부 행만 반환해도 보존한다.
+    // 같은 청크는 검색 시점의 본문을 우선한다.
+    const available = new Map([...rows, ...hits].map(row => [`${row.doc_seq}:${row.chunk_no}`, row]));
+    return searchItems(plans, [...available.values()], hits).slice(0, LIMIT);
   } catch (e) {
     warnOnce('search:merge', `chunk merge failed — falling back to matched chunks: ${e.message}`);
     return fallback.slice(0, LIMIT);
   }
+}
+
+function searchItems(plans, rows, hits) {
+  const items = buildItems(plans, rows, { maxDocLen: MAX_DOC_LEN });
+  let remaining = hits;
+  for (;;) {
+    const covered = new Set(items.flatMap(item => item.chunks.map(row => `${row.doc_seq}:${row.chunk_no}`)));
+    remaining = remaining.filter(row => !covered.has(`${row.doc_seq}:${row.chunk_no}`));
+    if (!remaining.length) break;
+    // 보충 실패로 구멍이 남았거나 긴 병합 구간이 상한에 닿으면,
+    // 아직 싣지 못한 적중을 독립 구간으로 남긴다.
+    const extra = buildItems(planRanges(remaining, { gapFill: 0 }), remaining, { maxDocLen: MAX_DOC_LEN });
+    if (!extra.length) break;
+    items.push(...extra);
+  }
+  return items.sort((a, b) => a._dist - b._dist);
 }
 
 export function searchQaMethods(text) {

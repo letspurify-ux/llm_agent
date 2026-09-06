@@ -34,10 +34,27 @@ CREATE TABLE IF NOT EXISTS vec_knowledge_chunk (
 
 -- vec_store가 아직 있으면 옮긴다. knowledge 벡터는 옮기지 않는다 —
 -- 청크 단위로 다시 만들어야 하므로(④) 문서 단위 벡터는 쓸 곳이 없다.
-INSERT IGNORE INTO vec_qa_method (seq, embed_hash, embedding)
-  SELECT seq, embed_hash, embedding FROM vec_store WHERE src = 'qa_method';
-INSERT IGNORE INTO vec_query_registry (seq, embed_hash, embedding)
-  SELECT seq, embed_hash, embedding FROM vec_store WHERE src = 'query_registry';
+-- 완료 후 vec_store를 지운 설치에서도 재실행할 수 있어야 한다.
+-- 없는 테이블을 참조하는 SELECT는 WHERE 조건으로 피할 수 없으므로
+-- 테이블이 있을 때만 복사 문장을 준비한다.
+SET @has_vec_store = EXISTS (
+  SELECT 1 FROM information_schema.TABLES
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'vec_store'
+);
+SET @copy_vectors = IF(@has_vec_store,
+  'INSERT IGNORE INTO vec_qa_method (seq, embed_hash, embedding)
+   SELECT seq, embed_hash, embedding FROM vec_store WHERE src = ''qa_method''',
+  'DO 0');
+PREPARE copy_vectors FROM @copy_vectors;
+EXECUTE copy_vectors;
+DEALLOCATE PREPARE copy_vectors;
+SET @copy_vectors = IF(@has_vec_store,
+  'INSERT IGNORE INTO vec_query_registry (seq, embed_hash, embedding)
+   SELECT seq, embed_hash, embedding FROM vec_store WHERE src = ''query_registry''',
+  'DO 0');
+PREPARE copy_vectors FROM @copy_vectors;
+EXECUTE copy_vectors;
+DEALLOCATE PREPARE copy_vectors;
 
 -- ───────────────────────────────────────────────────────────────────────
 -- ② 청크 테이블 (비어 있는 채로 만든다 — 채우는 것은 embed-sync의 일이다)
