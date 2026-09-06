@@ -217,18 +217,9 @@ export async function openaiDecide(ctx) {
 //      (parseDecision이 초안 JSON을 결정으로 삼지 않는 것과 같은 이유).
 //   ② JSON 이스케이프는 조각 경계를 넘어 이어질 수 있다 — 미완의 조각은 다음 조각 앞에 붙인다.
 // 모르는 이스케이프(\frac 같은 LaTeX)는 글자 그대로 둔다 — 파싱 경계(normalizeJsonEscapes)와 같은 관용이다.
-// 알려진 한계: 값이 백슬래시 하나로 끝나면(윈도우 경로) 그 닫는 따옴표를 이스케이프로 읽어 문자열의 끝을
-// 지나친다 — 미리보기 끝에 JSON 꼬리 몇 글자가 잠깐 붙는다. 파서는 그 경우를 위해 두 번째 읽기를 두지만
-// (matchingBrace의 literalBackslashBeforeQuote) 여기서는 그러지 않는다: 미리보기는 최종 답이 아니고
-// (done이 갈아 끼운다) 그 판정을 하려면 뒤를 다 봐야 하는데 흘려보내는 동안에는 뒤가 아직 없다.
+// 잘못 이스케이프된 끝의 백슬래시는 닫는 따옴표와 아직 구별할 수 없다. 이 경우의 복구는
+// 전체 응답을 보는 최종 파서(matchingBrace의 literalBackslashBeforeQuote)가 맡는다.
 // (테스트에서 쓰므로 export 한다)
-const ANSWER_START_RE = /"action"\s*:\s*"answer"\s*,\s*"answer"\s*:\s*"/;
-// 자기닫힘 표기(<think/>)는 여는 태그가 아니다 — 열린 것으로 보면 그 뒤가 영영 사고 과정이 되어 그 모델의
-// 모든 질문에서 미리보기가 통째로 사라진다. 결정 파서(scanCandidates)가 같은 표기에 같은 가드를 두고 있다:
-// '모델이 이 표기를 한 번 쓰기 시작하면 모든 질문이 같은 이유로 실패한다'.
-const REASONING_OPEN_RE = new RegExp(`<(?:${['thinking', 'think', 'reasoning', 'reflection', 'scratchpad', 'thought'].join('|')})\\b[^>]{0,100}(?<!/)>`, 'i');
-const REASONING_CLOSE_RE = new RegExp(`</(?:${['thinking', 'think', 'reasoning', 'reflection', 'scratchpad', 'thought'].join('|')})\\s*>`, 'gi');
-const SEEK_TAIL = 200;   // 찾는 동안 들고 있을 원문 — 시작 패턴은 이보다 짧다
 
 // 이스케이프 해독은 결정 파서와 같은 규칙을 쓴다(normalizeJsonEscapes·keepsControlMeaning). 모델은 LaTeX를 백슬래시
 // 하나로 쓰는 일이 잦고(\frac·\times·\beta·\rho·\nabla) 파서는 그것을 글자 그대로 살리는데, 미리보기가 JSON의
@@ -249,13 +240,8 @@ function escapeNeedsMore(text, i, n) {
 }
 
 export function answerPreviewer(onDelta) {
-  let state = 'seek';   // seek → inside → done
-  let tail = '';        // seek: 마지막 닫는 태그 뒤의 원문 (상한 안에서)
-  let recent = '';      // inside·done: 최근 원문 (닫는 태그가 조각에 걸쳐 올 때를 위해)
-  let inThink = false;  // 열린 채인 사고 과정 태그가 있는가
-  let pending = '';     // inside: 아직 끝나지 않은 이스케이프 조각
+  let pending = '';
   let emitted = false;
-  const out = text => { if (text) { emitted = true; onDelta({ text }); } };
 
   const decode = chunk => {
     const text = pending + chunk;
@@ -264,14 +250,25 @@ export function answerPreviewer(onDelta) {
     let i = 0;
     while (i < text.length) {
       const c = text[i];
-      if (c === '"') { state = 'done'; break; }
+      if (c === '"') break;
       if (c !== '\\') { s += c; i++; continue; }
       const n = text[i + 1];
       if (n === undefined) { pending = '\\'; break; }
       if (n === 'u') {
         const hex = text.slice(i + 2, i + 6);
-        if (hex.length < 4) { pending = text.slice(i); break; }
-        if (/^[0-9a-fA-F]{4}$/.test(hex)) { s += String.fromCharCode(parseInt(hex, 16)); i += 6; continue; }
+        // 닫는 따옴표가 네 자리 안에 있으면 이 이스케이프는 완성될 수 없다 — 파서와 같이 글자 그대로 내보낸다.
+        // 더 기다리면 답 끝의 '\u12' 같은 꼬리가 완료 때까지 화면에서 빠진다(실측).
+        if (hex.length < 4 && !hex.includes('"')) { pending = text.slice(i); break; }
+        if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+          const code = parseInt(hex, 16);
+          // 상위 서로게이트는 짝(\uDC00~\uDFFF)의 이스케이프가 같은 조각에 없으면 다음 조각까지 들고 있는다 —
+          // 홀로 내보내면 화면이 한 박자 동안 깨진 글자를 그린다. 문자열이 닫히면 그대로 내보낸다.
+          if (code >= 0xd800 && code <= 0xdbff) {
+            const next = text.slice(i + 6, i + 12);
+            if (next.length < 6 && !next.includes('"')) { pending = text.slice(i); break; }
+          }
+          s += String.fromCharCode(code); i += 6; continue;
+        }
         s += '\\u'; i += 2; continue;
       }
       if (UNAMBIGUOUS_ESCAPES.includes(n)) { s += n; i += 2; continue; }
@@ -286,47 +283,232 @@ export function answerPreviewer(onDelta) {
     return s;
   };
 
-  const lastCloseEnd = text => {
-    let at = -1;
-    REASONING_CLOSE_RE.lastIndex = 0;
-    for (let m; (m = REASONING_CLOSE_RE.exec(text));) at = m.index + m[0].length;
-    return at;
-  };
+  // JSON의 객체·키·문자열 경계를 조각 사이에 보존한다. 필드 순서나 공백 길이를 정규식으로
+  // 가정하면 유효한 답변도 스트리밍되지 않고, 문자열 안의 태그가 사고 과정으로 오인된다.
+  const frames = [];
+  const tagRe = handledTagRe();
+  let token = null;
+  let atom = false;
+  let tag = '';
+  let depth = 0;
+  let selected = null;
+  let rawDelta = '';
+  let recovery = null;
+  let recoveryDepth = 0;
+  let literalTag = '';
+  let shown = false;
 
-  const feed = chunk => {
-    if (!chunk) return;
-    if (state !== 'seek') {
-      // 흘리는 도중(또는 흘리고 난 뒤)에 닫는 태그가 왔다 — 지금까지 흘린 것은 사고 과정 안의 초안이었다.
-      // 여는 태그를 프롬프트에 미리 붙이는 템플릿(Qwen3·R1)은 content에 닫는 태그만 보내므로(parseDecision ②,
-      // 오히려 더 흔한 형태) 열린 태그로는 초안을 가려낼 수 없고, 초안이 닫힌 뒤에야 그것이 초안이었음을 안다.
-      // 되돌리지 않으면 화면은 버려진 초안을 답이 올 때까지 보여주고 진짜 답은 한 글자도 미리 보이지 않는다(실측).
-      // 답변 본문이 그 태그를 글자로 담은 경우(태그를 묻는 질문)도 여기서 되돌아가 미리보기가 비게 되지만,
-      // done이 갈아 끼우므로 잃는 것은 미리보기뿐이고 그쪽은 드물다.
-      const win = recent + chunk;
-      const close = lastCloseEnd(win);
-      if (close >= 0) {
-        onDelta({ reset: true });
-        state = 'seek'; inThink = false; pending = ''; tail = ''; recent = '';
-        feed(win.slice(close));
-        return;
-      }
-      recent = win.slice(-SEEK_TAIL);
-      if (state === 'inside') out(decode(chunk));
+  const flush = () => {
+    if (!rawDelta) return;
+    const text = decode(rawDelta);
+    rawDelta = '';
+    if (text) { emitted = true; shown = true; onDelta({ text }); }
+  };
+  // 후보를 바꿀 때는 JSON을 읽던 위치까지 지우면 안 된다. 이전 디코더의 미완 이스케이프와
+  // 아직 전송하지 않은 조각도 버려야 두 답이 조각 경계에 따라 섞이지 않는다.
+  const clearPreview = () => {
+    if (shown) onDelta({ reset: true });
+    shown = false;
+    selected = null;
+    pending = '';
+    rawDelta = '';
+  };
+  const clearParse = () => {
+    frames.length = 0;
+    token = null;
+    atom = false;
+    recovery = null;
+    literalTag = '';
+  };
+  const reset = () => {
+    flush();
+    clearPreview();
+    clearParse();
+  };
+  // 사고 과정 블록이 닫혔다 — 그 앞에서 읽던 미완성 후보는 초안이었다. 다만 이미 완성된 답은 최종 파서도 채택한다:
+  // 여는 태그가 있었으면 블록 밖의 1순위이고, 닫는 태그만 왔으면 추정 구간의 2순위다(parseDecision). 그 답을 화면에서
+  // 거두면 모델이 답 뒤에 검토를 덧붙일 때마다 보이던 답이 사라졌다가 done에서야 되살아난다(실측). 2순위인 답은 뒤에
+  // 오는 블록 밖의 결정에 지므로 표시는 두되 교체될 수 있다고 표시한다(assumed). 닫힌 블록 뒤의 답은 그 뒤의 닫는
+  // 태그만으로는 2순위가 되지 않는다(sealed) — 최종 파서가 구간을 나누는 방식과 같다(scanCandidates의 pending).
+  const closeBlock = opened => {
+    if (!selected?.complete) { reset(); return; }
+    flush();
+    if (opened) selected.sealed = true;
+    else if (!selected.sealed) selected.assumed = true;
+    clearParse();
+  };
+  const inside = (child, parent) => {
+    for (let f = child; f; f = f.parent) if (f === parent) return true;
+    return false;
+  };
+  const select = frame => {
+    if (depth || frame.action !== 'answer' || !frame.answer || frame.answer.valid === false) return;
+    // 부모가 행동을 이미 골랐으면 그 메타데이터의 answer는 별도 결정이 아니다.
+    if (frames.some(f => f !== frame && f.action && !(f.action === 'answer' && f.answer?.valid === false))) return;
+    if (selected === frame) return;
+    // 최종 파서(findDecision)는 상위 객체 자체의 결정을 내부 후보보다 먼저 채택한다.
+    // 추정 구간(닫는 태그만 온 사고 과정) 안의 답은 뒤에 오는 블록 밖의 답에 진다 (closeBlock).
+    if (selected && !inside(selected, frame) && !selected.assumed) return;
+    if (selected) { frame.fallback = selected; clearPreview(); }
+    selected = frame;
+    rawDelta += frame.answer.raw;
+  };
+  const append = (answer, c) => {
+    // action이 뒤늦게 바뀌었다가 answer로 돌아와도 같은 원문으로 복원할 수 있어야 한다.
+    answer.raw += c;
+    if (selected?.answer === answer) rawDelta += c;
+  };
+  const valueDone = frame => { frame.phase = 'comma'; };
+  const invalid = c => {
+    // 닫히지 않은 초안 문자열 뒤에 </think>{"action":... 이 이어지는 모델도 있다.
+    // 문자열 안의 태그만으로 지우지 않고, 실제 JSON 경계가 깨진 뒤에만 그 태그 뒤로 복구한다.
+    const rest = recovery;
+    const restDepth = recoveryDepth;
+    // 이미 완성된 답 뒤에 붙은 설명·예시의 문법 오류로 앞의 답을 거두지 않는다.
+    if (selected?.complete && rest === null) {
+      frames.length = 0;
+      token = null;
+      atom = false;
       return;
     }
-    tail += chunk;
-    // 닫는 태그가 왔으면 그 뒤만 본다 — 앞은 사고 과정이다
-    const lastClose = lastCloseEnd(tail);
-    if (lastClose >= 0) { tail = tail.slice(lastClose); inThink = false; }
-    if (REASONING_OPEN_RE.test(tail)) inThink = true;
-    if (inThink) { tail = tail.slice(-SEEK_TAIL); return; }
-    const m = ANSWER_START_RE.exec(tail);
-    if (!m) { tail = tail.slice(-SEEK_TAIL); return; }
-    state = 'inside';
-    const rest = tail.slice(m.index + m[0].length);
-    tail = '';
-    recent = rest.slice(-SEEK_TAIL);
-    out(decode(rest));
+    reset();
+    if (rest !== null) {
+      depth = restDepth;
+      for (const ch of rest) consume(ch);
+    } else if (c === '{' || c === '<') consume(c);
+  };
+  const consume = c => {
+    if (recovery !== null) recovery += c;
+    if (token) {
+      // 문자열의 태그는 본문이다. 다만 나중에 이 문자열이 잘못된 초안으로 판명되면 복구 지점이 된다.
+      if (c === '<') literalTag = '<';
+      else if (literalTag) {
+        literalTag += c;
+        if (c === '>') {
+          if (literalTag.startsWith('</') && tagRe.test(literalTag)) {
+            recoveryDepth = Math.max(0, (recovery === null ? depth : recoveryDepth) - 1);
+            recovery = '';
+          }
+          literalTag = '';
+        } else if (literalTag.length > MAX_TAG_ATTR_LEN + 20) literalTag = '';
+      }
+      if (c === '"' && !token.escaped) {
+        const t = token;
+        token = null;
+        literalTag = '';
+        if (t.kind === 'answer') {
+          append(t.answer, '"'); // 다음 글자가 필요한 \n·\t 등의 이스케이프 판정을 마친다
+          // 빈 답은 최종 파서도 후보에서 제외한다. 선택 상태를 남기면 뒤의 진짜 답을 막는다.
+          const value = tryParse(`"${t.answer.raw}`);
+          t.answer.valid = typeof value === 'string' && !!value.trim();
+          if (!t.answer.valid && selected === t.frame) {
+            clearPreview();
+            // 상위 답이 비어 있으면 최종 파서는 먼저 발견한 내부의 유효한 결정을 사용한다.
+            if (t.frame.fallback) select(t.frame.fallback);
+          }
+        } else {
+          let value;
+          if (t.kind === 'key' || t.frame.key === 'action') {
+            try { value = JSON.parse(`"${t.raw}"`); } catch { invalid(c); return; }
+          }
+          if (t.kind === 'key') { t.frame.key = value; t.frame.phase = 'colon'; return; }
+          if (t.frame.key === 'action') {
+            t.frame.action = value;
+            if (value !== 'answer' && inside(selected, t.frame)) clearPreview();
+            select(t.frame);
+          }
+        }
+        valueDone(t.frame);
+        return;
+      }
+      if (token.kind === 'answer') append(token.answer, c);
+      else token.raw += c;
+      token.escaped = c === '\\' && !token.escaped;
+      return;
+    }
+    if (tag) {
+      if (c === '<') { tag = '<'; return; }
+      tag += c;
+      if (c === '>') {
+        const marker = tag;
+        tag = '';
+        if (tagRe.test(marker)) {
+          if (marker.startsWith('</')) {
+            const opened = depth > 0;
+            if (opened) depth--;
+            if (!depth) closeBlock(opened);
+          } else if (!marker.endsWith('/>')) depth++;
+        }
+      } else if (tag.length > MAX_TAG_ATTR_LEN + 20 || c === '{') {
+        tag = '';
+        if (c === '{') consume(c);
+      }
+      return;
+    }
+    if (c === '<') { tag = '<'; return; }
+    if (atom) {
+      if (!/[\s,}\]]/.test(c)) return;
+      atom = false;
+      valueDone(frames.at(-1));
+    }
+    if (/\s/.test(c)) return;
+    const frame = frames.at(-1);
+    if (!frame) {
+      if (c === '{') frames.push({ kind: 'object', phase: 'key' });
+      return;
+    }
+    if (((frame.phase === 'key' || frame.phase === 'comma') && c === '}' && frame.kind === 'object')
+      || ((frame.phase === 'value' || frame.phase === 'comma') && c === ']' && frame.kind === 'array')) {
+      frame.complete = true;
+      frames.pop();
+      if (frames.length) valueDone(frames.at(-1));
+      recovery = null;
+      return;
+    }
+    if (frame.phase === 'comma') {
+      if (c !== ',') { invalid(c); return; }
+      frame.phase = frame.kind === 'object' ? 'key' : 'value';
+      recovery = null;
+      return;
+    }
+    if (frame.phase === 'key') {
+      if (c !== '"') { invalid(c); return; }
+      token = { kind: 'key', frame, raw: '', escaped: false };
+      return;
+    }
+    if (frame.phase === 'colon') {
+      if (c !== ':') { invalid(c); return; }
+      frame.phase = 'value';
+      return;
+    }
+    // JSON의 중복 키는 마지막 값이 이긴다. 문자열뿐 아니라 null·객체로 덮인 값도 무효화한다.
+    if (frame.kind === 'object' && frame.key === 'answer') {
+      if (selected === frame) clearPreview();
+      frame.answer = c === '"' ? null : { raw: '', valid: false };
+      if (c !== '"' && frame.fallback) select(frame.fallback);
+    }
+    if (frame.kind === 'object' && frame.key === 'action' && c !== '"') {
+      frame.action = undefined;
+      if (inside(selected, frame)) clearPreview();
+    }
+    if (c === '{' || c === '[') {
+      frames.push({ kind: c === '{' ? 'object' : 'array', phase: c === '{' ? 'key' : 'value', parent: frame });
+      return;
+    }
+    if (c === '"') {
+      if (frame.kind === 'object' && frame.key === 'answer') {
+        frame.answer = { raw: '' };
+        token = { kind: 'answer', frame, answer: frame.answer, escaped: false };
+        select(frame);
+      } else token = { kind: 'value', frame, raw: '', escaped: false };
+      return;
+    }
+    if (/[-0-9tfn]/.test(c)) { atom = true; return; }
+    invalid(c);
+  };
+  const feed = chunk => {
+    for (const c of chunk ?? '') consume(c);
+    flush();
   };
 
   return { feed, get emitted() { return emitted; } };

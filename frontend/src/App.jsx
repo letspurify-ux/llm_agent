@@ -8,9 +8,9 @@ import { parseChartBlock, splitBlock, chartTableMarkdownFrom, chartBlocksToTable
 // trace 패널의 계약(열·셀 표기·CSV)은 trace.js에 있다.
 import { columnsOf, cellValue, cellText, toCsv, csvFileName, stepLabel, normalizeTrace, isSearchStep, targetsLabel, traceSummary,
   applyProgress, progressText } from './trace.js';
-// 응답 스트림(진행 이벤트 + 마지막 답)을 읽는 계약은 stream.js에, 답변 미리보기의 손질은 preview.js에 있다.
+// 응답 스트림 읽기는 stream.js에, 미리보기 코드블록 표시는 preview.js에 있다.
 import { readEvents } from './stream.js';
-import { previewMarkdown, isPreviewBlock, PLACEHOLDER_TEXT } from './preview.js';
+import { PreviewPre } from './preview.js';
 // 답변 속 주소를 어떻게 다룰지의 판정은 markdown.js에 있다 (순수 함수라 회귀 테스트가 붙는다).
 import { linkTarget, imageTarget, mdProps, scopeMarkdownIds } from './markdown.js';
 
@@ -173,12 +173,6 @@ function PreOrBlock({ node, children, ...props }) {
   const code = codeOf(node);
   if (code?.lang === 'chart') return <ChartBlock text={code.text} />;
   if (code?.lang === 'mermaid') return <MermaidBlock text={code.text} />;
-  return <pre {...props}>{children}</pre>;
-}
-// 인용문·목록의 펜스는 markdown 파서가 컨테이너를 벗긴 뒤 판정한다.
-// 미리보기에서는 참조를 채우거나 흐름도 렌더를 시작할 수 없다.
-function PreviewPre({ node, children, ...props }) {
-  if (isPreviewBlock(codeOf(node)?.lang)) return <p><em>{PLACEHOLDER_TEXT}</em></p>;
   return <pre {...props}>{children}</pre>;
 }
 // 답변 속 링크는 새 탭에서 연다 — 같은 탭에서 열리면 대화가 통째로 사라진다(이력은 서버에 없다).
@@ -1045,17 +1039,6 @@ export default function App() {
     }
   }
 
-  // 미리보기 손질은 JSX 밖에서 한다. 자식 요소는 렌더 중에 먼저 만들어지므로 여기서 던지면 아래 Boundary가
-  // 아니라 App이 받는다 — 이 화면에는 root 경계가 없어(main.jsx) 대화가 통째로 사라진다.
-  // 던질 일이 없더라도(순수한 문자열 치환이다) 경계가 지킨다고 적어 둔 자리를 실제로 지키게 둔다.
-  let previewMd = '';
-  try {
-    previewMd = preview ? previewMarkdown(preview) : '';
-  } catch (e) {
-    console.error('[chat] 미리보기를 손질하지 못했습니다:', e);
-    previewMd = preview;
-  }
-
   return (
     <div className="app">
       <header className="header">
@@ -1100,13 +1083,13 @@ export default function App() {
                 <div className="typing"><i /><i /><i /></div>
                 {progress.length > 0 && <ProgressList items={progress} />}
                 {/* 답변 미리보기 — 도착한 조각까지를 markdown으로 그린다. 표·차트 참조는 done 뒤에야 채워지므로
-                    자리 표시로 바꾼다(preview.js). 반쯤 온 글이 렌더러를 던지게 해도 답을 잃지 않게 경계로 감싼다. */}
-                {previewMd && (
+                    코드블록 렌더러가 자리 표시를 그린다(preview.js). 반쯤 온 글이 렌더러를 던지게 해도 답을 잃지 않게 경계로 감싼다. */}
+                {preview && (
                   <Boundary what="preview" fallback={<pre className="preview-raw">{preview}</pre>}>
                     <div className="md preview">
                       <ChartBudget.Provider value={{ n: 0 }}>
                         <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={previewPlugins}
-                                       {...PREVIEW_MD}>{previewMd}</ReactMarkdown>
+                                       {...PREVIEW_MD}>{preview}</ReactMarkdown>
                       </ChartBudget.Provider>
                     </div>
                   </Boundary>

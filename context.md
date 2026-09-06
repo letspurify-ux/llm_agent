@@ -117,6 +117,16 @@
 - 성공·실패 시도를 합해 `MAX_RESULT_READS` 2회다. 반복·잘못된 읽기도 가드와 시간 예산을 적용한다.
   실패 안내는 실행 이력 몫 안에 최대 200자로 표시하며, 새 실행 번호를 만들지 않는다.
 
+날짜 결과의 후속 바인드는 등록 SQL의 타입·포맷과 맞아야 한다. `DATE`는 초까지,
+`TIMESTAMP` 계열은 드라이버의 JavaScript Date가 보존한 밀리초까지 표시한다.
+세션의 `NLS_TIMESTAMP_FORMAT`은 `YYYY-MM-DD HH24:MI:SS.FF3`,
+`NLS_TIMESTAMP_TZ_FORMAT`은 `YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM`이다.
+시간대 있는 결과는 오프셋을 포함한다. `TIMESTAMP WITH LOCAL TIME ZONE`에 그 문자열을
+바인드하는 등록 SQL은 `TO_TIMESTAMP_TZ(:at, 'YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM')`처럼
+오프셋을 명시적으로 해석한다. 밀리초보다 정밀한 값이 필요하면 조회 SQL에서
+`TO_CHAR(..., 'YYYY-MM-DD HH24:MI:SS.FF9')`로 반환하고, 후속 조회도 같은 포맷으로 변환한다.
+이 경우 원래 정밀도의 문자열이 보관되므로 추가 읽기도 그 값을 그대로 제공한다.
+
 ## 4. 프롬프트 예산
 
 전체 상한 + 섹션별 기본 몫과 천장을 유지한다. 배분 순서는 아래 표 순서이고, 표시 순서와는 별개다.

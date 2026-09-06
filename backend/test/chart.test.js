@@ -4,6 +4,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 
+test('표·차트 참조에서 없는 컬럼은 상속 속성이 아닌 빈칸이다', () => {
+  const rows = [JSON.parse('{"LABEL":"A","__proto__":10,"constructor":20}'), { LABEL: 'B' }];
+  for (const [resolve, block] of [
+    [resolveTableData, '```table\nstep: 1\ncols: LABEL, __proto__, constructor\n```'],
+    [resolveChartData, '```chart\ntype: bar\nx: LABEL\ny: __proto__, constructor\ndata: step 1\n```'],
+  ]) {
+    const answer = resolve(block, [rows]);
+    assert.ok(answer.includes('| A | 10 | 20 |'), answer);
+    assert.ok(answer.includes('| B |  |  |'), answer);
+    assert.doesNotMatch(answer, /\[object Object\]|function Object/);
+  }
+});
+
 test('코드 예시 안의 표·차트 참조는 실행하지 않고 바깥의 실제 참조만 채운다', () => {
   for (const [language, resolve, body] of [
     ['chart', resolveChartData, 'type: bar\ndata: step 1'],
@@ -29,6 +42,19 @@ const rows = [
   { MONTH: '2024-02', CNT: null, AMT: 2500, NOTE: 'x\ny' },
 ];
 const block = (body, indent = '') => `${indent}\`\`\`chart\n${body}\n${indent}\`\`\``;
+
+test('대소문자만 다른 결과 컬럼을 정확한 이름으로 표·차트에 선택한다', () => {
+  const steps = [[{ LABEL: 'A', amount: 10, AMOUNT: 100 }]];
+  const table = resolveTableData('```table\nstep: 1\ncols: amount, AMOUNT\n```', steps);
+  assert.ok(table.startsWith('| amount | AMOUNT |\n'), table);
+  assert.ok(table.includes('| 10 | 100 |'), table);
+  const chart = resolveChartData(block('type: bar\nx: LABEL\ny: amount\ny2: AMOUNT\ndata: step 1'), steps);
+  assert.ok(chart.includes('| LABEL | amount | AMOUNT |'), chart);
+  const parsed = parseChartBlock(chart.split('\n').slice(1, -1).join('\n'));
+  assert.equal(parsed.ok, true);
+  assert.deepEqual(parsed.spec.series, [{ name: 'amount', axis: 'left' }, { name: 'AMOUNT', axis: 'right' }]);
+  assert.deepEqual(parsed.spec.rows[0].values, [10, 100]);
+});
 
 test('긴 컬럼 이름을 셀처럼 잘라 차트 축과 표 헤더를 혼동하지 않는다', () => {
   const first = `${'METRIC_'.repeat(17)}_FIRST`;

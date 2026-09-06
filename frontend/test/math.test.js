@@ -29,6 +29,24 @@ const isDisplay = md => render(md).includes('katex-display');
 // href만 뽑는다 — 주소가 한 글자라도 달라지면 링크는 조용히 다른 곳을 가리킨다
 const hrefs = md => [...render(md).matchAll(/href="([^"]*)"/g)].map(m => m[1]);
 
+test('이스케이프된 대괄호는 별행 수식의 구분자가 되지 않는다', () => {
+  for (const md of [String.raw`\[ x = 1 \\]`, String.raw`\\[ x = 1 \]`, String.raw`\\[ x = 1 \\]`]) {
+    assert.equal(render(md), plain(md), md);
+    assert.equal(render(`> ${md}`), plain(`> ${md}`), `인용문: ${md}`);
+  }
+});
+
+test('별행 수식의 닫는 줄은 따로 있어야 하며 여는 달러 수 이상이어야 한다', () => {
+  for (const md of ['$$', '$$\nx=1\n\n이어지는 문장$$', '$$$\nx=1\n$$', '$$\n> $$']) {
+    const html = render(md);
+    assert.ok(!html.includes('katex'), html);
+    assert.equal(html.replace(/<[^>]*>/g, ''), md.replace(/>/g, '&gt;'), md);
+  }
+  assert.deepEqual(formulas('$$$\nx=1\n$$$$'), ['x=1']);
+  assert.deepEqual(formulas('> $$$\n> x=1\n> $$$'), ['x=1']);
+  assert.deepEqual(formulas('- 항목\n\n  $$$\n  x=1\n  $$$'), ['x=1']);
+});
+
 test('$ 하나로 감싼 수식을 그린다 — 표 셀 안에서도', () => {
   assert.deepStrictEqual(formulas('속도는 $v = d/t$ 이다.'), ['v = d/t']);
   assert.deepStrictEqual(formulas('| 항목 | 값 |\n|---|---|\n| 속도 | $v = d/t$ |'), ['v = d/t']);

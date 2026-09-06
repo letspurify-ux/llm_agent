@@ -956,6 +956,106 @@ test('시스템 프롬프트가 일괄 조회와 table 참조를 설명한다', 
 });
 
 // ===== 스트림 응답 =====
+test('답변 필드가 덮어써지면 이전 미리보기를 교체하고 새 답을 즉시 흘린다', async () => {
+  const raw = '{"action":"answer","answer":"옛 답","answer":"수정한 답"}';
+  for (const size of [1, 7, 1000]) {
+    let visible = '';
+    const p = answerPreviewer(e => { visible = e.reset ? '' : visible + e.text; });
+    for (let i = 0; i < raw.length; i += size) p.feed(raw.slice(i, i + size));
+    assert.equal(visible, (await decide(raw)).answer, `조각 ${size}자에서 답이 교체되지 않았다`);
+  }
+  let visible = '';
+  const p = answerPreviewer(e => { visible = e.reset ? '' : visible + e.text; });
+  p.feed('{"action":"answer","answer":"옛 답"');
+  assert.equal(visible, '옛 답');
+  p.feed(',"answer":"새 답의 앞부분');
+  assert.equal(visible, '새 답의 앞부분', '응답 완료까지 옛 답을 남기거나 새 답을 숨겼다');
+});
+
+test('빈 답변 후보가 먼저 나와도 뒤의 유효한 답변 미리보기를 막지 않는다', async () => {
+  const cases = [
+    '{"action":"answer","answer":"","decision":{"action":"answer","answer":"실제 답"}}',
+    '{"decision":{"action":"answer","answer":"실제 답"},"action":"answer","answer":""}',
+    '{"decision":{"action":"answer","answer":"실제 답"},"action":"answer","answer":null}',
+  ];
+  for (const empty of ['', '   ', '\\n\\t']) {
+    cases.push(`{"action":"answer","answer":"${empty}"}{"action":"answer","answer":"실제 답"}`);
+  }
+  for (const raw of cases) {
+    for (const size of [1, 7, 1000]) {
+      let visible = '';
+      const p = answerPreviewer(e => { visible = e.reset ? '' : visible + e.text; });
+      for (let i = 0; i < raw.length; i += size) p.feed(raw.slice(i, i + size));
+      assert.equal(visible, (await decide(raw)).answer, `조각 ${size}자: ${raw}`);
+    }
+  }
+});
+
+test('상위 객체의 답변이 확정되면 먼저 나온 내부 후보의 미리보기를 교체한다', async () => {
+  for (const raw of [
+    '{"decision":{"action":"answer","answer":"내부 예시"},"action":"answer","answer":"실제 답"}',
+    '{"decision":{"action":"answer","answer":"내부 예시"},"answer":"실제 답","action":"answer"}',
+  ]) {
+    for (const size of [1, 7, 1000]) {
+      let visible = '';
+      const p = answerPreviewer(e => { visible = e.reset ? '' : visible + e.text; });
+      for (let i = 0; i < raw.length; i += size) p.feed(raw.slice(i, i + size));
+      assert.equal(visible, (await decide(raw)).answer, `조각 ${size}자에서 내부 후보가 남았다`);
+    }
+  }
+});
+
+test('미리보기는 답변 객체의 필드 순서·추가 필드와 무관하게 최종 답을 흘린다', () => {
+  for (const raw of [
+    '{"answer":"순서가 다른 답","action":"answer"}',
+    '{"action":"answer","note":{"answer":"메타데이터"},"answer":"추가 필드가 있는 답"}',
+    '{"action":"answer","note":[{"action":"answer","answer":"메타데이터"}],"answer":"실제 답"}',
+    `{"action":${' '.repeat(240)}"answer","answer":"공백이 긴 답"}`,
+  ]) {
+    for (const size of [1, 7, 1000]) {
+      const events = [];
+      const p = answerPreviewer(e => events.push(e));
+      for (let i = 0; i < raw.length; i += size) p.feed(raw.slice(i, i + size));
+      assert.equal(events.map(e => e.text ?? '').join(''), JSON.parse(raw).answer, `${size}: ${raw}`);
+      assert.ok(!events.some(e => e.reset));
+    }
+  }
+  // answer 필드가 끝나기 전에도 내보내야 한다. 최종 JSON을 기다리는 폴백으로는 고쳐지지 않는다.
+  const events = [];
+  const p = answerPreviewer(e => events.push(e));
+  p.feed('{"action":"answer","note":0,"answer":"먼저 온 글');
+  assert.equal(events.map(e => e.text ?? '').join(''), '먼저 온 글');
+});
+
+test('중첩된 사고 과정의 안쪽 태그만 닫혀도 초안을 미리보기로 노출하지 않는다', () => {
+  for (const draft of [
+    '<think>바깥 <reflection>안쪽</reflection>{"action":"answer","answer":"폐기 초안"}',
+    '<think><reflection>{"action":"answer","answer":"미완 초안 </reflection>{"action":"answer","answer":"폐기 초안"}',
+  ]) {
+    for (const size of [1, 7, 1000]) {
+      const events = [];
+      const p = answerPreviewer(e => events.push(e));
+      for (let i = 0; i < draft.length; i += size) p.feed(draft.slice(i, i + size));
+      assert.deepEqual(events, [], `조각 ${size}자에서 바깥 사고 과정이 끝나기 전에 초안이 샜다`);
+      p.feed('</think>{"action":"answer","answer":"최종 답"}');
+      assert.equal(events.map(e => e.text ?? '').join(''), '최종 답');
+    }
+  }
+});
+
+test('답변 문자열 안의 사고 과정 태그는 조각 경계와 무관하게 본문으로 보존한다', () => {
+  for (const answer of ['<think> 태그 설명입니다.', '닫는 태그 </think> 설명입니다.', '`<think>내용</think>` 예시와 \\"인용\\"']) {
+    const raw = JSON.stringify({ action: 'answer', answer });
+    for (const size of [1, 7, 1000]) {
+      const events = [];
+      const p = answerPreviewer(e => events.push(e));
+      for (let i = 0; i < raw.length; i += size) p.feed(raw.slice(i, i + size));
+      assert.equal(events.map(e => e.text ?? '').join(''), answer, `${size}: ${answer}`);
+      assert.ok(!events.some(e => e.reset), '본문의 태그를 사고 과정 경계로 오인했다');
+    }
+  }
+});
+
 // 서버가 SSE로 답하면 조각을 이어 붙여 같은 결정을 얻고, 답변 조각을 미리보기로 흘리며, 멈추면 끊는다.
 const enc = new TextEncoder();
 const IDLE_MS = Number(process.env.LLM_IDLE_TIMEOUT_MS);
@@ -1235,4 +1335,68 @@ test('LLM 접속 실패는 fetch failed 뒤에 원인(접속 거부·DNS)이 로
     assert.equal(await openaiDecide(CTX), null);
     assert.ok(warns.some(l => /call failed/.test(l) && /ECONNREFUSED 127\.0\.0\.1:8000/.test(l)), JSON.stringify(warns));
   } finally { console.warn = orig; }
+});
+
+test('완성된 답 뒤에 오는 사고 과정 태그가 미리보기를 지우지 않는다', async () => {
+  // 모델이 결정 뒤에 검토를 덧붙이는 모양(닫힌 블록, 닫는 태그만). 최종 파서는 그 답을 그대로 채택하는데(1순위·2순위)
+  // 미리보기가 태그에서 초기화되면 보이던 답이 사라졌다가 done에서야 되살아난다(실측: Chrome에서 미리보기가 빈 채로 남았다).
+  const answer = '{"action":"answer","answer":"본문 답변"}';
+  for (const raw of [`${answer}\n<think>후기 검토</think>`, `${answer}\n</think>\n`]) {
+    for (const size of [1, 7, 1000]) {
+      const events = [];
+      const p = answerPreviewer(e => events.push(e));
+      for (let i = 0; i < raw.length; i += size) p.feed(raw.slice(i, i + size));
+      assert.ok(!events.some(e => e.reset), `조각 ${size}자에서 완성된 답을 거뒀다: ${raw}`);
+      assert.equal(events.map(e => e.text).join(''), (await decide(raw)).answer, `조각 ${size}자: ${raw}`);
+    }
+  }
+  // 순위는 최종 파서와 같다 — 닫힌 블록 앞의 답(1순위)은 뒤의 답이 밀지 못하고, 닫는 태그만 온 구간의 답(2순위)은
+  // 블록 밖의 유효한 답이 교체하되 빈 답은 교체하지 못한다. 닫힌 블록 뒤에 닫는 태그만 더 와도 1순위는 유지된다.
+  for (const raw of [
+    `${answer}<think>x</think>{"action":"answer","answer":"뒤의 예시"}`,
+    `${answer}</think>{"action":"answer","answer":"블록 밖의 답"}`,
+    `${answer}</think>{"action":"answer","answer":""}`,
+    `${answer}</think>{"action":"answer","answer":"B"}</think>{"action":"answer","answer":"C"}`,
+    `${answer}<think>x</think>{"action":"answer","answer":"B"}</think>{"action":"answer","answer":"C"}`,
+    `${answer}</think>{"decision":{"action":"answer","answer":"안쪽 답"}}`,
+  ]) {
+    for (const size of [1, 7, 1000]) {
+      let visible = '';
+      const p = answerPreviewer(e => { visible = e.reset ? '' : visible + e.text; });
+      for (let i = 0; i < raw.length; i += size) p.feed(raw.slice(i, i + size));
+      assert.equal(visible, (await decide(raw)).answer, `조각 ${size}자: ${raw}`);
+    }
+  }
+});
+
+test('답 끝의 미완성 유니코드 이스케이프가 미리보기의 꼬리를 잃지 않는다', async () => {
+  // '\u' 뒤에 네 자리가 오기 전에 문자열이 닫히면 이스케이프는 완성될 수 없다 — 파서는 글자 그대로 살리는데
+  // 미리보기가 다음 조각을 기다리면 그 꼬리는 done까지 화면에서 빠진다(실측: '끝에 유니코드 \u12'의 '\u12'가 빠졌다).
+  for (const tail of ['\\u', '\\u1', '\\u12', '\\u123', '\\u\\n', '\\u가']) {
+    const raw = `{"action":"answer","answer":"끝에 유니코드 ${tail}"}`;
+    for (const size of [1, 5, 1000]) {
+      let visible = '';
+      const p = answerPreviewer(e => { visible = e.reset ? '' : visible + e.text; });
+      for (let i = 0; i < raw.length; i += size) p.feed(raw.slice(i, i + size));
+      assert.equal(visible, (await decide(raw)).answer, `조각 ${size}자: ${raw}`);
+    }
+  }
+});
+
+test('이스케이프된 서로게이트 쌍이 조각 경계에서 갈라져도 짝 잃은 코드유닛을 내보내지 않는다', async () => {
+  // \ud83d 와 \ude00 이 다른 조각으로 오면 상위 서로게이트 하나가 먼저 화면에 가서 한 박자 깨진 글자로 선다.
+  // 짝이 올 때까지 들고 있되, 문자열이 닫히면 파서와 같이 그대로 내보낸다.
+  const raw = '{"action":"answer","answer":"웃음 \\ud83d\\ude00 끝"}';
+  for (const size of [1, 3, 7, 11]) {
+    const events = [];
+    const p = answerPreviewer(e => events.push(e));
+    for (let i = 0; i < raw.length; i += size) p.feed(raw.slice(i, i + size));
+    for (const e of events) assert.ok(e.text.isWellFormed(), `조각 ${size}자에서 짝 잃은 코드유닛이 나갔다: ${JSON.stringify(e.text)}`);
+    assert.equal(events.map(e => e.text).join(''), '웃음 😀 끝', `조각 ${size}자`);
+  }
+  const lone = '{"action":"answer","answer":"홀로 \\ud83d"}';
+  let visible = '';
+  const p = answerPreviewer(e => { visible = e.reset ? '' : visible + e.text; });
+  for (const c of lone) p.feed(c);
+  assert.equal(visible, (await decide(lone)).answer);
 });

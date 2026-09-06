@@ -218,6 +218,9 @@ function displayParagraph(node, source) {
     const parts = [...raw.matchAll(BRACKET_ALL_RE)].filter(m => m[1].trim());
     // 덩어리 밖에 글자가 남으면 그것은 문장이다
     if (!parts.length || raw.replace(BRACKET_ALL_RE, '').trim()) return null;
+    // 문장 속 판정(splitText)과 마찬가지로 이스케이프된 닫는 괄호는 글자다.
+    // 이를 허용하면 끝의 백슬래시가 TeX 안으로 들어가고 원문이 오류 표시로 바뀐다.
+    if (parts.some(m => escapedAt(raw, m.index) || escapedAt(raw, m.index + m[0].length - 2))) return null;
     for (const m of parts) out.push(mathNode(m[1].trim(), true));
   }
   return out.length ? out : null;
@@ -234,17 +237,23 @@ const withMeta = node => (node.type === 'math' && node.meta
 
 // 닫히지 않은 별행 수식($$ 뒤에 닫는 줄이 없는 경우)은 남은 답변을 통째로 수식으로 삼킨다.
 // 토큰 한도로 잘린 응답에서 실제로 나오고, 그러면 본문이 조판 속으로 사라진다.
-// 원문이 $$로 끝나지 않으면 닫히지 않은 것이므로 글자로 되돌린다.
+// 닫는 표시는 별도 줄에 있고 여는 달러 수 이상이어야 한다.
 function unclosedMath(node, source) {
   if (node.type !== 'math') return null;
   const from = node.position?.start?.offset;
   if (from === undefined) return null;
-  if (source.slice(from, node.position.end.offset).trimEnd().endsWith('$$')) return null;
+  const lines = source.slice(from, node.position.end.offset).split(/\r\n?|\n/);
+  const fence = /^\${2,}/.exec(lines[0])?.[0] ?? '$$';
+  const closing = /^[ \t>]*(\${2,})[ \t]*$/.exec(lines[lines.length - 1]);
+  // 컨테이너 접두사는 원문에만 남고, 닫는 줄은 파서의 value에서 빠진다.
+  // 줄 수도 확인해야 본문에 쓴 '> $$'를 인용문의 닫는 줄로 오인하지 않는다.
+  const bodyLines = node.value ? node.value.split(/\r\n?|\n/).length : 0;
+  if (closing && closing[1].length >= fence.length && lines.length >= bodyLines + 2) return null;
   // 원문이 아니라 파서가 뽑아 준 내용을 쓴다 — 인용문·목록 안이면 원문에는 줄마다 '>'가 붙어 있다.
   // 여는 줄에 이어 쓴 글자는 value가 아니라 meta에 담긴다 — remark-math는 별행 수식을 코드펜스처럼
   // 읽어서 '$$' 뒤의 나머지를 펜스의 언어 자리로 본다. 그것을 빠뜨리면 잘린 답변에서 가장 흔한 모양
   // ($$ 뒤에 수식을 이어 쓰다 끊긴 것)이 화면에 '$$' 한 줄만 남기고 통째로 사라진다(실측).
-  const head = node.meta ? `$$ ${node.meta}` : '$$';
+  const head = node.meta ? `${fence} ${node.meta}` : fence;
   return { type: 'paragraph', children: [{ type: 'text', value: node.value ? `${head}\n${node.value}` : head }] };
 }
 

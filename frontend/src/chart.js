@@ -119,26 +119,36 @@ export function toNumber(cell) {
 // 셀 하나를 시각(ms)으로. 구분자가 있는 날짜만 받는다 — 20240101 같은 숫자는 코드일 수도 있어
 // xtype: time 을 명시했을 때만 날짜로 읽는다. 시각은 지역 시간으로 만든다: 축의 눈금 글자도 지역
 // 시간으로 찍으므로 왕복이 맞아야 '2024-01-01'이 '2023-12-31'로 보이지 않는다.
-// 뒤의 Z·+09:00 은 읽되 무시한다 — Oracle의 TIMESTAMP WITH TIME ZONE 표기(NLS_TIMESTAMP_TZ_FORMAT)가 그렇게
-// 오고, 그 오프셋은 조회한 DB 자신의 시간대라 지역 시간으로 읽는 것과 같은 축에 놓인다.
-const DATE_RE = /^(\d{4})[-./](\d{1,2})(?:[-./](\d{1,2}))?(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?)?(?:\s*(?:Z|[-+]\d{2}:?\d{2}))?$/;
+// Z·+09:00처럼 시간대가 명시되면 그 오프셋을 적용한다. 시계 표시가 같아도 서로 다른 순간일 수 있다.
+// 원래 날짜 표기는 rows.full과 표에 남기고, 축에서는 실제 순간을 브라우저 지역 시간으로 표시한다.
+const DATE_RE = /^(\d{4})[-./](\d{1,2})(?:[-./](\d{1,2}))?(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?)?(?:\s*(Z|[-+]\d{2}:?\d{2}))?$/;
 const COMPACT_DATE_RE = /^(\d{4})(\d{2})(\d{2})?$/;
 export function toTime(cell, explicit = false) {
   const s = String(cell ?? '').trim();
   let m = DATE_RE.exec(s);
   if (!m && explicit) m = COMPACT_DATE_RE.exec(s) || (/^\d{4}$/.test(s) ? [s, s, '1'] : null);
   if (!m) return null;
-  const [, y, mo, d, h, mi, sec, fraction = ''] = m;
+  const [, y, mo, d, h, mi, sec, fraction = '', zone] = m;
   // 시각도 범위를 넘으면 날짜가 아니다. Date는 12:99를 13:39로 조용히 넘겨 버려(실측), 잘못 적힌
   // 시각이 축의 엉뚱한 자리에 찍힌다 — 아래 날짜 확인은 하루를 넘길 때만 걸린다.
   if (+(h ?? 0) > 23 || +(mi ?? 0) > 59 || +(sec ?? 0) > 59) return null;
+  let offset = 0;
+  if (zone && zone !== 'Z') {
+    const digits = zone.slice(1).replace(':', '');
+    const hours = +digits.slice(0, 2);
+    const minutes = +digits.slice(2);
+    if (hours > 23 || minutes > 59) return null;
+    offset = (hours * 60 + minutes) * (zone[0] === '-' ? -1 : 1);
+  }
   // 연·월·일을 함께 놓아 0~99년도 그 해의 윤년으로 판정한다.
   const t = new Date(0);
-  t.setFullYear(+y, +mo - 1, +(d ?? 1));
+  const mode = zone ? 'UTC' : '';
+  t[`set${mode}FullYear`](+y, +mo - 1, +(d ?? 1));
   // Date의 해상도인 밀리초까지 보존한다. 소수 초를 버리면 서로 다른 x가 중복된다.
-  t.setHours(+(h ?? 0), +(mi ?? 0), +(sec ?? 0), +fraction.slice(0, 3).padEnd(3, '0'));
+  t[`set${mode}Hours`](+(h ?? 0), +(mi ?? 0), +(sec ?? 0), +fraction.slice(0, 3).padEnd(3, '0'));
   // 2024-13-45 같은 값은 Date가 조용히 다음 달로 넘겨 버린다 — 넘긴 것은 날짜가 아니었다.
-  return t.getMonth() === +mo - 1 && t.getDate() === +(d ?? 1) && +mo >= 1 && +mo <= 12 ? t.getTime() : null;
+  if (t[`get${mode}Month`]() !== +mo - 1 || t[`get${mode}Date`]() !== +(d ?? 1) || +mo < 1 || +mo > 12) return null;
+  return t.getTime() - offset * 60_000;
 }
 
 // 글자를 n자까지 자른다. 경계에서 서로게이트 쌍(이모지 등)을 반으로 쪼개지 않는다 — 짝 잃은
@@ -212,8 +222,12 @@ const normalizeType = t => {
 
 // 열 이름 목록을 열 번호로. 없는 이름은 버린다(있는 것만으로 그린다 — 하나가 틀렸다고 전부 표로
 // 돌아가면, 모델이 열 이름의 대소문자 하나 틀린 값으로 차트 전체를 잃는다).
+const columnIndex = (name, header) => {
+  const exact = header.indexOf(name);
+  return exact >= 0 ? exact : header.findIndex(h => nameKey(h) === nameKey(name));
+};
 const resolveColumns = (names, header, exclude) =>
-  names.map(n => header.findIndex(h => nameKey(h) === nameKey(n)))
+  names.map(n => columnIndex(n, header))
     .filter((i, at, arr) => i >= 0 && !exclude.has(i) && arr.indexOf(i) === at);
 
 // 열 하나가 '숫자 열'인가: 값이 있는 칸이 하나 이상이고 그 전부가 숫자로 읽혀야 한다(결측 표시는
@@ -245,7 +259,7 @@ export function parseChartBlock(text, block) {
   const title = clip(String(config.title ?? '').trim(), MAX_TITLE_LEN);
 
   // x 열: 지정된 이름이 있으면 그 열, 없거나 못 찾으면 첫 열.
-  let xi = config.x ? header.findIndex(h => nameKey(h) === nameKey(config.x)) : 0;
+  let xi = config.x ? columnIndex(config.x, header) : 0;
   if (xi < 0) xi = 0;
 
   // 시리즈: y가 있으면 그 열들(숫자 열만), 없거나 하나도 못 찾으면 x 밖의 숫자 열 전부. y2는 오른쪽 축.

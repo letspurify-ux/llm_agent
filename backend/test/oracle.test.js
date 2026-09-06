@@ -14,6 +14,13 @@ process.env.ORACLE_MOCK = '1';
 const reg = (name, sql = 'SELECT 1 FROM DUAL', db = 'D') => ({ query_name: name, query_sql: sql, target_db_name: db });
 const withBind = sql => reg('batch_job_status', 'SELECT 1 FROM T WHERE A = :job_id');
 
+test('비유한 Oracle 숫자는 JSON에서 NULL로 소실되지 않는다', () => {
+  const row = normalizeCells({ POS: Infinity, NEG: -Infinity, NAN: NaN, EMPTY: null, N: 1.5 });
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(row)), {
+    POS: 'Infinity', NEG: '-Infinity', NAN: 'NaN', EMPTY: null, N: 1.5,
+  });
+});
+
 test('프로토타입 멤버와 겹치는 쿼리 이름도 safe 안내로 실패한다', async () => {
   // 'constructor'가 프로토타입 체인을 타면 !gen 가드를 지나쳐 unsafe TypeError로 죽는다 —
   // 사용자에게는 일반 오류 문구, 모델에게는 드라이버 오류처럼 보여 양쪽 다 원인을 잃는다.
@@ -460,6 +467,17 @@ test('대상 DB 선택은 어떤 입력에도 후보 하나로만 확정된다',
   }
 });
 
+test('TIMESTAMP 변환기는 드라이버가 확보한 밀리초를 버리지 않는다', () => {
+  const first = new Date(2026, 8, 6, 12, 34, 56, 123);
+  const second = new Date(2026, 8, 6, 12, 34, 56, 456);
+  for (const dbType of [oracledb.DB_TYPE_TIMESTAMP, oracledb.DB_TYPE_TIMESTAMP_TZ, oracledb.DB_TYPE_TIMESTAMP_LTZ]) {
+    const { converter } = oracledb.fetchTypeHandler({ dbType });
+    assert.notEqual(converter(first), converter(second));
+    assert.match(converter(first), /56\.123(?: |$)/);
+    assert.match(converter(second), /56\.456(?: |$)/);
+  }
+});
+
 test('날짜류 컬럼은 세션 포맷과 같은 글자로 확정된다 — thin 드라이버의 Date.toString()이 아니라', () => {
   // fetchAsString에 oracledb.DATE를 두면 thin 드라이버(기본)는 세션 포맷이 아니라 JS Date.toString()을 준다
   // ("Sun Sep 06 2026 12:34:56 GMT+0900 (Korean Standard Time)" — 실 Oracle 실측). 그 값은 프롬프트·답변 표·
@@ -474,10 +492,10 @@ test('날짜류 컬럼은 세션 포맷과 같은 글자로 확정된다 — thi
   // 로컬 구성 요소로 만든 Date는 프로세스 TZ와 무관하게 같은 벽시계로 돌아온다 (드라이버가 DATE를 그렇게 만든다)
   const d = new Date(2026, 8, 6, 12, 34, 56, 789);
   assert.equal(convert(oracledb.DB_TYPE_DATE, d), '2026-09-06 12:34:56');
-  assert.equal(convert(oracledb.DB_TYPE_TIMESTAMP, d), '2026-09-06 12:34:56', '소수점 초는 세션 포맷에 없다');
+  assert.equal(convert(oracledb.DB_TYPE_TIMESTAMP, d), '2026-09-06 12:34:56.789', '밀리초를 포함한 세션 포맷과 일치한다');
   // 시간대 있는 타입은 오프셋을 붙인다 — NLS_TIMESTAMP_TZ_FORMAT('… TZH:TZM')으로 되돌아가야 한다
-  assert.match(convert(oracledb.DB_TYPE_TIMESTAMP_TZ, d), /^2026-09-06 12:34:56 [+-]\d\d:\d\d$/);
-  assert.match(convert(oracledb.DB_TYPE_TIMESTAMP_LTZ, d), /^2026-09-06 12:34:56 [+-]\d\d:\d\d$/);
+  assert.match(convert(oracledb.DB_TYPE_TIMESTAMP_TZ, d), /^2026-09-06 12:34:56\.789 [+-]\d\d:\d\d$/);
+  assert.match(convert(oracledb.DB_TYPE_TIMESTAMP_LTZ, d), /^2026-09-06 12:34:56\.789 [+-]\d\d:\d\d$/);
   // NULL과 Date가 아닌 값은 손대지 않는다
   assert.strictEqual(convert(oracledb.DB_TYPE_DATE, null), null);
   assert.strictEqual(convert(oracledb.DB_TYPE_TIMESTAMP_TZ, 'x'), 'x');

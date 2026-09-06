@@ -35,10 +35,10 @@ oracledb.fetchAsBuffer = [oracledb.BLOB];
 //     로컬 getter로 되돌리면 프로세스 TZ와 무관하게 그 벽시계가 나온다 (UTC 컨테이너 ↔ KST DB여도 같다).
 //   TIMESTAMP WITH (LOCAL) TIME ZONE: 드라이버가 절대 시각(instant)으로 주므로 프로세스 TZ의 벽시계와
 //     그 오프셋(TZH:TZM)을 함께 적는다 — 저장된 오프셋 표기는 잃지만 시각은 같고, 오프셋이 붙어야
-//     NLS_TIMESTAMP_TZ_FORMAT으로 되돌아간다. 소수점 초는 세션 포맷에 없으므로 여기서도 적지 않는다.
-const DATE_TYPES = new Set([oracledb.DB_TYPE_DATE, oracledb.DB_TYPE_TIMESTAMP]);
+//     NLS_TIMESTAMP_TZ_FORMAT으로 해석할 수 있다. LTZ 바인드는 등록 SQL에서 TO_TIMESTAMP_TZ로 변환한다.
+//     TIMESTAMP는 Date가 보존한 밀리초까지 표시한다.
 const DATE_TZ_TYPES = new Set([oracledb.DB_TYPE_TIMESTAMP_TZ, oracledb.DB_TYPE_TIMESTAMP_LTZ]);
-const dateTimeText = withOffset => v => (v instanceof Date ? localDateTime(v, withOffset) : v);
+const dateTimeText = (withOffset, withFraction) => v => (v instanceof Date ? localDateTime(v, withOffset, withFraction) : v);
 
 // NUMBER는 기본 매핑(JS number)이 배정밀도라 16자리부터 조용히 반올림된다 — 18자리 채번 키가
 // 끝자리만 다른 값으로 답변되고, 그 값이 다음 스텝의 바인드로도 흘러가 0건 오답까지 만든다.
@@ -60,21 +60,19 @@ oracledb.fetchTypeHandler = md => {
     return { type: oracledb.STRING, converter: numberFromString };
   }
   // 날짜류 — 타입은 바꾸지 않고(JS Date 그대로 받는다) 글자만 확정한다 (위 dateTimeText 주석).
-  if (DATE_TZ_TYPES.has(md.dbType)) return { converter: dateTimeText(true) };
-  if (DATE_TYPES.has(md.dbType)) return { converter: dateTimeText(false) };
+  if (DATE_TZ_TYPES.has(md.dbType)) return { converter: dateTimeText(true, true) };
+  if (md.dbType === oracledb.DB_TYPE_TIMESTAMP) return { converter: dateTimeText(false, true) };
+  if (md.dbType === oracledb.DB_TYPE_DATE) return { converter: dateTimeText(false, false) };
 };
 
-// 날짜/시각은 JS Date로 받지 않고 DB가 직접 포맷한 문자열로 받는다.
-//   - JS Date를 로컬 getter로 다시 렌더링하면 TIMESTAMP WITH (LOCAL) TIME ZONE에서
-//     Node 프로세스 TZ와 DB TZ가 다를 때 조용히 어긋난다(UTC 컨테이너 ↔ KST DB = 9시간).
-//   - 세션 포맷을 고정해두면 그 문자열을 다음 스텝의 바인드로 되돌려도 같은 세션 포맷으로
-//     암묵 변환되므로, multi-step 날짜 연결에서 ORA-01861이 나지 않는다.
+// 위 변환기가 만든 문자열을 후속 쿼리의 바인드로 돌려도 같은 시각을 조회하도록 포맷을 맞춘다.
+// TIMESTAMP는 FF3를 포함해야 밀리초가 다른 행을 구별한다. DATE의 초 단위 포맷은 유지한다.
 // 부작용: 등록 SQL이 포맷 마스크 없는 TO_CHAR(d)/TO_DATE(s)를 쓰면 이제 서버 기본값이 아니라
 // 이 포맷을 따른다. 서버 설정에 따라 달라지던 것이 고정되는 것이므로 등록 쿼리는 포맷을 명시할 것.
 const NLS_SESSION_FORMATS =
   "ALTER SESSION SET NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS'" +
-  " NLS_TIMESTAMP_FORMAT='YYYY-MM-DD HH24:MI:SS'" +
-  " NLS_TIMESTAMP_TZ_FORMAT='YYYY-MM-DD HH24:MI:SS TZH:TZM'";
+  " NLS_TIMESTAMP_FORMAT='YYYY-MM-DD HH24:MI:SS.FF3'" +
+  " NLS_TIMESTAMP_TZ_FORMAT='YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM'";
 
 // 조회 타임아웃(ms). 0/음수/NaN/빈 값은 기본값으로 되돌린다 —
 // 드라이버는 NaN에 NJS-004를 던지고, 0은 "타임아웃 없음"이라 오타 하나가 무한 대기를 만든다.
@@ -502,7 +500,9 @@ function normalizeValue(v) {
   if (typeof v === 'string') {
     return v.length > MAX_CELL_LEN ? clipText(v, MAX_CELL_LEN) + TRUNC_MARK : v;
   }
-  if (typeof v === 'number' || typeof v === 'boolean') return v;
+  // BINARY_FLOAT/DOUBLE은 Infinity·NaN도 반환한다. JSON의 null 변환으로 결측값과 섞이지 않게 한다.
+  if (typeof v === 'number') return Number.isFinite(v) ? v : String(v);
+  if (typeof v === 'boolean') return v;
   // BigInt는 JSON.stringify가 던진다 — 여기서 문자열로 확정하지 않으면 프롬프트 조립과
   // chat_log 기록이 함께 죽는다 (드라이버가 큰 NUMBER를 BigInt로 주도록 설정이 바뀌는 경우).
   if (typeof v === 'bigint') return v.toString();
@@ -550,12 +550,13 @@ export function intervalYmText(v) {
   return `${y < 0 || m < 0 ? '-' : ''}${Math.abs(y)}-${Math.abs(m)}`;
 }
 
-// 'YYYY-MM-DD HH24:MI:SS' — NLS_SESSION_FORMATS의 DATE·TIMESTAMP 포맷과 같은 글자. withOffset이면 뒤에
-// ' TZH:TZM'(예: ' +09:00')을 붙여 NLS_TIMESTAMP_TZ_FORMAT과 같게 한다. (테스트에서 쓰므로 export)
-export function localDateTime(d, withOffset = false) {
+// 기본값은 DATE용 'YYYY-MM-DD HH24:MI:SS'. TIMESTAMP는 withFraction으로 밀리초를 붙인다.
+// withOffset이면 ' TZH:TZM'(예: ' +09:00')도 붙인다. 세션 포맷과 맞춘다. (테스트에서 쓰므로 export)
+export function localDateTime(d, withOffset = false, withFraction = false) {
   const p = n => String(n).padStart(2, '0');
   const text = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
-               `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+               `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}` +
+               (withFraction ? `.${String(d.getMilliseconds()).padStart(3, '0')}` : '');
   if (!withOffset) return text;
   const off = -d.getTimezoneOffset();   // 분 단위, 동쪽이 양수 (getTimezoneOffset은 반대 부호다)
   const abs = Math.abs(off);

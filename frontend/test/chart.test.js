@@ -2,6 +2,7 @@
 // 이 계약도 조용히 깨진다: 차트를 못 그리면 표만 보이고(눈치채기 어렵다), 잘못 그리면 숫자가 아닌
 // 값이 0으로, 문자열 날짜가 범주로 그려진 그래프가 '데이터'로 읽힌다.
 import { test } from 'node:test';
+
 import assert from 'node:assert';
 import {
   parseChartBlock, chartBlocksToTables, chartTableMarkdown, toNumber, toTime, pieSlices, clip, sliceSafe,
@@ -11,6 +12,42 @@ import {
 const TABLE = '| 월 | 건수 | 금액 |\n|---|---|---|\n| 2024-01 | 120 | 1,000 |\n| 2024-02 | 80 | 2,500 |';
 const spec = text => { const r = parseChartBlock(text); assert.ok(r.ok, r.reason); return r.spec; };
 
+test('시간대가 명시된 시각은 실제 순간으로 비교하고 원래 표기를 보존한다', () => {
+  const utc = Date.UTC(2026, 8, 6, 3, 0, 0, 123);
+  for (const date of ['2026-09-06T03:00:00.123Z', '2026-09-06 12:00:00.123 +09:00', '2026-09-05 22:00:00.123 -0500']) {
+    assert.equal(toTime(date), utc, date);
+  }
+  const s = spec('type: line\n| 시각 | 값 |\n|---|---|\n| 2026-09-06 12:00:00 +00:00 | 2 |\n| 2026-09-06 12:00:00 +09:00 | 1 |');
+  assert.equal(s.xKind, 'time');
+  assert.equal(s.rows[1].x - s.rows[0].x, 9 * 60 * 60 * 1000);
+  assert.deepEqual(s.rows.map(r => r.values[0]), [1, 2]);
+  assert.equal(s.rows[0].full, '2026-09-06 12:00:00 +09:00');
+  assert.equal(parseChartBlock('type: line\n| 시각 | 값 |\n|---|---|\n| 2026-09-06T03:00:00Z | 1 |\n| 2026-09-06 12:00:00 +09:00 | 2 |').ok, false, '같은 순간을 다른 시간대로 적어도 중복 x다');
+});
+
+test('잘못된 시간대와 날짜는 거절하고 명시된 시간대의 윤년을 판정한다', () => {
+  for (const date of ['2026-09-06 12:00:00 +24:00', '2026-09-06 12:00:00 -09:60', '2026-02-29T00:00:00Z', '0099-02-29T00:00:00Z']) {
+    assert.equal(toTime(date), null, date);
+  }
+  const early = new Date(toTime('0000-02-29T00:00:00Z'));
+  assert.equal(early.getUTCFullYear(), 0);
+  assert.equal(early.getUTCDate(), 29);
+});
+
+test('대소문자가 다른 컬럼은 x·y·y2의 정확한 이름으로 선택한다', () => {
+  const parsed = parseChartBlock(`type: bar
+x: LABEL
+y: amount
+y2: AMOUNT
+| label | LABEL | amount | AMOUNT |
+| --- | --- | --- | --- |
+| wrong | A | 10 | 100 |`);
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.spec.xName, 'LABEL');
+  assert.equal(parsed.spec.rows[0].label, 'A');
+  assert.deepEqual(parsed.spec.series, [{ name: 'amount', axis: 'left' }, { name: 'AMOUNT', axis: 'right' }]);
+  assert.deepEqual(parsed.spec.rows[0].values, [10, 100]);
+});
 test('일반 코드펜스 안의 차트 문법 예시는 대화 이력에서 그대로 남는다', () => {
   for (const fence of ['````markdown', '~~~text']) {
     const close = fence.startsWith('`') ? '````' : '~~~';
@@ -105,9 +142,9 @@ test('toNumber / toTime 의 경계', () => {
   assert.strictEqual(toTime('2024/3/5 14:30'), new Date(2024, 2, 5, 14, 30).getTime());
   assert.strictEqual(toTime('2024.03'), new Date(2024, 2, 1).getTime());
   assert.strictEqual(toTime('2024-01-01T09:00:00'), new Date(2024, 0, 1, 9).getTime());
-  // Oracle TIMESTAMP WITH TIME ZONE 표기의 오프셋은 읽되 무시한다
-  assert.strictEqual(toTime('2024-01-01 09:00:00 +09:00'), new Date(2024, 0, 1, 9).getTime());
-  assert.strictEqual(toTime('2024-01-01T09:00:00Z'), new Date(2024, 0, 1, 9).getTime());
+  // Oracle TIMESTAMP WITH TIME ZONE과 ISO 표기는 그 오프셋을 실제 순간에 반영한다.
+  assert.strictEqual(toTime('2024-01-01 09:00:00 +09:00'), Date.UTC(2024, 0, 1));
+  assert.strictEqual(toTime('2024-01-01T09:00:00Z'), Date.UTC(2024, 0, 1, 9));
   assert.strictEqual(toTime('2024-01-01 09:00:00 +9'), null);
   assert.strictEqual(toTime('2024-13-01'), null);
   assert.strictEqual(toTime('2024-02-30'), null);

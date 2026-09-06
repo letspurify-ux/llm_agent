@@ -15,7 +15,7 @@
 // 실패는 한쪽으로만 열린다: 참조를 채우지 못하면 블록을 짧은 안내 문장으로 바꾼다 — 채우지 못한 블록을
 // 그대로 두면 프런트가 설정 줄만 든 코드블록을 보여주고, 사용자는 그것이 무엇인지 알 수 없다.
 
-import { nameKey, clipText, TRUNC_MARK } from './constants.js';
+import { nameKey, clipText, TRUNC_MARK, ownProp } from './constants.js';
 
 // x·y·y2 지정이 없을 때 싣는 열 수. 넓은 결과(SELECT *)를 그대로 실으면 표가 화면을 넘고, 프런트도
 // 시리즈 6개까지만 그린다.
@@ -103,6 +103,10 @@ const cell = v => {
 
 const splitNames = v => String(v ?? '').split(/[,;]/).map(s => s.trim()).filter(Boolean);
 
+// Oracle의 따옴표 컬럼명은 대소문자가 다르면 별개의 열이다. 정확한 이름부터 찾는다.
+const findColumn = (keys, name) => keys.find(k => k === name)
+  ?? keys.find(k => nameKey(k) === nameKey(name));
+
 // 표에 실을 열. 프런트(chart.js parseChartBlock)가 표를 읽는 규칙에 맞춘다: x는 `x:`로 적은 열이고 적지
 // 않았거나 없는 이름이면 첫 열, 값은 `y:`·`y2:`로 적은 열들이다. 그래서 x는 언제나 싣고 맨 앞에 둔다 —
 // `x:` 없이 `y: a, b`만 적은 블록에 a·b만 실으면 프런트는 a를 x로 삼아 b 하나를 그린다(조용한 오답).
@@ -111,8 +115,7 @@ const splitNames = v => String(v ?? '').split(/[,;]/).map(s => s.trim()).filter(
 // 반드시 넣고 열 순서는 결과의 순서를 지킨다(프런트는 이름으로 찾으므로 x의 자리는 상관없다).
 // '…'는 oracle.js normalizeCells가 잘린 컬럼 수를 적어 두는 표시 열이라 keys에서 이미 뺐다.
 function pickColumns(config, keys) {
-  const byKey = new Map(keys.map(k => [nameKey(k), k]));
-  const find = names => names.map(w => byKey.get(nameKey(w))).filter(k => k !== undefined);
+  const find = names => names.map(w => findColumn(keys, w)).filter(k => k !== undefined);
   const x = find(splitNames(config.x))[0] ?? keys[0];
   const ys = [...new Set(find([...splitNames(config.y), ...splitNames(config.y2)]))].filter(k => k !== x);
   if (ys.length) return [x, ...ys];
@@ -188,7 +191,7 @@ export function resolveChartData(answer, steps) {
     let taken = 0;
     for (const r of rows) {
       if (taken >= MAX_CHART_BLOCK_ROWS) break;
-      const line = `${indent}| ${cols.map(c => cell(r[c])).join(' | ')} |`;
+      const line = `${indent}| ${cols.map(c => cell(ownProp(r, c))).join(' | ')} |`;
       if (used + line.length + 1 > allow) break;
       table.push(line);
       used += line.length + 1;
@@ -270,8 +273,7 @@ export function resolveTableData(answer, steps) {
 
     // 열: cols로 고른 것(대소문자 무시, 없는 이름은 버린다). 없거나 전부 틀리면 앞 열들 — 이름 하나가 틀렸다고
     // 표를 잃는 것보다 낫다 (차트 pickColumns와 같은 판단).
-    const byKey = new Map(keys.map(k => [nameKey(k), k]));
-    const picked = [...new Set(splitNames(config.cols).map(w => byKey.get(nameKey(w))).filter(k => k !== undefined))];
+    const picked = [...new Set(splitNames(config.cols).map(w => findColumn(keys, w)).filter(k => k !== undefined))];
     const cols = picked.length ? picked : keys.slice(0, MAX_TABLE_COLS);
     const limitRaw = Number.parseInt(String(config.limit ?? ''), 10);
     const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, MAX_TABLE_BLOCK_ROWS) : DEFAULT_TABLE_ROWS;
@@ -281,7 +283,7 @@ export function resolveTableData(answer, steps) {
     let taken = 0;
     for (const r of rows) {
       if (taken >= limit) break;
-      const line = `${indent}| ${cols.map(c => tableCell(r?.[c])).join(' | ')} |`;
+      const line = `${indent}| ${cols.map(c => tableCell(ownProp(r, c))).join(' | ')} |`;
       if (used + line.length + 1 > allow) break;
       table.push(line);
       used += line.length + 1;

@@ -161,6 +161,18 @@ async function sendQuestion(text, answers) {
   await page.until(`document.querySelectorAll('.row.assistant').length === ${answers} && !document.querySelector('.typing')`);
 }
 
+it('회귀: 시간대가 다른 두 시각은 같은 시계 표시라도 선 그래프로 그려진다', async () => {
+  await page.goto(url(), '.chip');
+  const answer = '```chart\ntype: line\n| 시각 | 값 |\n|---|---|\n| 2026-09-06 12:00:00 +00:00 | 2 |\n| 2026-09-06 12:00:00 +09:00 | 1 |\n```';
+  await page.eval(`window.fetch = async () => new Response(JSON.stringify({ answer: ${JSON.stringify(answer)} }),
+    { headers: { 'Content-Type': 'application/json' } })`);
+  await sendQuestion('시간대별 측정값', 1);
+  assert.ok(await page.eval(`!!document.querySelector('.chart-table')`), '유효한 두 시각이 차트 대신 표로만 나왔다');
+  await page.until(`document.querySelectorAll('.recharts-line-dot').length === 2`);
+  const points = await page.eval(`[...document.querySelectorAll('.recharts-line-dot')].map(e => Number(e.getAttribute('cx')))`);
+  assert.ok(points[1] > points[0], `두 순간의 x 좌표가 겹친다: ${points}`);
+});
+
 it('회귀: 인용문 속 차트도 미리보기에서는 준비 중으로 남긴다', async () => {
   await page.goto(url(), '.chip');
   const preview = '> ```chart\n> data: step 1\n> ```';
@@ -173,6 +185,26 @@ it('회귀: 인용문 속 차트도 미리보기에서는 준비 중으로 남�
   await page.until(`!document.querySelector('.typing')`);
   assert.match(text, /표·차트를 준비하고 있습니다/);
   assert.doesNotMatch(text, /그리지 못했습니다|data: step/);
+});
+
+it('회귀: 스트리밍 중 들여쓴 코드 예시와 목록 밖으로 나온 문장이 사라지지 않는다', async () => {
+  for (const [preview, expected, placeholder] of [
+    ['    ```chart\n    사용법 예시\n    ```\n\n설명 문장', '사용법 예시', false],
+    ['- 결과\n\n  ```chart\n  data: step 1\n\n목록 밖의 정상 문장', '목록 밖의 정상 문장', true],
+  ]) {
+    await page.goto(url(), '.chip');
+    await page.eval(`window.fetch = async () => new Response(new ReadableStream({
+      start(c) { window.__previewStream = c; c.enqueue(new TextEncoder().encode(JSON.stringify({ type: 'answer_delta', text: ${JSON.stringify(preview)} }) + '\\n')); }
+    }), { headers: { 'Content-Type': 'application/x-ndjson' } }); document.querySelector('.chip').click()`);
+    await page.until(`document.querySelector('.preview')`);
+    const text = await page.eval(`document.querySelector('.preview').textContent`);
+    assert.ok(text.includes(expected), `완료 전 본문이 사라졌다: ${text}`);
+    assert.equal(text.includes('준비하고 있습니다'), placeholder, text);
+    assert.ok(await page.eval(`!!document.querySelector('.typing')`), '완료 후 화면을 검사했다');
+    await page.eval(`window.__previewStream.enqueue(new TextEncoder().encode('{"type":"done","answer":"완료"}\\n'))`);
+    await page.until(`!document.querySelector('.typing') && !document.querySelector('.preview')`);
+    assert.equal(await page.eval(`document.querySelector('.bubble.assistant').textContent`), '완료');
+  }
 });
 
 it('회귀: 소수 초 차트의 시간 눈금은 서로 다른 시각을 구별한다', async () => {

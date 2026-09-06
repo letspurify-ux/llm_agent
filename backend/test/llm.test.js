@@ -10,6 +10,14 @@ import { MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_B
 
 const ok = (name, rows, extra = {}) => ({ query_name: name, params: {}, rows, totalRows: rows.length, ...extra });
 
+test('대체 답변 표의 없는 컬럼은 프로토타입 속성 대신 빈칸으로 표시한다', () => {
+  const rows = [{ ID: 'A' }, JSON.parse('{"ID":"B","__proto__":"실제 값","constructor":"등록 값"}')];
+  const answer = renderAnswer({ knowledge: [], history: [ok('q', rows)] });
+  assert.ok(answer.includes('| A |  |  |'), answer);
+  assert.ok(answer.includes('| B | 실제 값 | 등록 값 |'), answer);
+  assert.doesNotMatch(answer, /\[object Object\]|function Object/);
+});
+
 test('조립할 것이 없으면 null이다', () => {
   // 여기서 문구를 지어내면 Mock('일반 지식 없음')과 agent 폴백('LLM 호출 실패')이 같은 말을 하게 된다.
   assert.equal(renderAnswer({ knowledge: [], history: [] }), null);

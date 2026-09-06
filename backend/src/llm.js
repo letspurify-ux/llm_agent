@@ -450,6 +450,6 @@ function rowsToMarkdownTable(rows) {
   return [
     `| ${cols.map(cell).join(' | ')} |`,
     `| ${cols.map(() => '---').join(' | ')} |`,
-    ...rows.map(r => `| ${cols.map(c => cell(r[c])).join(' | ')} |`),
+    ...rows.map(r => `| ${cols.map(c => cell(ownProp(r, c))).join(' | ')} |`),
   ].join('\n');
 }

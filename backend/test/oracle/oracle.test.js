@@ -14,6 +14,8 @@ import { MAX_ROWS, MAX_CELL_LEN, TRUNC_MARK } from '../../src/constants.js';
 import { openaiDecide, buildPrompt } from '../../src/llm-openai.js';
 import { sanitizeDecision } from '../../src/llm.js';
 import { readStoredResult } from '../../src/read-result.js';
+import { resolveTableData, resolveChartData } from '../../src/chart.js';
+import { parseChartBlock } from '../../../frontend/src/chart.js';
 
 const exec = promisify(execFile);
 const container = `backend-oracle-test-${randomUUID().slice(0, 8)}`;
@@ -71,6 +73,61 @@ after(async () => {
 });
 
 const registry = query_sql => ({ query_name: 'fixture', query_sql, target_db_name: 'DISPOSABLE_ORACLE' });
+
+test('TIMESTAMP의 밀리초는 결과·프롬프트·추가 읽기·후속 바인드에서 보존된다', async () => {
+  const events = `WITH events AS (
+    SELECT 1 AS id, TIMESTAMP '2026-09-06 12:34:56.123' AS ts,
+      TO_TIMESTAMP_TZ('2026-09-06 12:34:56.123 +09:00', 'YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM') AS tz FROM DUAL
+    UNION ALL SELECT 2, TIMESTAMP '2026-09-06 12:34:56.456',
+      TO_TIMESTAMP_TZ('2026-09-06 12:34:56.456 +09:00', 'YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM') FROM DUAL
+  )`;
+  const result = await runQuery(registry(`${events} SELECT id, ts, tz,
+    CAST(tz AS TIMESTAMP WITH LOCAL TIME ZONE) AS ltz FROM events ORDER BY id`));
+  const chart = resolveChartData('```chart\ntype: line\nx: TS\ny: ID\ndata: step 1\n```', [result.rows]);
+  const parsed = parseChartBlock(chart.split('\n').slice(1, -1).join('\n'));
+  assert.equal(parsed.ok, true, '소수 초가 다른 조회 행이 중복 x로 처리됐다');
+  assert.equal(parsed.spec.rows[1].x - parsed.spec.rows[0].x, 333);
+  for (const col of ['TS', 'TZ', 'LTZ']) {
+    assert.notEqual(result.rows[0][col], result.rows[1][col], `${col}: 서로 다른 시각이 같은 값이 됐다`);
+    assert.match(result.rows[0][col], /56\.123(?: |$)/);
+    assert.match(result.rows[1][col], /56\.456(?: |$)/);
+    const view = readStoredResult(result.rows, { step: 1, cols: [col], offset: 1, limit: 1 });
+    const prompt = buildPrompt({ question: '둘째 시각 조회', chat: [], knowledge: [], qaMethods: [], queries: [],
+      history: [{ query_name: 'fixture', ...result, ...view }] });
+    assert.ok(prompt.includes(result.rows[1][col]), '후속 조회에 필요한 시각이 프롬프트에서 달라졌다');
+    const expr = col === 'LTZ' ? 'CAST(tz AS TIMESTAMP WITH LOCAL TIME ZONE)' : col;
+    // LTZ의 문자열 암묵 변환은 시간대 없는 NLS_TIMESTAMP_FORMAT을 쓴다.
+    // 오프셋이 포함된 조회 값을 되돌리는 등록 SQL은 그 시각을 명시적으로 해석해야 한다.
+    const bind = col === 'LTZ' ? "TO_TIMESTAMP_TZ(:at, 'YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM')" : ':at';
+    const again = await runQuery(registry(`${events} SELECT id FROM events WHERE ${expr} = ${bind}`), { at: view.rows[0][col] });
+    assert.deepEqual(again.rows, [{ ID: 2 }], `${col}: 선택한 시각으로 정확한 행을 다시 찾지 못했다`);
+  }
+  // Date의 해상도보다 세밀한 값은 등록 SQL에서 문자열로 반환해야 한다.
+  const precise = await runQuery(registry("SELECT TO_CHAR(TIMESTAMP '2026-09-06 12:34:56.123456789', 'YYYY-MM-DD HH24:MI:SS.FF9') AS TS FROM DUAL"));
+  assert.equal(precise.rows[0].TS, '2026-09-06 12:34:56.123456789');
+  const exact = await runQuery(registry("SELECT 1 AS OK FROM DUAL WHERE TIMESTAMP '2026-09-06 12:34:56.123456789' = TO_TIMESTAMP(:at, 'YYYY-MM-DD HH24:MI:SS.FF9')"), { at: precise.rows[0].TS });
+  assert.deepEqual(exact.rows, [{ OK: 1 }]);
+});
+
+test('실제 Oracle의 대소문자가 다른 컬럼은 표·차트에서도 서로 다른 값이다', async () => {
+  const result = await runQuery(registry(`SELECT 'A' AS LABEL, 10 AS "amount", 100 AS "AMOUNT" FROM DUAL`));
+  assert.deepEqual(result.rows, [{ LABEL: 'A', amount: 10, AMOUNT: 100 }]);
+  const table = resolveTableData('```table\nstep: 1\ncols: amount, AMOUNT\n```', [result.rows]);
+  assert.ok(table.includes('| amount | AMOUNT |\n| --- | --- |\n| 10 | 100 |'), table);
+  const chart = resolveChartData('```chart\ntype: bar\nx: LABEL\ny: amount\ny2: AMOUNT\ndata: step 1\n```', [result.rows]);
+  const parsed = parseChartBlock(chart.split('\n').slice(1, -1).join('\n'));
+  assert.equal(parsed.ok, true);
+  assert.deepEqual(parsed.spec.series, [{ name: 'amount', axis: 'left' }, { name: 'AMOUNT', axis: 'right' }]);
+  assert.deepEqual(parsed.spec.rows[0].values, [10, 100]);
+});
+
+test('실제 Oracle BINARY_FLOAT·BINARY_DOUBLE 특수 값과 NULL을 구분한다', async () => {
+  const result = await runQuery(registry(`SELECT BINARY_DOUBLE_INFINITY AS POS,
+    -BINARY_FLOAT_INFINITY AS NEG, BINARY_DOUBLE_NAN AS NAN, NULL AS EMPTY FROM DUAL`));
+  assert.deepEqual(JSON.parse(JSON.stringify(result.rows)), [
+    { POS: 'Infinity', NEG: '-Infinity', NAN: 'NaN', EMPTY: null },
+  ]);
+});
 
 test('실제 Oracle의 128자 컬럼·바인드를 프롬프트와 결과 추가 읽기까지 보존한다', async () => {
   const names = ['A', 'B'].map(last => 'P'.repeat(127) + last);
