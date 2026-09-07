@@ -9,7 +9,7 @@ import { once } from 'node:events';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import mariadb from 'mariadb';
-import { closePool, loadChunkRanges, insertChatLog } from '../../src/db.js';
+import { closePool, loadChunkRanges, loadQueriesByNames, insertChatLog } from '../../src/db.js';
 import { syncEmbeddings, syncSummary, SKIP } from '../../src/embed-sync.js';
 import { handleQuestion } from '../../src/agent.js';
 import { buildItems } from '../../src/chunk.js';
@@ -136,6 +136,40 @@ test('실제 쿼리 등록 검색에서 조회 실행·표 참조까지 이어�
   assert.equal(result.trace[1].rows.length, 1);
   assert.match(result.answer, /TODAY/);
   assert.match(result.answer, /\d{4}-\d{2}-\d{2}/);
+});
+
+// loadQueriesByNames의 계약은 '요청한 이름 순서로 돌려준다'이다. 그 순서가 프롬프트 예산의
+// 자르는 기준이라(꼬리부터 버린다) 순서가 뒤집히면 다단계 절차의 '1단계'가 잘려 나간다 —
+// 에이전트는 절차를 시작하지도 못하는데 어디에도 오류가 남지 않는다. IN(...)은 인자 순서를
+// 결과 순서로 보장하지 않으므로 이 정렬은 실물 DB에서만 의미가 있다.
+test('지목한 쿼리는 첫 자리까지 요청한 순서대로 돌아온다 (대소문자·중복 포함)', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  await conn.query(await sqlFile('seed.sql'));
+  // seed의 '고객 주문 상태 확인'은 find_customer_id가 1단계다.
+  const names = ['find_customer_id', 'batch_job_status'];
+  assert.deepEqual((await loadQueriesByNames(names)).map(r => r.query_name), names);
+  // 등록 철자와 본문 표기가 대소문자만 달라도 그 행만 뒤로 밀리지 않는다.
+  assert.deepEqual(
+    (await loadQueriesByNames(['FIND_CUSTOMER_ID', 'Batch_Job_Status'])).map(r => r.query_name), names);
+  // 같은 이름을 두 번 지목해도 기준은 처음 나온 자리다.
+  assert.deepEqual(
+    (await loadQueriesByNames(['find_customer_id', 'batch_job_status', 'find_customer_id']))
+      .map(r => r.query_name), names);
+  assert.deepEqual(await loadQueriesByNames([]), []);
+});
+
+// 검색이 넘기는 범위 목록은 모델 출력을 거친 값이라 빈 칸이 섞일 수 있다. 그것을 걸러내지
+// 않으면 바인드 수가 어긋나거나 조회 자체가 터져 질문 한 건이 통째로 실패한다.
+test('범위 목록에 빈 칸이 섞여도 성한 범위만 읽고 터지지 않는다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  await conn.query('INSERT INTO knowledge (title, content) VALUES (?, ?)', ['범위', '가'.repeat(1200)]);
+  await syncEmbeddings();
+  const only = await loadChunkRanges([{ doc_seq: 1, from: 1, to: 9 }]);
+  assert.ok(only.length >= 2);
+  const mixed = await loadChunkRanges([null, undefined, { from: 1, to: 9 }, { doc_seq: 1, from: 1, to: 9 }]);
+  assert.deepEqual(mixed.map(r => r.chunk_no), only.map(r => r.chunk_no));
+  assert.deepEqual(await loadChunkRanges([null, undefined, {}]), []);
+  assert.deepEqual(await loadChunkRanges(undefined), []);
 });
 
 // chat_log.trace는 JSON 컬럼이라 MariaDB가 INSERT에서 직접 검사한다 — 그 검사는 실물 DB에서만 드러난다.
