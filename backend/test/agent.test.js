@@ -1711,7 +1711,63 @@ test('mergeFront는 범위를 모르는 청크 행으로 항목의 구간을 바
 
 // 잘린 배치의 안내는 어느 상한에 걸렸는지를 말해야 한다 — 조회를 두 번밖에 안 한 요청이 이력 줄 수에 막혔는데
 // '조회 스텝 상한 5회'라고 적으면 모델은 사실과 다른 이유를 받는다.
+// 자리를 세는 방식도 함께 못 박는다: 남은 자리가 담을 항목 수와 '같을' 때가 경계다. 안내 줄의 몫을 셈에
+// 넣지 않으면 그 배치는 자리를 딱 맞게 채우고 안내 줄이 들어갈 자리가 사라져, 실행되지 못한 항목이
+// 아무 흔적 없이 사라진다 — 모델은 자기가 셋을 요청했다는 것을 아는데 이력에는 둘만 보인다.
 test('이력 줄 수에 막혀 잘린 배치의 안내는 조회 스텝 상한이 아니라 줄 수 상한을 말한다', async () => {
+  const restore = silence();
+  try {
+    const decisions = [];
+    // 검색 셋(진도) + 상한에 걸린 검색 하나 = 이력 네 줄. 그다음 조회 셋 = 일곱 줄, 남는 자리는 둘이다.
+    for (const t of ['a', 'b', 'c', 'd']) decisions.push({ action: 'search', text: t, targets: ['query'] });
+    for (const a of [1, 2, 3]) decisions.push({ action: 'run_query', query_name: 'q1', params: { a } });
+    // 남은 조회 수(MAX_STEPS − 3 = 2)가 곧 남은 자리 수(2)다 — 안내 줄의 몫을 세는 쪽만 하나를 실행하고
+    // 안내를 남길 수 있다. 세지 않으면 둘을 실행하고 안내가 통째로 빠진다.
+    decisions.push({ action: 'run_queries', queries: [4, 5, 6].map(a => ({ query_name: 'q1', params: { a } })) });
+    const llm = scripted(decisions);
+    let n = 0;
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      run: async (row, params) => ({ rows: [{ V: params.a }], totalRows: 1, capped: false, targetDb: 'D' }),
+      search: async () => found({ queries: [Q(++n, `q${n}`)], routed: false }) } });
+    assert.equal(r.trace.length, MAX_HISTORY_ROWS);
+    assert.ok(r.trace.filter(h => h.rows).length < MAX_STEPS, '이 시나리오는 조회 수 상한에 닿지 않아야 뜻이 있다');
+    const note = r.trace.at(-1)?.note ?? '';
+    assert.match(note, /줄 수 상한/, `줄 수에 막힌 배치가 다른 이유를 말했다: ${note}`);
+    assert.ok(!/조회 스텝 상한/.test(note));
+  } finally { restore(); }
+});
+
+// 반대 방향의 가드 — 안내 줄의 자리를 '늘' 비워 두면 안 된다. 항목이 남은 자리에 딱 맞는 배치에는
+// 알릴 것이 없는데, 그런 배치에서까지 한 줄을 떼어 두면 마지막 조회 하나를 공연히 잃는다.
+// (위 테스트는 자리가 모자랄 때 안내가 서야 한다는 쪽이고, 이 테스트는 모자라지 않을 때 조회가
+//  전부 실행되어야 한다는 쪽이다 — 한쪽만 있으면 반대 방향으로 조용히 깨진다.)
+test('남은 자리에 딱 맞는 배치는 자리를 전부 조회에 쓴다 (안내 줄 자리를 미리 떼지 않는다)', async () => {
+  const restore = silence();
+  try {
+    const decisions = [];
+    for (const t of ['a', 'b', 'c', 'd']) decisions.push({ action: 'search', text: t, targets: ['query'] });
+    for (const a of [1, 2, 3]) decisions.push({ action: 'run_query', query_name: 'q1', params: { a } });
+    // 남은 자리 2, 담은 항목 2 — 알릴 것이 없으므로 둘 다 실행되어야 한다.
+    decisions.push({ action: 'run_queries', queries: [4, 5].map(a => ({ query_name: 'q1', params: { a } })) });
+    const llm = scripted(decisions);
+    let n = 0;
+    const ran = [];
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
+      run: async (row, params) => { ran.push(params.a); return { rows: [{ V: params.a }], totalRows: 1, capped: false, targetDb: 'D' }; },
+      search: async () => found({ queries: [Q(++n, `q${n}`)], routed: false }) } });
+    assert.deepStrictEqual(ran, [1, 2, 3, 4, 5], '알릴 것이 없는 배치에서 조회 하나를 잃었다');
+    assert.equal(r.trace.length, MAX_HISTORY_ROWS);
+    assert.equal(r.trace.filter(h => h.note).length, 1, '가드 안내(검색 상한) 한 줄 말고 다른 안내가 붙었다');
+  } finally { restore(); }
+});
+
+// 안내 줄이 '실행할 수 있었던 마지막 조회'를 밀어내면 안 된다.
+// 지시 블록은 남은 조회 수를 말하고("조회는 1건까지만 더 실행할 수 있다 — 한 번에 그보다 많이 담으면
+// 나머지는 실행되지 않는다") 모델은 그보다 하나 더 담는 일이 있는데, 남은 이력 자리가 하나뿐일 때
+// 그 한 줄을 안내가 가져가면 실행 수가 0이 된다 — 약속한 한 건까지 함께 사라지고, 그 스텝은 헛돈 것으로
+// 세어져 강제 답변으로 넘어간다. 실서버(실 관리 DB·실 임베딩)에서도 두 조회 중 하나도 실행되지 않았다.
+// 사용자에게는 조회 결과 없는 답변이 나가고 오류는 한 줄도 남지 않는다 — 테스트가 유일한 방어선이다.
+test('이력 자리가 하나 남았으면 안내 줄이 아니라 조회가 그 자리를 쓴다', async () => {
   const restore = silence();
   try {
     const decisions = [];
@@ -1721,17 +1777,21 @@ test('이력 줄 수에 막혀 잘린 배치의 안내는 조회 스텝 상한�
     }
     decisions.push({ action: 'run_query', query_name: 'q1', params: { a: 1 } });
     decisions.push({ action: 'run_query', query_name: 'q1', params: { a: 2 } });
+    // 여기서 남은 자리는 하나다. 모델이 둘을 담아도 하나는 반드시 실행되어야 한다.
     decisions.push({ action: 'run_queries', queries: [{ query_name: 'q1', params: { a: 3 } }, { query_name: 'q1', params: { a: 4 } }] });
     const llm = scripted(decisions);
     let n = 0;
+    const ran = [];
     const r = await handleQuestion('q', [], { deps: { decide: llm.decide,
-      run: async () => ({ rows: [{ V: 1 }], totalRows: 1, capped: false, targetDb: 'D' }),
+      run: async (row, params) => { ran.push(params.a); return { rows: [{ V: params.a }], totalRows: 1, capped: false, targetDb: 'D' }; },
       search: async () => found({ queries: [Q(++n, `q${n}`)], routed: false }) } });
-    assert.equal(r.trace.length, MAX_HISTORY_ROWS);
-    assert.ok(r.trace.filter(h => h.rows).length < MAX_STEPS, '이 시나리오는 조회 수 상한에 닿지 않아야 뜻이 있다');
-    const note = r.trace.at(-1)?.note ?? '';
-    assert.match(note, /줄 수 상한/, `줄 수에 막힌 배치가 다른 이유를 말했다: ${note}`);
-    assert.ok(!/조회 스텝 상한/.test(note));
+    // 마지막 결정 직전의 프롬프트가 '1건까지 더'라고 말했는지 — 이 대조의 전제다
+    const before = llm.seen.at(-2);
+    assert.equal(before.queriesLeft, 1, '이 시나리오는 남은 조회 수가 1이어야 뜻이 있다');
+    assert.ok(buildPrompt(before).includes(fewQueriesLeftNote(1)), '지시 블록이 남은 조회 수를 말하지 않는다');
+    assert.deepStrictEqual(ran, [1, 2, 3], '남은 한 자리를 안내 줄이 가져가 마지막 조회가 통째로 사라졌다');
+    assert.equal(r.trace.length, MAX_HISTORY_ROWS, '이력 줄 수 상한을 넘겼다');
+    assert.equal(r.trace.at(-1)?.rows?.[0]?.V, 3, '마지막 줄이 조회 결과가 아니다');
   } finally { restore(); }
 });
 

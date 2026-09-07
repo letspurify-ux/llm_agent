@@ -170,6 +170,15 @@ cd frontend && npm install && npm run dev
 
 `http://localhost:5173` 접속 (`/api`는 vite proxy로 백엔드에 전달).
 
+`start_all.sh` 또는 각 앱의 `start.sh`로 실행하면 `backend/logs/backend.log`와
+`frontend/logs/frontend.log`에 표준 출력·오류를 기록한다. UTC 날짜 기준 **오늘과 이전 2일분**만
+보관하며(최대 72시간), 자정에 지난 로그를 `backend.log.YYYY-MM-DD` / `frontend.log.YYYY-MM-DD`로
+분리하고 오래된 파일을 삭제한다. 출력이 없어도 실행 중에는 정리하며, 중지 중에는 다음 시작 때 정리한다.
+최초 적용 시 기록별 날짜를 판별할 수 없는 기존 누적 로그는 삭제한다. 같은 날 재시작한 새 로그는 유지한다.
+`tail -F backend/logs/backend.log`로 날짜가 바뀌어도 계속 추적할 수 있다. 날짜 기준 보관이므로
+3일 안에 발생하는 로그의 총용량 제한은 없다. `npm start` / `npm run dev`의 직접 실행은 콘솔 출력만 한다.
+로그 보관·종료 동작 검증: 저장소 루트에서 `node --test scripts/retained-log.test.cjs`.
+
 #### 회귀 검증
 
 ```bash

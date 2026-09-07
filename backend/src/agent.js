@@ -872,9 +872,14 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
     // 실을 수 있는 항목 수 — 조회 수 상한과 이력 줄 수 상한 둘 다에 맞춘다. 다 싣지 못하면 그 사실을 알리는
     // 안내 줄이 한 자리를 더 쓰므로(아래) 그 자리까지 셈에 넣는다. 자리를 늘 비워 두지는 않는다 —
     // 그러면 안내가 필요 없는 배치에서 마지막 조회 하나를 공연히 잃는다.
+    // 같은 이유로 안내 줄이 '실행할 수 있었던 마지막 조회'를 밀어내서도 안 된다. 남은 자리가 하나뿐인데
+    // 그 한 줄을 안내에 내주면 실행 수가 0이 되어, 프롬프트가 방금 "조회는 1건까지 더 실행할 수 있다"고
+    // 알려준 그 한 건까지 사라진다 — 모델은 지시를 어긴 만큼(하나 더 담았다)이 아니라 전부를 잃고,
+    // 그 스텝은 헛돈 것으로 세어져 강제 답변으로 넘어간다(실서버 재현: 두 조회 중 하나도 실행되지 않았다).
+    // 안내보다 결과가 먼저다 — 최소 한 건은 실행하고, 안내는 자리가 남을 때만 적는다(아래 pushNote).
     const roomRows = MAX_HISTORY_ROWS - history.length;
     const want = Math.min(items.length, MAX_STEPS - runs);
-    const take = want + (want < items.length ? 1 : 0) <= roomRows ? want : Math.max(0, roomRows - 1);
+    const take = want + (want < items.length ? 1 : 0) <= roomRows ? want : Math.max(1, roomRows - 1);
     const batch = items.slice(0, take);
     runs += batch.length;
     const { progressed, wasted } = await runBatch(batch);
@@ -888,7 +893,10 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       // runs는 이미 이번 배치를 더한 값이다 — 조회 수 상한에 닿았으면 그것이 이유이고, 아니면 줄 수가 막은 것이다.
       const limit = runs >= MAX_STEPS
         ? `조회 스텝 상한(${MAX_STEPS}회)` : `실행 이력 줄 수 상한(${MAX_HISTORY_ROWS}줄)`;
-      history.push({
+      // 자리가 남았을 때만 적는다 (pushNote) — 마지막 자리를 조회에 내준 경우가 그렇지 않은 경우다.
+      // 그때 이 안내가 없어도 모델이 길을 잃지는 않는다: 이력이 상한에 닿아 루프가 곧 끝나고,
+      // 강제 답변 프롬프트의 지시 블록이 '더 조회할 수 없다'를 말한다(queriesLeft = 0).
+      pushNote({
         query_name: items.slice(batch.length).map(q => q.query_name).join(', '),
         params: {},
         note: `${limit}에 걸려 실행하지 않았다 — 지금까지의 결과로 답변하라`,

@@ -21,13 +21,9 @@ if [ ! -d node_modules ]; then
 fi
 
 mkdir -p logs
-# Append to the log instead of overwriting — overwriting on restart erases the crash cause
-# of the previous run. Runs are separated by a start marker line.
-echo "===== $(date '+%Y-%m-%d %H:%M:%S') start =====" >> "$LOG_FILE"
-# Run vite directly instead of npm run dev — through the npm wrapper, $! would be
-# the npm process, and stop.sh could end up killing only npm while the actual vite
-# process keeps running.
-nohup node node_modules/vite/bin/vite.js >> "$LOG_FILE" 2>&1 &
+# The wrapper captures both output streams and forwards shutdown signals.
+# stop.sh tracks the wrapper PID; it waits for the application to exit.
+APP_LOG_FILE="$LOG_FILE" APP_LOG_STOP_MS=2000 nohup node ../scripts/logged-process.cjs node_modules/vite/bin/vite.js >/dev/null 2>&1 &
 echo $! > "$PID_FILE"
 
 sleep 1

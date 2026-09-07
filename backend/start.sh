@@ -24,13 +24,9 @@ fi
 node scripts/ensure-env.js
 
 mkdir -p logs
-# Append to the log instead of overwriting — overwriting on restart erases the crash cause
-# of the previous run. Runs are separated by a start marker line.
-echo "===== $(date '+%Y-%m-%d %H:%M:%S') start =====" >> "$LOG_FILE"
-# Run the server script directly instead of npm start — through the npm wrapper, $! would be
-# the npm process, and stop.sh could end up killing only npm while the actual server
-# (node src/server.js) keeps running.
-nohup node src/server.js >> "$LOG_FILE" 2>&1 &
+# The wrapper captures both output streams and forwards shutdown signals.
+# stop.sh tracks the wrapper PID; it waits for the application to exit.
+APP_LOG_FILE="$LOG_FILE" APP_LOG_STOP_MS=11000 nohup node ../scripts/logged-process.cjs src/server.js >/dev/null 2>&1 &
 echo $! > "$PID_FILE"
 
 sleep 1
