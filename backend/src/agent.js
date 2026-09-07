@@ -449,8 +449,19 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       if (i < 0) continue;
       const row = list[i];
       // 숨긴 자료의 복원은 저장된 본문으로 끝낸다. DB 읽기나 재검색이 필요 없다.
+      // 숨김은 먼저 걷는다 — 모델이 그만두겠다고 한 일이고, 아래 판정도 숨김이 걷힌 상태를 봐야 답이
+      // 맞는다(knowledgeView는 숨긴 항목을 건너뛰므로 dropped인 채로는 '이미 실려 있는가'를 물을 수 없다).
       if (row.dropped || (row.expanded && i > 0)) {
         row.dropped = false;
+        // 앞으로 가져오는 일만 따로 막는다: 이 항목의 청크가 이미 같은 문서의 앞선 항목으로 전부 실려 있으면
+        // 맨 앞으로 옮겨도 새로 보이는 글자는 없이 문서 상한(MAX_DOC_LEN)만 나눠 쓰게 되어, 지금 보이던 본문이
+        // 그만큼 줄어든다 — 아래 !canGrow·포화 갈래가 covered로 막는 것과 같은 손해이고, 시스템 프롬프트가
+        // '넓힌 본문이 자리를 많이 쓰므로 더는 필요 없는 자료를 함께 적어라'로 권하는 흐름이 곧 이 자리다:
+        // 확대와 함께 버린 번호를 나중에 되살리면 그 확대가 삼킨 구간을 앞으로 부르게 된다
+        // (실측: 확대가 8~10을 삼킨 뒤 그 번호를 drop했다가 복구하니 실린 청크가 17개에서 10개로 줄었다).
+        // 숨김을 걷은 것 자체는 되돌리지 않는다 — 그 항목은 다시 보관 목록의 일부이고, 앞선 항목이 나중에
+        // 버려지거나 좁아지면 그때 저절로 실린다.
+        if (noRoomToBringForward(row, i) === 'covered') { covered++; continue; }
         row.expanded = true;
         list.splice(i, 1);
         list.unshift(row);

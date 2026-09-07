@@ -416,26 +416,31 @@ test('확대가 다른 보관 구간을 삼켜도 한 항목은 한 줄이다 �
   } });
 
   const grown = last.knowledge.find(o => o.seq === seed.seq);
+  const swallowed = last.knowledge.find(o => o.seq === narrow.seq);
   assert.ok(grown.from < narrow.from && grown.to > narrow.to,
     `확대 구간이 좁은 구간을 가운데 두고 넘어서야 이 회귀가 성립한다: ${grown.from}~${grown.to}`);
   assert.equal(grown.chunks.length, grown.to - grown.from + 1, '표시 제한이 보관한 청크를 지우지 않는다');
 
-  const shown = knowledgeView(last.knowledge).filter(o => !o.dropped && !o.viewOmitted);
+  // 삼켜진 구간이 목록 앞에 오는 순서를 그대로 만든다. 위 루프는 그 구간이 이미 전부 실려 있으면
+  // 앞으로 가져오지 않지만(아래 '숨김 복구가 …' 테스트), 일부만 실린 구간과 표시 예산에 밀린 구간은
+  // 여전히 앞으로 오고, 그때 넓힌 항목의 남은 청크가 앞뒤 두 도막이 된다 — 그 상태의 규칙이 여기 있다.
+  const list = [swallowed, grown];
+  const shown = knowledgeView(list).filter(o => !o.dropped && !o.viewOmitted);
   assert.equal(shown.filter(o => o.seq === seed.seq).length, 1, '한 항목은 한 줄이다');
   const line = shown.find(o => o.seq === seed.seq);
   assert.ok(line.from <= grown.rep && grown.rep <= line.to, '싣는 구간은 대표 청크가 든 쪽이다');
   assert.ok(line.moreStored, '싣지 못한 보관 구간이 있으면 그 사실을 알린다');
 
-  const prompt = buildPrompt(last);
+  const prompt = buildPrompt({ ...last, knowledge: list });
   const section = prompt.split('## 관련 지식')[1].split('\n## ')[0];
   const ids = [...section.matchAll(/^- (k\d+) \[/gm)].map(m => m[1]);
   assert.deepEqual(ids, [...new Set(ids)], `같은 ID의 줄이 둘이다: ${ids}`);
-  assert.equal(ids.length, last.knowledge.filter(o => !o.dropped).length, '본문 줄 수가 머리말의 건수와 같다');
+  assert.equal(ids.length, list.filter(o => !o.dropped).length, '본문 줄 수가 머리말의 건수와 같다');
   // 청구 기회가 남아 있으면 보관 구간이 더 있다는 사실이 프롬프트에도 실린다 (다 썼으면 표시가 사라진다).
-  assert.match(buildPrompt({ ...last, canExpand: true }), /\(보관 구간 더 있음\)/);
+  assert.match(buildPrompt({ ...last, knowledge: list, canExpand: true }), /\(보관 구간 더 있음\)/);
 
   // 싣지 못한 구간은 지워진 것이 아니다 — 같은 ID를 앞으로 가져오면 보관한 범위가 전부 실린다.
-  const front = knowledgeView([grown, last.knowledge.find(o => o.seq === narrow.seq)]);
+  const front = knowledgeView([grown, swallowed]);
   assert.deepEqual([front[0].seq, front[0].from, front[0].to], [seed.seq, grown.from, grown.to]);
   assert.ok(front[1].viewOmitted, '앞선 항목이 다 실으면 삼켜진 구간은 보관 목록으로 물러난다');
 });
@@ -563,5 +568,69 @@ test('확대가 삼킨 구간을 다시 청구해도 그 문서의 표시가 줄
     assert.equal(seen[4].count, seen[3].count, `표시가 줄었다: ${seen[3].count} → ${seen[4].count}`);
     assert.match(result.trace.find(h => h.expand)?.note ?? '', /이미 같은 문서의 다른 항목으로 실려 있다/);
     assert.equal(seen[4].ctx.knowledge[0].seq, seed.seq, '삼킨 항목이 목록 앞을 지킨다');
+  });
+});
+
+test('숨긴 구간의 복구도 이미 실려 있으면 앞으로 가져오지 않는다', async t => {
+  // 시스템 프롬프트는 확대에 drop을 함께 적으라고 권하고("넓힌 본문이 자리를 많이 쓰므로 더는 필요 없는
+  // 자료를 함께 적어라"), context.md 2절은 "필요해지면 expand로 복구한다"고 약속한다. 그런데 그 확대가
+  // 방금 버린 구간을 통째로 삼켰으면, 복구가 그 구간을 목록 맨 앞으로 가져오면서 새로 보이는 글자 하나 없이
+  // 문서 상한(MAX_DOC_LEN)만 나눠 쓰게 된다 — 지금 보이던 본문이 그만큼 줄고 둘뿐인 청구 기회 하나가
+  // 거기서 사라진다(실측: 한 문서의 실린 청크가 17개에서 10개로).
+  // 바로 위 '확대가 삼킨 구간을 다시 청구해도 …'가 막은 것과 같은 손해인데, 숨김 복구 갈래만 그 판정
+  // 앞을 지나가고 있었다. 숨김 자체는 걷는다 — 모델이 그만두겠다고 한 일이고, 앞선 항목이 나중에
+  // 버려지거나 좁아지면 그때 저절로 실린다. 앞으로 가져오는 일만 막는다.
+  const rows = source();
+  const inner = window(rows, 8, 10);   // 숨겼다 되살릴 구간
+  const seed = window(rows, 1, 2);     // 확대하면 8~10을 품는 구간
+  const far = window(rows, 40, 41);    // 확대해도 8~10과 겹치지 않는 구간 (과교정 방지)
+  const shownChunks = ctx => new Set(knowledgeView(ctx.knowledge)
+    .filter(v => !v.dropped && !v.viewOmitted)
+    .flatMap(v => v.chunks.map(c => c.chunk_no)));
+
+  const run = async grow => {
+    const script = [
+      { action: 'search', text: '앞', targets: ['knowledge'] },
+      { action: 'search', text: '뒤', targets: ['knowledge'] },
+      { action: 'expand', ids: [`k${grow.seq}`], drop: [`k${inner.seq}`] },
+      { action: 'expand', ids: [`k${inner.seq}`] },
+    ];
+    const seen = [];
+    const result = await handleQuestion('문서 전체', [], { deps: {
+      // ctx.knowledge는 요청 내내 같은 배열이라 나중에 보면 마지막 상태다 — 스텝별 판정은 그 자리에서 굳힌다.
+      decide: async c => {
+        seen.push({ ctx: c, prompt: buildPrompt(c), shown: shownChunks(c),
+          dropped: c.knowledge.filter(o => o.dropped).map(o => o.seq), front: c.knowledge[0]?.seq });
+        return script.shift() ?? { action: 'answer', answer: '끝' };
+      },
+      loadChunks: async ranges => rows.filter(r => ranges.some(g => r.chunk_no >= g.from && r.chunk_no <= g.to)),
+      search: async text => ({ knowledge: [structuredClone(text === '앞' ? inner : grow)] }),
+    } });
+    return { seen, result };
+  };
+
+  await t.test('삼킨 구간을 되살려도 보이던 청크를 잃지 않는다', async () => {
+    const { seen, result } = await run(seed);
+    const swallowed = seen[3].ctx.knowledge.find(o => o.seq === seed.seq);
+    assert.ok(swallowed.from <= inner.from && swallowed.to >= inner.to,
+      `확대 구간이 숨긴 구간을 품어야 이 회귀가 성립한다: ${swallowed.from}~${swallowed.to}`);
+    assert.deepEqual(seen[3].dropped, [inner.seq], '전제: 확대와 함께 그 구간을 숨겼다');
+
+    const lost = [...seen[3].shown].filter(n => !seen[4].shown.has(n));
+    const gained = [...seen[4].shown].filter(n => !seen[3].shown.has(n));
+    assert.deepEqual(lost, [], `복구가 보이던 청크를 잃었다: ${lost} (새로 보인 청크: ${gained})`);
+    assert.deepEqual(seen[4].dropped, [], '숨김 자체는 걷는다 — 복구 요청을 무시하지는 않는다');
+    assert.equal(seen[4].front, seed.seq, '삼킨 항목이 목록 앞을 지킨다');
+    assert.match(result.trace.find(h => h.expand)?.note ?? '', /이미 같은 문서의 다른 항목으로 실려 있다/);
+  });
+
+  await t.test('삼키지 않은 구간의 복구는 그대로 앞으로 와서 본문이 실린다', async () => {
+    const { seen, result } = await run(far);
+    assert.deepEqual(seen[3].dropped, [inner.seq], '전제: 확대와 함께 그 구간을 숨겼다');
+    assert.deepEqual(seen[4].dropped, []);
+    assert.equal(seen[4].front, inner.seq, '되살린 구간이 목록 맨 앞으로 온다');
+    assert.ok([8, 9, 10].every(n => seen[4].shown.has(n)), '되살린 구간의 본문이 실린다');
+    assert.ok(seen[4].prompt.includes(indentLines(rows[7].content).slice(0, 200)), '프롬프트에 그 본문이 있다');
+    assert.equal(result.trace.filter(h => h.expand).length, 0, '성공한 청구는 이력에 안내 줄을 남기지 않는다');
   });
 });
