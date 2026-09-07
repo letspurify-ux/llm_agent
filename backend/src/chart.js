@@ -158,10 +158,83 @@ const marked = (v, max) => {
 // 않는다 — 그래서 식별자꼴 값은 지금까지와 글자 하나 다르지 않다.
 // 되돌리는 쪽(agent.js unescapeCell, frontend/src/chart.js splitRow)이 같은 목록을 본다 — 한쪽만 늘리면
 // 화면에 백슬래시가 남거나 잘린 값 가드가 길이를 못 맞춘다.
+//
+// '$'도 같은 목록에 든다. markdown 자체의 구성요소는 아니지만 이 칸을 실제로 그리는 파이프라인이
+// 수식을 함께 읽기 때문이다(frontend/src/math.js REMARK_PLUGINS = remark-gfm + remark-math + remarkLooseMath).
+// 그래서 셀에 든 '$…$'·'$$…$$'가 조판으로 바뀌어 달러 기호가 사라진다(실측 — 프런트 실물 파이프라인:
+// '$x$' → 'x', '수식 $a+b$ 참고' → '수식 a+b 참고', '$$100$$' → '100'). 이 함수가 보는 문법은
+// CommonMark가 아니라 '이 글자를 읽는 쪽'이어야 한다 — 22회차에 remark-gfm으로 목록을 맞춘 것과 같은 이유다.
+// 짝 규칙은 그대로라 홑 '$'는 손대지 않는다: $HOME·V$SESSION·'$100 ~ $200'은 글자 하나 달라지지 않는다.
 const isAlnum = c => c !== undefined && /[\p{L}\p{N}]/u.test(c);
 // 자리에서 바로 본다(sticky) — 남은 문자열을 slice로 떼면 '& 수 × 셀 길이'라 이차가 된다
 // (llm-openai.js keepsControlMeaning에 같은 이유를 적어 두었다).
 const ENTITY_AT = /&(?:[a-zA-Z][a-zA-Z0-9]{1,31}|#\d{1,7}|#[xX][0-9a-fA-F]{1,6});/y;
+
+// ===== GFM 자동 링크(literal) 구간 =====
+// 값에 든 주소는 GFM이 통째로 링크로 만들고 그 안에서는 아무 구성요소도 읽지 않는다
+// (실측 — remark-gfm: 'http://a.com/x*b*c'의 '*'도, '~'·'`'·'_'·'['·'&amp;'도 전부 원문 그대로 남는다).
+// 즉 여기서는 막을 것이 없는데, 막으면 두 가지를 함께 잃는다: 백슬래시가 화면 글자로 그대로 보이고
+// (값이 달라진다) 링크의 '주소'에도 들어가 클릭이 엉뚱한 곳으로 간다
+// (실측: 'http://intra/a*b*c' → 화면·href 모두 'http://intra/a\*b\*c'). 뒤쪽이 특히 나쁘다 —
+// 조회 결과에 실린 주소는 눌러 보라고 있는 것이고, 그 실패는 404 한 번으로만 보여 원인이 보이지 않는다.
+//
+// 판정은 '반드시 링크가 된다'는 모양으로만 좁힌다. 넓게 잡아 링크가 아닌 자리를 놓치면 그 글자가
+// 구성요소가 되어 값이 바뀌는데, 그것이 이 함수가 막기로 한 실패다. 좁게 잡아 놓치는 쪽은 지금과 같다.
+//   ① 글의 처음이거나 앞이 공백 — 우리가 막는 글자가 아니라서 그 자리에 백슬래시가 끼어들지 않는다.
+//   ② www. | http:// | https:// 로 시작하고, 다음 공백 앞까지가 한 구간이다.
+//   ③ 도메인이 아래 LINK_DOMAIN 모양 — 이 칸을 실제로 그리는 파서(remark-gfm/micromark)가 링크로 받는
+//      모양의 부분집합이다. 경계는 실측으로 잡았다: '_'가 든 도메인은 링크가 아니고
+//      (http://a_b.com/x·http://a.b_c.com/x는 그냥 글자다), 점 없는 사내 호스트(http://intra/…)는 링크다.
+//   ④ 링크가 낱말의 '끝까지' 간다 — 그래야 보호 구간과 링크 구간이 정확히 같아져, 링크 안에
+//      백슬래시가 들어가는 일도, 링크 밖에 막지 않은 글자가 남는 일도 없다 (아래 full의 ③~⑤).
+// 구간 안에서도 '\'와 '|'는 그대로 막는다: 파이프는 칸을 갈라 행을 무너뜨리고, 역슬래시를 그냥 두면
+// 구간 끝의 '\'가 바로 뒤 이스케이프의 백슬래시와 붙어 다른 뜻이 된다.
+//
+// 이 판정이 파서의 실제 동작에 기대고 있다는 것을 잊지 말 것 — 넓어지면(링크가 아닌 자리를 보호하면)
+// 그 글자가 구성요소가 되어 값이 조용히 바뀐다. 그래서 실물 렌더러로 원문을 대조하는 회귀 테스트를
+// 프런트에 둔다(frontend/test/chart.test.js) — 파서를 갈아 끼우면 그 테스트가 먼저 깨진다.
+//
+// 낱말은 앞 글자를 가리지 않고 잡는다(실측: '5http://intra$'의 주소도 링크다). 앞 조건은 아래 full에만 건다.
+const URLISH_TOKEN = /(?:https?:\/\/|www\.)[^ \t]*/gi;
+const LINK_SCHEME = /^https?:\/\//i;
+// 파서가 '도메인'으로 읽는 글자 — 영숫자·'_'·'-'·'.'과 비ASCII. 그 뒤는 경로라 무엇이 와도 된다.
+const LINK_DOMAIN = /^[A-Za-z0-9_.\-¡-￿]*/;
+// 낱말 끝의 이 글자들은 링크에서 떨어져 나온다(micromark tokenizeTrail) — 그러면 보호 구간이 링크보다
+// 길어지므로 아예 보호하지 않는다.
+const LINK_TRAIL_END = /[!"'),.:;?_~*]$|&[a-zA-Z]+;$/;
+
+// 구간마다 두 가지를 돌려준다.
+//   full=true  — 낱말 전체가 그대로 링크가 된다. 이 구간에서는 아무것도 막지 않는다.
+//   full=false — 링크인지, 어디까지가 링크인지 확실하지 않다. 종전대로 막되 '$'만은 막지 않는다:
+//                '$'는 이번에 새로 막기 시작한 글자라, 여기서 막으면 '실제로는 링크였던' 구간에
+//                없던 백슬래시를 새로 집어넣게 된다(그 자리는 지금까지 아무 문제가 없던 곳이다).
+//                막지 않아서 손해 보는 것은 '링크가 아닌 주소꼴 낱말 안의 $…$'뿐이고, 그것은 지금과 같다.
+function autolinkRanges(s) {
+  // 주소가 없는 값(대부분)은 정규식 한 번으로 끝난다.
+  if (!/https?:\/\/|www\./i.test(s)) return null;
+  let ranges = null;
+  for (const m of s.matchAll(URLISH_TOKEN)) {
+    const run = m[0];
+    const domain = LINK_DOMAIN.exec(run.replace(LINK_SCHEME, ''))[0];
+    const full =
+      // ① 글의 처음이거나 앞이 공백 — 그 자리는 우리가 막는 글자가 아니라 백슬래시가 끼어들지 않는다.
+      (m.index === 0 || s[m.index - 1] === ' ' || s[m.index - 1] === '\t')
+      // ② 도메인에 '_'가 하나라도 있으면 확신하지 않는다. 파서는 '마지막 두 조각'만 보지만(micromark
+      //    tokenizeDomain), 그 셈은 끝의 '.'이 링크에서 떨어져 나가는지까지 함께 봐야 해서 이쪽에서
+      //    정확히 흉내 낼 값이 아니다 — 좁은 쪽(막는 쪽)으로 둔다.
+      && domain.length >= 2 && !domain.includes('_') && !/^[.-]/.test(domain)
+      // ③ 앞에 짝 없는 '['·'<'가 있으면 그 뒤의 자동 링크는 아예 만들어지지 않는다 — 링크 라벨·원시 HTML의
+      //    시작으로 읽혀 뒤가 통째로 그 안에 들어간다(실측: '[ https://localhost/x'는 링크가 아니다).
+      //    우리는 ']'만 막으므로 값에 든 '['는 언제나 짝을 잃은 채 남는다 — 그 앞자락을 함께 봐야 한다.
+      && !/[[<]/.test(s.slice(0, m.index))
+      // ④ 낱말 안의 '<'·']'는 링크를 거기서 끝낸다 (micromark tokenizePath/tokenizeTrail).
+      && !run.includes('<') && !run.includes(']')
+      // ⑤ 낱말 끝의 문장부호·엔터티는 링크 밖으로 떨어진다.
+      && !LINK_TRAIL_END.test(run);
+    (ranges ??= []).push([m.index, m.index + run.length, full]);
+  }
+  return ranges;
+}
 
 export function escapeCell(value) {
   const s = String(value ?? '').replace(/[\r\n]/g, ' ');
@@ -174,8 +247,16 @@ export function escapeCell(value) {
     return n;
   };
   const paired = new Set();
-  for (const ch of ['*', '`', '~']) if (runs(ch) >= 2) paired.add(ch);
-  if (s.indexOf('[') >= 0 && s.indexOf('[') < s.lastIndexOf(']')) { paired.add('['); paired.add(']'); }
+  for (const ch of ['*', '`', '~', '$']) if (runs(ch) >= 2) paired.add(ch);
+  // 링크·이미지·각주는 닫는 ']'만 막아도 전부 성립하지 못한다 — 여는 '['는 짝을 잃으면 그냥 글자다
+  // (실측: '[x\](y)'·'![a\](b.png)'·'[a\][b\]'·'[^1\]'이 모두 원문 그대로 남는다).
+  // '['를 함께 막으면 안 된다. 그러면 우리가 쓴 '\[…\]'가 **수식 표시**가 되어, 이 칸을 그리는
+  // 파이프라인(frontend/src/math.js remarkLooseMath)이 그것을 원문에서 알아보고 조판해 버린다 —
+  // markdown이 백슬래시를 떼어 '[ ]'만 남기는 표기를 되살리는 것이 그 플러그인의 존재 이유라,
+  // 우리의 이스케이프가 곧 그 표기가 된다. 실측: '[ERROR]'가 화면에서 대괄호를 잃고 수식 'ERROR'로,
+  // '상태[1]'이 '상태' + 수식 '1'로, 'JSON: {"a":[1,2]}'가 '{"a":' + 수식 '1,2' + '}'로 나갔다.
+  // 대괄호는 조회 결과에 흔하다([ERROR]·[BATCH001]·배열 첨자) — 가장 조용하고 가장 자주 나는 오답이다.
+  if (s.indexOf('[') >= 0 && s.indexOf('[') < s.lastIndexOf(']')) paired.add(']');
   if (s.indexOf('<') >= 0 && s.indexOf('<') < s.lastIndexOf('>')) paired.add('<');
   // '_'만 규칙이 하나 더 붙는다: 런의 양옆이 모두 글자·숫자면 강조를 열지도 닫지도 못한다(intraword 예외).
   // 그런 런은 짝으로 세지 않고 막지도 않는다 — BATCH_JOB_STATUS·order_id가 지금까지와 같은 글자로 남는 이유다.
@@ -193,10 +274,19 @@ export function escapeCell(value) {
     looseRuns++;
     for (let j = i; j <= end; j++) looseUnderscore.add(j);
   }
+  // 자동 링크 구간은 커서 하나로 따라간다 — 구간마다 배열을 다시 훑으면 '글자 수 × 구간 수'가 된다.
+  // 구간은 겹치지 않고 앞에서부터 나온다(matchAll).
+  const links = autolinkRanges(s);
+  let at = 0;
   let out = '';
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
-    if (c === '\\' || c === '|' || paired.has(c)) { out += `\\${c}`; continue; }
+    // 파이프·역슬래시는 자동 링크 안에서도 막는다 (위 자동 링크 머리말).
+    if (c === '\\' || c === '|') { out += `\\${c}`; continue; }
+    while (links && at < links.length && links[at][1] <= i) at++;
+    const inLink = links && at < links.length && i >= links[at][0];
+    if (inLink && (links[at][2] || c === '$')) { out += c; continue; }
+    if (paired.has(c)) { out += `\\${c}`; continue; }
     if (c === '_' && looseRuns >= 2 && looseUnderscore.has(i)) { out += '\\_'; continue; }
     if (c === '&' && ((ENTITY_AT.lastIndex = i), ENTITY_AT.test(s))) { out += '\\&'; continue; }
     out += c;

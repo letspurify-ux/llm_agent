@@ -404,12 +404,17 @@ test('표·차트의 칸은 값이 markdown으로 해석될 수 있을 때만 �
     '~미사용~': '\\~미사용\\~',
     '__init__': '\\_\\_init\\_\\_',
     '노트: `code`': '노트: \\`code\\`',
-    '[확인](http://x)': '\\[확인\\](http://x)',
+    // 링크·이미지·각주는 닫는 ']'만 막아도 전부 성립하지 못한다. 여는 '['를 함께 막으면 우리가 쓴
+    // '\[…\]'가 수식 표시가 되어 화면이 대괄호를 잃는다 (escapeCell 주석 — 아래 별도 테스트가 잰다).
+    '[확인](http://x)': '[확인\\](http://x)',
     '&amp;': '\\&amp;',
     '<b>굵게</b>': '\\<b>굵게\\</b>',
+    '$x$': '\\$x\\$',                        // 수식 표시 — 짝이 있을 때만
+    '$$100$$': '\\$\\$100\\$\\$',
   };
   const 그대로 = ['BATCH_JOB_STATUS', 'order_id', '_start', 'end_', 'METRIC__FIRST', 'A__B__C',
-    '**', 'a**b', '2 * 3', 'A&B', 'x & y', '[확인필요', 'a<b', '2026-09-07 10:23:45', 'C:\\a_b\\c'];
+    '**', 'a**b', '2 * 3', 'A&B', 'x & y', '[확인필요', 'a<b', '2026-09-07 10:23:45', 'C:\\a_b\\c',
+    '$HOME', 'V$SESSION', '단가 $12.5'];
   for (const [value, want] of Object.entries(막는다)) {
     assert.equal(escapeCell(value), want, value);
   }
@@ -468,4 +473,72 @@ test('바꿔 넣기의 비용은 블록 수에 비례한다 — 앞 글을 되�
   const 하나 = Math.max(0.5, ms(1000));
   const 넷 = ms(4000);
   assert.ok(넷 < 하나 * 8, `블록이 4배인데 비용이 ${(넷 / 하나).toFixed(1)}배다 (${하나.toFixed(1)}ms → ${넷.toFixed(1)}ms)`);
+});
+
+// ── 채운 칸이 화면에서 다른 값으로 읽히던 세 자리 (23회차) ────────────────────────────────
+// 셋 다 같은 실패다: DB의 값과 화면의 값이 달라지는데 오류가 한 줄도 남지 않는다. 앞선 회차가
+// remark-gfm만으로 규칙을 맞춘 탓에, 이 칸을 실제로 그리는 파이프라인이 함께 읽는 것(수식)과
+// GFM이 링크로 삼는 구간을 보지 못했다. 실물 렌더러로 원문을 대조하는 쪽은 프런트가 맡고
+// (frontend/test/chart.test.js) 여기서는 '무엇을 막고 무엇을 그대로 두는가'를 못 박는다.
+
+test('대괄호는 닫는 쪽만 막는다 — 여는 쪽까지 막으면 그 이스케이프가 수식 표시가 된다', () => {
+  // '\[…\]'는 프런트가 원문에서 알아보는 별행 수식 표기다(frontend/src/math.js remarkLooseMath) —
+  // 우리가 '['를 막는 순간 그 표기를 우리 손으로 만들어 준다. 실측: '[ERROR]'가 화면에서 대괄호를
+  // 잃고 수식 'ERROR'로, '상태[1]'이 '상태' + 수식 '1'로 나갔다. 대괄호는 조회 결과에 흔하다.
+  for (const [value, want] of Object.entries({
+    '[ERROR]': '[ERROR\\]',
+    '[BATCH001] 실패': '[BATCH001\\] 실패',
+    '상태[1]': '상태[1\\]',
+    'JSON: {"a":[1,2]}': 'JSON: {"a":[1,2\\]}',
+    '[a][b]': '[a\\][b\\]',
+    '![그림](x.png)': '![그림\\](x.png)',
+  })) {
+    assert.equal(escapeCell(value), want, value);
+    assert.ok(!escapeCell(value).includes('\\['), `여는 대괄호를 막으면 수식 표시가 된다: ${value}`);
+  }
+  // 닫는 쪽만 막아도 링크는 성립하지 못한다 — 그것이 이 자리에서 막아야 하는 전부다.
+  assert.ok(!escapeCell('[확인](http://x)').includes('\\['));
+  // ']'가 없으면 '['는 짝이 없어 아무것도 열지 못한다 — 그대로 둔다.
+  assert.equal(escapeCell('배열[0'), '배열[0');
+});
+
+test("'$'는 짝이 있을 때만 막는다 — 화면이 수식으로 조판해 달러 기호를 잃는다", () => {
+  // 이 칸을 그리는 파이프라인은 remark-math와 remarkLooseMath를 함께 건다(frontend/src/math.js).
+  // 실측: '$x$'가 'x'로, '수식 $a+b$ 참고'가 '수식 a+b 참고'로, '$$100$$'가 '100'으로 나갔다.
+  assert.equal(escapeCell('수식 $a+b$ 참고'), '수식 \\$a+b\\$ 참고');
+  // 홑 '$'는 짝이 없어 조판되지 않는다 — 이 시스템의 값에 흔한 표기라 글자 하나 바뀌면 안 된다.
+  for (const value of ['$HOME', 'V$SESSION', '$100', 'USD $12.50']) {
+    assert.equal(escapeCell(value), value, value);
+  }
+  // 되돌리는 쪽이 같은 목록을 봐야 한다 — 한쪽만 늘리면 화면에 백슬래시가 남고,
+  // 잘린 값 가드가 칸에 보인 앞부분의 길이를 못 맞춘다 (agent.js unescapeCell).
+  const long = '$a$ 10*20*30 ~x~ '.repeat(20);
+  const answer = resolveTableData(tblock('step: 1'), [[{ 값: long }]]);
+  assert.ok(clippedCopyDetector([{ role: 'assistant', text: answer }]).isCopy(clipText(long, MAX_TABLE_CELL_LEN)));
+});
+
+test('값에 든 주소(자동 링크)는 막지 않는다 — 백슬래시가 화면과 링크 주소에 그대로 들어간다', () => {
+  // GFM은 주소 낱말을 통째로 링크로 만들고 그 안의 글자는 무엇도 구성요소로 읽지 않는다.
+  // 막으면 화면 글자와 href가 함께 어긋난다(실측: href가 'http://intra/a\*b\*c'가 되어 404).
+  for (const value of [
+    'http://intra/a*b*c', 'https://intra/~user/~tmp', 'http://intra/r?a=1&amp;b=2',
+    'https://host/p`q`r', 'www.a.com/_x_/_y_/z', 'http://a.com/x$y$z',
+  ]) {
+    assert.equal(escapeCell(value), value, value);
+  }
+  // 문장 안에 섞여 있어도 주소 밖은 종전대로 막는다.
+  assert.equal(escapeCell('참고 http://intra/a*b*c 그리고 *중요*'),
+    '참고 http://intra/a*b*c 그리고 \\*중요\\*');
+  // 파이프·역슬래시는 주소 안에서도 막는다 — 파이프는 칸을 가르고, 역슬래시를 두면 구간 끝의
+  // 백슬래시가 바로 뒤 이스케이프와 붙어 다른 뜻이 된다.
+  assert.equal(escapeCell('http://a.com/x|y'), 'http://a.com/x\\|y');
+  // '반드시 링크가 되는' 모양만 보호한다 — 확신하지 못하는 낱말은 종전대로 막는다.
+  //   도메인에 '_'가 있다 / 앞에 짝 없는 '['가 있다 / 낱말 끝이 링크에서 떨어져 나가는 문장부호다
+  assert.equal(escapeCell('http://a_b.com/x*y*z'), 'http://a_b.com/x\\*y\\*z');
+  assert.equal(escapeCell('[메모 http://a.com/x*y*z'), '[메모 http://a.com/x\\*y\\*z');
+  assert.equal(escapeCell('http://a.com/x*y*z*'), 'http://a.com/x\\*y\\*z\\*');
+  // 낱말이 공백 뒤에서 시작하지 않으면 확신하지 않는다 — 다만 낱말 '안'의 '$'는 그때도 막지 않는다:
+  // 이번에 새로 막기 시작한 글자라, 실제로는 링크였던 자리에 없던 백슬래시를 넣게 된다
+  // (실측: '5http://intra$'의 주소도 링크다). 낱말 밖의 '$'는 종전대로 짝 규칙을 따른다.
+  assert.equal(escapeCell('단가$12.5http://a.com/x$'), '단가\\$12.5http://a.com/x$');
 });

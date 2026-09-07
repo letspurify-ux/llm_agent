@@ -719,7 +719,10 @@ const 표의_칸 = md => [...renderToStaticMarkup(React.createElement(ReactMarkd
     .replace(/&#x27;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'));
 
 const 값들 = ['10*20*30', '~미사용~', '__init__', '노트: `code`', '[확인](http://x)', '&amp;',
-  '<b>굵게</b>', 'BATCH_JOB_STATUS', 'C:\\logs\\a|b', '재고 부족 — *긴급*', '2026-09-07 10:23:45'];
+  '<b>굵게</b>', 'BATCH_JOB_STATUS', 'C:\\logs\\a|b', '재고 부족 — *긴급*', '2026-09-07 10:23:45',
+  // 서버가 막는 목록이 늘면 되돌리는 쪽(splitRow)도 함께 늘어야 한다 — 한쪽만 고치면 차트 라벨에
+  // 백슬래시가 남는다. '$'·']'가 그렇게 늘어난 자리다 (backend/src/chart.js escapeCell).
+  '$x$', '$$100$$', '[ERROR]', '상태[1]'];
 
 test('서버가 채운 표의 칸은 화면에서 조회 결과 원문 그대로 읽힌다', () => {
   const rows = 값들.map(v => ({ 값: v, N: 1 }));
@@ -826,4 +829,50 @@ test("정렬 표시가 든 구분 줄은 그대로 두고, GFM이 읽지 못하�
   // 목록 안의 표는 들여쓰기를 지킨다 — 우리가 넣는 파이프는 들여쓰기 뒤에 온다
   assert.strictEqual(chartBlocksToTables('1. 항목\n   ```chart\n   a | b\n   - | -\n   1 | 2\n   ```'),
     '1. 항목\n   |a | b\n   | --- | --- |\n   |1 | 2');
+});
+
+// ===== 실제 말풍선이 쓰는 파이프라인으로 다시 잰다 (23회차) =====
+// 위 두 테스트는 remark-gfm만으로 쟀는데, 답변 본문을 실제로 그리는 것은 그것 하나가 아니다 —
+// App.jsx는 REMARK_PLUGINS(remark-gfm + remark-math + remarkLooseMath)와 REHYPE_PLUGINS로 그린다.
+// 그 차이 때문에 서버가 채운 칸이 세 가지로 조용히 바뀌고 있었다(전부 실측):
+//   ① '[ERROR]'가 대괄호를 잃고 수식 'ERROR'로 나갔다 — 서버가 막은 '\[…\]'가 곧 별행 수식 표기다.
+//   ② '$x$'·'$$100$$'가 조판되어 달러 기호가 사라졌다.
+//   ③ 주소가 든 칸에서 이스케이프의 백슬래시가 화면 글자와 href에 그대로 들어갔다(눌러도 404).
+// 그래서 '무엇으로 그리는가'를 계약에 넣는다 — 파서를 갈아 끼우거나 플러그인을 더하면 여기서 먼저 깨진다.
+import { REMARK_PLUGINS, REHYPE_PLUGINS } from '../src/math.js';
+
+const 실제_렌더 = md => renderToStaticMarkup(React.createElement(ReactMarkdown, {
+  remarkPlugins: REMARK_PLUGINS, rehypePlugins: REHYPE_PLUGINS,
+}, md));
+// KaTeX는 조판 결과와 원문(annotation)을 함께 싣는다 — 조판 쪽을 걷어내고 남는 글자가 화면의 글자다.
+const 실제_칸 = md => [...실제_렌더(md).replace(/<span class="katex-html"[\s\S]*?<\/annotation>/g, '')
+  .matchAll(/<(td|th)\b[^>]*>(.*?)<\/\1>/g)]
+  .map(m => m[2].replace(/<[^>]*>/g, '')
+    .replace(/&#x27;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'));
+
+const 실무_값들 = [
+  '[ERROR]', '[BATCH001] 실패', '상태[1]', 'JSON: {"a":[1,2]}',   // ①
+  '$x$', '수식 $a+b$ 참고', '$$100$$', '$HOME', 'V$SESSION', '단가 $12.5', '$100 ~ $200',  // ②
+  'http://intra/a*b*c', 'https://intra/~user/~tmp', 'http://intra/r?a=1&amp;b=2',  // ③
+  '10*20*30', '~미사용~', '__init__', '노트: `code`', '&amp;', 'BATCH_JOB_STATUS', 'C:\\logs\\a|b',
+];
+
+test('서버가 채운 칸은 말풍선이 실제로 쓰는 파이프라인에서도 조회 결과 원문 그대로다', () => {
+  const rows = 실무_값들.map(v => ({ 값: v, N: 1 }));
+  const md = resolveTableData('```table\nstep: 1\nlimit: 100\n```', [rows]);
+  const shown = 실제_칸(md).slice(2).filter((_, i) => i % 2 === 0);
+  assert.deepEqual(shown, 실무_값들);
+  // 채운 칸에서 수식이 하나도 만들어지지 않아야 한다 — 조회 결과는 값이지 수식이 아니다.
+  assert.equal(실제_렌더(md).includes('katex'), false, '조회 결과 값이 수식으로 조판됐다');
+});
+
+test('칸에 든 주소는 화면 글자도 링크 주소도 원문 그대로다', () => {
+  // 이스케이프의 백슬래시는 자동 링크 안에서 되돌려지지 않는다 — 화면에도 href에도 그대로 남아
+  // 사용자가 누르면 없는 주소로 간다. 값이 바뀌는 것보다 이쪽이 먼저 눈에 띄지 않는다.
+  const 주소들 = ['http://intra/a*b*c', 'https://intra/~user/~tmp', 'http://intra/r?a=1&amp;b=2', 'https://host/p`q`r'];
+  const md = resolveTableData('```table\nstep: 1\n```', [주소들.map(v => ({ URL: v }))]);
+  assert.deepEqual(실제_칸(md).slice(1), 주소들);
+  // href는 렌더러가 URL로 정규화한다(백틱 → %60) — 그 정규화만 되돌려 원문과 맞춘다.
+  const href = [...실제_렌더(md).matchAll(/href="([^"]*)"/g)].map(m => decodeURI(m[1].replace(/&amp;/g, '&')));
+  assert.deepEqual(href, 주소들);
 });

@@ -79,7 +79,7 @@ const SEP_ROW_RE = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
 // 값이 조용히 바뀌므로 서버가 짝이 있을 때만 막아 보낸다(backend/src/chart.js escapeCell). 그 목록을 여기서도
 // 같이 되돌린다 — 한쪽만 늘리면 차트 라벨에 백슬래시가 남는다. 그 밖의 역슬래시는 글자다(`C:\dir`).
 // 양끝 파이프는 벗긴다.
-const CELL_ESCAPABLE = '\\|`*~[]<_&';
+const CELL_ESCAPABLE = '\\|`*~[]<_&$';
 function splitRow(line) {
   const cells = [];
   let cur = '';
