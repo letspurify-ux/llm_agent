@@ -600,6 +600,10 @@ ollama pull bge-m3
 Windows: `setup/bge-m3/start.bat` 실행 (설치 확인·모델 다운로드·검증까지 자동, 중지는 `stop.bat`).
 자세한 내용은 [setup/bge-m3/README.md](setup/bge-m3/README.md) 참고.
 
+**다른 모델을 쓰려면** — `qwen3-embedding:0.6b`(1024차원, 640MB)용 같은 형식의 스크립트가
+[setup/qwen3-embedding/](setup/qwen3-embedding/README.md)에 있다. 관련도 문턱(`MAX_DIST`)을 그대로 써도 되는지
+실측한 표와, `registry.ollama.ai`가 막힌 사내망에 모델을 파일로 반입하는 절차가 함께 있다.
+
 **모델을 내리지 않게 한다.** Ollama는 5분 유휴 뒤 모델을 메모리에서 내리고 다음 요청에서 다시 올리므로(수 초),
 한산한 시간대의 첫 질문이 그 비용을 그대로 낸다. `OLLAMA_KEEP_ALIVE=-1`로 끈다 — macOS는
 `launchctl setenv OLLAMA_KEEP_ALIVE -1` 뒤 Ollama 재기동, Windows는 `setx OLLAMA_KEEP_ALIVE -1` 뒤 새 터미널에서
@@ -774,4 +778,7 @@ GROUP BY searches ORDER BY searches;
 
 - **새 쿼리/지식 추가**: 코드 변경 없이 MariaDB 테이블에 INSERT (임베딩은 1분 내 자동 동기화).
   단일 쿼리는 `query_desc`만 성실히 작성하면 되고, 다단계 절차는 `qa_method.method` 본문에 `query_name`을 순서대로 언급
-- **임베딩 모델 교체**: `EMBEDDING_MODEL`만 변경 (1024차원 유지 시). vLLM/TEI 등 OpenAI 호환 서버는 `EMBEDDING_URL`로 전환
+- **임베딩 모델 교체**: `EMBEDDING_MODEL`만 변경 (1024차원 유지 시). vLLM/TEI 등 OpenAI 호환 서버는 `EMBEDDING_URL`로 전환.
+  지시문을 학습한 모델(Qwen3-Embedding·Harrier 계열)은 `EMBEDDING_QUERY_PREFIX`로 **질의에만** 접두를 붙인다
+  (문서에는 붙지 않는다 — 그 비대칭이 모델의 학습 형식이다). 바꾸면 전 행이 자동으로 다시 임베딩되고,
+  관련도 문턱(`search.js MAX_DIST`)이 그 모델에서도 성립하는지는 등록 지식으로 직접 잴 것

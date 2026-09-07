@@ -956,9 +956,12 @@ const DRIVER_CLIP_LENS = [MAX_CELL_LEN, MAX_CELL_LEN - 1];
 const CELL_CLIP_LENS = [MAX_TABLE_CELL_LEN, MAX_CHART_CELL_LEN].flatMap(n => [n, n - 1]);
 const CLIP_LENS = new Set([...DRIVER_CLIP_LENS, ...CELL_CLIP_LENS]);
 
-// GFM 칸의 이스케이프를 되돌린다 — 쓰는 쪽(chart.js cell·tableCell, llm.js cell)과 프런트(frontend/src/chart.js
-// splitRow)가 같은 두 규칙을 쓴다. 개행을 공백으로 바꾼 것은 되돌릴 수 없다(그 값은 모델도 공백으로 본다).
-const unescapeCell = s => s.replace(/\\([\\|])/g, '$1');
+// GFM 칸의 이스케이프를 되돌린다 — 쓰는 쪽(chart.js escapeCell, 그것을 그대로 쓰는 llm.js cell)과
+// 프런트(frontend/src/chart.js splitRow)가 같은 목록을 쓴다. 목록에는 파이프·역슬래시 말고도 값에 든
+// 강조·코드·링크·취소선·HTML·엔터티 표기가 들어 있다(escapeCell 주석) — 여기만 두 글자로 남으면 그런 값이
+// 실린 칸에서 되돌린 길이가 '우리가 자른 길이'와 어긋나 가드가 자기가 보여준 앞부분을 못 알아본다.
+// 개행을 공백으로 바꾼 것은 되돌릴 수 없다(그 값은 모델도 공백으로 본다).
+const unescapeCell = s => s.replace(/\\([\\|`*~[\]<_&])/g, '$1');
 
 // 마크(markAt)가 든 GFM 표 행에서, 그 칸의 시작부터 마크 직전까지 보이는 글자. 표의 행이 아니면 null.
 // 칸의 경계는 이스케이프되지 않은 '|'다 — 앞의 연속 역슬래시가 홀수면 값 속의 파이프('\|')이고 짝수면 구분자다

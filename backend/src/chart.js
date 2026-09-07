@@ -64,24 +64,65 @@ function fencedBlocks(text, language) {
   return blocks;
 }
 
+// 펜스는 닫는 줄이 곧 경계지만, 그 자리에 넣는 표·안내 문장은 스스로 끝나지 않는다 — GFM 표는 빈 줄이나
+// 다른 블록이 와야 끝나고, 그 전까지 오는 줄을 자기 행으로 삼킨다. 그래서 바꿔 넣은 자리의 앞뒤에 빈 줄이
+// 없으면 넣어 준다. 없으면 세 가지가 조용히 무너진다(실측 — remark-gfm 실물 파싱):
+//   ① 표 블록 둘이 빈 줄 없이 이어지면 뒤 표의 머리글과 구분 줄('---')이 앞 표의 데이터 행이 된다.
+//   ② 모델이 손으로 쓴 표 바로 뒤에 오면 열 수가 적은 앞 표에 흡수되어 뒤 표의 열이 통째로 사라진다
+//      (실측: 1열 표 뒤에 붙은 2열 결과에서 STATUS 값이 화면에서 사라졌다).
+//   ③ 표 바로 뒤의 설명 문장이 표의 마지막 행이 된다 — 문장이 답변에서 사라진다.
+// 셋 다 채우기 '전'에는 멀쩡했다: 펜스는 스스로 닫히기 때문이다. 즉 이 치환이 스스로 만드는 실패다.
+// 바꾸지 않은 블록(참조 없는 그대로 두는 블록)에는 손대지 않는다 — 원문을 건드릴 이유가 없다.
+// 판정은 자리에서 한다 — 남은 글을 slice로 떼거나 지금까지 만든 글에 `$` 정규식을 걸면 블록마다 글 전체를
+// 다시 훑어 '블록 수 × 답변 길이'가 된다(답변 상한 안에 빈 표 블록 수천 개가 들어간다).
+// 앞쪽: 넣을 자리 바로 앞 줄이 비어 있는가. 펜스는 줄 머리에서 시작하므로 여기 오는 글은 줄 끝으로 끝난다.
+const blankLineBefore = s => {
+  let i = s.length;
+  if (i === 0) return true;                                       // 글의 처음 — 앞 블록이 없다
+  if (s[i - 1] === '\n') { i--; if (i > 0 && s[i - 1] === '\r') i--; }
+  else if (s[i - 1] === '\r') i--;
+  else return false;
+  while (i > 0 && (s[i - 1] === ' ' || s[i - 1] === '\t')) i--;
+  return i === 0 || s[i - 1] === '\n' || s[i - 1] === '\r';
+};
+// 뒤쪽: 블록 다음 자리가 빈 줄로 시작하는가(또는 거기서 글이 끝나는가). sticky라 그 자리만 본다.
+const BLANK_AFTER = /\r?\n[ \t]*(?:\r?\n|$)/y;
+
+// 앞쪽 판정에 넘기는 것은 '지금까지 만든 글' 전체가 아니라 그 꼬리다 — 이어 붙인 문자열을 인덱스로
+// 읽으면 V8이 그때마다 평탄화해 블록 수 × 답변 길이가 된다(실측: 블록 4,000개에서 75ms → 6ms).
+// 판정이 보는 것은 마지막 줄 끝과 그 앞 줄의 공백뿐이라 이만큼이면 넉넉하다.
+const TAIL_LEN = 4096;
+
 function replaceBlocks(text, blocks, replace) {
-  const parts = [];
+  let out = '';
+  let tail = '';
   let at = 0;
+  const push = piece => {
+    if (!piece) return;
+    out += piece;
+    tail = piece.length >= TAIL_LEN ? piece.slice(-TAIL_LEN) : (tail + piece).slice(-TAIL_LEN);
+  };
   for (const block of blocks) {
-    parts.push(text.slice(at, block.index), replace(...block));
+    const replaced = replace(...block);
+    push(text.slice(at, block.index));
     at = block.index + block[0].length;
+    if (replaced === block[0]) { push(replaced); continue; }
+    if (!blankLineBefore(tail)) push('\n');
+    push(replaced);
+    BLANK_AFTER.lastIndex = at;
+    if (at < text.length && !BLANK_AFTER.test(text)) push('\n');
   }
-  parts.push(text.slice(at));
-  return parts.join('');
+  return out + text.slice(at);
 }
 const CONFIG_RE = /^\s*(type|title|x|y|y2|xtype|data)\s*:\s*(.*?)\s*$/i;
 
 // 셀 값을 표의 칸으로. 숫자는 천 단위 구분 없이 그대로(프런트가 숫자로 읽는다), 파이프와 줄바꿈은
 // 표를 깨뜨리므로 바꾼다. null은 빈칸이다 — 'null'이라는 글자는 값으로 읽힌다.
 // 홀로 선 CR도 줄바꿈이다 — markdown은 \r 하나도 줄 끝으로 읽으므로 남겨 두면 그 행이 둘로 갈라진다.
-// 역슬래시는 GFM의 이스케이프 글자라 그것부터 두 개로 만든다 — 값 `a\|b`를 파이프만 바꿔 `a\\|b`로 적으면
-// GFM은 `\\`를 역슬래시 하나로 읽고 남은 `|`에서 칸을 갈라 '표로 보기'의 열이 밀린다(프런트 splitRow는
-// 이 두 이스케이프를 GFM과 같은 규칙으로 되돌린다).
+// 역슬래시도 GFM의 이스케이프 글자라 함께 두 개로 만든다 — 값 `a\|b`를 파이프만 바꿔 `a\\|b`로 적으면
+// GFM은 `\\`를 역슬래시 하나로 읽고 남은 `|`에서 칸을 갈라 '표로 보기'의 열이 밀린다. 그래서 escapeCell은
+// 한 번의 훑기로 글자마다 판정한다 — 치환을 겹쳐 돌리면 앞 회차가 넣은 백슬래시를 뒤 회차가 다시 센다
+// (프런트 splitRow는 이 이스케이프들을 GFM과 같은 규칙으로 되돌린다).
 //
 // 자른 셀에는 TRUNC_MARK를 붙인다 — 이 저장소의 다른 절단(oracle.js normalizeValue, llm-openai.js clip)과 같은
 // 규칙이다. 표시 없이 자르던 동안 두 가지가 조용히 어긋났다(실측). ① 사용자는 표의 값을 온전한 값으로 읽는다 —
@@ -101,7 +142,67 @@ const marked = (v, max) => {
 // 어긋나 가드가 자기가 보여준 앞부분을 못 알아본다 — CRLF가 둘만 들어 있어도 그렇다(실측: 120자 칸이 117자로
 // 보여 대조를 비켜 갔다). 그러면 모델이 그 조각으로 조회해 0건을 받고 "없다"로 단정하는, 이 가드가 막기로 한
 // 실패가 그대로 난다. 공백 두 칸은 markdown이 한 칸으로 렌더하므로 화면은 달라지지 않는다.
-const escapeCell = value => String(value ?? '').replace(/[\r\n]/g, ' ').replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
+// 파이프·역슬래시 말고도 막아야 하는 것이 있다. 채운 칸은 **markdown 표의 인라인 문맥**이라, 값에 든
+// 강조·코드·링크·취소선·HTML·엔터티 표기가 그대로 해석된다 — 파이프처럼 열을 밀지는 않지만 값을 조용히
+// 바꾼다(실측: 치수 '10*20*30'이 화면에 '102030'으로, '~미사용~'이 '미사용'으로, '__init__'이 'init'으로,
+// '&amp;'가 '&'로, '노트: `code`'가 '노트: code'로 나갔다 — remark-gfm 실물 파싱). 사용자는 조회 결과를
+// 원문으로 읽고 그 값을 다음 질문에 옮겨 적으므로, 이 코드베이스가 가장 나쁘게 보는 '조용한 오답'이다.
+// 자른 값에 표시를 붙이기로 한 것(marked)과 같은 이유다: 화면의 값은 DB의 값과 같아야 한다.
+//
+// 다만 '위험한 글자를 늘 막는' 방식은 쓰지 않는다. 이 글자는 이력으로 되돌아가 모델이 다시 읽는 자리이고
+// (chartBlocksToTables), 이 시스템의 값에는 밑줄이 흔하다 — BATCH_JOB_STATUS·order_id를 늘 막으면 모델이
+// 보는 값이 항상 어긋난다. 그래서 **그 칸에서 실제로 구성요소가 될 수 있을 때만** 막는다. 구성요소는 전부
+// 짝이 있어야 성립하므로 판정이 정확하다(CommonMark: 강조는 여는·닫는 구분자 한 쌍, 코드는 백틱 한 쌍,
+// 링크는 '['보다 뒤의 ']', 원시 HTML·자동링크는 '<'보다 뒤의 '>', 엔터티는 '&이름;'). 밑줄만 규칙이 하나 더
+// 붙는다: 낱말 가운데의 '_'는 강조를 열지도 닫지도 못하므로(CommonMark의 intraword 예외) 그런 것은 세지
+// 않는다 — 그래서 식별자꼴 값은 지금까지와 글자 하나 다르지 않다.
+// 되돌리는 쪽(agent.js unescapeCell, frontend/src/chart.js splitRow)이 같은 목록을 본다 — 한쪽만 늘리면
+// 화면에 백슬래시가 남거나 잘린 값 가드가 길이를 못 맞춘다.
+const isAlnum = c => c !== undefined && /[\p{L}\p{N}]/u.test(c);
+// 자리에서 바로 본다(sticky) — 남은 문자열을 slice로 떼면 '& 수 × 셀 길이'라 이차가 된다
+// (llm-openai.js keepsControlMeaning에 같은 이유를 적어 두었다).
+const ENTITY_AT = /&(?:[a-zA-Z][a-zA-Z0-9]{1,31}|#\d{1,7}|#[xX][0-9a-fA-F]{1,6});/y;
+
+export function escapeCell(value) {
+  const s = String(value ?? '').replace(/[\r\n]/g, ' ');
+  // 세는 단위는 글자가 아니라 '구분자 런'이다 — CommonMark는 이어진 같은 글자를 구분자 하나로 본다.
+  // 글자로 세면 `METRIC__FIRST`(런 하나)나 `**`가 짝이 있는 것으로 잘못 잡혀, 막을 이유가 없는 값까지
+  // 이력에서 백슬래시가 붙은 채 모델에게 되돌아간다(실측: 등록 컬럼명에서 그렇게 걸렸다).
+  const runs = ch => {
+    let n = 0;
+    for (let i = 0; i < s.length; i++) if (s[i] === ch && s[i - 1] !== ch) n++;
+    return n;
+  };
+  const paired = new Set();
+  for (const ch of ['*', '`', '~']) if (runs(ch) >= 2) paired.add(ch);
+  if (s.indexOf('[') >= 0 && s.indexOf('[') < s.lastIndexOf(']')) { paired.add('['); paired.add(']'); }
+  if (s.indexOf('<') >= 0 && s.indexOf('<') < s.lastIndexOf('>')) paired.add('<');
+  // '_'만 규칙이 하나 더 붙는다: 런의 양옆이 모두 글자·숫자면 강조를 열지도 닫지도 못한다(intraword 예외).
+  // 그런 런은 짝으로 세지 않고 막지도 않는다 — BATCH_JOB_STATUS·order_id가 지금까지와 같은 글자로 남는 이유다.
+  const looseAt = i => {
+    if (s[i] !== '_' || s[i - 1] === '_') return -1;      // 런의 첫 글자에서만 잰다
+    let end = i;
+    while (s[end + 1] === '_') end++;
+    return isAlnum(s[i - 1]) && isAlnum(s[end + 1]) ? -1 : end;
+  };
+  const looseUnderscore = new Set();
+  let looseRuns = 0;
+  for (let i = 0; i < s.length; i++) {
+    const end = looseAt(i);
+    if (end < 0) continue;
+    looseRuns++;
+    for (let j = i; j <= end; j++) looseUnderscore.add(j);
+  }
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\\' || c === '|' || paired.has(c)) { out += `\\${c}`; continue; }
+    if (c === '_' && looseRuns >= 2 && looseUnderscore.has(i)) { out += '\\_'; continue; }
+    if (c === '&' && ((ENTITY_AT.lastIndex = i), ENTITY_AT.test(s))) { out += '\\&'; continue; }
+    out += c;
+  }
+  return out;
+}
 const cell = v => {
   if (v === null || v === undefined) return '';
   const s = typeof v === 'number' ? String(v) : marked(v, MAX_CHART_CELL_LEN);

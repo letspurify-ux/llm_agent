@@ -254,13 +254,19 @@ test('들여쓴 펜스(목록 안)는 같은 들여쓰기로 채운다 — 안�
 
 test('markdown 파서가 펜스로 읽는 변형을 다 받는다 — 언어 뒤 덧말·백틱 4개로 닫기·CRLF', () => {
   assert.match(resolveChartData('```chart 월별\ntype: bar\ndata: step 1\n````', [rows]), /^```chart\ntype: bar\n\| MONTH \|.*\n```$/s);
-  assert.strictEqual(resolveChartData('```chart\r\ntitle: t\r\ndata: step 2\r\n```\r\n뒤', [rows]), "_'t' 차트를 그리지 못했습니다: 실행 2의 결과가 없습니다_\n뒤");
+  // 안내 문장 뒤에 빈 줄이 선다 — 펜스와 달리 문단은 스스로 끝나지 않아, 없으면 뒤 문장이 그 문단에
+  // 이어 붙고(앞이 표였다면 그 표의 행이 된다) — replaceBlocks의 블록 경계 주석 참고.
+  assert.strictEqual(resolveChartData('```chart\r\ntitle: t\r\ndata: step 2\r\n```\r\n뒤', [rows]), "_'t' 차트를 그리지 못했습니다: 실행 2의 결과가 없습니다_\n\n뒤");
   // ```charts 는 차트 펜스가 아니다
   assert.strictEqual(resolveChartData('```charts\ndata: step 1\n```', [rows]), '```charts\ndata: step 1\n```');
 });
 
 // ===== ```table 블록 =====
 import { resolveTableData, MAX_TABLE_BLOCK_ROWS, DEFAULT_TABLE_ROWS, MAX_TABLE_COLS, MAX_TABLE_CELL_LEN, MAX_TABLE_INJECT_LEN } from '../src/chart.js';
+import { escapeCell } from '../src/chart.js';
+import { clipText } from '../src/constants.js';
+import { renderAnswer } from '../src/llm.js';
+import { clippedCopyDetector } from '../src/agent.js';
 
 const tblock = (body, indent = '') => `${indent}\`\`\`table\n${body}\n${indent}\`\`\``;
 
@@ -382,4 +388,84 @@ test('표·차트의 칸을 자르면 잘렸다는 표시를 붙이고, 상한 �
   const emoji = 'a'.repeat(MAX_TABLE_CELL_LEN - 1) + '😀😀';
   const eline = resolveTableData(tblock('step: 1'), [[{ E: emoji }]]).split('\n')[2].split('|')[1].trim();
   assert.equal(eline, 'a'.repeat(MAX_TABLE_CELL_LEN - 1) + TRUNC_MARK, '이모지 한가운데를 가르지 않는다');
+});
+
+// 채운 칸은 markdown 표의 '인라인 문맥'이라, 값에 든 강조·코드·링크·취소선·HTML·엔터티 표기가 그대로
+// 해석된다 — 파이프처럼 열을 밀지는 않지만 값을 조용히 바꾼다(실측: remark-gfm 실물 파싱에서 치수
+// '10*20*30'이 '102030'으로, '~미사용~'이 '미사용'으로, '__init__'이 'init'으로, '&amp;'가 '&'로,
+// '노트: `code`'가 '노트: code'로 나갔다). 사용자는 조회 결과를 원문으로 읽고 그 값을 다음 질문에
+// 옮겨 적으므로 이것이 이 저장소가 가장 나쁘게 보는 '조용한 오답'이다.
+// 화면에서 그렇게 읽히는지는 프런트가 실제 렌더러로 잰다(frontend/test/chart.test.js) — 여기서는
+// '무엇을 막고 무엇을 그대로 두는가'라는 규칙 자체를 못 박는다. 늘 막지 않는 이유가 규칙의 절반이다:
+// 이 글자는 이력으로 되돌아가 모델이 다시 읽는 자리이고 이 시스템의 값에는 밑줄이 흔하다.
+test('표·차트의 칸은 값이 markdown으로 해석될 수 있을 때만 막고, 식별자꼴 값은 그대로 둔다', () => {
+  const 막는다 = {
+    '10*20*30': '10\\*20\\*30',              // 강조 구분자 두 런
+    '~미사용~': '\\~미사용\\~',
+    '__init__': '\\_\\_init\\_\\_',
+    '노트: `code`': '노트: \\`code\\`',
+    '[확인](http://x)': '\\[확인\\](http://x)',
+    '&amp;': '\\&amp;',
+    '<b>굵게</b>': '\\<b>굵게\\</b>',
+  };
+  const 그대로 = ['BATCH_JOB_STATUS', 'order_id', '_start', 'end_', 'METRIC__FIRST', 'A__B__C',
+    '**', 'a**b', '2 * 3', 'A&B', 'x & y', '[확인필요', 'a<b', '2026-09-07 10:23:45', 'C:\\a_b\\c'];
+  for (const [value, want] of Object.entries(막는다)) {
+    assert.equal(escapeCell(value), want, value);
+  }
+  for (const value of 그대로) {
+    // 파이프·역슬래시 규칙은 종전 그대로다 — 그것만 적용된 결과와 같아야 한다.
+    const 종전 = value.replace(/[\r\n]/g, ' ').replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
+    assert.equal(escapeCell(value), 종전, value);
+  }
+  // 채우는 두 경로(```table·```chart)와 폴백 표가 모두 같은 규칙을 지난다 — 사본이 있으면 한쪽만 어긋난다.
+  const rows = [{ 값: '10*20*30', N: 1 }];
+  assert.ok(resolveTableData(tblock('step: 1'), [rows]).includes('| 10\\*20\\*30 | 1 |'));
+  assert.ok(resolveChartData(block('type: bar\ndata: step 1'), [rows]).includes('| 10\\*20\\*30 | 1 |'));
+  assert.ok(renderAnswer({ knowledge: [], history: [{ query_name: 'q', rows, totalRows: 1 }] })
+    .includes('| 10\\*20\\*30 | 1 |'));
+  // 되돌리는 쪽이 같은 목록을 봐야 잘린 값 가드가 칸에 보인 앞부분의 길이를 알아본다 (agent.js unescapeCell).
+  const long = '10*20*30_~`[<&'.repeat(20);
+  const shown = clipText(long, MAX_TABLE_CELL_LEN);
+  const answer = resolveTableData(tblock('step: 1'), [[{ 값: long }]]);
+  assert.ok(clippedCopyDetector([{ role: 'assistant', text: answer }]).isCopy(shown),
+    '이스케이프가 늘어도 가드는 화면에 보인 앞부분을 알아본다');
+});
+
+// 펜스는 닫는 줄이 곧 경계지만 그 자리에 넣는 표·안내 문장은 스스로 끝나지 않는다 — 채우기 '전'에는
+// 멀쩡하던 답변이 채운 뒤에만 무너지는, 이 치환이 스스로 만드는 실패다(실측 — remark-gfm 실물 파싱은
+// frontend/test/chart.test.js가 잰다). 여기서는 앞뒤 빈 줄 규칙 자체를 못 박는다.
+test('바꿔 넣은 표·안내는 앞뒤 빈 줄로 다른 블록과 갈라 놓는다 — 이미 있으면 더 넣지 않는다', () => {
+  const steps = [[{ JOB: 'B1', STATUS: 'FAILED' }], [{ CODE: 'X9' }]];
+  const T1 = tblock('step: 1'), T2 = tblock('step: 2');
+  const 표1 = '| JOB | STATUS |\n| --- | --- |\n| B1 | FAILED |';
+  const 표2 = '| CODE |\n| --- |\n| X9 |';
+  assert.equal(resolveTableData(`${T1}\n${T2}`, steps), `${표1}\n\n${표2}`, '표 블록 둘이 붙어 있으면 사이에 빈 줄');
+  assert.equal(resolveTableData(`${T1}\n\n${T2}`, steps), `${표1}\n\n${표2}`, '이미 빈 줄이면 그대로');
+  assert.equal(resolveTableData(`조회했습니다.\n${T1}\n다음 단계는 재시작입니다.`, steps),
+    `조회했습니다.\n\n${표1}\n\n다음 단계는 재시작입니다.`, '앞 문장·뒤 문장 모두와 갈라진다');
+  assert.equal(resolveTableData(`| a |\n| --- |\n| 1 |\n${T1}`, steps),
+    `| a |\n| --- |\n| 1 |\n\n${표1}`, '모델이 손으로 쓴 표에 흡수되지 않는다');
+  assert.equal(resolveTableData(T1, steps), 표1, '앞뒤에 아무것도 없으면 빈 줄을 붙이지 않는다');
+  // 참조 없는 table 펜스는 벗겨 본문을 그대로 내보내되(그 자체가 바뀐 블록이라) 경계는 세운다
+  assert.equal(resolveTableData('```table\n손으로 쓴 표\n```\n뒤 문장', steps), '손으로 쓴 표\n\n뒤 문장');
+  // 바꾸지 않는 블록(참조 없는 chart 펜스)은 원문을 건드리지 않는다 — 빈 줄도 넣지 않는다
+  const 그대로 = '```chart\ntype: bar\n| a |\n| --- |\n| 1 |\n```\n뒤 문장';
+  assert.equal(resolveChartData(그대로, steps), 그대로);
+  // 안내 문장도 같은 규칙이다 — 앞이 표면 그 표의 행이 되어 버린다
+  assert.equal(resolveTableData(`| a |\n| --- |\n| 1 |\n${tblock('step: 9')}`, steps),
+    '| a |\n| --- |\n| 1 |\n\n_표를 채우지 못했습니다: 실행 9의 결과가 없습니다_');
+});
+
+// 블록 경계를 세우는 판정은 '지금까지 만든 글'을 다시 훑으면 안 된다 — 이어 붙인 문자열을 인덱스로 읽으면
+// V8이 그때마다 평탄화해 블록 수 × 답변 길이가 된다(실측: 빈 표 블록 4,000개에서 75ms, 길이를 두 배로 하면
+// 아홉 배가 됐다). 답변 상한(MAX_ANSWER_LEN) 안에 이런 블록 수천 개가 들어가고, 그 시간은 동기 작업이라
+// 그동안 처리 중인 모든 요청이 함께 멈춘다 — 이 저장소가 이차 비용을 막아온 자리와 같은 종류다.
+test('바꿔 넣기의 비용은 블록 수에 비례한다 — 앞 글을 되훑지 않는다', () => {
+  const 답 = n => '```table\nstep: 9\n```\n'.repeat(n);
+  const ms = n => { const t0 = performance.now(); resolveTableData(답(n), [[{ A: 1 }]]); return performance.now() - t0; };
+  ms(1000);
+  const 하나 = Math.max(0.5, ms(1000));
+  const 넷 = ms(4000);
+  assert.ok(넷 < 하나 * 8, `블록이 4배인데 비용이 ${(넷 / 하나).toFixed(1)}배다 (${하나.toFixed(1)}ms → ${넷.toFixed(1)}ms)`);
 });

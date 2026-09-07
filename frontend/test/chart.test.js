@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import {
   parseChartBlock, chartBlocksToTables, chartTableMarkdown, toNumber, toTime, pieSlices, clip, sliceSafe,
-  chartNotes, fmtNum, pieLabelsOverflow, fitText, chartFences, CHART_FENCE_RE, MAX_CHART_ROWS, MAX_SERIES, MAX_LABEL_LEN, MAX_NAME_LEN, MAX_PIE_SLICES,
+  chartNotes, fmtNum, pieLabelsOverflow, fitText, chartFences, normalizeTable, parseTable, CHART_FENCE_RE, MAX_CHART_ROWS, MAX_SERIES, MAX_LABEL_LEN, MAX_NAME_LEN, MAX_PIE_SLICES,
 } from '../src/chart.js';
 
 const TABLE = '| 월 | 건수 | 금액 |\n|---|---|---|\n| 2024-01 | 120 | 1,000 |\n| 2024-02 | 80 | 2,500 |';
@@ -586,6 +586,72 @@ test('차트의 숫자 표기: 소수 두 자리로 담기지 않는 작은 값�
   for (const v of [null, undefined, NaN, Infinity, -Infinity, '3', {}]) assert.strictEqual(fmtNum(v), '');
 });
 
+test('차트의 숫자 표기: 아주 큰 값도 눈금 하나가 그래프를 밀어낼 만큼 길어지지 않는다', () => {
+  // 값 축은 width="auto"라(Chart.jsx) 눈금 글자가 넓은 만큼 그림에서 폭을 가져간다. 자릿수 표기는
+  // 값이 커질수록 끝없이 자라므로(1e308 한 칸이 쉼표까지 410자다) 큰 값 하나가 그래프를 없앤다 —
+  // 실측(창 1000px, 그림 상자 574px): 1e75에서 막대도 눈금선도 0개, 눈금 글자만 상자 밖으로 나갔다.
+  // 아무 오류도 나지 않아 사용자에게는 그냥 차트가 없는 답변이다. 작은 값 쪽(1e-6)과 같은 처방이다.
+  assert.strictEqual(fmtNum(1e21), '1.00e+21');
+  assert.strictEqual(fmtNum(-1e308), '-1.00e+308');
+  assert.strictEqual(Number(fmtNum(1.5e30)), 1.5e30);
+  // 경계 바로 아래는 지금까지의 표기 그대로다 — 조·경 단위의 실제 조회 값이 여기 있다
+  assert.strictEqual(fmtNum(1e12), '1,000,000,000,000');
+  assert.strictEqual(fmtNum(Number.MAX_SAFE_INTEGER), '9,007,199,254,740,991');
+  assert.ok(fmtNum(1e20).includes(','), `1e20은 자릿수 표기여야 한다: ${fmtNum(1e20)}`);
+  // 어떤 크기에서도 눈금 하나의 길이가 묶여 있어야 한다 (1e21 아래는 정수부 21자리 + 쉼표 + 소수 두 자리)
+  for (let e = -320; e <= 308; e++) {
+    for (const v of [10 ** e, -(10 ** e), 1.23456 * 10 ** e]) {
+      if (!Number.isFinite(v)) continue;
+      assert.ok(fmtNum(v).length <= 31, `${v}의 표기가 길다(${fmtNum(v).length}자): ${fmtNum(v)}`);
+    }
+  }
+});
+
+// 아래 넷은 이 파일이 말로만 적어 두고 아무 시험도 지키지 않던 계약이다(돌연변이 검사로 찾았다 —
+// 그 자리를 뒤집어도 검사가 전부 통과했다). 계약이 깨져도 오류는 나지 않는다: 그릴 수 있는 열이
+// 사라지거나, 표 아래 설명이 제목이 되거나, 그릴 것이 없는 명세가 그리는 쪽으로 넘어갈 뿐이다.
+test('숫자 열의 판정: 결측이 섞여도 숫자 열이고, 값이 하나도 없으면 아니다', () => {
+  // 조회 결과에 NULL이 섞이는 것은 예사다(LEFT JOIN·GROUP BY). 그 열을 숫자 열에서 빼면 그릴 것이
+  // 사라지고, 차트는 조용히 표로 주저앉는다.
+  const s = spec('type: bar\n| 월 | 건수 |\n|---|---|\n| 1월 | 10 |\n| 2월 |  |\n| 3월 | - |\n| 4월 | N/A |\n| 5월 | 30 |');
+  assert.deepEqual(s.series.map(x => x.name), ['건수']);
+  assert.deepEqual(s.rows.map(r => r.values[0]), [10, null, null, null, 30]);
+  // 값이 하나도 없는 열은 숫자 열이 아니다 — 전부 결측인 열을 0의 줄로 그리면 없는 값을 그린 것이 된다
+  assert.equal(parseChartBlock('type: bar\n| 월 | 건수 |\n|---|---|\n| 1월 |  |\n| 2월 | - |').ok, false);
+});
+
+test('설정 줄은 표가 시작되기 전까지만 읽는다 — 표 아래 설명은 설정이 아니다', () => {
+  // 모델은 표 아래에 설명을 붙인다. 그 줄이 설정으로 읽히면 제목이 설명 문장으로 바뀌고,
+  // `x:`·`y:` 한 줄이면 그리는 열까지 달라진다.
+  const s = spec('type: bar\ntitle: 진짜 제목\n| 이름 | 값 |\n|---|---|\n| 가 | 1 |\n| 나 | 2 |\ntitle: 표 아래 설명\ny: 이름');
+  assert.equal(s.title, '진짜 제목');
+  assert.deepEqual(s.series.map(x => x.name), ['값']);
+});
+
+test('그릴 행이 하나도 남지 않으면 차트를 포기한다 — 빈 명세를 그리는 쪽으로 넘기지 않는다', () => {
+  // 원그래프는 값이 0 이하인 조각을 그릴 수 없다(Recharts가 음수를 0으로 뭉갠다). 전부 그렇다면 그릴 것이 없다.
+  const r = parseChartBlock('type: pie\n| 이름 | 값 |\n|---|---|\n| 가 | 0 |\n| 나 | -5 |');
+  assert.equal(r.ok, false);
+  assert.equal(r.spec, undefined, 'ok가 아닌 답에 명세가 딸려 오면 그리는 쪽이 그것을 믿는다');
+  // 시간 축으로 명시했는데 한 줄도 시각이 아니면 마찬가지다
+  assert.equal(parseChartBlock('type: line\nxtype: time\n| 구간 | 값 |\n|---|---|\n| 합계 | 1 |\n| 소계 | 2 |').ok, false);
+});
+
+test('x로 적은 이름이 표에 없으면 첫 열이 x다 — 값 열을 x로 삼지 않는다', () => {
+  const s = spec('type: bar\nx: 없는열\n| 이름 | 값 |\n|---|---|\n| 가 | 1 |\n| 나 | 2 |');
+  assert.equal(s.xName, '이름');
+  assert.deepEqual(s.rows.map(r => r.label), ['가', '나']);
+  assert.deepEqual(s.series.map(x => x.name), ['값']);
+  // 첫 열을 y·y2로 지목하면 그 열을 그린다(0번 열이라고 버리지 않는다 — 이름을 못 찾은 것과 다르다)
+  const t = spec('type: bar\nx: 이름\ny: 값\n| 값 | 이름 |\n|---|---|\n| 1 | 가 |\n| 2 | 나 |');
+  assert.equal(t.xName, '이름');
+  assert.deepEqual(t.series.map(x => x.name), ['값']);
+  assert.deepEqual(t.rows.map(r => r.values[0]), [1, 2]);
+  // y2가 첫 열이면 오른쪽 축에 선다. 버려지면 그 열은 왼쪽 축의 채움으로 넘어가거나 통째로 사라진다.
+  const u = spec('type: bar\nx: 이름\ny: 건수\ny2: 값\n| 값 | 이름 | 건수 |\n|---|---|---|\n| 1 | 가 | 10 |\n| 2 | 나 | 20 |');
+  assert.deepEqual(u.series, [{ name: '건수', axis: 'left' }, { name: '값', axis: 'right' }]);
+});
+
 // 줄 단위 탐색(chartFences)은 CHART_FENCE_RE와 같은 블록을 찾아야 한다 — 정규식은 서버(backend chart.js)와 나누는 '모양'이고
 // 탐색은 그것을 길이에 비례하게 다시 쓴 것이라, 둘이 갈리면 화면·이력·서버가 서로 다른 블록을 본다. 무작위 문서로
 // 대조한다: 펜스 글자·길이·들여쓰기(탭·4칸 포함)·덧말·CRLF·닫히지 않은 펜스·다른 언어의 펜스·목록·인용문을 섞는다.
@@ -632,4 +698,132 @@ test('chartBlocksToTables는 닫히지 않은 펜스가 아무리 많아도 비�
   assert.strictEqual(chartBlocksToTables(degenerate(3)), degenerate(3));
   // dead 표시는 '이 길이 이상의 닫는 펜스가 끝까지 없다'일 뿐이다 — 더 짧은 여는 줄은 여전히 제 닫는 줄을 찾는다
   assert.strictEqual(chartBlocksToTables('````chart\n글\n```chart\n| a | b |\n| x | 1 |\n```'), '````chart\n글\n| a | b |\n| --- | --- |\n| x | 1 |');
+});
+
+// ===== 서버가 채운 표의 칸이 화면에서 원문 그대로 읽히는가 =====
+// 채운 칸은 markdown 표의 인라인 문맥이라 값에 든 강조·코드·링크·취소선·HTML·엔터티 표기가 그대로
+// 해석된다 — 파이프처럼 열을 밀지는 않지만 값을 조용히 바꾼다(실측: 치수 '10*20*30'이 '102030'으로,
+// '~미사용~'이 '미사용'으로, '__init__'이 'init'으로, '&amp;'가 '&'로 나갔다).
+// 서버가 짝이 있을 때만 막아 보내고(backend/src/chart.js escapeCell) 여기 splitRow가 같은 목록을
+// 되돌린다 — 두 규칙이 갈라지면 화면에 백슬래시가 남거나 값이 바뀐다. 그래서 실제 렌더러까지 통과시켜
+// 잰다(math.test.js와 같은 이유): 판정과 remark-gfm이 그 판정을 어떻게 읽는지가 함께 있어야 계약이다.
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { resolveTableData, resolveChartData } from '../../backend/src/chart.js';
+
+const 표의_칸 = md => [...renderToStaticMarkup(React.createElement(ReactMarkdown, { remarkPlugins: [remarkGfm] }, md))
+  .matchAll(/<(td|th)\b[^>]*>(.*?)<\/\1>/g)]
+  .map(m => m[2].replace(/<[^>]*>/g, '')
+    .replace(/&#x27;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'));
+
+const 값들 = ['10*20*30', '~미사용~', '__init__', '노트: `code`', '[확인](http://x)', '&amp;',
+  '<b>굵게</b>', 'BATCH_JOB_STATUS', 'C:\\logs\\a|b', '재고 부족 — *긴급*', '2026-09-07 10:23:45'];
+
+test('서버가 채운 표의 칸은 화면에서 조회 결과 원문 그대로 읽힌다', () => {
+  const rows = 값들.map(v => ({ 값: v, N: 1 }));
+  const md = resolveTableData('```table\nstep: 1\nlimit: 100\n```', [rows]);
+  const cells = 표의_칸(md);
+  // 머리글 두 칸을 지나 값 칸만 (열이 둘이므로 두 칸씩)
+  const shown = cells.slice(2).filter((_, i) => i % 2 === 0);
+  assert.deepEqual(shown, 값들);
+});
+
+test('차트 블록의 칸은 라벨(splitRow)과 표로 보기(GFM) 양쪽에서 같은 글자다', () => {
+  const rows = 값들.map((v, i) => ({ 값: v, N: i + 1 }));
+  const filled = resolveChartData('```chart\ntype: bar\nx: 값\ny: N\ndata: step 1\n```', [rows]);
+  const body = filled.split('\n').slice(1, -1).join('\n');
+  const parsed = parseChartBlock(body);
+  assert.ok(parsed.ok, parsed.reason);
+  // 라벨은 표시 상한(MAX_LABEL_LEN)에서 잘릴 수 있으므로 full을 본다
+  assert.deepEqual(parsed.spec.rows.map(r => r.full), 값들);
+  // 같은 표를 '표로 보기'로 렌더해도 같은 글자여야 한다
+  const shown = 표의_칸(chartTableMarkdown(body)).slice(2).filter((_, i) => i % 2 === 0);
+  assert.deepEqual(shown, 값들);
+});
+
+test('채운 표는 앞뒤 블록에 흡수되지 않는다 — 펜스와 달리 GFM 표는 스스로 끝나지 않는다', () => {
+  const steps = [[{ JOB: 'BATCH001', STATUS: 'FAILED' }], [{ CODE: 'X9' }]];
+  const T1 = '```table\nstep: 1\n```', T2 = '```table\nstep: 2\n```';
+  const 표 = md => [...renderToStaticMarkup(React.createElement(ReactMarkdown, { remarkPlugins: [remarkGfm] }, md))
+    .matchAll(/<table>([\s\S]*?)<\/table>/g)]
+    .map(t => [...t[1].matchAll(/<(td|th)\b[^>]*>(.*?)<\/\1>/g)].map(c => c[2]));
+
+  // ① 표 블록 둘이 빈 줄 없이 이어져도 표 둘이다 (뒤 표의 머리글·구분 줄이 앞 표의 행이 되지 않는다)
+  assert.deepEqual(표(resolveTableData(`${T1}\n${T2}`, steps)),
+    [['JOB', 'STATUS', 'BATCH001', 'FAILED'], ['CODE', 'X9']]);
+  // ② 모델이 손으로 쓴 표 바로 뒤에 와도 흡수되지 않는다 — 흡수되면 열 수가 적은 앞 표에 맞춰 STATUS가 사라진다
+  assert.deepEqual(표(resolveTableData(`| a |\n| --- |\n| 1 |\n${T1}`, steps)),
+    [['a', '1'], ['JOB', 'STATUS', 'BATCH001', 'FAILED']]);
+  // ③ 표 바로 뒤의 설명 문장이 표의 행이 되지 않는다
+  assert.deepEqual(표(resolveTableData(`${T1}\n다음 단계는 재시작입니다.`, steps)),
+    [['JOB', 'STATUS', 'BATCH001', 'FAILED']]);
+});
+
+// 표를 읽는 규칙(parseTable)과 그것을 다시 내보내는 규칙(normalizeTable)이 갈리면, 차트는 그려지는데
+// '표로 보기'만 파이프 글자 묶음이 된다 — 차트를 못 그린 블록에서는 그 글자가 값을 보는 유일한 자리다.
+// 그래서 판정이 아니라 실제 렌더러로 잰다: 우리가 표로 읽은 블록은 remark-gfm도 표로 읽어야 하고,
+// 행 수와 칸의 글자가 우리가 읽은 것과 같아야 한다.
+const 표들 = md => [...renderToStaticMarkup(React.createElement(ReactMarkdown, { remarkPlugins: [remarkGfm] }, md))
+  .matchAll(/<table>([\s\S]*?)<\/table>/g)]
+  .map(t => [...t[1].matchAll(/<tr>([\s\S]*?)<\/tr>/g)]
+    .map(r => [...r[1].matchAll(/<(td|th)\b[^>]*>(.*?)<\/\1>/g)].map(c => c[2].replace(/<[^>]*>/g, ''))));
+
+test("표로 읽은 블록은 '표로 보기'·이력에서도 GFM 표다 (구분 줄·줄머리 파이프)", () => {
+  const 블록들 = {
+    // 파이프 없이 시작하는 한 칸 대시 구분 줄: markdown이 목록 항목으로 먼저 읽어 표가 통째로 깨졌다
+    // (실측: '표로 보기'에 글머리표 하나와 파이프 글자가 남았고, 차트를 못 그린 블록에서는 그것이 전부였다).
+    '한 칸 대시': '이름 | 값\n- | -\n가 | 1\n나 | 2',
+    // 구분 줄의 공백이 스페이스·탭이 아니면 micromark는 구분 줄로 읽지 않는다 — `\s`로 보던 우리만 읽었다.
+    'NBSP 구분 줄': '| 이름 | 값 |\n| --- | --- |\n| 가 | 1 |\n| 나 | 2 |',
+    '전각공백 구분 줄': '| 이름 | 값 |\n|　---　|　---　|\n| 가 | 1 |\n| 나 | 2 |',
+    // 머리글의 첫 칸이 markdown의 블록 표시로 시작하면 그 줄이 제목·목록이 된다 (조회 결과의 '#' 열 등)
+    '# 머리글': '# | 이름 | 값\n--- | --- | ---\n1 | 가 | 10\n2 | 나 | 20',
+    '* 값 행': '| 이름 | 값 |\n| --- | --- |\n* | 1 |\n나 | 2',
+    // 지금까지도 되던 모양들 — 함께 지킨다
+    '구분 줄 없음': '| 이름 | 값 |\n| 가 | 1 |\n| 나 | 2 |',
+    '칸 수 다름': '| 이름 | 값 |\n| --- |\n| 가 | 1 |\n| 나 | 2 |',
+    '정렬 표시': '| 이름 | 값 |\n|:---|---:|\n| 가 | 1 |\n| 나 | 2 |',
+  };
+  for (const [why, body] of Object.entries(블록들)) {
+    const parsed = parseChartBlock(`type: bar\n${body}`);
+    assert.ok(parsed.ok, `${why}: 차트로 읽지 못했다 (${parsed.reason})`);
+    const 읽은행 = parsed.spec.rows.length;
+    for (const [어디, md] of [['표로 보기', chartTableMarkdown(body)], ['이력', chartBlocksToTables(`\`\`\`chart\ntype: bar\n${body}\n\`\`\``)]]) {
+      const 표 = 표들(md);
+      assert.strictEqual(표.length, 1, `${why} · ${어디}: 표가 아니다 — ${JSON.stringify(md)}`);
+      assert.strictEqual(표[0].length, 읽은행 + 1, `${why} · ${어디}: 행 수가 다르다 — ${JSON.stringify(md)}`);
+    }
+  }
+});
+
+test('우리가 넣는 줄머리 파이프는 칸을 하나도 늘리지 않는다 (무작위 줄 대조)', () => {
+  // 표를 세우려던 파이프가 칸을 늘리면 머리글과 구분 줄의 칸 수가 어긋나 그 표가 도로 깨진다.
+  // 특히 전각공백·NBSP로 들여쓴 줄이 그렇다 — splitRow는 그 공백을 앞의 빈 칸으로 세지 않으므로
+  // '파이프가 없다'고 보고 하나 더 붙이면 거기서 칸이 하나 늘어난다.
+  let seed = 20260907;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const pick = a => a[Math.floor(rnd() * a.length)];
+  const SP = [' ', '', '\t', '\u00a0', '\u3000', '  '];
+  const CELL = ['이름', '값', '가', '1', '', '#', '-', '*', 'a b'];
+  for (let i = 0; i < 3000; i++) {
+    const cols = 2 + Math.floor(rnd() * 3);
+    const cells = Array.from({ length: cols }, () => `${pick(SP)}${pick(CELL)}${pick(SP)}`);
+    const line = pick(SP) + (rnd() < 0.5 ? '|' : '') + cells.join('|') + (rnd() < 0.5 ? '|' : '');
+    const 원래 = parseTable([line, '| x | y |']);
+    const 내보낸 = normalizeTable([line, '| x | y |']);
+    if (!원래) continue;
+    assert.deepStrictEqual(parseTable([내보낸.header, 내보낸.sep]).header, 원래.header,
+      `줄머리 파이프가 칸을 바꿨다: ${JSON.stringify(line)} → ${JSON.stringify(내보낸.header)}`);
+  }
+});
+
+test("정렬 표시가 든 구분 줄은 그대로 두고, GFM이 읽지 못하는 것만 새로 만든다", () => {
+  // 새로 만들면 정렬이 사라지므로, GFM이 그대로 읽어 주는 구분 줄은 손대지 않는다.
+  assert.strictEqual(chartTableMarkdown('| a | b |\n|:--|--:|\n| 1 | 2 |'), '| a | b |\n|:--|--:|\n| 1 | 2 |');
+  assert.strictEqual(chartTableMarkdown('| a | b |\n| - | - |\n| 1 | 2 |'), '| a | b |\n| - | - |\n| 1 | 2 |');
+  // 목록 안의 표는 들여쓰기를 지킨다 — 우리가 넣는 파이프는 들여쓰기 뒤에 온다
+  assert.strictEqual(chartBlocksToTables('1. 항목\n   ```chart\n   a | b\n   - | -\n   1 | 2\n   ```'),
+    '1. 항목\n   |a | b\n   | --- | --- |\n   |1 | 2');
 });

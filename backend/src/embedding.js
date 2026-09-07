@@ -13,6 +13,23 @@ export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'bge-m3';
 // 재구성하면, 여기 설정 경로가 바뀔 때 호출부만 조용히 어긋난다.
 export const isEmbeddingEnabled = () => Boolean(process.env.EMBEDDING_URL);
 
+// 질의에만 붙이는 지시문 접두 (EMBEDDING_QUERY_PREFIX). 문서에는 붙이지 않는다 — 그 **비대칭이 곧 모델의
+// 학습 형식**이라, 지시문 학습 모델(Qwen3-Embedding·Harrier 계열: `Instruct: <한 문장>\nQuery: `)에서는
+// 질의에만 붙여야 하고 붙이지 않은 모델(bge-m3)에는 아예 없어야 한다. 기본값은 빈 문자열이라 설정하지
+// 않으면 지금까지와 글자 하나 다르지 않다.
+//
+// 값을 호출 시점에 읽는다 — 모듈 로드 때 굳히면 검사가 실행 중에 바꾸는 경로가 깨진다
+// (isEmbeddingEnabled·llmProvider와 같은 이유).
+//
+// `\n`·`\t`·`\\`는 여기서 직접 되살린다. dotenv는 **큰따옴표로 감쌌을 때만** 그 이스케이프를 푼다
+// (실측 16.6.1: `X=a\nb`는 백슬래시가 그대로 남고 값 끝의 공백도 잘린다, `X="a\nb"`만 줄바꿈이 된다).
+// 그 차이는 오류를 내지 않는다 — 모델은 백슬래시 두 글자가 낀 다른 프롬프트를 받고, 검색 품질만 조용히
+// 떨어진다. 따옴표를 잊었는지 여부가 검색 결과를 가르는 자리를 남기지 않는다.
+// (끝의 공백은 dotenv가 이미 잘라낸 뒤라 되살릴 수 없다 — .env.example이 큰따옴표를 쓰라고 적어 둔다.)
+const ESCAPES = { n: '\n', t: '\t', '\\': '\\' };
+export const embedQueryPrefix = () =>
+  String(process.env.EMBEDDING_QUERY_PREFIX ?? '').replace(/\\([nt\\])/g, (m, c) => ESCAPES[c] ?? m);
+
 const TIMEOUT_MS = 60_000; // 모델 콜드 로드가 30초+ 걸릴 수 있어 넉넉히. 초과하면 그 검색은 '검색 불가'가 된다
 
 // 임베딩 실패는 성격이 둘로 갈리고, 호출부가 해야 할 일이 정반대다 —

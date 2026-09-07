@@ -110,6 +110,26 @@ test('이상한 요청도 반드시 답을 받는다 — JSON으로, 매달리�
   assert.ok(살아있나(), '이상한 요청에 서버가 내려갔다');
 });
 
+// 상태 코드는 원인 분류다 — 서버는 '클라이언트가 고칠 수 있는 요청'(400·413)과 '없는 경로'(404)와
+// '서버 버그'(500)를 코드로 갈라 보내기로 했고(server.js의 오류 핸들러 주석: 전부 400으로 뭉개면
+// 원인 분류가 뒤집힌다), 감시자·프록시·접속 로그는 그 코드만 본다. 위 검사는 '4xx/5xx 중 하나'만 재므로
+// 그 약속이 통째로 무너져도 통과한다(변이 검사로 확인: 400·404·500을 서로 바꿔도 아무 테스트도 잡지 않았다).
+test('거부의 상태 코드가 원인을 가른다 — 잘못된 요청 400, 없는 경로 404, 너무 큰 본문 413', async () => {
+  const 기대 = [
+    [400, '/api/chat', J({})],
+    [400, '/api/chat', J({ message: '   ' })],
+    [400, '/api/chat', J({ message: 'a'.repeat(5000) })],
+    [400, '/api/chat', RAW('{not json')],
+    [413, '/api/chat', J({ message: 'a'.repeat(2_000_000) })],
+    [404, '/api/nope', J({ message: 'hi' })],
+  ];
+  for (const [status, path, init] of 기대) {
+    const r = await 답(path, init);
+    assert.strictEqual(r.status, status, `${path} ${JSON.stringify(init.body).slice(0, 40)}`);
+  }
+  assert.strictEqual((await fetch(`${base()}/api/health`)).status, 200);
+});
+
 test('프로토타입 오염 시도가 뒤따르는 요청의 판정을 바꾸지 못한다', async () => {
   // 위 목록의 오염 시도는 그 자체로 400이라 '거부됐다'만으로는 오염 여부를 알 수 없다.
   // Object.prototype.message가 심어졌다면 message 없는 요청의 req.body?.message가 그 값을 읽어

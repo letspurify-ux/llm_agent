@@ -226,7 +226,14 @@
          그래프 상자 밖이라 몇 줄로 감기든 그래프가 설 자리를 뺏지 않는다. */
       .md .chart-legend { display: flex; flex-wrap: wrap; gap: 3px 12px; margin: 3px 0 0; padding: 0 4px; list-style: none; font-size: 12px; }
       .md .chart-legend li { display: flex; align-items: center; gap: 5px; min-width: 0; overflow-wrap: anywhere; }
-      .md .chart-legend i { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+      /* 색칩은 이름과 그림을 잇는 유일한 끈이다 — 그림 속에는 이름이 없다(원그래프의 조각에는 비율만
+         적히고, 막대·선의 계열도 색으로만 구별된다). 그래서 강제 색상(Windows 고대비)에서도 이 색만은
+         지킨다: 브라우저는 강제 색상에서 HTML의 background-color를 시스템 색으로 갈아 끼우는데 SVG의
+         fill·stroke는 그대로 두므로, 두면 조각·선은 여덟 가지 색인데 색칩만 여덟 개가 모두 바탕과 같은
+         흰색이 되어 사라진다(실측: 강제 색상에서 색칩 8개가 전부 rgb(255,255,255), 말풍선 바탕과 같은
+         색이었다 — 이름 목록만 남아 어느 이름이 어느 조각인지 알 길이 없다). CSS 표준이 이 예외를
+         두고 든 보기가 정확히 차트의 범례다. 글자는 손대지 않는다 — 그쪽은 고대비가 지켜야 한다. */
+      .md .chart-legend i { width: 9px; height: 9px; border-radius: 2px; flex: none; forced-color-adjust: none; }
       /* 차트 아래 '표로 보기'. 접힌 줄은 눈에 띄지 않게, 펼치면 표는 원래 규칙(.md table)대로 */
       .md .chart-table { margin: 0 0 8px; font-size: 12.5px; }
       .md .chart-table summary { cursor: pointer; color: var(--muted); user-select: none; }

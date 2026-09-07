@@ -1,8 +1,8 @@
 // 검색 경계: 소스별 벡터 검색 + query_name 정확 일치.
 // 빈 배열은 성공·0건, null은 검색 실패다. 정확한 쿼리명은 임베딩 없이도 찾는다.
 import { query, loadChunkRanges, loadQueriesByNames } from './db.js';
-import { embed, isEmbeddingEnabled, warnEmbeddingFailure } from './embedding.js';
-import { warnOnce, SEARCH_LIMIT, MAX_DOC_LEN } from './constants.js';
+import { embed, isEmbeddingEnabled, warnEmbeddingFailure, embedQueryPrefix } from './embedding.js';
+import { warnOnce, SEARCH_LIMIT, MAX_DOC_LEN, MAX_EMBED_TEXT_LEN, clipText } from './constants.js';
 import { planRanges, buildItems, sameChunk } from './chunk.js';
 
 const LIMIT = SEARCH_LIMIT; // 검색 한 번이 돌려주는 최대 후보 수 — 기본 20, 환경변수로 낮춘다 (constants.js SEARCH_LIMIT)
@@ -154,7 +154,12 @@ function embedText(text) {
   while (embedCache.size >= EMBED_CACHE_MAX) {
     embedCache.delete(embedCache.keys().next().value);
   }
-  const p = embed([text])
+  // 지시문 접두는 질의에만 붙는다 (embedding.js embedQueryPrefix) — 문서 쪽(embed-sync.js toText)에는
+  // 붙이지 않는다. 캐시 키는 접두를 뺀 원문 그대로다: 접두는 프로세스 수명 동안 같은 값이라 키에 넣어도
+  // 적중이 달라지지 않는데, 넣으면 같은 검색어가 설정 하나로 다른 항목이 되어 캐시가 뜻을 잃는다.
+  // 상한은 문서와 같은 자를 쓴다 — 접두를 더한 뒤에 재야 요청이 유계다(질의는 이미 MAX_SEARCH_TEXT_LEN
+  // 안이라 지금 설정에서는 아무 일도 하지 않는다).
+  const p = embed([clipText(embedQueryPrefix() + text, MAX_EMBED_TEXT_LEN)])
     .then(v => v[0])
     .catch(e => {
       warnEmbeddingFailure(e);

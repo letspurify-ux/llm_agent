@@ -102,6 +102,16 @@ test('실제 DB에서 스키마·시드·동기화가 멱등하고 원문 수정
   const second = await syncEmbeddings();
   assert.equal(second.embedded, 0);
   assert.deepEqual(embeddedTexts, []);
+  // chunk_no는 1부터 이어지는 번호다 — 0부터 매기면 buildItems의 'closed(no) → no < 1'과 확대 창
+  // (agent.js growItem의 Math.max(1, …))이 첫 조각을 문서 밖으로 보고 그 조각을 영영 읽지 못한다.
+  // 그런데 그 실패는 '(확대 가능)'이 사라지지 않는 것으로만 보인다 — 오류가 남지 않아 테스트가 유일한 방어선이다.
+  const 번호 = (await conn.query('SELECT doc_seq, chunk_no, chunk_of FROM knowledge_chunk ORDER BY doc_seq, chunk_no'));
+  const 문서별 = new Map();   // Map.groupBy는 Node 21+다 — 이 저장소의 하한은 20이다 (package.json engines)
+  for (const r of 번호) 문서별.set(r.doc_seq, [...(문서별.get(r.doc_seq) ?? []), r]);
+  for (const [doc, rows] of 문서별) {
+    assert.deepEqual(rows.map(r => r.chunk_no), rows.map((_, i) => i + 1), `문서 ${doc}의 chunk_no는 1부터 이어진다`);
+    assert.ok(rows.every(r => r.chunk_of === rows.length), `문서 ${doc}의 chunk_of는 그 문서의 조각 수다`);
+  }
   await conn.query("UPDATE knowledge SET content = '갱신된 원문' WHERE seq = 1");
   await syncEmbeddings();
   assert.equal((await conn.query('SELECT content FROM knowledge_chunk WHERE doc_seq = 1'))[0].content, '갱신된 원문');
@@ -169,10 +179,13 @@ test('실제 동기화로 문서 뒤쪽만 바뀌어도 이전 판본의 검색 
   assert.match(result.trace.find(h => h.expand)?.note ?? '', /변경/);
 });
 
-test('동기화 CLI는 부분 저장 실패·청크 실패·DB 오류를 실패 코드로 알리고 풀을 닫는다', async t => {
-  for (const mode of ['vector', 'chunk', 'db']) {
+// 성공 회차도 함께 잰다 — 실패만 단언하면 '언제나 1을 돌려주는' 회귀가 그대로 통과한다(변이 검사로 확인).
+// 프로비저닝 스크립트가 이 코드로 성공을 판정하므로, 늘 1이면 정상 배포가 매번 실패로 기록된다.
+test('동기화 CLI는 부분 저장 실패·청크 실패·DB 오류를 실패 코드로 알리고 풀을 닫는다 (성공은 0)', async t => {
+  for (const mode of ['ok', 'vector', 'chunk', 'db']) {
     await t.test(mode, async () => {
       await conn.query(await sqlFile('schema.sql'));
+      if (mode === 'ok') await conn.query("INSERT INTO qa_method (title, method) VALUES ('title', 'content')");
       if (mode === 'vector') await conn.query("INSERT INTO qa_method (title, method) VALUES ('title', 'content')");
       if (mode === 'chunk') {
         await conn.query("INSERT INTO knowledge (title, content) VALUES ('title', 'content')");
@@ -186,8 +199,9 @@ test('동기화 CLI는 부분 저장 실패·청크 실패·DB 오류를 실패 
         timeout: 15_000,
         env: { ...process.env, BACKEND_TEST_DB_SOCKET: join(dir, 'db.sock'), BACKEND_TEST_BAD_VECTOR: mode === 'vector' ? '1' : '' },
       }).then(value => ({ ...value, code: 0 }), error => error);
-      assert.equal(result.code, 1, `실패를 종료 코드로 알려야 한다: ${mode}`);
-      assert.match(result.stdout, /\[test\] pool closed/, '실패 경로도 커넥션 풀을 닫아야 한다');
+      assert.equal(result.code, mode === 'ok' ? 0 : 1, `종료 코드로 결과를 알려야 한다: ${mode}`);
+      assert.match(result.stdout, /\[test\] pool closed/, '어느 경로도 커넥션 풀을 닫아야 한다');
+      if (mode === 'ok') assert.match(result.stdout, /embedding sync complete: created\/updated 1/);
     });
   }
 });

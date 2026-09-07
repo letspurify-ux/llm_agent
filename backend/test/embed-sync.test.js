@@ -93,3 +93,24 @@ test('청크 커밋 실패는 롤백하고 삭제 건수를 성공으로 집계�
   assert.equal(result.chunksFailed, 1);
   assert.equal(rolledBack, 1);
 });
+
+// 지시문 접두(EMBEDDING_QUERY_PREFIX)는 질의에만 붙는다 — 문서는 원문 그대로 임베딩해야 한다.
+// 양쪽에 다 붙이면 모델이 학습한 비대칭이 사라지고, 오류 없이 검색 품질만 조용히 떨어진다.
+// 접두를 넣는 쪽(search.js embedText)의 짝이 되는 검사다 — 한쪽만 있으면 계약의 절반만 지켜진다.
+test('문서 임베딩에는 질의 지시문 접두가 붙지 않는다', async t => {
+  const saved = process.env.EMBEDDING_QUERY_PREFIX;
+  process.env.EMBEDDING_QUERY_PREFIX = 'Instruct: 근거를 찾아라\nQuery: ';
+  t.after(() => { if (saved === undefined) delete process.env.EMBEDDING_QUERY_PREFIX; else process.env.EMBEDDING_QUERY_PREFIX = saved; });
+  const inputs = [];
+  database(t, async sql => {
+    if (sql.includes('FROM qa_method')) return [{ seq: 1, title: '점검', method: '본문', h: 'h1' }];
+    return [];
+  });
+  t.mock.method(globalThis, 'fetch', async (_url, init) => {
+    const { input } = JSON.parse(init.body);
+    inputs.push(...input);
+    return new Response(JSON.stringify({ data: input.map((_, index) => ({ index, embedding: [1] })) }));
+  });
+  await syncEmbeddings();
+  assert.deepEqual(inputs, ['점검\n본문']);
+});

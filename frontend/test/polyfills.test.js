@@ -148,3 +148,70 @@ test('폴리필의 URL.canParse는 명세와 같다 — 만들 수 있으면 tru
     네이티브와같은가: true, enumerable: true, 네이티브도열거되는가: true, keepsExisting: true,
   });
 });
+
+test('폴리필의 structuredClone은 명세와 같다 — 깊은 복사·순환·옮길 수 없는 값, 원래 있으면 손대지 않는다', async () => {
+  // mermaid가 그림을 그리는 길에서 부른다. 앞서 '쓰는 자리가 pie 하나뿐'이라고 적어 두었던 것이 틀렸다:
+  // dagre(흐름도 배치)가 **자기 자신을 가리키는 화살표**(`A --> A`)의 모서리를 복제하는 데 쓴다 —
+  // structuredClone은 Chrome 98·Safari 15.4·Firefox 94부터라 빌드 타깃(chrome87·safari14·firefox78) 밖이고,
+  // 없는 브라우저에서는 그 한 줄이 든 흐름도와 원그래프만 'structuredClone is not defined'로 원문 코드가 됐다
+  // (실측: 평범한 흐름도·시퀀스·간트·ER·클래스·상태는 그려졌다 — 그림 종류가 아니라 '그 안에 무엇이 있는가'로 갈린다).
+  // 네이티브와 나란히 세워 잰다 — 폴리필의 모양만 보는 검사는 무엇도 보증하지 않는다.
+  const got = await inChild(`
+    const native = globalThis.structuredClone;
+    const 네이티브도열거되는가 = Object.prototype.propertyIsEnumerable.call(globalThis, 'structuredClone');
+    delete globalThis.structuredClone;
+    const before = typeof globalThis.structuredClone;
+    await import('./src/polyfills.js');
+    const p = globalThis.structuredClone;
+    // 값을 만드는 함수로 둔다 — 같은 표본을 네이티브와 폴리필에 따로 넘겨야 순환 참조도 서로를 침범하지 않는다.
+    const 표본 = () => { const a = { s: '가', n: -0, b: true, u: undefined, nul: null, big: 1n,
+      arr: [1, [2, { d: new Date(0), re: /a\\+b/gi }]], m: new Map([['k', { v: 1 }]]), st: new Set([1, '가']),
+      buf: new Uint8Array([1, 2, 3]), box: Object(5), err: new TypeError('앗') }; a.self = a; return a; };
+    const 같은모양 = (x, y, seen = new Map()) => {
+      if (Object.is(x, y)) return true;
+      if (typeof x !== 'object' || typeof y !== 'object' || x === null || y === null) return false;
+      if (seen.get(x) === y) return true;
+      seen.set(x, y);
+      if (Object.prototype.toString.call(x) !== Object.prototype.toString.call(y)) return false;
+      if (x instanceof Date) return +x === +y;
+      if (x instanceof RegExp) return x.source === y.source && x.flags === y.flags;
+      if (x instanceof Error) return x.name === y.name && x.message === y.message;
+      if (x instanceof Map) return x.size === y.size && [...x].every(([k, v], i) => 같은모양(k, [...y][i][0], seen) && 같은모양(v, [...y][i][1], seen));
+      if (x instanceof Set) return x.size === y.size && [...x].every((v, i) => 같은모양(v, [...y][i], seen));
+      if (ArrayBuffer.isView(x)) return x.length === y.length && [...x].every((v, i) => v === y[i]);
+      const kx = Object.keys(x), ky = Object.keys(y);
+      return kx.length === ky.length && kx.every(k => 같은모양(x[k], y[k], seen));
+    };
+    const c = p(표본());
+    const cases = {
+      before, after: typeof p,
+      네이티브와같은가: 같은모양(c, native(표본())),
+      깊은복사: c.arr[1][1] !== 표본().arr[1][1] && c.m.get('k').v === 1,
+      순환: c.self === c,
+      원형은안옮긴다: Object.getPrototypeOf(p(new (class X { constructor() { this.a = 1; } })())) === Object.prototype,
+      // 옮길 수 없는 값은 명세대로 DataCloneError — 조용히 빈 객체로 만들면 부르는 쪽이 그것을 값으로 믿는다
+      던지는것: ['function', 'symbol', 'method', 'weakmap', 'promise'].map(kind => {
+        const v = { function: () => 1, symbol: Symbol('s'), method: { f() {} }, weakmap: new WeakMap(), promise: Promise.resolve() }[kind];
+        try { p(v); return 'no-throw'; } catch (e) { return e.name; }
+      }),
+      네이티브가던지는것: ['function', 'symbol', 'method', 'weakmap', 'promise'].map(kind => {
+        const v = { function: () => 1, symbol: Symbol('s'), method: { f() {} }, weakmap: new WeakMap(), promise: Promise.resolve() }[kind];
+        try { native(v); return 'no-throw'; } catch (e) { return e.name; }
+      }),
+      // WebIDL의 연산이라 열거된다 (URL.canParse와 같은 이유)
+      enumerable: Object.prototype.propertyIsEnumerable.call(globalThis, 'structuredClone'),
+      네이티브도열거되는가,
+    };
+    const marker = () => 'native'; globalThis.structuredClone = marker;
+    await import('./src/polyfills.js?again');
+    cases.keepsExisting = globalThis.structuredClone === marker;
+    process.stdout.write(JSON.stringify(cases));
+  `);
+  assert.deepStrictEqual(got, {
+    before: 'undefined', after: 'function',
+    네이티브와같은가: true, 깊은복사: true, 순환: true, 원형은안옮긴다: true,
+    던지는것: ['DataCloneError', 'DataCloneError', 'DataCloneError', 'DataCloneError', 'DataCloneError'],
+    네이티브가던지는것: ['DataCloneError', 'DataCloneError', 'DataCloneError', 'DataCloneError', 'DataCloneError'],
+    enumerable: true, 네이티브도열거되는가: true, keepsExisting: true,
+  });
+});

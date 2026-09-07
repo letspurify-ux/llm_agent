@@ -1,4 +1,4 @@
-﻿# bge-m3 임베딩 서버 중지 (Windows)
+﻿# qwen3-embedding 임베딩 서버 중지 (Windows)
 # 사용: stop.bat
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 

@@ -162,6 +162,17 @@ export const CASES = {
   // mermaid의 클래스 다이어그램 파서는 Array.prototype.at을 부른다 — 그 API가 없는 브라우저(빌드 타깃 안의 Chrome 87~91·
   // Safari 14~15.3)에서 흐름도는 그려지는데 이것만 원문 코드로 남았다(실측). src/polyfills.js가 채운다.
   classdiagram: ['```mermaid', 'classDiagram', '  class Animal {', '    +String name', '    +speak()', '  }', '  Animal <|-- Dog', '```'].join('\n'),
+  // 모델이 손으로 쓴 표 두 갈래 — 둘 다 차트는 그려지는데 화면의 다른 절반이 조용히 무너지던 자리다.
+  // ① 양끝 파이프를 빼고 구분 줄을 `- | -`로 쓴 표. 그 줄을 그대로 내보내면 markdown이 표보다 먼저
+  //    목록 항목으로 읽어 '표로 보기'가 표가 아니라 글머리표와 파이프 글자가 된다(실측). 차트를 그리지
+  //    못한 블록에서는 그 글자가 값을 보는 유일한 자리다.
+  // ② 값이 아주 큰 표. 값 축은 width="auto"라(Chart.jsx) 눈금 글자가 넓은 만큼 그림 몫을 가져가는데,
+  //    자릿수 표기는 값이 커질수록 끝없이 자란다 — 1e308 한 칸이 쉼표까지 410자가 되어 막대도 눈금선도
+  //    하나 없이 눈금 글자만 상자 밖으로 나갔다(실측: 상자 574px에 눈금 2,411px).
+  oddtable: ['```chart', 'type: bar', 'title: 손으로 쓴 표',
+    '이름 | 값', '- | -', '가 | 1', '나 | 2', '```', '',
+    '```chart', 'type: bar', 'title: 아주 큰 값', '| 이름 | 값 |', '|---|---|',
+    '| 가 | 1e308 |', '| 나 | 5e307 |', '```'].join('\n'),
   bars: ['```chart', 'type: bar', 'title: 눕힌 막대', '| 항목 | 값 |', '|---|---|',
     ...Array.from({ length: 15 }, (_, i) => `| 항목${i + 1} | ${(i * 37) % 90 + 10} |`), '```', '',
     '```chart', 'type: bar', 'title: 세로 막대', '| 항목 | 값 |', '|---|---|',
@@ -240,6 +251,11 @@ export const READY = {
   longtitle: `document.querySelector('figure.chart .recharts-surface') && document.querySelector('.md strong')`,
   footnote: `document.querySelector('.md .footnotes')`,
   classdiagram: `document.querySelector('.mermaid svg')`,
+  // 두 차트가 '무언가를 그렸다'까지 기다린다 — 막대로 기다리면 고치기 전에는 영영 서지 않아 시험이
+  // 실패가 아니라 시간 초과로 죽는다(그러면 무엇이 잘못됐는지는 말해 주지 않는다. longnamechart와 같은 이유).
+  oddtable: `document.querySelectorAll('figure.chart').length === 2
+    && [...document.querySelectorAll('figure.chart')].every(f => f.querySelector('.recharts-wrapper svg'))
+    && document.querySelectorAll('.md .chart-table').length === 2`,
   bars: `document.querySelectorAll('figure.chart').length === 2 && [...document.querySelectorAll('figure.chart')].every(f => f.querySelector('.recharts-bar-rectangle .recharts-rectangle'))`,
   // 차트가 서고 '표로 보기'의 표까지 붙은 뒤라야 셀 안의 그림을 볼 수 있다(접혀 있어도 DOM에는
   // 있고, 브라우저는 접힌 <details> 안의 <img>도 불러온다).

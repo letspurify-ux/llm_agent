@@ -73,15 +73,19 @@ const CONFIG_RE = /^\s*(type|title|x|y|y2|xtype|data)\s*:\s*(.*?)\s*$/i;
 // 우리에게 필요한 것은 머리글과 값뿐이다.
 const SEP_ROW_RE = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
 
-// 표 한 줄을 칸으로 쪼갠다. GFM처럼 `\|` 는 칸 안의 파이프, `\\` 는 역슬래시 하나다 — 둘 다 되돌려야
-// '표로 보기'(GFM이 그린다)와 차트의 라벨이 같은 글자가 된다(서버 cell()이 이 두 글자를 이렇게 적는다).
-// 그 밖의 역슬래시는 글자다(`C:\dir`). 양끝 파이프는 벗긴다.
+// 표 한 줄을 칸으로 쪼갠다. GFM처럼 `\|` 는 칸 안의 파이프, `\\` 는 역슬래시 하나다 — 되돌려야
+// '표로 보기'(GFM이 그린다)와 차트의 라벨이 같은 글자가 된다(서버 escapeCell이 이렇게 적는다).
+// 파이프·역슬래시만이 아니다: 값에 든 강조·코드·링크·취소선·HTML·엔터티 표기도 그대로 두면 GFM이 해석해
+// 값이 조용히 바뀌므로 서버가 짝이 있을 때만 막아 보낸다(backend/src/chart.js escapeCell). 그 목록을 여기서도
+// 같이 되돌린다 — 한쪽만 늘리면 차트 라벨에 백슬래시가 남는다. 그 밖의 역슬래시는 글자다(`C:\dir`).
+// 양끝 파이프는 벗긴다.
+const CELL_ESCAPABLE = '\\|`*~[]<_&';
 function splitRow(line) {
   const cells = [];
   let cur = '';
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
-    if (ch === '\\' && (line[i + 1] === '|' || line[i + 1] === '\\')) { cur += line[i + 1]; i++; continue; }
+    if (ch === '\\' && CELL_ESCAPABLE.includes(line[i + 1])) { cur += line[i + 1]; i++; continue; }
     if (ch === '|') { cells.push(cur.trim()); cur = ''; continue; }
     cur += ch;
   }
@@ -429,9 +433,19 @@ export function pieLabelsOverflow({ width, height, margin, radiusRatio, values, 
 // 수백 자로 만든다(라벨을 clip으로 묶어 두는 것과 같은 이유다).
 // Chart.jsx가 아니라 여기 있는 이유는 아래 chartNotes와 같다: 순수 함수라 회귀 테스트가 붙는다.
 // 표기 결함은 오류를 남기지 않아 테스트가 유일한 방어선인데, 그 함수가 JSX 안에 살면 방어선을 세울 수 없다.
+// 아주 큰 값도 지수로 적는다 — 아래쪽(1e-6)과 같은 이유이고, 이쪽이 손해가 더 크다. 자릿수 표기는
+// 값이 커질수록 길이가 끝없이 자라는데(1e308 한 칸이 쉼표까지 410자다) 그 글자가 서는 자리는 값 축의
+// 눈금이고, 그 축은 width="auto"라 눈금이 넓은 만큼 그림에서 폭을 가져간다(Chart.jsx). 그래서 큰 값
+// 하나가 그래프를 밀어내다 아예 없앤다 — 실측(창 1000px, 그림 상자 574px): 1e21 눈금 169px, 1e60
+// 474px, 1e75에서는 막대도 눈금선도 하나 없이 눈금 글자만 상자 밖으로 나갔다(그러고는 말풍선의
+// overflow-x: clip에 잘려 읽지도 못한다). 아무 오류도 나지 않아 사용자에게는 그냥 차트가 없는 답변이다.
+// 경계를 1e21에 두는 이유: 자바스크립트 자신이 수를 글자로 옮길 때 지수로 넘어가는 자리가 거기고
+// (String(1e21) === '1e+21'), 그 아래는 정수부가 21자리를 넘지 않아 표기가 31자 안에서 묶인다 —
+// 조·경 단위의 실제 조회 값은 지금까지와 글자 하나 다르지 않다.
 export function fmtNum(v) {
   if (typeof v !== 'number' || !Number.isFinite(v)) return '';
   const a = Math.abs(v);
+  if (a >= 1e21) return v.toExponential(2);
   if (a === 0 || a >= 0.01) return v.toLocaleString('ko-KR', { maximumFractionDigits: 2 });
   return a >= 1e-6 ? v.toLocaleString('ko-KR', { maximumSignificantDigits: 3 }) : v.toExponential(2);
 }
@@ -461,6 +475,21 @@ export function chartNotes(spec) {
 // 표 줄들을 GFM이 표로 인정하는 모양으로: 머리글 · 구분 줄 · 값 줄들. 구분 줄이 없거나 칸 수가
 // 머리글과 다르면 채워 넣는다 — 모델이 빼먹는 일이 있다. 화면과 이력이 같은 함수를 쓰는 이유는,
 // 한쪽만 고쳐 두면 화면에는 표인 것이 모델에게는 파이프 글자 묶음으로 가기 때문이다(실측).
+// 읽는 규칙(SEP_ROW_RE)과 내보내는 규칙(아래 GFM_SEP_RE)은 일부러 다르다. 읽을 때는 넓게 봐야 한다 —
+// 구분 줄로 쓰인 것이 분명한 줄은 값 행으로 세지 않아야 차트에 `---` 행이 생기지 않는다. 내보낼 때는
+// 좁게 봐야 한다 — 그대로 내보낸 줄을 GFM이 구분 줄로 읽지 못하면 표가 통째로 파이프 글자가 된다.
+// 좁은 쪽이 요구하는 둘: ① 공백은 스페이스·탭뿐이다(micromark와 같은 규칙 — 같은 파일 OPEN_LINE_RE·
+// maskLiteralFences가 `[ \t]`만 보는 것과 같은 이유다. `\s`는 NBSP·전각공백·얇은공백·VT·FF까지 공백으로
+// 세는데 micromark는 아니다) ② 줄이 파이프로 시작한다.
+const GFM_SEP_RE = /^[ \t]*\|[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*\r?$/;
+// 줄 앞에 파이프가 없으면 넣는다(들여쓰기는 그대로). 넣는 이유는 그 첫 글자다: 파이프 없이 시작하는
+// 줄은 markdown이 표보다 먼저 다른 블록으로 읽는다 — `- | -` 구분 줄은 목록 항목이 되고(실측: '표로
+// 보기'가 표 대신 글머리표 하나와 파이프 글자 묶음이 됐다), 머리글의 첫 칸이 `#`이면 제목이, `*`·`+`이면
+// 목록이 되어 그 표는 화면에서도 이력에서도 표가 아니다. 파이프 하나가 그 모든 갈래를 닫는다.
+// 넣을지 말지는 splitRow가 '앞의 파이프'로 보는 것과 같은 규칙(`\s*\|`)으로 가른다 — 여기만 좁게 보면
+// 전각공백으로 들여쓴 줄에 파이프가 하나 더 붙어 칸이 하나 늘고(splitRow는 그 공백을 앞의 빈 칸으로
+// 세지 않는다) 머리글과 구분 줄의 칸 수가 어긋난다. 그러면 표를 세우려던 것이 표를 깨뜨린다.
+const withPipe = line => (/^\s*\|/.test(line) ? line : line.replace(/^([ \t]*)/, '$1|'));
 export function normalizeTable(table) {
   if (!table.length) return null;
   const cols = splitRow(table[0]).length;
@@ -468,8 +497,10 @@ export function normalizeTable(table) {
   // 채워 넣는 구분 줄은 머리글과 같은 들여쓰기로 — 이력에서는 원문의 줄 모양을 그대로 두기 때문에
   // (목록 안의 표는 항목 폭만큼 들여 온다) 이 줄만 왼쪽 끝에 붙으면 그 표가 목록에서 떨어져 나간다.
   const indent = /^\s*/.exec(table[0])[0];
-  const sep = isSep && splitRow(table[1]).length === cols ? table[1] : `${indent}|${' --- |'.repeat(cols)}`;
-  return { header: table[0], sep, rows: table.slice(isSep ? 2 : 1) };
+  // 원문의 구분 줄은 GFM이 그대로 읽어 줄 때만 그대로 둔다(정렬 표시가 살아 있게). 아니면 새로 만든다.
+  const keep = isSep && GFM_SEP_RE.test(table[1]) && splitRow(table[1]).length === cols;
+  const sep = keep ? table[1] : `${indent}|${' --- |'.repeat(cols)}`;
+  return { header: withPipe(table[0]), sep, rows: table.slice(isSep ? 2 : 1).map(withPipe) };
 }
 
 // 이미 가른 블록에서 바로. 화면은 한 블록을 두 번(제목 있는 표·'표로 보기') 그리므로, 부르는 쪽이

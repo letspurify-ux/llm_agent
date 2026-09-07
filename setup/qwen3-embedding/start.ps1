@@ -1,9 +1,9 @@
-﻿# bge-m3 임베딩 서버 기동 (Windows)
+﻿# qwen3-embedding 임베딩 서버 기동 (Windows)
 # 사용: start.bat  (또는 powershell -File start.ps1)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $Url   = 'http://localhost:11434'
-$Model = 'bge-m3'
+$Model = 'qwen3-embedding:0.6b'
 
 function Test-Server {
     try { Invoke-RestMethod "$Url/api/tags" -TimeoutSec 3 | Out-Null; $true } catch { $false }
@@ -33,10 +33,16 @@ if (Test-Server) {
 }
 
 # 3) 모델 준비 (없을 때만 다운로드)
+# 이름을 태그까지 그대로 대조한다 — 'qwen3-embedding'만 보면 다른 크기(4b/8b)가 깔려 있어도
+# '준비됨'이 되는데, 그 모델들은 차원이 달라 vec_* 스키마에 넣을 수 없다.
 if (((ollama list) -join "`n") -notmatch [regex]::Escape($Model)) {
-    Write-Host "[.] $Model 다운로드 중 (~1.2GB, 네트워크에 따라 수 분)..."
+    Write-Host "[.] $Model 다운로드 중 (~640MB, 네트워크에 따라 수 분)..."
     ollama pull $Model
-    if ($LASTEXITCODE -ne 0) { Write-Host "[X] 모델 다운로드 실패" -ForegroundColor Red; exit 1 }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[X] 모델 다운로드 실패 — 사내망에서 registry.ollama.ai가 막혀 있으면" -ForegroundColor Red
+        Write-Host "    README의 '인터넷이 안 되는 사내망' 절차로 반입하세요."
+        exit 1
+    }
 }
 Write-Host "[O] $Model 준비됨"
 
@@ -61,4 +67,5 @@ Write-Host ""
 Write-Host "준비 완료. backend/.env 에 아래가 설정되어 있어야 합니다:" -ForegroundColor Cyan
 Write-Host "  EMBEDDING_URL=$Url/v1"
 Write-Host "  EMBEDDING_MODEL=$Model"
+Write-Host "모델을 바꾸면 다음 동기화가 전 행을 자동으로 다시 임베딩합니다 (수 분)." -ForegroundColor Cyan
 Write-Host "중지하려면 stop.bat 를 실행하세요."

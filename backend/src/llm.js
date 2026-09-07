@@ -15,6 +15,7 @@ import { openaiDecide } from './llm-openai.js';
 import { bindNames } from './sql.js';
 import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, MAX_SEARCH_TEXT_LEN, MAX_BATCH_QUERIES, MAX_EXPANDS, MAX_DROPS, SEARCH_TARGETS, normalizeSearchTargets, normalizeItemIds, clipText, nameKey, ownProp, warnOnce, targetDbNames, isPlainObject, stripLoneSurrogates} from './constants.js';
 import { rowCounts } from './result.js';
+import { escapeCell } from './chart.js';
 import { normalizeResultRead } from './read-result.js';
 
 // LLM provider 선택의 단일 해석 지점.
@@ -463,13 +464,10 @@ export function renderAnswer({ knowledge, history }) {
 // 그 행이 둘로 갈라져 뒤 칸의 값이 다음 행으로 밀린다. `\r?\n`만 바꾸던 때 실제로 그랬다: CRLF를 담은
 // 텍스트 셀을 oracle.js normalizeValue가 MAX_CELL_LEN에서 자르면 \r만 남고 \n은 잘려 나간다 —
 // 그 뒤에 붙는 TRUNC_MARK가 다음 행의 첫 칸이 되어, 표의 그 행부터 열이 어긋난 채 화면에 나갔다.
-const cell = v => String(v ?? '')
-  .replace(/\\/g, '\\\\')
-  .replace(/\|/g, '\\|')
-  // 문자 하나에 공백 하나로 바꾼다 — CRLF를 한 칸으로 접으면 잘린 값 가드가 칸에 보인 앞부분의 길이를
-  // 알아보지 못한다 (chart.js escapeCell에 같은 이유를 적어 두었다). 이 폴백 표도 다음 턴의 대화 이력으로
-  // 되돌아가 모델이 값을 옮겨 적는 자리다.
-  .replace(/[\r\n]/g, ' ');
+// 규칙 자체는 chart.js가 갖고 이 폴백 표도 그것을 그대로 쓴다 — 사본을 두면 한쪽만 늘어난 날
+// 같은 값이 어느 표에 실렸느냐에 따라 화면에서 달라진다(그리고 그 차이는 오류를 남기지 않는다).
+// 개행을 '문자 하나에 공백 하나'로 바꾸는 것도, 강조·코드·링크 표기를 짝이 있을 때만 막는 것도 그쪽 규칙이다.
+const cell = escapeCell;
 
 // 컬럼은 모든 행의 합집합으로 잡는다(등장 순서 유지). 첫 행만 보면 뒤 행에만 있는 컬럼의 값이
 // 표에서 조용히 사라진다 — 드라이버가 주는 행은 보통 동종이지만, 값이 사라지는 실패는 오류를

@@ -1022,6 +1022,42 @@ it('원그래프: 이름이 길면 넓은 화면에서도 범례로 내리고, �
   for (const n of PIE_SHORT_NAMES) assert.ok(짧은것.곁의글자.some(t => t.startsWith(n)), `조각 곁에 '${n}'이 없다: ${JSON.stringify(짧은것.곁의글자)}`);
 });
 
+it('강제 색상(Windows 고대비)에서도 범례의 색칩이 조각의 색을 그대로 말한다', async () => {
+  // 강제 색상에서 브라우저는 HTML의 background-color를 시스템 색으로 갈아 끼우지만 SVG의 fill·stroke는
+  // 그대로 둔다(실측: 조각 여덟은 색을 지켰고 색칩 여덟은 전부 rgb(255,255,255)가 되어 말풍선 바탕과
+  // 같아졌다). 그러면 조각에는 비율만 적히고 이름은 범례에만 있는 이 그림에서(Chart.jsx useLabelsFit),
+  // 어느 이름이 어느 조각인지 잇는 끈이 통째로 끊긴다 — 오류는 나지 않고 색칩만 소리 없이 사라진다.
+  // index.html의 `.md .chart-legend i { forced-color-adjust: none }` 한 줄이 그 색만 지킨다.
+  const 재기 = `(() => {
+    const fig = document.querySelector('figure.chart');
+    const legend = fig.querySelector('.chart-legend');
+    return {
+      색칩: legend ? [...legend.querySelectorAll('i')].map(i => getComputedStyle(i).backgroundColor) : null,
+      조각: [...fig.querySelectorAll('.recharts-pie-sector path')].map(p => getComputedStyle(p).fill),
+      바탕: getComputedStyle(fig.closest('.bubble')).backgroundColor,
+      강제: matchMedia('(forced-colors: active)').matches,
+    }; })()`;
+  await answered(1000, 760, { c: 'pielong' });
+  const 보통 = await page.eval(재기);
+  assert.ok(보통.색칩?.length > 1, `범례의 색칩이 없다 — 이 시험의 전제가 무너졌다 (${JSON.stringify(보통)})`);
+  assert.strictEqual(보통.색칩.length, 보통.조각.length, '색칩과 조각의 수가 다르다');
+  try {
+    await page.send('Emulation.setEmulatedMedia', { features: [{ name: 'forced-colors', value: 'active' }] });
+    // 전제: 브라우저가 실제로 강제 색상을 켰는가. 켜지지 않았다면 아래 단언은 아무것도 보지 않는다.
+    await page.until(`matchMedia('(forced-colors: active)').matches`, { what: '강제 색상이 켜지기' });
+    const 강제 = await page.eval(재기);
+    assert.ok(강제.강제, '강제 색상이 켜지지 않았다 — 이 시험은 아무것도 재지 않았다');
+    assert.deepStrictEqual(강제.조각, 보통.조각, '전제: 강제 색상은 SVG 조각의 색을 바꾸지 않는다');
+    assert.strictEqual(new Set(강제.색칩).size, 강제.색칩.length,
+      `강제 색상에서 색칩이 서로 구별되지 않는다 — 이름과 조각을 이을 수 없다: ${JSON.stringify(강제.색칩)}`);
+    assert.deepStrictEqual(강제.색칩, 강제.조각,
+      `강제 색상에서 색칩이 조각과 다른 색을 말한다: ${JSON.stringify(강제)}`);
+    assert.ok(!강제.색칩.includes(강제.바탕), `색칩이 바탕과 같은 색이라 보이지 않는다 (${강제.바탕})`);
+  } finally {
+    await page.send('Emulation.setEmulatedMedia', { features: [] });
+  }
+});
+
 it('막대 위의 툴팁은 눕힌 막대에서도 마우스 자리의 행을 보여준다', async () => {
   // Recharts 3의 툴팁은 '어느 행인가'를 범주 축에서 찾는데 그 축을 axisId(기본 0)로 고른다. 눕힌 막대의 범주
   // 축은 YAxis(yAxisId="left")라 기본 축이 없어, 툴팁이 엉뚱한 띠로 행을 나눴다(실측: 15행 중 2·3행은 툴팁이
@@ -1554,6 +1590,44 @@ it('URL.canParse가 없는 브라우저(빌드 타깃 안의 Chrome 87~119·Safa
   }
 });
 
+// 같은 부류의 넷째 자리. mermaid는 그림을 그리는 길에서 structuredClone(Chrome 98·Safari 15.4·Firefox 94부터)을
+// 부른다 — 빌드 타깃(chrome87·safari14·firefox78) 밖이다. 앞서 '쓰는 자리가 pie 하나뿐'이라 적어 두고 채우지
+// 않았는데 그것이 틀렸다: dagre(흐름도 배치)가 **자기 자신을 가리키는 화살표**(`A --> A`)의 모서리를 복제하는
+// 데 쓴다. 없는 브라우저에서는 그 한 줄이 든 흐름도와 원그래프만 'structuredClone is not defined'로 원문 코드가
+// 됐다(실측: 평범한 흐름도·시퀀스·간트·ER·클래스·상태는 그려졌다). 흐름도는 이 화면에서 가장 흔한 그림이고
+// 자기 고리는 재시도·반복을 그릴 때 모델이 자연스럽게 쓴다 — 그림 종류가 아니라 '그 안에 무엇이 있는가'로
+// 되고 안 되고가 갈리므로 사용자에게는 모델이 틀린 것으로 보인다.
+// 한 답변에 셋을 함께 둔다: 자기 고리가 없는 흐름도(예전에도 그려졌다)·자기 고리가 있는 흐름도·원그래프.
+// 앞의 것까지 함께 재야 '폴리필이 그림을 통째로 망가뜨리지는 않았다'가 같은 자리에서 보인다.
+it('structuredClone이 없는 브라우저(빌드 타깃 안의 Chrome 87~97·Firefox 78~93)에서도 자기 고리 흐름도와 원그래프가 그려진다', async () => {
+  const { identifier } = await page.send('Page.addScriptToEvaluateOnNewDocument', {
+    source: 'delete window.structuredClone; window.__cloneGone = typeof structuredClone === "undefined";',
+  });
+  try {
+    await page.touchMode(false);
+    await page.viewport(1000, 760);
+    await page.goto(url(), '.chip');
+    assert.strictEqual(await page.eval('window.__cloneGone'), true, '검사의 전제: 문서가 서기 전에 structuredClone을 지웠다');
+    const 그림들 = ['flowchart LR\n  A[하나] --> B[둘]', 'flowchart LR\n  A[하나] --> A\n  A --> B[둘]', 'pie title 비율\n  "가" : 50\n  "나" : 50'];
+    const answer = 그림들.map(t => `\`\`\`mermaid\n${t}\n\`\`\``).join('\n\n');
+    await page.eval(`window.fetch = async () => new Response(JSON.stringify({ answer: ${JSON.stringify(answer)} }),
+      { headers: { 'Content-Type': 'application/json' } })`);
+    await sendQuestion('자기 고리가 든 흐름도', 1);
+    await page.until(`document.querySelectorAll('.md .mermaid svg').length === ${그림들.length}`,
+      { what: '그림 셋이 다 그려지기 (예전에는 자기 고리와 원그래프가 원문 코드로 남았다)' });
+    const got = await page.eval(`(() => ({
+      clone: typeof structuredClone,
+      코드로남은것: document.querySelectorAll('.bubble.assistant pre code').length,
+      원조각: document.querySelectorAll('.md .mermaid path[class*="pieCircle"], .md .mermaid .pieCircle').length,
+    }))()`);
+    assert.strictEqual(got.clone, 'function', '폴리필이 structuredClone을 채우지 않았다');
+    assert.strictEqual(got.코드로남은것, 0, '그리지 못하고 원문 코드로 남은 그림이 있다');
+    assert.ok(got.원조각 >= 2, `원그래프의 조각이 그려지지 않았다: ${JSON.stringify(got)}`);
+  } finally {
+    await page.send('Page.removeScriptToEvaluateOnNewDocument', { identifier });
+  }
+});
+
 it('띄운 브라우저는 끝나면 정말 사라지고, 끊긴 연결은 기다리던 요청을 놓아준다', async () => {
   // 검사를 한 번 돌릴 때마다 브라우저가 한 벌씩 남으면 개발자의 컴퓨터가 몇 번 만에 잠긴다.
   // kill()은 신호를 보낼 뿐이라, 앱을 띄운 headless Chrome은 그것 하나로는 내려가지 않는다.
@@ -1674,4 +1748,42 @@ test('검색·조회가 도는 동안 진행 줄이 바로 서고, 답이 오면
   assert.ok(panel.summary.includes(STREAM_SUMMARY), `패널 머리띠가 검색을 말하지 않는다: ${panel.summary}`);
   assert.ok(panel.search.includes(STREAM_SEARCH.text) && panel.search.includes(STREAM_SEARCH_LABEL), `패널의 검색 줄이 다르다: ${panel.search}`);
   assert.strictEqual(panel.steps, TRACE.length + 1, '검색 항목이 패널에 남지 않았거나 쿼리 항목이 빠졌다');
+});
+
+test("손으로 쓴 표도 '표로 보기'에서 표로 서고, 아주 큰 값이 그래프를 밀어내지 않는다", async () => {
+  // 두 계약 모두 깨져도 오류가 나지 않는다 — 차트는 멀쩡히 그려지고 그 곁의 것만 조용히 무너진다.
+  // ① 구분 줄을 `- | -`로 쓴 표(양끝 파이프 없음)를 그대로 내보내면 markdown이 그 줄을 목록 항목으로
+  //    읽어 '표로 보기'가 표가 아니게 된다(실측: 표 0개, 글머리표 하나와 파이프 글자만 남았다).
+  //    chart.js normalizeTable이 줄머리 파이프와 구분 줄을 보장한다.
+  // ② 값 축은 width="auto"라 눈금 글자가 넓은 만큼 그림 몫을 가져간다 — 1e308의 자릿수 표기(410자)에서는
+  //    막대도 눈금선도 하나 없이 눈금 글자만 상자 밖으로 나갔다(실측: 상자 574px에 눈금 2,411px).
+  //    chart.js fmtNum이 1e21부터 지수로 적어 눈금 하나의 길이를 묶는다.
+  await answered(1000, 760, { c: 'oddtable' });
+  const 표 = await page.eval(`(() => {
+    const t = document.querySelectorAll('.md .chart-table')[0].querySelector('table');
+    if (!t) return null;
+    return [...t.querySelectorAll('tr')].map(r => [...r.querySelectorAll('th,td')].map(c => c.textContent.trim()));
+  })()`);
+  assert.deepStrictEqual(표, [['이름', '값'], ['가', '1'], ['나', '2']], "'표로 보기'가 표가 아니다");
+  const 큰값 = await page.eval(`(() => {
+    const fig = document.querySelectorAll('figure.chart')[1];
+    const svg = fig.querySelector('.recharts-surface');
+    const box = svg.getBoundingClientRect();
+    const ticks = [...svg.querySelectorAll('text')].map(t => {
+      const b = t.getBoundingClientRect();
+      return { w: Math.round(b.width), out: b.right > box.right + 1 || b.left < box.left - 1, s: t.textContent };
+    });
+    return {
+      막대: svg.querySelectorAll('.recharts-bar-rectangle .recharts-rectangle').length,
+      눈금선: svg.querySelectorAll('.recharts-cartesian-grid line').length,
+      가장긴눈금: Math.max(0, ...ticks.map(t => t.w)),
+      상자밖: ticks.filter(t => t.out).map(t => t.s),
+      상자폭: Math.round(box.width),
+    };
+  })()`);
+  assert.ok(큰값.막대 >= 1, `큰 값의 막대가 하나도 그려지지 않았다: ${JSON.stringify(큰값)}`);
+  assert.ok(큰값.눈금선 > 2, `값 축의 눈금선이 사라졌다: ${JSON.stringify(큰값)}`);
+  assert.deepStrictEqual(큰값.상자밖, [], `눈금 글자가 그림 상자 밖으로 나갔다(말풍선에 잘려 읽을 수 없다): ${JSON.stringify(큰값)}`);
+  // 눈금 하나가 상자의 절반을 넘으면 그래프가 설 자리가 없다 — 길이의 상한이 실제로 걸려 있는지 잰다
+  assert.ok(큰값.가장긴눈금 < 큰값.상자폭 / 2, `눈금 하나가 상자의 절반을 넘는다: ${JSON.stringify(큰값)}`);
 });

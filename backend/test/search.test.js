@@ -241,3 +241,50 @@ test('예열은 종료 신호를 받으면 임베딩 상한(60초)까지 매달�
     if (saved === undefined) delete process.env.EMBEDDING_URL; else process.env.EMBEDDING_URL = saved;
   }
 });
+
+// 지시문을 학습한 임베딩 모델(Qwen3-Embedding·Harrier 계열)은 **질의에만** 한 문장 지시문을 붙이고
+// 문서에는 붙이지 않는다 — 그 비대칭이 곧 모델의 학습 형식이다. 붙이지 않거나 양쪽에 다 붙이면
+// 오류는 나지 않고 검색 품질만 조용히 떨어지므로, 이 계약은 검사가 유일한 방어선이다.
+// 설정하지 않으면 지금까지와 글자 하나 다르지 않아야 한다 (bge-m3처럼 지시문을 안 쓰는 모델).
+test('질의 지시문 접두는 질의에만 붙고, 설정하지 않으면 아무것도 붙지 않는다', async context => {
+  const savedUrl = process.env.EMBEDDING_URL;
+  const savedPrefix = process.env.EMBEDDING_QUERY_PREFIX;
+  process.env.EMBEDDING_URL = 'http://test.invalid/v1';
+  const 보낸것 = [];
+  context.mock.method(globalThis, 'fetch', async (_url, init) => {
+    보낸것.push(...JSON.parse(init.body).input);
+    return new Response(JSON.stringify({ data: [{ index: 0, embedding: [1, 0] }] }));
+  });
+  context.mock.method(mariadb, 'createPool', () => ({
+    getConnection: async () => ({ query: async () => [], release: async () => {} }),
+    end: async () => {},
+  }));
+  try {
+    // ① 미설정 — 원문 그대로
+    delete process.env.EMBEDDING_QUERY_PREFIX;
+    await searchQaMethods('배치 재시작');
+    assert.deepEqual(보낸것, ['배치 재시작']);
+
+    // ② 큰따옴표로 준 값(dotenv가 이미 줄바꿈으로 푼 형태)
+    보낸것.length = 0;
+    process.env.EMBEDDING_QUERY_PREFIX = 'Instruct: 사내 질문에 답할 근거를 찾아라\nQuery: ';
+    await searchQaMethods('점검 일정');
+    assert.deepEqual(보낸것, ['Instruct: 사내 질문에 답할 근거를 찾아라\nQuery: 점검 일정']);
+
+    // ③ 따옴표를 잊어 백슬래시가 그대로 온 값 — dotenv는 큰따옴표일 때만 이스케이프를 푼다(실측 16.6.1).
+    //    두 표기가 같은 프롬프트가 되어야 '따옴표를 잊었는지'가 검색 결과를 가르지 않는다.
+    보낸것.length = 0;
+    process.env.EMBEDDING_QUERY_PREFIX = 'Instruct: 사내 질문에 답할 근거를 찾아라\\nQuery: ';
+    await searchQaMethods('점검 일정 2');
+    assert.deepEqual(보낸것, ['Instruct: 사내 질문에 답할 근거를 찾아라\nQuery: 점검 일정 2']);
+
+    // ④ 캐시 키는 접두를 뺀 원문이다 — 같은 검색어를 두 번 찾아도 임베딩 왕복은 한 번이다
+    보낸것.length = 0;
+    await searchQaMethods('점검 일정 2');
+    assert.deepEqual(보낸것, [], '같은 검색어가 접두 때문에 캐시를 비켜 갔다');
+  } finally {
+    if (savedUrl === undefined) delete process.env.EMBEDDING_URL; else process.env.EMBEDDING_URL = savedUrl;
+    if (savedPrefix === undefined) delete process.env.EMBEDDING_QUERY_PREFIX; else process.env.EMBEDDING_QUERY_PREFIX = savedPrefix;
+    await closePool();
+  }
+});
