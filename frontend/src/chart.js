@@ -533,17 +533,27 @@ export function chartFences(md) {
 
 // 펜스 탐색 전에 일반 코드블록을 가린다. 그 안에 적힌 ```chart는 문법 예시이며
 // 화면에서도 코드 그대로다. 줄 수를 유지해 변환하지 않은 원문은 그대로 이어 붙인다.
+// 공백으로 치는 글자는 markdown과 같이 스페이스·탭뿐이다. `.trim()`·`\s`는 NBSP·전각공백·얇은공백·
+// VT·FF까지 공백으로 세는데, micromark(=화면)는 그것을 공백으로 보지 않는다 — 그 어긋남이 그대로
+// '화면과 이력이 다른 글을 말한다'가 된다(실측, 여는 꼬리·닫는 꼬리 10종 전수):
+//   닫는 줄 ```+NBSP — 화면은 리터럴 블록이 안 닫혀 뒤까지 통째로 코드인데, 여기서는 닫힌 것으로 보아
+//     뒤를 가리지 않는다. 그러면 그 안의 ```chart가 이력에서만 표로 바뀌어, 사용자가 코드로 본 글이
+//     모델에게는 표로 간다(펜스·설정 줄·설명 문장이 함께 사라진다).
+//   여는 줄 ```chart+NBSP — 화면의 언어는 'chart\u00a0…'이라 그냥 코드블록인데, 여기서는 chart 블록으로
+//     보아 가리지 않는다. 그 안에 적힌 ```chart 예시가 이력에서만 표로 바뀐다.
+// 같은 파일의 OPEN_LINE_RE·CLOSE_LINE_RE는 처음부터 `[ \t]`만 본다 — 셋이 같은 규칙이어야 한다.
+const FENCE_TAIL_RE = /[^ \t]/;
 function maskLiteralFences(lines) {
   let open = null;
   return lines.map(line => {
     const m = /^[ \t]*(`{3,}|~{3,})([^\r\n]*)\r?$/.exec(line);
     if (open) {
       const result = open.literal ? '' : line;
-      if (m && m[1][0] === open.ch && m[1].length >= open.len && !m[2].trim()) open = null;
+      if (m && m[1][0] === open.ch && m[1].length >= open.len && !FENCE_TAIL_RE.test(m[2])) open = null;
       return result;
     }
     if (m && !(m[1][0] === '`' && m[2].includes('`'))) {
-      open = { ch: m[1][0], len: m[1].length, literal: !/^[ \t]*chart(?:\s|$)/i.test(m[2]) };
+      open = { ch: m[1][0], len: m[1].length, literal: !/^[ \t]*chart(?:[ \t]|$)/i.test(m[2]) };
       if (open.literal) return '';
     }
     return line;

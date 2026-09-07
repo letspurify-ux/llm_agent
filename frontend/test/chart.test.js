@@ -426,6 +426,31 @@ test('표도 `data:` 참조도 없는 chart 펜스는 화면에 남는 그대로
   assert.strictEqual(chartBlocksToTables('1. 항목\n\n    ```chart\n    그냥 글\n    ```'), '1. 항목\n\n    그냥 글');
 });
 
+// 펜스 줄의 '공백'은 markdown과 같이 스페이스·탭뿐이다. 여기가 넓으면 가리기(maskLiteralFences)가
+// 화면과 다른 자리에서 코드블록을 열고 닫아, 사용자가 코드로 본 글이 모델에게는 표로 간다.
+test('펜스 줄의 공백은 스페이스·탭뿐이다 — NBSP·전각공백이 붙은 펜스는 화면과 같이 펜스가 아니다', () => {
+  const NB = '\u00a0';
+  // 닫는 줄에 NBSP가 붙으면 markdown은 그 리터럴 블록을 닫지 않는다 — 뒤의 ```chart는 그 안의 글자다.
+  // `.trim()`으로 세던 때에는 여기서 닫힌 것으로 보아 뒤를 가리지 않았고, 그 ```chart가 이력에서만
+  // 표로 바뀌었다(펜스·구분 줄·닫는 줄이 사라진 채).
+  const inLiteral = `\`\`\`\`text\n\`\`\`\`${NB}\n\`\`\`chart\n| a | b |\n|---|---|\n| x | 1 |\n\`\`\`\n뒤`;
+  assert.strictEqual(chartBlocksToTables(inLiteral), inLiteral);
+  // 전각공백·얇은공백·수직탭도 같다 (markdown은 스페이스·탭만 센다)
+  for (const ws of ['\u3000', '\u2009', '\u000b', '\u000c']) {
+    const md = `\`\`\`\`text\n\`\`\`\`${ws}\n\`\`\`chart\n| a | b |\n| x | 1 |\n\`\`\`\n뒤`;
+    assert.strictEqual(chartBlocksToTables(md), md, `닫는 꼬리 ${JSON.stringify(ws)}`);
+  }
+  // 여는 줄도 같다: ```chart 다음이 NBSP면 markdown의 언어는 'chart\u00a0월별'이라 그냥 코드블록이다 —
+  // 그 안에 적힌 ```chart 예시를 이력에서 표로 바꾸면 화면과 다른 글을 모델에게 보내게 된다.
+  const notChart = `\`\`\`chart${NB}월별\n\`\`\`chart\n| a | b |\n|---|---|\n| x | 1 |\n\`\`\``;
+  assert.strictEqual(chartBlocksToTables(notChart), notChart);
+  // 스페이스·탭은 지금까지대로 펜스의 공백이다 (좁히면서 함께 막히지 않았는지)
+  assert.strictEqual(chartBlocksToTables('```text\n```\t\n```chart\n| a | b |\n| x | 1 |\n```'),
+    '```text\n```\t\n| a | b |\n| --- | --- |\n| x | 1 |');
+  assert.strictEqual(chartBlocksToTables('``` chart \n| a | b |\n| x | 1 |\n``` '),
+    '| a | b |\n| --- | --- |\n| x | 1 |');
+});
+
 // 값 읽기의 실패 방향은 한쪽으로만 열려 있어야 한다: 읽지 못하면 빈칸(그리지 않음)이지, 그럴듯한
 // 숫자로 읽어 없는 값을 그려서는 안 된다. 아래 두 가지는 실제로 그렇게 새던 자리다.
 test('구분자가 섞인 표기는 숫자가 아니다 — 묶음은 자리가 맞을 때만 벗긴다', () => {
