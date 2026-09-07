@@ -4,7 +4,7 @@ import express from 'express';
 import { handleQuestion, normalizeQuestion } from './agent.js';
 import { llmProvider } from './llm.js';
 import { oracleMock, oracleDriver, initOracleClient, closeOraclePools } from './oracle.js';
-import { syncEmbeddings, syncSummary, requestSyncStop } from './embed-sync.js';
+import { syncEmbeddings, syncSummary, requestSyncStop, shutdownSignal } from './embed-sync.js';
 import { warmUpEmbedding } from './search.js';
 import { insertChatLog, cleanupChatLogs, closePool } from './db.js';
 import { numEnv, warnOnce, clipText, MAX_QUESTION_LEN } from './constants.js';
@@ -273,7 +273,10 @@ function runJob(fn) {
 
 // 임베딩 모델 예열 — 검색이 벡터 단일 경로라 첫 검색이 모델 적재를 기다리면 첫 질문이 그만큼 늦다
 // (search.js warmUpEmbedding). 미설정이면 아무 일도 하지 않는다.
-runJob(() => warmUpEmbedding().then(ok => { if (ok) console.log('[embed] embedding model is warm'); }));
+// 아래 backgroundJobs가 기다리는 작업이므로 종료 신호를 함께 준다 — 주지 않으면 임베딩 서버가
+// 응답하지 않는 동안(모델 콜드 로드가 정상적으로 수십 초다) SIGTERM이 닿았을 때 이 호출이 자체
+// 타임아웃 60초까지 매달려 종료가 10초 강제 타이머로 밀린다. 동기화 쪽은 처음부터 같은 신호를 쓴다.
+runJob(() => warmUpEmbedding(shutdownSignal()).then(ok => { if (ok) console.log('[embed] embedding model is warm'); }));
 
 // 임베딩 diff 동기화: 기동 시 1회 + 주기 실행 (SQL로 직접 등록한 데이터도 자동 반영).
 // 결과 문구는 embed-sync.js가 SKIP 옆에서 만든다 — 여기서 SKIP 키 맵을 다시 들면

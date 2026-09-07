@@ -301,3 +301,73 @@ describe('진행 상황 스트림', () => {
     assert.equal((await next.json()).answer, '다음 답');
   });
 });
+
+// ===== 정상 종료 =====
+// 재배포는 SIGTERM으로 온다. 그 경로가 강제 타이머(10초)에 걸리면 두 가지를 함께 잃는다:
+// 종료 코드가 1이 되어 supervisor의 재시작 판정이 어긋나고, 그 타이머는 process.exit이라
+// closePool()·closeOraclePools()가 실행되지 않아 관리 DB에는 끊긴 커넥션이, 조회 DB에는 세션이 남는다.
+// server.js가 그 경로에 공들인 이유가 그것인데, 종료 경로가 기다리는 작업(backgroundJobs) 하나가
+// 신호를 받지 않으면 그 공이 통째로 무의미해진다 — 실제로 임베딩 예열이 그랬다(실측 10.0초/코드 1).
+// 이 검사는 '예열이 신호를 지나는가'를 프로세스 경계에서 본다 — 단위 검사(search.test.js)는 함수만 보므로
+// server.js가 신호를 넘기지 않는 회귀는 여기서만 드러난다.
+describe('정상 종료', () => {
+  let embed; let embedPort; let kproc; let klog = '';
+  const 열린요청 = [];
+  const 살아있나3 = () => !!kproc && kproc.exitCode === null && kproc.signalCode === null;
+  const 로그에 = re => new Promise(async resolve => {
+    for (let i = 0; i < 200; i++) {
+      if (re.test(klog)) return resolve(true);
+      if (!살아있나3()) return resolve(false);
+      await sleep(100);
+    }
+    resolve(false);
+  });
+
+  before(async () => {
+    embedPort = await freePort();
+    // 절대 답하지 않는 임베딩 서버 — 모델 콜드 로드가 길어진 상태를 그대로 흉내낸다.
+    embed = httpServer((req, res) => { 열린요청.push(res); });
+    await new Promise(r => embed.listen(embedPort, '127.0.0.1', r));
+    const deadPort = await freePort();
+    kproc = spawn(process.execPath, [join(ROOT, 'src', 'server.js')], {
+      cwd: ROOT,
+      env: {
+        ...process.env, PORT: String(await freePort()), ORACLE_MOCK: '1', LLM_PROVIDER: '', EMBED_SYNC_INTERVAL: '0',
+        EMBEDDING_URL: `http://127.0.0.1:${embedPort}/v1`,
+        MARIADB_HOST: '127.0.0.1', MARIADB_PORT: String(deadPort),
+        MARIADB_USER: 'backend_test', MARIADB_PASSWORD: '', MARIADB_DATABASE: 'backend_test',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    kproc.stdout.on('data', d => { klog += d; });
+    kproc.stderr.on('data', d => { klog += d; });
+  });
+
+  after(async () => {
+    kproc?.kill('SIGKILL');
+    for (const res of 열린요청) res.destroy();
+    if (embed) await new Promise(r => embed.close(r));
+  });
+
+  test('임베딩 예열이 매달려 있어도 SIGTERM이 정상 종료로 끝난다', async () => {
+    assert.ok(await 로그에(/agent server: http/), `서버가 뜨지 않았다: ${klog.slice(0, 400)}`);
+    // 예열 요청이 실제로 나가서 매달려 있는 상태를 만든 뒤에 종료한다.
+    for (let i = 0; i < 100 && !열린요청.length; i++) await sleep(50);
+    assert.equal(열린요청.length, 1, '임베딩 예열 요청이 나가지 않았다 — 이 검사가 아무것도 재지 못한다');
+    // 관리 DB가 없는 환경이라 나머지 주기 작업은 커넥터의 획득 상한(10초)까지 매달린다. 그 둘이
+    // 끝난 것을 확인하고 종료해야 이 검사가 재는 것이 '예열' 하나로 남는다 (강제 타이머와 경주하지 않게).
+    assert.ok(await 로그에(/\[embed\] sync failed/), '주기 동기화가 실패로 끝나지 않았다');
+    assert.ok(await 로그에(/\[chat_log\] cleanup failed/), 'chat_log 정리가 실패로 끝나지 않았다');
+
+    const 시작 = Date.now();
+    kproc.kill('SIGTERM');
+    // 강제 타이머(10초)보다 넉넉히 기다린다 — 회귀했을 때 '아직 살아 있다'가 아니라 '강제 종료로 끝났다'는
+    // 정확한 실패 문구가 나오게. 정상 경로에서는 첫 몇 번의 확인 안에 끝난다.
+    for (let i = 0; i < 260 && 살아있나3(); i++) await sleep(50);
+    const 걸린시간 = Date.now() - 시작;
+    assert.equal(살아있나3(), false, `SIGTERM 뒤에도 프로세스가 남아 있다 (${걸린시간}ms)`);
+    assert.equal(kproc.exitCode, 0, `정상 종료가 강제 종료로 끝났다 (${걸린시간}ms, 로그: ${klog.slice(-300)})`);
+    assert.ok(!/cleanup timed out/.test(klog), `종료가 강제 타이머까지 갔다 (${걸린시간}ms)`);
+    assert.ok(걸린시간 < 5000, `정상 종료가 ${걸린시간}ms 걸렸다 — 예열이 종료 신호를 받지 못한다`);
+  });
+});

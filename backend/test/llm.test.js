@@ -183,6 +183,28 @@ test('잘린 답변의 펜스 닫기는 markdown 규칙을 따른다 — ~~~ 펜
   assert.strictEqual(t[0], '글'); assert.match(t[2], note);
 });
 
+test('홑 CR로 줄을 바꾼 답변도 줄 끝을 저장소의 나머지와 같이 센다', () => {
+  // markdown(CommonMark)도 이 저장소의 다른 자리도 홑 CR을 줄 끝으로 본다(constants.indentLines,
+  // chart.js fencedBlocks·splitBlock, 위의 cell, 프런트 파서). clipAnswer의 두 자리만 '\n'을 보던 동안
+  // CR로 줄을 바꾼 본문에서 두 보호가 함께 꺼졌다(실측): 마지막 줄바꿈을 못 찾아 표 행이 '| 2026-'처럼
+  // 반만 남았고(프런트는 그 조각을 값으로 그린다) 열린 펜스를 닫지 못해 안내 문장이 코드블록에 삼켜졌다.
+  // 닿는 경로는 폴백 답변이다 — 조회 결과와 등록 원문 그대로의 지식 본문을 이어 붙여 이 상한을 실제로 넘고,
+  // CR은 그 등록 원문에서 온다 (CRLF는 위 검사가, LF는 그 앞 검사가 이미 잡는다).
+  const rows = Array.from({ length: Math.ceil(MAX_ANSWER_LEN / 20) }, (_, i) => `| 2026-01 | ${100000 + i} |`).join('\r');
+  const t = sanitizeDecision({
+    action: 'answer',
+    answer: `앞 문장\r\r\u0060\u0060\u0060chart\rtype: bar\rtitle: 월별\r| 월 | 건수 |\r|---|---|\r${rows}\r\u0060\u0060\u0060\r`,
+  }).answer;
+  assert.match(t, /생략했습니다/);
+  const 본문 = t.slice(0, t.lastIndexOf('\n\n'));           // 안내 문장을 뗀 나머지
+  const 줄 = 본문.split(/\r\n?|\n/);
+  assert.strictEqual(줄[줄.length - 1], '\u0060\u0060\u0060', '열린 펜스를 닫지 않아 안내 문장이 코드블록에 삼켜진다');
+  const 표 = 줄.slice(줄.findIndex(l => l.startsWith('|---')) + 1, -1);
+  const 깨진행 = 표.find(l => !/^\| 2026-01 \| 1\d{5} \|$/.test(l));
+  assert.strictEqual(깨진행, undefined, `표 행이 반만 남았다: ${JSON.stringify(깨진행)}`);
+  assert.ok(표.length > 100, `표가 통째로 사라졌다 (${표.length}행)`);
+});
+
 test('바인드로 쓸 수 없는 긴 이름은 뭉개거나 개명하지 않고 버린다', () => {
   // 이름을 자르면 두 방향 모두로 깨진다. 그냥 자르면 앞부분이 같은 두 이름이 한 키로 뭉개져
   // 다른 바인드의 값이 사라지고, 뭉개짐을 피하려 순번을 붙이면(base~2) 그 이름은 ① '~'가

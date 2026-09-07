@@ -259,13 +259,20 @@ export function resolveTableData(answer, steps) {
   let budget = MAX_TABLE_INJECT_LEN;
   return replaceBlocks(text, blocks, (whole, indent, _fence, _ch, body = '') => {
     const { config, ref } = refOf(body);
-    // 참조가 없을 때 할 일이 두 경우에 다르다.
+    // 참조가 없을 때 할 일이 세 경우에 다르다.
     //   cols·limit 같은 이 블록의 설정 줄이 있다 — 모델이 이 블록을 쓰려다 step만 빠뜨린 것이다. 본문을
     //     그대로 내보내면 'cols: A' 'limit: 5'라는 설정 줄이 답변 글자로 사용자에게 보인다. 안내로 바꾼다.
-    //   설정 줄도 없다 — 모델이 펜스를 다른 용도로 쓴 것이다. 펜스만 벗겨 본문이 렌더되게 한다(표를 손수
-    //     적었으면 표로, 다른 글이면 글로). 그대로 두면 화면이 코드블록으로 보여 무엇인지 알 수 없다 —
-    //     프런트는 chart·mermaid 펜스만 따로 알아보기 때문이다(차트 블록을 손대지 않는 것과 다른 이유다).
-    if (ref === undefined) return Object.keys(config).length ? tableNote('step 참조가 없습니다', indent) : body;
+    //   본문에 보이는 글자가 있다 — 모델이 펜스를 다른 용도로 쓴 것이다. 펜스만 벗겨 본문이 렌더되게 한다
+    //     (표를 손수 적었으면 표로, 다른 글이면 글로). 그대로 두면 화면이 코드블록으로 보여 무엇인지 알 수
+    //     없다 — 프런트는 chart·mermaid 펜스만 따로 알아보기 때문이다(차트 블록을 손대지 않는 것과 다른 이유다).
+    //   본문이 비었다 — '다른 용도'가 아니다. 벗길 본문이 없으므로 벗기면 그 블록 자리에 아무것도 남지
+    //     않는데, 그 블록이 답변의 전부이면 답변 자체가 빈 문자열이 된다 (실측: 여는 펜스와 닫는 펜스
+    //     사이가 비었거나 공백뿐인 table 블록 하나만 든 답변).
+    //     빈 답변은 이 저장소가 두 곳에서 막기로 한 것이다 — llm-openai.js toDecision이 결정으로 받지 않고
+    //     agent.js answerOf가 폴백으로 넘기는데, 후처리는 그 둘보다 '뒤'라 두 가드를 모두 지난 답변을
+    //     비워 버린다. 화면에는 빈 말풍선이 뜨고 chat_log에는 답한 것으로 기록된다. 설정 줄만 있는 블록과
+    //     같은 실패(쓰려다 만 표)이므로 같은 안내로 바꾼다.
+    if (ref === undefined) return Object.keys(config).length || !body.trim() ? tableNote('step 참조가 없습니다', indent) : body;
     const allow = Math.floor(budget / Math.max(1, blocksLeft--));
 
     const n = stepOf(ref);

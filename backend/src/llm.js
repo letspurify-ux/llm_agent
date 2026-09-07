@@ -71,6 +71,19 @@ const MAX_DECISION_PARAMS = 20;
 // 조용히 자르면 끊긴 문장을 답변의 끝으로 읽는다 (프롬프트의 TRUNC_MARK와 같은 이유).
 const ANSWER_TRUNC_NOTE = '\n\n*(답변이 너무 길어 이후 내용을 생략했습니다.)*';
 
+// 줄 끝은 저장소의 나머지와 같은 규칙으로 센다 — 홑 CR(\r)도 줄 끝이다. markdown(CommonMark)이 그렇게 읽고,
+// 이 저장소의 다른 자리도 전부 그렇다: constants.indentLines, chart.js의 fencedBlocks·splitBlock, 바로 아래 cell,
+// 프런트 파서. 아래 두 자리만 '\n'을 보던 동안 CR로 줄을 바꾼 본문에서 두 가지가 함께 깨졌다(실측).
+//   ① 마지막 줄바꿈을 못 찾아 '줄 중간에서 자르지 않는다'가 통째로 꺼진다 — 차트 블록 안의 표 행이
+//      '| 2026-'처럼 반만 남고, 프런트는 그 조각을 값으로 그린다(clipAnswer가 막겠다고 적어둔 그 오답).
+//   ② 여는 펜스 줄도 줄로 보이지 않아 열린 코드블록을 닫지 못한다 — 아래 안내 문장이 코드블록의
+//      글자로 읽혀 '잘렸다'는 사실 자체가 화면에서 사라진다(openFence가 막겠다고 적어둔 그 실패).
+// 닿는 경로는 폴백 답변(agent.js fallbackAnswer)이다 — 조회 결과와 등록 원문 그대로의 지식 본문을 이어
+// 붙이므로 이 상한을 실제로 넘고(실측 57만 자), CR은 그 등록 원문에서 온다.
+// 선언을 쓰는 곳보다 앞에 둔다 — 함수 선언과 달리 const는 호이스팅되지 않는다(constants.js 머리말과 같은 이유).
+const LINE_BREAK = /\r\n?|\n/;
+const lastLineBreak = s => Math.max(s.lastIndexOf('\n'), s.lastIndexOf('\r'));
+
 // 답변 크기를 확정하는 단일 지점 (constants.MAX_ANSWER_LEN 주석 참고).
 // 함수로 떼어낸 이유: 답변이 시스템을 빠져나가는 경로가 둘인데 하나만 묶여 있었다.
 //   ① LLM의 결정 — 아래 sanitizeDecision
@@ -85,7 +98,7 @@ export function clipAnswer(answer) {
   let cut = clipText(s, MAX_ANSWER_LEN);
   // 줄 중간에서 자르지 않는다 — 표의 행이 반만 남으면 '| 2024-03 | 1' 의 1이 값으로 읽히고, 차트 블록
   // 안이면 프런트가 그 값을 그린다(조용한 오답). 한 줄이 상한의 절반을 넘는 글(줄바꿈 없는 덩어리)은 그냥 자른다.
-  const nl = cut.lastIndexOf('\n');
+  const nl = lastLineBreak(cut);
   if (nl > MAX_ANSWER_LEN / 2) cut = cut.slice(0, nl);
   // 코드펜스 안에서 잘렸으면 닫는다 — 열린 채 두면 아래 안내 문장까지 코드블록의 글자로 읽힌다
   // (차트 블록이면 표 아래 설명 줄로 버려져 잘린 사실이 화면에서 사라진다).
@@ -101,7 +114,7 @@ export function clipAnswer(answer) {
 // 들여쓰기는 chart.js FENCE_RE와 같이 칸 수를 따지지 않는다(목록 안의 펜스).
 function openFence(text) {
   let open = null;
-  for (const line of text.split(/\r?\n/)) {
+  for (const line of text.split(LINE_BREAK)) {
     const m = /^[ \t]*((`|~)\2{2,})(.*)$/.exec(line);
     if (!m) continue;
     if (open) { if (m[2] === open.ch && m[1].length >= open.len && !m[3].trim()) open = null; }

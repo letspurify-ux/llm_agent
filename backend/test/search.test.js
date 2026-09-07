@@ -208,3 +208,36 @@ test('지식 검색은 문서 상한보다 많은 청크를 받는다 — 병합
     assert.ok(!/CHUNK_OVERFETCH/.test(other), `${name}에는 배수가 필요 없다`);
   }
 });
+
+// 예열(warmUpEmbedding)은 server.js가 종료 경로에서 기다리는 backgroundJobs의 하나다. 임베딩 서버가
+// 응답하지 않으면 embed()의 자체 상한은 60초인데(모델 콜드 로드가 30초+ 걸리는 것이 정상이라 그 창은
+// 기동 직후 재배포와 정확히 겹친다), 종료 경로의 강제 타이머는 10초다 — 신호를 받지 않으면 정상 종료가
+// 매번 강제 종료(코드 1)가 되고 그 타이머는 process.exit이라 closePool()·closeOraclePools()가 실행되지
+// 않는다(실측: 10.0초/코드 1 → 신호를 준 뒤 50ms/코드 0). 같은 신호를 쓰는 embed-sync는 처음부터
+// 그렇게 하고 있었으므로, 이 검사는 '형제 갈래가 같은 신호를 지나는가'를 잡는다.
+test('예열은 종료 신호를 받으면 임베딩 상한(60초)까지 매달리지 않는다', async context => {
+  const saved = process.env.EMBEDDING_URL;
+  process.env.EMBEDDING_URL = 'http://test.invalid/v1';
+  const warnings = [];
+  context.mock.method(console, 'warn', (...args) => { warnings.push(args.join(' ')); });
+  // 신호가 끊을 때까지 답하지 않는 임베딩 서버 (embedding.test.js의 상한 검사와 같은 대역)
+  context.mock.method(globalThis, 'fetch', (_url, { signal }) => new Promise((_, reject) => {
+    signal.addEventListener('abort', () => reject(Object.assign(new Error('This operation was aborted'), { name: 'AbortError' })), { once: true });
+  }));
+  try {
+    const controller = new AbortController();
+    const warming = warmUpEmbedding(controller.signal);
+    controller.abort();
+    const outcome = await Promise.race([
+      warming.then(ok => ({ ok })),
+      new Promise(resolve => setTimeout(() => resolve('매달림'), 500)),
+    ]);
+    assert.notEqual(outcome, '매달림', '종료 신호를 무시하고 임베딩 상한까지 기다렸다');
+    assert.equal(outcome.ok, false);
+    // 정상 종료로 끊은 것은 실패가 아니다 — 경고를 남기면 재배포마다 '임베딩 서버에 닿지 못했다'는
+    // 오해를 부르는 줄이 쌓인다 (embed-sync.js embedStale이 쓰는 것과 같은 판정).
+    assert.deepEqual(warnings.filter(w => /embedding call failed/.test(w)), []);
+  } finally {
+    if (saved === undefined) delete process.env.EMBEDDING_URL; else process.env.EMBEDDING_URL = saved;
+  }
+});

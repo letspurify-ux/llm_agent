@@ -173,13 +173,23 @@ function embedText(text) {
 // 바꾼다 — README) 한산한 시간대의 첫 검색이 모델 재적재(수 초)를 그대로 낸다. 기동 시 한 번
 // 불러 두면 최소한 첫 질문은 그 비용을 내지 않는다. 실패해도 조용히 넘긴다 — 검색 시점에 다시
 // 시도하고 그때의 실패는 그쪽이 알린다. 미설정이면 아무것도 하지 않는다(경고는 검색 시점에 한 번).
-export async function warmUpEmbedding() {
+//
+// signal은 정상 종료 신호다(embed-sync.js shutdownSignal — 배선은 server.js가 한다). 반드시 받아야 한다:
+// 이 호출은 종료 경로가 기다리는 backgroundJobs의 하나인데(server.js), 임베딩 서버가 응답하지 않으면
+// embed()의 자체 타임아웃 60초까지 매달린다 — 모델 콜드 로드가 30초+ 걸리는 것이 정상이라 그 창은
+// 기동 직후 재배포와 정확히 겹친다. 신호가 없던 동안 SIGTERM이 그 사이에 닿으면 종료가 10초 강제
+// 타이머로 밀려 종료 코드 1이 되고, 그 타이머는 process.exit이라 closePool()·closeOraclePools()가
+// 실행되지 않았다(실측). 같은 신호를 쓰는 embed-sync는 처음부터 그렇게 하고 있었다 — 형제 갈래만 빠져 있었다.
+// 요청 경로의 임베딩(embedText)에는 여전히 주지 않는다 (embed-sync.js의 신호 주석).
+export async function warmUpEmbedding(signal) {
   if (!isEmbeddingEnabled()) return false;
   try {
-    await embed(['warm-up']);
+    await embed(['warm-up'], signal);
     return true;
   } catch (e) {
-    warnEmbeddingFailure(e);
+    // 종료 신호로 끊긴 호출은 실패가 아니다 — 경고를 남기면 정상 재배포마다 '임베딩 서버에 닿지
+    // 못했다'는 오해를 부르는 줄이 쌓인다 (embed-sync.js embedStale이 쓰는 것과 같은 판정).
+    if (!signal?.aborted) warnEmbeddingFailure(e);
     return false;
   }
 }

@@ -461,6 +461,22 @@ test('쓸 수 있는 답변인지는 두 답변 경로가 같은 함수로 판�
   assert.equal(answerOf(undefined), null);
 });
 
+test('답변 후처리가 답변을 통째로 비우지 않는다 — 두 가드보다 뒤에서 도는 자리다', async () => {
+  // '빈 답변은 내보내지 않는다'를 두 곳이 막는다(llm-openai.js toDecision, 바로 위 answerOf). 그런데
+  // 표·차트 참조 채우기(finish)는 그 둘보다 '뒤'에 돌므로, 후처리가 답변을 비우면 두 가드를 모두 지난
+  // 답변이 빈 문자열로 나간다 — 화면에는 빈 말풍선이 뜨고 chat_log에는 답한 것으로 기록된다.
+  // 실제로 그런 답변이 있었다: 참조도 설정 줄도 없는 빈 ```table 블록 하나만 든 답변에서 펜스를 벗기면
+  // 남는 글자가 없다(적대적 세션 소크로 잡았다 — chart.js에 회귀 검사를 함께 두었다).
+  // 여기서는 후처리가 무엇을 하든 이 경계를 넘어 빈 답변이 나가지 않는지를 본다.
+  for (const answer of ['```table\n```', '```table\n   \n```', '```chart\ntype: bar\ndata: step 9\n```']) {
+    const r = await handleQuestion('질문', [], {
+      deps: { search: async () => ({}), run: async () => ({ rows: [], totalRows: 0, capped: false }),
+        decide: async () => ({ action: 'answer', answer }) },
+    });
+    assert.ok(typeof r.answer === 'string' && r.answer.trim(), `후처리가 답변을 비웠다: ${JSON.stringify(answer)}`);
+  }
+});
+
 test('대상 DB가 다르면 같은 쿼리·같은 파라미터라도 다른 실행이다', () => {
   // 대상 DB가 여럿인 쿼리에서 이 구분이 없으면 '서울 재고를 보고 이어서 부산 재고를 본다'는
   // 정상 흐름이 '이미 같은 파라미터로 실행된 쿼리'로 끊긴다 — 이름도 바인드도 같고 다른 것은

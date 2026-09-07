@@ -313,6 +313,20 @@ test('0건·없는 스텝·번호 없는 참조는 안내 문장으로, 참조 �
   assert.strictEqual(resolveTableData('표 없는 답', [rows]), '표 없는 답');
 });
 
+test('본문이 빈 table 블록은 벗기지 않는다 — 답변이 통째로 사라진다', () => {
+  // '펜스만 벗긴다'는 규칙은 벗길 본문이 있을 때의 규칙이다. 본문이 없으면 벗긴 자리에 아무것도
+  // 남지 않고, 그 블록이 답변의 전부이면 답변 자체가 빈 문자열이 된다 — 화면에는 빈 말풍선이 뜨고
+  // chat_log에는 답한 것으로 기록된다. 빈 답변은 이 저장소가 두 곳에서 막기로 한 것인데
+  // (llm-openai.js toDecision이 결정으로 받지 않고, agent.js answerOf가 폴백으로 넘긴다) 후처리는
+  // 그 둘보다 뒤라, 두 가드를 모두 지난 답변을 이 자리에서 비웠다(적대적 세션 소크로 잡았다).
+  for (const body of ['', '   ', '\n \n']) {
+    const out = resolveTableData(tblock(body), [rows]);
+    assert.match(out, /^_표를 채우지 못했습니다: step 참조가 없습니다_$/, JSON.stringify(body));
+  }
+  // 본문이 있는 블록은 종전대로 벗긴다 (바로 위 검사의 규칙을 좁히지 않았다는 확인).
+  assert.strictEqual(resolveTableData(tblock('그냥 글'), [rows]), '그냥 글');
+});
+
 test('표 블록도 스텝 번호는 이력의 절대 인덱스이고, 들여쓴 펜스는 같은 들여쓰기로 채운다', () => {
   const out = resolveTableData(tblock('step: 2', '  '), [null, rows]);
   assert.ok(out.startsWith('  | MONTH |') && out.includes('\n  | --- |'), out);

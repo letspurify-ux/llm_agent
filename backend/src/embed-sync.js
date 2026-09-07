@@ -120,7 +120,7 @@ const LOCK_NAME = 'space_voc_embed_sync';
 //      닿았을 때 그 호출의 자체 타임아웃(60초)까지 기다려야 하고, 그동안 락 커넥션을 쥔 채라
 //      종료가 그대로 강제 타이머로 밀린다. 임베딩 서버가 응답하지 않는 상태가 정확히 그 경우다.
 // 신호는 프로세스 수명 동안 한 번만 켜진다(되돌리지 않는다) — 켜졌다는 것은 종료 중이라는 뜻이다.
-// 요청 경로의 임베딩(search.js)에는 이 신호를 주지 않는다: 처리 중인 질문은 server.close()가
+// 요청 경로의 임베딩(search.js embedText)에는 이 신호를 주지 않는다: 처리 중인 질문은 server.close()가
 // 끝까지 기다리므로, 그쪽 호출까지 끊으면 아직 응답하지 않은 요청의 검색이 무너진다.
 let stopRequested = false;
 const stopSignal = new AbortController();
@@ -129,6 +129,15 @@ export function requestSyncStop() {
   stopRequested = true;
   stopSignal.abort();
 }
+
+// 같은 신호를 응답 경로 밖의 다른 임베딩 호출도 쓴다 — 지금은 기동 시 모델 예열
+// (server.js → search.js warmUpEmbedding)이다. 그쪽도 종료 경로가 기다리는 backgroundJobs의
+// 하나이고 embed()의 자체 타임아웃이 60초라, 신호를 주지 않으면 위 ②가 막겠다고 적어둔 결과가
+// 그 갈래에서 그대로 난다: SIGTERM이 예열 도중에 닿으면 종료가 10초 강제 타이머로 밀려
+// 종료 코드 1이 되고, closePool()·closeOraclePools()가 실행되지 않는다(실측 10.0초/코드 1).
+// 신호를 export로 내주고 배선은 server.js가 한다 — search.js가 이 모듈을 import하면 순환이 된다
+// (이 파일이 search.js의 SEARCH_COLUMNS·vecTable을 쓴다).
+export const shutdownSignal = () => stopSignal.signal;
 
 export async function syncEmbeddings() {
   if (running) return { embedded: 0, deleted: 0, failed: 0, skipped: SKIP.BUSY };
