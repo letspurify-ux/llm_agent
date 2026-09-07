@@ -22,6 +22,10 @@ const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포�
                                // 프런트(App.jsx REQUEST_TIMEOUT_MS)가 이 계산에 맞춰져 있으니 함께 고칠 것.
 const MAX_PROMPT_QUERIES = 30; // 검색 한 번의 쿼리 후보 수. 실제 표시는 별도 예산으로 제한한다.
 const MAX_SAME_QUERY_TRIES = 2; // 같은 쿼리·파라미터의 최대 실행 시도 (1회 실패는 일시 오류일 수 있어 재시도 허용)
+// 성립하지 않은 검색('검색 불가')의 최대 시도 수. 근거는 위와 같다 — 첫 실패는 일시 오류일 수 있다:
+// 임베딩 모델이 유휴 뒤 내려가 다시 올라오는 데 수십 초가 걸리고(search.js warmUpEmbedding), 관리 DB도
+// 순간 장애를 낸다. 두 번째까지 실패하면 반복을 끊는다.
+const MAX_SAME_SEARCH_TRIES = 2;
 // 경로A(qa_method 본문이 지목한 쿼리)에서 관리 DB로 보내는 본문 길이 상한.
 // qa_method.method는 TEXT(64KB)이고 검색은 최대 20건을 돌려주므로, 상한이 없으면 요청마다
 // 1MB가 넘는 문자열이 바인드로 나가고 등록 행마다 그 길이를 훑게 된다.
@@ -415,12 +419,30 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
     return n;
   };
 
+  // 청구가 '앞으로 가져오기'로 할 수 있는 일이 남았는가. 없으면 그 이유를 돌려준다.
+  //   front   — 이미 목록 맨 앞이라 옮길 자리가 없다. 그 자리는 문서별 첫 항목이자 renderItems가 '첫 본문 한 건은
+  //             반드시 싣는다'로 보장하는 자리라, 옮기지 못한다는 것과 이미 실려 있다는 것이 같은 말이다.
+  //   covered — 같은 문서의 앞선 항목이 이 항목의 청크를 이미 전부 싣고 있다 (knowledgeView의 covered).
+  //             확대가 다른 보관 구간을 통째로 삼킨 뒤의 상태다. 삼켜진 구간은 ID가 남으므로 본문 없이
+  //             '- (보관 중, expand로 다시 표시: k37)'로 안내되는데, 모델이 그 안내를 그대로 따르면 새로 보이는
+  //             글자는 없이 문서 상한(MAX_DOC_LEN)만 나눠 쓰게 되어 지금 보이던 본문이 줄어든다
+  //             (퍼저 실측: 한 문서의 실린 청크가 12개에서 10개로). 청구가 보여주던 것을 도로 가져가는 셈이다.
+  // 넓힐 것이 남은 청구는 이 판정보다 먼저 처리한다 — 삼켜진 구간이라도 문서 바깥쪽으로는 더 읽을 수 있고,
+  // 그때 늘어난 본문은 어느 항목도 싣고 있지 않은 진짜 새 내용이다.
+  const noRoomToBringForward = (row, i) => {
+    if (i === 0) return 'front';
+    if (row.doc_seq == null) return null;
+    return knowledgeView(knowledge).find(view => view.seq === row.seq)?.covered ? 'covered' : null;
+  };
+
   // 확대·복구한 항목은 앞에 고정한다. 이후 검색도 이 우선순위를 유지한다.
-  // done은 성공한 ID, saturated는 읽어도 본문이 늘지 않은 수, unread는 DB 읽기 실패 수다.
+  // done은 성공한 ID, saturated는 읽어도 본문이 늘지 않은 수, unread는 DB 읽기 실패 수,
+  // covered는 이미 다른 항목으로 전부 실려 있어 청구할 것이 없던 수다.
   const applyExpand = async ids => {
     const done = [];
     let saturated = 0;
     let unread = 0;
+    let covered = 0;
     for (const id of ids ?? []) {
       if (expands >= MAX_EXPANDS) break;
       const { list, i } = rowAt(id);
@@ -439,8 +461,10 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       if (row.doc_seq != null) {
         // 청구한 구간의 ID를 유지하며 앞뒤 청크를 읽는다. 다른 구간은 캐시에 그대로 남는다.
         if (!canGrow(row)) {
-          // 표시 예산에 밀린 구간도 같은 ID로 앞으로 가져올 수 있다.
-          if (i === 0) continue;
+          // 표시 예산에 밀린 구간도 같은 ID로 앞으로 가져올 수 있다 — 옮길 자리와 실을 것이 남아 있을 때만이다.
+          const blocked = noRoomToBringForward(row, i);
+          if (blocked === 'covered') { covered++; continue; }
+          if (blocked) continue;
           row.expanded = true;
           list.splice(i, 1);
           list.unshift(row);
@@ -449,17 +473,37 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
           continue;
         }
         const grown = await growItem(row, loadChunks);
-        if (!grown) { unread++; continue; }          // 읽기 실패 — 판정할 근거가 없으니 아무것도 바꾸지 않는다
-        // seq는 덮어쓰지 않는다. 모델이 지목한 번호가 그 스텝에 바뀌면 방금 청구한 항목을 다시
-        // 청구할 수도 버릴 수도 없다 — 'seq는 요청 내내 고정'이 식별자 설계의 근거다
-        // (constants.js ITEM_PREFIX). rep을 그대로 넘기므로 지금은 같은 값이 오지만, 그 계약을
-        // 호출 인자에 기대지 않고 여기서 구조로 못 박는다.
-        const { seq: _ignored, ...widened } = grown;
-        const progressed = grown.content.length > row.content.length;
-        // 늘지 않았어도 판정(full)은 받아 적는다 — 그래야 다음 프롬프트에서 확대 표시가 사라진다. 이 표시를 세우지
-        // 않으면 모델은 같은 번호를 다시 청구하고, 그 헛도는 스텝이 둘이면 강제 답변으로 넘어간다(실측).
-        Object.assign(row, widened);
-        if (!progressed) { saturated++; continue; }   // 늘지 않았으면 진도가 아니다
+        // 본문이 늘지 않아도(읽기 실패·상한 포화) 청구에는 할 일이 하나 남아 있다 — '앞으로 가져오기'다.
+        // 그 일은 DB를 읽지 않으며, 표시 예산에 밀려 보관 목록에만 있던 항목에는 그것이 곧 '본문이 실리는가'를
+        // 가른다. 시스템 프롬프트가 "보관 목록의 ID를 청구하면 저장된 본문을 다시 우선 표시한다"고, context.md 2절이
+        // "expand는 … 보관된 항목을 앞으로 가져온다"고 내건 약속이 이 자리다. 두 갈래에서 그대로 continue 하던 동안
+        // 그 약속이 깨졌다: 프롬프트가 '- (보관 중, expand로 다시 표시: k37)'로 이름을 대 준 항목을 모델이 그대로
+        // 청구했는데 본문은 끝내 실리지 않고, 안내는 '지금 범위로 답변하라'라 — 모델은 본 적 없는 범위로 답하라는
+        // 말을 듣는다. 둘뿐인 청구 기회가 그렇게 둘 다 사라지면 강제 답변으로 넘어간다(퍼저 실측).
+        // 그래서 판정을 '늘었는가'가 아니라 '이 청구로 할 수 있는 일이 남았는가'로 옮긴다. 남은 일이 없는 경우는
+        // 하나뿐이다 — 이미 목록 맨 앞이면 옮길 자리가 없고, 그 자리는 반드시 표시된다(문서별 첫 항목이자
+        // renderItems의 '첫 본문 한 건은 반드시 싣는다'). 위 !canGrow 갈래가 쓰는 것과 같은 기준이다.
+        if (!grown) {
+          // 읽기 실패 — 판정(full)할 근거가 없으니 기존 본문과 표시를 그대로 보존한다.
+          const blocked = noRoomToBringForward(row, i);
+          if (blocked === 'covered') { covered++; continue; }
+          if (blocked) { unread++; continue; }
+        } else {
+          // seq는 덮어쓰지 않는다. 모델이 지목한 번호가 그 스텝에 바뀌면 방금 청구한 항목을 다시
+          // 청구할 수도 버릴 수도 없다 — 'seq는 요청 내내 고정'이 식별자 설계의 근거다
+          // (constants.js ITEM_PREFIX). rep을 그대로 넘기므로 지금은 같은 값이 오지만, 그 계약을
+          // 호출 인자에 기대지 않고 여기서 구조로 못 박는다.
+          const { seq: _ignored, ...widened } = grown;
+          const progressed = grown.content.length > row.content.length;
+          // 늘지 않았어도 판정(full)은 받아 적는다 — 그래야 다음 프롬프트에서 확대 표시가 사라진다. 이 표시를 세우지
+          // 않으면 모델은 같은 번호를 다시 청구하고, 그 헛도는 스텝이 둘이면 강제 답변으로 넘어간다(실측).
+          Object.assign(row, widened);
+          if (!progressed) {
+            const blocked = noRoomToBringForward(row, i);
+            if (blocked === 'covered') { covered++; continue; }
+            if (blocked) { saturated++; continue; }   // 옮길 자리도 없고 늘지도 않았으면 진도가 아니다
+          }
+        }
         // 핀 표시. mergeFront가 이 표시로 펼침 구간을 알아보고 그 뒤에 새 검색 결과를 끼운다 —
         // 표시를 세우지 않으면 다음 검색이 청구한 구간을 그대로 앞에서 밀어낸다.
         row.expanded = true;
@@ -475,7 +519,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       expands++;
       done.push(id);
     }
-    return { done, saturated, unread };
+    return { done, saturated, unread, covered };
   };
 
   // 이력 줄은 상한이 있다 — 자리가 없으면 안내를 접는다. 그때는 루프가 곧 그 상한에서 멈추므로
@@ -724,7 +768,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       ? applyDrop(decision.drop) : 0;
 
     if (decision.action === 'expand') {
-      const { done: grownIds, saturated, unread } = await applyExpand(decision.ids);
+      const { done: grownIds, saturated, unread, covered } = await applyExpand(decision.ids);
       // 펼쳤거나 버렸으면 자료가 달라졌다 — 진도로 본다. 둘 다 없으면 헛돈 스텝이다.
       if (grownIds.length || droppedNow) { guardHits = 0; continue; }
       // 번호가 붙어 있던 항목이 늘지 않은 경우는 따로 말한다 — '번호가 붙은 항목만 청구할 수 있다'는 안내는
@@ -738,9 +782,14 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
           ? `본문 청구 상한(${MAX_EXPANDS}건)에 닿았다 — 지금까지의 자료로 답변하라`
           : unread
             ? '청구한 본문을 읽어 오지 못했다 (관리 DB 오류 또는 검색 이후 본문 변경) — 같은 번호를 다시 청구하지 말고 지금 범위로 답변하라'
-            : saturated
-              ? '청구한 항목은 더 넓힐 수 없다 — 이웃 조각이 문서당 글자 상한에 들어가지 않는다. 지금 범위로 답변하라'
-              : '표시할 새 내용이 없다 — 확대 가능하거나 보관 목록에 있는 항목을 청구하라',
+            // 보관 목록에 있는 번호를 그대로 청구했는데 그 본문이 이미 다른 항목으로 실려 있는 경우다.
+            // 여기에 '보관 목록에 있는 항목을 청구하라'는 기본 안내를 주면 모델이 방금 한 일과 모순된다 —
+            // 같은 번호를 다시 청구하고 둘째 헛돈 스텝에서 강제 답변으로 넘어간다.
+            : covered
+              ? '청구한 항목의 본문은 이미 같은 문서의 다른 항목으로 실려 있다 — 그 번호는 다시 청구하지 말고 지금 보이는 본문으로 답변하라'
+              : saturated
+                ? '청구한 항목은 더 넓힐 수 없다 — 이웃 조각이 문서당 글자 상한에 들어가지 않는다. 지금 범위로 답변하라'
+                : '표시할 새 내용이 없다 — 확대 가능하거나 보관 목록에 있는 항목을 청구하라',
       });
       if (++guardHits >= MAX_GUARD_HITS) break;
       continue;
@@ -751,11 +800,21 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       const targets = decision.targets;
       const key = searchKey(text, targets);
       // 같은 검색의 반복과 횟수 상한은 루프 가드와 같은 부류다 — note로 남기고 연속 카운터를 올린다.
-      const guardNote = history.some(h => h.search !== undefined && !h.note && searchKey(h.search, h.targets) === key)
+      // '같은 부류'에는 루프 가드가 성공과 실패를 가르는 것도 포함된다(loopGuard의 MAX_SAME_QUERY_TRIES):
+      // 요청한 대상이 전부 '검색 불가'였던 시도는 아무것도 찾아보지 못한 것이라 반복으로 셀 수 없다.
+      // 세던 동안 임베딩 서버가 한 번 늦게 답한 것만으로 그 검색어가 그 요청에서 영영 막혔고, 안내는
+      // '검색된 자료로 답변하라'라 — 자료가 하나도 없는 상태에서 있지도 않은 자료로 답하라는 말이 된다
+      // (시스템 프롬프트가 '검색 불가'에 대해 지시하는 것과도 어긋난다). 두 번째 실패까지 세어 반복은 끊는다.
+      const sameKey = history.filter(h => h.search !== undefined && !h.note && searchKey(h.search, h.targets) === key);
+      const nothingSearched = h => (h.failed?.length ?? 0) > 0
+        && SEARCH_TARGETS.filter(t => (h.targets ?? []).includes(t)).every(t => h.failed.includes(t));
+      const guardNote = sameKey.some(h => !nothingSearched(h))
         ? '이미 같은 검색어·대상으로 검색했다 — 검색된 자료로 답변하거나 다른 검색어를 쓰라'
-        : searches >= MAX_SEARCHES
-          ? `검색 횟수 상한(${MAX_SEARCHES}회)에 닿았다 — 지금까지의 자료로 답변하라`
-          : null;
+        : sameKey.length >= MAX_SAME_SEARCH_TRIES
+          ? '같은 검색어·대상으로 반복했으나 검색이 성립하지 않았다 — 다른 검색어를 쓰거나 지금까지의 자료로 답변하라'
+          : searches >= MAX_SEARCHES
+            ? `검색 횟수 상한(${MAX_SEARCHES}회)에 닿았다 — 지금까지의 자료로 답변하라`
+            : null;
       if (guardNote) {
         history.push({ search: text, targets, note: guardNote });
         if (++guardHits >= MAX_GUARD_HITS) break;
@@ -783,7 +842,14 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       emit('search_done', { text, targets, hits, ...(failed.length && { failed }) });
       // 새 자료가 하나도 없으면 헛돈 스텝이다 — 미등록 쿼리 이름과 같은 연속 카운터로 센다.
       // (검색어를 바꿔 한 번 더 시도할 기회는 남는다 — 첫 1회는 카운터만 오른다)
-      if (added === 0) { if (++guardHits >= MAX_GUARD_HITS) break; } else guardHits = 0;
+      // 같은 결정으로 버린 것이 있으면 헛돈 것이 아니다 — 바로 위 expand 갈래가 쓰는 것과 같은 판정이다
+      // ('펼쳤거나 버렸으면 자료가 달라졌다'). 시스템 프롬프트가 검색·청구에 drop을 함께 적으라고 권하는데,
+      // 이미 아는 자료만 돌아온 검색(added === 0)에 정리를 겹치면 그 스텝이 진도 없음으로 세어졌다 —
+      // 그런 결정 둘이면 남은 검색·청구·조회를 다 남긴 채 강제 답변으로 넘어간다(실측).
+      // 버리기는 되풀이될 수 없어 이 완화가 루프를 열지 않는다: 이미 버린 항목은 applyDrop이 건너뛰므로
+      // droppedNow가 0이 되고, 그때부터 카운터가 다시 오른다.
+      // 가드에 걸려 '실행하지 않은' 검색은 종전대로 센다 — 그쪽은 결정 자체가 이미 한 일을 다시 낸 것이다.
+      if (added === 0 && !droppedNow) { if (++guardHits >= MAX_GUARD_HITS) break; } else guardHits = 0;
       continue;
     }
 

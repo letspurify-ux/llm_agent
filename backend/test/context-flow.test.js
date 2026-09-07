@@ -439,3 +439,129 @@ test('확대가 다른 보관 구간을 삼켜도 한 항목은 한 줄이다 �
   assert.deepEqual([front[0].seq, front[0].from, front[0].to], [seed.seq, grown.from, grown.to]);
   assert.ok(front[1].viewOmitted, '앞선 항목이 다 실으면 삼켜진 구간은 보관 목록으로 물러난다');
 });
+
+test('보관 목록의 항목은 확대가 늘리지 못해도 청구하면 앞으로 와서 본문이 실린다', async t => {
+  // 프롬프트는 표시 예산에 밀린 항목을 '- (보관 중, expand로 다시 표시: k12)'로 알리고, 시스템 프롬프트는
+  // "보관 목록의 ID를 청구하면 저장된 본문을 다시 우선 표시한다"고 약속한다 (context.md 2절의 '보관된 항목을
+  // 앞으로 가져온다'). 그런데 확대 시도가 한 글자도 늘리지 못하면 — 이웃 조각이 문서 상한에 안 들어가거나(포화),
+  // 관리 DB 읽기가 실패하면(읽기 실패) — 앞으로 가져오기까지 함께 건너뛰어 본문이 끝내 실리지 않았다.
+  // 그 자리에 남는 안내는 '지금 범위로 답변하라'인데, 모델은 그 범위를 한 번도 본 적이 없다.
+  // 앞으로 가져오기는 DB를 읽지 않는 일이므로 늘지 않았다는 이유로 함께 버릴 것이 아니다.
+  const rows = source();
+  // 문서 상한에 닿은 구간을 만들고, 검색이 그 바로 뒤 조각을 읽지 못한 상태로 둔다 —
+  // 이웃을 모르니 full이 서지 않아('확대 가능'이 남아) 청구가 growItem 갈래로 들어간다.
+  const capped = buildItems([{ doc_seq: 1, rep: 1, from: 1, to: rows.length, chunk_of: rows.length, dist: .3 }], rows)[0];
+  const item = buildItems(
+    [{ doc_seq: 1, rep: 1, from: 1, to: capped.to, chunk_of: rows.length, dist: .3 }],
+    rows.slice(0, capped.to)
+  )[0];
+  assert.equal(item.full, false, '이웃을 읽지 못한 구간은 full이 서지 않는다');
+  assert.ok(canGrow(item), '확대 갈래로 들어가야 이 회귀가 성립한다');
+  // 지식 섹션 예산을 앞에서 다 쓰는 채움 항목 — 뒤에 오는 item은 본문 없이 보관 ID로만 실린다.
+  const filler = Array.from({ length: 50 }, (_, i) => buildItems(
+    [{ doc_seq: 100 + i, rep: 1, from: 1, to: 1, chunk_of: 1, dist: .1 + i / 10000 }],
+    [{ seq: 900000 + i, doc_seq: 100 + i, chunk_no: 1, chunk_of: 1, title: `채움${i}`, content: `채움 ${i} `.repeat(160) }]
+  )[0]);
+
+  const id = `k${item.seq}`;
+  const bodyLine = p => p.split('\n').find(line => line.startsWith(`- ${id} `));
+  const storedNote = p => p.split('\n').find(line => line.startsWith('- (보관 중')) ?? '';
+
+  for (const mode of ['포화', '읽기 실패']) {
+    await t.test(mode, async () => {
+      const prompts = [];
+      const script = [{ action: 'search', text: '운영', targets: ['knowledge'] }, { action: 'expand', ids: [id] }];
+      const result = await handleQuestion('운영 안내', [], { deps: {
+        decide: async c => { prompts.push(buildPrompt(c)); return script.shift() ?? { action: 'answer', answer: '끝' }; },
+        // 포화: 전 청크를 읽어 주지만 이웃이 상한에 들어가지 않아 한 글자도 늘지 않는다.
+        // 읽기 실패: 관리 DB가 응답하지 않아 판정할 근거 자체가 없다 (기존 본문은 보존한다).
+        loadChunks: async ranges => {
+          if (mode === '읽기 실패') throw new Error('관리 DB 일시 장애');
+          return rows.filter(r => ranges.some(g => r.chunk_no >= g.from && r.chunk_no <= g.to));
+        },
+        search: async () => ({ knowledge: [...filler.map(f => structuredClone(f)), structuredClone(item)] }),
+      } });
+
+      assert.ok(!bodyLine(prompts[1]), '표시 예산에 밀려 본문이 실리지 않아야 이 회귀가 성립한다');
+      assert.ok(storedNote(prompts[1]).includes(id), `보관 목록이 그 ID를 청구하라고 알린다: ${storedNote(prompts[1])}`);
+      assert.ok(bodyLine(prompts[2]), '보관 목록의 ID를 청구하면 저장된 본문이 다시 실린다');
+      assert.deepEqual(result.trace.filter(h => h.expand), [], '앞으로 가져왔으므로 헛돈 스텝이 아니다');
+      const stored = prompts[2].split('## 관련 지식')[1].split('\n## ')[0];
+      assert.deepEqual([...stored.matchAll(/^- (k\d+) \[/gm)].map(m => m[1]).filter(x => x === id), [id],
+        '같은 ID의 줄이 둘이 되지는 않는다');
+    });
+  }
+
+  // 이미 목록 맨 앞에 있어 옮길 자리가 없으면 종전대로 '늘릴 수 없다'를 알린다 — 그 항목은 이미 실려 있다.
+  await t.test('맨 앞의 항목은 늘지 않으면 그 사실을 알린다', async () => {
+    const script = [{ action: 'search', text: '운영', targets: ['knowledge'] }, { action: 'expand', ids: [id] }];
+    const result = await handleQuestion('운영 안내', [], { deps: {
+      decide: async () => script.shift() ?? { action: 'answer', answer: '끝' },
+      loadChunks: async ranges => rows.filter(r => ranges.some(g => r.chunk_no >= g.from && r.chunk_no <= g.to)),
+      search: async () => ({ knowledge: [structuredClone(item)] }),
+    } });
+    assert.match(result.trace.find(h => h.expand)?.note ?? '', /더 넓힐 수 없다/);
+  });
+});
+
+test('확대가 삼킨 구간을 다시 청구해도 그 문서의 표시가 줄지 않는다', async t => {
+  // 확대는 대표 청크에서 문서 상한까지 넓히므로 같은 문서의 다른 보관 구간을 통째로 삼킬 수 있다.
+  // 삼켜진 구간은 ID가 그대로 남아 본문 없이 '- (보관 중, expand로 다시 표시: k12)'로 안내되는데,
+  // 그 본문은 이미 삼킨 항목의 줄에 전부 실려 있다. 안내를 그대로 따라 청구하면 새로 보이는 글자는
+  // 없이 문서 상한(MAX_DOC_LEN)만 나눠 쓰게 되어, 지금 보이던 본문이 그만큼 줄어든다 —
+  // 청구가 보여주던 것을 도로 가져가는 셈이고, 둘뿐인 청구 기회 하나가 그렇게 사라진다.
+  const rows = source();
+  const inner = window(rows, 8, 10);   // 삼켜질 구간
+  const seed = window(rows, 1, 2);     // 확대하면 8~10을 품는 구간
+  const shownCount = ctx => knowledgeView(ctx.knowledge)
+    .filter(v => !v.dropped && !v.viewOmitted)
+    .reduce((n, v) => n + (v.to - v.from + 1), 0);
+
+  const run = async failSecondRead => {
+    const script = [
+      { action: 'search', text: '앞', targets: ['knowledge'] },
+      { action: 'search', text: '뒤', targets: ['knowledge'] },
+      { action: 'expand', ids: [`k${seed.seq}`] },
+      { action: 'expand', ids: [`k${inner.seq}`] },
+    ];
+    const seen = [];
+    let reads = 0;
+    const result = await handleQuestion('문서 전체', [], { deps: {
+      // ctx.knowledge는 요청 내내 같은 배열이라 나중에 보면 마지막 상태다 — 스텝별 판정은 그 자리에서 굳힌다.
+      decide: async c => {
+        seen.push({ ctx: c, prompt: buildPrompt(c), count: shownCount(c), view: knowledgeView(c.knowledge).map(v => ({ seq: v.seq, covered: !!v.covered, omitted: !!v.viewOmitted })) });
+        return script.shift() ?? { action: 'answer', answer: '끝' };
+      },
+      loadChunks: async ranges => {
+        if (failSecondRead && ++reads > 1) throw new Error('관리 DB 일시 장애');
+        return rows.filter(r => ranges.some(g => r.chunk_no >= g.from && r.chunk_no <= g.to));
+      },
+      search: async text => ({ knowledge: [structuredClone(text === '앞' ? inner : seed)] }),
+    } });
+    return { seen, result };
+  };
+
+  // 확대가 실제로 삼켰는지 먼저 확인한다 — 삼키지 않으면 이 회귀가 성립하지 않는다.
+  const { seen: base } = await run(false);
+  const swallowed = base[3].ctx.knowledge.find(o => o.seq === seed.seq);
+  assert.ok(swallowed.from <= inner.from && swallowed.to >= inner.to,
+    `확대 구간이 좁은 구간을 품어야 한다: ${swallowed.from}~${swallowed.to}`);
+  assert.deepEqual(base[3].view.find(v => v.seq === inner.seq), { seq: inner.seq, covered: true, omitted: true },
+    '삼켜진 구간은 본문이 실리지 않되 covered로 구분된다');
+  assert.ok((base[3].prompt.split('\n').find(l => l.startsWith('- (보관 중')) ?? '').includes(`k${inner.seq}`),
+    '프롬프트는 그 번호를 보관 목록으로 안내한다');
+
+  await t.test('넓힐 것이 남았으면 삼켜진 구간도 청구할 수 있다', async () => {
+    const { seen } = await run(false);
+    assert.ok(seen[4].count >= seen[3].count, `표시가 줄었다: ${seen[3].count} → ${seen[4].count}`);
+    const grown = seen[4].ctx.knowledge.find(o => o.seq === inner.seq);
+    assert.ok(grown.to > inner.to || grown.from < inner.from, '문서 바깥쪽으로 실제로 넓혀야 진도다');
+  });
+
+  await t.test('넓힐 수 없으면 앞으로 가져오지 않고 이미 실려 있다고 알린다', async () => {
+    const { seen, result } = await run(true);
+    assert.equal(seen[4].count, seen[3].count, `표시가 줄었다: ${seen[3].count} → ${seen[4].count}`);
+    assert.match(result.trace.find(h => h.expand)?.note ?? '', /이미 같은 문서의 다른 항목으로 실려 있다/);
+    assert.equal(seen[4].ctx.knowledge[0].seq, seed.seq, '삼킨 항목이 목록 앞을 지킨다');
+  });
+});

@@ -607,6 +607,85 @@ test('같은 검색어·대상의 반복은 실행하지 않고 note로 남긴�
   } finally { restore(); }
 });
 
+test('검색이 성립하지 않았으면 같은 검색어를 한 번 더 시도할 수 있다', async () => {
+  // 반복 가드는 '이미 찾아본 것을 또 찾는' 퇴화를 막는 장치다. 요청한 대상이 전부 '검색 불가'였던 시도는
+  // 아무것도 찾아보지 못한 것이라 그 부류가 아니다 — 임베딩 모델이 유휴 뒤 내려갔다가 올라오는 동안
+  // 첫 검색이 한 번 늦게 답하는 것만으로 그 검색어가 요청 내내 막혔고, 안내는 '검색된 자료로 답변하라'라
+  // 자료가 하나도 없는 상태에서 있지도 않은 자료로 답하라는 말이 됐다.
+  // 조회 쪽 루프 가드가 실패한 실행에 재시도를 한 번 허용하는 것과 같은 근거다 (MAX_SAME_QUERY_TRIES).
+  const restore = silence();
+  try {
+    const same = { action: 'search', text: '배치', targets: ['knowledge', 'qa_method'] };
+    const llm = scripted([same, same, same]);
+    let times = 0;
+    const r = await handleQuestion('q', [], { deps: {
+      decide: llm.decide,
+      // 첫 시도는 임베딩이 응답하지 않아 통째로 성립하지 않고, 두 번째는 정상이다.
+      search: async () => (++times === 1
+        ? found({ knowledge: null, qaMethods: null })
+        : found({ knowledge: [K(1)], qaMethods: [] })),
+    } });
+    assert.equal(times, 2, '성립하지 않은 검색은 반복으로 세지 않는다');
+    assert.deepEqual(r.trace[0].failed, ['knowledge', 'qa_method']);
+    assert.equal(r.trace[1].hits.knowledge, 1, '재시도가 실제로 자료를 찾아온다');
+    // 성립한 뒤의 세 번째 같은 검색은 종전대로 반복이다.
+    assert.match(r.trace[2].note, /이미 같은 검색어/);
+    assert.equal(r.search.searches, 2);
+  } finally { restore(); }
+});
+
+test('성립하지 않은 검색이 되풀이되면 두 번째에서 끊는다', async () => {
+  const restore = silence();
+  try {
+    const same = { action: 'search', text: '배치', targets: ['knowledge'] };
+    const llm = scripted([same, same, same, same]);
+    let times = 0;
+    const r = await handleQuestion('q', [], { deps: {
+      decide: llm.decide,
+      search: async () => { times++; return found({ knowledge: null }); },
+    } });
+    assert.equal(times, 2, `재시도는 한 번뿐이다: ${times}`);
+    assert.ok(llm.seen.at(-1).forceAnswer, '진도가 없으면 강제 답변으로 간다');
+  } finally { restore(); }
+});
+
+test('검색과 함께 버린 항목이 있으면 그 스텝은 헛돈 것이 아니다', async () => {
+  // 시스템 프롬프트는 search·expand에 drop을 함께 적으라고 권한다. expand 갈래는 '펼쳤거나 버렸으면
+  // 자료가 달라졌다'로 진도를 세는데 search 갈래는 새 자료(added)만 봤다 — 이미 아는 자료만 돌아온 검색에
+  // 자료 정리를 겹치면 그 스텝이 진도 없음으로 세어지고, 그런 결정 둘이면 남은 검색·청구·조회를 다 남긴 채
+  // 강제 답변으로 넘어간다.
+  const restore = silence();
+  try {
+    const found4 = () => found({ knowledge: [K(1), K(2), K(3), K(4)] });
+    const llm = scripted([
+      { action: 'search', text: '가', targets: ['knowledge'] },
+      { action: 'search', text: '나', targets: ['knowledge'], drop: ['k1', 'k2'] },
+      { action: 'search', text: '다', targets: ['knowledge'], drop: ['k3'] },
+      { action: 'answer', answer: '정리하고 답한다' },
+    ]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide, search: async () => found4() } });
+    assert.equal(r.answer, '정리하고 답한다', '버리기로 자료를 바꾼 스텝이 강제 답변을 부르면 안 된다');
+    assert.equal(r.search.dropped, 3);
+    assert.ok(!llm.seen.some(c => c.forceAnswer), '강제 답변으로 가지 않는다');
+  } finally { restore(); }
+});
+
+test('버릴 것이 없어진 뒤의 헛도는 검색은 종전대로 끊는다', async () => {
+  // 완화가 루프를 열지 않는다 — 이미 버린 항목은 applyDrop이 건너뛰므로 두 번째부터는 진도가 없다.
+  const restore = silence();
+  try {
+    const llm = scripted([
+      { action: 'search', text: '가', targets: ['knowledge'] },
+      { action: 'search', text: '나', targets: ['knowledge'], drop: ['k1'] },
+      { action: 'search', text: '다', targets: ['knowledge'], drop: ['k1'] },
+      { action: 'search', text: '라', targets: ['knowledge'], drop: ['k1'] },
+    ]);
+    const r = await handleQuestion('q', [], { deps: { decide: llm.decide, search: async () => found({ knowledge: [K(1), K(2)] }) } });
+    assert.equal(r.search.dropped, 1, '같은 항목을 두 번 버릴 수는 없다');
+    assert.ok(llm.seen.at(-1).forceAnswer, '진도가 없으면 종전대로 강제 답변으로 간다');
+  } finally { restore(); }
+});
+
 test('같은 검색어라도 대상을 더하면 새 검색이다', async () => {
   const restore = silence();
   try {

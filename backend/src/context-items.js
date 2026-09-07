@@ -118,6 +118,12 @@ export function knowledgeView(items) {
       shown.push({ ...best, seq: item.seq, expanded: item.expanded, more: canGrow(item) });
     }
     if (shown.length && shown[0].chunks.length < unseen.length) shown[0].moreStored = true;
-    return shown.length ? shown : [{ ...item, viewOmitted: true }];
+    // 실을 것이 하나도 없는 이유는 둘로 갈린다. 남은 청크가 있는데 자리가 없어 밀린 것(viewOmitted)은
+    // 같은 ID를 앞으로 가져오면(expand) 실린다 — 프롬프트의 보관 목록이 그것을 약속한다.
+    // 반면 남은 청크가 아예 없는 것(covered)은 이 항목의 본문이 같은 문서의 앞선 항목으로 이미 전부
+    // 실려 있다는 뜻이다. 확대가 다른 보관 구간을 통째로 삼킨 뒤가 그 상태다. 그 항목을 앞으로 가져오면
+    // 새로 보이는 글자는 없이 문서 상한(MAX_DOC_LEN)만 나눠 쓰게 되어, 지금 보이던 본문이 그만큼 줄어든다
+    // (실측: 12청크가 10청크로). 청구를 받는 쪽(agent.js applyExpand)이 그 둘을 갈라 보게 표시를 남긴다.
+    return shown.length ? shown : [{ ...item, viewOmitted: true, ...(unseen.length ? {} : { covered: true }) }];
   });
 }
