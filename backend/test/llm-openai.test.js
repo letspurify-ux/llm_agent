@@ -1486,3 +1486,36 @@ test('이스케이프된 서로게이트 쌍이 조각 경계에서 갈라져도
   for (const c of lone) p.feed(c);
   assert.equal(visible, (await decide(lone)).answer);
 });
+
+// 위 'stream_options를 모르는 서버' 검사의 형제 — reasoning_effort. 소스는 둘을 같은 방식으로 다루는데
+// (400 본문에 이름이 보이면 그 요청부터 빼고 바로 이어지는 재시도가 성공한다) 검사는 한쪽에만 있었다.
+// 변이로 그 판정을 지워도 아무 검사가 잡지 못했다. 깨지면 그 엔드포인트에서는 '모든 질문이 LLM 호출
+// 실패'가 되고 — 이 표시가 존재하는 이유가 정확히 그것을 막는 것이다 — 로그의 400 한 줄이 유일한 단서다.
+// 이 검사는 파일 맨 끝에 둔다: 표시는 프로세스 수명 동안 유지되므로(한 번 배우고 뺀다) 앞의
+// 'reasoning_effort 기본값' 검사들보다 먼저 돌면 그쪽이 깨진다. stream_options 검사도 같은 이유로
+// 그것을 요구하는 검사 뒤에 있다.
+test('reasoning_effort를 모르는 서버에는 그 요청부터 빼고 재시도가 성공한다', async () => {
+  const bodies = [];
+  globalThis.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(init.body));
+    if (bodies.length === 1) {
+      return new Response('{"error":{"message":"unknown parameter: reasoning_effort"}}', { status: 400 });
+    }
+    return 응답({ choices: [{ message: { content: '{"action":"answer","answer":"복구"}' } }] });
+  };
+  const d = await openaiDecide(CTX);
+  assert.equal(d.answer, '복구', '재시도가 성공하지 못했다 — 이 엔드포인트의 모든 질문이 실패한다');
+  assert.ok('reasoning_effort' in bodies[0], '첫 요청에는 보냈어야 한다 (이 검사의 전제)');
+  assert.ok(!('reasoning_effort' in bodies[1]), '400을 겪고도 같은 파라미터를 다시 보냈다');
+  assert.equal(bodies[1].model, bodies[0].model, '나머지 요청 내용은 그대로여야 한다');
+
+  // 배운 것은 다음 요청에도 남는다 — '한 번 배우고 뺀다'가 이 표시의 존재 이유다.
+  bodies.length = 0;
+  globalThis.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return 응답({ choices: [{ message: { content: '{"action":"answer","answer":"다음"}' } }] });
+  };
+  assert.equal((await openaiDecide(CTX)).answer, '다음');
+  assert.equal(bodies.length, 1, '다음 요청이 다시 400을 겪었다');
+  assert.ok(!('reasoning_effort' in bodies[0]));
+});

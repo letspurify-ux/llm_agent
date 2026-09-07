@@ -295,6 +295,33 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
   if (target.db_type && nameKey(target.db_type) !== 'oracle') {
     throw wasted(safeError(`지원하지 않는 db_type: ${target.db_type} (현재 oracle만 지원)`, UNRUNNABLE_HINT));
   }
+  // 등록 행은 있는데 접속에 쓸 값이 비어 있으면 접속을 시도하지 않는다.
+  // 아래 resolvePassword가 'ENV:변수명'이 가리키는 변수가 비었을 때 이미 같은 판정을 하고 근거도
+  // 거기 적혀 있는데, 평문으로 등록한 값에는 그 판정이 없었다 — 같은 실수가 같은 결과를 낸다:
+  //   ① 시도하면 DB는 ORA-01017(잘못된 사용자명/비밀번호)을 돌려주고, 그 원문은 화면에서 가려지므로
+  //      (server.js) 운영자는 '설정 누락'이 아니라 '저장된 자격증명이 틀렸다'고 읽는다.
+  //   ② 빈 비밀번호 로그인이 매 조회마다 반복되면 공용 조회 계정이 FAILED_LOGIN_ATTEMPTS에 걸려 잠긴다.
+  //      resolvePassword가 ENV: 쪽에서 막겠다고 적어둔 바로 그 결과다.
+  // 빈 값이 클라이언트에서 걸러지지 않는다는 것은 실측이다(실 Oracle FREEPDB1):
+  // {user:'APP_USER', password:''}와 {user:'', password:''} 모두 서버가 ORA-01017을 돌려준다.
+  // 외부 인증(oracleDriver의 oci 주석)을 깨지 않는다 — 그 경로는 속성을 '비우는' 것이 아니라
+  // '주지 않는' 것이고, NULL을 그대로 넘기는 지금 동작은 어차피 NJS-007로 죽는다(실측).
+  // connection_info도 함께 본다. 이 값이 비면 어느 DB를 조회할지를 등록이 아니라 '클라이언트의
+  // 기본값'이 정하게 된다 — Thick(oci)에서 빈 접속 문자열은 ORACLE_SID/TWO_TASK가 가리키는 로컬
+  // 인스턴스로 간다(실측: 그 변수가 없는 이 머신에서는 ORA-12162, 있으면 그 DB에 실제로 붙는다).
+  // 그러면 등록과 다른 DB의 행이 등록된 이름표를 달고 이력·답변·trace로 나가는데 어디에도 그 사실이
+  // 남지 않는다 — 이 저장소가 가장 나쁘게 보는 조용한 오답이다. thin에서는 NJS-125로 죽을 뿐이지만
+  // 판정을 드라이버 모드에 맡길 이유가 없다. 등록된 값이 대상을 지목하는 유일한 자리다.
+  // 판정은 resolvePassword의 ENV: 갈래와 같은 기준(falsy)을 쓴다 — 공백만 든 값은 양쪽 다 통과시킨다.
+  const 빈칸 = ['connection_info', 'db_user', 'db_password'].filter(column => !target[column]);
+  if (빈칸.length) {
+    // 컬럼 이름은 서버 내부 정보다 — 로그에만 남긴다 (위 target_db 이름과 같은 기준).
+    warnOnce('oracle:target-db', `target_db row for ${targetDbName} has empty ${빈칸.join(', ')}`);
+    throw wasted(safeError(
+      '조회대상 DB 접속 정보가 서버에 설정되어 있지 않습니다.',
+      '설정 문제라 재시도해도 결과가 같다 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라'
+    ));
+  }
 
   // 드라이버 모드 확정은 첫 접속보다 먼저여야 한다 (initOracleClient 주석 참고).
   // 기동 시점에 이미 했으면 여기서는 아무 일도 하지 않는다.
