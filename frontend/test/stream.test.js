@@ -141,12 +141,30 @@ test('마지막 줄이 아주 길어도 비용이 길이에 비례한다 — 조
     const CHUNK = 16 * 1024;
     return { body: new ReadableStream({ start(c) { for (let i = 0; i < bytes.length; i += CHUNK) c.enqueue(bytes.slice(i, i + CHUNK)); c.close(); } }) };
   };
-  const ms = async mb => { const t0 = Date.now(); const f = await readEvents(bodyOf(mb)); assert.equal(f.type, 'done'); return Date.now() - t0; };
-  await ms(1);                       // 워밍업 (JIT 편차 제거)
-  const one = Math.max(1, await ms(1));
-  const four = await ms(4);
-  // 선형이면 4배 남짓, 제곱이면 16배가 된다. 느린 기계에서도 갈리도록 넉넉히 8배로 둔다.
-  assert.ok(four < one * 8, `길이가 4배인데 비용이 ${(four / one).toFixed(1)}배다 — 조각마다 전부 다시 훑고 있다 (${one}ms → ${four}ms)`);
+  // 재는 자리에 잡음이 많다: 1MB는 몇 ms짜리라 Date.now()(1ms 눈금)로는 한 눈금이 곧 30% 오차이고,
+  // GC나 다른 프로세스가 한 번만 끼어도 4MB 쪽이 통째로 늘어난다. 눈금을 performance.now로 바꾸고
+  // 여러 번 재어 중앙값을 써도 모자랐다 — 두 크기를 '따로' 재는 한, 오래 도는 쪽(4MB)이 방해를 그만큼
+  // 더 받아 비가 커진다(실측: 중앙값 5회로도 부하 평균 63에서 3.6ms → 32.8ms = 9.1배로 깨졌다.
+  // 같은 순간의 같은 코드가 1·2·4·8MB에서 3.6·7.5·16.9·37.1ms, 곱마다 2.1배로 선형이었다).
+  //
+  // 그래서 '같은 총 바이트'로 비교한다: 1MB 여덟 번과 8MB 한 번은 처리해야 할 바이트가 같으므로,
+  // take()가 선형이면 두 시간이 같고(비 1), 조각마다 쌓인 전체를 다시 훑으면 한 줄짜리 쪽만 배로 든다.
+  // 방해도 양쪽이 같은 시간만큼 받으므로 부하가 비를 밀지 않는다 — 실측(부하 평균 73):
+  // 비 1.02·0.93·1.13·0.78·0.87. 쌓아 두고 다시 훑는 돌연변이에서는 6.5였다.
+  const ms = async mb => { const t0 = performance.now(); const f = await readEvents(bodyOf(mb)); assert.equal(f.type, 'done'); return performance.now() - t0; };
+  // 한 번씩만 재면 그 한 번이 방해를 받는 것까지는 못 막는다(실측: 부하 평균 74에서 4MB 한 번이
+  // 13ms 대신 40ms). 양쪽을 세 번씩 재어 '최소'를 쓴다 — 가장 덜 방해받은 실행이 참값에 가깝고,
+  // 제곱이 되면 최소값도 함께 커진다.
+  await ms(1); await ms(8);          // 워밍업 (JIT 편차 제거)
+  let split = Infinity, whole = Infinity;
+  for (let round = 0; round < 3; round++) {
+    let eight = 0;
+    for (let i = 0; i < 8; i++) eight += await ms(1);  // 1MB 여덟 번
+    split = Math.min(split, eight);
+    whole = Math.min(whole, await ms(8));              // 같은 바이트를 한 줄로
+  }
+  // 선형이면 1 남짓이고 제곱이면 여러 배다. 느린 기계에서도 갈리도록 넉넉히 2배로 둔다.
+  assert.ok(whole < split * 2, `같은 바이트인데 한 줄로 오면 ${(whole / split).toFixed(1)}배 든다 — 조각마다 전부 다시 훑고 있다 (1MB×8 ${split.toFixed(1)}ms → 8MB×1 ${whole.toFixed(1)}ms)`);
 });
 
 test('답을 다 읽은 뒤 스트림이 끊겨도 그 답을 버리지 않는다', async () => {

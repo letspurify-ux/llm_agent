@@ -323,6 +323,58 @@ it('회귀: 마우스로 보낸 뒤에도(전송 단추·예시 칩) 키보드�
   }
 });
 
+// 답이 도착한 것을 화면 없이도 알 수 있는가. 진행 중에는 진행 줄(.progress)이 aria-live="polite"라
+// "검색 …"까지는 읽히는데, 답이 오면 그 영역이 통째로 사라지고 최종 말풍선은 어떤 라이브 영역에도
+// 없었다 — 화면을 보지 못하는 사용자는 "검색 중"을 마지막으로 듣고 그 뒤로 아무 신호도 받지 못한다
+// (수정 전 접근성 트리 확인: done 뒤 라이브 영역 0개). 답변 본문에 aria-live를 달아서는 안 되므로
+// (조각마다 자란 글 전체가 다시 읽힌다) 상태 한 줄만 알린다 — App.jsx의 role="status".
+//
+// DOM이 아니라 접근성 트리로 본다. 화면낭독기가 읽는 것이 그쪽이고, .sr-only처럼 1px로 접어 둔 요소는
+// display:none 한 글자 차이로 트리에서 통째로 빠지는데 DOM 검사로는 그 차이가 보이지 않는다.
+it('회귀: 답이 도착한 것이 보조기술에도 알려진다 (질문마다 다시)', async () => {
+  await page.goto(url(), '.chip');
+  await page.send('Accessibility.enable');
+  // 라이브 영역이 실제로 무엇을 읽어 주는지를 접근성 트리에서 읽는다. 노드의 '이름'이 아니라 그 안의
+  // 글자를 모은다 — status 같은 영역은 이름을 내용에서 가져오지 않으므로(name from: author) 이름만 보면
+  // 글자가 들어 있어도 늘 비어 있다. 영역이 아예 없으면 '(없음)'을 돌려준다 — 비어 있는 것과 없는 것은
+  // 다른 실패이고(늘 그 자리에 있어야 한다), 둘 다 ''로 뭉개면 검사가 그 차이를 못 본다.
+  const 알림 = async () => {
+    const { nodes } = await page.send('Accessibility.getFullAXTree');
+    const byId = new Map(nodes.map(n => [n.nodeId, n]));
+    const 글자 = n => (n.name?.value && !(n.childIds ?? []).length ? n.name.value : '')
+      + (n.childIds ?? []).map(id => byId.get(id)).filter(Boolean).map(글자).join('');
+    const 영역 = nodes.filter(n => n.role?.value === 'status' && !n.ignored);
+    return 영역.length ? 영역.map(글자).join('|') : '(없음)';
+  };
+  // 답을 400ms 늦춘다 — '보내는 순간 비워졌는가'를 볼 창이 필요하다.
+  await page.eval(`window.fetch = async () => { await new Promise(r => setTimeout(r, 400));
+    return new Response(JSON.stringify({ answer: '답변 본문' }), { headers: { 'Content-Type': 'application/json' } }); }`);
+  // 입력창에 글자를 넣고 보낸다. 값은 React가 붙여 둔 setter로 넣어야 controlled state가 따라온다.
+  // 즉시실행 함수로 감싸는 이유: page.eval은 전역에서 평가되므로 const가 다음 호출까지 살아남는다.
+  const 보내기 = async 글 => page.eval(`(() => {
+    const t = document.querySelector('.composer textarea');
+    const set = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+    set.call(t, ${JSON.stringify(글)}); t.dispatchEvent(new Event('input', { bubbles: true }));
+    document.querySelector('button.send').click();
+  })()`);
+
+  // 라이브 영역은 답이 오기 '전에' 이미 그 자리에 있어야 한다 — 알릴 때 함께 만들어 넣으면
+  // 바뀐 것으로 보지 못해 아무것도 읽지 않는 브라우저가 있다. 그때는 이 조회가 빈 문자열이 아니라
+  // 아무 노드도 찾지 못한다(둘 다 ''라 아래 도착 검사가 그 차이를 마저 가른다).
+  assert.equal(await 알림(), '', '알림 줄이 답보다 먼저 그 자리에 있고 비어 있어야 한다');
+  await 보내기('첫 질문');
+  await page.until(`!document.querySelector('.typing')`, { what: '첫 답이 도착하기' });
+  assert.equal(await 알림(), '답변이 도착했습니다.', '답이 도착한 것이 보조기술에 알려지지 않았다');
+
+  // 두 번째 질문. 같은 문구를 그대로 두었다가 다시 놓기만 하면 라이브 영역은 '바뀌지 않았다'고 보아
+  // 읽지 않는다 — 보내는 순간 비워야 다음 도착이 '바뀜'이 되어 두 번째 답부터도 들린다.
+  await 보내기('두 번째 질문');
+  await page.until(`document.querySelector('.typing')`, { what: '두 번째 질문이 나가기' });
+  assert.equal(await 알림(), '', '다음 질문을 보냈는데 지난 답의 알림이 그대로 남아 있다 — 두 번째 답은 읽히지 않는다');
+  await page.until(`!document.querySelector('.typing')`, { what: '두 번째 답이 도착하기' });
+  assert.equal(await 알림(), '답변이 도착했습니다.', '두 번째 답의 도착이 알려지지 않았다');
+});
+
 // 서버가 흘려보내는 이벤트 중 answer_reset·error는 단위 검사만 있었다 — 화면까지 오는 길은 여기서 지킨다.
 // answer_reset은 모델이 답을 쓰다 되돌릴 때 온다(backend agent.js onAnswerDelta). 미리보기를 비우지 못하면
 // 버려진 앞부분이 다시 쓴 답 앞에 남아, 사용자는 답이 도착하기까지 모델이 취소한 글을 읽는다.

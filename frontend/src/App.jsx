@@ -446,6 +446,12 @@ export default function App() {
   const [preview, setPreview] = useState('');
   const previewBufRef = useRef('');
   const previewTimerRef = useRef(0);
+  // 화면을 보지 못하는 사용자에게 '답이 도착했다'를 알리는 한 줄 (아래 role="status").
+  // 답변 본문에 aria-live를 달지 않는 이유: 조각이 올 때마다 자란 글 전체가 다시 읽혀 오히려 못 쓰게 된다.
+  // 진행 줄(.progress)은 aria-live="polite"라 "검색 …"까지는 읽히는데, 답이 오면 그 영역이 사라지고
+  // 최종 말풍선은 어떤 라이브 영역에도 없다 — 그래서 기다리던 사람이 끝을 알 수 있는 신호가 하나도 없었다
+  // (접근성 트리로 확인: done 뒤 라이브 영역 0개).
+  const [status, setStatus] = useState('');
   const inputRef = useRef(null);
   const historyRef = useRef([]);      // 서버로 보낼 대화 이력 (setState 비동기와 무관하게 즉시 반영)
   const composingRef = useRef(false); // IME 조합 진행 중
@@ -904,6 +910,7 @@ export default function App() {
     setLoading(false);
     setProgress([]);
     resetPreview();
+    setStatus('');
     inputRef.current?.focus();
   }
 
@@ -1014,6 +1021,9 @@ export default function App() {
       setMessages(m => [...m, { role: 'user', text: message }]);
       setLoading(true);
       setProgress([]);
+      // 알림 줄을 먼저 비운다. 라이브 영역은 '글자가 바뀔 때'만 읽히므로, 지난 답의 문구가 그대로
+      // 남아 있으면 다음 답이 같은 문구를 놓았을 때 아무것도 읽히지 않는다 (두 번째 질문부터 조용해진다).
+      setStatus('');
       const res = await fetch('/api/chat', {
         method: 'POST',
         // 진행 상황을 흘려 받는다(NDJSON — backend server.js openStream). Accept가 없으면 서버는 예전처럼
@@ -1079,6 +1089,10 @@ export default function App() {
           abortRef.current = null;
           if (answered) historyRef.current = [...historyRef.current, { role: 'assistant', text: answer }];
           setMessages(m => [...m, { role: 'assistant', text: answer, trace }]);
+          // 도착했다는 사실만 알린다 — 답변 본문은 길고(상한 70,000자) 표·차트가 섞여 있어 읽어 주면
+          // 오히려 화면과 어긋난다. 사용자는 이 신호를 듣고 말풍선으로 옮겨 가 자기 속도로 읽는다.
+          // 답하지 못한 경우는 그 짧은 문구가 곧 상태다 — '도착했습니다'로 뭉개면 실패가 성공으로 읽힌다.
+          setStatus(answered ? '답변이 도착했습니다.' : answer);
         } catch (e) {
           console.error('[chat] 답을 화면에 얹지 못했습니다:', e);
         } finally {
@@ -1111,6 +1125,11 @@ export default function App() {
           <span aria-hidden="true">⌂</span><span className="home-label">홈</span>
         </button>
       </header>
+
+      {/* 답이 도착한 것을 알리는 한 줄. 늘 그 자리에 있어야 한다 — 알릴 때 이 요소를 함께 만들어 넣으면
+          화면낭독기가 '바뀐 것'으로 보지 못해 아무것도 읽지 않는 브라우저가 있다. 비어 있는 동안에는
+          접근성 트리에 글자가 없어 사용자에게도 보이지 않는다. */}
+      <p className="sr-only" role="status">{status}</p>
 
       <main className="chat" ref={chatRef} onScroll={onChatScroll}>
         <div className="chat-inner">
