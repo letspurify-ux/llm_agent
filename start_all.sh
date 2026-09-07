@@ -29,6 +29,16 @@ for arg in "$@"; do
 done
 
 ORACLE_CONTAINER=${ORACLE_CONTAINER:-oracle1521}
+
+# 임베딩 모델 이름은 '백엔드가 읽는 곳'에서 읽는다 — 셸 환경 > backend/.env > 기본값.
+# dotenv와 같은 우선순위이고, 값을 읽는 파서도 같은 부류를 쓴다(Node의 --env-file). 셸 환경만 보던
+# 동안, 문서가 시키는 대로(README '임베딩 모델 교체', setup/bge-m3/README.md) .env에서 모델을 바꾼
+# 설치에서 아래 검사가 옛 이름을 보고 "임베딩 모델 … 준비됨"이라 알리고 새 모델은 받지 않았다.
+# 그 상태의 증상은 '모든 검색이 검색 불가'인데(벡터 단일 경로) 이 스크립트는 성공을 보고하므로,
+# 검사가 막겠다고 적어둔 바로 그 결과가 검사를 통과한 채로 난다.
+# 값을 못 읽으면(.env 없음 — 새 클론, node 없음, Node 20.6 미만) 빈 문자열이 되어 기본값으로 간다.
+env_value() { node --env-file="$1" -e 'process.stdout.write(process.env[process.argv[1]] ?? "")' "$2" 2>/dev/null; }
+EMBEDDING_MODEL=${EMBEDDING_MODEL:-$(env_value backend/.env EMBEDDING_MODEL)}
 EMBEDDING_MODEL=${EMBEDDING_MODEL:-bge-m3}
 # Oracle은 컨테이너 안에서 인스턴스가 열릴 때까지 시간이 걸린다(콜드 스타트 1분 내외).
 ORACLE_WAIT_S=${ORACLE_WAIT_S:-180}

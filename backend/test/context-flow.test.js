@@ -634,3 +634,54 @@ test('숨긴 구간의 복구도 이미 실려 있으면 앞으로 가져오지 
     assert.equal(result.trace.filter(h => h.expand).length, 0, '성공한 청구는 이력에 안내 줄을 남기지 않는다');
   });
 });
+
+// "확대·복구한 항목은 앞에 고정한다. 이후 검색도 이 우선순위를 유지한다" (agent.js applyExpand·mergeFront,
+// context.md 2절). 고정 표시(row.expanded)가 없어도 그 스텝에서는 항목이 맨 앞에 온다 — 어긋남은 '뒤이은
+// 검색'에서야 드러난다: 새 결과가 mergeFront의 앞자리를 차지하고 청구한 자료가 뒤로 밀린다. 밀리면 문서별
+// 상한과 섹션 예산을 뒤에서 받게 되어, 모델이 왕복 하나를 들여 앞으로 부른 본문이 그 다음 스텝에서 잘린다.
+// 결함을 고친 것이 아니라 검증한 동작을 회귀 가드로 남긴 것이다 — 변이 검사에서 applyExpand의 세 갈래
+// (숨김 복구·더 넓힐 수 없는 구간·확대)에서 `row.expanded = true`를 각각 지워도 잡히지 않았고,
+// 이 검사를 붙인 뒤 셋 다 잡힌다.
+test('청구로 앞에 온 자료는 뒤이은 검색에도 앞에 남는다 — 세 갈래 모두', async () => {
+  const doc = (d, n) => Array.from({ length: n }, (_, i) => ({
+    seq: d * 100 + i + 1, doc_seq: d, chunk_no: i + 1, chunk_of: n,
+    doc_hash: `h${d}`, title: `문서${d}`, content: `문서${d}조각${i + 1} ${'가'.repeat(300)}`,
+  }));
+  const all = [1, 2, 3, 4, 5, 6, 7, 8].flatMap(d => doc(d, 6));
+  const pick = (d, from, to, dist) => ({ ...window(doc(d, 6), from, to), _dist: dist });
+  const 뒤검색 = ds => ds.map((d, i) => pick(d, 1, 2, 0.5 + i / 100));
+
+  const 갈래 = {
+    // 확대가 실제로 본문을 늘리는 갈래
+    확대: { first: [pick(1, 3, 3, 0.1)], ids: ['k103'] },
+    // 더 넓힐 것이 없는 구간 — 맨 앞이 아니어야 '앞으로 가져오기'가 할 일이 된다
+    포화: { first: [pick(2, 1, 2, 0.05), pick(1, 1, 6, 0.1)], ids: ['k101'] },
+    // 숨겼다가 되살리는 갈래
+    숨김복구: { first: [pick(1, 3, 3, 0.1)], drop: ['k103'], ids: ['k103'] },
+  };
+  for (const [이름, s] of Object.entries(갈래)) {
+    const decisions = [
+      { action: 'search', text: '첫 검색', targets: ['knowledge'] },
+      ...(s.drop ? [{ action: 'expand', ids: [], drop: s.drop }] : []),
+      { action: 'expand', ids: s.ids },
+      { action: 'search', text: '둘째 검색', targets: ['knowledge'] },
+      { action: 'answer', answer: '끝' },
+    ];
+    let searched = 0;
+    const prompts = [];
+    await handleQuestion('질문', [], { deps: {
+      search: async () => ({ knowledge: searched++ === 0 ? s.first : 뒤검색([3, 4, 5, 6, 7, 8]) }),
+      loadChunks: async ranges => all.filter(c =>
+        ranges.some(r => c.doc_seq === r.doc_seq && c.chunk_no >= r.from && c.chunk_no <= r.to)),
+      decide: async c => {
+        prompts.push(buildPrompt(c));
+        return sanitizeDecision(decisions.shift() ?? { action: 'answer', answer: '끝' });
+      },
+    } });
+    const last = prompts[prompts.length - 1];
+    const 지식 = last.slice(last.indexOf('## 관련 지식'));
+    const 첫줄 = 지식.split('\n').find(l => l.startsWith('- ')) ?? '(본문 줄 없음)';
+    assert.match(첫줄, /^- k1\d\d /, `${이름}: 청구한 자료가 뒤이은 검색에 밀렸다 — ${첫줄.slice(0, 60)}`);
+    assert.match(지식, /문서1조각/, `${이름}: 청구한 자료의 본문이 사라졌다`);
+  }
+});
