@@ -42,7 +42,7 @@ const capRows = rows => rows.slice(0, MAX_RESULT_ROWS);
 
 // 동일 실행 판정용 파라미터 키 — LLM이 준 원본이 아니라 "실제로 바인드되는 값"으로 만든다.
 // runQuery가 SQL의 바인드 변수만 추려 쓰므로, 여분 키 하나가 붙었다고 다른 실행이 되지는 않는다.
-// 값은 문자열로 정규화한다 (숫자 1과 문자열 '1'은 같은 컬럼에 같은 값으로 바인드된다).
+// 값과 타입을 함께 비교한다. Oracle은 숫자 1과 문자열 '1'의 비교 결과가 다를 수 있다.
 // (테스트에서 쓰므로 export 한다 — 아래 loopGuard 주석 참고)
 export function paramKey(bindNameList, params) {
   // 값 조회는 실행 경계와 같은 함수로 한다 (constants.bindValue) — 소유 키만 보고(프로토타입 멤버와
@@ -65,7 +65,9 @@ export function paramKey(bindNameList, params) {
 }
 
 // 값 하나를 비교 가능한 형태로 정규화한다.
-// 스칼라는 문자열로 낮춘다 (숫자 1과 문자열 '1'은 같은 컬럼에 같은 값으로 바인드된다).
+// 스칼라는 타입도 남긴다. VARCHAR2 코드가 '01'·'1'일 때 숫자 1로 비교하면 두 행이 나오지만
+// 문자열 '1'로 비교하면 한 행만 나온다(실 Oracle 재현). String(v)만 비교하면 그 두 번째 조회를
+// 이미 실행한 것으로 생략한다. 거부된 boolean true를 문자열 'true'로 고치는 결정도 구별해야 한다.
 // null·undefined는 배열로 감싸 문자열 'null'·'undefined'와 구분한다.
 // 구조(객체·배열)를 String(v)로 낮추면 안 된다 — 전부 '[object Object]'로 뭉개져 서로 다른
 // 결정이 같은 실행으로 판정된다. 값이 아닌 구조는 실행 경계(oracle.js bindProblem)가 매번
@@ -102,7 +104,7 @@ function canonical(v, seen) {
 function valueKey(v) {
   if (v === undefined) return ['undefined'];
   if (v === null) return ['null'];
-  if (typeof v !== 'object') return String(v);
+  if (typeof v !== 'object') return [typeof v, String(v)];
   try {
     return ['json', JSON.stringify(canonical(v, new Set()))];
   } catch {

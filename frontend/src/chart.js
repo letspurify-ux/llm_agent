@@ -391,6 +391,26 @@ export function pieSlices(rows, max = MAX_PIE_SLICES) {
   return [...data.filter((_, i) => keep.has(i)), { name: other, full: other, value: rest.reduce((a, d) => a + d.value, 0) }];
 }
 
+// 개별 값이 유한해도 합계는 넘칠 수 있다. 그룹화와 Recharts의 비율 계산보다 먼저
+// 같은 배율로 줄인다. 보통 값은 그대로 두고, 툴팁은 scale로 원래 단위를 복원한다.
+export function pieData(rows) {
+  const total = rows.reduce((sum, row) => sum + row.values[0], 0);
+  const scale = Number.isFinite(total) ? 1 : Math.max(...rows.map(row => row.values[0]));
+  return {
+    data: pieSlices(scale === 1 ? rows : rows.map(row => ({ ...row, values: [row.values[0] / scale] }))),
+    scale,
+  };
+}
+
+export function fmtScaledNum(value, scale) {
+  const product = value * scale;
+  if (Number.isFinite(product)) return fmtNum(product);
+  // '기타' 자체가 Number 범위를 넘을 때도 Infinity 대신 원래 크기를 지수로 적는다.
+  const exponent = Math.floor(Math.log10(scale));
+  const [mantissa, extra] = (value * (scale / 10 ** exponent)).toExponential(2).split('e');
+  return `${mantissa}e+${exponent + Number(extra)}`;
+}
+
 // 원그래프의 바깥 라벨(이름과 비율을 조각 곁에 적는 것)이 그림 상자를 넘는가. 넘으면 그리는 쪽(Chart.jsx
 // PieView)은 비율만 조각 안에 적고 이름은 상자 아래 범례로 내린다 — SVG 밖으로 나간 글자는 소리 없이
 // 잘리기 때문이다. 상자 폭 하나로 가르던 때에는(380px 아래에서만 안으로) 데스크톱 폭에서도 스무 자

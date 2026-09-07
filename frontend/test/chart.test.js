@@ -6,11 +6,28 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import {
   parseChartBlock, chartBlocksToTables, chartTableMarkdown, toNumber, toTime, pieSlices, clip, sliceSafe,
-  chartNotes, fmtNum, pieLabelsOverflow, fitText, chartFences, normalizeTable, parseTable, CHART_FENCE_RE, MAX_CHART_ROWS, MAX_SERIES, MAX_LABEL_LEN, MAX_NAME_LEN, MAX_PIE_SLICES,
+  chartNotes, fmtNum, pieData, fmtScaledNum, pieLabelsOverflow, fitText, chartFences, normalizeTable, parseTable, CHART_FENCE_RE, MAX_CHART_ROWS, MAX_SERIES, MAX_LABEL_LEN, MAX_NAME_LEN, MAX_PIE_SLICES,
 } from '../src/chart.js';
 
 const TABLE = '| 월 | 건수 | 금액 |\n|---|---|---|\n| 2024-01 | 120 | 1,000 |\n| 2024-02 | 80 | 2,500 |';
 const spec = text => { const r = parseChartBlock(text); assert.ok(r.ok, r.reason); return r.spec; };
+
+test('원그래프는 합계와 기타 조각이 넘쳐도 유한한 비율과 원래 단위를 보존한다', () => {
+  const rows = values => values.map((value, i) => ({ label: String(i), full: String(i), values: [value] }));
+  const normal = pieData(rows([30, 70]));
+  assert.deepEqual(normal.data.map(d => d.value), [30, 70]);
+  assert.equal(normal.scale, 1);
+  assert.equal(fmtScaledNum(30, normal.scale), '30');
+  const huge = pieData(rows([1e308, 1e308]));
+  assert.deepEqual(huge.data.map(d => d.value), [1, 1]);
+  assert.equal(fmtScaledNum(huge.data[0].value, huge.scale), '1.00e+308');
+  const grouped = pieData(rows(Array(14).fill(1e308)));
+  assert.equal(grouped.data.length, MAX_PIE_SLICES);
+  assert.equal(grouped.data.reduce((sum, d) => sum + d.value, 0), 14);
+  assert.equal(grouped.data.at(-1).value, 3);
+  assert.equal(fmtScaledNum(grouped.data.at(-1).value, grouped.scale), '3.00e+308');
+  assert.equal(fmtScaledNum(100, Number.MAX_VALUE), '1.80e+310');
+});
 
 test('시간대가 명시된 시각은 실제 순간으로 비교하고 원래 표기를 보존한다', () => {
   const utc = Date.UTC(2026, 8, 6, 3, 0, 0, 123);

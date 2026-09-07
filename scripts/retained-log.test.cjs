@@ -6,6 +6,53 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { createLog } = require('./retained-log.cjs');
 
+test('launcher preserves failure status and drains both output pipes before exiting', { timeout: 10_000 }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'logged-process-drain-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'backend.log');
+  const child = spawn(process.execPath, [path.join(__dirname, 'logged-process.cjs'), '-e', `
+    process.stdout.write('OUT'.repeat(100_000) + 'stdout end\\n');
+    process.stderr.write('ERR'.repeat(100_000) + 'stderr end\\n');
+    process.exitCode = 7;
+  `], { env: { ...process.env, APP_LOG_FILE: file }, stdio: 'ignore' });
+  t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
+  assert.equal(await new Promise(resolve => child.on('close', resolve)), 7);
+  const content = fs.readFileSync(file, 'utf8').replace(/^===== .* start =====\n/, '');
+  // stdout/stderr chunks may interleave in the middle of a repeated token.
+  for (const letter of ['O', 'U', 'T', 'E']) assert.equal(content.split(letter).length - 1, 100_000);
+  assert.equal(content.split('R').length - 1, 200_000);
+  assert.match(content, /stdout end/);
+  assert.match(content, /stderr end/);
+});
+
+test('launcher kills a server that ignores SIGTERM within its shutdown deadline', { timeout: 10_000 }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'logged-process-force-'));
+  const file = path.join(dir, 'backend.log');
+  let serverPid;
+  const child = spawn(process.execPath, [path.join(__dirname, 'logged-process.cjs'), '-e', `
+    process.on('SIGTERM', () => {});
+    console.log('ready pid=' + process.pid);
+    setInterval(() => {}, 1000);
+  `], { env: { ...process.env, APP_LOG_FILE: file, APP_LOG_STOP_MS: '100' }, stdio: 'ignore' });
+  t.after(() => {
+    if (child.exitCode === null) child.kill('SIGKILL');
+    if (serverPid) { try { process.kill(serverPid, 'SIGKILL'); } catch {} }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const closed = new Promise(resolve => child.on('close', resolve));
+  const deadline = Date.now() + 5000;
+  while (!serverPid) {
+    if (fs.existsSync(file)) serverPid = Number(fs.readFileSync(file, 'utf8').match(/ready pid=(\d+)/)?.[1]);
+    assert.ok(Date.now() < deadline, 'server should install its signal handler');
+    if (!serverPid) await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  child.kill('SIGTERM');
+  assert.equal(await closed, 1);
+  assert.match(fs.readFileSync(file, 'utf8'), /process exited on SIGKILL/);
+  assert.throws(() => process.kill(serverPid, 0), { code: 'ESRCH' });
+  serverPid = undefined;
+});
+
 test('rotation retains only today and two preceding UTC dates, including idle cleanup and restart', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'retained-log-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

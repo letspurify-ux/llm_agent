@@ -87,6 +87,11 @@ if (typeof structuredClone !== 'function') {
   const fail = what => { throw new DOMException(`${what} could not be cloned.`, 'DataCloneError'); };
   const TYPED = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array',
     'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array'];
+  // 대입은 __proto__ setter를 부르므로 데이터가 사라지거나 순환 원형 오류가 난다.
+  // 네이티브처럼 원형을 건드리지 않고 자신의 데이터 속성으로 만든다.
+  const put = (out, key, value) => Object.defineProperty(out, key, {
+    value, writable: true, enumerable: true, configurable: true,
+  });
   const clone = (v, seen) => {
     if (v === null || typeof v !== 'object') {
       if (typeof v === 'function') fail('A function');
@@ -128,7 +133,7 @@ if (typeof structuredClone !== 'function') {
     if (Array.isArray(v)) {
       out = new Array(v.length);
       seen.set(v, out);
-      for (const k of Object.keys(v)) out[k] = clone(v[k], seen);
+      for (const k of Object.keys(v)) put(out, k, clone(v[k], seen));
       return out;
     }
     if (tag === 'Map') {
@@ -148,7 +153,7 @@ if (typeof structuredClone !== 'function') {
     // 그 밖은 평범한 객체로 (클래스의 인스턴스도 원형 없이 값만 — 명세가 그렇다)
     out = {};
     seen.set(v, out);
-    for (const k of Object.keys(v)) out[k] = clone(v[k], seen);
+    for (const k of Object.keys(v)) put(out, k, clone(v[k], seen));
     return out;
   };
   Object.defineProperty(globalThis, 'structuredClone', {

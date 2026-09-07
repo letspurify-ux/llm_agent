@@ -13,6 +13,27 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
+test('structuredClone 폴리필은 __proto__ 데이터 키를 잃거나 원형으로 바꾸지 않는다', async () => {
+  const got = await inChild(`
+    const native = globalThis.structuredClone;
+    delete globalThis.structuredClone;
+    await import('./src/polyfills.js');
+    const samples = [JSON.parse('{"__proto__":{"label":"값"},"name":"그림"}'), []];
+    Object.defineProperty(samples[1], '__proto__', { value: samples[1], enumerable: true });
+    const inspect = clone => samples.map(source => {
+      const result = clone(source);
+      return {
+        keys: Object.keys(result),
+        prototype: Object.getPrototypeOf(result) === (Array.isArray(source) ? Array.prototype : Object.prototype),
+        own: Object.hasOwn(result, '__proto__'),
+        value: Array.isArray(source) ? result.__proto__ === result : result.__proto__.label,
+      };
+    });
+    process.stdout.write(JSON.stringify({actual: inspect(structuredClone), expected: inspect(native)}));
+  `);
+  assert.deepStrictEqual(got.actual, got.expected);
+});
+
 // 아이 프로세스에서 스크립트를 돌리고 stdout(JSON 한 줄)을 받는다.
 function inChild(script) {
   return new Promise((resolve, reject) => {

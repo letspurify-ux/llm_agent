@@ -16,6 +16,7 @@ import { sanitizeDecision } from '../../src/llm.js';
 import { readStoredResult } from '../../src/read-result.js';
 import { resolveTableData, resolveChartData } from '../../src/chart.js';
 import { parseChartBlock } from '../../../frontend/src/chart.js';
+import { handleQuestion } from '../../src/agent.js';
 
 const exec = promisify(execFile);
 const container = `backend-oracle-test-${randomUUID().slice(0, 8)}`;
@@ -73,6 +74,35 @@ after(async () => {
 });
 
 const registry = query_sql => ({ query_name: 'fixture', query_sql, target_db_name: 'DISPOSABLE_ORACLE' });
+
+test('숫자·문자열 바인드로 다른 행을 찾는 실제 Oracle 조회를 중복으로 생략하지 않는다', async () => {
+  const q = { ...registry(`WITH codes AS (
+    SELECT CAST('01' AS VARCHAR2(2)) AS code FROM DUAL
+    UNION ALL SELECT CAST('1' AS VARCHAR2(2)) FROM DUAL
+  ) SELECT code FROM codes WHERE code = :id ORDER BY code`), seq: 1 };
+  const numeric = await runQuery(q, { id: 1 });
+  const textual = await runQuery(q, { id: '1' });
+  assert.deepEqual(numeric.rows, [{ CODE: '01' }, { CODE: '1' }]);
+  assert.deepEqual(textual.rows, [{ CODE: '1' }]);
+
+  for (const batch of [false, true]) {
+    const queries = [{ query_name: q.query_name, params: { id: 1 } },
+      { query_name: q.query_name, params: { id: '1' } }];
+    const decisions = [
+      { action: 'search', text: '코드 조회', targets: ['query'] },
+      ...(batch ? [{ action: 'run_queries', queries }]
+        : queries.map(item => ({ action: 'run_query', ...item }))),
+      { action: 'answer', answer: '조회 완료' },
+    ];
+    const result = await handleQuestion('숫자 비교 후 정확한 문자열로 다시 조회', [], { deps: {
+      decide: async () => sanitizeDecision(decisions.shift()),
+      search: async () => ({ queries: [{ ...q }] }),
+      run: runQuery,
+    } });
+    assert.deepEqual(result.trace.filter(h => h.rows).map(h => h.rows), [numeric.rows, textual.rows],
+      `${batch ? '배치' : '순차'} 조회에서 타입이 다른 두 번째 바인드가 사라졌다`);
+  }
+});
 
 test('TIMESTAMP의 밀리초는 결과·프롬프트·추가 읽기·후속 바인드에서 보존된다', async () => {
   const events = `WITH events AS (

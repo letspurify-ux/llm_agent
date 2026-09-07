@@ -6,7 +6,7 @@ import {
   ResponsiveContainer, ComposedChart, PieChart, ScatterChart,
   Bar, Line, Area, Pie, Scatter, Cell, XAxis, YAxis, CartesianGrid, Tooltip,
 } from 'recharts';
-import { pieSlices, chartNotes, fmtNum, pieLabelsOverflow, fitText } from './chart.js';
+import { pieData, fmtScaledNum, chartNotes, fmtNum, pieLabelsOverflow, fitText } from './chart.js';
 
 // 첫 색은 앱의 강조색(index.html --accent)을 따라가고, 나머지는 서로 구별되는 고정 팔레트다.
 // 강조색은 이 모듈이 처음 실행될 때 한 번 읽는다 — 차트가 나올 시점에는 문서가 이미 그려져 있다.
@@ -292,7 +292,7 @@ function PieView({ spec }) {
   // 조각 고르기(큰 것 남기고 나머지는 '기타')는 chart.js pieSlices — 표 순서와 무관하게 값으로 고른다.
   // 행이 바뀔 때만 고른다: 폭이 바뀔 때마다(useLabelsFit) 다시 렌더되는데, 그때마다 100행을
   // 다시 훑고 정렬할 이유가 없다.
-  const data = useMemo(() => pieSlices(spec.rows), [spec.rows]);
+  const { data, scale } = useMemo(() => pieData(spec.rows), [spec.rows]);
   const total = data.reduce((a, d) => a + d.value, 0);
   const pct = v => (total > 0 ? `${((v / total) * 100).toFixed(1)}%` : '');
   const [boxRef, inside] = useLabelsFit(data, total);
@@ -307,7 +307,7 @@ function PieView({ spec }) {
         </Pie>
         {/* 이름은 조각(범주)의 것이다 — 시리즈 이름은 제목이 이미 말하고, 툴팁이 답해야 할 것은 '어느 조각인가'다.
             조각 라벨은 잘린 것(name)이고 원래 값은 full에 있다. */}
-        <Tooltip contentStyle={tooltipStyle} formatter={(v, name, item) => [`${fmtNum(v)} (${pct(v)})`, item?.payload?.full ?? name]} />
+        <Tooltip contentStyle={tooltipStyle} formatter={(v, name, item) => [`${fmtScaledNum(v, scale)} (${pct(v)})`, item?.payload?.full ?? name]} />
       </PieChart>
     </ResponsiveContainer>
     {/* 이름을 조각 곁에 둘 자리가 없을 때만 범례를 단다 — 자리가 있으면 라벨이 이미 이름을 말한다.

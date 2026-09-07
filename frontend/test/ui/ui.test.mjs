@@ -161,6 +161,28 @@ async function sendQuestion(text, answers) {
   await page.until(`document.querySelectorAll('.row.assistant').length === ${answers} && !document.querySelector('.typing')`);
 }
 
+it('원그래프의 유효한 큰 값 합계가 넘쳐도 비율과 조각을 그린다', async () => {
+  await page.touchMode(false);
+  await page.viewport(1000, 760);
+  await page.goto(url(), '.chip');
+  const answer = '```chart\ntype: pie\ntitle: 큰 비율\n|항목|값|\n|---|---|\n|가|1e308|\n|나|1e308|\n```';
+  await page.eval(`window.fetch = async () => new Response(JSON.stringify({answer: ${JSON.stringify(answer)}}), {headers: {'Content-Type': 'application/json'}})`);
+  await sendQuestion('큰 값 비율', 1);
+  await page.until(`document.querySelector('figure.chart svg')`);
+  await settled();
+  const labels = await page.eval(`Array.from(document.querySelectorAll('figure.chart svg text')).map(e => e.textContent)`);
+  assert.equal(labels.length, 2);
+  assert.ok(labels.every(s => s.includes('50')), JSON.stringify(labels));
+  const paths = await page.eval(`Array.from(document.querySelectorAll('.recharts-pie-sector path')).map(e => e.getAttribute('d'))`);
+  assert.equal(paths.length, 2);
+  assert.ok(paths.every(d => d && !/NaN|Infinity/.test(d)));
+  await page.eval(`document.querySelector('figure.chart').scrollIntoView({block:'center'})`);
+  await settled();
+  const point = await page.eval(`(() => { const r = document.querySelector('.recharts-pie-sector path').getBoundingClientRect(); return {x:r.x+r.width/2, y:r.y+r.height/2}; })()`);
+  await page.send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...point });
+  await page.until(`(() => { const el = document.querySelector('.recharts-tooltip-wrapper'); return el && getComputedStyle(el).visibility === 'visible' && el.textContent.includes('1.00e+308') && el.textContent.includes('50.0%'); })()`);
+});
+
 // 이 파일의 스크롤 검사 절반은 '움직이지 않는다'를 단언한다(휠로 올려 읽는 중·펼침·빈 첫 화면·표를
 // 굴리는 동안). 그 검사들이 뜻을 가지려면 '가만히 두면 움직였을 것'이 참이어야 하는데, 화면을 움직이는
 // 것은 App.jsx glide의 requestAnimationFrame이다 — rAF가 돌지 않는 환경에서는 앱이 한 프레임도 놓지

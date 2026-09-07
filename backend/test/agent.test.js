@@ -40,9 +40,18 @@ test('SQL에 없는 여분 파라미터는 다른 실행으로 보지 않는다'
   assert.match(loopGuard(history, 'batch_job_status', BINDS, { job_id: 'B1', 잡소리: 'x' }), /이미 같은 파라미터/);
 });
 
-test('숫자와 문자열은 같은 바인드 값이다', () => {
+test('숫자와 문자열은 Oracle 비교 결과가 달라 별도 바인드 값이다', () => {
   const history = [ran('q', { id: 1 })];
-  assert.match(loopGuard(history, 'q', ['id'], { id: '1' }), /이미 같은 파라미터/);
+  assert.equal(loopGuard(history, 'q', ['id'], { id: '1' }), null);
+  assert.match(loopGuard(history, 'q', ['id'], { id: 1 }), /이미 같은 파라미터/);
+});
+
+test('거부된 boolean 바인드를 문자열로 고치면 이전 실패에 막히지 않는다', () => {
+  for (const value of [true, false]) {
+    const history = [failed('q', { flag: value }), failed('q', { flag: value })];
+    assert.equal(loopGuard(history, 'q', ['flag'], { flag: String(value) }), null);
+    assert.match(loopGuard(history, 'q', ['flag'], { flag: value }), /반복 실패/);
+  }
 });
 
 test('null·undefined·문자열 "null"을 구분한다', () => {
@@ -1829,4 +1838,3 @@ test('대화 로그의 trace 글자에는 짝 잃은 코드유닛이 남지 않�
   const plain = { v: 4, steps: [{ query_name: '조회', params: { a: '값', b: 1 }, rows: [{ V: '\u{1f600} 정상\n둘째 줄' }] }] };
   assert.equal(traceJson(plain), JSON.stringify(plain));
 });
-
