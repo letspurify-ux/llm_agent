@@ -291,6 +291,12 @@ test('cols로 열을 고르고(대소문자 무시·없는 이름은 버림), li
   assert.equal((resolveTableData(tblock('step: 1'), [many]).match(/^\| \d+ \|/gm) || []).length, DEFAULT_TABLE_ROWS);
   const big = Array.from({ length: MAX_TABLE_BLOCK_ROWS + 20 }, (_, i) => ({ A: i }));
   assert.equal((resolveTableData(tblock('step: 1\nlimit: 999'), [big]).match(/^\| \d/gm) || []).length, MAX_TABLE_BLOCK_ROWS);
+  // 행 수가 될 수 없는 값은 기본 행 수로 돌아간다 — 0을 그대로 받으면 표가 통째로 사라지고
+  // 안내는 '답변에 실을 수 있는 표의 양을 넘었습니다'가 되어, 원인과 정반대되는 말을 하게 된다.
+  for (const bad of ['0', '-1', 'x', '', '  ']) {
+    assert.equal((resolveTableData(tblock(`step: 1\nlimit: ${bad}`), [many]).match(/^\| \d+ \|/gm) || []).length,
+      DEFAULT_TABLE_ROWS, `limit: ${bad}`);
+  }
   // cols가 전부 틀리면 앞 열들로 — 이름 하나 틀렸다고 표를 잃지 않는다
   assert.ok(resolveTableData(tblock('step: 1\ncols: x, y'), [rows]).startsWith('| MONTH | CNT |'));
 });
@@ -414,7 +420,9 @@ test('표·차트의 칸은 값이 markdown으로 해석될 수 있을 때만 �
   };
   const 그대로 = ['BATCH_JOB_STATUS', 'order_id', '_start', 'end_', 'METRIC__FIRST', 'A__B__C',
     '**', 'a**b', '2 * 3', 'A&B', 'x & y', '[확인필요', 'a<b', '2026-09-07 10:23:45', 'C:\\a_b\\c',
-    '$HOME', 'V$SESSION', '단가 $12.5'];
+    '$HOME', 'V$SESSION', '단가 $12.5',
+    // 여는 '['가 없으면 ']'는 아무것도 닫지 못한다 — 막을 이유가 없다
+    'a]b', '닫힘]', ']앞'];
   for (const [value, want] of Object.entries(막는다)) {
     assert.equal(escapeCell(value), want, value);
   }
@@ -467,12 +475,26 @@ test('바꿔 넣은 표·안내는 앞뒤 빈 줄로 다른 블록과 갈라 놓
 // 아홉 배가 됐다). 답변 상한(MAX_ANSWER_LEN) 안에 이런 블록 수천 개가 들어가고, 그 시간은 동기 작업이라
 // 그동안 처리 중인 모든 요청이 함께 멈춘다 — 이 저장소가 이차 비용을 막아온 자리와 같은 종류다.
 test('바꿔 넣기의 비용은 블록 수에 비례한다 — 앞 글을 되훑지 않는다', () => {
+  // 두 '크기'를 따로 재어 비를 보면 부하에서 거짓말한다 — 오래 도는 쪽이 방해를 그만큼 더 받고,
+  // 짧은 쪽은 몇 ms짜리라 GC 한 번이 곧 몇 배다(실측: 다른 작업이 도는 동안 8.2배로 깨졌고, 기계가
+  // 한산할 때는 5회 모두 통과했다). 그래서 '같은 총 블록 수'를 두 가지로 나눠 잰다
+  // (frontend/test/stream.test.js·chart.test.js가 같은 이유로 쓰는 방식):
+  // 1,000블록 네 번과 4,000블록 한 번은 바꿔 넣을 블록 수가 같으므로, 선형이면 두 시간이 같고(비 1)
+  // 블록마다 지금까지 만든 글을 되훑으면 한 번에 넣는 쪽만 배로 든다. 방해는 양쪽이 같은 시간만큼
+  // 받으므로 비를 밀지 않는다. 양쪽을 세 번씩 재어 '최소'를 쓴다 — 가장 덜 방해받은 실행이 참값에 가깝다.
   const 답 = n => '```table\nstep: 9\n```\n'.repeat(n);
-  const ms = n => { const t0 = performance.now(); resolveTableData(답(n), [[{ A: 1 }]]); return performance.now() - t0; };
-  ms(1000);
-  const 하나 = Math.max(0.5, ms(1000));
-  const 넷 = ms(4000);
-  assert.ok(넷 < 하나 * 8, `블록이 4배인데 비용이 ${(넷 / 하나).toFixed(1)}배다 (${하나.toFixed(1)}ms → ${넷.toFixed(1)}ms)`);
+  const K = 4, N = 4000;
+  const 큰답 = 답(N), 작은답 = 답(N / K);
+  const steps = [[{ A: 1 }]];
+  const ms = fn => { const t0 = performance.now(); fn(); return performance.now() - t0; };
+  ms(() => resolveTableData(큰답, steps));   // 워밍업 (JIT 편차 제거)
+  let 나눠 = Infinity, 한번에 = Infinity;
+  for (let round = 0; round < 3; round++) {
+    나눠 = Math.min(나눠, ms(() => { for (let k = 0; k < K; k++) resolveTableData(작은답, steps); }));
+    한번에 = Math.min(한번에, ms(() => resolveTableData(큰답, steps)));
+  }
+  assert.ok(한번에 < 나눠 * 2.5,
+    `같은 블록 수인데 한 번에 넣으면 ${(한번에 / 나눠).toFixed(1)}배 든다 — 블록마다 앞 글을 되훑고 있다 (${N / K}블록×${K} ${나눠.toFixed(1)}ms → ${N}블록×1 ${한번에.toFixed(1)}ms)`);
 });
 
 // ── 채운 칸이 화면에서 다른 값으로 읽히던 세 자리 (23회차) ────────────────────────────────
@@ -526,6 +548,10 @@ test('값에 든 주소(자동 링크)는 막지 않는다 — 백슬래시가 �
   ]) {
     assert.equal(escapeCell(value), value, value);
   }
+  // 도메인이 두 글자여도 링크다 (실측: 'http://ab/x'는 링크). 경계를 좁히면 사내 짧은 호스트가 밀린다.
+  assert.equal(escapeCell('http://ab/x*y*z'), 'http://ab/x*y*z');
+  // 앞이 탭이어도 낱말의 시작이다 — 공백만 보면 탭으로 나눈 값에서 보호가 통째로 꺼진다.
+  assert.equal(escapeCell('메모\thttp://a.com/x*y*z'), '메모\thttp://a.com/x*y*z');
   // 문장 안에 섞여 있어도 주소 밖은 종전대로 막는다.
   assert.equal(escapeCell('참고 http://intra/a*b*c 그리고 *중요*'),
     '참고 http://intra/a*b*c 그리고 \\*중요\\*');

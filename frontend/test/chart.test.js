@@ -689,11 +689,24 @@ test('chartFences는 CHART_FENCE_RE와 같은 블록을 찾는다 (무작위 문
 // 길이 두 배에 네 배). 이력 변환은 그 답변이 최근 여섯 턴에 있는 동안 매 전송마다 다시 도므로 질문마다 반초씩 멈췄다.
 test('chartBlocksToTables는 닫히지 않은 펜스가 아무리 많아도 비용이 길이에 비례한다', () => {
   const degenerate = n => '```chart\n'.repeat(n);
-  const ms = n => { const t0 = performance.now(); chartBlocksToTables(degenerate(n)); return performance.now() - t0; };
-  ms(2000);
-  const one = Math.max(0.5, ms(2000));
-  const four = ms(8000);
-  assert.ok(four < one * 8, `길이가 4배인데 비용이 ${(four / one).toFixed(1)}배다 (${one.toFixed(1)}ms → ${four.toFixed(1)}ms)`);
+  // 두 '길이'를 따로 재어 비를 보면 부하에서 거짓말한다 — 오래 도는 쪽(긴 입력)이 방해를 그만큼 더
+  // 받아 비가 커지고, 짧은 쪽은 몇 ms짜리라 한 번의 GC가 곧 몇 배다(실측: 전체 스위트와 함께 돌리면
+  // 세 번에 한 번 깨졌다. 같은 코드가 홀로 돌 때의 비는 2.5~4.3으로 상한 8과 멀었다).
+  // 그래서 '같은 총 길이'를 두 가지로 나눠 잰다 (stream.test.js의 선형성 시험과 같은 방식):
+  // 2,000줄 네 번과 8,000줄 한 번은 훑어야 할 글자가 같으므로, 선형이면 두 시간이 같고(비 1)
+  // 여는 펜스마다 남은 글을 끝까지 다시 훑으면 한 번에 넣는 쪽만 배로 든다. 방해는 양쪽이 같은 시간만큼
+  // 받으므로 비를 밀지 않는다. 양쪽을 세 번씩 재어 '최소'를 쓴다 — 가장 덜 방해받은 실행이 참값에 가깝다.
+  const K = 4, N = 8000;
+  const big = degenerate(N), small = degenerate(N / K);
+  const ms = fn => { const t0 = performance.now(); fn(); return performance.now() - t0; };
+  ms(() => chartBlocksToTables(big));   // 워밍업 (JIT 편차 제거)
+  let split = Infinity, whole = Infinity;
+  for (let round = 0; round < 3; round++) {
+    split = Math.min(split, ms(() => { for (let k = 0; k < K; k++) chartBlocksToTables(small); }));
+    whole = Math.min(whole, ms(() => chartBlocksToTables(big)));
+  }
+  assert.ok(whole < split * 2.5,
+    `같은 글자 수인데 한 번에 넣으면 ${(whole / split).toFixed(1)}배 든다 — 펜스마다 전부 다시 훑고 있다 (${(N / K)}줄×${K} ${split.toFixed(1)}ms → ${N}줄×1 ${whole.toFixed(1)}ms)`);
   // 결과도 같아야 한다 — 닫히지 않은 펜스는 블록이 아니라 그대로 남는다
   assert.strictEqual(chartBlocksToTables(degenerate(3)), degenerate(3));
   // dead 표시는 '이 길이 이상의 닫는 펜스가 끝까지 없다'일 뿐이다 — 더 짧은 여는 줄은 여전히 제 닫는 줄을 찾는다

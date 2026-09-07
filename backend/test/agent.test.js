@@ -9,6 +9,8 @@ import { loopGuard, paramKey, normalizeChat, fallbackAnswer, normalizeQuestion, 
 import { MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_ANSWER_LEN, MAX_RESULT_ROWS, MAX_RESULT_COLS, MAX_CELL_LEN, TRUNC_MARK, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_BATCH_QUERIES, MAX_EXPANDS, MAX_DOC_LEN, SEARCH_TARGETS, indentLines } from '../src/constants.js';
 import { buildPrompt, NO_SEARCH_LEFT_NOTE, NO_QUERY_LEFT_NOTE, fewQueriesLeftNote, fewExpandsLeftNote } from '../src/llm-openai.js';
 import { buildItems, planRanges, canGrow, CHUNK_OVERLAP, CHUNK_TARGET_LEN } from '../src/chunk.js';
+import { traceJson } from '../src/db.js';
+import { sanitizeDecision } from '../src/llm.js';
 
 const ran = (name, params, rows = [{ A: 1 }]) => ({ query_name: name, params, rows, totalRows: rows.length });
 const failed = (name, params) => ({ query_name: name, params, error: 'ORA-00942' });
@@ -1732,3 +1734,39 @@ test('이력 줄 수에 막혀 잘린 배치의 안내는 조회 스텝 상한�
     assert.ok(!/조회 스텝 상한/.test(note));
   } finally { restore(); }
 });
+
+// chat_log.trace는 JSON 컬럼이라 MariaDB가 INSERT에서 검사한다 — 짝 잃은 코드유닛이 `\udXXX`
+// 이스케이프로 실리면 그 검사를 통과하지 못하고(실측: CONSTRAINT chat_log.trace failed) 그 요청의
+// 대화 로그가 통째로 사라진다. 남는 것은 '[chat_log] failed to record' 한 줄뿐인데, chat_log는
+// '답하지 못한 질문'을 찾는 유일한 출처라(README) 하필 모델 출력이 깨진 요청만 데이터에서 빠진다.
+// 통로는 params다: 결정 경계는 검색어·query_name·target_db만 걷어내고 params는 일부러 두기 때문이다
+// (실행에 쓰는 값을 말없이 고치면 그 경계가 '잘린 값으로 조회해 0건을 없다고 단정하는' 실패를 스스로 만든다).
+// 그래서 실행에 쓰는 값은 그대로 두고 '저장하는 쪽'(db.js traceJson)에서만 맞춘다 — 이 테스트가 그 둘을 함께 못 박는다.
+test('대화 로그의 trace 글자에는 짝 잃은 코드유닛이 남지 않는다 (실행에 쓰는 params는 그대로)', () => {
+  const HI = '\uD800', LO = '\uDC00';
+  const decision = sanitizeDecision({
+    action: 'run_query', query_name: `q${HI}`, target_db: `D${HI}`,
+    params: { [`job${HI}`]: `BATCH${LO}`, ok: '정상' },
+  });
+  // 결정 경계의 계약: 이력 줄에 원문 그대로 실리는 셋은 걷어내고, 실행에 쓰는 params는 건드리지 않는다
+  assert.doesNotMatch(decision.query_name, /[\uD800-\uDFFF]/);
+  assert.doesNotMatch(decision.target_db ?? '', /[\uD800-\uDFFF]/);
+  assert.match(Object.keys(decision.params).join(''), /[\uD800-\uDFFF]/, 'params 키는 실행 경계까지 그대로 간다');
+  assert.match(Object.values(decision.params).join(''), /[\uD800-\uDFFF]/, 'params 값은 실행 경계까지 그대로 간다');
+
+  const trace = { v: 4, outcome: 'answered', steps: [{ query_name: 'q', params: decision.params, rows: [{ V: '정상' }] }] };
+  const text = traceJson(trace);
+  // JSON.stringify가 \uXXXX로 내보내는 것은 제어문자(0000~001F)와 짝 잃은 코드유닛뿐이다 —
+  // D800~DFFF 범위의 이스케이프가 남아 있으면 그것이 곧 짝 잃은 코드유닛이다.
+  assert.doesNotMatch(text, /\\u[dD][89abAB][0-9a-fA-F]{2}|\\u[dD][c-fC-F][0-9a-fA-F]{2}/, text);
+  assert.doesNotMatch(text, /[\uD800-\uDFFF]/);
+  // 키·값이 사라지지는 않는다 — 걷어낸 것은 반쪽짜리 코드유닛뿐이다
+  const back = JSON.parse(text);
+  assert.equal(Object.keys(back.steps[0].params).length, 2);
+  assert.equal(back.steps[0].params.ok, '정상');
+  assert.equal(back.steps[0].params.job, 'BATCH');
+  // 성한 trace는 글자 하나 달라지지 않는다 (이모지·줄바꿈 포함)
+  const plain = { v: 4, steps: [{ query_name: '조회', params: { a: '값', b: 1 }, rows: [{ V: '\u{1f600} 정상\n둘째 줄' }] }] };
+  assert.equal(traceJson(plain), JSON.stringify(plain));
+});
+

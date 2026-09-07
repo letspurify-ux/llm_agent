@@ -146,12 +146,12 @@
 | 설정 | 기본 | 천장 |
 |---|---:|---:|
 | `MAX_PROMPT_TOTAL_LEN` | 80,000자 | 자료 네 섹션과 고정 틀의 합계 |
-| `PROMPT_FRAME_RESERVE` | 400자 | 제목·지시·빈 줄 |
+| `PROMPT_FRAME_RESERVE` | 500자 | 제목·지시·빈 줄 (실측 최대 425자) |
 | `PROMPT_FLOORS.history` | 25,000자 | 줄 수와 개별 결과 상한으로 제한 |
 | `PROMPT_FLOORS.queries` | 15,000자 | `PROMPT_CEILINGS.queries` 20,000자 |
 | `PROMPT_FLOORS.qaMethods` | 10,000자 | `PROMPT_CEILINGS.qaMethods` 20,000자 |
 | `PROMPT_FLOORS.knowledge` | 25,000자 | `PROMPT_CEILINGS.knowledge` 40,000자 |
-| 기본 합계 | 75,400자 | 여유 4,600자 |
+| 기본 합계 | 75,500자 | 여유 4,500자 |
 
 | 개별 상한 | 값 |
 |---|---:|

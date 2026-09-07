@@ -9,7 +9,7 @@ import { once } from 'node:events';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import mariadb from 'mariadb';
-import { closePool, loadChunkRanges } from '../../src/db.js';
+import { closePool, loadChunkRanges, insertChatLog } from '../../src/db.js';
 import { syncEmbeddings, syncSummary, SKIP } from '../../src/embed-sync.js';
 import { handleQuestion } from '../../src/agent.js';
 import { buildItems } from '../../src/chunk.js';
@@ -136,6 +136,26 @@ test('실제 쿼리 등록 검색에서 조회 실행·표 참조까지 이어�
   assert.equal(result.trace[1].rows.length, 1);
   assert.match(result.answer, /TODAY/);
   assert.match(result.answer, /\d{4}-\d{2}-\d{2}/);
+});
+
+// chat_log.trace는 JSON 컬럼이라 MariaDB가 INSERT에서 직접 검사한다 — 그 검사는 실물 DB에서만 드러난다.
+// 모델이 낸 params에 짝 잃은 코드유닛이 있으면 JSON.stringify가 그것을 `\udXXX`로 내보내는데, 그 JSON은
+// 검사를 통과하지 못해 **그 요청의 대화 로그 한 줄이 통째로** 사라진다(남는 것은 경고 한 줄뿐이다).
+// 하필 모델 출력이 깨진 요청 — 가장 들여다볼 값어치가 있는 요청 — 만 데이터에서 빠지므로,
+// 그 자리를 실물 컬럼으로 못 박는다 (직렬화 규칙 자체는 test/agent.test.js가 잰다).
+test('모델이 낸 깨진 코드유닛이 있어도 대화 로그가 통째로 사라지지 않는다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  const HI = '\uD800', LO = '\uDC00';
+  const trace = { v: 4, outcome: 'answered',
+    steps: [{ query_name: 'q', params: { [`job${HI}`]: `BATCH${LO}` }, rows: [{ V: '정상' }] }] };
+  await insertChatLog('질문', `답변${HI}`, trace);
+  const [row] = await conn.query(
+    'SELECT JSON_VALUE(trace, ?) AS outcome, JSON_VALUE(trace, ?) AS job, answer FROM llm_agent.chat_log ORDER BY seq DESC LIMIT 1',
+    ['$.outcome', '$.steps[0].params.job']);
+  assert.equal(row.outcome, 'answered', '분석 SQL이 읽을 수 있는 JSON으로 남아야 한다');
+  assert.equal(row.job, 'BATCH');
+  // answer는 MEDIUMTEXT라 커넥터가 UTF-8로 바꾸며 대체 문자가 된다 — 행이 남는다는 것이 계약이다
+  assert.match(row.answer, /^답변/);
 });
 
 test('제목과 본문 사이 개행 이동도 원문 변경으로 감지해 청크를 갱신한다', async () => {

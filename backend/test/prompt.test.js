@@ -8,7 +8,7 @@ import assert from 'node:assert';
 import { buildPrompt, NO_SEARCH_LEFT_NOTE, NO_QUERY_LEFT_NOTE, fewQueriesLeftNote, fewExpandsLeftNote } from '../src/llm-openai.js';
 import { normalizeChat } from '../src/agent.js';
 import { normalizeCells } from '../src/oracle.js';
-import { MAX_PROMPT_TOTAL_LEN, MAX_PROMPT_STEP_LEN, PROMPT_FLOORS, PROMPT_CEILINGS, PROMPT_FRAME_RESERVE, MAX_EXPANDED_ITEM_LEN, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN, MAX_CELL_LEN, MAX_RESULT_COLS, MAX_ROWS, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_DOC_LEN, MAX_PROMPT_ITEM_LEN, TRUNC_MARK, MAX_BATCH_QUERIES } from '../src/constants.js';
+import { MAX_PROMPT_TOTAL_LEN, MAX_PROMPT_STEP_LEN, PROMPT_FLOORS, PROMPT_CEILINGS, PROMPT_FRAME_RESERVE, MAX_EXPANDED_ITEM_LEN, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN, MAX_CELL_LEN, MAX_RESULT_COLS, MAX_ROWS, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_DOC_LEN, MAX_PROMPT_ITEM_LEN, TRUNC_MARK, MAX_BATCH_QUERIES, MAX_RESULT_READS } from '../src/constants.js';
 
 const big = n => 'ㄱ'.repeat(n);
 
@@ -316,19 +316,46 @@ test('섹션 최소 몫 합계가 전체 예산을 넘지 않는다', () => {
 test('고정 틀(제목·빈 줄·지시 블록)이 자기 몫 안에 든다', () => {
   // 섹션 본문은 배분이 세지만 제목 줄·블록 사이 빈 줄·질문 제목·지시 블록은 세지 않는다 —
   // 그 몫을 미리 떼는데, 떼는 값이 실제 틀보다 작으면 꽉 찬 요청에서 그 차이만큼 넘친다.
-  // 지시 블록의 모양 셋(강제 답변 / 아직 검색 전 / 검색 기회 소진)을 전부 재서 가장 긴 것을 쓴다 — 한 모양만 재면
-  // 다른 모양에 붙는 안내 한 줄이 몫 밖으로 새어도 아무 데서도 드러나지 않는다(forceAnswer만 재던 동안 '아직 검색 전'
-  // 모양이 이미 그보다 50자 길었다).
-  const base = { question: '', chat: [], knowledge: [], qaMethods: [], queries: [], history: [] };
-  const forms = [
-    { ...base, forceAnswer: true },
-    { ...base, tried: false, searched: [] },
-    { ...base, tried: true, searched: ['knowledge'], canSearch: false, queriesLeft: 0 },
-    { ...base, tried: true, searched: ['knowledge'], canSearch: false, queriesLeft: 1, expandsLeft: 1 },
-  ];
-  const frame = Math.max(...forms.map(f => buildPrompt(f).length - 5 * '(없음)'.length));
-  // 건수 자릿수 여유(섹션 다섯 곳 × 4자리)까지 더해도 몫 안이어야 한다
-  assert.ok(frame + 20 <= PROMPT_FRAME_RESERVE, `틀이 몫을 넘는다: ${frame} + 20 > ${PROMPT_FRAME_RESERVE}`);
+  //
+  // 재는 ctx는 agent가 실제로 만드는 모양이어야 한다. 앞선 판은 두 자리에서 그렇지 않았고, 그래서
+  // 틀이 몫을 25자 넘긴 채로도 통과했다(실측 425 > 400):
+  //   ① 자료 섹션이 한둘만 보이는 ctx로 재면서 '(없음)' 다섯 줄을 뺐다 — 보이지도 않은 제목 줄 셋이
+  //      함께 빠져 틀을 그만큼 작게 셌다. searched를 셋 다 주어 다섯 섹션이 모두 보이게 한다.
+  //   ② agent의 ctx는 resultReadsLeft를 늘 넘기는데(agent.js ctx) 어느 모양에도 없었다 — 그 줄이
+  //      붙는 조합이 가장 긴 모양이다.
+  // 지시 블록의 모양은 하나씩 고르지 않고 조합을 전부 돈다. 한 모양만 재면 다른 모양에 붙는 안내 한 줄이
+  // 몫 밖으로 새어도 아무 데서도 드러나지 않는다(forceAnswer만 재던 동안 '아직 검색 전' 모양이 이미 50자 길었다).
+  // 본문은 '- '로 시작하는 줄이므로 그것만 빼면 남는 것이 곧 틀이다 — '(없음)'을 세는 방식보다
+  // 섹션이 몇 개 보이는지에 좌우되지 않는다.
+  const frameOf = p => p.split('\n').filter(l => !l.startsWith('- ') && l !== '(없음)').join('\n').length;
+  // 건수·버림 표기의 자릿수도 최대로 — 제목 줄은 (N건, 버림 M건)까지 자란다.
+  const many = n => new Array(n).fill(0).map((_, i) => ({ seq: i + 1, title: '', content: '', method: '', dropped: true }));
+  const qs = n => new Array(n).fill(0).map((_, i) => ({ seq: i, query_name: '', query_desc: '', input_desc: '',
+    output_desc: '', query_sql: 'SELECT 1 FROM t', target_db_name: 'D' }));
+  // 지시 블록의 조합과 건수 자릿수는 서로 영향을 주지 않는다 — 따로 재서 더한다(조합마다 9,999건짜리
+  // 목록을 만들면 이 테스트 하나가 분 단위가 된다).
+  const base = { question: '', chat: [], knowledge: [], qaMethods: [], queries: [], history: [],
+    searched: ['knowledge', 'qa_method', 'query'], contextNote: '', canExpand: true,
+    resultReadsLeft: MAX_RESULT_READS };
+  let frame = 0;
+  for (const forceAnswer of [true, false]) {
+    for (const tried of [true, false]) {
+      for (const canSearch of [true, false]) {
+        for (const expandsLeft of [0, 1, MAX_EXPANDS]) {
+          for (const queriesLeft of [0, 1, MAX_BATCH_QUERIES - 1, MAX_STEPS]) {
+            frame = Math.max(frame, frameOf(buildPrompt({ ...base, forceAnswer, tried, canSearch, expandsLeft, queriesLeft })));
+          }
+        }
+      }
+    }
+  }
+  // 건수·버림 표기가 최대일 때 제목 줄이 자라는 몫 — 한 번만 잰다
+  const rep = { ...base, tried: true, canSearch: false, expandsLeft: 1, queriesLeft: 1 };
+  const grown = frameOf(buildPrompt({ ...rep, knowledge: many(9999), qaMethods: many(9999), queries: qs(9999) }));
+  const digits = grown - frameOf(buildPrompt(rep));
+  assert.ok(digits > 0, '건수 표기가 자라지 않았다 — 재는 방식이 틀렸다');
+  assert.ok(frame + digits <= PROMPT_FRAME_RESERVE,
+    `틀이 몫을 넘는다: ${frame} + ${digits} > ${PROMPT_FRAME_RESERVE}`);
 });
 
 // 실행한 검색은 이력에 남지만 상한(MAX_SEARCHES)은 프롬프트 어디에도 없었다 — 생산적인 검색 셋 뒤 모델이 낸 넷째 검색은

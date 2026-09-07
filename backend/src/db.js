@@ -1,6 +1,6 @@
 // MariaDB (agent 관리 DB) 커넥션 풀 + 관리 테이블 로더
 import mariadb from 'mariadb';
-import { numEnv, nameKey } from './constants.js';
+import { numEnv, nameKey, stripLoneSurrogates } from './constants.js';
 
 // 풀은 처음 쓸 때 만든다 — import만으로 만들면 이 모듈을 (간접적으로라도) 불러오는 모든 코드가
 // DB에 접속을 시도한다. 검색 로직만 import하는 테스트가 MariaDB 기동 여부에 따라 10초씩 매달리는 식이다.
@@ -178,6 +178,50 @@ export function loadQueriesMentionedIn(text) {
   );
 }
 
+// trace를 chat_log.trace(JSON 컬럼)에 넣을 글자로 만든다. (테스트에서 쓰므로 export)
+//
+// 짝 잃은 서로게이트를 여기서 걷어내는 이유: JSON 컬럼은 MariaDB가 INSERT에서 검사하는데
+// (`CHECK (json_valid(trace))`), JSON.stringify가 짝 잃은 코드유닛을 `\udXXX` 이스케이프로 내보내면
+// 그 JSON은 검사를 통과하지 못한다 — 실측: `CONSTRAINT chat_log.trace failed`. 그러면 그 요청의
+// **대화 로그 한 줄이 통째로** 사라지고 남는 것은 '[chat_log] failed to record' 한 줄뿐이다.
+// chat_log는 '답하지 못한 질문'을 찾는 유일한 출처인데(README), 하필 모델 출력이 깨진 요청 —
+// 가장 들여다볼 값어치가 있는 요청 — 만 데이터에서 빠진다.
+//
+// 들어오는 통로는 params다. 결정 경계(llm.js sanitizeDecision)는 검색어·query_name·target_db에서만
+// 짝 잃은 코드유닛을 걷어내고 params는 일부러 건드리지 않는다 — 그 값은 실행에 쓰이므로 말없이 고치면
+// '잘린 값으로 조회해 0건을 없다고 단정하는' 실패를 그 경계가 스스로 만들게 되기 때문이다(그쪽 주석).
+// 그 판단은 그대로 둔다. 실행에 쓰는 값과 로그에 남기는 글자는 다른 소비자이고, 제약도 다르다 —
+// 그래서 '저장하는 쪽'인 여기서 한 번만 맞춘다. 모델은 출력이 토큰 상한에서 이모지 한가운데로 끊기면
+// 실제로 반쪽짜리 코드유닛을 낸다(llm.js sanitizeDecision 머리말).
+//
+// 키도 같은 통로다 — params의 키는 모델이 적은 바인드명이다. 그런데 replacer는 키를 고칠 수 없고,
+// 키를 고치려고 replacer에서 '새 객체'를 돌려주면 안 된다: JSON.stringify의 순환 참조 탐지는
+// '지금 직렬화 중인 값'의 스택을 보므로 원본이 그 스택에 한 번도 올라가지 않아, 깔끔한 TypeError 대신
+// 스택이 바닥날 때까지 재귀한다 (agent.js valueKey에 같은 교훈을 적어 두었다).
+// 그래서 두 걸음으로 나눈다: ① 값만 고치는 replacer로 한 번 만들고 ② 그래도 짝 잃은 이스케이프가
+// 남아 있으면(= 키에 남은 것이다) 그때만 키까지 훑어 다시 만든다. ②는 순환을 마커로 끊는다.
+// 성한 trace는 ①에서 끝나고 글자가 한 글자도 달라지지 않는다.
+const safeString = (key, value) => (typeof value === 'string' ? stripLoneSurrogates(value) : value);
+// JSON.stringify가 `\uXXXX`로 내보내는 것은 제어문자(0000~001F)와 짝 잃은 코드유닛뿐이다 —
+// D800~DFFF 범위의 이스케이프가 남았다는 것은 곧 짝 잃은 코드유닛이 남았다는 뜻이다.
+// (값에 든 리터럴 백슬래시는 `\\`로 나가므로 여기 걸려도 손해는 ②를 한 번 더 도는 것뿐이다.)
+const LONE_ESCAPE_RE = /\\u[dD][89abAB][0-9a-fA-F]{2}|\\u[dD][c-fC-F][0-9a-fA-F]{2}/;
+const CYCLE_MARK = '[순환]';
+function stripKeysDeep(v, seen) {
+  if (!v || typeof v !== 'object') return v;
+  if (seen.has(v)) return CYCLE_MARK;
+  seen.add(v);
+  const out = Array.isArray(v)
+    ? v.map(x => stripKeysDeep(x, seen))
+    : Object.fromEntries(Object.entries(v).map(([k, x]) => [stripLoneSurrogates(k), stripKeysDeep(x, seen)]));
+  seen.delete(v);
+  return out;
+}
+export function traceJson(trace) {
+  const text = JSON.stringify(trace, safeString);
+  return LONE_ESCAPE_RE.test(text ?? '') ? JSON.stringify(stripKeysDeep(trace, new Set()), safeString) : text;
+}
+
 // 대화 로그 기록 — 평가셋/미답변 질문 발굴용. 실패해도 응답에는 영향 없다 (호출부 catch).
 // async여야 한다: JSON.stringify는 query() 호출 전에 동기로 평가되므로, 일반 함수면
 // 직렬화 실패(순환 참조 등)가 호출부의 .catch가 붙기도 전에 동기 예외로 튀어나가
@@ -185,7 +229,7 @@ export function loadQueriesMentionedIn(text) {
 export async function insertChatLog(question, answer, trace) {
   return query(
     'INSERT INTO chat_log (question, answer, trace) VALUES (?, ?, ?)',
-    [question, answer, JSON.stringify(trace)]
+    [question, answer, traceJson(trace)]
   );
 }
 
