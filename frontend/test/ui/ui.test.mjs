@@ -1017,9 +1017,16 @@ it('비어 있는 첫 화면은 크기가 바뀌어도 맨 위로 튕기지 않�
 
 it('펼침(⚡ 실행된 쿼리·표로 보기)은 보던 화면을 그대로 둔다', async () => {
   await answered();
-  const before = await seen('details.trace > summary');
+  // 좌표 측정과 클릭을 같은 JS 작업에서 수행한다. CDP 왕복 사이의 정상적인
+  // 따라가기 이동을 패널 펼침이 일으킨 이동으로 잘못 세지 않는다.
+  const before = await page.eval(`(() => {
+    const summary = document.querySelector('details.trace > summary');
+    if (!summary) return null;
+    const top = Math.round(summary.getBoundingClientRect().top);
+    summary.click();
+    return top;
+  })()`);
   assert.ok(before !== null, '⚡ 패널이 없다 (검사의 전제)');
-  await page.eval(`document.querySelector('details.trace > summary').click()`);
   await sleep(900);
   const after = await state();
   assert.ok(after.rest > 100, '펼치자 바닥으로 끌려가 패널의 끝이 보인다');

@@ -101,9 +101,14 @@ export default function Mermaid({ text }) {
       // 받으면 넓히기를 아예 포기하게 되어 그림 전체가 못 읽는 크기로 남는다.
       // 첫 라벨이 아니라 가장 작은 것을 쓰는 이유는, 크기가 섞인 그림에서 큰 라벨 하나가 기준을
       // 넘겼다고 멈추면 그보다 작은 글자가 못 읽는 채 남기 때문이다.
-      const labels = [...el.querySelectorAll('.nodeLabel, text')];
+      // 한 라벨 안에서도 한글·영문 및 줄마다 글리프 높이가 다를 수 있다.
+      // 첫 tspan만 재면 나머지 줄의 작은 글자가 검사에서 빠진다.
+      const labels = [...el.querySelectorAll('.nodeLabel, text')].flatMap(n => {
+        const spans = [...n.querySelectorAll('tspan')];
+        return spans.length ? spans : [n];
+      });
       const lineHeight = () => {
-        const hs = labels.map(n => (n.querySelector?.('tspan') ?? n).getBoundingClientRect().height).filter(v => v > 0);
+        const hs = labels.map(n => n.getBoundingClientRect().height).filter(v => v > 0);
         return hs.length ? Math.min(...hs) : 0;
       };
       // 넓힌 뒤 다시 재서 모자라면 한 번 더 넓힌다. '폭을 두 배로 하면 글자도 두 배'가 아니기 때문이다 —
