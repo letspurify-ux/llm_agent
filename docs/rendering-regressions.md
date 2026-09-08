@@ -42,6 +42,8 @@ Node 22 이상과 Chrome이 필요하다. 필요하면 `CHROME_PATH`로 실행 �
 | JSON 디코딩에서 TeX 백슬래시가 제어 문자로 변환되거나 응답 소실 | [llm-openai.test.js](../backend/test/llm-openai.test.js) | 정상/덜 이스케이프된 기존 코퍼스 및 최신 4개 전체 문서의 최종 원문·1/7/1000자 조각 대조 |
 | 개발 모드만 통과하고 배포 빌드에서 회귀 | [production.test.mjs](../frontend/test/ui/production.test.mjs) | 실제 빌드에서 200개 표·78개 정상 예제·180개 링크 표와 복합 콘텐츠 검사 |
 | Chrome 누락으로 화면 검사가 생략되는데 전체 성공 | [driver.test.js](../frontend/test/driver.test.js), [필수 실행기](../frontend/test/run-regressions.mjs) | 브라우저 없는 필수 모드는 예외, 전체 실행은 REQUIRE_CHROME=1 전달 |
+| Linux에서 패널을 펼칠 때 머리글이 63px 이동 | ui.test의 `펼침(⚡ 실행된 쿼리·표로 보기)` 및 진행 중 펼침/접힘 검사 | 클릭 직전 좌표와 펼친 뒤 좌표의 차이가 6px 미만, 머리글 위치 복원 |
+| 한 라벨의 첫 글자 조각만 측정해 흐름도 일부 글자가 8px로 축소 | ui.test의 `좁은 화면: 흐름도 글자` | 모든 tspan의 실제 높이가 9px 이상, 인쇄에서는 최소 폭 해제 |
 
 차트 파싱·빈 데이터·오류 데이터, Markdown 링크·코드·이미지, Mermaid 보안, 미리보기 상태의
 기존 `chart`, `markdown`, `mermaid-secure`, `preview` 테스트도 전체 단위/UI 검사에 함께 포함된다.
@@ -55,3 +57,7 @@ Node 22 이상과 Chrome이 필요하다. 필요하면 `CHROME_PATH`로 실행 �
 프런트엔드 단위 273개, 실제 Chrome UI 84개, production 2개, 총 462개가 통과했다.
 실패·취소·건너뜀은 모두 0개다. 이는 위에 명시한 입력과 동작의 검증 결과이며,
 모든 임의 입력에 결함이 없다는 보장은 아니다.
+
+CI 최초 실행에서는 한글 글꼴이 없는 환경의 차트 검사 전제 실패도 확인했다.
+Linux 작업에 `fonts-noto-cjk` 설치를 추가했고, 위 두 화면 문제는 원격 재현 결과에 따라
+수정했다. 패널 검사는 좌표 측정과 클릭을 같은 JS 작업으로 묶어 통신 사이의 이동도 배제한다.

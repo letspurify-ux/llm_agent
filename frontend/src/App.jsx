@@ -652,8 +652,31 @@ export default function App() {
     // 사용자의 개입에서 도는 미끄러짐을 멈추는 것은 이 파일의 다른 자리와 같은 처방이다
     // (끌기 시작·안쪽 스크롤·대화 밖 휠이 모두 stopGlide를 부른다).
     const unstick = () => { stuckRef.current = false; stopGlide(); };
-    const onSummaryClick = e => { const d = e.target.closest?.('summary')?.parentElement; if (d && !d.open) unstick(); };
-    const onToggle = e => { if (e.target.open) unstick(); };
+    let openingAnchor = null;
+    let anchorFrame = 0;
+    const onSummaryClick = e => {
+      const summary = e.target.closest?.('summary');
+      const d = summary?.parentElement;
+      if (d && !d.open) {
+        unstick();
+        openingAnchor = { d, summary, top: summary.getBoundingClientRect().top };
+      }
+    };
+    const onToggle = e => {
+      if (!e.target.open) return;
+      unstick();
+      if (openingAnchor?.d !== e.target) return;
+      // 따라가기를 멈춰도 브라우저의 스크롤 앵커 보정이 펼친 패널의 머리를
+      // 옮길 수 있다. 기본 펼침과 React 렌더 뒤에 클릭 당시의 화면 좌표를 복원한다.
+      const anchor = openingAnchor;
+      openingAnchor = null;
+      cancelAnimationFrame(anchorFrame);
+      anchorFrame = requestAnimationFrame(() => {
+        if (anchor.d.open && el.contains(anchor.summary)) {
+          el.scrollTop += anchor.summary.getBoundingClientRect().top - anchor.top;
+        }
+      });
+    };
     el?.addEventListener('click', onSummaryClick, true);
     el?.addEventListener('toggle', onToggle, true);
 
@@ -795,6 +818,7 @@ export default function App() {
     return () => {
       el?.removeEventListener('click', onSummaryClick, true);
       el?.removeEventListener('toggle', onToggle, true);
+      cancelAnimationFrame(anchorFrame);
       el?.removeEventListener('pointerdown', onDown);
       removeEventListener('pointermove', onMove);
       removeEventListener('keydown', onKeyInput, true);
