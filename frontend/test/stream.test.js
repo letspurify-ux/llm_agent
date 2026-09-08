@@ -4,6 +4,23 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { eventOf, isFinal, readEvents } from '../src/stream.js';
+import { NESTED_MIXED_ANSWER } from './mixed-content-corpus.js';
+
+test('복합 콘텐츠: UTF-8·JSON 이스케이프 중간에서 잘린 수식·표·차트 스트림을 원문 그대로 복원한다', async () => {
+  const deltas = Array.from({ length: Math.ceil(NESTED_MIXED_ANSWER.length / 17) }, (_, i) =>
+    ({ type: 'answer_delta', text: NESTED_MIXED_ANSWER.slice(i * 17, (i + 1) * 17) }));
+  const done = { type: 'done', answer: NESTED_MIXED_ANSWER };
+  const bytes = new TextEncoder().encode([...deltas, done].map(e => JSON.stringify(e)).join('\r\n'));
+  for (const size of [1, 2, 7, 31, 1024]) {
+    const chunks = [];
+    for (let i = 0; i < bytes.length; i += size) chunks.push(bytes.slice(i, i + size));
+    const seen = [];
+    const final = await readEvents(chunked(chunks), e => seen.push(e));
+    assert.deepStrictEqual(seen, deltas, `${size}바이트 단위 이벤트`);
+    assert.equal(seen.map(e => e.text).join(''), NESTED_MIXED_ANSWER);
+    assert.deepStrictEqual(final, done);
+  }
+});
 
 test('JSON 응답은 들여쓰기와 여러 줄이 있어도 객체 전체를 읽는다', async () => {
   const data = { answer: '정상 답변', trace: [{ rows: [{ VALUE: 7 }] }] };

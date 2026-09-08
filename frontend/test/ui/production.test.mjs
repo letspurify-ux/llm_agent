@@ -10,6 +10,7 @@ import { findChrome, launchChrome, chromePort, stopProcess, killOnExit, freePort
 import { CASES, TRACE } from './fixtures.js';
 import { TABLE_FORMULAS, INCOMPLETE_TABLE_FORMULAS } from '../table-math-corpus.js';
 import { checkLatex200 } from './latex-table-200-checks.mjs';
+import { checkMixedContent } from './mixed-content-checks.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const VITE = join(ROOT, 'node_modules/vite/bin/vite.js');
@@ -85,6 +86,15 @@ test('production 빌드에서도 대화·수식·차트·흐름도·조회 표�
   assert.equal(await page.eval(`window.__requests[1].history.length`), 2);
   await page.eval(`document.querySelector('.home-btn').click()`);
   await page.until(`document.querySelector('.empty') && !document.querySelector('.row')`);
+  // 개발용 probe뿐 아니라 지연 로딩/최적화를 거친 배포 번들에서도 같은 중첩 조합을 확인한다.
+  await page.eval(`window.fetch = async () => new Response(JSON.stringify({ answer: ${JSON.stringify(CASES.nestedmixed)} }),
+    { headers: { 'Content-Type': 'application/json' } }); document.querySelector('.chip').click()`);
+  await page.until(`document.querySelector('.mermaid svg') && document.querySelector('figure.chart .recharts-surface') && !document.querySelector('.typing')`);
+  await page.eval(`document.querySelector('.chart-table').open = true`);
+  for (const width of [1000, 380, 320]) {
+    await page.viewport(width, 760);
+    await checkMixedContent(page);
+  }
   assert.deepEqual(page.logs, [], 'production 화면 콘솔에 오류가 남았다');
 });
 

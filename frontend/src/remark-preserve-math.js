@@ -75,7 +75,7 @@ export default function remarkPreserveMath() {
   return (tree, file) => {
     const source = String(file);
     const normalized = normalizeMath(source); // 길이가 같으므로 원문 좌표가 유지된다.
-    const protectedRanges = [], noBare = [], candidates = [], contexts = [], tableRows = [], textScopes = [];
+    const protectedRanges = [], noBare = [], candidates = [], contexts = [], tableRows = [], textScopes = [], tagScopes = [];
     const protect = (start, end) => { if (start !== undefined && end !== undefined) protectedRanges.push({ start, end }); };
     const inspect = (node, quotes = 0, inTable = false, tableWidth = 0) => {
       const [start, end] = offsets(node);
@@ -83,6 +83,9 @@ export default function remarkPreserveMath() {
       if (node.type === 'table') { inTable = true; tableWidth = node.children[0].children.length; }
       if (node.type === 'tableRow') tableRows.push({ start, end, width: tableWidth });
       if (['paragraph', 'heading', 'tableRow'].includes(node.type)) textScopes.push({ start, end });
+      if (['paragraph', 'heading', 'tableCell'].includes(node.type) && node.children?.length) {
+        tagScopes.push({ start: offsets(node.children[0])[0], end: offsets(node.children.at(-1))[1], quotes });
+      }
       if (start !== undefined) contexts.push({ start, end, quotes, inTable });
       if (node.type === 'code') {
         protect(start, end);
@@ -220,15 +223,22 @@ export default function remarkPreserveMath() {
         span.end = end; span.display = true;
       }
     }
-    // 구분자가 빠진 번호 달린 식은 문장과 구별 가능한 독립된 한 줄에만 적용한다.
-    const tagged = /^([^\r\n]*[=+^_<>][^\r\n]*?)\s*\\tag\*?\{[^{}\r\n]+\}[ \t]*$/gm;
-    for (const match of normalized.matchAll(tagged)) {
-      const start = match.index, end = start + match[0].length;
+    // 식 번호 복구도 Markdown 본문 범위 안에서만 한다. 문서 전체의 줄을 대상으로 하면
+    // 인용의 >·목록의 -를 수학 기호로 삼키고, 번호 목록의 1.은 산문으로 오인한다.
+    // 첫 줄의 컨테이너 구분자는 AST 좌표가 제외한다. 이어지는 줄에서는 실제 인용 깊이만 벗긴다.
+    const tagged = /^([^\r\n]*[=+^_<>][^\r\n]*?)\s*\\tag\*?\{[^{}\r\n]+\}[ \t]*$/;
+    for (const scope of tagScopes) for (const line of normalized.slice(scope.start, scope.end).matchAll(/[^\r\n]+/g)) {
+      let text = line[0];
+      if (line.index > 0) for (let q = 0; q < scope.quotes; q++) text = text.replace(/^[ \t]*> ?/, '');
+      text = text.replace(/^[ \t]+/, '');
+      const match = tagged.exec(text);
+      if (!match) continue;
+      const start = scope.start + line.index + line[0].length - text.length, end = start + text.length;
       const expression = match[1].replace(/\\[A-Za-z]+/g, '');
       if (!cjk.test(expression) && !/[A-Za-z]{3,}|[.!?:]/.test(expression) &&
-        !escapedAt(normalized, start + match[0].lastIndexOf('\\tag')) && !intersects(start, end) &&
+        !escapedAt(normalized, start + text.lastIndexOf('\\tag')) && !intersects(start, end) &&
         !candidates.some(span => span.start < end && span.end > start))
-        candidates.push({ start, end, value: normalized.slice(start, end).trim(), display: true });
+        candidates.push({ start, end, value: text.trim(), display: true });
     }
     if (!candidates.length) return tree;
     candidates.sort((a, b) => a.start - b.start);

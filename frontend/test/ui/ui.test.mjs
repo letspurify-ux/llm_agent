@@ -20,6 +20,8 @@ import { pieSlices, parseChartBlock, MAX_TITLE_LEN } from '../../src/chart.js';
 import { MATH_CORPUS, MATH_LAYOUT_CASES } from '../math-corpus.js';
 import { TABLE_FORMULAS, INCOMPLETE_TABLE_FORMULAS } from '../table-math-corpus.js';
 import { checkLatex200 } from './latex-table-200-checks.mjs';
+import { checkMixedContent } from './mixed-content-checks.mjs';
+import { NESTED_MIXED_ANSWER, MIXED_FORMULAS } from '../mixed-content-corpus.js';
 import { CASES, TRACE, READY, ENVIRONMENT_EXAMPLES, PIE_BLOCK, PIE_LONG_NAMES, PIE_SHORT_NAMES, LONG_URL, DATA_URL, MAIL_URL, CAPPED_LABEL, ERROR_LABEL,
   STREAM_SEARCH, STREAM_SEARCH_LABEL, STREAM_SUMMARY, STREAM_PREVIEW_TEXT,
   ANCHOR_URL, ANCHOR_TEXT, ANCHOR_IMG_TEXT, NESTED_LINK, LONG_CELL, LONG_SERIES_NAMES, LONG_CATEGORY_NAMES,
@@ -1983,4 +1985,104 @@ test("손으로 쓴 표도 '표로 보기'에서 표로 서고, 아주 큰 값�
   assert.deepStrictEqual(큰값.상자밖, [], `눈금 글자가 그림 상자 밖으로 나갔다(말풍선에 잘려 읽을 수 없다): ${JSON.stringify(큰값)}`);
   // 눈금 하나가 상자의 절반을 넘으면 그래프가 설 자리가 없다 — 길이의 상한이 실제로 걸려 있는지 잰다
   assert.ok(큰값.가장긴눈금 < 큰값.상자폭 / 2, `눈금 하나가 상자의 절반을 넘는다: ${JSON.stringify(큰값)}`);
+});
+
+for (const width of [320, 380, 1000]) it(`복합 콘텐츠: ${width}px 중첩 표·수식·차트·Mermaid·각주와 인쇄`, async () => {
+  await answered(width, 760, { mobile: width < 500, c: 'nestedmixed' });
+  await page.eval(`document.querySelector('.chart-table').open = true`);
+  await settled();
+  await checkMixedContent(page);
+  if (process.env.MIXED_SCREENSHOT_DIR) {
+    for (const [name, selector] of [['math', '.bubble.assistant table'], ['chart', 'figure.chart'], ['diagram', '.mermaid']]) {
+      await page.eval(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({ block: 'center' })`);
+      await settled();
+      const shot = await page.send('Page.captureScreenshot', { format: 'png' });
+      await writeFile(join(process.env.MIXED_SCREENSHOT_DIR, `mixed-${width}-${name}.png`), Buffer.from(shot.data, 'base64'));
+    }
+  }
+  await page.send('Emulation.setEmulatedMedia', { media: 'print' });
+  try {
+    await checkMixedContent(page);
+    assert.ok(await page.eval(`[...document.querySelectorAll('.bubble.assistant table')].every(e => e.scrollWidth <= e.clientWidth + 1)`), '인쇄에서 표 내용이 잘린다');
+  } finally { await page.send('Emulation.setEmulatedMedia', { media: '' }); }
+});
+
+async function controlledMixedStream() {
+  await page.goto(url('nestedmixed'), '.chip');
+  await page.eval(`window.__streams = []; window.__requests = []; window.__signals = [];
+    window.fetch = async (_, opts) => {
+      window.__requests.push(JSON.parse(opts.body)); window.__signals.push(opts.signal);
+      return new Response(new ReadableStream({ start(c) { window.__streams.push(c); } }),
+        { headers: { 'Content-Type': 'application/x-ndjson' } });
+    };
+    window.__emit = (n, event) => window.__streams[n].enqueue(new TextEncoder().encode(JSON.stringify(event) + '\\n'));
+    document.querySelector('.chip').click()`);
+  await page.until(`window.__streams.length === 1`);
+}
+const emitMixed = (n, event) => page.eval(`window.__emit(${n}, ${JSON.stringify(event)})`);
+
+it('복합 콘텐츠: 수식·표·펜스 중간 조각과 answer_reset 후 완성 답변', async () => {
+  await controlledMixedStream();
+  const answer = NESTED_MIXED_ANSWER;
+  const cuts = [...new Set([answer.indexOf('=|a|') + 2, answer.indexOf('물 |') + 1,
+    answer.indexOf('type: bar') + 5, answer.indexOf('A[입력]') + 3, answer.length])].sort((a, b) => a - b);
+  let prev = 0;
+  for (const end of cuts) {
+    await emitMixed(0, { type: 'answer_delta', text: answer.slice(prev, end) }); prev = end;
+    await sleep(180);
+    assert.ok(await page.eval(`!!document.querySelector('.preview') && !!document.querySelector('.typing')`));
+    assert.equal(await page.eval(`document.querySelectorAll('.preview .mermaid svg, .preview .recharts-surface').length`), 0);
+  }
+  await page.until(`document.querySelectorAll('.preview annotation').length === ${MIXED_FORMULAS.length}`);
+  assert.equal(await page.eval(`document.querySelector('.preview').textContent.split('(표·차트를 준비하고 있습니다)').length - 1`), 2);
+  await emitMixed(0, { type: 'answer_reset' });
+  await page.until(`!document.querySelector('.preview')`);
+  await emitMixed(0, { type: 'answer_delta', text: '재작성 확인\n\n' + answer });
+  await page.until(`document.querySelector('.preview')?.textContent.includes('재작성 확인')`);
+  await emitMixed(0, { type: 'done', answer: '재작성 확인\n\n' + answer });
+  await page.until(READY.nestedmixed);
+  await page.eval(`document.querySelector('.chart-table').open = true`);
+  await checkMixedContent(page);
+  assert.equal(await page.eval(`document.querySelectorAll('.preview').length`), 0);
+});
+
+it('복합 콘텐츠: 연결 중단 후 재시도에서 미완성 답변이 기록에 들어가지 않는다', async () => {
+  await controlledMixedStream();
+  await emitMixed(0, { type: 'answer_delta', text: NESTED_MIXED_ANSWER.slice(0, 900) });
+  await page.until(`document.querySelector('.preview')`);
+  await page.eval(`window.__streams[0].close()`);
+  await page.until(`!document.querySelector('.typing')`);
+  assert.equal(await page.eval(`document.querySelector('.bubble.assistant').textContent`), '답변을 만들지 못했습니다.');
+  await page.eval(`document.querySelector('textarea').focus()`);
+  await page.send('Input.insertText', { text: '다시 시도' });
+  await page.key('Enter', 'Enter', 13);
+  await page.until(`window.__streams.length === 2`);
+  assert.ok(await page.eval(`window.__requests[1].history.every(m => m.role !== 'assistant')`));
+  await emitMixed(1, { type: 'done', answer: NESTED_MIXED_ANSWER });
+  await page.until(READY.nestedmixed);
+  await page.eval(`document.querySelector('.chart-table').open = true`);
+  await checkMixedContent(page, '.row.assistant:last-child .bubble.assistant');
+});
+
+it('복합 콘텐츠: 홈 이동 후 늦은 이전 조각·reset·완료가 새 답변을 훼손하지 않는다', async () => {
+  await controlledMixedStream();
+  await emitMixed(0, { type: 'answer_delta', text: NESTED_MIXED_ANSWER });
+  await page.until(`document.querySelectorAll('.preview annotation').length === ${MIXED_FORMULAS.length}`);
+  await page.eval(`document.querySelector('.home-btn').click()`);
+  await page.until(`document.querySelector('.chip')`);
+  await page.eval(`document.querySelector('.chip').click()`);
+  await page.until(`window.__streams.length === 2`);
+  assert.equal(await page.eval(`window.__signals[0].aborted`), true);
+  assert.deepEqual(await page.eval(`window.__requests[1].history`), []);
+  await emitMixed(1, { type: 'answer_delta', text: '새 대화 표식\n\n' + NESTED_MIXED_ANSWER });
+  await page.until(`document.querySelector('.preview')?.textContent.includes('새 대화 표식')`);
+  for (const event of [{ type: 'answer_delta', text: '폐기할 조각' }, { type: 'answer_reset' }, { type: 'done', answer: '폐기할 답변' }])
+    await emitMixed(0, event);
+  await sleep(250);
+  assert.ok(await page.eval(`!!document.querySelector('.typing') && document.querySelector('.preview')?.textContent.includes('새 대화 표식') && !document.querySelector('.chat').textContent.includes('폐기할')`));
+  await emitMixed(1, { type: 'done', answer: NESTED_MIXED_ANSWER });
+  await page.until(READY.nestedmixed);
+  await page.eval(`document.querySelector('.chart-table').open = true`);
+  await checkMixedContent(page);
+  assert.equal(await page.eval(`document.querySelectorAll('.row.assistant').length`), 1);
 });

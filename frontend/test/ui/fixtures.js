@@ -7,6 +7,7 @@ import { stepLabel, searchLabel, traceSummary } from '../../src/trace.js';
 import { MATH_AUDIT_ANSWER, MATH_CORPUS, MATH_LAYOUT_CASES } from '../math-corpus.js';
 import { TABLE_MATH_ANSWER, TABLE_FORMULAS, INCOMPLETE_TABLE_FORMULAS } from '../table-math-corpus.js';
 import { LATEX_200_MARKDOWN } from '../latex-table-200.js';
+import { NESTED_MIXED_ANSWER } from '../mixed-content-corpus.js';
 
 // 원그래프 조각 수의 상한을 늘 넘겨 둔다 — '기타'로 모으는 길이 실제로 밟힌다. 정해진 목록을
 // 잘라 쓰면 상한이 목록 길이에 닿는 순간 조용히 넘지 못하게 되고(그날 '기타'는 그려지지 않는데
@@ -80,6 +81,7 @@ export const ENVIRONMENT_EXAMPLES = [
 ];
 
 export const CASES = {
+  nestedmixed: NESTED_MIXED_ANSWER,
   latex200: LATEX_200_MARKDOWN,
   tablemath: TABLE_MATH_ANSWER,
   mixed: [
@@ -274,6 +276,7 @@ const 그릴차트수 = Math.min(chartFences(CASES.rich).blocks.length, MAX_CHAR
 export const 주소를_가리키는_링크 = url => JSON.stringify(`.md a[href=${JSON.stringify(url)}]`);
 
 export const READY = {
+  nestedmixed: `document.querySelector('.mermaid svg') && document.querySelector('figure.chart .recharts-surface') && !document.querySelector('.typing')`,
   latex200: `document.querySelectorAll('.katex annotation').length === 200 && !document.querySelector('.typing')`,
   tablemath: `document.querySelectorAll('.katex annotation').length === ${TABLE_FORMULAS.length + 1} &&
     document.querySelectorAll('.math-error').length === ${INCOMPLETE_TABLE_FORMULAS.length}`,
