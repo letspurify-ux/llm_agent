@@ -43,13 +43,13 @@ test('모든 청크가 상한 안이다 — 경계를 못 찾아도', () => {
 
 test('경계는 빈 줄 > 마크다운 제목 > 문장 끝 순으로 고른다', () => {
   const blank = `${para(700)}\n\n${para(700)}`;
-  assert.ok(splitContent(blank)[0].endsWith(para(700)), '빈 줄이 있으면 거기서 끊는다');
+  assert.ok(splitContent(blank)[0].trimEnd().endsWith(para(700)), '빈 줄이 있으면 거기서 끊는다');
 
   const heading = `${para(700)}\n## 다음 절\n${para(700)}`;
-  assert.ok(splitContent(heading)[0].endsWith(para(700)), '제목 앞에서 끊는다');
+  assert.ok(splitContent(heading)[0].trimEnd().endsWith(para(700)), '제목 앞에서 끊는다');
 
   const sentence = `${para(700)}. ${para(700)}`;
-  assert.ok(splitContent(sentence)[0].endsWith('.'), '문장 끝에서 끊는다');
+  assert.ok(splitContent(sentence)[0].trimEnd().endsWith('.'), '문장 끝에서 끊는다');
 });
 
 // 등록 본문은 Windows 편집기에서 붙여 넣은 CRLF일 수 있다. 경계 정규식이 LF만 보던 동안 '.\r\n'과 '\r\n\r\n'이
@@ -58,13 +58,13 @@ test('경계는 빈 줄 > 마크다운 제목 > 문장 끝 순으로 고른다',
 // 어긋나 있던 셈이다. 오류는 남지 않고 임베딩이 흐려지고 프롬프트의 구간이 낱말 한가운데에서 시작할 뿐이다.
 test('CRLF 문서도 빈 줄·문장 끝에서 끊는다 — 강제 절단으로 떨어지지 않는다', () => {
   const blank = `${para(700)}\r\n\r\n${para(700)}`;
-  assert.ok(splitContent(blank)[0].endsWith(para(700)), 'CRLF 빈 줄이 경계가 아니다');
+  assert.ok(splitContent(blank)[0].trimEnd().endsWith(para(700)), 'CRLF 빈 줄이 경계가 아니다');
 
   // 줄 안에 '. '가 하나도 없는 글 — 문장 끝은 전부 줄 끝(.\r\n)에 있다.
   const lines = Array.from({ length: 80 }, (_, i) => `${i + 1}단계에서는 배치 서버에 접속해 상태를 확인하고 로그 파일을 열어 오류 코드를 기록한다.`);
   const parts = splitContent(lines.join('\r\n'));
   assert.ok(parts.length >= 4, `이 시나리오는 여러 청크로 나뉘어야 뜻이 있다: ${parts.length}`);
-  for (const c of parts.slice(0, -1)) assert.ok(c.endsWith('.'), `문장 끝(.\\r\\n)이 경계가 되지 않아 낱말 한가운데에서 갈렸다: …${c.slice(-12)}`);
+  for (const c of parts.slice(0, -1)) assert.ok(c.trimEnd().endsWith('.'), `문장 끝(.\\r\\n)이 경계가 되지 않아 낱말 한가운데에서 갈렸다: …${c.slice(-12)}`);
   // 이어 붙이면 원문 그대로다 — CR까지 포함해서.
   const rows = parts.map((content, i) => ({ seq: i + 1, doc_seq: 1, chunk_no: i + 1, chunk_of: parts.length, title: 'T', content }));
   const [item] = buildItems([{ doc_seq: 1, rep: 1, from: 1, to: parts.length, chunk_of: parts.length, dist: 0.3 }], rows,
@@ -398,13 +398,36 @@ test('분할은 서로게이트 쌍(이모지)을 반으로 쪼개지 않는다'
   assert.ok(intact(c), '이모지만 든 글에서 쌍이 갈라졌다');
 });
 
-// 꼬리 청크만 앞 공백을 떼지 않고 있었다 — 겹침 시작이 빈 줄 구간에 떨어지면 앞 공백이 최대 겹침 길이만큼 붙어
-// 임베딩 원문과 청크 저장소에 그대로 들어갔다(퍼징으로 잡았다). 모든 청크가 같은 모양이어야 한다.
-test('모든 청크는 앞뒤 공백 없이 저장된다 — 꼬리 청크도', () => {
-  // 경계(빈 줄) 뒤 겹침 구간이 통째로 빈 줄이라 꼬리 청크의 시작이 공백에 떨어지는 글
+test('청크는 내부 공백을 보존하고 문서 양끝만 정리한다', () => {
   const s = '가'.repeat(800) + '\n'.repeat(200) + '나'.repeat(300);
-  const parts = splitContent(s);
-  assert.ok(parts.length >= 2, `이 시나리오는 두 청크 이상이어야 뜻이 있다: ${parts.length}`);
-  for (const [i, p] of parts.entries()) assert.equal(p, p.trim(), `${i + 1}번 청크에 앞뒤 공백이 남았다`);
-  assert.ok(parts.every(p => p.length > 0));
+  const parts = splitContent('  ' + s + '  ');
+  assert.ok(parts.length >= 2);
+  assert.ok(parts[1].startsWith('\n'));
+  assert.equal(parts[0] + cutSeam(parts[0], parts[1]), s);
+});
+
+test('긴 공백 뒤 반복 본문도 병합에서 삭제하거나 중복하지 않는다', () => {
+  for (const gap of [120, 200, 1500]) {
+    const src = '가'.repeat(800) + '\n'.repeat(gap) + '가'.repeat(300);
+    const parts = splitContent(src);
+    const rows = parts.map((content, i) => ({ seq: i + 1, doc_seq: 1, chunk_no: i + 1,
+      chunk_of: parts.length, title: '문서', content }));
+    const [item] = buildItems([{ doc_seq: 1, rep: 1, from: 1, to: parts.length, dist: 0.1 }], rows,
+      { maxDocLen: Number.MAX_SAFE_INTEGER });
+    assert.equal(item.content, src, `공백 ${gap}자: 실제로 다른 위치의 반복 본문을 겹침으로 지우면 안 된다`);
+  }
+});
+
+test('분할·병합은 공백·반복문구·이모지를 섞은 1000개 문서의 원문을 보존한다', () => {
+  let seed = 786;
+  const random = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 2 ** 32);
+  const units = ['가', 'ABCD', '-', '단계 안내입니다. ', '\n', '\r\n', '\n\n', '😀', '  ', '\t'];
+  for (let i = 0; i < 1000; i++) {
+    let source = '';
+    while (source.length < 2500) source += units[Math.floor(random() * units.length)].repeat(1 + Math.floor(random() * 100));
+    const parts = splitContent(source);
+    const joined = parts.slice(1).reduce((text, next) => text + cutSeam(text, next), parts[0]);
+    assert.equal(joined, source.trim(), `문서 ${i}의 원문이 손실되거나 중복되었다`);
+    assert.ok(parts.every(p => p.length <= CHUNK_MAX_LEN));
+  }
 });

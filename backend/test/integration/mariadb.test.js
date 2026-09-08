@@ -9,10 +9,13 @@ import { once } from 'node:events';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import mariadb from 'mariadb';
-import { closePool, loadChunkRanges, loadQueriesByNames, insertChatLog } from '../../src/db.js';
+import { closePool, loadChunkRanges, loadQueriesByNames, loadQueriesMentionedIn, insertChatLog } from '../../src/db.js';
 import { syncEmbeddings, syncSummary, SKIP } from '../../src/embed-sync.js';
 import { handleQuestion } from '../../src/agent.js';
 import { buildItems } from '../../src/chunk.js';
+import { searchKnowledge, searchQaMethods, searchQueries } from '../../src/search.js';
+import { vector } from '../fixtures/vector.js';
+import { EMBEDDING_MODEL, normalizeEmbedding } from '../../src/embedding.js';
 
 const exec = promisify(execFile);
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -23,6 +26,8 @@ let embeddedTexts = [];
 // 이 대역이 모든 테스트에 공유되므로 되돌리지 않으면 뒤 테스트가 남의 고장을 물려받는다.
 let embedMode = 'ok';
 let embedCalls = 0;
+let searchStatements = [];
+let registryStatements = [];
 // 대역이 만드는 벡터의 one-hot 위치 — 텍스트만으로 정해진다. 응답 순서가 뒤바뀌어도 어느 행의
 // 벡터인지 이 값으로 되짚을 수 있다 (embedding.js가 index로 짝짓는 것을 검증하는 근거).
 const slotOf = text => createHash('sha256').update(text).digest().readUInt16BE(0) % 1024;
@@ -44,9 +49,23 @@ before(async () => {
   }
   assert.ok(conn, `임시 MariaDB 기동 실패: ${await readFile(join(dir, 'db.log'), 'utf8').catch(() => '')}`);
   const createPool = mariadb.createPool.bind(mariadb);
-  mock.method(mariadb, 'createPool', options => createPool({
-    ...options, socketPath, user: 'root', password: '', database: 'llm_agent',
-  }));
+  mock.method(mariadb, 'createPool', options => {
+    const pool = createPool({ ...options, socketPath, user: 'root', password: '', database: 'llm_agent' });
+    const acquire = pool.getConnection.bind(pool);
+    pool.getConnection = async () => {
+      const connection = await acquire();
+      return new Proxy(connection, { get(target, key) {
+        if (key === 'query') return (sql, ...args) => {
+          if (sql.startsWith('SET STATEMENT') || sql.includes('IGNORE INDEX (embedding)')) searchStatements.push({ sql, args });
+          if (/^SELECT .* FROM query_registry/.test(sql)) registryStatements.push({ sql, args });
+          return target.query(sql, ...args);
+        };
+        const value = Reflect.get(target, key);
+        return typeof value === 'function' ? value.bind(target) : value;
+      } });
+    };
+    return pool;
+  });
   process.env.EMBEDDING_URL = 'http://test.invalid/v1';
   process.env.ORACLE_MOCK = '1';
   mock.method(globalThis, 'fetch', async (_url, init) => {
@@ -59,7 +78,7 @@ before(async () => {
     }
     embeddedTexts.push(...input);
     const data = input.map((text, index) =>
-      ({ index, embedding: Array.from({ length: 1024 }, (_, i) => Number(i === slotOf(text))) }));
+      ({ index, embedding: embedMode === 'zero' ? Array(1024).fill(0) : vector(slotOf(text)) }));
     // vLLM·TEI의 continuous batching은 실제로 응답 순서를 바꾼다 (index는 그대로다).
     return new Response(JSON.stringify({ data: embedMode === 'shuffle' ? data.slice().reverse() : data }));
   });
@@ -120,6 +139,39 @@ test('실제 DB에서 스키마·시드·동기화가 멱등하고 원문 수정
   await syncEmbeddings();
   assert.equal(Number((await conn.query('SELECT COUNT(*) AS n FROM knowledge_chunk WHERE doc_seq = 1'))[0].n), 0);
   assert.equal(Number((await conn.query('SELECT COUNT(*) AS n FROM vec_knowledge_chunk v LEFT JOIN knowledge_chunk c USING(seq) WHERE c.seq IS NULL'))[0].n), 0);
+});
+
+test('재임베딩 실패 시 세 소스 모두 이전 벡터로 새 본문을 반환하지 않고 복구 후 다시 검색된다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  await conn.query("INSERT INTO knowledge (title, content) VALUES ('검증 지식', 'original')");
+  await conn.query("INSERT INTO qa_method (title, method) VALUES ('검증 절차', 'original')");
+  await conn.query("INSERT INTO query_registry (query_name, query_desc, query_sql, target_db_name) VALUES ('verify_query', 'original', 'SELECT 1 FROM dual', 'DB')");
+  const cases = [
+    { table: 'knowledge_chunk', search: searchKnowledge, text: '검증 지식\noriginal' },
+    { table: 'qa_method', search: searchQaMethods, text: '검증 절차\noriginal' },
+    { table: 'query_registry', search: searchQueries, text: 'verify_query\noriginal\n\n' },
+  ];
+  assert.equal((await syncEmbeddings()).embedded, 3);
+  for (const c of cases) assert.equal((await c.search(c.text)).length, 1);
+  await conn.query("UPDATE knowledge SET content = 'changed'");
+  await conn.query("UPDATE qa_method SET method = 'changed'");
+  await conn.query("UPDATE query_registry SET query_desc = 'changed'");
+  try {
+    embedMode = 'reject:changed';
+    assert.equal((await syncEmbeddings()).failed, 3);
+    for (const c of cases) {
+      assert.equal(Number((await conn.query(`SELECT COUNT(*) n FROM vec_${c.table}`))[0].n), 1,
+        '이전 벡터가 남아 있는 실패 경로를 검증한다');
+      assert.deepEqual(await c.search(c.text), [], `${c.table}: 이전 내용으로 새 본문을 검색하면 안 된다`);
+    }
+  } finally { embedMode = 'ok'; }
+  assert.equal((await syncEmbeddings()).embedded, 3);
+  for (const c of cases) {
+    const text = c.text.replace('original', 'changed');
+    assert.equal((await c.search(text)).length, 1, `${c.table}: 복구 후 최신 본문을 찾는다`);
+    await conn.query(`UPDATE vec_${c.table} SET embed_hash = REPEAT('0', 32)`);
+    assert.deepEqual(await c.search(text), [], '본문이 같아도 모델 등 해시가 다르면 제외한다');
+  }
 });
 
 test('실제 쿼리 등록 검색에서 조회 실행·표 참조까지 이어진다', async () => {
@@ -328,4 +380,293 @@ test('임베딩 응답 순서가 뒤바뀌어도 index로 짝지어 행과 벡�
     const hot = JSON.parse(row.vec).findIndex(x => x > 0.5);
     assert.equal(hot, slotOf(`${row.title}\n${row.method}`), `${row.title}에 다른 행의 벡터가 저장됐다`);
   }
+});
+
+test('오래된 상위 후보와 고아 벡터 뒤의 정상 결과를 세 소스 모두 보충한다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  for (let i = 1; i <= 61; i++) {
+    await conn.query("INSERT INTO knowledge (title, content) VALUES (?, '본문')", [`지식 ${i}`]);
+    await conn.query("INSERT INTO qa_method (title, method) VALUES (?, '본문')", [`절차 ${i}`]);
+    await conn.query("INSERT INTO query_registry (query_name, query_desc, query_sql, target_db_name) VALUES (?, '본문', 'SELECT 1 FROM dual', 'DB')", [`query_${i}`]);
+  }
+  await syncEmbeddings();
+  for (const [table, search] of [['knowledge_chunk', searchKnowledge], ['qa_method', searchQaMethods], ['query_registry', searchQueries]]) {
+    const text = `candidate refill ${table}`;
+    const slot = slotOf(text);
+    const near = vector(slot);
+    const far = vector(slot); far[slot] = 0.9; far[(slot + 1) % 1024] = 0.1;
+    await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?), embed_hash = REPEAT('0', 32) WHERE seq <= 60`, [JSON.stringify(near)]);
+    await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?) WHERE seq = 61`, [JSON.stringify(far)]);
+    const result = await search(text);
+    assert.equal(result.length, 1, `${table}: 상위 후보가 모두 오래된 벡터여도 정상 61번은 찾는다`);
+    assert.equal(result[0].seq, 61);
+    await conn.query(`DELETE FROM ${table} WHERE seq <= 60`);
+    const orphanResult = await search(text);
+    assert.equal(orphanResult.length, 1, `${table}: 고아 벡터가 검색 후보를 독점하지 않는다`);
+    assert.equal(orphanResult[0].seq, 61);
+  }
+});
+
+test('영벡터 응답은 동기화 실패로 남고 다음 정상 응답에서 자동 복구된다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  await conn.query("INSERT INTO knowledge (title, content) VALUES ('영벡터 복구', '본문')");
+  try {
+    embedMode = 'zero';
+    const bad = await syncEmbeddings();
+    assert.equal(bad.embedded, 0);
+    assert.equal(bad.failed, 1);
+    assert.equal(Number((await conn.query('SELECT COUNT(*) n FROM vec_knowledge_chunk'))[0].n), 0);
+  } finally { embedMode = 'ok'; }
+  assert.equal((await syncEmbeddings()).embedded, 1);
+  assert.equal((await searchKnowledge('영벡터 복구\n본문')).length, 1);
+});
+
+test('기존 영벡터 복구 SQL은 정상 벡터를 보존하고 멱등하며 누락분만 재임베딩한다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  await conn.query("INSERT INTO knowledge (title, content) VALUES ('복구 지식', '본문'), ('정상 지식', '본문')");
+  await conn.query("INSERT INTO qa_method (title, method) VALUES ('복구 절차', '본문')");
+  await conn.query("INSERT INTO query_registry (query_name, query_sql, target_db_name) VALUES ('repair_query', 'SELECT 1 FROM dual', 'DB')");
+  await syncEmbeddings();
+  const good = (await conn.query('SELECT embed_hash, VEC_ToText(embedding) AS v FROM vec_knowledge_chunk WHERE seq = 2'))[0];
+  for (const src of ['knowledge_chunk', 'qa_method', 'query_registry']) {
+    await conn.query(`UPDATE vec_${src} SET embedding = VEC_FromText(?) WHERE seq = 1`, [JSON.stringify(Array(1024).fill(src === 'qa_method' ? 1e-23 : 0))]);
+  }
+  assert.equal((await syncEmbeddings()).embedded, 0, '기존 불량 벡터에는 성공으로 기록된 해시가 남아 있다');
+  const repair = await sqlFile('repair-invalid-vectors.sql');
+  await conn.query(repair);
+  await conn.query(repair);
+  assert.deepEqual((await conn.query('SELECT embed_hash, VEC_ToText(embedding) AS v FROM vec_knowledge_chunk WHERE seq = 2'))[0], good);
+  const fixed = await syncEmbeddings();
+  assert.equal(fixed.embedded, 3);
+  assert.equal(fixed.failed, 0);
+  assert.equal((await syncEmbeddings()).embedded, 0);
+  assert.equal((await searchKnowledge('복구 지식\n본문')).length, 1);
+});
+
+test('복구 SQL 실행 전의 기존 불량 벡터도 정상 검색 결과를 가리거나 적중으로 나오지 않는다', async t => {
+  for (const [label, value] of [['영벡터', 0], ['극소 벡터', 1e-23]]) {
+    await t.test(label, async () => {
+      await conn.query(await sqlFile('schema.sql'));
+      await conn.batch("INSERT INTO qa_method (title, method) VALUES (?, '본문')",
+        Array.from({ length: 61 }, (_, i) => [`${label} 후보 ${i + 1}`]));
+      await syncEmbeddings();
+      const text = `invalid stored vector ${label}`;
+      const good = vector(slotOf(text));
+      await conn.query('UPDATE vec_qa_method SET embedding = VEC_FromText(?) WHERE seq <= 60',
+        [JSON.stringify(Array(1024).fill(value))]);
+      await conn.query('UPDATE vec_qa_method SET embedding = VEC_FromText(?) WHERE seq = 61', [JSON.stringify(good)]);
+      const rows = await searchQaMethods(text);
+      assert.deepEqual(rows?.map(r => r.seq), [61]);
+    });
+  }
+});
+
+test('정상 검색은 인덱스와 PK 후보 조회만 사용하고 무효 후보가 있을 때만 정확 검색한다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  const text = 'query plan healthy corpus';
+  await conn.batch("INSERT INTO qa_method (title, method) VALUES (?, '본문')", Array.from({ length: 1000 }, (_, i) => [`문서 ${i}`]));
+  await conn.query(`INSERT INTO vec_qa_method (seq, embed_hash, embedding)
+    SELECT seq, MD5(CONCAT_WS(CHAR(10), ?, title, method)), VEC_FromText(?) FROM qa_method`,
+    [EMBEDDING_MODEL, JSON.stringify(vector(slotOf(text)))]);
+  await conn.query('ANALYZE TABLE qa_method, vec_qa_method');
+  searchStatements = [];
+  const hits = await searchQaMethods(text);
+  assert.ok(hits.length > 0);
+  assert.equal(searchStatements.length, 1, '정상 검색에 보충 조회가 추가되면 안 된다');
+  assert.ok(hits.every(h => !('_stale' in h) && !('_invalid' in h)), '내부 상태를 검색 결과에 노출하지 않는다');
+  const { sql, args } = searchStatements[0];
+  const plan = await conn.query(sql.replace(' FOR\n', ' FOR EXPLAIN\n'), ...args);
+  assert.equal(plan.find(r => r.table === 'vec_qa_method').key, 'embedding', '평상시 벡터 인덱스를 사용한다');
+  assert.equal(plan.find(r => r.table === 't').type, 'eq_ref', '전체 본문 스캔 대신 후보 PK로 조회한다');
+  await conn.query("UPDATE qa_method SET method = '바뀐 본문'");
+  searchStatements = [];
+  assert.deepEqual(await searchQaMethods(text), []);
+  assert.equal(searchStatements.length, 2, '무효 후보는 한 번의 정확 검색으로 처리한다');
+  const exact = searchStatements[1];
+  const exactPlan = await conn.query(`EXPLAIN ${exact.sql}`, ...exact.args);
+  assert.notEqual(exactPlan.find(r => r.table === 'v').key, 'embedding');
+});
+
+test('검증을 통과한 FP32 극단값도 DB에서 코사인 거리를 계산할 수 있다', async () => {
+  for (const value of [1, 1e-10, 1e-20, 1e-23, 1e-24, 1e10, 1e18, 1e20]) {
+    const v = normalizeEmbedding(Array(1024).fill(value));
+    if (!v) continue;
+    const encoded = JSON.stringify(v);
+    const [r] = await conn.query('SELECT VEC_DISTANCE_COSINE(VEC_FromText(?), VEC_FromText(?)) AS d', [encoded, JSON.stringify(vector())]);
+    assert.equal(typeof r.d, 'number', `값 ${value}: NULL 거리`);
+    assert.ok(Number.isFinite(r.d) && Math.abs(r.d - (1 - 1 / Math.sqrt(1024))) < 0.001, `값 ${value}: 기준 벡터와의 거리 ${r.d}`);
+  }
+});
+
+test('기존 v3 청크는 규칙 변경으로 자동 재분할되며 문서 공백과 seq를 보존한다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  const source = '가'.repeat(800) + '\n'.repeat(200) + '가'.repeat(300);
+  await conn.query('INSERT INTO knowledge (title, content) VALUES (?, ?)', ['기존 문서', source]);
+  const [doc] = await conn.query("SELECT MD5(JSON_ARRAY('chunk:900:1000:150:v3', title, content)) h FROM knowledge");
+  for (const [i, content] of ['가'.repeat(800), '가'.repeat(300)].entries()) {
+    await conn.query('INSERT INTO knowledge_chunk (doc_seq, chunk_no, chunk_of, doc_hash, title, content) VALUES (1, ?, 2, ?, ?, ?)',
+      [i + 1, doc.h, '기존 문서', content]);
+  }
+  const result = await syncEmbeddings();
+  assert.equal(result.chunks, 2);
+  assert.equal(result.embedded, 2);
+  const rows = await loadChunkRanges([{ doc_seq: 1, from: 1, to: 2 }]);
+  assert.deepEqual(rows.map(r => r.seq), [1, 2]);
+  const [item] = buildItems([{ doc_seq: 1, rep: 1, from: 1, to: 2, dist: 0.1 }], rows);
+  assert.equal(item.content, source);
+  assert.equal((await syncEmbeddings()).embedded, 0);
+  assert.equal((await syncEmbeddings()).chunks, 0);
+});
+
+test('벡터 배치 저장 실패는 정상 행만 재저장하고 실패 행은 다음 동기화에서 복구한다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  await conn.query("INSERT INTO qa_method (title, method) VALUES ('행1','본문'), ('행2','본문'), ('행3','본문')");
+  await conn.query(`CREATE TRIGGER reject_vector BEFORE INSERT ON vec_qa_method FOR EACH ROW
+    BEGIN IF NEW.seq = 2 THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fixture storage failure'; END IF; END`);
+  const partial = await syncEmbeddings();
+  assert.equal(partial.embedded, 2);
+  assert.equal(partial.failed, 1);
+  assert.deepEqual((await conn.query('SELECT seq FROM vec_qa_method ORDER BY seq')).map(r => r.seq), [1, 3]);
+  await conn.query('DROP TRIGGER reject_vector');
+  const recovered = await syncEmbeddings();
+  assert.equal(recovered.embedded, 1);
+  assert.equal(recovered.failed, 0);
+});
+
+test('동기화 락 점유와 DB 오류 뒤에도 다음 회차가 정상 실행된다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  await conn.query("SELECT GET_LOCK('space_voc_embed_sync', 0)");
+  try { assert.equal((await syncEmbeddings()).skipped, SKIP.BUSY); }
+  finally { await conn.query("SELECT RELEASE_LOCK('space_voc_embed_sync')"); }
+  await conn.query('DROP TABLE vec_qa_method');
+  await assert.rejects(syncEmbeddings());
+  assert.equal(Number((await conn.query("SELECT IS_FREE_LOCK('space_voc_embed_sync') AS free"))[0].free), 1);
+  await conn.query(await sqlFile('schema.sql'));
+  assert.equal((await syncEmbeddings()).skipped, SKIP.NONE);
+});
+
+test('청크 일부가 누락되어도 원문을 수정하지 않고 다음 동기화에서 복원한다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  const content = '첫 문단입니다. '.repeat(160) + '마지막 문단입니다. '.repeat(160);
+  await conn.query('INSERT INTO knowledge (title, content) VALUES (?, ?)', ['청크 복구', content]);
+  await syncEmbeddings();
+  const original = await loadChunkRanges([{ doc_seq: 1, from: 1, to: 100 }]);
+  assert.ok(original.length >= 3);
+  const preserved = original[0].seq;
+  await conn.query('DELETE FROM knowledge_chunk WHERE doc_seq = 1 AND chunk_no = 2');
+  const repaired = await syncEmbeddings();
+  const current = await loadChunkRanges([{ doc_seq: 1, from: 1, to: 100 }]);
+  assert.equal(current.length, original.length, '같은 doc_hash의 다른 청크가 남아 있어도 누락을 복원해야 한다');
+  assert.deepEqual(current.map(r => r.content), original.map(r => r.content));
+  assert.equal(current[0].seq, preserved, '정상 청크의 ID는 보존한다');
+  assert.equal(repaired.embedded, 1, '누락되어 재생성한 청크만 임베딩한다');
+  assert.equal((await syncEmbeddings()).chunks, 0);
+});
+
+test('DB에 등록 가능한 보충 평면 문자가 포함된 쿼리명도 임베딩 없이 정확 검색한다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  const name = '📊'.repeat(60);
+  await conn.query("INSERT INTO query_registry (query_name, query_sql, target_db_name) VALUES (?, 'SELECT 1 FROM dual', 'DB')", [name]);
+  const saved = process.env.EMBEDDING_URL;
+  delete process.env.EMBEDDING_URL;
+  try {
+    const rows = await searchQueries(name);
+    assert.ok(Array.isArray(rows));
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].query_name, name);
+    assert.equal(rows[0].exact, true);
+  } finally { process.env.EMBEDDING_URL = saved; }
+});
+
+test('처리방법 벡터 검색은 한글 조사·짧은 이름·리터럴 기호를 해석하여 본문 순서대로 쿼리를 싣는다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  // 등록 순서와 절차 순서를 반대로 둔다. '_'가 와일드카드가 되면 batch_job도 잘못 선택된다.
+  for (const name of ['미등장', 'batch_job', 'batchXjob', 'Q', '배치상태조회']) {
+    await conn.query("INSERT INTO query_registry (query_name, query_sql, target_db_name) VALUES (?, 'SELECT 1 FROM dual', 'DB')", [name]);
+  }
+  const title = '라우팅 순서 검증';
+  const method = '배치상태조회를 실행하고 q를 확인한 뒤 batchXjob으로 마무리한다.';
+  await conn.query('INSERT INTO qa_method (title, method) VALUES (?, ?)', [title, method]);
+  await syncEmbeddings();
+  let snapshot;
+  const result = await handleQuestion(title, [], { deps: { decide: async ctx => {
+    if (!ctx.history.length) return { action: 'search', text: `${title}\n${method}`, targets: ['qa_method'] };
+    snapshot = ctx;
+    return { action: 'answer', answer: '절차 확인 완료' };
+  } } });
+  assert.deepEqual(snapshot.queries.map(q => q.query_name), ['배치상태조회', 'Q', 'batchXjob']);
+  assert.ok(snapshot.queries.every(q => q.detail));
+  assert.equal(result.trace[0].hits.qaMethods, 1);
+  assert.equal(result.trace[0].hits.queries, 3);
+  assert.equal(result.search.searchFailed, undefined);
+});
+
+test('DB collation이 같게 취급하는 다른 이름을 정확 쿼리명으로 반환하지 않는다', async t => {
+  for (const [registered, requested] of [['📊조회', '📈조회'], ['résumé', 'resume']]) {
+    await t.test(`${registered}와 ${requested}`, async () => {
+      await conn.query(await sqlFile('schema.sql'));
+      await conn.query("INSERT INTO query_registry (query_name, query_sql, target_db_name) VALUES (?, 'SELECT 1 FROM dual', 'DB')", [registered]);
+      assert.deepEqual(await loadQueriesByNames([requested]), []);
+      assert.equal((await loadQueriesByNames([registered.toUpperCase()]))[0].query_name, registered);
+      assert.deepEqual(await loadQueriesMentionedIn(`${requested}를 실행한다`.toLowerCase()), [],
+        '처리방법 라우팅도 다른 식별자를 선택하면 안 된다');
+      assert.equal((await loadQueriesMentionedIn(`${registered}를 실행한다`.toLowerCase()))[0].query_name, registered);
+      const saved = process.env.EMBEDDING_URL;
+      delete process.env.EMBEDDING_URL;
+      try {
+        assert.equal(await searchQueries(requested), null, '정확 일치가 아니므로 임베딩 없는 구성에서는 검색 불가다');
+      } finally { process.env.EMBEDDING_URL = saved; }
+    });
+  }
+});
+
+test('미등록 쿼리명의 DB collation 충돌로 다른 등록 쿼리를 실행하지 않는다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  await conn.query("INSERT INTO query_registry (query_name, query_sql, target_db_name) VALUES ('📊조회', 'SELECT 1 FROM dual', 'DB')");
+  const decisions = [
+    { action: 'run_query', query_name: '📈조회', params: {} },
+    { action: 'answer', answer: '완료' },
+  ];
+  let runs = 0;
+  const result = await handleQuestion('쿼리 식별자 확인', [], { deps: {
+    decide: async () => decisions.shift(),
+    run: async () => { runs++; return { rows: [], targetDb: 'DB' }; },
+  } });
+  assert.equal(runs, 0, '요청하지 않은 등록 쿼리가 실행되면 안 된다');
+  assert.ok(result.trace[0].error);
+});
+
+test('Unicode 대소문자 변환이 있는 쿼리명도 정확 검색과 처리방법 라우팅에서 일치한다', async t => {
+  for (const name of ['𐐀조회', 'ΟΣ', 'İ조회', 'İ'.repeat(60), 'K조회']) {
+    await t.test(name, async () => {
+      await conn.query(await sqlFile('schema.sql'));
+      await conn.query("INSERT INTO query_registry (query_name, query_sql, target_db_name) VALUES (?, 'SELECT 1 FROM dual', 'DB')", [name]);
+      assert.deepEqual((await loadQueriesByNames([name.toLowerCase()])).map(q => q.query_name), [name]);
+      assert.deepEqual((await loadQueriesMentionedIn(`${name}를 실행한다`.toLowerCase())).map(q => q.query_name), [name]);
+      const saved = process.env.EMBEDDING_URL;
+      delete process.env.EMBEDDING_URL;
+      try {
+        assert.equal((await searchQueries(name.toLowerCase()))?.[0]?.query_name, name);
+      } finally { process.env.EMBEDDING_URL = saved; }
+    });
+  }
+});
+
+test('등록 1000건의 라우팅은 이름 인덱스와 상위 30건 상세 조회 두 번으로 끝난다', async t => {
+  await conn.query(await sqlFile('schema.sql'));
+  const names = Array.from({ length: 1000 }, (_, i) => `route_${String(i).padStart(4, '0')}`);
+  await conn.batch("INSERT INTO query_registry (query_name, query_desc, query_sql, target_db_name) VALUES (?, ?, 'SELECT 1 FROM dual', 'DB')",
+    names.map(name => [name, '설명'.repeat(1000)]));
+  const plan = await conn.query('EXPLAIN SELECT seq, query_name FROM query_registry');
+  assert.equal(plan[0].key, 'query_name');
+  assert.match(plan[0].Extra, /Using index/, '긴 설명과 SQL 대신 이름 인덱스만 읽는다');
+  registryStatements = [];
+  const text = [...names].reverse().join(' ');
+  const start = performance.now();
+  const rows = await loadQueriesMentionedIn(text, 30);
+  t.diagnostic(`1000개 이름 대조와 30개 상세 조회: ${(performance.now() - start).toFixed(1)}ms`);
+  assert.deepEqual(rows.map(q => q.query_name), [...names].reverse().slice(0, 30));
+  assert.equal(registryStatements.length, 2);
+  assert.equal(registryStatements[0].sql, 'SELECT seq, query_name FROM query_registry');
+  assert.equal(registryStatements[1].args[0].length, 30);
 });

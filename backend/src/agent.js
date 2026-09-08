@@ -26,9 +26,9 @@ const MAX_SAME_QUERY_TRIES = 2; // 같은 쿼리·파라미터의 최대 실행 
 // 임베딩 모델이 유휴 뒤 내려가 다시 올라오는 데 수십 초가 걸리고(search.js warmUpEmbedding), 관리 DB도
 // 순간 장애를 낸다. 두 번째까지 실패하면 반복을 끊는다.
 const MAX_SAME_SEARCH_TRIES = 2;
-// 경로A(qa_method 본문이 지목한 쿼리)에서 관리 DB로 보내는 본문 길이 상한.
+// 경로A(qa_method 본문이 지목한 쿼리)에서 이름을 대조할 본문 길이 상한.
 // qa_method.method는 TEXT(64KB)이고 검색은 최대 20건을 돌려주므로, 상한이 없으면 요청마다
-// 1MB가 넘는 문자열이 바인드로 나가고 등록 행마다 그 길이를 훑게 된다.
+// 1MB가 넘는 문자열을 등록된 이름마다 훑게 된다.
 // 앞쪽이 관련도가 높은 처리방법이고(검색 결과 순서) 절차의 첫 단계도 본문 앞쪽에 온다 —
 // 잘려도 다단계 절차의 시작은 남는다 (프롬프트 예산이 꼬리부터 버리는 것과 같은 전제다).
 const MAX_ROUTE_TEXT_LEN = 20_000;
@@ -1145,8 +1145,8 @@ const DETAIL_TOP = 5;
 // /[A-Za-z_][A-Za-z0-9_]{2,}/ 라서 한글 query_name은 어떤 본문에서도 한 번도 뽑히지 않았다 —
 // query_name은 VARCHAR(100)에 문자 제한이 없고 이 코드베이스는 다른 곳에 전부 한글을 쓴다.
 // 한국어는 조사가 낱말에 붙어 '배치상태조회를'이 한 낱말이므로 토큰화로는 고칠 수 없다.
-// 그래서 방향을 뒤집는다 — '등록된 이름이 본문에 들어 있는가'를 관리 DB가 직접 본다
-// (db.js loadQueriesMentionedIn). 등장 위치를 DB가 함께 돌려주므로 순서 보장이 정확하다.
+// 그래서 방향을 뒤집는다 — 관리 DB의 등록명을 읽어 '이름이 본문에 들어 있는가'를 본다
+// (db.js loadQueriesMentionedIn). 공통 이름 규칙으로 첫 등장 위치를 계산해 순서를 보장한다.
 // 본문은 검색 결과 순서대로 이어 붙인다 — 위치 순서가 곧 '관련도 높은 처리방법 먼저, 그 안에서는
 // 등장 순서대로'가 된다. method는 NOT NULL이지만 컬럼 하나가 완화되거나 임포터가 NULL을 넣는
 // 순간 여기서 죽는다 — 이 값의 다른 소비자(llm-openai clip, embed-sync toText)는 전부 NULL을 견딘다.
@@ -1156,7 +1156,7 @@ async function selectQueries(qaMethods, direct) {
     qaMethods.map(m => String(m.method ?? '')).join('\n').toLowerCase(),
     MAX_ROUTE_TEXT_LEN
   );
-  const named = await loadQueriesMentionedIn(routeText);   // 빈 본문이면 왕복하지 않는다 (db.js)
+  const named = await loadQueriesMentionedIn(routeText, MAX_PROMPT_QUERIES);   // 빈 본문이면 왕복하지 않는다 (db.js)
 
   const seen = new Set();
   const list = [];

@@ -764,6 +764,9 @@ const indent = indentLines;   // 정의는 constants.js — 청크 병합(chunk.
 // 전체 예산(MAX_PROMPT_TOTAL_LEN)을 그대로 넘기고, 그 뒤 모든 질문이 컨텍스트 초과로 끝난다.
 // 예산은 다른 파일의 스키마 제약이 아니라 이 파일 안에서 확정되어야 한다.
 const MAX_PROMPT_NAME_LEN = 100;
+// query_name VARCHAR(100)은 보충 평면 문자를 포함하면 UTF-16으로 200자가 된다.
+// 실행 식별자는 제목처럼 줄이면 안 된다. 결정 파서도 같은 200자 상한을 사용한다.
+const MAX_PROMPT_QUERY_NAME_LEN = 200;
 
 // 섹션 예산을 쓰는 모든 렌더가 공유하는 두 규칙.
 //
@@ -877,7 +880,7 @@ const dbList = q => {
 const hasDbChoice = q => targetDbNames(q.target_db_name).length > 1;
 
 const queryItem = q =>
-  `- ${clip(q.query_name, MAX_PROMPT_NAME_LEN)}: ${clip(oneLine(q.query_desc))}` +
+  `- ${clip(q.query_name, MAX_PROMPT_QUERY_NAME_LEN)}: ${clip(oneLine(q.query_desc))}` +
   ` / 입력(${clip(oneLine(q.input_desc)) || '설명 미등록 — 값의 의미·형식을 추측하지 말 것'}) / 출력(${clip(oneLine(q.output_desc), 300)})` +
   ` / 바인드(${bindList(q)}) / 대상DB(${dbList(q)})` +
   (q.selected ? ` / SQL: ${clip(oneLine(q.query_sql), MAX_PROMPT_SQL_LEN)}` : '');
@@ -885,7 +888,7 @@ const queryItem = q =>
 // 짧은 형태에서도 입력 의미·형식은 보존한다. 대상 DB는 선택지가 여러 개인 경우 표시한다.
 const MAX_PROMPT_SHORT_DESC_LEN = 120;
 const queryItemShort = q =>
-  `- ${clip(q.query_name, MAX_PROMPT_NAME_LEN)}: ${clip(oneLine(q.query_desc), MAX_PROMPT_SHORT_DESC_LEN)} / 바인드(${bindList(q)})` +
+  `- ${clip(q.query_name, MAX_PROMPT_QUERY_NAME_LEN)}: ${clip(oneLine(q.query_desc), MAX_PROMPT_SHORT_DESC_LEN)} / 바인드(${bindList(q)})` +
   ` / 입력(${clip(oneLine(q.input_desc)) || '설명 미등록 — 값의 의미·형식을 추측하지 말 것'})` +
   (hasDbChoice(q) ? ` / 대상DB(${dbList(q)})` : '');
 
@@ -1056,7 +1059,7 @@ function historyLine(h, step) {
   // 방금 무엇을 조회했는지 알 수 없어, 다음 스텝에서 다른 후보를 골라 놓고 같은 결과를 기대하거나
   // 이미 본 DB를 다시 조회한다 (루프 가드는 이름·바인드만 보므로 그 반복을 잡지 못한다).
   const at = h.targetDb ? `@${clip(h.targetDb, MAX_TARGET_DB_NAME_LEN)}` : '';
-  const head = `${step}. ${clip(h.query_name, 100)}${at} params=${paramsJson(h.params)}`;
+  const head = `${step}. ${clip(h.query_name, MAX_PROMPT_QUERY_NAME_LEN)}${at} params=${paramsJson(h.params)}`;
   if (h.note) {
     // 루프 가드가 남긴 제어용 기록 — 실패가 아니므로 '오류'로 알리지 않는다 (모델이 실패로 오해해 불필요한 우회를 하지 않게)
     return `${head} → 실행하지 않음: ${clip(oneLine(h.note))}`;
@@ -1243,7 +1246,7 @@ const expandsLeftNote = n => n === 0 ? '자료 확대·복구 기회를 다 썼�
 // 결과 줄과 오류 줄 중 긴 쪽이 한 줄의 상한이다.
 function maxHistoryLineLen() {
   const over = n => 'x'.repeat(n + 1); // 상한을 넘겨 clip이 '상한 + TRUNC_MARK'까지 채우게 한다
-  const head = { query_name: over(MAX_PROMPT_NAME_LEN), targetDb: over(MAX_TARGET_DB_NAME_LEN), params: { p: over(MAX_PROMPT_PARAMS_LEN) } };
+  const head = { query_name: over(MAX_PROMPT_QUERY_NAME_LEN), targetDb: over(MAX_TARGET_DB_NAME_LEN), params: { p: over(MAX_PROMPT_PARAMS_LEN) } };
   const rows = Array.from({ length: MAX_RESULT_ROWS }, () => ({ C: 'x'.repeat(MAX_CELL_LEN) }));
   const resultLine = historyLine({ ...head, rows, totalRows: MAX_ROWS, capped: true }, MAX_HISTORY_ROWS);
   const rowsLen = JSON.stringify(fitRows(rows, MAX_PROMPT_STEP_LEN)).length;
@@ -1268,7 +1271,7 @@ function maxOtherLineLen() {
   const step = MAX_HISTORY_ROWS; // 번호는 이력 안의 절대 순번 — 자릿수가 가장 큰 값으로 잰다
   return Math.max(
     historyLine({
-      query_name: over(MAX_PROMPT_NAME_LEN), targetDb: over(MAX_TARGET_DB_NAME_LEN),
+      query_name: over(MAX_PROMPT_QUERY_NAME_LEN), targetDb: over(MAX_TARGET_DB_NAME_LEN),
       params: { p: over(MAX_PROMPT_PARAMS_LEN) }, note: over(MAX_PROMPT_ITEM_LEN),
     }, step).length,
     historyLine({ ...search, hits: { knowledge: MAX_ROWS, qaMethods: MAX_ROWS, queries: MAX_ROWS } }, step).length,

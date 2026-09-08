@@ -8,6 +8,30 @@
 import { warnOnce, joinUrl, readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_UPSTREAM_ERROR_BYTES, errorText } from './constants.js';
 
 export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'bge-m3';
+export const EMBEDDING_DIMENSIONS = 1024; // schema.sql과 migrate-chunk.sql의 VECTOR 차원
+
+// MariaDB는 FP32로 저장·계산한다. JS에서 유한한 값도 FP32에서는 Infinity/0이 될 수 있고,
+// 영벡터의 코사인 거리는 정의되지 않는다. 저장 해시나 질의 캐시에 성공으로 남기기 전에 막는다.
+export function normalizeEmbedding(v) {
+  if (!Array.isArray(v) || v.length !== EMBEDDING_DIMENSIONS) return null;
+  let norm2 = 0;
+  for (const value of v) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+    const f = Math.fround(value);
+    if (!Number.isFinite(f)) return null;
+    norm2 += f * f;
+  }
+  if (!(Math.fround(norm2) > 0) || !Number.isFinite(Math.fround(norm2))) return null;
+  // 미세한 성분의 제곱은 DB의 FP32 연산에서 0이 될 수 있다. 코사인 각도는
+  // 유지하면서 단위 길이로 정규화해, 유효한 응답이 DB에서 거리 0으로 퇴화하지 않게 한다.
+  const norm = Math.sqrt(norm2);
+  return v.map(value => Math.fround(Math.fround(value) / norm));
+}
+
+// 동기화와 검색이 같은 해시 규칙을 사용한다. cols는 코드가 정한 SQL 식별자만 받는다.
+// 모델명은 첫 번째 바인드 값이다. NULL과 개행 처리도 기존 저장 해시와 호환된다.
+export const embeddingHashExpr = cols =>
+  `MD5(CONCAT_WS(CHAR(10), ?, ${cols.map(c => `COALESCE(${c}, '')`).join(', ')}))`;
 
 // 임베딩 서버 사용 여부의 단일 판단 지점 — 호출부가 EMBEDDING_URL을 직접 읽어 같은 판단을
 // 재구성하면, 여기 설정 경로가 바뀔 때 호출부만 조용히 어긋난다.
@@ -102,9 +126,9 @@ export async function embed(texts, signal) {
     if (items.some((item, index) => item?.index !== index)) {
       throw new EmbeddingError('임베딩 응답 index가 중복되거나 누락되거나 범위를 벗어났습니다', false);
     }
-    const vectors = items.map(d => d.embedding);
-    if (vectors.some(v => !Array.isArray(v) || v.length === 0 || v.some(n => !Number.isFinite(n)))) {
-      throw new EmbeddingError('임베딩 응답에 유효하지 않은 벡터가 포함되어 있습니다', false);
+    const vectors = items.map(d => normalizeEmbedding(d.embedding));
+    if (vectors.some(v => !v)) {
+      throw new EmbeddingError(`임베딩 벡터는 ${EMBEDDING_DIMENSIONS}차원이며 FP32에서 유한한 양의 제곱합을 가져야 합니다`, false);
     }
     return vectors;
   } catch (e) {

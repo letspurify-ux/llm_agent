@@ -5,17 +5,19 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
 import mariadb from 'mariadb';
-import { closePool } from '../src/db.js';
+import { closePool, loadQueriesByNames, loadQueriesMentionedIn } from '../src/db.js';
 import { handleQuestion } from '../src/agent.js';
 import { buildPrompt } from '../src/llm-openai.js';
 import { canGrow } from '../src/chunk.js';
+import { EMBEDDING_MODEL } from '../src/embedding.js';
+import { vector } from './fixtures/vector.js';
 import { searchKnowledge, searchQaMethods, searchQueries, warmUpEmbedding, SEARCH_COLUMNS, vecTable, CHUNK_OVERFETCH } from '../src/search.js';
 
 async function withSearchDb(context, query, run) {
   const saved = process.env.EMBEDDING_URL;
   process.env.EMBEDDING_URL = 'http://test.invalid/v1';
   context.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({
-    data: [{ index: 0, embedding: [1, 0] }],
+    data: [{ index: 0, embedding: vector() }],
   })));
   context.mock.method(mariadb, 'createPool', () => ({
     getConnection: async () => ({ query, release: async () => {} }),
@@ -26,6 +28,41 @@ async function withSearchDb(context, query, run) {
     if (saved === undefined) delete process.env.EMBEDDING_URL; else process.env.EMBEDDING_URL = saved;
   }
 }
+
+test('잘못된 질의 벡터는 검색 불가로 알리고 동일 검색어도 서버 복구 후 다시 임베딩한다', async context => {
+  let queries = 0;
+  await withSearchDb(context, async () => { queries++; return [{ seq: 1, title: '복구', method: '본문' }]; }, async () => {
+    for (const [name, bad] of [['short', [1, 0]], ['zero', Array(1024).fill(0)]]) {
+      let calls = 0;
+      const before = queries;
+      context.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({
+        data: [{ index: 0, embedding: ++calls === 1 ? bad : vector() }],
+      })));
+      assert.equal(await searchQaMethods(`invalid recovery ${name}`), null);
+      assert.equal(queries, before, '잘못된 벡터를 DB까지 보내지 않는다');
+      assert.equal((await searchQaMethods(`invalid recovery ${name}`)).length, 1);
+      assert.equal(calls, 2, '실패한 벡터는 캐시에 남지 않는다');
+    }
+  });
+});
+
+test('해시 검증은 ANN LIMIT 뒤의 후보에만 적용하고 별도 DB 왕복을 하지 않는다', async context => {
+  let calls = 0;
+  await withSearchDb(context, async (sql, params) => {
+    calls++;
+    assert.match(sql, /SELECT seq, embed_hash, VEC_DISTANCE_COSINE/);
+    assert.match(sql, /FROM vec_\w+ ORDER BY _dist LIMIT \d+\s*\) v LEFT JOIN/);
+    assert.match(sql, /v.embed_hash <> MD5\(CONCAT_WS\(CHAR\(10\), \?, COALESCE\(t\./);
+    assert.equal(params[0], EMBEDDING_MODEL);
+    return [];
+  }, async () => {
+    await searchKnowledge('해시 검증 지식');
+    await searchQaMethods('해시 검증 절차');
+    // 정확한 이름 조회를 거치지 않는 길이로 벡터 경로만 검사한다.
+    await searchQueries('해시 검증 쿼리'.repeat(40));
+    assert.equal(calls, 3);
+  });
+});
 
 test('검색과 보충 조회 사이 문서가 바뀌면 다른 판본의 중간 청크를 섞지 않는다', async context => {
   const original = [1, 2, 3].map(n => ({ seq: n, doc_seq: 1, chunk_no: n, chunk_of: 3,
@@ -62,7 +99,7 @@ test('처리방법 라우팅 조회가 실패해도 성공한 직접 쿼리 검�
   await withSearchDb(context, async sql => {
     if (sql.includes('vec_qa_method')) return [{ seq: 1, title: '절차', method: 'direct_query 실행' }];
     if (sql.includes('vec_query_registry')) return [{ seq: 2, query_name: 'direct_query', query_sql: 'SELECT 1 FROM dual' }];
-    if (sql.includes('LOCATE')) throw new Error('routing timeout');
+    if (sql === 'SELECT seq, query_name FROM query_registry') throw new Error('routing timeout');
     if (sql.includes('query_name IN')) return [];
     assert.fail(`예상 밖 SQL: ${sql}`);
   }, async () => {
@@ -149,12 +186,60 @@ test('정확한 쿼리 이름은 임베딩 없이 찾고 실행 명세를 보존
 });
 
 test('정확한 이름이 없으면 벡터 검색으로 이어진다', async context => {
+  let nameReads = 0;
   await withSearchDb(context, async sql => {
-    if (sql.includes('query_name IN')) return [];
+    if (sql.includes('query_name IN')) { nameReads++; return []; }
+    if (sql === 'SELECT seq, query_name FROM query_registry') assert.fail('일반 자연어 검색에서 등록명 전체를 읽었다');
     assert.match(sql, /vec_query_registry/);
     return [{ seq: 4, query_name: 'semantic_match' }];
   }, async () => {
     assert.equal((await searchQueries('작업별 처리량'))[0].query_name, 'semantic_match');
+    assert.equal(nameReads, 1, '정확 이름은 UNIQUE 인덱스 한 번만 조회한다');
+  });
+});
+
+test('라우팅은 이름만 훑고 상위 후보의 상세만 읽으며 중간 이름 변경은 제외한다', async context => {
+  const names = Array.from({ length: 100 }, (_, i) => ({ seq: i + 1, query_name: `q${String(i).padStart(3, '0')}` }));
+  let reads = 0;
+  await withSearchDb(context, async (sql, params) => {
+    reads++;
+    if (sql === 'SELECT seq, query_name FROM query_registry') return names;
+    assert.match(sql, /WHERE seq IN/);
+    assert.deepEqual(params, [100, 99, 98], '본문 순서의 상위 3건만 상세를 요청한다');
+    return [{ ...names[97], query_sql: 'SELECT 1 FROM dual' },
+      { ...names[98], query_name: 'renamed' }, names[99]];
+  }, async () => {
+    const rows = await loadQueriesMentionedIn([...names].reverse().map(r => r.query_name).join(' '), 3);
+    assert.deepEqual(rows.map(r => r.seq), [100, 98]);
+    assert.equal(reads, 2);
+  });
+});
+
+test('정확 이름 보충 조회 중 등록명이 바뀌어도 다른 SQL을 반환하지 않는다', async context => {
+  let reads = 0;
+  await withSearchDb(context, async sql => {
+    reads++;
+    if (sql.includes('query_name IN')) return [];
+    if (sql === 'SELECT seq, query_name FROM query_registry') return [{ seq: 1, query_name: 'İ조회' }];
+    assert.match(sql, /WHERE seq IN/);
+    return [{ seq: 1, query_name: '다른조회', query_sql: 'SELECT 2 FROM dual' }];
+  }, async () => {
+    assert.deepEqual(await loadQueriesByNames(['i\u0307조회']), []);
+    assert.equal(reads, 3);
+  });
+});
+
+test('ASCII k로 소문자화되는 켈빈 기호 등록명도 보충 조회한다', async context => {
+  let reads = 0;
+  await withSearchDb(context, async sql => {
+    reads++;
+    if (sql.includes('query_name IN')) return [];
+    if (sql === 'SELECT seq, query_name FROM query_registry') return [{ seq: 1, query_name: 'K조회' }];
+    assert.match(sql, /WHERE seq IN/);
+    return [{ seq: 1, query_name: 'K조회', query_sql: 'SELECT 1 FROM dual' }];
+  }, async () => {
+    assert.deepEqual((await loadQueriesByNames(['k조회'])).map(row => row.query_name), ['K조회']);
+    assert.equal(reads, 3);
   });
 });
 
@@ -253,7 +338,7 @@ test('질의 지시문 접두는 질의에만 붙고, 설정하지 않으면 아
   const 보낸것 = [];
   context.mock.method(globalThis, 'fetch', async (_url, init) => {
     보낸것.push(...JSON.parse(init.body).input);
-    return new Response(JSON.stringify({ data: [{ index: 0, embedding: [1, 0] }] }));
+    return new Response(JSON.stringify({ data: [{ index: 0, embedding: vector() }] }));
   });
   context.mock.method(mariadb, 'createPool', () => ({
     getConnection: async () => ({ query: async () => [], release: async () => {} }),
@@ -278,7 +363,7 @@ test('질의 지시문 접두는 질의에만 붙고, 설정하지 않으면 아
     await searchQaMethods('점검 일정 2');
     assert.deepEqual(보낸것, ['Instruct: 사내 질문에 답할 근거를 찾아라\nQuery: 점검 일정 2']);
 
-    // ④ 캐시 키는 접두를 뺀 원문이다 — 같은 검색어를 두 번 찾아도 임베딩 왕복은 한 번이다
+    // ④ 서버·접두·검색어가 모두 같으면 임베딩 왕복은 한 번이다
     보낸것.length = 0;
     await searchQaMethods('점검 일정 2');
     assert.deepEqual(보낸것, [], '같은 검색어가 접두 때문에 캐시를 비켜 갔다');
@@ -287,4 +372,88 @@ test('질의 지시문 접두는 질의에만 붙고, 설정하지 않으면 아
     if (savedPrefix === undefined) delete process.env.EMBEDDING_QUERY_PREFIX; else process.env.EMBEDDING_QUERY_PREFIX = savedPrefix;
     await closePool();
   }
+});
+
+test('같은 검색어라도 질의 접두나 서버가 바뀌면 이전 임베딩 캐시를 재사용하지 않는다', async context => {
+  const prefix = process.env.EMBEDDING_QUERY_PREFIX;
+  context.after(() => { if (prefix === undefined) delete process.env.EMBEDDING_QUERY_PREFIX; else process.env.EMBEDDING_QUERY_PREFIX = prefix; });
+  await withSearchDb(context, async () => [], async () => {
+    const inputs = [];
+    context.mock.method(globalThis, 'fetch', async (url, init) => {
+      inputs.push([url, JSON.parse(init.body).input[0]]);
+      return new Response(JSON.stringify({ data: [{ index: 0, embedding: vector() }] }));
+    });
+    process.env.EMBEDDING_QUERY_PREFIX = '';
+    await searchQaMethods('cache configuration change');
+    process.env.EMBEDDING_QUERY_PREFIX = 'Instruct: find evidence\nQuery: ';
+    await searchQaMethods('cache configuration change');
+    process.env.EMBEDDING_URL = 'http://replacement.invalid/v1';
+    await searchQaMethods('cache configuration change');
+    assert.equal(inputs.length, 3);
+    assert.equal(inputs[1][1], 'Instruct: find evidence\nQuery: cache configuration change');
+    assert.match(inputs[2][0], /replacement\.invalid/);
+    await searchQaMethods('cache configuration change');
+    assert.equal(inputs.length, 3, '설정이 같으면 캐시를 재사용한다');
+  });
+});
+
+test('후보 보충 조회가 실패해도 이미 검증한 정상 후보는 보존한다', async context => {
+  await withSearchDb(context, async sql => {
+    if (sql.includes('IGNORE INDEX')) throw new Error('fixture fallback timeout');
+    return [{ seq: 1, title: '정상', method: '본문', _dist: 0.2, _stale: 0 },
+      { seq: 2, title: '변경', method: '수정됨', _dist: 0.1, _stale: 1 }];
+  }, async () => {
+    assert.deepEqual(await searchQaMethods('partial candidates timeout'),
+      [{ seq: 1, title: '정상', method: '본문', _dist: 0.2 }]);
+  });
+});
+
+test('후보 보충이 실패하고 정상 후보가 없으면 0건 대신 검색 불가를 알린다', async context => {
+  await withSearchDb(context, async sql => {
+    if (sql.includes('IGNORE INDEX')) throw new Error('fixture refill failure without valid hits');
+    return [{ seq: null, _dist: 0.1, _stale: 1 }];
+  }, async () => assert.equal(await searchQaMethods('no valid candidates timeout'), null));
+});
+
+test('동일 입력의 세 소스 병렬 검색은 한 번의 임베딩을 공유한다', async context => {
+  await withSearchDb(context, async () => [], async () => {
+    let calls = 0, release;
+    context.mock.method(globalThis, 'fetch', async () => {
+      calls++;
+      await new Promise(resolve => { release = resolve; });
+      return new Response(JSON.stringify({ data: [{ index: 0, embedding: vector() }] }));
+    });
+    const text = 'parallel source query '.repeat(6);
+    const pending = Promise.all([searchKnowledge(text), searchQaMethods(text), searchQueries(text)]);
+    assert.equal(calls, 1);
+    release();
+    assert.deepEqual(await pending, [[], [], []]);
+    assert.equal(calls, 1);
+  });
+});
+
+test('퇴출된 요청의 늦은 실패가 같은 검색어의 새 캐시 요청을 지우지 않는다', async context => {
+  await withSearchDb(context, async () => [], async () => {
+    let rejectOld, releaseNew, matchingCalls = 0;
+    const text = 'evicted pending embedding race';
+    context.mock.method(globalThis, 'fetch', async (_url, init) => {
+      const input = JSON.parse(init.body).input[0];
+      if (input.endsWith(text)) {
+        matchingCalls++;
+        if (matchingCalls === 1) return new Promise((_, reject) => { rejectOld = reject; });
+        if (matchingCalls === 2) await new Promise(resolve => { releaseNew = resolve; });
+      }
+      return new Response(JSON.stringify({ data: [{ index: 0, embedding: vector() }] }));
+    });
+    const old = searchQaMethods(text);
+    for (let i = 0; i < 100; i++) await searchQaMethods(`cache flood ${i}`);
+    const current = searchQaMethods(text);
+    assert.equal(matchingCalls, 2);
+    rejectOld(new Error('fixture old request failure'));
+    assert.equal(await old, null);
+    const joined = searchQaMethods(text);
+    assert.equal(matchingCalls, 2, '이전 실패가 진행 중인 새 항목을 지워 중복 호출하면 안 된다');
+    releaseNew();
+    assert.deepEqual(await Promise.all([current, joined]), [[], []]);
+  });
 });

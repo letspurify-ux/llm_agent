@@ -831,3 +831,12 @@ test('청크 항목은 문서당 상한까지 잘리지 않고 통째로 실린�
   assert.ok(p.includes(body), '문서당 상한 안의 본문이 프롬프트에서 다시 잘리면 안 된다');
   assert.ok(!p.includes(TRUNC_MARK), '청크는 잘림 표시가 붙지 않는다');
 });
+
+test('검색된 쿼리 식별자는 DB의 문자 수 범위 안이면 보충 평면 문자도 온전히 표시한다', () => {
+  const name = '📊'.repeat(60);
+  for (const detail of [false, true]) {
+    const prompt = buildPrompt(ctx({ searched: ['query'], queries: [{seq:1,query_name:name,
+      query_desc:'정확한 식별자로 실행할 조회',query_sql:'SELECT 1 FROM dual',input_desc:'없음',target_db_name:'DB', detail, selected:detail}] }));
+    assert.ok(prompt.includes(name), `detail=${detail}: 검색 결과의 실행 식별자가 잘렸다`);
+  }
+});

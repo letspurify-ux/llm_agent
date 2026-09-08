@@ -451,7 +451,8 @@ export const isPlainObject = v => v !== null && typeof v === 'object' && !Array.
 // 100자로 자르면 101~128자짜리 적법한 이름을 모델이 철자대로 적을 방법이 사라진다.
 export const MAX_BIND_NAME_LEN = 128;
 
-// 쿼리 이름 비교 키. query_registry 조회는 MariaDB 기본 collation(대소문자·후행 공백 무시)이라
+// 쿼리 이름 비교 키. 대소문자·앞뒤 공백만 흡수한다 — 악센트와 다른 이모지는 다른 식별자다.
+// DB 이름 조회도 collation으로 찾은 후보를 이 키로 확인한다(db.js loadQueriesByNames).
 // JS의 ===로 비교하면 'BATCH_JOB_STATUS'와 'batch_job_status'가 서로 다른 쿼리로 보인다.
 // 이름으로 무언가를 판정하는 곳(agent의 루프 가드, mock의 실행 계획과 stub 데이터 조회)은 전부 이 키를 쓴다 —
 // 한 곳이라도 ===로 남으면 그 경로에서만 가드가 조용히 무력화된다.

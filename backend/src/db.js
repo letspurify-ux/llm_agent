@@ -134,48 +134,59 @@ export function loadChunkRanges(ranges) {
 // 철자가 대소문자만 다르면 ===로는 순서를 되돌리지 못하고 그 행만 맨 뒤로 밀린다.
 export async function loadQueriesByNames(names) {
   if (!names.length) return [];
+  const order = new Map();
+  names.forEach((n, i) => { const k = nameKey(n); if (k && !order.has(k)) order.set(k, i); });
+  if (!order.size) return [];
   const rows = await query(
     `SELECT * FROM query_registry WHERE query_name IN (${names.map(() => '?').join(',')})`,
     names
   );
-  const order = new Map();
-  names.forEach((n, i) => { const k = nameKey(n); if (!order.has(k)) order.set(k, i); });
-  return rows.sort((a, b) =>
-    (order.get(nameKey(a.query_name)) ?? Infinity) - (order.get(nameKey(b.query_name)) ?? Infinity));
+  // 일반적인 정확 조회는 UNIQUE 인덱스 한 번으로 끝낸다. collation은 악센트와
+  // 다른 이모지도 같게 보므로 실행·반복 가드와 같은 nameKey로 후보를 확인한다.
+  const valid = rows.filter(r => order.has(nameKey(r.query_name)));
+  const found = new Set(valid.map(r => nameKey(r.query_name)));
+  const missing = new Set([...order.keys()].filter(k => !found.has(k)));
+  // 대부분의 검색어(ASCII·한글·숫자·이모지)는 UNIQUE 인덱스 조회 한 번이면 충분하다.
+  // 등록명 전체 확인은 DB Unicode 표와 JS 변환이 달라질 수 있는 비ASCII 대소문자·결합 문자에만 한다.
+  // 예외적으로 K는 JS 소문자화 결과가 ASCII k다. 요청이 이미 k로 들어오면 정규화한 키만 보고
+  // 원래 등록명에 비ASCII 문자가 있었음을 알 수 없으므로 k를 포함한 미적중도 보충한다.
+  // 이 제한이 없으면 자연어 query 검색마다 등록명 전체를 한 번 더 읽게 된다.
+  const needsUnicodeFallback = [...missing].some(s =>
+    s.includes('k') || [...s].some(ch =>
+      (ch.codePointAt(0) > 0x7f && ch.toLowerCase() !== ch.toUpperCase()) || /\p{M}/u.test(ch)));
+  if (needsUnicodeFallback) {
+    // DB와 JS의 Unicode 소문자화는 다르다(İ → i + 결합점 등).
+    // 인덱스가 놓친 이름은 번호·이름만 읽어 확인하고 해당 PK의 상세만 가져온다.
+    const refs = (await queryNames()).filter(r => missing.has(nameKey(r.query_name)));
+    const extra = await queriesByIds(refs.map(r => r.seq));
+    // 두 조회 사이 이름이 바뀌면 요청하지 않은 SQL이 될 수 있다. 현재 이름을 재확인한다.
+    valid.push(...extra.filter(r => missing.has(nameKey(r.query_name))));
+  }
+  return valid.sort((a, b) => order.get(nameKey(a.query_name)) - order.get(nameKey(b.query_name)));
 }
 
-// qa_method 본문이 지목한 쿼리를 등장 순서대로 로드 (라우팅 경로A).
+const queryNames = () => query('SELECT seq, query_name FROM query_registry');
+const queriesByIds = ids => ids.length
+  ? query(`SELECT * FROM query_registry WHERE seq IN (${ids.map(() => '?').join(',')})`, ids)
+  : Promise.resolve([]);
+
+// 처리방법 본문에 있는 등록명을 첫 등장 순서로 읽는다. 한글 조사와 1~2자 이름도
+// 매칭하며 '_'·'%'는 리터럴이다. 짧은 이름이 긴 이름 안에도 잡히는 부분 문자열 계약은
+// 유지한다. 흔한 낱말보다 변별력 있는 query_name을 등록해야 한다.
 //
-// '본문에서 이름처럼 보이는 토큰을 뽑아 IN 절로 묻는' 방식이 아니라, 등록된 이름이 본문에
-// 들어 있는지를 DB가 직접 본다. 토큰화가 성립하지 않기 때문이다: query_name에는 문자 제한이
-// 없는데(VARCHAR(100)) 한국어는 조사가 낱말에 붙어 '배치상태조회를'이 한 낱말이므로, 공백으로
-// 나눠서는 이름의 끝을 알 수 없다. 실제로 앞선 구현의 추출식(/[A-Za-z_][A-Za-z0-9_]{2,}/)은
-// 한글 이름과 1~2자 이름을 한 번도 뽑지 못했고, 그 쿼리들은 경로A에서 통째로 빠졌다 —
-// 오류는 남지 않고 다단계 절차의 순서 보장만 조용히 사라진다 (agent.js selectQueries 주석 참고).
-//
-// LIKE가 아니라 LOCATE를 쓴다. LIKE는 패턴 쪽이 컬럼이 되어 query_name 안의 '_'와 '%'가
-// 와일드카드로 살아나는데, query_name은 snake_case라 '_'가 거의 항상 들어 있다
-// (batch_job_status가 'batchXjobYstatus'에도 맞는다). LOCATE는 와일드카드 개념이 없고,
-// 덤으로 '본문 어디에 나왔는가'를 그대로 돌려줘 정렬 키가 된다 — 호출부가 원하는 값이 정확히 그것이다.
-// 빈 이름을 제외하는 이유: LOCATE('', s)는 1이라 등록 전체가 매칭된다.
-// 부분 문자열 매칭이므로 짧은 이름이 긴 이름 안에서도 잡힌다('batch'가 'batch_job_status'를 쓴
-// 본문에서 함께 걸린다). 의도한 동작이다 — 결과는 '프롬프트 목록이 넓어진다'뿐이고, 무엇을
-// 실행할지는 모델이 목록에서 고른다. Mock provider의 판정(llm.js plannedQueries)도 같다.
-// 다만 '조회'처럼 흔한 낱말을 이름으로 등록하면 거의 모든 처리방법에 걸려 상한(MAX_PROMPT_QUERIES)
-// 자리를 차지하므로, query_name은 그 자체로 변별력 있게 지을 것.
-// 대소문자는 양쪽을 낮춰 맞춘다 — collation이 이미 무시하지만, 그 전제를 이 SQL 안에서 확정한다
-// (호출부가 본문을 낮춰 보낸다 — 낮추는 지점이 하나여야 길이 상한과 어긋나지 않는다).
-// 정렬의 2차 키는 seq다 — 같은 위치에서 시작하는 이름은 없지만, ORDER BY가 유일하지 않으면
-// 실행계획이 바뀌는 것만으로(query_name 인덱스 추가, ANALYZE, 온라인 ALTER) 순서가 달라진다.
-export function loadQueriesMentionedIn(text) {
-  // 빈 본문이면 왕복하지 않는다. 공백만 남은 경우까지 함께 본다 — method는 NOT NULL이지만
-  // 컬럼 하나가 완화되거나 임포터가 NULL 행을 넣으면 호출부가 개행만 이어 붙인 문자열을 보낸다.
-  if (!text?.trim()) return Promise.resolve([]);
-  return query(
-    `SELECT *, LOCATE(LOWER(query_name), ?) AS _pos FROM query_registry
-     WHERE query_name <> '' HAVING _pos > 0 ORDER BY _pos, seq`,
-    [text]
-  );
+// DB LOWER/LOCATE는 JS와 Unicode 규칙이 달라 정상 이름을 놓치거나 다른 이모지를
+// 선택한다. 실행·정확 조회와 같은 nameKey로 판정한다. 첫 조회는 이름과 번호뿐이며,
+// 본문에 맞는 상위 후보만 PK로 읽는다. 등록된 SQL·설명 전체를 전송하거나 캐시하지 않는다.
+// limit은 호출부의 후보 상한이다. 두 SELECT 사이 변경된 이름도 상세를 받은 뒤 재검증한다.
+export async function loadQueriesMentionedIn(text, limit = Infinity) {
+  const body = String(text ?? '').toLowerCase();
+  if (!body.trim() || limit <= 0) return [];
+  const matching = rows => rows.map(r => {
+    const name = nameKey(r.query_name);
+    return { ...r, _pos: name ? body.indexOf(name) : -1 };
+  }).filter(r => r._pos >= 0).sort((a, b) => a._pos - b._pos || a.seq - b.seq);
+  const refs = matching(await queryNames()).slice(0, limit);
+  return matching(await queriesByIds(refs.map(r => r.seq)));
 }
 
 // trace를 chat_log.trace(JSON 컬럼)에 넣을 글자로 만든다. (테스트에서 쓰므로 export)

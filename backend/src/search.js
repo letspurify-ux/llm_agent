@@ -1,7 +1,7 @@
 // 검색 경계: 소스별 벡터 검색 + query_name 정확 일치.
 // 빈 배열은 성공·0건, null은 검색 실패다. 정확한 쿼리명은 임베딩 없이도 찾는다.
 import { query, loadChunkRanges, loadQueriesByNames } from './db.js';
-import { embed, isEmbeddingEnabled, warnEmbeddingFailure, embedQueryPrefix } from './embedding.js';
+import { embed, EMBEDDING_MODEL, embeddingHashExpr, isEmbeddingEnabled, warnEmbeddingFailure, embedQueryPrefix } from './embedding.js';
 import { warnOnce, SEARCH_LIMIT, MAX_DOC_LEN, MAX_EMBED_TEXT_LEN, clipText } from './constants.js';
 import { planRanges, buildItems, sameChunk } from './chunk.js';
 
@@ -23,6 +23,11 @@ export const CHUNK_OVERFETCH = 3;  // (테스트에서 쓰므로 export 한다)
 const MAX_DIST = 0.55;    // 관련도 임계값 (코사인 거리). 실측: 관련 0.30~0.53, 무관 0.58~0.75.
                           // top-K는 무관해도 항상 K건을 돌려주므로, 이 필터가 없으면 "관련 지식 없음 →
                           // 일반 지식 답변" 폴백이 무력화된다.
+// 이전 버전이 저장한 영벡터·극단 벡터를 복구 SQL 실행 전에도 결과에서 제외한다.
+// 범위는 repair-invalid-vectors.sql과 같으며 정상화된 새 벡터의 노름(약 1)은 충분히 안쪽이다.
+const MIN_SAFE_NORM = 1.0842021724855044e-19;
+const MAX_SAFE_NORM = 1.844674352395373e19;
+const ZERO_VECTOR = JSON.stringify(Array(1024).fill(0));
 
 // 테이블별 임베딩 원문 컬럼 (첫 컬럼 = 제목/이름). embed-sync.js가 임베딩 원문을 만들 때 쓴다 —
 // 검색이 무엇을 보고 맞추는지가 곧 이 컬럼들이다. 쿼리는 SQL 원문을 넣지 않는다(질문과 닮은 것은 설명이다).
@@ -97,7 +102,9 @@ export async function searchQueries(text) {
   const name = String(text ?? '').trim();
   if (!name) return [];
   // query_name의 UNIQUE 인덱스로 정확한 이름을 먼저 해석한다. 적중하면 임베딩도 필요 없다.
-  if (name.length <= 100) {
+  // VARCHAR(100)의 이름과 소문자 변형은 UTF-16 최대 200자다.
+  // İ → i + 결합점처럼 문자 수도 늘 수 있으므로 코드포인트 100자로 제한하지 않는다.
+  if (name.length <= 200) {
     try {
       const exact = await loadQueriesByNames([name]);
       if (exact.length) return exact.map(row => ({ ...row, exact: true }));
@@ -137,14 +144,18 @@ function embedText(text) {
     warnOnce('search:embedding', 'EMBEDDING_URL is not set — vector search is unavailable; exact query-name lookup still works. Set it in backend/.env.');
     return null;
   }
-  const hit = embedCache.get(text);
+  // 실제 서버·모델·전송 입력을 키로 삼는다. 접두/서버가 바뀐 호출은 이전 벡터와
+  // 합치지 않고, 상한 밖 원문만 다른 검색어는 같은 요청으로 합친다.
+  const input = clipText(embedQueryPrefix() + text, MAX_EMBED_TEXT_LEN);
+  const key = JSON.stringify([process.env.EMBEDDING_URL, EMBEDDING_MODEL, input]);
+  const hit = embedCache.get(key);
   if (hit) {
     // 적중한 항목을 맨 뒤로 옮긴다 — 삽입 순서만 보고 밀어내면(FIFO) 가장 자주 묻는 검색어가
     // 한 번 들어간 뒤 스쳐 가는 검색어 100건에 그대로 밀려난다. 캐시는 가득 찬 채로 적중률만
     // 0에 수렴하고, 오류는 나지 않은 채 같은 검색어마다 임베딩 왕복(최대 60초)이 되돌아온다.
     // sql.js analysisCache가 같은 이유로 같은 방식(delete 후 재삽입)을 쓴다.
-    embedCache.delete(text);
-    embedCache.set(text, hit);
+    embedCache.delete(key);
+    embedCache.set(key, hit);
     return hit;
   }
   // 가득 차면 통째로 비우지 않고 가장 오래 '안 쓴' 것부터 하나씩 밀어낸다 (Map은 삽입 순서를
@@ -154,12 +165,7 @@ function embedText(text) {
   while (embedCache.size >= EMBED_CACHE_MAX) {
     embedCache.delete(embedCache.keys().next().value);
   }
-  // 지시문 접두는 질의에만 붙는다 (embedding.js embedQueryPrefix) — 문서 쪽(embed-sync.js toText)에는
-  // 붙이지 않는다. 캐시 키는 접두를 뺀 원문 그대로다: 접두는 프로세스 수명 동안 같은 값이라 키에 넣어도
-  // 적중이 달라지지 않는데, 넣으면 같은 검색어가 설정 하나로 다른 항목이 되어 캐시가 뜻을 잃는다.
-  // 상한은 문서와 같은 자를 쓴다 — 접두를 더한 뒤에 재야 요청이 유계다(질의는 이미 MAX_SEARCH_TEXT_LEN
-  // 안이라 지금 설정에서는 아무 일도 하지 않는다).
-  const p = embed([clipText(embedQueryPrefix() + text, MAX_EMBED_TEXT_LEN)])
+  const p = embed([input])
     .then(v => v[0])
     .catch(e => {
       warnEmbeddingFailure(e);
@@ -167,10 +173,10 @@ function embedText(text) {
       // 지운다 — 느린 실패가 돌아오는 사이 위의 LRU가 이 항목을 밀어내고 같은 검색어의 새 요청이
       // 새 promise를 넣었을 수 있는데, 키로만 지우면 그 진행 중인 항목까지 함께 버려
       // 다음 검색이 합류하지 못하고 60초짜리 임베딩 호출을 한 번 더 만든다.
-      if (embedCache.get(text) === p) embedCache.delete(text);
+      if (embedCache.get(key) === p) embedCache.delete(key);
       return null;                 // 검색 불가 — vectorSearch가 null로 알린다
     });
-  embedCache.set(text, p);
+  embedCache.set(key, p);
   return p;
 }
 
@@ -203,17 +209,48 @@ export async function warmUpEmbedding(signal) {
 // _dist를 함께 돌려준다 — 청크 병합이 대표 청크와 문서 순서를 이 값으로 정하고(chunk.js planRanges),
 // 계측(agent.js trace.search.top)도 이 값을 남겨 문서당 상한을 나중에 데이터로 다시 잡는다.
 // table은 코드가 정의한 식별자다(SEARCH_COLUMNS의 키) — 외부 입력이 아니다.
-function vecQuery(table, vector, limit) {
-  // 안팎 상한이 같다. 바깥의 거리 필터가 거리 순서와 단조라, 안쪽에서 더 뽑아 봐야 그 여분은
-  // 전부 필터에 걸린다 — 넉넉히 뽑는 것은 병합이 있는 지식 쪽에서 바깥 상한으로 한다.
+async function vecQuery(table, vector, limit) {
   const n = Number.isInteger(limit) && limit > 0 ? limit : LIMIT;
-  return query(
+  const currentHash = embeddingHashExpr(SEARCH_COLUMNS[table].map(c => `t.${c}`));
+  const encoded = JSON.stringify(vector);
+  // LEFT JOIN으로 후보를 보존한다. 해시 불일치/원본 삭제를 WHERE에서 제거하면
+  // 정상적인 0건과 '무효 후보가 자리를 차지한 0건'을 구분할 수 없어 보충할 수 없다.
+  // LIMIT이 있는 파생 테이블을 왼쪽에 두어 평상시 본문 조회와 해싱은 후보에만 적용한다.
+  const candidates = await query(
     `SET STATEMENT mhnsw_ef_search=${EF_SEARCH} FOR
-     SELECT t.*, v._dist FROM (
-       SELECT seq, VEC_DISTANCE_COSINE(embedding, VEC_FromText(?)) AS _dist
+     SELECT t.*, v._dist,
+       (t.seq IS NULL OR v.embed_hash <> ${currentHash}) AS _stale,
+       (COALESCE(v._norm, 0) NOT BETWEEN ${MIN_SAFE_NORM} AND ${MAX_SAFE_NORM}) AS _invalid FROM (
+       SELECT seq, embed_hash, VEC_DISTANCE_COSINE(embedding, VEC_FromText(?)) AS _dist,
+         VEC_DISTANCE_EUCLIDEAN(embedding, VEC_FromText(?)) AS _norm
        FROM ${vecTable(table)} ORDER BY _dist LIMIT ${n}
-     ) v JOIN ${table} t ON t.seq = v.seq WHERE v._dist <= ${MAX_DIST}
+     ) v LEFT JOIN ${table} t ON t.seq = v.seq
+     WHERE v._dist <= ${MAX_DIST}
+       OR COALESCE(v._norm, 0) NOT BETWEEN ${MIN_SAFE_NORM} AND ${MAX_SAFE_NORM}
      ORDER BY v._dist LIMIT ${n}`,
-    [JSON.stringify(vector)]
+    [EMBEDDING_MODEL, encoded, ZERO_VECTOR]
   );
+  const valid = candidates.filter(row => !Number(row._stale) && !Number(row._invalid))
+    .map(({ _stale, _invalid, ...row }) => row);
+  if (valid.length === candidates.length) return valid;
+  // 무효 후보가 있는 회차만 정확 검색으로 보충한다. 고정 배수로 늘리면 오래된 벡터가
+  // 그 배수보다 많을 때 같은 누락이 재발한다. 벡터 인덱스를 배제하여 필터 후 LIMIT을
+  // 적용하고 현재 본문/모델이 유효한 결과를 찾는다. DB의 queryTimeout으로 비용을 제한한다.
+  // 평상시는 위 한 번의 ANN 조회뿐이다. 재조회도 하나의 SELECT 스냅샷에서 검증한다.
+  return query(
+    `SELECT t.*, VEC_DISTANCE_COSINE(v.embedding, VEC_FromText(?)) AS _dist
+     FROM ${vecTable(table)} v IGNORE INDEX (embedding) JOIN ${table} t ON t.seq = v.seq
+     WHERE v.embed_hash = ${currentHash}
+       AND COALESCE(VEC_DISTANCE_EUCLIDEAN(v.embedding, VEC_FromText(?)), 0)
+         BETWEEN ${MIN_SAFE_NORM} AND ${MAX_SAFE_NORM}
+       AND VEC_DISTANCE_COSINE(v.embedding, VEC_FromText(?)) <= ${MAX_DIST}
+     ORDER BY _dist, v.seq LIMIT ${n}`,
+    [encoded, EMBEDDING_MODEL, ZERO_VECTOR, encoded]
+  ).catch(e => {
+    // 보충 실패가 이미 확보한 정상 근거까지 버리지 않게 한다. 정상 후보가 하나도
+    // 없으면 상위 호출이 null(검색 불가)로 보고하며 0건으로 숨기지 않는다.
+    if (!valid.length) throw e;
+    warnOnce(`search:refill:${table}`, `candidate refill failed on ${table} — keeping validated matches: ${e.message}`);
+    return valid;
+  });
 }

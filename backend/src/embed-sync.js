@@ -10,7 +10,7 @@ import 'dotenv/config';
 import { writeSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { query, getConnection, releaseConnection, closePool } from './db.js';
-import { embed, EMBEDDING_MODEL, isEmbeddingEnabled, warnEmbeddingFailure } from './embedding.js';
+import { embed, EMBEDDING_MODEL, embeddingHashExpr as hashExpr, isEmbeddingEnabled, warnEmbeddingFailure } from './embedding.js';
 import { SEARCH_COLUMNS, vecTable } from './search.js';
 import { MAX_EMBED_TEXT_LEN, clipText } from './constants.js';
 import { splitContent, CHUNK_TARGET_LEN, CHUNK_MAX_LEN, CHUNK_OVERLAP, CHUNK_SPLIT_VERSION } from './chunk.js';
@@ -59,8 +59,7 @@ const chunked = (arr, n) => {
 // CONCAT_WS는 NULL 인자를 건너뛴다 — COALESCE로 빈 문자열을 고정하지 않으면 NULL 컬럼 유무에
 // 따라 구분자 수가 달라져 같은 내용이 다른 해시가 된다. 구분자는 CHAR(10)으로 박는다
 // (리터럴 '\n'은 서버의 NO_BACKSLASH_ESCAPES 설정에 따라 뜻이 바뀐다).
-const hashExpr = cols =>
-  `MD5(CONCAT_WS(CHAR(10), ?, ${cols.map(c => `COALESCE(${c}, '')`).join(', ')}))`;
+// 구현은 embedding.js에 공유한다. 검색도 이 식으로 후보의 현재 본문을 검증한다.
 
 // skipped 값 — 호출부(서버 로그, CLI 종료 코드)가 "설정상 안 쓰는 것"과 "쓰려는데 실패한 것"을
 // 구분해야 한다. 임베딩을 끄고 쓰는 것은 설정상의 선택이므로 이 동기화의 실패로 보고하지 않는다 —
@@ -168,25 +167,32 @@ export async function syncEmbeddings() {
 // 벡터 동기화(②) 앞에 선다. 두 단계 모두 MD5 게으른 비교라 새 개념은 없다 —
 // ①은 '문서가 바뀌었나'를 doc_hash로, ②는 '청크가 바뀌었나'를 embed_hash로 본다.
 //
-// 문서 하나가 바뀌면 그 문서의 청크를 통째로 지우고 다시 넣는다. 청크 단위로 diff하지 않는 이유:
-// 겹침(CHUNK_OVERLAP) 때문에 앞부분을 한 글자만 고쳐도 뒤 청크의 경계가 밀린다. 부분 갱신을 흉내내면
-// 어긋난 경계가 남고, 그것은 검색 결과가 이상하다는 형태로만 드러난다 — 문서 단위 비용이 작으므로
-// 통째로 다시 만드는 쪽이 옳다.
-// seq는 AUTO_INCREMENT라 재생성 때 바뀐다. 그래도 되는 이유: seq가 고정이어야 하는 범위는 '한 요청
-// 안'이고(constants.js ITEM_PREFIX), 동기화는 요청 밖에서 돈다. 다음 요청은 새 seq로 다시 검색한다.
+// 문서가 바뀌면 전체 경계를 다시 계산하되 (doc_seq, chunk_no) 자리로 갱신한다.
+// 유지되는 자리는 seq도 유지한다. 벡터는 실제 텍스트 해시가 달라진 자리만 재계산한다.
 //
 // 임베딩이 꺼져 있어도 이 단계는 돈다 — 청크는 임베딩과 무관한 원문 파생이고, 여기서 건너뛰면
 // 임베딩을 다시 켰을 때 청크가 없어 지식이 통째로 검색되지 않는다.
+const STOP_CHUNKING = Symbol('stop chunking');
 async function rebuildChunks() {
   let built = 0, dropped = 0, failed = 0;
   // 문서 단위 해시. 컬럼 목록은 knowledge의 검색 대상과 같아야 한다 — 제목만 고친 수정도
   // 청크의 title 복사본에 반영되어야 하기 때문이다.
   const docs = await query(`SELECT seq, ${DOC_HASH_EXPR} AS h FROM knowledge`, [CHUNK_RULE]);
   const have = new Map(
-    (await query('SELECT doc_seq, MIN(doc_hash) AS h FROM knowledge_chunk GROUP BY doc_seq'))
-      .map(r => [r.doc_seq, r.h])
+    (await query(`SELECT doc_seq, MIN(doc_hash) AS h, MAX(doc_hash) AS max_h,
+       COUNT(*) AS n, MIN(chunk_no) AS first_no, MAX(chunk_no) AS last_no,
+       MIN(chunk_of) AS min_of, MAX(chunk_of) AS max_of
+       FROM knowledge_chunk GROUP BY doc_seq`))
+      .map(r => [r.doc_seq, r])
   );
-  const stale = docs.filter(d => have.get(d.seq) !== d.h).map(d => d.seq);
+  // 해시 하나만 같아도 최신으로 보면 부분 누락된 청크가 영구히 복구되지 않는다.
+  // 이미 수행하는 GROUP BY에서 개수·연속 번호·총수·판본도 확인한다. 본문 전송은 없다.
+  const stale = docs.filter(d => {
+    const c = have.get(d.seq);
+    return !c || c.h !== d.h || c.max_h !== d.h || Number(c.first_no) !== 1
+      || Number(c.last_no) !== Number(c.n) || Number(c.min_of) !== Number(c.n)
+      || Number(c.max_of) !== Number(c.n);
+  }).map(d => d.seq);
   // 원본이 사라진 청크는 FK ON DELETE CASCADE가 이미 거둔다 — 여기서 다시 지우지 않는다.
   // (그 벡터는 ②의 고아 정리가 거둔다: 청크가 없어지면 vec 쪽이 stored에 고아로 남는다.)
 
@@ -212,6 +218,7 @@ async function rebuildChunks() {
         // 168조각짜리 문서의 오타 하나를 고치면 임베딩 168회다. 자리를 유지하면 실제로 내용이
         // 바뀐 청크만 해시가 달라져 그것들만 다시 계산된다.
         for (const [i, content] of parts.entries()) {
+          if (stopRequested) throw STOP_CHUNKING;
           await conn.query(
             `INSERT INTO knowledge_chunk (doc_seq, chunk_no, chunk_of, doc_hash, title, content)
              VALUES (?, ?, ?, ?, ?, ?)
@@ -219,16 +226,22 @@ async function rebuildChunks() {
                                      title = VALUES(title), content = VALUES(content)`,
             [row.seq, i + 1, parts.length, row.h, row.title, content]
           );
+          // 종료 신호가 문장 실행 중 들어왔으면 다음 청크 쓰기를 시작하지 않는다.
+          if (stopRequested) throw STOP_CHUNKING;
         }
         // 문서가 짧아졌으면 남는 꼬리를 거둔다. 두지 않으면 지워진 대목이 검색에 계속 살아 있다.
+        if (stopRequested) throw STOP_CHUNKING;
         const del = await conn.query('DELETE FROM knowledge_chunk WHERE doc_seq = ? AND chunk_no > ?',
           [row.seq, parts.length]);
+        if (stopRequested) throw STOP_CHUNKING;
         await conn.commit();
         dropped += Number(del?.affectedRows ?? 0);
         built += parts.length;
       } catch (e) {
-        failed++;
         await conn.rollback().catch(() => { /* 이미 끊긴 커넥션 */ });
+        // 정상 종료는 데이터 결함이 아니다. 트랜잭션을 되돌려 다음 실행이 문서 전체를 다시 만든다.
+        if (e === STOP_CHUNKING) break;
+        failed++;
         // 행 하나의 실패로 동기화 전체를 버리지 않는다 — 다음 주기에 해시가 여전히 불일치하므로
         // 자동으로 다시 잡힌다 (embedRows가 행별 실패를 다루는 것과 같은 방식).
         console.warn(`[embed] knowledge#${row.seq} chunking failed — skipping this document only: ${e.message}`);
@@ -301,8 +314,8 @@ async function doSync() {
       deleted += Number(r?.affectedRows ?? 0);
     }
 
-    // 변경된 행만 본문을 읽는다. 해시 스캔과 이 읽기 사이에 원본이 또 바뀌면 새 본문을 임베딩하면서
-    // 스캔 시점 해시를 저장하게 되는데, 다음 주기에 불일치로 다시 잡혀 한 번 더 임베딩될 뿐이다(자가 치유).
+    // 변경된 행만 본문을 읽고, 같은 SELECT에서 계산한 해시를 저장한다.
+    // 임베딩 중 다시 수정된 행은 검색 해시 검증에서 제외되고 다음 동기화가 이어받는다.
     // 그 사이 삭제된 행은 여기서 빠지고, vec_store에 남은 벡터는 다음 주기의 고아 정리가 거둔다.
     //
     // 읽은 덩어리를 바로 임베딩한다 — 테이블 전체를 배열 하나에 모아두고 시작하면 메모리 최고점이
@@ -366,6 +379,8 @@ async function embedStale(src, stale) {
     const r = await storeBatch(src, batch, vectors);
     embedded += r.stored;
     failed += r.failed;
+    // 마지막 배치에서도 종료 상태를 상위로 전달한다. 다음 반복이 없을 수 있다.
+    if (stopRequested) return left(false, true);
   }
   return left(false, false);
 }
@@ -386,6 +401,7 @@ async function embedRows(src, batch) {
       const r = await storeBatch(src, [b], await embed([b.text], stopSignal.signal));
       embedded += r.stored;
       failed += r.failed;   // 저장에 실패한 행도 다음 주기에 그대로 되돌아온다 (storeBatch 주석)
+      if (stopRequested) return left(false, true);
     } catch (e) {
       if (stopRequested) return left(false, true);
       warnEmbeddingFailure(e);
@@ -410,6 +426,7 @@ async function embedRows(src, batch) {
 // 매 주기 조용히 되풀이되는 실패에 눈에 띄는 표시를 남기려고 failed를 둔 것인데(위 syncSummary
 // 주석), 이 경로만 그 집계 밖에 있었다.
 async function storeBatch(src, batch, vectors) {
+  if (stopRequested) return { stored: 0, failed: 0 };
   try {
     await query(
       `REPLACE INTO ${vecTable(src)} (seq, embed_hash, embedding) VALUES ${batch.map(() => '(?, ?, VEC_FromText(?))').join(', ')}`,
@@ -417,9 +434,13 @@ async function storeBatch(src, batch, vectors) {
     );
     return { stored: batch.length, failed: 0 };
   } catch (e) {
+    if (stopRequested) return { stored: 0, failed: 0 };
     console.warn(`[embed] ${src} batch store failed — retrying row by row: ${e.message}`);
-    let stored = 0;
+    let stored = 0, failed = 0;
     for (const [j, b] of batch.entries()) {
+      // DB 오류 뒤 행별 재시도도 각각 새 I/O다. 종료 뒤 남은 행을 계속 쓰면
+      // DB 타임아웃이 행 수만큼 누적되어 종료가 늦어진다. 미처리 행은 다음 실행이 잇는다.
+      if (stopRequested) break;
       try {
         await query(
           `REPLACE INTO ${vecTable(src)} (seq, embed_hash, embedding) VALUES (?, ?, VEC_FromText(?))`,
@@ -427,10 +448,11 @@ async function storeBatch(src, batch, vectors) {
         );
         stored++;
       } catch (e2) {
+        failed++;
         console.warn(`[embed] ${src}#${b.seq} store failed: ${e2.message}`);
       }
     }
-    return { stored, failed: batch.length - stored };
+    return { stored, failed };
   }
 }
 

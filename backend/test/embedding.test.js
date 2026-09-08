@@ -2,9 +2,19 @@
 // 임베딩 실패는 검색 전체를 '검색 불가'로 만들고 그 원인은 로그 한 줄뿐이다. 그 줄이 원인을 말해야 한다.
 import { test } from 'node:test';
 import assert from 'node:assert';
+import { vector } from './fixtures/vector.js';
 
 process.env.EMBEDDING_URL = 'http://test.invalid/v1';
 const { embed, EmbeddingError } = await import('../src/embedding.js');
+
+test('잘못된 차원·영벡터·FP32 범위를 벗어난 벡터를 저장과 캐시 전에 거부한다', async t => {
+  for (const bad of [[], [1, 0], vector().slice(1), [...vector(), 0],
+    Array(1024).fill(0), Array(1024).fill(1e-50), Array(1024).fill(1e38),
+    [1e40, ...Array(1023).fill(0)]]) {
+    t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({ data: [{ index: 0, embedding: bad }] })));
+    await assert.rejects(embed(['invalid']), e => e instanceof EmbeddingError && !e.retriable);
+  }
+});
 
 test('잘못된 응답 구조와 숫자가 아닌 벡터를 영구 응답 오류로 거부한다', async () => {
   const invalid = [
@@ -23,7 +33,7 @@ test('잘못된 응답 구조와 숫자가 아닌 벡터를 영구 응답 오류
 test('임베딩 index 중복·누락·범위 오류는 원문과 벡터를 잘못 짝짓지 않는다', async () => {
   for (const indices of [[0, 0], [1, 2], [-1, 0], [0, 0.5], [undefined, undefined]]) {
     globalThis.fetch = async () => new Response(JSON.stringify({
-      data: indices.map((index, position) => ({ index, embedding: [position + 1] })),
+      data: indices.map((index, position) => ({ index, embedding: vector(position) })),
     }));
     await assert.rejects(embed(['a', 'b']), error =>
       error instanceof EmbeddingError && error.retriable === false, JSON.stringify(indices));
@@ -60,8 +70,16 @@ test('4xx는 재시도 대상이 아니고 5xx·429는 재시도 대상이다', 
 });
 
 test('응답 항목은 index로 짝짓고 개수·모양이 어긋나면 재시도하지 않는다', async () => {
-  globalThis.fetch = async () => new Response(JSON.stringify({ data: [{ index: 1, embedding: [2] }, { index: 0, embedding: [1] }] }), { status: 200 });
-  assert.deepEqual(await embed(['a', 'b']), [[1], [2]]);
-  globalThis.fetch = async () => new Response(JSON.stringify({ data: [{ index: 0, embedding: [1] }] }), { status: 200 });
+  globalThis.fetch = async () => new Response(JSON.stringify({ data: [{ index: 1, embedding: vector(1) }, { index: 0, embedding: vector() }] }), { status: 200 });
+  assert.deepEqual(await embed(['a', 'b']), [vector(), vector(1)]);
+  globalThis.fetch = async () => new Response(JSON.stringify({ data: [{ index: 0, embedding: vector() }] }), { status: 200 });
   await assert.rejects(embed(['a', 'b']), e => e instanceof EmbeddingError && e.retriable === false);
+});
+
+test('임베딩은 각도를 보존하는 FP32 단위 벡터로 반환한다', async t => {
+  const raw = vector(); raw[0] = 3; raw[1] = 4;
+  t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({ data: [{ index: 0, embedding: raw }] })));
+  const [v] = await embed(['normalization']);
+  assert.ok(Math.abs(v[0] - 0.6) < 1e-6 && Math.abs(v[1] - 0.8) < 1e-6);
+  assert.ok(Math.abs(v.reduce((sum, n) => sum + n * n, 0) - 1) < 1e-6);
 });
