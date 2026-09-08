@@ -11,6 +11,8 @@ import { CASES, TRACE } from './fixtures.js';
 import { TABLE_FORMULAS, INCOMPLETE_TABLE_FORMULAS } from '../table-math-corpus.js';
 import { checkLatex200 } from './latex-table-200-checks.mjs';
 import { checkMixedContent } from './mixed-content-checks.mjs';
+import { checkValidEdges } from './valid-edge-checks.mjs';
+import { EDGE_CASES } from '../valid-math-edge-corpus.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const VITE = join(ROOT, 'node_modules/vite/bin/vite.js');
@@ -96,6 +98,16 @@ test('production 빌드에서도 대화·수식·차트·흐름도·조회 표�
     await checkMixedContent(page);
   }
   assert.deepEqual(page.logs, [], 'production 화면 콘솔에 오류가 남았다');
+  await page.eval(`document.querySelector('.home-btn').click()`);
+  await page.until(`document.querySelector('.chip')`);
+  await page.eval(`window.fetch = async () => new Response(JSON.stringify({ answer: ${JSON.stringify(CASES.validedges)} }),
+    { headers: { 'Content-Type': 'application/json' } }); document.querySelector('.chip').click()`);
+  await page.until(`document.querySelectorAll('.bubble.assistant annotation').length === ${EDGE_CASES.length} && !document.querySelector('.typing')`);
+  for (const width of [1000, 380, 320]) {
+    await page.viewport(width, 760);
+    await checkValidEdges(page);
+  }
+  assert.deepEqual(page.logs, [], 'production 정상 입력 경계 검사 콘솔에 오류가 남았다');
 });
 
 // 그림을 부르지 못하게 막는 정책(index.html의 CSP meta)은 브라우저가 그 줄을 읽은 '뒤에' 시작되는

@@ -10,6 +10,18 @@ import remarkPreserveMath, { normalizeMath, unwrapMath } from './remark-preserve
 const KATEX_OPTIONS = { strict: 'ignore', trust: false, maxSize: 10, maxExpand: 1000, throwOnError: true };
 const element = (tagName, properties, children) => ({ type: 'element', tagName, properties, children });
 const text = value => ({ type: 'text', value });
+// KaTeX의 번호는 기본적으로 절대 위치라 좁은 컨테이너에서 수식과 겹친다.
+// 생성된 HTML의 본문과 번호를 분리해 CSS가 두 영역의 실제 폭을 함께 계산하게 한다.
+function numberLayout(node) {
+  if (node.properties?.className?.includes('katex-html')) {
+    const tag = node.children.find(child => child.properties?.className?.includes('tag'));
+    if (tag) {
+      node.properties.className.push('math-numbered');
+      node.children = [element('span', { className: ['math-equation'] }, node.children.filter(child => child !== tag)), tag];
+    }
+  }
+  for (const child of node.children ?? []) numberLayout(child);
+}
 const fallback = source => element('details', { className: ['math-error', 'katex-error'] }, [
   element('summary', {}, [text('수식을 표시하지 못했습니다 · 원문 보기')]),
   element('pre', {}, [element('code', {}, [text(source)])]),
@@ -28,7 +40,9 @@ function rehypeMath() {
         try {
           // KaTeX만 만든 HTML을 HAST로 바꾼다. 모델의 HTML을 파싱하거나 trust를 켜지 않는다.
           const html = katex.renderToString(tex, { ...KATEX_OPTIONS, displayMode });
-          return fromHtmlIsomorphic(html, { fragment: true }).children;
+          const rendered = fromHtmlIsomorphic(html, { fragment: true });
+          numberLayout(rendered);
+          return rendered.children;
         } catch {
           // 모르는 명령도 붉은 원문 조각으로 조판하지 않는다. 내용은 펼쳐 확인할 수 있게 남긴다.
           return [fallback(node.properties?.['data-math-source'] ?? original)];

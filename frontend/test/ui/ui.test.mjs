@@ -22,6 +22,8 @@ import { TABLE_FORMULAS, INCOMPLETE_TABLE_FORMULAS } from '../table-math-corpus.
 import { checkLatex200 } from './latex-table-200-checks.mjs';
 import { checkMixedContent } from './mixed-content-checks.mjs';
 import { NESTED_MIXED_ANSWER, MIXED_FORMULAS } from '../mixed-content-corpus.js';
+import { VALID_EDGE_ANSWER, EDGE_CASES } from '../valid-math-edge-corpus.js';
+import { checkValidEdges } from './valid-edge-checks.mjs';
 import { CASES, TRACE, READY, ENVIRONMENT_EXAMPLES, PIE_BLOCK, PIE_LONG_NAMES, PIE_SHORT_NAMES, LONG_URL, DATA_URL, MAIL_URL, CAPPED_LABEL, ERROR_LABEL,
   STREAM_SEARCH, STREAM_SEARCH_LABEL, STREAM_SUMMARY, STREAM_PREVIEW_TEXT,
   ANCHOR_URL, ANCHOR_TEXT, ANCHOR_IMG_TEXT, NESTED_LINK, LONG_CELL, LONG_SERIES_NAMES, LONG_CATEGORY_NAMES,
@@ -2085,4 +2087,33 @@ it('복합 콘텐츠: 홈 이동 후 늦은 이전 조각·reset·완료가 새 
   await page.eval(`document.querySelector('.chart-table').open = true`);
   await checkMixedContent(page);
   assert.equal(await page.eval(`document.querySelectorAll('.row.assistant').length`), 1);
+});
+
+for (const width of [320, 1000]) it(`정상 입력 경계: ${width}px에서 78개 수식·참조 링크·중첩 구조를 전수 검증한다`, async () => {
+  await answered(width, 760, { mobile: width < 500, c: 'validedges' });
+  await checkValidEdges(page);
+  if (process.env.VALID_EDGE_SCREENSHOT_DIR) {
+    for (const index of [31, 40, 61, 76]) {
+      await page.eval(`[...document.querySelectorAll('.bubble.assistant h2')].find(e => e.textContent === '정상 예제 ${index}').scrollIntoView({ block: 'start' })`);
+      await settled();
+      const shot = await page.send('Page.captureScreenshot', { format: 'png' });
+      await writeFile(join(process.env.VALID_EDGE_SCREENSHOT_DIR, `valid-edge-${width}-${index}.png`), Buffer.from(shot.data, 'base64'));
+    }
+  }
+});
+
+it('정상 입력 경계: 참조 정의가 늦게 도착하는 스트리밍도 최종 78개 수식과 링크를 복원한다', async () => {
+  await controlledMixedStream();
+  for (let i = 0; i < VALID_EDGE_ANSWER.length; i += 411) {
+    await emitMixed(0, { type: 'answer_delta', text: VALID_EDGE_ANSWER.slice(i, i + 411) });
+    if (i % (411 * 8) === 0) {
+      await sleep(180);
+      assert.equal(await page.eval(`document.querySelector('.preview')?.textContent.includes('LLMMATHPLACEHOLDER')`), false);
+    }
+  }
+  await page.until(`document.querySelectorAll('.preview annotation').length === ${EDGE_CASES.length}`);
+  await checkValidEdges(page, '.preview');
+  await emitMixed(0, { type: 'done', answer: VALID_EDGE_ANSWER });
+  await page.until(READY.validedges);
+  await checkValidEdges(page);
 });

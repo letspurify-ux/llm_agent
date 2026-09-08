@@ -75,31 +75,38 @@ export default function remarkPreserveMath() {
   return (tree, file) => {
     const source = String(file);
     const normalized = normalizeMath(source); // 길이가 같으므로 원문 좌표가 유지된다.
-    const protectedRanges = [], noBare = [], candidates = [], contexts = [], tableRows = [], textScopes = [], tagScopes = [];
+    const protectedRanges = [], noBare = [], candidates = [], contexts = [], tableRows = [], textScopes = [], tagScopes = [], referenceEdits = [];
     const protect = (start, end) => { if (start !== undefined && end !== undefined) protectedRanges.push({ start, end }); };
-    const inspect = (node, quotes = 0, inTable = false, tableWidth = 0) => {
+    const inspect = (node, quotes = 0, inTable = false, tableWidth = 0, boundaryEnd = source.length) => {
       const [start, end] = offsets(node);
       if (node.type === 'blockquote') quotes++;
+      if (['blockquote', 'listItem', 'footnoteDefinition'].includes(node.type)) boundaryEnd = Math.min(boundaryEnd, end);
       if (node.type === 'table') { inTable = true; tableWidth = node.children[0].children.length; }
       if (node.type === 'tableRow') tableRows.push({ start, end, width: tableWidth });
       if (['paragraph', 'heading', 'tableRow'].includes(node.type)) textScopes.push({ start, end });
       if (['paragraph', 'heading', 'tableCell'].includes(node.type) && node.children?.length) {
         tagScopes.push({ start: offsets(node.children[0])[0], end: offsets(node.children.at(-1))[1], quotes });
       }
-      if (start !== undefined) contexts.push({ start, end, quotes, inTable });
+      if (start !== undefined) contexts.push({ start, end, quotes, inTable, boundaryEnd });
       if (node.type === 'code') {
         protect(start, end);
         if (MATH_LANGUAGES.has(node.lang?.toLowerCase())) candidates.push({ start, end, value: unwrapMath(node.value), display: true });
         return;
       }
-      if (['inlineCode', 'image', 'imageReference', 'definition', 'html', 'footnoteReference', 'linkReference'].includes(node.type)) { protect(start, end); return; }
-      if (node.type === 'link') {
+      if (['inlineCode', 'image', 'imageReference', 'definition', 'html', 'footnoteReference'].includes(node.type)) { protect(start, end); return; }
+      if (node.type === 'link' || node.type === 'linkReference') {
         if (source[start] !== '[') { protect(start, end); return; }
         const [labelStart] = offsets(node.children[0] ?? {});
         const [, labelEnd] = offsets(node.children.at(-1) ?? {});
         if (labelStart === undefined) { protect(start, end); return; }
         protect(start, labelStart); protect(labelEnd, end);
         noBare.push({ start, end });
+        // 축약 참조는 표시 글자 자체가 식별자다. 수식을 임시 토큰으로 바꾸기 전에 원래
+        // 식별자를 명시한 참조로 만들어 두면 두 번째 파싱에서도 주소·제목이 유지된다.
+        if (node.type === 'linkReference' && node.referenceType !== 'full') {
+          referenceEdits.push({ start: node.referenceType === 'collapsed' ? end - 2 : end, end,
+            replacement: `[${node.identifier}]` });
+        }
       }
       if (node.type === 'math' || node.type === 'inlineMath') {
         protect(start, end);
@@ -119,7 +126,7 @@ export default function remarkPreserveMath() {
         candidates.push({ start, end, value: node.meta ? `${node.meta}\n${node.value}`.trim() : node.value, display: true });
         return;
       }
-      for (const child of node.children ?? []) inspect(child, quotes, inTable, tableWidth);
+      for (const child of node.children ?? []) inspect(child, quotes, inTable, tableWidth, boundaryEnd);
     };
     inspect(tree);
     protectedRanges.sort((a, b) => a.start - b.start);
@@ -137,14 +144,14 @@ export default function remarkPreserveMath() {
     const contextAt = start => {
       for (let i = contexts.length - 1; i >= 0; i--)
         if (contexts[i].start <= start && contexts[i].end > start) return contexts[i];
-      return { quotes: 0 };
+      return { quotes: 0, boundaryEnd: source.length };
     };
     const texAt = (start, end) => {
       if (!/[\r\n]/.test(normalized.slice(start, end))) return normalized.slice(start, end).trim();
       const { quotes } = contextAt(start);
       return normalized.slice(start, end).split(/\r\n?|\n/).map((line, i) => {
         if (!i) return line;
-        for (let q = 0; q < quotes; q++) line = line.replace(/^[ \t]{0,3}> ?/, '');
+        for (let q = 0; q < quotes; q++) line = line.replace(/^[ \t]*> ?/, '');
         return line.replace(/^[ \t]+/, '');
       }).join('\n').trim();
     };
@@ -169,7 +176,7 @@ export default function remarkPreserveMath() {
       const row = tableRows[rowIndex];
       const inRow = row && row.start <= i;
       // 표 셀은 한 물리적 행 안에 있다. 다음 행의 $를 닫는 구분자로 빌려오지 않는다.
-      const limit = inRow ? row.end : source.length;
+      const limit = Math.min(inRow ? row.end : source.length, contextAt(i).boundaryEnd);
       while (scopeIndex < textScopes.length && textScopes[scopeIndex].end <= i) scopeIndex++;
       const scope = textScopes[scopeIndex];
       let start = i, end = -1, contentStart = i, contentEnd = i, display = false, bare = false;
@@ -215,10 +222,14 @@ export default function remarkPreserveMath() {
     // 구분자 밖으로 떨어진 식 번호도 바로 앞 수식에만 연결한다.
     for (const span of candidates) {
       if (span.literal !== undefined || span.incomplete) continue;
-      const after = /^\s*/.exec(normalized.slice(span.end))?.[0].length ?? 0;
+      const limit = Math.min(contextAt(span.start).boundaryEnd, span.end + MAX_MATH_SPAN);
+      const after = normalized.slice(span.end, limit).search(/\\tag\*?\s*\{/);
+      if (after < 0) continue;
       const start = span.end + after;
+      // 같은 인용문 안의 줄바꿈은 공백이다. 다른 목록·인용문으로 넘어가 번호를 빌려오지 않는다.
+      if (texAt(span.end, start)) continue;
       const end = commandEnd(normalized, start, 'tag');
-      if (end > 0 && !intersects(start, end)) {
+      if (end > 0 && end <= limit && !intersects(start, end)) {
         span.value += ' ' + normalized.slice(start, end);
         span.end = end; span.display = true;
       }
@@ -226,28 +237,33 @@ export default function remarkPreserveMath() {
     // 식 번호 복구도 Markdown 본문 범위 안에서만 한다. 문서 전체의 줄을 대상으로 하면
     // 인용의 >·목록의 -를 수학 기호로 삼키고, 번호 목록의 1.은 산문으로 오인한다.
     // 첫 줄의 컨테이너 구분자는 AST 좌표가 제외한다. 이어지는 줄에서는 실제 인용 깊이만 벗긴다.
-    const tagged = /^([^\r\n]*[=+^_<>][^\r\n]*?)\s*\\tag\*?\{[^{}\r\n]+\}[ \t]*$/;
+    // 번호를 먼저 찾는다. 식 전체의 탐욕적 정규식은 =가 반복되는 정상 텍스트에서도 제곱 비용이 든다.
+    const tagged = /\\tag\*?[ \t]*\{[^{}\r\n]+\}[ \t]*$/;
     for (const scope of tagScopes) for (const line of normalized.slice(scope.start, scope.end).matchAll(/[^\r\n]+/g)) {
       let text = line[0];
       if (line.index > 0) for (let q = 0; q < scope.quotes; q++) text = text.replace(/^[ \t]*> ?/, '');
       text = text.replace(/^[ \t]+/, '');
       const match = tagged.exec(text);
-      if (!match) continue;
+      if (!match || !/[=+^_<>]/.test(text.slice(0, match.index))) continue;
       const start = scope.start + line.index + line[0].length - text.length, end = start + text.length;
-      const expression = match[1].replace(/\\[A-Za-z]+/g, '');
+      const expression = text.slice(0, match.index).replace(/\\[A-Za-z]+/g, '').replace(/\d+(?:\.\d*)?|\.\d+/g, '0');
       if (!cjk.test(expression) && !/[A-Za-z]{3,}|[.!?:]/.test(expression) &&
         !escapedAt(normalized, start + text.lastIndexOf('\\tag')) && !intersects(start, end) &&
         !candidates.some(span => span.start < end && span.end > start))
         candidates.push({ start, end, value: text.trim(), display: true });
     }
     if (!candidates.length) return tree;
-    candidates.sort((a, b) => a.start - b.start);
+    const edits = [...candidates, ...referenceEdits].sort((a, b) => a.start - b.start);
     let prefix = 'LLMMATHPLACEHOLDER';
     while (source.includes(prefix)) prefix += 'X';
     const placeholders = new Map();
     let masked = '', cursor = 0;
-    for (const [index, span] of candidates.entries()) {
+    for (const [index, span] of edits.entries()) {
       if (span.start < cursor) continue;
+      if (span.replacement !== undefined) {
+        masked += source.slice(cursor, span.start) + span.replacement;
+        cursor = span.end; continue;
+      }
       const placeholder = `${prefix}${index}END`;
       placeholders.set(placeholder, span);
       masked += source.slice(cursor, span.start) + placeholder;
