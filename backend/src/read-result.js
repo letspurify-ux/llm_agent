@@ -1,4 +1,5 @@
 import { MAX_RESULT_ROWS, MAX_RESULT_COLS, stripLoneSurrogates } from './constants.js';
+import { preserveColumnOmission } from './result.js';
 
 export function normalizeResultRead(d) {
   const offset = d.offset ?? 0;
@@ -30,7 +31,7 @@ export function readStoredResult(rows, request) {
   if (missing.length) throw new Error(`없는 컬럼: ${missing.join(', ')}. 사용 가능한 컬럼: ${[...names].join(', ')}`);
   return {
     rows: rows.slice(d.offset, d.offset + d.limit).map(row => d.cols.length
-      ? Object.fromEntries(d.cols.filter(c => Object.hasOwn(row, c)).map(c => [c, row[c]])) : row),
+      ? preserveColumnOmission(row, Object.fromEntries(d.cols.filter(c => Object.hasOwn(row, c)).map(c => [c, row[c]]))) : row),
     rowOffset: d.offset,
     resultRead: true,
   };

@@ -16,6 +16,11 @@
 // 그대로 두면 프런트가 설정 줄만 든 코드블록을 보여주고, 사용자는 그것이 무엇인지 알 수 없다.
 
 import { nameKey, clipText, TRUNC_MARK, ownProp } from './constants.js';
+import { columnOmissionKey } from './result.js';
+
+// 생략 안내의 출처로 판정한다. 실제 컬럼 이름이 '…'일 수 있고, 안내 이름도 행마다 다를 수 있다.
+const dataKeys = row => Object.keys(row ?? {}).filter(k => k !== columnOmissionKey(row));
+const dataValue = (row, key) => key === columnOmissionKey(row) ? undefined : ownProp(row, key);
 
 // x·y·y2 지정이 없을 때 싣는 열 수. 넓은 결과(SELECT *)를 그대로 실으면 표가 화면을 넘고, 프런트도
 // 시리즈 6개까지만 그린다.
@@ -311,7 +316,7 @@ const findColumn = (keys, name) => keys.find(k => k === name)
 // 값 열의 이름이 하나도 맞지 않으면(적지 않았거나 전부 오타) 결과의 앞 열들로 MAX_CHART_COLS까지 채운다 —
 // 이름 하나가 틀렸다고 차트를 잃는 것보다, 프런트가 숫자 열을 스스로 고르게 두는 편이 낫다. 이때도 x는
 // 반드시 넣고 열 순서는 결과의 순서를 지킨다(프런트는 이름으로 찾으므로 x의 자리는 상관없다).
-// '…'는 oracle.js normalizeCells가 잘린 컬럼 수를 적어 두는 표시 열이라 keys에서 이미 뺐다.
+// oracle.js normalizeCells가 붙인 생략 안내 열은 keys에서 이미 뺐다.
 function pickColumns(config, keys) {
   const find = names => names.map(w => findColumn(keys, w)).filter(k => k !== undefined);
   const x = find(splitNames(config.x))[0] ?? keys[0];
@@ -379,7 +384,7 @@ export function resolveChartData(answer, steps) {
     if (n === null) return note(config, 'data 참조에 실행 번호가 없습니다', indent);
     if (!Array.isArray(rows)) return note(config, `실행 ${n}의 결과가 없습니다`, indent);
     if (!rows.length) return note(config, `실행 ${n}의 조회 결과가 0건입니다`, indent);
-    const keys = Object.keys(rows[0]).filter(k => k !== '…');
+    const keys = dataKeys(rows[0]);
     if (keys.length < 2) return note(config, `실행 ${n}의 결과에 그릴 열이 부족합니다`, indent);
     if (allow <= 0) return note(config, '답변에 실을 수 있는 표의 양을 넘었습니다', indent);
 
@@ -389,7 +394,7 @@ export function resolveChartData(answer, steps) {
     let taken = 0;
     for (const r of rows) {
       if (taken >= MAX_CHART_BLOCK_ROWS) break;
-      const line = `${indent}| ${cols.map(c => cell(ownProp(r, c))).join(' | ')} |`;
+      const line = `${indent}| ${cols.map(c => cell(dataValue(r, c))).join(' | ')} |`;
       if (used + line.length + 1 > allow) break;
       table.push(line);
       used += line.length + 1;
@@ -472,7 +477,7 @@ export function resolveTableData(answer, steps) {
     if (!Array.isArray(rows)) return tableNote(`실행 ${n}의 결과가 없습니다`, indent);
     if (!rows.length) return `${indent}_실행 ${n}의 조회 결과가 0건입니다_`;
     // 열은 모든 행의 합집합이다 (llm.js rowsToMarkdownTable과 같은 이유 — 뒤 행에만 있는 열이 사라지지 않게)
-    const keys = [...new Set(rows.flatMap(r => Object.keys(r ?? {})))].filter(k => k !== '…');
+    const keys = [...new Set(rows.flatMap(dataKeys))];
     if (!keys.length) return tableNote(`실행 ${n}의 결과에 열이 없습니다`, indent);
     if (allow <= 0) return tableNote('답변에 실을 수 있는 표의 양을 넘었습니다', indent);
 
@@ -488,7 +493,7 @@ export function resolveTableData(answer, steps) {
     let taken = 0;
     for (const r of rows) {
       if (taken >= limit) break;
-      const line = `${indent}| ${cols.map(c => tableCell(ownProp(r, c))).join(' | ')} |`;
+      const line = `${indent}| ${cols.map(c => tableCell(dataValue(r, c))).join(' | ')} |`;
       if (used + line.length + 1 > allow) break;
       table.push(line);
       used += line.length + 1;

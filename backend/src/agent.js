@@ -9,6 +9,7 @@ import { loadQueriesByNames, loadQueriesMentionedIn, loadChunkRanges } from './d
 import { canGrow, buildItems, sameChunk, CHUNK_TARGET_LEN, CHUNK_OVERLAP } from './chunk.js';
 import { absorbKnowledge, knowledgeView } from './context-items.js';
 import { normalizeResultRead, readStoredResult } from './read-result.js';
+import { promptParams } from './prompt-values.js';
 import { runQuery } from './oracle.js';
 import { bindNames } from './sql.js';
 import { llm, renderAnswer, clipAnswer } from './llm.js';
@@ -386,7 +387,13 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
         ...(onEvent && {
           onAnswerDelta: d => emit(d?.reset ? 'answer_reset' : 'answer_delta', d?.reset ? {} : { text: d.text }),
         }),
-      }, decideFn);
+      }, async input => {
+        // 성공·오류·가드 안내 모두 params를 표시한다. 그 호출에 보인 절단 조각을 기억해야
+        // 모델이 표시를 떼고 재조회해도 '다른 파라미터'로 실행되지 않는다.
+        // 표시 변환의 실패도 decide의 기존 예외 경계에서 처리한다.
+        for (const h of input.history) clippedCopy.recordParams(h.params);
+        return decideFn(input);
+      });
     } finally {
       entry.ms = Date.now() - t0;
     }
@@ -993,6 +1000,11 @@ function cellShownBefore(text, markAt) {
 
 export function clippedCopyDetector(chat) {
   const clipped = new Set();
+  const recordValues = values => {
+    for (const v of values) {
+      if (typeof v === 'string' && v.endsWith(TRUNC_MARK)) clipped.add(v.slice(0, -TRUNC_MARK.length));
+    }
+  };
   const addFromMark = (text, markAt) => {
     for (const len of DRIVER_CLIP_LENS) {
       if (markAt >= len) clipped.add(text.slice(markAt - len, markAt));
@@ -1010,12 +1022,9 @@ export function clippedCopyDetector(chat) {
   }
   return {
     record(rows) {
-      for (const row of rows) {
-        for (const v of Object.values(row)) {
-          if (typeof v === 'string' && v.endsWith(TRUNC_MARK)) clipped.add(v.slice(0, -TRUNC_MARK.length));
-        }
-      }
+      for (const row of rows) recordValues(Object.values(row));
     },
+    recordParams: params => recordValues(promptParams(params).values),
     // oracle.js가 그대로 호출하므로 this에 기대지 않는다 (메서드를 값으로 넘긴다)
     isCopy: v => clipped.has(v),
   };

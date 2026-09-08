@@ -16,6 +16,10 @@ import { buildItems } from '../../src/chunk.js';
 import { searchKnowledge, searchQaMethods, searchQueries } from '../../src/search.js';
 import { vector } from '../fixtures/vector.js';
 import { EMBEDDING_MODEL, normalizeEmbedding } from '../../src/embedding.js';
+import { SEARCH_LIMIT } from '../../src/constants.js';
+import { buildPrompt } from '../../src/llm-openai.js';
+import { sanitizeDecision } from '../../src/llm.js';
+import { runQuery } from '../../src/oracle.js';
 
 const exec = promisify(execFile);
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -31,6 +35,35 @@ let registryStatements = [];
 // 대역이 만드는 벡터의 one-hot 위치 — 텍스트만으로 정해진다. 응답 순서가 뒤바뀌어도 어느 행의
 // 벡터인지 이 값으로 되짚을 수 있다 (embedding.js가 index로 짝짓는 것을 검증하는 근거).
 const slotOf = text => createHash('sha256').update(text).digest().readUInt16BE(0) % 1024;
+
+test('실제 DB에 등록한 보충 평면 문자의 대상 DB 이름을 검색·선택·이력에서 보존한다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  const targetName = '조회_😀'.repeat(25);
+  await conn.query('INSERT INTO target_db (db_name, connection_info) VALUES (?, ?)', [targetName, 'fixture.invalid']);
+  await conn.query('INSERT INTO query_registry (query_name, query_sql, target_db_name) VALUES (?, ?, ?)',
+    ['batch_job_status', 'SELECT 1 FROM dual WHERE :job_id IS NOT NULL', `OPS;${targetName}`]);
+  const [stored] = await conn.query('SELECT db_name, CHAR_LENGTH(db_name) AS chars FROM target_db');
+  assert.equal(stored.chars, 100);
+  assert.equal(stored.db_name, targetName);
+  const snapshots = [];
+  let turn = 0;
+  const result = await handleQuestion('등록된 대상 DB 조회', [], { deps: {
+    run: runQuery,
+    decide: async c => {
+      snapshots.push(buildPrompt(c));
+      return sanitizeDecision([
+        { action: 'search', text: 'batch_job_status', targets: ['query'] },
+        { action: 'run_query', query_name: 'batch_job_status', params: { job_id: 'BATCH001' }, target_db: targetName },
+        { action: 'answer', answer: '조회 완료' },
+      ][turn++]);
+    },
+  } });
+  assert.ok(snapshots[1].includes(`대상DB(OPS | ${targetName})`), '등록된 후보 이름이 잘렸다');
+  assert.equal(result.trace[1].error, undefined);
+  assert.equal(result.trace[1].targetDb, targetName);
+  assert.equal(result.trace[1].rows[0].JOB_ID, 'BATCH001');
+  assert.ok(snapshots[2].includes(`@${targetName} params=`));
+});
 
 before(async () => {
   // 기존 서버·.env의 DB는 사용하지 않는다. TCP도 열지 않는 임시 DB다.
@@ -495,6 +528,45 @@ test('검증을 통과한 FP32 극단값도 DB에서 코사인 거리를 계산�
     const [r] = await conn.query('SELECT VEC_DISTANCE_COSINE(VEC_FromText(?), VEC_FromText(?)) AS d', [encoded, JSON.stringify(vector())]);
     assert.equal(typeof r.d, 'number', `값 ${value}: NULL 거리`);
     assert.ok(Number.isFinite(r.d) && Math.abs(r.d - (1 - 1 / Math.sqrt(1024))) < 0.001, `값 ${value}: 기준 벡터와의 거리 ${r.d}`);
+  }
+});
+
+test('세 소스의 실제 검색은 가까운 순서·반환 상한·관련도 문턱과 정상 0건을 지킨다', async t => {
+  await conn.query(await sqlFile('schema.sql'));
+  for (let i = 1; i <= SEARCH_LIMIT + 2; i++) {
+    await conn.query("INSERT INTO knowledge (title, content) VALUES (?, '본문')", [`검색 경계 지식 ${i}`]);
+    await conn.query("INSERT INTO qa_method (title, method) VALUES (?, '본문')", [`검색 경계 절차 ${i}`]);
+    await conn.query("INSERT INTO query_registry (query_name, query_desc, query_sql, target_db_name) VALUES (?, '본문', 'SELECT 1 FROM dual', 'DB')", [`boundary_query_${i}`]);
+  }
+  assert.equal((await syncEmbeddings()).failed, 0);
+  for (const [table, search] of [['knowledge_chunk', searchKnowledge], ['qa_method', searchQaMethods], ['query_registry', searchQueries]]) {
+    await t.test(table, async () => {
+      const text = `distance and limit ${table}`;
+      const slot = slotOf(text);
+      const atDistance = distance => {
+        const values = Array(1024).fill(0);
+        values[slot] = 1 - distance;
+        values[(slot + 1) % values.length] = Math.sqrt(1 - values[slot] ** 2);
+        return JSON.stringify(values);
+      };
+      // 후보를 역순으로 가깝게 만든다. PK 순서를 관련도 순서로 오인하지 않게 한다.
+      for (let i = 1; i <= SEARCH_LIMIT + 2; i++) {
+        await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?) WHERE seq = ?`,
+          [atDistance((SEARCH_LIMIT + 3 - i) / (SEARCH_LIMIT + 3) * 0.35), i]);
+      }
+      const ranked = await search(text);
+      assert.deepEqual(ranked.map(row => row.seq), Array.from({ length: SEARCH_LIMIT }, (_, i) => SEARCH_LIMIT + 2 - i));
+      assert.ok(ranked.every((row, i) => i === 0 || ranked[i - 1]._dist <= row._dist));
+
+      // 상한에 가려지지 않는 별도 검색으로 거리 문턱을 확인한다. FP32 반올림에
+      // 의존하지 않도록 현재 문턱(0.4)의 양쪽에 충분한 여유를 둔다.
+      await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?)`, [atDistance(1)]);
+      await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?) WHERE seq = 1`, [atDistance(0.39)]);
+      await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?) WHERE seq = 2`, [atDistance(0.41)]);
+      assert.deepEqual((await search(text)).map(row => row.seq), [1], '관련 없는 후보를 상한까지 채우면 안 된다');
+      await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?) WHERE seq = 1`, [atDistance(0.41)]);
+      assert.deepEqual(await search(text), [], '정상 검색의 무관한 자료는 검색 불가(null)가 아닌 0건이다');
+    });
   }
 });
 

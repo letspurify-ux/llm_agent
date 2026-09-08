@@ -5,8 +5,12 @@ import { knowledgeView } from '../src/context-items.js';
 import { handleQuestion, mergeFront } from '../src/agent.js';
 import { buildPrompt } from '../src/llm-openai.js';
 import { sanitizeDecision } from '../src/llm.js';
+import { runQuery } from '../src/oracle.js';
 import { normalizeResultRead, readStoredResult } from '../src/read-result.js';
 import { MAX_DOC_LEN, MAX_PROMPT_TOTAL_LEN, MAX_RESULT_ROWS, MAX_RESULT_READS, indentLines } from '../src/constants.js';
+
+// 실제 가드까지 호출하는 회귀도 조회·관리 DB에 접속하지 않는다.
+process.env.ORACLE_MOCK = '1';
 
 const ctx = over => ({ question: '비교', knowledge: [], qaMethods: [], queries: [], history: [], chat: [], ...over });
 const source = (doc = 1) => {
@@ -16,6 +20,48 @@ const source = (doc = 1) => {
 const window = (rows, from, to = from) => buildItems([
   { doc_seq: rows[0].doc_seq, rep: from, from, to, chunk_of: rows.length, dist: .3 },
 ], rows)[0];
+
+test('실행 이력의 긴 파라미터에서 생략 표시만 뗀 값으로 다시 조회하지 않는다', async t => {
+  for (const failed of [false, true]) {
+    for (const value of ['메모'.repeat(175), '가'.repeat(204) + '😀' + '나'.repeat(150)]) {
+      await t.test(`${failed ? '실패' : '성공'}한 조회 / ${value.includes('😀') ? '서로게이트 경계' : '일반 문자열'}`, async () => {
+        const query = { seq: 1, query_name: 'memo_lookup', query_sql: 'SELECT 1 FROM dual WHERE :memo IS NOT NULL', target_db_name: 'OPS' };
+        const snapshots = [];
+        const executionChecks = [];
+        let copied, turn = 0;
+        const result = await handleQuestion(value, [], { deps: {
+          search: async () => ({ queries: [query] }),
+          run: async (q, params, isCopy) => {
+            if (params.memo === value) {
+              if (failed) throw new Error('temporary query failure');
+              return { rows: [{ ID: 'found' }], totalRows: 1, targetDb: 'OPS' };
+            }
+            // 실제 실행 경계가 접속 전에 거부해야 한다. 다른 값은 허용하는지도 함께 확인한다.
+            executionChecks.push({ copied: isCopy(params.memo), original: isCopy(value), ordinary: isCopy('정상 입력') });
+            return runQuery(q, params, isCopy, 'OPS');
+          },
+          decide: async c => {
+            snapshots.push(buildPrompt(c));
+            switch (turn++) {
+              case 0: return { action: 'search', text: '메모 조회', targets: ['query'] };
+              case 1: return sanitizeDecision({ action: 'run_query', query_name: query.query_name, params: { memo: value } });
+              case 2: {
+                const shown = JSON.parse(/params=(\{[^\n]*\}) →/.exec(snapshots.at(-1))[1]).memo;
+                copied = shown.replace(/…\(생략\)$/, '');
+                return sanitizeDecision({ action: 'run_query', query_name: query.query_name, params: { memo: copied } });
+              }
+              default: return { action: 'answer', answer: '원본 값 확인 필요' };
+            }
+          },
+        } });
+        assert.ok(copied && copied.length < value.length, '프롬프트에서 실제로 잘린 조각을 읽어야 한다');
+        assert.deepEqual(executionChecks, [{ copied: true, original: false, ordinary: false }]);
+        assert.match(result.trace.at(-1).error, /잘린 값이라 원본과 다름/);
+        assert.equal(result.trace.at(-1).rows, undefined, '잘린 조각으로 조회한 0건 결과가 남으면 안 된다');
+      });
+    }
+  }
+});
 
 test('재검색의 판본이 달라지면 기존 ID와 근거를 지키고 새 절은 따로 보관한다', () => {
   const original = [1, 2, 3].map(n => ({ seq: n, doc_seq: 1, chunk_no: n, chunk_of: 3,

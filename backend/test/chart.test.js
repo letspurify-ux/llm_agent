@@ -3,6 +3,41 @@
 // 번호를 어긋나게 읽으면 다른 조회의 표가 '그 질문의 답'으로 그려진다.
 import { test } from 'node:test';
 import assert from 'node:assert';
+import { normalizeCells } from '../src/oracle.js';
+import { readStoredResult } from '../src/read-result.js';
+import { columnOmissionKey, withColumnOmission } from '../src/result.js';
+
+test('실제 말줄임표 컬럼은 표·차트에서 보존하고 시스템 생략 안내만 제외한다', () => {
+  for (const extra of [0, 35]) {
+    const stored = [normalizeCells({ LABEL: 'A', '…': 42, '……': 43,
+      ...Object.fromEntries(Array.from({ length: extra }, (_, i) => [`C${i}`, i])) })];
+    const omission = columnOmissionKey(stored[0]);
+    for (const selected of [[], ['LABEL', '…', '……', ...(omission ? [omission] : [])]]) {
+      const { rows } = readStoredResult(stored, { step: 1, cols: selected });
+      const table = resolveTableData('```table\nstep: 1\ncols: LABEL, …, ……\n```', [rows]);
+      assert.equal(table, '| LABEL | … | …… |\n| --- | --- | --- |\n| A | 42 | 43 |');
+      const chart = resolveChartData('```chart\ntype: bar\nx: LABEL\ny: …\ny2: ……\ndata: step 1\n```', [rows]);
+      const parsed = parseChartBlock(chart.split('\n').slice(1, -1).join('\n'));
+      assert.equal(parsed.ok, true);
+      assert.deepEqual(parsed.spec.series, [{ name: '…', axis: 'left' }, { name: '……', axis: 'right' }]);
+      assert.deepEqual(parsed.spec.rows[0].values, [42, 43]);
+      for (const out of [resolveTableData('```table\nstep: 1\n```', [rows]),
+        resolveChartData('```chart\ntype: bar\ndata: step 1\n```', [rows])]) {
+        assert.doesNotMatch(out, /컬럼 수 상한|컬럼 생략/);
+        if (omission) assert.ok(!out.includes(`| ${omission} |`), out);
+      }
+    }
+  }
+});
+
+test('행마다 안내 열 이름이 달라도 실제 컬럼에 다른 행의 생략 안내를 채우지 않는다', () => {
+  const rows = [withColumnOmission({ LABEL: 'A' }, '외 1개 컬럼 생략'), { LABEL: 'B', '…': 42 }];
+  assert.equal(resolveTableData('```table\nstep: 1\ncols: LABEL, …\n```', [rows]),
+    '| LABEL | … |\n| --- | --- |\n| A |  |\n| B | 42 |');
+  const chart = resolveChartData('```chart\ntype: bar\nx: LABEL\ny: …\ndata: step 1\n```', [[rows[1], rows[0]]]);
+  assert.match(chart, /\| B \| 42 \|\n\| A \|  \|/);
+  assert.doesNotMatch(chart, /컬럼 생략/);
+});
 
 test('표·차트 참조에서 없는 컬럼은 상속 속성이 아닌 빈칸이다', () => {
   const rows = [JSON.parse('{"LABEL":"A","__proto__":10,"constructor":20}'), { LABEL: 'B' }];
@@ -175,8 +210,8 @@ test('x·y·y2로 열을 고른다 — x는 언제나 맨 앞, 이름은 대소�
   // 값 열 이름이 하나도 맞지 않으면 앞 열들로 채운다 (프런트가 숫자 열을 고른다)
   assert.match(resolveChartData(block('type: bar\nx: month\ndata: step 1'), [rows]), /\| MONTH \| CNT \| AMT \| NOTE \|/);
   assert.match(resolveChartData(block('type: bar\ny: nope\ndata: step 1'), [rows]), /\| MONTH \| CNT \| AMT \| NOTE \|/);
-  // 넓은 결과는 MAX_CHART_COLS열까지, '…' 표시 열은 뺀다
-  const wide = [Object.fromEntries([...Array.from({ length: 12 }, (_, i) => [`C${i}`, i]), ['…', '외 5개 컬럼 생략']])];
+  // 넓은 결과는 MAX_CHART_COLS열까지, 드라이버가 붙인 생략 안내 열은 뺀다
+  const wide = [normalizeCells(Object.fromEntries(Array.from({ length: 35 }, (_, i) => [`C${i}`, i])))];
   const header = resolveChartData(block('type: bar\ndata: step 1'), [wide]).split('\n')[2];
   assert.strictEqual(header.split('|').length - 2, MAX_CHART_COLS);
   assert.ok(!header.includes('…'));

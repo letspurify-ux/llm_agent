@@ -6,8 +6,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { buildPrompt, NO_SEARCH_LEFT_NOTE, NO_QUERY_LEFT_NOTE, fewQueriesLeftNote, fewExpandsLeftNote } from '../src/llm-openai.js';
-import { normalizeChat } from '../src/agent.js';
+import { normalizeChat, clippedCopyDetector } from '../src/agent.js';
 import { normalizeCells } from '../src/oracle.js';
+import { readStoredResult } from '../src/read-result.js';
 import { MAX_PROMPT_TOTAL_LEN, MAX_PROMPT_STEP_LEN, PROMPT_FLOORS, PROMPT_CEILINGS, PROMPT_FRAME_RESERVE, MAX_EXPANDED_ITEM_LEN, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_QUESTION_LEN, MAX_CELL_LEN, MAX_RESULT_COLS, MAX_ROWS, MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_DOC_LEN, MAX_PROMPT_ITEM_LEN, TRUNC_MARK, MAX_BATCH_QUERIES, MAX_RESULT_READS } from '../src/constants.js';
 
 const big = n => 'ㄱ'.repeat(n);
@@ -55,12 +56,72 @@ test('넓은 결과의 128자 컬럼명을 자르거나 같은 접두사끼리 �
   assert.ok(json.length <= MAX_PROMPT_STEP_LEN);
 });
 
+test('실제 말줄임표 컬럼과 두 단계 생략 안내는 추가 읽기 후에도 구분된다', () => {
+  for (const total of [30, 40]) {
+    const row = normalizeCells(Object.fromEntries([['…', 42],
+      ...Array.from({ length: total - 1 }, (_, i) => [`C${i}`, '가'.repeat(200)])]));
+    for (const select of [false, true]) {
+      // 컬럼 선택이 새 행 객체를 만들 때도 상류의 생략 안내라는 사실을 유지해야 한다.
+      const cols = select ? Object.keys(row).filter(k => k !== 'C0') : undefined;
+      const view = readStoredResult([row], { step: 1, cols });
+      const prompt = buildPrompt(ctx({ history: [{ query_name: 'columns', totalRows: 1, ...view }] }));
+      const [shown] = JSON.parse(lastRowsJson(prompt));
+      assert.equal(shown['…'], 42, `total=${total}, select=${select}: 실제 값이 안내 문자열로 변했다`);
+      const notes = Object.entries(shown).filter(([k]) => k !== '…').map(([, v]) => String(v)).join(' ');
+      assert.match(notes, /컬럼 생략 \(프롬프트 길이 제한\)/);
+      if (total > MAX_RESULT_COLS) assert.match(notes, /컬럼 수 상한 30개/);
+    }
+  }
+  const row = normalizeCells({ ...wideRows(1, MAX_RESULT_COLS)[0], '…': '드라이버 상한 밖의 실제 컬럼' });
+  const [shown] = JSON.parse(lastRowsJson(buildPrompt(ctx({ history: [{ query_name: 'columns', rows: [row], totalRows: 1 }] }))));
+  assert.equal(Object.hasOwn(shown, '…'), false, '상류에서 생략된 실제 컬럼명을 안내가 차지하면 안 된다');
+  assert.match(shown['……'], /컬럼 수 상한/);
+});
+
 test('긴 바인드명도 실행 이력에서 원래 이름과 값의 짝을 유지한다', () => {
   const prefix = 'P'.repeat(127);
   const params = { [`${prefix}A`]: 'first', [`${prefix}B`]: 'second' };
   const p = buildPrompt(ctx({ history: [{ query_name: 'binds', params, rows: [], totalRows: 0 }] }));
   const shown = JSON.parse(/params=(\{[^\n]*\}) →/.exec(p)[1]);
   assert.deepEqual(shown, params);
+});
+
+test('파라미터 표시 예산에 걸려도 JSON 값 중간을 자르지 않는다', () => {
+  for (const value of ['가'.repeat(350), '\\'.repeat(350), '\u0001'.repeat(350)]) {
+    const params = { first: value, second: value, third: value, id: 'BATCH001' };
+    const prompt = buildPrompt(ctx({ history: [{ query_name: 'params', params, rows: [], totalRows: 0 }] }));
+    const shown = /params=([^\n]*) →/.exec(prompt)[1];
+    const json = /^(\{.*\})/.exec(shown)?.[1];
+    assert.ok(json, '파라미터 JSON이 중간에서 끊겼다');
+    const parsed = JSON.parse(json);
+    assert.ok(shown.length <= 500, '생략 안내까지 파라미터 예산 안이어야 한다');
+    assert.equal(parsed.id, 'BATCH001', '큰 값 뒤의 온전히 실을 수 있는 바인드도 보존한다');
+    assert.match(shown, /생략/);
+    const detector = clippedCopyDetector([]);
+    detector.recordParams(params);
+    for (const [key, v] of Object.entries(parsed)) {
+      if (key !== 'id') {
+        assert.ok(v.endsWith(TRUNC_MARK), '짧은 조각이 온전한 값으로 보이면 안 된다');
+        assert.equal(detector.isCopy(v.slice(0, -TRUNC_MARK.length)), true, '표시한 조각은 가드도 기억한다');
+      }
+    }
+    assert.equal(detector.isCopy(value), false, '원본 파라미터는 잘린 값이 아니다');
+    assert.equal(detector.isCopy('BATCH001'), false);
+    // JSON 이스케이프로 한 값도 실을 수 없었던 경우에는 가짜 절단 근거를 남기지 않는다.
+    if (!Object.hasOwn(parsed, 'first')) assert.equal(detector.isCopy(value.slice(0, 205)), false);
+  }
+});
+
+test('대상 DB 식별자는 스키마가 허용하는 보충 평면 문자도 온전히 표시한다', () => {
+  const name = '조회_😀'.repeat(25);
+  assert.equal([...name].length, 100);
+  for (const detail of [false, true]) {
+    const prompt = buildPrompt(ctx({ queries: [{ seq: 1, query_name: 'q', query_sql: 'SELECT 1 FROM dual',
+      target_db_name: `OPS;${name}`, detail, selected: detail }],
+      history: [{ query_name: 'q', targetDb: name, rows: [{ ID: 1 }], totalRows: 1 }] }));
+    assert.ok(prompt.includes(`대상DB(OPS | ${name})`), '후보 식별자가 잘렸다');
+    assert.ok(prompt.includes(`q@${name} params=`), '실행 이력의 DB 식별자가 잘렸다');
+  }
 });
 
 test('한 섹션이 아무리 길어도 프롬프트 전체가 예산을 넘지 않는다', () => {
@@ -296,8 +357,7 @@ test('두 단계의 컬럼 생략 안내가 서로를 덮어쓰지 않는다', (
   // 조립이 길이 제한으로 자르며 남기는 표시는 키가 같다 — 한 행에 둘이 겹치면 fromEntries가
   // 나중 것만 남겨 상류의 안내가 사라지고, 모델은 실제보다 훨씬 적은 수의 컬럼만 생략된 것으로
   // 읽는다. 두 주석이 나란히 막겠다고 적어둔 실패('없는 컬럼을 없다로 단정')가 바로 그것이다.
-  const row = Object.fromEntries(new Array(30).fill(0).map((_, c) => [`COL_${c}`, big(200)]));
-  row['…'] = '외 10개 컬럼 생략 (컬럼 수 상한 30개)';
+  const row = normalizeCells(Object.fromEntries(new Array(40).fill(0).map((_, c) => [`COL_${c}`, big(200)])));
   const p = buildPrompt(ctx({
     history: [{ query_name: 'q0', params: {}, rows: [row], totalRows: 1 }],
   }));

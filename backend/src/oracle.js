@@ -7,6 +7,7 @@ import { numberFromString } from './numbers.js';
 export { numberFromString } from './numbers.js';
 import { createHash } from 'node:crypto';
 import { loadTargetDb } from './db.js';
+import { withColumnOmission } from './result.js';
 import { bindNames, assertReadOnly } from './sql.js';
 import { MAX_ROWS, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK, MAX_TARGET_DB_NAME_LEN, MAX_BATCH_QUERIES, numEnv, nameKey, safeError, clipText, warnOnce, ownProp, bindValue, targetDbNames, isPlainObject } from './constants.js';
 
@@ -517,7 +518,8 @@ export function normalizeCells(row) {
   const kept = entries.slice(0, MAX_RESULT_COLS).map(([k, v]) => [k, normalizeValue(v)]);
   // 자른 사실은 행 안에 표시로 남긴다 — 조용히 자르면 모델과 사용자가 그 컬럼을 '없다'로 읽는다.
   if (entries.length > MAX_RESULT_COLS) {
-    kept.push(['…', `외 ${entries.length - MAX_RESULT_COLS}개 컬럼 생략 (컬럼 수 상한 ${MAX_RESULT_COLS}개)`]);
+    return withColumnOmission(Object.fromEntries(kept),
+      `외 ${entries.length - MAX_RESULT_COLS}개 컬럼 생략 (컬럼 수 상한 ${MAX_RESULT_COLS}개)`, entries.map(([k]) => k));
   }
   return Object.fromEntries(kept);
 }

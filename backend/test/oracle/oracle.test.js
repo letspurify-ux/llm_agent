@@ -75,6 +75,55 @@ after(async () => {
 
 const registry = query_sql => ({ query_name: 'fixture', query_sql, target_db_name: 'DISPOSABLE_ORACLE' });
 
+test('실제 Oracle의 말줄임표 컬럼 값은 보관·프롬프트·추가 읽기·표·차트에서 보존된다', async () => {
+  for (const count of [29, 39]) {
+    const columns = Array.from({ length: count }, (_, i) => `RPAD('x', 200, 'x') AS C${i}`);
+    const result = await runQuery(registry(`SELECT 42 AS "…", ${columns.join(', ')} FROM DUAL`));
+    assert.equal(result.rows[0]['…'], 42);
+    const view = readStoredResult(result.rows, { step: 1, cols: Object.keys(result.rows[0]).filter(k => k !== 'C0') });
+    const prompt = buildPrompt({ question: '생략 안내와 실제 값', chat: [], knowledge: [], qaMethods: [], queries: [],
+      history: [{ query_name: 'fixture', totalRows: 1, ...view }] });
+    const [shown] = JSON.parse(/: (\[[^\n]*\])/.exec(prompt)[1]);
+    assert.equal(shown['…'], 42);
+    const notes = Object.entries(shown).filter(([k]) => k !== '…').map(([, v]) => v).join(' ');
+    assert.match(notes, /프롬프트 길이 제한/);
+    if (count > 30) assert.match(notes, /컬럼 수 상한 30개/);
+    assert.match(resolveTableData('```table\nstep: 1\ncols: …\n```', [result.rows]), /\| 42 \|/);
+    const chart = resolveChartData('```chart\ntype: bar\nx: C0\ny: …\ndata: step 1\n```', [result.rows]);
+    const parsed = parseChartBlock(chart.split('\n').slice(1, -1).join('\n'));
+    assert.equal(parsed.ok, true);
+    assert.deepEqual(parsed.spec.rows[0].values, [42]);
+  }
+});
+
+test('프롬프트가 자른 실행 파라미터를 복사한 실제 Oracle 재조회는 0건으로 실행되지 않는다', async () => {
+  const original = 'x'.repeat(350);
+  const q = { ...registry("SELECT 1 AS ID FROM DUAL WHERE :memo = RPAD('x', 350, 'x')"), seq: 1 };
+  assert.deepEqual((await runQuery(q, { memo: original })).rows, [{ ID: 1 }]);
+  let copied, turn = 0;
+  const result = await handleQuestion(original, [], { deps: {
+    search: async () => ({ queries: [q] }),
+    run: runQuery,
+    decide: async c => {
+      switch (turn++) {
+        case 0: return { action: 'search', text: '메모', targets: ['query'] };
+        case 1: return sanitizeDecision({ action: 'run_query', query_name: q.query_name, params: { memo: original } });
+        case 2: {
+          const shown = JSON.parse(/params=(\{[^\n]*\}) →/.exec(buildPrompt(c))[1]);
+          copied = shown.memo.replace(/…\(생략\)$/, '');
+          return sanitizeDecision({ action: 'run_query', query_name: q.query_name, params: { memo: copied } });
+        }
+        default: return { action: 'answer', answer: '원본 값 확인 필요' };
+      }
+    },
+  } });
+  assert.ok(copied.length < original.length);
+  assert.match(result.trace[2].error ?? '', /잘린 값이라 원본과 다름/);
+  assert.equal(result.trace[2].rows, undefined, '잘린 파라미터로 조회한 0건이 결과로 남았다');
+  // 원본은 여전히 적법하며, 요청별 절단 가드가 다른 요청까지 오염시키지 않는다.
+  assert.deepEqual((await runQuery(q, { memo: original })).rows, [{ ID: 1 }]);
+});
+
 test('숫자·문자열 바인드로 다른 행을 찾는 실제 Oracle 조회를 중복으로 생략하지 않는다', async () => {
   const q = { ...registry(`WITH codes AS (
     SELECT CAST('01' AS VARCHAR2(2)) AS code FROM DUAL

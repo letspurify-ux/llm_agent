@@ -131,11 +131,10 @@ export const MAX_PROMPT_TOTAL_LEN = 80_000;
 // 합계는 반드시 MAX_PROMPT_TOTAL_LEN 이하여야 한다 (아래에서 검증한다 — 이 검증이 없어서
 // 섹션 상한과 전체 상한이 조용히 어긋났다).
 export const PROMPT_FLOORS = {
-  history: 25_000,   // MAX_HISTORY_ROWS 줄이 '어떤 조합으로 오든' 각자 상한까지 차도 전부 실리는 크기(필요 23,557) —
+  history: 29_000,   // 결과·식별자·params를 각각 표시 상한으로 계산해도 MAX_HISTORY_ROWS 줄이 전부 든다 —
                      // llm-openai.js가 로드 시 검증한다. 조합을 세지 않는 이유는 그쪽 주석에 있다:
                      // 개수가 묶여 있는 것은 쿼리 결과·오류 줄(MAX_STEPS)뿐이고 검색 줄은 그렇지 않다.
-                     // 20,000이면 MAX_PROMPT_STEP_LEN을 2,000으로 낮춰야 든다(필요 18,552) — 조회 결과를 덜 보여주는
-                     // 대가라 올리는 쪽을 골랐다.
+                     // 다른 세 섹션의 기본 몫을 남긴 뒤 받을 수 있던 29,500자 안에서 보장한다.
   queries: 15_000,   // 입력 설명을 포함한 실행 명세부터 채운다. 설명이 긴 후보는 예산에 따라 생략될 수 있다.
   qaMethods: 10_000, // 항목 1,000자(MAX_PROMPT_ITEM_LEN)면 9건. 펼침 총량 MAX_EXPANDS × MAX_EXPANDED_ITEM_LEN(9,000)이 이 안에 든다.
   knowledge: 25_000, // 항목 하나가 '문서의 한 구간'이라 크기를 정하는 것은 MAX_PROMPT_ITEM_LEN이 아니라 MAX_DOC_LEN이다
@@ -458,9 +457,9 @@ export const MAX_BIND_NAME_LEN = 128;
 // 한 곳이라도 ===로 남으면 그 경로에서만 가드가 조용히 무력화된다.
 export const nameKey = s => String(s ?? '').trim().toLowerCase();
 
-// 조회대상 DB 이름 상한. target_db.db_name이 VARCHAR(100)이므로 그보다 긴 이름은 어떤 등록 DB와도
-// 대응할 수 없다.
-export const MAX_TARGET_DB_NAME_LEN = 100;
+// target_db.db_name의 VARCHAR(100)은 Unicode 문자 수다. 실행 식별자를 보존하려면
+// 프롬프트·결정·실행 경계의 UTF-16 상한은 보충 평면 문자까지 200칸이어야 한다.
+export const MAX_TARGET_DB_NAME_LEN = 200;
 
 // 조회대상 DB 목록의 단일 해석 지점.
 // query_registry.target_db_name은 ';'로 구분한 목록이다 — 'ORDER_DB' 하나면 지금까지와 똑같고,

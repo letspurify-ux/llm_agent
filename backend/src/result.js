@@ -8,6 +8,28 @@
 // totalRows는 "드라이버가 실제로 받은 건수"(oracle.js MAX_ROWS 상한 적용 후)이고,
 // rows는 그중 프롬프트·답변에 싣는 몫(agent.js MAX_RESULT_ROWS)이다. 둘은 다를 수 있다.
 // capped=true면 totalRows 자체가 상한에 걸린 값이라 실제 총 건수는 더 많을 수 있다.
+// 생략 안내도 JSON에는 컬럼으로 싣지만 실제 DB 컬럼과는 구별한다. 이름만 보고
+// 판정하면 Oracle의 유효한 컬럼 "…"를 안내로 오인해 값과 타입을 바꾼다.
+// Symbol은 요청 안에서만 쓰며 JSON·로그·사용자 출력에는 나가지 않는다.
+const COLUMN_OMISSION = Symbol('column omission');
+export const columnOmissionKey = row => row?.[COLUMN_OMISSION];
+
+export function withColumnOmission(row, message, reservedKeys = Object.keys(row), preferredKey = '…') {
+  const reserved = new Set(reservedKeys);
+  let key = preferredKey;
+  while (reserved.has(key)) key += '…';
+  Object.defineProperty(row, key, { value: message, enumerable: true, writable: true, configurable: true });
+  Object.defineProperty(row, COLUMN_OMISSION, { value: key });
+  return row;
+}
+
+// 컬럼을 골라 새 표시 행을 만들면 안내의 출처도 함께 옮긴다. 선택하지 않은 안내는 복구하지 않는다.
+export function preserveColumnOmission(source, target) {
+  const key = columnOmissionKey(source);
+  if (key !== undefined && Object.hasOwn(target, key)) Object.defineProperty(target, COLUMN_OMISSION, { value: key });
+  return target;
+}
+
 export function rowCounts(h) {
   // rows가 없는 기록(오류, 또는 오류 메시지가 비어 분기를 빠져나온 기록)에도 죽지 않아야 한다 —
   // 여기서 던지면 프롬프트 조립이 통째로 실패해 이미 조회해둔 결과까지 버려진다.

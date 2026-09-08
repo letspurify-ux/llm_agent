@@ -18,8 +18,9 @@ import {
 import { bindNames } from './sql.js';
 import { canGrow } from './chunk.js';
 import { knowledgeView } from './context-items.js';
-import { rowCounts } from './result.js';
+import { rowCounts, columnOmissionKey, withColumnOmission } from './result.js';
 import { numberFromString } from './numbers.js';
+import { clipDisplayValue, promptParams } from './prompt-values.js';
 
 // 추론 강도. 기본을 low로 두는 이유: 이 에이전트가 모델에게 요구하는 건 매 스텝 결정 JSON 하나이고,
 // 판단 근거(지식·처리방법·실행 이력)는 프롬프트에 이미 다 들어가 있다. 길게 생각할수록
@@ -956,29 +957,25 @@ function fitRows(rows, budget) {
   return rows;
 }
 
-// 생략 표시의 키. 드라이버 경계(oracle.js normalizeCells)가 컬럼 수 상한으로 자를 때 쓰는 키와
-// 같은 값이다 — 같은 행에 두 표시가 함께 들어오면 Object.fromEntries가 나중 것만 남기므로,
-// 여기서 무심코 다시 붙이면 상류의 안내가 조용히 사라지고 모델은 '프롬프트 길이 제한으로 N개'만
-// 생략된 것으로 읽는다(실제로는 두 단계에서 잘린 합계다). 없는 컬럼을 '없다'로 단정하게 만드는,
-// 두 주석이 나란히 막겠다고 적어둔 바로 그 실패다. 그래서 상류 표시를 예산 경쟁에서 빼고
-// 반드시 실은 뒤, 두 단계의 생략을 한 값에 합쳐 둘 다 남긴다.
-const OMIT_KEY = '…';
-
 // 행 하나를 예산 안으로 줄인다 — 컬럼(값) 단위로 자르고, 몇 개를 버렸는지 행 안에 남긴다
 // (JSON을 중간에서 자르지 않는 이유는 fitRows와 같다). 여기가 유계가 아니면 renderHistory의
 // '최소 1줄 보장'을 타고 행 하나가 섹션 배분 전체를 우회한다. 키·값도 표시 상한으로 자른다 —
 // 드라이버 경계가 우회된 거대 셀 하나가 '컬럼 하나는 무조건 싣는다'를 뚫으면 안 된다.
 function fitCols(row, budget) {
   const entries = Object.entries(row);
-  const upstream = entries.find(([k]) => k === OMIT_KEY)?.[1];
-  const cols = entries.filter(([k]) => k !== OMIT_KEY);
+  const omissionKey = columnOmissionKey(row);
+  const upstream = entries.find(([k]) => k === omissionKey)?.[1];
+  const cols = entries.filter(([k]) => k !== omissionKey);
   const kept = [];
   const withOmissions = () => {
     const omitted = cols.length - kept.length;
     const notes = [];
     if (omitted > 0) notes.push(`외 ${omitted}개 컬럼 생략 (프롬프트 길이 제한)`);
     if (upstream !== undefined) notes.push(String(clipDisplayValue(upstream)));
-    return Object.fromEntries(notes.length ? [...kept, [OMIT_KEY, notes.join(' / ')]] : kept);
+    const result = Object.fromEntries(kept);
+    // 상류 안내는 예산 경쟁에서 빼고 두 단계의 생략을 함께 남긴다. 기존 안내 이름은
+    // 드라이버에서 생략된 실제 컬럼명까지 피한 것이므로 그대로 유지한다.
+    return notes.length ? withColumnOmission(result, notes.join(' / '), cols.map(([k]) => k), omissionKey) : result;
   };
   for (const [k0, v0] of cols) {
     // 식별자는 자르면 다른 컬럼과 충돌하고 read_result로 다시 읽을 수도 없다.
@@ -998,32 +995,10 @@ function fitCols(row, budget) {
 // renderHistory는 최소 1줄을 반드시 실으므로, 여기가 유계가 아니면 값 하나가 섹션 배분을 통째로
 // 우회해 전체 예산(MAX_PROMPT_TOTAL_LEN)을 뚫는다 — 결정 경계(llm.js sanitizeDecision)가 이미
 // 값을 묶지만, 프롬프트 조립은 그 경계가 우회되거나 느슨해져도 스스로 유계여야 한다.
-// 값 단위로 먼저 잘라 JSON을 유효하게 유지하고(중간에서 자르면 모델이 조각을 값으로 되읽는다),
-// 여러 값의 합이 그래도 크면 전체를 한 번 더 자른다.
+// 값별 절단 뒤에는 바인드 단위로 생략한다. 같은 표시 변환을 agent의 절단 가드도 사용한다.
 function paramsJson(params) {
-  const entries = Object.entries(params || {}).map(([k, v]) => [k, clipDisplayValue(v)]);
-  return clip(JSON.stringify(Object.fromEntries(entries)), MAX_PROMPT_PARAMS_LEN);
+  return promptParams(params).text;
 }
-
-// 표시용 값 절단 — params(위)와 컬럼 절단 행(fitCols)이 같은 규칙을 쓴다.
-// 문자열은 아래 상한으로, 스칼라는 그대로(수 리터럴은 짧다), 구조는 직렬화해 같은 상한으로.
-//
-// 이름에 '표시용(Display)'을 박아 두는 이유: llm.js에도 값 절단 규칙이 하나 더 있는데 뜻이 다르다
-// (그쪽은 MAX_BIND_LEN으로 묶고 자른 값에 TRUNC_MARK를 붙여 실행 경계가 거부하게 만드는
-// '실행에 쓸 값'의 상한이다 — llm.js clipBindValue). 두 규칙이 한때 같은 이름을 쓰고 있었는데,
-// 이름이 같으면 '값을 어떻게 묶는가'를 바꾸는 변경이 한쪽에만 들어가도 아무 데서도 드러나지 않는다.
-//
-// 상한이 MAX_CELL_LEN이 아니라 그 + TRUNC_MARK 길이인 이유: 셀은 드라이버 경계
-// (oracle.js normalizeValue)에서 이미 MAX_CELL_LEN으로 묶여 있고, 잘린 셀에는 TRUNC_MARK가
-// 붙어 딱 그만큼 더 길다. 상한을 MAX_CELL_LEN으로 잡으면 '잘린 셀'만 여기서 한 번 더 잘려,
-// 모델이 보는 앞부분이 실제로 자른 앞부분과 달라진다. 그러면 그 앞부분을 옮겨 적은 바인드 값을
-// 실행 경계(oracle.js bindProblem)가 원본과 대조할 방법이 없어진다 —
-// 대조가 성립해야 '잘린 조각으로 조회해 0건을 얻고 그것을 없다고 단정하는' 실패를 막을 수 있다.
-const MAX_DISPLAY_VALUE_LEN = MAX_CELL_LEN + TRUNC_MARK.length;
-const clipDisplayValue = v =>
-  typeof v === 'string' ? clip(v, MAX_DISPLAY_VALUE_LEN)
-    : v === null || typeof v === 'number' || typeof v === 'boolean' ? v
-      : clip(JSON.stringify(v) ?? String(v), MAX_DISPLAY_VALUE_LEN);
 
 // 검색 기록 한 줄. 대상별 적중 수를 대상 이름과 함께 적는다 — 어느 대상을 아직 안 찾아봤는지가 이 줄에서 보여야
 // 다음 검색에서 그 대상을 더할 수 있다. '검색 불가'는 0건과 다른 말이다 (search.js 머리말) — 시스템 프롬프트가
@@ -1246,12 +1221,15 @@ const expandsLeftNote = n => n === 0 ? '자료 확대·복구 기회를 다 썼�
 // 결과 줄과 오류 줄 중 긴 쪽이 한 줄의 상한이다.
 function maxHistoryLineLen() {
   const over = n => 'x'.repeat(n + 1); // 상한을 넘겨 clip이 '상한 + TRUNC_MARK'까지 채우게 한다
-  const head = { query_name: over(MAX_PROMPT_QUERY_NAME_LEN), targetDb: over(MAX_TARGET_DB_NAME_LEN), params: { p: over(MAX_PROMPT_PARAMS_LEN) } };
+  const head = { query_name: over(MAX_PROMPT_QUERY_NAME_LEN), targetDb: over(MAX_TARGET_DB_NAME_LEN), params: {} };
   const rows = Array.from({ length: MAX_RESULT_ROWS }, () => ({ C: 'x'.repeat(MAX_CELL_LEN) }));
   const resultLine = historyLine({ ...head, rows, totalRows: MAX_ROWS, capped: true }, MAX_HISTORY_ROWS);
   const rowsLen = JSON.stringify(fitRows(rows, MAX_PROMPT_STEP_LEN)).length;
   const errorLine = historyLine({ ...head, error: over(MAX_PROMPT_ITEM_LEN), hint: over(MAX_PROMPT_ITEM_LEN) }, MAX_HISTORY_ROWS);
-  return Math.max(resultLine.length - rowsLen + MAX_PROMPT_STEP_LEN, errorLine.length);
+  // 긴 값 하나는 개별 절단에 먼저 걸려 params 전체 상한을 채우지 못한다.
+  // 실제 '{}'의 비용을 전체 params 몫으로 대체해야 여러 바인드의 최악도 포함한다.
+  return Math.max(resultLine.length - rowsLen + MAX_PROMPT_STEP_LEN, errorLine.length)
+    - paramsJson(head.params).length + MAX_PROMPT_PARAMS_LEN;
 }
 // 쿼리 결과·오류 줄이 아닌 나머지 모양의 상한. 이력에 오는 줄은 넷이다 — 쿼리 결과·오류(위),
 // 쿼리 모양의 안내(루프 가드·조회 상한), 검색, 본문 청구 실패. 뒤 셋은 결과도 오류도 없어 머리말과
@@ -1272,8 +1250,8 @@ function maxOtherLineLen() {
   return Math.max(
     historyLine({
       query_name: over(MAX_PROMPT_QUERY_NAME_LEN), targetDb: over(MAX_TARGET_DB_NAME_LEN),
-      params: { p: over(MAX_PROMPT_PARAMS_LEN) }, note: over(MAX_PROMPT_ITEM_LEN),
-    }, step).length,
+      params: {}, note: over(MAX_PROMPT_ITEM_LEN),
+    }, step).length - paramsJson({}).length + MAX_PROMPT_PARAMS_LEN,
     historyLine({ ...search, hits: { knowledge: MAX_ROWS, qaMethods: MAX_ROWS, queries: MAX_ROWS } }, step).length,
     historyLine({ ...search, failed: [...SEARCH_TARGETS] }, step).length,
     historyLine({ ...search, note: over(MAX_PROMPT_ITEM_LEN) }, step).length,

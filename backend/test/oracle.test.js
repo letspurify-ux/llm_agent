@@ -21,6 +21,15 @@ test('비유한 Oracle 숫자는 JSON에서 NULL로 소실되지 않는다', () 
   });
 });
 
+test('컬럼 생략 안내는 실제 말줄임표 컬럼의 값을 덮어쓰지 않는다', () => {
+  const row = Object.fromEntries([['…', 42], ['……', '원래 값'],
+    ...Array.from({ length: MAX_RESULT_COLS - 1 }, (_, i) => [`C${i}`, i])]);
+  const normalized = normalizeCells(row);
+  assert.equal(normalized['…'], 42);
+  assert.equal(normalized['……'], '원래 값');
+  assert.ok(Object.values(normalized).some(v => typeof v === 'string' && /외 1개 컬럼 생략/.test(v)));
+});
+
 test('프로토타입 멤버와 겹치는 쿼리 이름도 safe 안내로 실패한다', async () => {
   // 'constructor'가 프로토타입 체인을 타면 !gen 가드를 지나쳐 unsafe TypeError로 죽는다 —
   // 사용자에게는 일반 오류 문구, 모델에게는 드라이버 오류처럼 보여 양쪽 다 원인을 잃는다.
@@ -355,6 +364,15 @@ test('mock 생성기도 바인드명 표기에 좌우되지 않는다', async ()
 
 // --- 조회대상 DB 선택 (target_db_name의 ';' 목록) ---------------------------------
 const multi = list => ({ query_name: 'batch_job_status', query_sql: 'SELECT 1 FROM DUAL', target_db_name: list });
+
+test('스키마의 100문자 안인 대상 DB 이름은 UTF-16 길이가 길어도 실행된다', async () => {
+  const name = '😀'.repeat(100);
+  const registry = multi(`OPS;${name}`);
+  const decision = sanitizeDecision({ action: 'run_query', query_name: registry.query_name, params: {}, target_db: name });
+  assert.equal(decision.target_db, name, '정상 DB 식별자가 결정 경계에서 잘렸다');
+  assert.equal(resolveTargetDb(registry, decision.target_db), name);
+  assert.equal((await runQuery(registry, {}, undefined, decision.target_db)).targetDb, name);
+});
 
 test('긴 대상 DB 이름을 잘라 접두사가 같은 등록 DB에서 실행하지 않는다', async () => {
   const registered = 'D'.repeat(MAX_TARGET_DB_NAME_LEN);
