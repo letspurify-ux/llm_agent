@@ -175,9 +175,11 @@ export async function syncEmbeddings() {
 const STOP_CHUNKING = Symbol('stop chunking');
 async function rebuildChunks() {
   let built = 0, dropped = 0, failed = 0;
+  if (stopRequested) return { built, dropped, failed };
   // 문서 단위 해시. 컬럼 목록은 knowledge의 검색 대상과 같아야 한다 — 제목만 고친 수정도
   // 청크의 title 복사본에 반영되어야 하기 때문이다.
   const docs = await query(`SELECT seq, ${DOC_HASH_EXPR} AS h FROM knowledge`, [CHUNK_RULE]);
+  if (stopRequested) return { built, dropped, failed };
   const have = new Map(
     (await query(`SELECT doc_seq, MIN(doc_hash) AS h, MAX(doc_hash) AS max_h,
        COUNT(*) AS n, MIN(chunk_no) AS first_no, MAX(chunk_no) AS last_no,
@@ -291,9 +293,11 @@ async function doSync() {
     const rows = checkContent
       ? await query(`SELECT seq, ${hashExpr(cols)} AS h FROM ${src}`, [EMBEDDING_MODEL])
       : await query(`SELECT seq FROM ${src}`);
+    if (stopRequested) { stopped = true; break; }
     const stored = new Map(
       (await query(`SELECT seq, embed_hash FROM ${vecTable(src)}`)).map(r => [r.seq, r.embed_hash])
     );
+    if (stopRequested) { stopped = true; break; }
 
     const staleHash = new Map(); // seq → 새 해시. 본문은 아래에서 불일치한 행만 읽는다.
     for (const r of rows) {
@@ -304,6 +308,8 @@ async function doSync() {
     // 원본이 삭제된 행 정리 (stored에 남은 것 = 원본 없음). IN 절은 상한 단위로 나눈다 —
     // 대량 삭제 직후 수만 개의 플레이스홀더가 한 문장에 실리면 정리가 매 주기 실패한다 (IN_CHUNK 주석).
     for (const seqs of chunked([...stored.keys()], IN_CHUNK)) {
+      // 고아 정리도 새 쓰기다. 종료 중에는 다음 삭제 배치를 시작하지 않는다.
+      if (stopRequested) break;
       const r = await query(
         `DELETE FROM ${vecTable(src)} WHERE seq IN (${seqs.map(() => '?').join(',')})`,
         seqs
@@ -313,6 +319,8 @@ async function doSync() {
       // 요약의 존재 이유가 '진짜 고아 정리'와 '아무 일도 없던 주기'를 운영자가 구분하는 것이다.
       deleted += Number(r?.affectedRows ?? 0);
     }
+    // 마지막 소스·마지막 삭제에서도 종료를 기록하고 본문 읽기로 넘어가지 않는다.
+    if (stopRequested) { stopped = true; break; }
 
     // 변경된 행만 본문을 읽고, 같은 SELECT에서 계산한 해시를 저장한다.
     // 임베딩 중 다시 수정된 행은 검색 해시 검증에서 제외되고 다음 동기화가 이어받는다.
@@ -329,6 +337,9 @@ async function doSync() {
          FROM ${src} WHERE seq IN (${seqs.map(() => '?').join(',')})`,
         [EMBEDDING_MODEL, ...seqs]
       );
+      // 스캔 뒤 원본이 삭제되면 빈 배치라 embedStale의 반복문에 진입하지 않는다.
+      // 본문 읽기 중 받은 종료 신호는 행 유무와 무관하게 여기서 처리한다.
+      if (stopRequested) { stopped = true; break; }
       // 최초 스캔 이후 원문이 바뀔 수 있다. 저장할 해시는 실제 읽은
       // 본문과 같은 SELECT에서 계산해야 다음 동기화의 변경 감지가 정확하다.
       const stale = contentRows.map(r => ({ seq: r.seq, text: toText(cols, r), hash: r.h }));

@@ -188,6 +188,98 @@ test('벡터 저장 중 종료 요청 뒤에는 새 쓰기를 시작하지 않�
   }
 });
 
+test('변경 행이 본문 읽기 전에 삭제되어도 종료 상태를 보존하고 다음 읽기를 멈춘다', async t => {
+  for (const count of [1, 1001]) {
+    await t.test(`${count}개 변경 행`, async t => {
+      const isolated = await import(`../src/embed-sync.js?stop-empty-content-${count}`);
+      let stopped = false, afterStop = 0;
+      database(t, async sql => {
+        if (stopped) afterStop++;
+        if (sql.includes('FROM query_registry')) {
+          if (sql.includes('WHERE seq IN')) {
+            // 해시 스캔 뒤 원본이 삭제되면 읽을 본문이 없다. 이 I/O 중 종료 요청도 들어온다.
+            stopped = true;
+            isolated.requestSyncStop();
+            return [];
+          }
+          return Array.from({ length: count }, (_, i) => ({ seq: i + 1, h: 'changed' }));
+        }
+        return [];
+      });
+      t.mock.method(globalThis, 'fetch', async () => assert.fail('삭제된 원본은 임베딩하지 않는다'));
+      const result = await isolated.syncEmbeddings();
+      assert.equal(afterStop, 0, '빈 배치 뒤에도 다음 본문 읽기를 시작하지 않는다');
+      assert.equal(result.skipped, isolated.SKIP.STOPPED, '마지막 소스의 빈 배치도 종료 상태를 보존한다');
+      assert.equal(result.embedded, 0);
+      assert.equal(result.failed, 0);
+    });
+  }
+});
+
+test('청크 원문 스캔 전·도중 종료 요청은 추가 스캔을 시작하지 않는다', async t => {
+  for (const stage of ['before-scan', 'during-scan']) {
+    await t.test(stage, async t => {
+      const isolated = await import(`../src/embed-sync.js?stop-chunk-scan-${stage}`);
+      let stopped = stage === 'before-scan', afterStop = 0;
+      if (stopped) isolated.requestSyncStop();
+      database(t, async sql => {
+        if (stopped) afterStop++;
+        if (/FROM knowledge\s*$/.test(sql)) {
+          isolated.requestSyncStop();
+          stopped = true;
+        }
+        return [];
+      });
+      const result = await isolated.syncEmbeddings();
+      assert.equal(afterStop, 0);
+      assert.equal(result.skipped, isolated.SKIP.STOPPED);
+      assert.equal(result.chunksFailed, 0);
+    });
+  }
+});
+
+test('고아 벡터 스캔·삭제 중 종료 요청은 다음 DB 작업을 멈추고 남은 정리를 복구한다', async t => {
+  for (const stage of ['source-scan', 'vector-scan', 'delete-batch']) {
+    await t.test(stage, async t => {
+      const isolated = await import(`../src/embed-sync.js?stop-cleanup-${stage}`);
+      const stored = new Set(Array.from({ length: 2001 }, (_, i) => i + 1));
+      let stopped = false, afterStop = 0, deleted = 0;
+      database(t, async (sql, params) => {
+        if (stopped) afterStop++;
+        const stop = () => { stopped = true; isolated.requestSyncStop(); };
+        if (sql.includes('FROM query_registry')) {
+          if (stage === 'source-scan') stop();
+          return [];
+        }
+        if (sql.startsWith('SELECT seq, embed_hash FROM vec_query_registry')) {
+          if (stage === 'vector-scan') stop();
+          return [...stored].map(seq => ({ seq, embed_hash: 'old' }));
+        }
+        if (sql.startsWith('DELETE FROM vec_query_registry')) {
+          let affectedRows = 0;
+          for (const seq of params) if (stored.delete(seq)) affectedRows++;
+          deleted += affectedRows;
+          if (stage === 'delete-batch') stop();
+          return { affectedRows };
+        }
+        return [];
+      });
+      t.mock.method(globalThis, 'fetch', async () => assert.fail('고아 정리는 임베딩하지 않는다'));
+      const result = await isolated.syncEmbeddings();
+      assert.equal(afterStop, 0, '종료 뒤 추가 스캔이나 삭제를 시작하지 않는다');
+      assert.equal(result.skipped, isolated.SKIP.STOPPED, '마지막 소스에서도 종료 상태를 보존한다');
+      assert.equal(result.deleted, stage === 'delete-batch' ? 1000 : 0);
+      assert.equal(result.failed, 0);
+      const remaining = stored.size;
+      const recovered = await syncEmbeddings();
+      assert.equal(recovered.deleted, remaining);
+      assert.equal(stored.size, 0);
+      assert.equal(deleted, 2001);
+      assert.equal((await syncEmbeddings()).deleted, 0, '다시 실행해도 중복 정리하지 않는다');
+    });
+  }
+});
+
 test('청크 트랜잭션 중 종료 요청은 추가 쓰기를 멈추고 다음 실행이 문서 전체를 복구한다', async t => {
   const isolated = await import('../src/embed-sync.js?stop-chunk-write');
   const content = '긴 지식 문장입니다. '.repeat(700);
