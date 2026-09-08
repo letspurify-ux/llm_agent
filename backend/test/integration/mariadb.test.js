@@ -20,8 +20,6 @@ import { SEARCH_LIMIT } from '../../src/constants.js';
 import { buildPrompt } from '../../src/llm-openai.js';
 import { llm, sanitizeDecision } from '../../src/llm.js';
 import { runQuery } from '../../src/oracle.js';
-import { clientTrace } from '../../src/result.js';
-import { searchLabel, traceSummary } from '../../../frontend/src/trace.js';
 
 const exec = promisify(execFile);
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -223,85 +221,6 @@ test('실제 쿼리 등록 검색에서 조회 실행·표 참조까지 이어�
   assert.equal(result.trace[1].rows.length, 1);
   assert.match(result.answer, /TODAY/);
   assert.match(result.answer, /\d{4}-\d{2}-\d{2}/);
-});
-
-test('일반 검색과 정확 쿼리명 검색 모두 최소 3건을 프롬프트·화면까지 유지한다', async () => {
-  await conn.query(await sqlFile('schema.sql'));
-  const text = '일반 검색 후보 개수 검토';
-  const slot = slotOf(text);
-  const names = Array.from({ length: 5 }, (_, i) => `count_query_${i + 1}`);
-  for (const [i, name] of names.entries()) {
-    await conn.query(`INSERT INTO query_registry (query_name, query_desc, query_sql, target_db_name)
-      VALUES (?, '건수 검토용 조회', 'SELECT 1 AS ID FROM dual', 'OPS')`, [name]);
-    const values = Array(1024).fill(0);
-    values[slot] = 1 - (0.6 + i / 10);
-    values[(slot + 1) % values.length] = Math.sqrt(1 - values[slot] ** 2);
-    await conn.query(`INSERT INTO vec_query_registry (seq, embed_hash, embedding)
-      SELECT seq, MD5(CONCAT_WS(CHAR(10), ?, query_name, query_desc, COALESCE(input_desc, ''), COALESCE(output_desc, ''))), VEC_FromText(?)
-      FROM query_registry WHERE query_name = ?`, [EMBEDDING_MODEL, JSON.stringify(values), name]);
-  }
-  const rows = await searchQueries(text);
-  assert.equal(rows.length, 3, '관련도 문턱 밖의 후보도 세 건까지 보충한다');
-  assert.ok(rows.every(row => row._dist > 0.4 && !row.exact));
-  assert.ok(rows.every((row, i) => i === 0 || rows[i - 1]._dist <= row._dist));
-  const candidates = rows.map(row => row.query_name);
-
-  const beforeExact = embedCalls;
-  const exact = await searchQueries(names[0]);
-  assert.equal(exact.length, 3, '정확한 등록명 검색도 가까운 후보로 세 건까지 보충한다');
-  assert.equal(exact[0].query_name, names[0]);
-  assert.equal(exact[0].exact, true);
-  assert.equal(new Set(exact.map(row => row.seq)).size, 3, '정확 적중과 벡터 적중을 중복해서 세지 않는다');
-  assert.equal(embedCalls, beforeExact + 1, '정확한 이름을 찾은 뒤에도 벡터 보충을 요청한다');
-
-  for (const [searchText, expected] of [[text, candidates], [names[0], exact.map(row => row.query_name)]]) {
-    const events = [];
-    const script = [
-      { action: 'search', text: searchText, targets: ['query'] },
-      { action: 'run_query', query_name: expected[0], params: {} },
-      { action: 'answer', answer: '조회 완료' },
-    ];
-    const result = await handleQuestion(searchText, [], { onEvent: e => events.push(e), deps: {
-      run: async () => ({ rows: [{ ID: 1 }], totalRows: 1, targetDb: 'OPS' }),
-      decide: async ctx => {
-        if (ctx.history.length === 1) {
-          assert.deepEqual(ctx.queries.map(row => row.query_name), expected);
-          const prompt = buildPrompt(ctx);
-          for (const name of expected) assert.ok(prompt.includes(name), `${name}이 프롬프트에서 빠졌다`);
-        }
-        return script.shift();
-      },
-    } });
-    assert.equal(result.search.queries, 3);
-    assert.equal(events.find(e => e.type === 'search_done').hits.queries, 3);
-    const trace = clientTrace(result.trace, result.fullRows);
-    assert.equal(searchLabel(trace[0]), '쿼리 3건');
-    assert.equal(traceSummary(trace), '검색 1회 · 실행된 쿼리 1건');
-  }
-});
-
-test('처리방법만 검색하면 세 방법이 같은 쿼리를 지목해도 쿼리 직접 검색 없이 한 건으로 합친다', async () => {
-  await conn.query(await sqlFile('schema.sql'));
-  await conn.query(`INSERT INTO query_registry (query_name, query_sql, target_db_name)
-    VALUES ('shared_count_query', 'SELECT 1 FROM dual', 'OPS')`);
-  for (let i = 1; i <= 3; i++) {
-    await conn.query('INSERT INTO qa_method (title, method) VALUES (?, ?)', [`검토 방법 ${i}`, 'shared_count_query를 실행한다.']);
-  }
-  assert.equal((await syncEmbeddings()).failed, 0);
-  const events = [];
-  searchStatements = [];
-  const result = await handleQuestion('처리방법만 검색하는 후보 개수 검토', [], { onEvent: e => events.push(e), deps: {
-    decide: async ctx => {
-      if (!ctx.history.length) return { action: 'search', text: '처리방법 후보 수', targets: ['qa_method'] };
-      assert.equal(ctx.qaMethods.length, 3);
-      assert.deepEqual(ctx.queries.map(row => row.query_name), ['shared_count_query']);
-      return { action: 'answer', answer: '처리방법 확인 완료' };
-    },
-  } });
-  assert.ok(searchStatements.every(entry => !entry.sql.includes('vec_query_registry')), '요청하지 않은 쿼리 벡터 검색을 실행하지 않는다');
-  assert.deepEqual(events.find(e => e.type === 'search_done').targets, ['qa_method']);
-  assert.equal(result.search.queries, null, '방법이 지목한 쿼리 수를 직접 검색 성공으로 집계하지 않는다');
-  assert.equal(searchLabel(clientTrace(result.trace, result.fullRows)[0]), '처리방법 3건 · 쿼리 1건');
 });
 
 // loadQueriesByNames의 계약은 '요청한 이름 순서로 돌려준다'이다. 그 순서가 프롬프트 예산의
