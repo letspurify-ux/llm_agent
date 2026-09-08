@@ -76,12 +76,26 @@ export default function remarkPreserveMath() {
     const source = String(file);
     const normalized = normalizeMath(source); // 길이가 같으므로 원문 좌표가 유지된다.
     const protectedRanges = [], noBare = [], candidates = [], contexts = [], tableRows = [], textScopes = [], tagScopes = [], referenceEdits = [];
+    const tableSeparators = [], knownLinks = new Set(), definitions = new Map();
+    let hasDefinitions = false;
+    const contextAt = start => {
+      for (let i = contexts.length - 1; i >= 0; i--)
+        if (contexts[i].start <= start && contexts[i].end > start) return contexts[i];
+      return { quotes: 0, boundaryEnd: source.length };
+    };
     const protect = (start, end) => { if (start !== undefined && end !== undefined) protectedRanges.push({ start, end }); };
     const inspect = (node, quotes = 0, inTable = false, tableWidth = 0, boundaryEnd = source.length) => {
       const [start, end] = offsets(node);
       if (node.type === 'blockquote') quotes++;
       if (['blockquote', 'listItem', 'footnoteDefinition'].includes(node.type)) boundaryEnd = Math.min(boundaryEnd, end);
-      if (node.type === 'table') { inTable = true; tableWidth = node.children[0].children.length; }
+      if (node.type === 'table') {
+        inTable = true; tableWidth = node.children[0].children.length;
+        tableSeparators.push({ start: offsets(node.children[0])[1], end: node.children[1] ? offsets(node.children[1])[0] : end });
+      }
+      if (node.type === 'definition') {
+        hasDefinitions = true;
+        if (!definitions.has(node.identifier)) definitions.set(node.identifier, node);
+      }
       if (node.type === 'tableRow') tableRows.push({ start, end, width: tableWidth });
       if (['paragraph', 'heading', 'tableRow'].includes(node.type)) textScopes.push({ start, end });
       if (['paragraph', 'heading', 'tableCell'].includes(node.type) && node.children?.length) {
@@ -95,17 +109,19 @@ export default function remarkPreserveMath() {
       }
       if (['inlineCode', 'image', 'imageReference', 'definition', 'html', 'footnoteReference'].includes(node.type)) { protect(start, end); return; }
       if (node.type === 'link' || node.type === 'linkReference') {
+        knownLinks.add(start);
         if (source[start] !== '[') { protect(start, end); return; }
         const [labelStart] = offsets(node.children[0] ?? {});
         const [, labelEnd] = offsets(node.children.at(-1) ?? {});
         if (labelStart === undefined) { protect(start, end); return; }
         protect(start, labelStart); protect(labelEnd, end);
         noBare.push({ start, end });
-        // 축약 참조는 표시 글자 자체가 식별자다. 수식을 임시 토큰으로 바꾸기 전에 원래
-        // 식별자를 명시한 참조로 만들어 두면 두 번째 파싱에서도 주소·제목이 유지된다.
-        if (node.type === 'linkReference' && node.referenceType !== 'full') {
-          referenceEdits.push({ start: node.referenceType === 'collapsed' ? end - 2 : end, end,
-            replacement: `[${node.identifier}]` });
+        // 참조 식별자 자체의 |도 표를 나눌 수 있다. 두 번째 파싱에서는 안전한 별칭을 쓰고
+        // 그 별칭의 정의에 원래 URL·제목을 연결한다. 표시 글자는 원문에서 따로 복원한다.
+        if (node.type === 'linkReference') {
+          referenceEdits.push({ start: node.referenceType === 'shortcut' ? end
+            : node.referenceType === 'collapsed' ? end - 2 : source.indexOf(']', labelEnd) + 1,
+          end, linkStart: start, referenceId: node.identifier });
         }
       }
       if (node.type === 'math' || node.type === 'inlineMath') {
@@ -129,7 +145,40 @@ export default function remarkPreserveMath() {
       for (const child of node.children ?? []) inspect(child, quotes, inTable, tableWidth, boundaryEnd);
     };
     inspect(tree);
+    // 첫 표 파싱은 수식 안의 |에서도 셀을 나눠 링크 전체를 놓칠 수 있다. 구분 행만 같은
+    // 길이의 공백으로 바꾼 분석에서 링크 원문 좌표를 보충한다. 실제로 그릴 표는 바꾸지 않는다.
+    if (tableSeparators.length && (hasDefinitions || /\]\s*\(/.test(source))) {
+      let linkSource = '', cursor = 0;
+      for (const range of tableSeparators) {
+        linkSource += source.slice(cursor, range.start) + source.slice(range.start, range.end).replace(/[|:-]/g, ' ');
+        cursor = range.end;
+      }
+      linkSource += source.slice(cursor);
+      const collect = node => {
+        const [start, end] = offsets(node);
+        if (['link', 'linkReference'].includes(node.type) && !knownLinks.has(start) &&
+          (node.type === 'link' || definitions.has(node.identifier)) &&
+          tableRows.some(row => row.start <= start && row.end >= end)) {
+          const ctx = contextAt(start);
+          // [수식][ref]의 뒷부분만 독립된 [ref]로 읽었던 보정은 폐기한다.
+          for (let i = referenceEdits.length - 1; i >= 0; i--)
+            if (referenceEdits[i].linkStart > start && referenceEdits[i].linkStart < end) referenceEdits.splice(i, 1);
+          inspect(node, ctx.quotes, true, 0, ctx.boundaryEnd);
+          return;
+        }
+        for (const child of node.children ?? []) collect(child);
+      };
+      collect(processor.parse(linkSource));
+    }
     protectedRanges.sort((a, b) => a.start - b.start);
+    // 보충한 링크 주소가 기존 보호 범위를 포함할 수 있다. 이진 탐색의 끝 좌표도 단조롭게 유지한다.
+    let rangeCount = 0;
+    for (const range of protectedRanges) {
+      const previous = protectedRanges[rangeCount - 1];
+      if (previous && range.start <= previous.end) previous.end = Math.max(previous.end, range.end);
+      else protectedRanges[rangeCount++] = range;
+    }
+    protectedRanges.length = rangeCount;
     const firstRange = start => {
       let lo = 0, hi = protectedRanges.length;
       while (lo < hi) {
@@ -141,11 +190,6 @@ export default function remarkPreserveMath() {
     };
     const intersects = (start, end) => (firstRange(start)?.start ?? Infinity) < end;
     let rowIndex = 0, scopeIndex = 0;
-    const contextAt = start => {
-      for (let i = contexts.length - 1; i >= 0; i--)
-        if (contexts[i].start <= start && contexts[i].end > start) return contexts[i];
-      return { quotes: 0, boundaryEnd: source.length };
-    };
     const texAt = (start, end) => {
       if (!/[\r\n]/.test(normalized.slice(start, end))) return normalized.slice(start, end).trim();
       const { quotes } = contextAt(start);
@@ -255,13 +299,15 @@ export default function remarkPreserveMath() {
     if (!candidates.length) return tree;
     const edits = [...candidates, ...referenceEdits].sort((a, b) => a.start - b.start);
     let prefix = 'LLMMATHPLACEHOLDER';
-    while (source.includes(prefix)) prefix += 'X';
-    const placeholders = new Map();
+    while (source.toLowerCase().includes(prefix.toLowerCase())) prefix += 'X';
+    const placeholders = new Map(), aliases = new Map();
     let masked = '', cursor = 0;
     for (const [index, span] of edits.entries()) {
       if (span.start < cursor) continue;
-      if (span.replacement !== undefined) {
-        masked += source.slice(cursor, span.start) + span.replacement;
+      if (span.referenceId !== undefined) {
+        const alias = `${prefix}REF${index}END`.toLowerCase();
+        aliases.set(alias, { ...definitions.get(span.referenceId), identifier: alias, label: alias });
+        masked += source.slice(cursor, span.start) + `[${alias}]`;
         cursor = span.end; continue;
       }
       const placeholder = `${prefix}${index}END`;
@@ -272,11 +318,14 @@ export default function remarkPreserveMath() {
     masked += source.slice(cursor);
     // 첫 파싱은 코드·주소 경계를 제공하고, 두 번째는 수식 내부의 Markdown 문법을 보지 못한다.
     // 파서가 이 토큰을 읽으므로 표의 |·목록·인용문·빈 줄도 따로 흉내 낼 필요가 없다.
-    const result = processor.parse(masked);
+    // 정의를 앞에 둬 스트림 끝의 미완성 코드 펜스에 삼켜지지 않게 한다.
+    const declarations = [...aliases.keys()].map(alias => `[${alias}]: /`).join('\n');
+    const result = processor.parse(declarations ? declarations + '\n\n' + masked : masked);
     const pattern = new RegExp(`${prefix}\\d+END`, 'g');
     const restore = node => {
       if (!node.children) return;
       node.children = node.children.flatMap(child => {
+        if (child.type === 'definition' && aliases.has(child.identifier)) return [aliases.get(child.identifier)];
         if (child.type !== 'text') {
           restore(child);
           // 임시 토큰 때문에 새로 생긴 자동 링크는 링크가 아니다. 주소에 토큰을 남기지 않는다.

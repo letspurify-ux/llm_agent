@@ -24,6 +24,8 @@ import { checkMixedContent } from './mixed-content-checks.mjs';
 import { NESTED_MIXED_ANSWER, MIXED_FORMULAS } from '../mixed-content-corpus.js';
 import { VALID_EDGE_ANSWER, EDGE_CASES } from '../valid-math-edge-corpus.js';
 import { checkValidEdges } from './valid-edge-checks.mjs';
+import { checkTableLinks } from './table-link-checks.mjs';
+import { TABLE_LINK_ANSWER, TABLE_LINK_EXPECTED } from '../table-link-edge-corpus.js';
 import { CASES, TRACE, READY, ENVIRONMENT_EXAMPLES, PIE_BLOCK, PIE_LONG_NAMES, PIE_SHORT_NAMES, LONG_URL, DATA_URL, MAIL_URL, CAPPED_LABEL, ERROR_LABEL,
   STREAM_SEARCH, STREAM_SEARCH_LABEL, STREAM_SUMMARY, STREAM_PREVIEW_TEXT,
   ANCHOR_URL, ANCHOR_TEXT, ANCHOR_IMG_TEXT, NESTED_LINK, LONG_CELL, LONG_SERIES_NAMES, LONG_CATEGORY_NAMES,
@@ -2116,4 +2118,31 @@ it('정상 입력 경계: 참조 정의가 늦게 도착하는 스트리밍도 �
   await emitMixed(0, { type: 'done', answer: VALID_EDGE_ANSWER });
   await page.until(READY.validedges);
   await checkValidEdges(page);
+});
+
+for (const width of [320, 1000]) it(`표 링크 경계: ${width}px에서 180개 표의 수식·링크·마지막 열을 전수 검증한다`, async () => {
+  await answered(width, 760, { mobile: width < 500, c: 'tablelinks' });
+  await checkTableLinks(page);
+  if (process.env.TABLE_LINK_SCREENSHOT_DIR) {
+    await page.eval(`document.querySelectorAll('.bubble.assistant table')[110].scrollIntoView({ block: 'center' })`);
+    await settled();
+    const shot = await page.send('Page.captureScreenshot', { format: 'png' });
+    await writeFile(join(process.env.TABLE_LINK_SCREENSHOT_DIR, `table-links-${width}.png`), Buffer.from(shot.data, 'base64'));
+  }
+});
+
+it('표 링크 경계: 참조 정의와 코드 펜스가 나뉘어 오는 스트리밍에서도 링크가 유지된다', async () => {
+  await controlledMixedStream();
+  for (let i = 0; i < TABLE_LINK_ANSWER.length; i += 1701) {
+    await emitMixed(0, { type: 'answer_delta', text: TABLE_LINK_ANSWER.slice(i, i + 1701) });
+    if (i % (1701 * 5) === 0) await sleep(180);
+  }
+  await page.until(`document.querySelectorAll('.preview annotation').length === ${TABLE_LINK_EXPECTED.length}`);
+  await checkTableLinks(page, '.preview');
+  await emitMixed(0, { type: 'answer_delta', text: '\n\n```text\n코드 작성 중' });
+  await page.until(`document.querySelector('.preview')?.textContent.includes('코드 작성 중')`);
+  await checkTableLinks(page, '.preview');
+  await emitMixed(0, { type: 'done', answer: TABLE_LINK_ANSWER });
+  await page.until(READY.tablelinks);
+  await checkTableLinks(page);
 });
