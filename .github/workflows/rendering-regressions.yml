@@ -19,5 +19,11 @@ jobs:
             backend/package-lock.json
       - run: npm ci --prefix frontend
       - run: npm ci --prefix backend
+      # 한글을 대체 글리프로 재면 차트 라벨 폭과 문서 높이가 실제 화면과 달라진다.
+      - name: Install Korean fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk
+          fc-match :lang=ko
       # Hosted runner의 Chrome을 실제로 실행하며, 누락 시 검사는 실패한다.
       - run: npm --prefix frontend run test:regression

@@ -1024,7 +1024,8 @@ it('펼침(⚡ 실행된 쿼리·표로 보기)은 보던 화면을 그대로 �
   const after = await state();
   assert.ok(after.rest > 100, '펼치자 바닥으로 끌려가 패널의 끝이 보인다');
   // 바닥으로 끌려가지 않았다는 것만으로는 모자란다 — 위로 밀려 올라가도 읽던 자리는 잃는다.
-  assert.ok(Math.abs((await seen('details.trace > summary')) - before) < 6, '펼치자 패널의 머리가 화면에서 움직였다');
+  const summaryAfter = await seen('details.trace > summary');
+  assert.ok(Math.abs(summaryAfter - before) < 6, `펼치자 패널의 머리가 화면에서 움직였다 (${before} → ${summaryAfter})`);
   // '표로 보기'는 화면 안에 있는 것을 펼쳐 본다 — 보던 자리가 그대로여야 한다
   await page.eval(`document.querySelector('.md .chart-table > summary').scrollIntoView({ block: 'center' })`);
   await sleep(600);
