@@ -124,20 +124,29 @@ export async function searchQaMethods(text) {
 export async function searchQueries(text) {
   const name = String(text ?? '').trim();
   if (!name) return [];
+  let exact = [];
   let exactFailed = false;
-  // query_name의 UNIQUE 인덱스로 정확한 이름을 먼저 해석한다. 적중하면 임베딩도 필요 없다.
+  // query_name의 UNIQUE 인덱스로 정확한 이름을 먼저 해석한다. 정확 적중도 최소 개수에
+  // 포함하고, 나머지는 벡터 거리순으로 보충한다. 임베딩이 없어도 정확 적중은 보존한다.
   // VARCHAR(100)의 이름과 소문자 변형은 UTF-16 최대 200자다.
   // İ → i + 결합점처럼 문자 수도 늘 수 있으므로 코드포인트 100자로 제한하지 않는다.
   if (name.length <= 200) {
     try {
-      const exact = await loadQueriesByNames([name]);
-      if (exact.length) return exact.map(row => ({ ...row, exact: true }));
+      exact = (await loadQueriesByNames([name])).map(row => ({ ...row, exact: true }));
     } catch (e) {
       exactFailed = true;
       warnOnce('search:query-name', `exact query lookup failed: ${e.message}`);
     }
   }
-  const matches = selectMatches(await vectorSearch('query_registry', text));
+  if (exact.length && !isEmbeddingEnabled()) return exact;
+  const candidates = await vectorSearch('query_registry', text);
+  if (exact.length) {
+    // 정확 적중이 벡터 후보에도 있으면 한 번만 센다. 합친 뒤 문턱·최소 개수·상한을
+    // 적용하므로 정확 적중 1건 + 가까운 2건으로 채워지고, 보충 실패도 적중을 지우지 않는다.
+    const ids = new Set(exact.map(row => row.seq));
+    return selectMatches([...exact, ...(candidates ?? []).filter(row => !ids.has(row.seq))]).slice(0, LIMIT);
+  }
+  const matches = selectMatches(candidates);
   // 아직 임베딩되지 않은 등록명도 정확 조회로 찾을 수 있다. 그 조회가 실패했으면
   // 빈 벡터 결과만으로 정상 0건이라고 단정하지 않는다. 그래야 같은 검색을 재시도할 수 있다.
   return exactFailed && !matches?.length ? null : matches;

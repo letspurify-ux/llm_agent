@@ -186,6 +186,49 @@ test('정확한 쿼리 이름은 임베딩 없이 찾고 실행 명세를 보존
   });
 });
 
+test('정확한 쿼리명 적중도 중복을 빼고 가까운 후보로 최소 3건을 보충한다', async t => {
+  const exact = { seq: 9, query_name: 'exact_minimum', query_sql: 'SELECT 1 FROM dual' };
+  const q = (seq, distance) => ({ seq, query_name: `nearby_${seq}`, _dist: distance });
+  const cases = [
+    { name: '정확 적중이 벡터에도 있음', candidates: [{ ...exact, _dist: 0.1 }, q(1, 0.6), q(2, 0.7), q(3, 0.8)], ids: [9, 1, 2] },
+    { name: '정확 적중은 아직 미임베딩', candidates: [q(1, 0.6), q(2, 0.7), q(3, 0.8)], ids: [9, 1, 2] },
+    { name: '거리 문턱 안 후보는 유지', candidates: [q(1, 0.1), q(2, 0.2), q(3, 0.3), q(4, 0.6)], ids: [9, 1, 2, 3].slice(0, SEARCH_LIMIT) },
+    { name: '유효한 후보 자체가 부족함', candidates: [q(1, 0.6)], ids: [9, 1] },
+    { name: '보충할 후보가 없음', candidates: [], ids: [9] },
+  ];
+  for (const c of cases) await t.test(c.name, async context => {
+    let vectorReads = 0;
+    await withSearchDb(context, async sql => {
+      if (sql.includes('query_name IN')) return [exact];
+      if (sql.includes('vec_query_registry')) { vectorReads++; return c.candidates; }
+      assert.fail(sql);
+    }, async () => {
+      const rows = await searchQueries(exact.query_name);
+      assert.deepEqual(rows.map(row => row.seq), c.ids);
+      assert.equal(rows[0].exact, true);
+      assert.equal(rows[0].query_sql, exact.query_sql);
+      assert.equal(new Set(rows.map(row => row.seq)).size, rows.length);
+      assert.equal(vectorReads, 1, '정확 적중 후에도 벡터 후보를 조회한다');
+    });
+  });
+});
+
+test('정확한 쿼리는 벡터 보충이 실패해도 반환한다', async t => {
+  for (const failure of ['embedding', 'vector']) await t.test(failure, async context => {
+    const exact = { seq: 9, query_name: `exact_refill_${failure}`, query_sql: 'SELECT 1 FROM dual' };
+    await withSearchDb(context, async sql => {
+      if (sql.includes('query_name IN')) return [exact];
+      if (sql.includes('vec_query_registry')) throw new Error('fixture vector refill failure');
+      assert.fail(sql);
+    }, async () => {
+      if (failure === 'embedding') {
+        context.mock.method(globalThis, 'fetch', async () => new Response('{"error":"fixture rejection"}', { status: 400 }));
+      }
+      assert.deepEqual(await searchQueries(exact.query_name), [{ ...exact, exact: true }]);
+    });
+  });
+});
+
 test('정확한 이름이 없으면 벡터 검색으로 이어진다', async context => {
   let nameReads = 0;
   await withSearchDb(context, async sql => {
