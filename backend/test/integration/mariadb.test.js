@@ -716,6 +716,48 @@ test('DB에 등록 가능한 보충 평면 문자가 포함된 쿼리명도 임�
   } finally { process.env.EMBEDDING_URL = saved; }
 });
 
+test('벡터 후보가 충분해도 정확 쿼리명은 해당 명세 한 건만 반환하고 임베딩 장애와 무관하다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  const name = 'daily_count';
+  const sql = 'SELECT :day AS DAY FROM dual';
+  await conn.query(`INSERT INTO query_registry
+    (query_name, query_desc, query_sql, input_desc, output_desc, target_db_name)
+    VALUES (?, '일별 처리량', ?, 'day: YYYYMMDD', 'DAY: 조회 기준일', 'DB')`, [name, sql]);
+  for (let i = 1; i <= 3; i++) {
+    await conn.query(`INSERT INTO query_registry (query_name, query_desc, query_sql, target_db_name)
+      VALUES (?, '다른 처리량 조회', 'SELECT 1 FROM dual', 'DB')`, [`daily_count_other_${i}`]);
+  }
+  assert.equal((await syncEmbeddings()).failed, 0);
+  assert.ok((await searchQueries('일별 처리량 의미 검색')).length >= 3, '보충할 벡터 후보가 실제로 있어야 한다');
+
+  const savedUrl = process.env.EMBEDDING_URL;
+  const savedMode = embedMode;
+  try {
+    for (const mode of ['ok', 'down', 'unconfigured']) {
+      embedMode = mode;
+      if (mode === 'unconfigured') delete process.env.EMBEDDING_URL;
+      else process.env.EMBEDDING_URL = savedUrl;
+      const before = embedCalls;
+      searchStatements = [];
+      registryStatements = [];
+      const rows = await searchQueries(' \tDAILY_COUNT\n');
+      assert.equal(rows.length, 1, `${mode}: 정확 이름 결과에 벡터 후보를 덧붙이지 않는다`);
+      assert.equal(rows[0].query_name, name);
+      assert.equal(rows[0].query_sql, sql);
+      assert.equal(rows[0].input_desc, 'day: YYYYMMDD');
+      assert.equal(rows[0].output_desc, 'DAY: 조회 기준일');
+      assert.equal(rows[0].target_db_name, 'DB');
+      assert.equal(rows[0].exact, true);
+      assert.equal(embedCalls, before, `${mode}: 정확 조회에서 임베딩 서버를 호출했다`);
+      assert.equal(searchStatements.length, 0, `${mode}: 정확 조회에서 벡터 SQL을 실행했다`);
+      assert.equal(registryStatements.length, 1, `${mode}: UNIQUE 인덱스 조회 한 번으로 끝나야 한다`);
+    }
+  } finally {
+    if (savedUrl === undefined) delete process.env.EMBEDDING_URL; else process.env.EMBEDDING_URL = savedUrl;
+    embedMode = savedMode;
+  }
+});
+
 test('처리방법 벡터 검색은 한글 조사·짧은 이름·리터럴 기호를 해석하여 본문 순서대로 쿼리를 싣는다', async () => {
   await conn.query(await sqlFile('schema.sql'));
   // 등록 순서와 절차 순서를 반대로 둔다. '_'가 와일드카드가 되면 batch_job도 잘못 선택된다.
