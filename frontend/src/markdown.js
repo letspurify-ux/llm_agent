@@ -160,6 +160,14 @@ const unescaped = s => {
   return cur;
 };
 
+// 수식만 KaTeX가 만든 MathML로 넣을 때의 HTML 라벨 허용 조건. 모델이 작성한
+// HTML·문자 참조·Markdown 이미지가 섞인 그림은 기존 SVG 텍스트 경로를 유지한다.
+export const mermaidMathLabels = text => {
+  if (!/\b(?:flowchart|graph)\s+(?:TB|TD|BT|LR|RL)\b/.test(text) || !/\$\$[^\r\n]+?\$\$/.test(text)) return false;
+  const labels = unescaped(text.replace(/\$\$[^\r\n]+?\$\$/g, 'MATH'));
+  return !/<|&|#[A-Za-z0-9]+;|!\s*\[/.test(labels);
+};
+
 // 흐름도 원문에 그림 노드(`A@{ img: "주소" }`)가 있는가. mermaid는 이 노드의 크기를 재려고 그리는 도중에
 // 그 주소를 new Image()로 불러온다 — 사용자가 누르기도 전에, 그리고 그림이 화면에 서기도 전에 요청이
 // 나간다(실측: 같은 출처 요청 1건이 먼저 나가고, 다른 출처는 CSP에 막힌 뒤에야 멈춘다). 설정으로 끄는

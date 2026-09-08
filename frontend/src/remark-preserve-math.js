@@ -26,6 +26,9 @@ function closingAt(source, start, closing, end = source.length) {
     const c = source[i];
     if (comment) { if (c === '\n' || c === '\r') comment = false; continue; }
     if (!depth && source.startsWith(closing, i)) return i;
+    // 뒤에서 새 수식이 시작되면 그 수식의 닫는 표시를 앞 오류에 빌려주지 않는다.
+    if ((closing === '\\]' && source.startsWith('\\[', i)) ||
+      (closing === '\\)' && source.startsWith('\\(', i))) return -1;
     if (c === '%') { comment = true; continue; }
     if (SLASH.test(c)) {
       const verb = verbEnd(source, i);
@@ -76,7 +79,7 @@ export default function remarkPreserveMath() {
     const source = String(file);
     const normalized = normalizeMath(source); // 길이가 같으므로 원문 좌표가 유지된다.
     const protectedRanges = [], noBare = [], candidates = [], contexts = [], tableRows = [], textScopes = [], tagScopes = [], referenceEdits = [];
-    const tableSeparators = [], knownLinks = new Set(), definitions = new Map();
+    const tableSeparators = [], blockCodes = [], knownLinks = new Set(), definitions = new Map();
     let hasDefinitions = false;
     const contextAt = start => {
       for (let i = contexts.length - 1; i >= 0; i--)
@@ -104,10 +107,16 @@ export default function remarkPreserveMath() {
       if (start !== undefined) contexts.push({ start, end, quotes, inTable, boundaryEnd });
       if (node.type === 'code') {
         protect(start, end);
+        blockCodes.push({ start, end });
         if (MATH_LANGUAGES.has(node.lang?.toLowerCase())) candidates.push({ start, end, value: unwrapMath(node.value), display: true });
         return;
       }
       if (['inlineCode', 'image', 'imageReference', 'definition', 'html', 'footnoteReference'].includes(node.type)) { protect(start, end); return; }
+      if (node.type === 'footnoteDefinition') {
+        // 정의의 이름은 본문이 아니다. 각주 본문 속 수식은 계속 검사한다.
+        const labelEnd = source.indexOf(']:', start);
+        if (labelEnd >= start && labelEnd < end) protect(start, labelEnd + 2);
+      }
       if (node.type === 'link' || node.type === 'linkReference') {
         knownLinks.add(start);
         if (source[start] !== '[') { protect(start, end); return; }
@@ -236,7 +245,8 @@ export default function remarkPreserveMath() {
         contentStart = i + fence.length;
         contentEnd = closingAt(normalized, contentStart, fence, limit);
         if (contentEnd >= 0) { end = contentEnd + fence.length; display = true; }
-      } else if (normalized[i] === '$' && normalized[i + 1] !== '$' && normalized[i - 1] !== '$') {
+      } else if (normalized[i] === '$' && normalized[i + 1] !== '$' &&
+        (normalized[i - 1] !== '$' || candidates.at(-1)?.end === i)) {
         contentStart = i + 1;
         // 통화의 $와 다음 문단·표에 있는 수식의 $를 연결하지 않는다.
         contentEnd = closingAt(normalized, contentStart, '$', scope && scope.start <= i ? Math.min(limit, scope.end) : limit);
@@ -256,7 +266,8 @@ export default function remarkPreserveMath() {
       }
       // 시작/끝이 코드·주소 안에 있으면 제외한다. 수식에 완전히 포함된 `·[링크]는 TeX 본문이다.
       const endRange = firstRange(end - 1);
-      if (end < 0 || end > limit || (endRange && endRange.start < end && endRange.end > end) ||
+      if (end < 0 || end > limit || blockCodes.some(r => r.start > start && r.start < end) ||
+        (endRange && endRange.start < end && endRange.end > end) ||
         (bare && noBare.some(r => r.start <= start && r.end >= end))) continue;
       candidates.push({ start, end, value: texAt(contentStart, contentEnd), display });
       i = end - 1;

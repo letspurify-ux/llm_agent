@@ -366,6 +366,19 @@ test('답변 표·차트에서 잘린 칸의 앞부분도 잘린 조각으로 �
 // 들면 칸의 시작에 닿지 못해 앞부분을 하나도 넣지 못했다(실측 — 'a|'가 되풀이되는 300자 값에서 120자 조각도
 // 보이는 그대로의 표시도 통과했다). 경로·로그 메시지 같은 자유 텍스트가 정확히 그 값이고, 그것이 잘린 채 바인드로
 // 되돌아오면 0건 오답이 된다. 칸의 경계(이스케이프되지 않은 '|')에서 시작해 이스케이프를 되돌린 값으로 판정한다.
+test('문자로 저장된 br을 코드로 보호해도 잘린 조회값을 옮긴 바인드는 차단한다', async () => {
+  const { resolveTableData, MAX_TABLE_CELL_LEN } = await import('../src/chart.js');
+  const { renderAnswer } = await import('../src/llm.js');
+  for (const token of ['<br>', '<BR />', '`<br>`', String.raw`\<br>`]) {
+    const value = (token + '메모').repeat(60);
+    const answer = resolveTableData('```table\nstep: 1\n```', [[{ 메모: value }]]);
+    assert.equal(clippedCopyDetector([{ text: answer }]).isCopy(value.slice(0, MAX_TABLE_CELL_LEN)), true);
+    const clipped = value.slice(0, MAX_CELL_LEN) + TRUNC_MARK;
+    const fallback = renderAnswer({ knowledge: [], history: [{ query_name: 'q', rows: [{ 메모: clipped }] }] });
+    assert.equal(clippedCopyDetector([{ text: fallback }]).isCopy(value.slice(0, MAX_CELL_LEN)), true);
+  }
+});
+
 test('CRLF가 든 잘린 칸의 앞부분도 걸러낸다 — 칸의 개행이 글자 수를 줄이지 않는다', async () => {
   // 자유 텍스트 컬럼(장애 메모·주소·로그)은 Windows 편집기에서 들어와 줄바꿈이 CRLF인 경우가 흔하다.
   // 칸은 개행을 공백으로 바꿔 보여주는데, CRLF 두 글자를 공백 '한 칸'으로 접으면 칸에 보인 앞부분의

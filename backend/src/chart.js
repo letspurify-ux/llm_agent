@@ -47,15 +47,25 @@ function fencedBlocks(text, language) {
   let open = null;
   for (const line of text.matchAll(/([^\r\n]*)(\r\n|\r|\n|$)/g)) {
     if (!line[0]) continue;
-    const mark = /^([ \t]*)((`|~)\3{2,})(.*)$/.exec(line[1]);
+    let content = line[1];
+    if (open?.container) {
+      if (content.startsWith(open.container)) content = content.slice(open.container.length);
+      else if (content.trim() === open.container.trim()) content = '';
+      else if (content.trim()) open = null; // 목록·인용문 밖의 펜스는 별개다.
+    }
+    const mark = /^([ \t]*(?:(?:>[ \t]?|(?:[-+*]|\d+[.)])[ \t]+)[ \t]*)*)((`|~)\3{2,})(.*)$/.exec(content);
     if (!mark) continue;
     if (open) {
-      if (mark[3] === open.ch && mark[2].length >= open.fence.length && !mark[4].trim()) {
-        if (open.language === language) {
+      if (/^[ \t]*$/.test(mark[1]) && mark[3] === open.ch && mark[2].length >= open.fence.length && !mark[4].trim()) {
+        if (open.language === language || language === '*') {
           const end = line.index + line[1].length + (line[2] === '\r\n' ? 1 : 0);
-          const block = [text.slice(open.index, end), open.indent,
-            open.fence, open.ch, text.slice(open.bodyStart, line.index).replace(/(?:\r\n|\r|\n)$/, '')];
+          let body = text.slice(open.bodyStart, line.index).replace(/(?:\r\n|\r|\n)$/, '');
+          if (open.container) body = body.split(/\r\n|\r|\n/).map(value =>
+            value.startsWith(open.container) ? value.slice(open.container.length) : '').join('\n');
+          const block = [text.slice(open.index, end), open.container ? '' : open.indent,
+            open.fence, open.ch, body];
           block.index = open.index;
+          if (open.container) block.container = { first: open.indent, rest: open.container };
           blocks.push(block);
         }
         open = null;
@@ -65,8 +75,58 @@ function fencedBlocks(text, language) {
     if (mark[3] === '`' && mark[4].includes('`')) continue;
     open = { index: line.index, bodyStart: line.index + line[0].length,
       indent: mark[1], fence: mark[2], ch: mark[3], language: mark[4].trim().split(/\s+/)[0].toLowerCase() };
+    if (/[>\d.*+-]/.test(mark[1])) open.container = mark[1].replace(/(?:[-+*]|\d+[.)])([ \t]+)/g,
+      match => ' '.repeat(match.length));
+  }
+  if (open && language === '*') {
+    const block = [text.slice(open.index)];
+    block.index = open.index;
+    blocks.push(block);
   }
   return blocks;
+}
+
+// 표 셀 또는 독립 문단의 `chart<br>...` / `chart\n...`도 같은 데이터 계약이다.
+// 일반 펜스 안의 예제와 일반 인라인 코드 안의 중첩 백틱은 건드리지 않는다.
+function serializedChartBlocks(text) {
+  const protectedBlocks = fencedBlocks(text, '*');
+  const blocks = [];
+  let protectedAt = 0;
+  for (const line of text.matchAll(/[^\r\n]+/g)) {
+    while (protectedBlocks[protectedAt] && protectedBlocks[protectedAt].index + protectedBlocks[protectedAt][0].length <= line.index) protectedAt++;
+    if (protectedBlocks[protectedAt]?.index <= line.index) continue;
+    const runs = /(?:\\?`)+/g;
+    for (let mark; (mark = runs.exec(line[0]));) {
+      const fence = mark[0];
+      const end = line[0].indexOf(fence, runs.lastIndex);
+      if (end < 0) break;
+      const raw = line[0].slice(runs.lastIndex, end);
+      runs.lastIndex = end + fence.length;
+      const start = /^chart(?:(?:\\r)?\\n|\\?<br\s*\/?>)/i.exec(raw);
+      if (!start) continue;
+      const left = line[0].slice(0, mark.index), right = line[0].slice(runs.lastIndex);
+      const inCell = left.includes('|') && right.includes('|');
+      if (!inCell && (left.replace(/^\s*(?:(?:>\s*|[-+*]\s+|\d+[.)]\s+)\s*)*/, '').trim() || right.trim())) continue;
+      let body = raw.slice(start[0].length).replace(/\\\\|\\r\\n|\\n(?=[^A-Za-z]|$)|\\n(?=(?:type|title|x|y|y2|xtype|data)\s*:)|\\?<br\s*\/?>/gi,
+        match => match === '\\\\' ? match : '\n');
+      if (inCell) body = body.replace(/(\\+)\|/g, (_whole, slashes) => '\\'.repeat(Math.floor(slashes.length / 2)) + '|');
+      const block = [line[0].slice(mark.index, runs.lastIndex), '', '```', '`', body];
+      block.index = line.index + mark.index;
+      block.serialized = { inCell };
+      blocks.push(block);
+    }
+  }
+  return blocks;
+}
+
+function serializeChartReplacement(replaced, { inCell }) {
+  const match = /^```chart\n([\s\S]*?)\n```(?:\n([\s\S]*))?$/.exec(replaced);
+  const escapePipes = value => inCell ? value.replace(/(\\*)\|/g,
+    (_whole, slashes) => '\\'.repeat(slashes.length * 2 + 1) + '|') : value;
+  if (!match) return escapePipes(replaced);
+  const body = escapePipes(match[1]).replaceAll('\n', '\\n');
+  const fence = '`'.repeat(Math.max(1, ...[...body.matchAll(/`+/g)].map(m => m[0].length + 1)));
+  return fence + 'chart\\n' + body + fence + (match[2] ? (inCell ? '<br>' : '\n\n') + escapePipes(match[2]) : '');
 }
 
 // 펜스는 닫는 줄이 곧 경계지만, 그 자리에 넣는 표·안내 문장은 스스로 끝나지 않는다 — GFM 표는 빈 줄이나
@@ -108,10 +168,13 @@ function replaceBlocks(text, blocks, replace) {
     tail = piece.length >= TAIL_LEN ? piece.slice(-TAIL_LEN) : (tail + piece).slice(-TAIL_LEN);
   };
   for (const block of blocks) {
-    const replaced = replace(...block);
+    let replaced = replace(...block, block);
     push(text.slice(at, block.index));
     at = block.index + block[0].length;
     if (replaced === block[0]) { push(replaced); continue; }
+    if (block.serialized) { push(serializeChartReplacement(replaced, block.serialized)); continue; }
+    if (block.container) replaced = replaced.split('\n').map((line, i) =>
+      (i ? block.container.rest : block.container.first) + line).join('\n');
     if (!blankLineBefore(tail)) push('\n');
     push(replaced);
     BLANK_AFTER.lastIndex = at;
@@ -364,12 +427,12 @@ const note = (config, why, indent = '') => {
 // 표를 통째로 잃지는 않는다.
 export function resolveChartData(answer, steps) {
   const text = String(answer ?? '');
-  if (!/(?:```|~~~)[ \t]*chart/i.test(text)) return text;
+  if (!/(?:`|~~~)[ \t]*chart/i.test(text)) return text;
   const needsFill = body => { const b = splitBlock(body); return b.config.data !== undefined && !b.hasTable; };
-  const blocks = fencedBlocks(text, 'chart');
+  const blocks = [...fencedBlocks(text, 'chart'), ...serializedChartBlocks(text)].sort((a, b) => a.index - b.index);
   let blocksLeft = blocks.filter(m => needsFill(m[4] ?? '')).length;
   let budget = MAX_CHART_INJECT_LEN;
-  return replaceBlocks(text, blocks, (whole, indent, fence, _ch, body = '') => {
+  return replaceBlocks(text, blocks, (whole, indent, fence, _ch, body = '', sourceBlock) => {
     const { config, lines, hasTable } = splitBlock(body);
     if (config.data === undefined) return whole;
     // 표가 함께 있으면 표가 우선이다 — data 줄만 지운다 (프런트는 어차피 무시하지만, 이력으로
@@ -377,7 +440,9 @@ export function resolveChartData(answer, steps) {
     if (hasTable) return `${indent}${fence}chart\n${lines.filter(l => l.key !== 'data').map(l => l.raw).join('\n')}\n${indent}${fence}`;
     // 채울 때는 설정 줄만 남긴다 — 그 밖의 줄(설명 문장, 파이프 하나 든 줄)은 프런트가 표로 오인하거나 버린다.
     const kept = lines.filter(l => l.key && l.key !== 'data').map(l => l.raw);
-    const allow = Math.floor(budget / Math.max(1, blocksLeft--));
+    // 직렬화 개행·바깥 셀 이스케이프가 늘리는 크기도 같은 답변 예산에 포함한다.
+    const expansion = sourceBlock.serialized ? 3 : 1;
+    const allow = Math.floor(budget / Math.max(1, blocksLeft--) / expansion);
 
     const n = stepOf(config.data);
     const rows = n !== null && n >= 1 ? steps?.[n - 1] : undefined;
@@ -400,7 +465,7 @@ export function resolveChartData(answer, steps) {
       used += line.length + 1;
       taken++;
     }
-    budget -= used;
+    budget -= used * expansion;
     if (!taken) return note(config, '답변에 실을 수 있는 표의 양을 넘었습니다', indent);
     const block = `${indent}${fence}chart\n${[...kept, ...table].join('\n')}\n${indent}${fence}`;
     // 행 상한이나 예산에 걸려 다 싣지 못한 표는 그 사실을 차트 아래 밝힌다 — 그래프만 보면 그것이 전부로 읽힌다.
@@ -421,6 +486,10 @@ export const MAX_TABLE_COLS = 10;            // cols를 적지 않았을 때 싣
 export const MAX_TABLE_CELL_LEN = 120;       // 표의 칸. 프롬프트 셀 상한(200)보다 짧고 차트(60)보다 길다
 export const MAX_TABLE_INJECT_LEN = 30_000;  // 답변 하나에 채워 넣는 표의 총 글자 수 (차트 예산과 별도 — 둘 다 MAX_ANSWER_LEN 위에 얹힌다)
 
+// DB 값의 <br>는 셀 줄바꿈 문법이 아니다. 해당 토큰만 인라인 코드로 보호해
+// 일반 문자의 내용·주변 공백·나머지 Markdown 이스케이프를 그대로 유지한다.
+export const escapeTableCell = value => escapeCell(value).replace(/\\(<br\s*\/?>)/gi, '`$1`');
+
 // chart와 같은 fencedBlocks 경계 판정을 사용한다.
 const TABLE_CONFIG_RE = /^\s*(step|data|cols|limit)\s*:\s*(.*?)\s*$/i;
 
@@ -428,7 +497,7 @@ const TABLE_CONFIG_RE = /^\s*(step|data|cols|limit)\s*:\s*(.*?)\s*$/i;
 const tableCell = v => {
   if (v === null || v === undefined) return '';
   const s = typeof v === 'number' ? String(v) : marked(v, MAX_TABLE_CELL_LEN);
-  return escapeCell(s);
+  return escapeTableCell(s);
 };
 
 const tableNote = (why, indent = '') => `${indent}_표를 채우지 못했습니다: ${why}_`;
@@ -488,7 +557,7 @@ export function resolveTableData(answer, steps) {
     const limitRaw = Number.parseInt(String(config.limit ?? ''), 10);
     const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, MAX_TABLE_BLOCK_ROWS) : DEFAULT_TABLE_ROWS;
 
-    const table = [`${indent}| ${cols.map(escapeCell).join(' | ')} |`, `${indent}|${' --- |'.repeat(cols.length)}`];
+    const table = [`${indent}| ${cols.map(escapeTableCell).join(' | ')} |`, `${indent}|${' --- |'.repeat(cols.length)}`];
     let used = table[0].length + table[1].length + 2;
     let taken = 0;
     for (const r of rows) {

@@ -591,8 +591,13 @@ test('닫히지 않은 \\(·\\[가 아무리 많아도 렌더 비용이 길이�
   for (const unit of ['\\( x ', '\\[ x ']) {
     const ms = n => { const t0 = performance.now(); render(unit.repeat(n)); return performance.now() - t0; };
     ms(1000);
-    const one = Math.max(1, ms(2000));
-    const four = ms(8000);
+    // 한 번의 GC가 큰 입력 측정에만 끼면 선형 구현도 10배 이상으로 보인다.
+    // 두 크기를 번갈아 측정한 중앙값으로 같은 8배 상한을 검사한다.
+    const small = [], large = [];
+    for (let i = 0; i < 3; i++) { small.push(ms(2000)); large.push(ms(8000)); }
+    const median = values => values.sort((a, b) => a - b)[1];
+    const one = Math.max(1, median(small));
+    const four = median(large);
     assert.ok(four < one * 8, `${JSON.stringify(unit)}: 길이가 4배인데 비용이 ${(four / one).toFixed(1)}배다 (${one.toFixed(0)}ms → ${four.toFixed(0)}ms)`);
   }
   // 상한 안의 긴 수식은 그대로 조판되고, 넘는 것은 원문으로 남되 던지지 않는다 (실패 방향은 원문 쪽이다)

@@ -15,7 +15,7 @@ import { openaiDecide } from './llm-openai.js';
 import { bindNames } from './sql.js';
 import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, MAX_SEARCH_TEXT_LEN, MAX_BATCH_QUERIES, MAX_EXPANDS, MAX_DROPS, SEARCH_TARGETS, normalizeSearchTargets, normalizeItemIds, clipText, nameKey, nameIndexOf, ownProp, warnOnce, targetDbNames, isPlainObject, stripLoneSurrogates} from './constants.js';
 import { rowCounts } from './result.js';
-import { escapeCell } from './chart.js';
+import { escapeTableCell } from './chart.js';
 import { normalizeResultRead } from './read-result.js';
 
 // LLM provider 선택의 단일 해석 지점.
@@ -473,7 +473,7 @@ export function renderAnswer({ knowledge, history }) {
 // 규칙 자체는 chart.js가 갖고 이 폴백 표도 그것을 그대로 쓴다 — 사본을 두면 한쪽만 늘어난 날
 // 같은 값이 어느 표에 실렸느냐에 따라 화면에서 달라진다(그리고 그 차이는 오류를 남기지 않는다).
 // 개행을 '문자 하나에 공백 하나'로 바꾸는 것도, 강조·코드·링크 표기를 짝이 있을 때만 막는 것도 그쪽 규칙이다.
-const cell = escapeCell;
+const cell = escapeTableCell;
 
 // 컬럼은 모든 행의 합집합으로 잡는다(등장 순서 유지). 첫 행만 보면 뒤 행에만 있는 컬럼의 값이
 // 표에서 조용히 사라진다 — 드라이버가 주는 행은 보통 동종이지만, 값이 사라지는 실패는 오류를

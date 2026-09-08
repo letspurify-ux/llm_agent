@@ -3,9 +3,10 @@
 import { useEffect, useLayoutEffect, useRef, useState, useId } from 'react';
 import mermaid from 'mermaid';
 // 그림 안 링크의 주소 규칙과 그림 노드의 판정은 답변의 링크·그림과 같은 자리에 있다 (markdown.js).
-import { rawLinkTarget, mermaidLoadsImage, mermaidFetchesViaStyle } from './markdown.js';
+import { rawLinkTarget, mermaidLoadsImage, mermaidFetchesViaStyle, mermaidMathLabels } from './markdown.js';
+import { renderMathML } from './math.js';
 
-mermaid.initialize({
+const MERMAID_CONFIG = {
   startOnLoad: false,
   // 라벨의 HTML을 그대로 넣지 않는다(모델이 만든 글자가 곧 화면에 들어가는 자리다).
   securityLevel: 'strict',
@@ -25,13 +26,32 @@ mermaid.initialize({
   // 답변의 링크를 새 탭으로만 여는 이 화면의 규칙(App.jsx NewTabLink) 밖이다). 머리말의 config도
   // 같은 문을 지나므로 함께 막힌다. 지키는 키는 어느 깊이에 있든 걸러진다(flowchart.htmlLabels도).
   // 기본 목록을 이어받아 늘린다 — 통째로 다시 적으면 mermaid가 기본 목록에 키를 더한 날 그것을 조용히 잃는다.
-  secure: [...(mermaid.mermaidAPI?.defaultConfig?.secure ?? []), 'htmlLabels'],
+  secure: [...(mermaid.mermaidAPI?.defaultConfig?.secure ?? []), 'htmlLabels', 'dompurifyConfig'],
   // 문법이 틀린 그림에 mermaid가 '폭탄' 오류 SVG를 문서에 직접 끼워 넣는 것을 막는다 —
   // 그 경우는 아래에서 원문 코드로 되돌린다.
   suppressErrorRendering: true,
   theme: 'neutral',
   fontFamily: 'inherit',
-});
+};
+mermaid.initialize(MERMAID_CONFIG);
+
+// 설정은 전역이므로 설정 변경과 실제 렌더를 같은 직렬 작업으로 묶는다. 수식 라벨은
+// 본문과 같은 제한의 KaTeX가 만든 MathML만 주입한다. 모델의 HTML은 허용하지 않는다.
+let renderQueue = Promise.resolve();
+function renderDiagram(id, text) {
+  const task = renderQueue.then(() => {
+    const math = mermaidMathLabels(text);
+    const source = math ? text.replace(/\$\$([^\r\n]+?)\$\$/g,
+      (_, tex) => renderMathML(tex).replaceAll('"', "'")) : text;
+    mermaid.initialize({ ...MERMAID_CONFIG, htmlLabels: math, ...(math ? {
+      dompurifyConfig: { FORBID_TAGS: ['img', 'image', 'style', 'iframe', 'object', 'embed', 'video', 'audio', 'source', 'link'],
+        FORBID_ATTR: ['src', 'srcset', 'style'] },
+    } : {}) });
+    return mermaid.render(id, source);
+  });
+  renderQueue = task.catch(() => {});
+  return task;
+}
 
 // 라벨 글자가 이보다 작아지면 그림은 남고 글자는 사라진다 — 그 아래로는 줄이지 않는다(아래 참고).
 const MIN_LABEL_PX = 9;
@@ -53,7 +73,7 @@ export default function Mermaid({ text }) {
       return;
     }
     // 그리지 못하면(문법 오류 등) svg를 null로 둔 채 끝낸다 — 아래에서 원문을 코드로 보여준다.
-    mermaid.render(id, text).then(r => { if (alive) setSvg(r.svg); }, e => console.warn('[mermaid] render failed:', e?.message ?? e));
+    renderDiagram(id, text).then(r => { if (alive) setSvg(r.svg); }, e => console.warn('[mermaid] render failed:', e?.message ?? e));
     return () => { alive = false; };
   }, [text, id]);
   // 그림 안의 링크(`click A "주소"`)는 답변의 링크와 같은 규칙으로 연다 — 새 탭, 페이지 안 앵커만

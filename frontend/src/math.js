@@ -6,8 +6,12 @@ import 'katex/contrib/mhchem';
 import { fromHtmlIsomorphic } from 'hast-util-from-html-isomorphic';
 import { compatibleEnvironments, requiresDisplay } from './tex-environments.js';
 import remarkPreserveMath, { normalizeMath, unwrapMath } from './remark-preserve-math.js';
+import remarkSerializedMarkdown, { decodeMathEscapes } from './serialized-markdown.js';
+import remarkRichTable, { remarkProtectTableVisualizations } from './remark-rich-table.js';
 
 const KATEX_OPTIONS = { strict: 'ignore', trust: false, maxSize: 10, maxExpand: 1000, throwOnError: true };
+export const renderMathML = tex => katex.renderToString(compatibleEnvironments(normalizeMath(decodeMathEscapes(tex).trim())),
+  { ...KATEX_OPTIONS, displayMode: true, output: 'mathml' });
 const element = (tagName, properties, children) => ({ type: 'element', tagName, properties, children });
 const text = value => ({ type: 'text', value });
 // KaTeX의 번호는 기본적으로 절대 위치라 좁은 컨테이너에서 수식과 겹친다.
@@ -35,7 +39,7 @@ function rehypeMath() {
       if (classes.includes('math-inline') || classes.includes('math-display') || fence) {
         const original = (node.children ?? []).map(child => child.value ?? '').join('');
         if (node.properties?.['data-math-incomplete']) return [fallback(node.properties['data-math-source'] ?? original)];
-        const tex = compatibleEnvironments(normalizeMath(fence ? unwrapMath(original) : original));
+        const tex = compatibleEnvironments(normalizeMath(decodeMathEscapes(fence ? unwrapMath(original) : original).trim()));
         const displayMode = fence || classes.includes('math-display') || requiresDisplay(tex);
         try {
           // KaTeX만 만든 HTML을 HAST로 바꾼다. 모델의 HTML을 파싱하거나 trust를 켜지 않는다.
@@ -75,4 +79,5 @@ function rehypeMath() {
 }
 
 export const REHYPE_PLUGINS = [rehypeMath];
-export const REMARK_PLUGINS = [remarkGfm, [remarkMath, { singleDollarTextMath: false }], remarkPreserveMath];
+export const REMARK_PLUGINS = [remarkGfm, [remarkMath, { singleDollarTextMath: false }], remarkProtectTableVisualizations,
+  remarkSerializedMarkdown, remarkPreserveMath, remarkRichTable];

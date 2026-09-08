@@ -10,6 +10,7 @@ import { LATEX_200_MARKDOWN } from '../latex-table-200.js';
 import { NESTED_MIXED_ANSWER } from '../mixed-content-corpus.js';
 import { VALID_EDGE_ANSWER, EDGE_CASES } from '../valid-math-edge-corpus.js';
 import { TABLE_LINK_ANSWER, TABLE_LINK_EXPECTED } from '../table-link-edge-corpus.js';
+import { RICH_TABLE_ANSWER } from '../rich-table-corpus.js';
 
 // 원그래프 조각 수의 상한을 늘 넘겨 둔다 — '기타'로 모으는 길이 실제로 밟힌다. 정해진 목록을
 // 잘라 쓰면 상한이 목록 길이에 닿는 순간 조용히 넘지 못하게 되고(그날 '기타'는 그려지지 않는데
@@ -83,6 +84,7 @@ export const ENVIRONMENT_EXAMPLES = [
 ];
 
 export const CASES = {
+  richtable: RICH_TABLE_ANSWER,
   tablelinks: TABLE_LINK_ANSWER,
   validedges: VALID_EDGE_ANSWER,
   nestedmixed: NESTED_MIXED_ANSWER,
@@ -280,6 +282,7 @@ const 그릴차트수 = Math.min(chartFences(CASES.rich).blocks.length, MAX_CHAR
 export const 주소를_가리키는_링크 = url => JSON.stringify(`.md a[href=${JSON.stringify(url)}]`);
 
 export const READY = {
+  richtable: `document.querySelectorAll('.mermaid svg').length === 4 && document.querySelectorAll('.rich-cell figure.chart .recharts-surface').length === 2 && !document.querySelector('.typing')`,
   tablelinks: `document.querySelectorAll('.bubble.assistant annotation').length === ${TABLE_LINK_EXPECTED.length} && !document.querySelector('.typing')`,
   validedges: `document.querySelectorAll('.bubble.assistant annotation').length === ${EDGE_CASES.length} && !document.querySelector('.typing')`,
   nestedmixed: `document.querySelector('.mermaid svg') && document.querySelector('figure.chart .recharts-surface') && !document.querySelector('.typing')`,

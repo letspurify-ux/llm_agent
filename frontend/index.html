@@ -199,6 +199,10 @@
       .md table { border-collapse: collapse; margin: 8px 0; display: block; overflow-x: auto; }
       .md th, .md td { border: 1px solid var(--border); padding: 6px 12px; font-size: 13px; text-align: left; white-space: nowrap; }
       .md th { background: #f1f3fb; font-weight: 600; }
+      .md .rich-cell { white-space: normal; vertical-align: top; }
+      .md .rich-cell > p:last-child { margin-bottom: 0; }
+      .md .rich-cell > .chart, .md .rich-cell > .mermaid { width: 480px; max-width: min(480px, 72vw); }
+      .md .rich-cell > .chart-table { max-width: min(480px, 72vw); }
       .md tr:nth-child(even) td { background: #fafbfe; }
       .md code { background: #eef0fa; padding: 1px 6px; border-radius: 5px; font-size: 12.5px; }
       /* 코드블록(```). 이 규칙이 없으면 <pre> 기본값(white-space: pre)대로 한 줄을 끝까지 늘여

@@ -14,10 +14,19 @@ import { checkMixedContent } from './mixed-content-checks.mjs';
 import { checkValidEdges } from './valid-edge-checks.mjs';
 import { EDGE_CASES } from '../valid-math-edge-corpus.js';
 import { checkTableLinks } from './table-link-checks.mjs';
+import { checkRichTables } from './rich-table-checks.mjs';
 import { TABLE_LINK_EXPECTED } from '../table-link-edge-corpus.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const VITE = join(ROOT, 'node_modules/vite/bin/vite.js');
+
+test('production 교차 조합 회귀: 오류 격리·중첩 참조·각주·Mermaid 수식', { timeout: 90_000 }, async () => {
+  const { stdout } = await promisify(execFile)(process.execPath,
+    [join(ROOT, 'test/review/rendering-browser.mjs'), '--production'], { cwd: ROOT, timeout: 85_000 });
+  const result = JSON.parse(stdout);
+  assert.equal(result.pass, 20);
+  assert.equal(result.fail, 0);
+});
 
 test('production 빌드에서도 대화·수식·차트·흐름도·조회 표가 동작한다', { timeout: 90_000 }, async t => {
   const bin = await findChrome();
@@ -117,6 +126,13 @@ test('production 빌드에서도 대화·수식·차트·흐름도·조회 표�
   await page.until(`document.querySelectorAll('.bubble.assistant annotation').length === ${TABLE_LINK_EXPECTED.length} && !document.querySelector('.typing')`);
   for (const width of [1000, 320]) { await page.viewport(width, 760); await checkTableLinks(page); }
   assert.deepEqual(page.logs, [], 'production 표 링크 검사 콘솔에 오류가 남았다');
+  await page.eval(`document.querySelector('.home-btn').click()`);
+  await page.until(`document.querySelector('.chip')`);
+  await page.eval(`window.fetch = async () => new Response(JSON.stringify({ answer: ${JSON.stringify(CASES.richtable)} }),
+    { headers: { 'Content-Type': 'application/json' } }); document.querySelector('.chip').click()`);
+  await page.until(`document.querySelectorAll('.mermaid svg').length === 4 && document.querySelectorAll('.rich-cell figure.chart .recharts-surface').length === 2 && !document.querySelector('.typing')`);
+  for (const width of [1000, 320]) { await page.viewport(width, 760); await checkRichTables(page); }
+  assert.deepEqual(page.logs, [], 'production 표 셀 시각화 검사 콘솔에 오류가 남았다');
 });
 
 // 그림을 부르지 못하게 막는 정책(index.html의 CSP meta)은 브라우저가 그 줄을 읽은 '뒤에' 시작되는

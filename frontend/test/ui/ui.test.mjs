@@ -25,6 +25,7 @@ import { NESTED_MIXED_ANSWER, MIXED_FORMULAS } from '../mixed-content-corpus.js'
 import { VALID_EDGE_ANSWER, EDGE_CASES } from '../valid-math-edge-corpus.js';
 import { checkValidEdges } from './valid-edge-checks.mjs';
 import { checkTableLinks } from './table-link-checks.mjs';
+import { checkRichTables } from './rich-table-checks.mjs';
 import { TABLE_LINK_ANSWER, TABLE_LINK_EXPECTED } from '../table-link-edge-corpus.js';
 import { CASES, TRACE, READY, ENVIRONMENT_EXAMPLES, PIE_BLOCK, PIE_LONG_NAMES, PIE_SHORT_NAMES, LONG_URL, DATA_URL, MAIL_URL, CAPPED_LABEL, ERROR_LABEL,
   STREAM_SEARCH, STREAM_SEARCH_LABEL, STREAM_SUMMARY, STREAM_PREVIEW_TEXT,
@@ -162,6 +163,45 @@ const seen = sel => page.eval(`(() => { const e = document.querySelector(${JSON.
   return e ? Math.round(e.getBoundingClientRect().top) : null; })()`);
 // Chrome이 없으면 그 자리에서 건너뛴다 (before가 돈 뒤에야 알 수 있으므로 시험 안에서 판단한다)
 const it = (name, fn) => test(name, async t => { if (skip) return t.skip(skip); await fn(t); });
+
+it('표 셀의 줄바꿈·목록·Mermaid·chart와 이중 이스케이프 수식이 표시된다', async () => {
+  for (const width of [1000, 320]) {
+    await answered(width, 760, { c: 'richtable' });
+    await page.eval('document.fonts.ready.then(() => true)');
+    await checkRichTables(page);
+  }
+});
+
+it('표 셀 시각화의 스트리밍 미리보기는 자리 표시에서 실제 그림으로 바뀐다', async () => {
+  await page.viewport(380, 760);
+  await page.goto(url('richtable') + '&stream=1&gap=60', '.chip');
+  await page.eval(`document.querySelector('.chip').click()`);
+  await page.until(`document.querySelector('.preview')?.textContent.includes('표·차트를 준비하고 있습니다')`);
+  assert.equal(await page.eval(`document.querySelectorAll('.preview figure.chart, .preview .mermaid').length`), 0);
+  await page.until(READY.richtable);
+  await settled();
+  await checkRichTables(page);
+});
+
+it('Mermaid 수식을 그려도 수식·다른 라벨의 이미지가 자동 요청되지 않는다', async () => {
+  const sources = [
+    String.raw`flowchart LR
+ A["$$\text{<img src='/pixel-math.png'>}$$"] --> B[완료]`,
+    String.raw`flowchart LR
+ A["$$\frac{1}{2}$$"] --> B["<img src='/pixel-math.png'>"]`,
+    String.raw`flowchart LR
+ A["$$x^2$$"] --> B["![이미지](/pixel-math.png)"]`,
+    String.raw`flowchart LR
+ A["$$\nu+\frac12$$"] --> B[완료]`,
+  ];
+  await page.goto(url(), '.chip');
+  await page.eval(`window.fetch = async () => new Response(JSON.stringify({ answer: ${JSON.stringify(sources.map(s => '```mermaid\n' + s + '\n```').join('\n\n'))} }),
+    { headers: { 'Content-Type': 'application/json' } }); document.querySelector('.chip').click()`);
+  await page.until(`document.querySelectorAll('.mermaid svg').length === 4 && !document.querySelector('.typing')`);
+  assert.equal(await page.eval(`document.querySelectorAll('.mermaid img, .mermaid image').length`), 0);
+  assert.equal(await page.eval(`performance.getEntriesByType('resource').filter(e => e.name.includes('pixel-math')).length`), 0);
+  assert.ok(await page.eval(`document.querySelectorAll('.mermaid math').length >= 2`));
+});
 
 it('200개 수식 표: 데스크톱·모바일에서 모든 행의 원문과 실제 조판 영역을 검증한다', async () => {
   for (const width of [1000, 380]) {

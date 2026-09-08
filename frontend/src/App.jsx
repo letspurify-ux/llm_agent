@@ -76,7 +76,9 @@ function ChartTable({ text, block, withTitle = false }) {
   // 섞인 모델의 글자라 길이의 상한이 없고, 상한이 어느 갈래에만 있으면 그것은 상한이 아니다.
   const title = clip(String(block.config.title ?? '').trim(), MAX_TITLE_LEN);
   if (!md) {
-    if (block.config.data === undefined) return <pre><code>{text}</code></pre>;
+    if (block.config.data === undefined) return Object.keys(block.config).length
+      ? <p><em>{title ? `'${title}' ` : ''}차트를 그리지 못했습니다: 표시할 데이터가 없습니다</em></p>
+      : <pre><code>{text}</code></pre>;
     return <p><em>{title ? `'${title}' ` : ''}차트를 그리지 못했습니다: 조회 결과를 채우지 못했습니다</em></p>;
   }
   return (
