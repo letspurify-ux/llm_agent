@@ -7,7 +7,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { findChrome, launchChrome, chromePort, stopProcess, killOnExit, freePort, oneTab, Page, sleep } from './driver.mjs';
-import { CASES, TRACE, READY } from './fixtures.js';
+import { CASES, TRACE } from './fixtures.js';
+import { TABLE_FORMULAS, INCOMPLETE_TABLE_FORMULAS } from '../table-math-corpus.js';
+import { checkLatex200 } from './latex-table-200-checks.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const VITE = join(ROOT, 'node_modules/vite/bin/vite.js');
@@ -40,7 +42,7 @@ test('production 빌드에서도 대화·수식·차트·흐름도·조회 표�
   assert.ok(ready, 'preview 서버를 시작하지 못했다');
   chrome = launchChrome({ bin, profile });
   page = await Page.open((await oneTab(await chromePort(profile))).webSocketDebuggerUrl);
-  const reply = { answer: CASES.rich, trace: TRACE };
+  const reply = { answer: `${CASES.rich}\n\n${CASES.latex}\n\n${CASES.mixed}\n\n${CASES.tablemath}\n\n${CASES.latex200}`, trace: TRACE };
   await page.send('Page.addScriptToEvaluateOnNewDocument', { source: `
     const realFetch = window.fetch.bind(window);
     window.__requests = [];
@@ -54,8 +56,22 @@ test('production 빌드에서도 대화·수식·차트·흐름도·조회 표�
   await page.viewport(1000, 760);
   await page.goto(url, '.chip');
   await page.eval(`document.querySelector('.chip').click()`);
-  await page.until(READY.rich);
+  await page.until(`[...document.querySelectorAll('figure.chart')].filter(f => f.querySelector('.recharts-surface')).length === 4 &&
+    document.querySelector('.mermaid svg')`);
   assert.ok(await page.eval(`!!document.querySelector('.katex') && !document.querySelector('.typing')`));
+  // mhchem의 명령 등록은 부수 효과이므로 실제 배포 번들에도 남아 있어야 한다.
+  assert.ok(await page.eval(`document.querySelectorAll('.math-error').length === ${1 + INCOMPLETE_TABLE_FORMULAS.length} &&
+    [...document.querySelectorAll('annotation')].some(e => e.textContent === ${JSON.stringify(String.raw`\ce{H2O}`)}) &&
+    !document.querySelector('.bubble.assistant').innerText.includes('unsupportedExample')`));
+  const tableFormulas = await page.eval(`[...document.querySelectorAll('td annotation')].map(e => e.textContent)`);
+  assert.ok(TABLE_FORMULAS.every(tex => tableFormulas.includes(tex)), '배포 빌드에서 표의 절댓값 뒤가 잘렸다');
+  await page.eval('document.fonts.ready.then(() => true)');
+  await checkLatex200(page);
+  await page.viewport(380, 760);
+  await checkLatex200(page);
+  await page.viewport(1000, 760);
+  assert.ok(await page.eval(`![...document.querySelectorAll('.bubble.assistant .md > p')].some(e =>
+    e.innerText.includes(${JSON.stringify(String.raw`\begin{`)}))`));
   await page.eval(`document.querySelector('.trace summary').click()`);
   await page.until(`document.querySelectorAll('.trace-grid tbody tr').length > 0`);
   if (process.env.UI_SCREENSHOT) {

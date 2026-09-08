@@ -4,6 +4,9 @@
 import { MAX_PIE_SLICES, MAX_CHARTS_PER_MESSAGE, MAX_SERIES, MAX_NAME_LEN, MAX_LABEL_LEN, MAX_TITLE_LEN,
   chartFences } from '../../src/chart.js';
 import { stepLabel, searchLabel, traceSummary } from '../../src/trace.js';
+import { MATH_AUDIT_ANSWER, MATH_CORPUS, MATH_LAYOUT_CASES } from '../math-corpus.js';
+import { TABLE_MATH_ANSWER, TABLE_FORMULAS, INCOMPLETE_TABLE_FORMULAS } from '../table-math-corpus.js';
+import { LATEX_200_MARKDOWN } from '../latex-table-200.js';
 
 // 원그래프 조각 수의 상한을 늘 넘겨 둔다 — '기타'로 모으는 길이 실제로 밟힌다. 정해진 목록을
 // 잘라 쓰면 상한이 목록 길이에 닿는 순간 조용히 넘지 못하게 되고(그날 '기타'는 그려지지 않는데
@@ -66,7 +69,49 @@ const pieOf = names => ['```chart', 'type: pie', 'title: 노드별 처리 건수
 export const PIE_BLOCK = ['type: pie', 'title: 노드별 처리 건수', '| 노드 | 건수 |', '| --- | --- |',
   ...NODE_NAMES.map((n, i) => `| ${n} | ${NODE_VALUES[i]} |`)].join('\n');
 
+export const ENVIRONMENT_EXAMPLES = [
+  String.raw`설명 시작 \begin{gather}x=1\\y=2\end{gather} 설명 끝`,
+  String.raw`$\begin{split}x&=1\\&=2\end{split}$`,
+  String.raw`\begin{multiline}x+y\\=3\end{multiline}`,
+  String.raw`$$\begin{multline*}x+y\\=3\end{multline*}$$`,
+  String.raw`\begin{subequation}x&=1\\y&=2\end{subequation}`,
+  String.raw`설명 시작 \begin{flalign}x&=1\\y&=2\end{flalign} 설명 끝`,
+  String.raw`\begin{subequations}\begin{equation}x=1\tag{1a}\end{equation}\begin{equation}y=2\tag{1b}\end{equation}\end{subequations}`,
+];
+
 export const CASES = {
+  latex200: LATEX_200_MARKDOWN,
+  tablemath: TABLE_MATH_ANSWER,
+  mixed: [
+    '## 수식으로 설명한 차트',
+    String.raw`평균 **계산식**은 $\bar{x} = (x_1+x_2)/2$ 입니다.`,
+    '```chart\ntype: bar\ntitle: 관측값\n| 항목 | 값 |\n|---|---|\n| A | 2 |\n| B | 4 |\n```',
+    String.raw`\begin{gather}x_1=2\\x_2=4\end{gather}`,
+    '> 비율은 $p_i=x_i/(x_1+x_2)$ 입니다.',
+    '```chart\ntype: pie\ntitle: 구성 비율\n| 항목 | 값 |\n|---|---|\n| A | 2 |\n| B | 4 |\n```',
+    '- 계산 결과: \\[ \\bar{x}=3 \\]',
+    '```text\n\\begin{gather}원문 예시\\end{gather}\n```',
+    MATH_AUDIT_ANSWER,
+  ].join('\n\n'),
+  mathaudit: MATH_AUDIT_ANSWER,
+  latex: [
+    '### 수식 렌더링 확인',
+    String.raw`\begin{gather} x + y = 10 \\ x - y = 4 \end{gather}`,
+    String.raw`E = mc^2 \tag{1}`,
+    String.raw`$\begin{gather} x + y = 10 \\ x - y = 4 \end{gather}$`,
+    String.raw`앞 $E = mc^2 \tag{1}$ 뒤`,
+    '₩begin{gather} x + y = 10 ₩₩ x - y = 4 ₩end{gather}',
+    'E = mc^2 ₩tag{1}',
+    '₩begin{flalign} &x + y = 1 && ₩₩ &2x - y = 3 && ₩end{flalign}',
+    String.raw`$\begin{flalign*} &x + y = 1 && \\ &2x - y = 3 && \end{flalign*}$`,
+    String.raw`물은 $\ce{H2O}$ 입니다.`,
+    '₩ce{2H2 + O2 -> 2H2O}',
+    String.raw`$$\ce{SO4^2-}$$`,
+    String.raw`$$\pu{123 kJ mol-1}$$`,
+    ...ENVIRONMENT_EXAMPLES,
+    '금액 ₩100, $200',
+    '```text\nE = mc^2 \\tag{1}\n```',
+  ].join('\n\n'),
   // 글·표·차트 둘·흐름도·수식·목록이 모두 든 보통의 답변. 차트와 흐름도는 모듈을 내려받은 뒤에
   // 자리를 잡으므로, 이 답변 하나로 '뒤늦게 커지는' 상황이 실제로 만들어진다.
   rich: ['## 현황', '', `조회 결과 **${NODE_NAMES.length}개 노드**가 등록되어 있습니다.`,
@@ -229,6 +274,13 @@ const 그릴차트수 = Math.min(chartFences(CASES.rich).blocks.length, MAX_CHAR
 export const 주소를_가리키는_링크 = url => JSON.stringify(`.md a[href=${JSON.stringify(url)}]`);
 
 export const READY = {
+  latex200: `document.querySelectorAll('.katex annotation').length === 200 && !document.querySelector('.typing')`,
+  tablemath: `document.querySelectorAll('.katex annotation').length === ${TABLE_FORMULAS.length + 1} &&
+    document.querySelectorAll('.math-error').length === ${INCOMPLETE_TABLE_FORMULAS.length}`,
+  mixed: `document.querySelectorAll('.katex annotation').length === ${MATH_CORPUS.length + MATH_LAYOUT_CASES.length + 4} &&
+    [...document.querySelectorAll('figure.chart')].filter(f => f.querySelector('.recharts-surface')).length === 2`,
+  mathaudit: `document.querySelectorAll('.katex annotation').length === ${MATH_CORPUS.length + MATH_LAYOUT_CASES.length} && document.querySelectorAll('.math-error').length === 1`,
+  latex: `document.querySelectorAll('.katex-display').length === ${11 + ENVIRONMENT_EXAMPLES.length}`,
   // 차트 하나에 .recharts-surface가 하나뿐이라고 보면 안 된다 — 범례의 아이콘도 같은 클래스다.
   rich: `[...document.querySelectorAll('figure.chart')].filter(f => f.querySelector('.recharts-surface')).length === ${그릴차트수}
          && document.querySelector('.mermaid svg')`,

@@ -11,6 +11,9 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { REMARK_PLUGINS, REHYPE_PLUGINS } from '../src/math.js';
+import { compatibleEnvironments } from '../src/tex-environments.js';
+import { MATH_CORPUS, MATH_LAYOUT_CASES } from './math-corpus.js';
+import { TABLE_FORMULAS, INCOMPLETE_TABLE_FORMULAS } from './table-math-corpus.js';
 
 const render = md => renderToStaticMarkup(React.createElement(ReactMarkdown, {
   remarkPlugins: REMARK_PLUGINS,
@@ -28,6 +31,288 @@ const visible = md => render(md).replace(/<span class="katex-html"[\s\S]*?<\/ann
 const isDisplay = md => render(md).includes('katex-display');
 // href만 뽑는다 — 주소가 한 글자라도 달라지면 링크는 조용히 다른 곳을 가리킨다
 const hrefs = md => [...render(md).matchAll(/href="([^"]*)"/g)].map(m => m[1]);
+
+test('표의 절댓값·적분·곡률 수식은 구분자 안 공백과 위치에 상관없이 온전히 보존된다', () => {
+  for (const tex of TABLE_FORMULAS) for (const [left, right] of [['', ''], [' ', ''], ['', ' '], [' ', ' '], ['\t', '\t']])
+    for (const slash of ['\\', '₩', '￦'])
+    for (const position of [0, 1, 2]) for (const border of [false, true]) for (const header of [false, true]) {
+      const equation = `$${left}${tex.replaceAll('\\', slash)}${right}$`;
+      const cells = ['이웃1', '이웃2', '이웃3']; cells[position] = equation;
+      const row = values => (border ? '| ' : '') + values.join(' | ') + (border ? ' |' : '');
+      const md = [row(header ? cells : ['열1', '열2', '열3']), row(['---', '---', '---']),
+        row(header ? ['값1', '값2', '값3'] : cells)].join('\n');
+      assert.deepEqual(formulas(md), [tex], md);
+      const html = render(md);
+      assert.equal((html.match(/<th>/g) ?? []).length, 3, md);
+      assert.equal((html.match(/<td>/g) ?? []).length, 3, md);
+      assert.ok(cells.filter(c => c !== equation).every(c => html.includes(c)), md);
+      assert.ok(!html.includes('math-error'), md);
+    }
+});
+
+test('표의 불완전한 수식은 해당 셀에만 격리하고 이웃 셀·다음 행을 보존한다', () => {
+  for (const broken of INCOMPLETE_TABLE_FORMULAS) for (const position of [0, 1, 2])
+    for (const prefix of ['', '> ', '  ']) for (const border of [false, true]) {
+      const row = cells => (border ? '| ' : '') + cells.join(' | ') + (border ? ' |' : '');
+      const cells = ['이웃1', '이웃2', '이웃3']; cells[position] = broken;
+      const md = [row(['열1', '열2', '열3']), row(['---', '---', '---']), row(cells),
+        row(['다음', '$x=1$', '끝'])].map(line => prefix + line).join('\n');
+      const html = render(md);
+      assert.deepEqual(formulas(md), ['x=1'], md);
+      assert.equal((html.match(/<td>/g) ?? []).length, 6, md);
+      assert.equal((html.match(/<details/g) ?? []).length, 1, md);
+      assert.ok(html.includes('<code>' + broken.replaceAll('&', '&amp;') + '</code>'), md);
+      assert.ok(cells.filter(c => c !== broken).every(c => html.includes('<td>' + c + '</td>')), md);
+      assert.ok(html.includes('<td>다음</td>') && html.includes('<td>끝</td>'), md);
+    }
+});
+
+test('표의 오류 수식과 이웃 수식의 구분자가 서로 연결되지 않는다', () => {
+  for (const space of ['', ' ']) {
+    const md = '| A | B | C |\n|---|---|---|\n' + `| $\\frac{ | $${space}${TABLE_FORMULAS[0]} $ | $ y=2 $ |`;
+    assert.deepEqual(formulas(md), [TABLE_FORMULAS[0], 'y=2']);
+    assert.equal((render(md).match(/<td>/g) ?? []).length, 3);
+    assert.equal((render(md).match(/<details/g) ?? []).length, 1);
+  }
+  for (const raw of ['| $100 | $200 | $300 |', '| $ORACLE_HOME | \\$x=1 | `$\\frac{` |']) {
+    const input = '| A | B | C |\n|---|---|---|\n' + raw;
+    assert.equal(render(input), plain(input), raw);
+  }
+  const table = '| 수식 | 값 |\n|---|---|\n| $ ' + TABLE_FORMULAS[0] + ' $ | 정상 |';
+  assert.deepEqual(formulas('금액 $100\n\n' + table), [TABLE_FORMULAS[0]]);
+  assert.ok(render('금액 $100\n\n' + table).includes('<p>금액 $100</p>'));
+});
+
+test('표의 모든 스트리밍 접두사에서 앞의 완성된 행을 보존한다', () => {
+  const first = '| A | B | C |\n|---|---|---|\n| 먼저 | $x=1$ | 유지 |\n';
+  const row = '| 이어서 | $ ' + TABLE_FORMULAS[2].replaceAll('\\', '₩') + ' $ | 끝 |';
+  for (let i = 0; i <= row.length; i++) {
+    const md = first + row.slice(0, i);
+    assert.equal(formulas(md)[0], 'x=1', md);
+    assert.ok(render(md).includes('<td>유지</td>'), md);
+    assert.ok(!render(md).includes('LLMMATHPLACEHOLDER'), md);
+  }
+  assert.deepEqual(formulas(first + row), ['x=1', TABLE_FORMULAS[2]]);
+});
+
+test('수식 문법 × 구분자 × Markdown 위치의 공통 경로를 검증한다', () => {
+  const wrappers = [tex => `$${tex}$`, tex => `$$${tex}$$`, tex => `\\(${tex}\\)`, tex => `\\[${tex}\\]`];
+  const contexts = [formula => formula, formula => `설명 &amp; ${formula} **끝**`,
+    formula => `- 항목 ${formula}`, formula => `> ${formula}`, formula => `### 식 ${formula}`,
+    formula => `| 수식 | 값 |\n|---|---|\n| ${formula} | 1 |`];
+  for (const tex of MATH_CORPUS) for (const wrap of wrappers) for (const context of contexts) {
+    const md = context(wrap(tex));
+    const html = render(md);
+    assert.deepEqual(formulas(md), [compatibleEnvironments(tex)], md);
+    assert.ok(!html.includes('katex-error'), md);
+    assert.ok(!html.includes('LLMMATHPLACEHOLDER'), md);
+    if (md.startsWith('|')) assert.equal((html.match(/<td>/g) ?? []).length, 2, md);
+  }
+});
+
+test('수식은 빈 줄·컨테이너·원화 구분자·중복 구분자·분리된 tag에서도 보존된다', () => {
+  for (const md of MATH_LAYOUT_CASES) {
+    assert.equal(formulas(md).length, 1, md);
+    assert.ok(!render(md).includes('katex-error'), md);
+  }
+  for (const lang of ['math', 'MATH', 'latex', 'LaTeX', 'TeX']) {
+    for (const formula of [String.raw`\[ x=1 \]`, '$x=1$', '$$\nx=1\n$$'])
+      assert.deepEqual(formulas('```' + lang + '\n' + formula + '\n```'), ['x=1']);
+  }
+  const raw = '\\begin{gather}\nx\n>0\n\\end{gather}';
+  assert.deepEqual(formulas(raw), [raw], '부등호 >를 인용문 접두사로 지우지 않는다');
+  assert.deepEqual(formulas('> ' + raw.replaceAll('\n', '\n> ')), [raw]);
+  const formula = String.raw`\begin{gather}x=1\end{gather}`;
+  assert.deepEqual(formulas('```text\n\\begin{gather}\n```\n\n' + formula), [formula]);
+  assert.deepEqual(formulas(String.raw`$E=mc^2$ \tag{1}`), [String.raw`E=mc^2 \tag{1}`]);
+});
+
+test('미지원·잘못된 문법은 원문을 보존하는 동일한 오류 표시를 사용한다', () => {
+  for (const tex of [String.raw`\unsupportedExample{x}`, String.raw`\frac{1}`,
+    String.raw`\begin{notSupported}x=1\end{notSupported}`, String.raw`\def\loop{\loop}\loop`]) {
+    const md = `앞 $${tex}$ 뒤 $x=1$`;
+    const html = render(md);
+    assert.equal((html.match(/<details/g) ?? []).length, 1, tex);
+    assert.ok(html.includes('원문 보기') && !html.includes('#cc0000'));
+    assert.deepEqual(formulas(md), ['x=1']);
+    assert.ok(html.includes('앞') && html.includes('뒤'));
+  }
+  // 정규화된 호환 문법 대신 사용자가 받은 원문을 보여준다.
+  assert.ok(render('₩[ ₩notSupported{x} ₩]').includes('₩notSupported{x}'));
+  assert.deepEqual(formulas(String.raw`$\def\local{x}\local$ $\local$`), [String.raw`\def\local{x}\local`]);
+  const good = String.raw`\begin{gather}y=2\end{gather}`;
+  for (const bad of [String.raw`$\begin{gather}x$`, String.raw`$\text{\begin{gather}}$`]) {
+    assert.deepEqual(formulas(`${bad} 뒤 ${good}`), [good], '앞 수식의 미완성 환경이 뒤 수식을 숨기지 않는다');
+  }
+});
+
+test('스트리밍의 모든 접두사에서 예외·임시 토큰 누출 없이 최종 수식을 복원한다', () => {
+  for (const md of MATH_LAYOUT_CASES.slice(0, 3).concat(String.raw`앞 $\ce{H2O}$ 뒤`, String.raw`\begin{split}x&=1\\y&=2\end{split}`)) {
+    for (let n = 0; n <= md.length; n++) {
+      const html = render(md.slice(0, n));
+      assert.ok(!html.includes('LLMMATHPLACEHOLDER'), md.slice(0, n));
+    }
+    assert.equal(formulas(md).length, 1);
+  }
+});
+
+test('여러 줄 환경과 철자 변형을 구분자 유무·인라인 모드에 관계없이 렌더링한다', () => {
+  for (const name of ['gather', 'split', 'multline', 'multline*', 'multiline', 'multiline*',
+    'subequations', 'subequation', 'flalign', 'flalign*']) {
+    const body = ['split', 'flalign', 'flalign*'].includes(name) ? String.raw`x &= 1 \\ y &= 2` : String.raw`x = 1 \\ y = 2`;
+    const eq = `\\begin{${name}}${body}\\end{${name}}`;
+    for (const slash of ['\\', '₩', '￦']) {
+      const input = eq.replaceAll('\\', slash);
+      for (const md of [input, `$${input}$`, `$$${input}$$`, `$$\n${input}\n$$`,
+        `\\[${input}\\]`, `설명 $${input}$ 끝`, `설명 ${input} 끝`, '```latex\n' + input + '\n```']) {
+        const html = render(md);
+        assert.ok(isDisplay(md) && !/katex-error|#cc0000/.test(html), md);
+        const actual = formulas(md);
+        assert.equal(actual.length, 1, md);
+        assert.ok(actual[0].includes(body), md);
+        assert.ok(!/flalign|multline|multiline|subequation/.test(actual[0]), md);
+        if (md.startsWith('설명')) assert.ok(visible(md).includes('설명') && visible(md).includes('끝'), md);
+      }
+    }
+  }
+});
+
+test('설명과 같은 문단의 환경을 분리해도 강조·링크·인라인 수식과 환경의 중첩은 유지한다', () => {
+  const eq = '\\begin{gather}\nx_1 = 1 \\\\\nx_2 = 2\n\\end{gather}';
+  const md = `**설명** $a$\n${eq}\n[참고](https://example.test) $b$ 끝`;
+  assert.deepEqual(formulas(md), ['a', eq, 'b']);
+  assert.match(render(md), /<strong>설명<\/strong>/);
+  assert.deepEqual(hrefs(md), ['https://example.test']);
+  assert.ok(visible(md).includes('끝'));
+  for (const input of [eq, '> ' + eq.replaceAll('\n', '\n> '), '- ' + eq.replaceAll('\n', '\n  ')])
+    assert.deepEqual(formulas(input), [eq], input);
+  const nested = String.raw`\begin{equation}\begin{split}x&=1\\&=2\end{split}\tag{A}\end{equation}`;
+  assert.deepEqual(formulas(`설명 ${nested} 끝`), [nested]);
+  assert.deepEqual(formulas(String.raw`\begin { gather } x=1 \end { gather }`), [String.raw`\begin{gather} x=1 \end{gather}`]);
+  assert.deepEqual(formulas(`${eq}\n${eq}`), [eq, eq]);
+  assert.deepEqual(formulas(`진행률 100% ${eq} 끝`), [eq]);
+  const commented = '\\begin{gather}x=1 % \\end{gather}\n\\\\ y=2\\end{gather}';
+  assert.deepEqual(formulas(commented), [commented], '주석 안의 end는 환경을 닫지 않는다');
+});
+
+test('subequations 안의 개별 식·명시적 번호와 multline의 단일 번호를 보존한다', () => {
+  const eq = String.raw`\begin{subequations}\begin{equation}x=1\tag{1a}\end{equation}\begin{equation}y=2\tag{1b}\end{equation}\end{subequations}`;
+  const html = render(eq);
+  assert.ok(!/katex-error|#cc0000/.test(html));
+  assert.deepEqual(formulas(eq), [String.raw`\begin{align*}\begin{equation}x=1\tag{1a}\end{equation}\\` + '\n' + String.raw`\begin{equation}y=2\tag{1b}\end{equation}\end{align*}`]);
+  assert.match(visible(eq), /1a/);
+  assert.match(visible(eq), /1b/);
+  const multline = String.raw`\begin{multline}x+y\\=3\tag{A}\end{multline}`;
+  assert.ok(!/katex-error|#cc0000/.test(render(multline)));
+  assert.equal((render(multline).match(/class="tag"/g) ?? []).length, 1);
+});
+
+test('환경의 이름만 쓴 설명·코드·링크·닫히지 않은 환경은 바꾸지 않는다', () => {
+  for (const md of [String.raw`{gather} {split} {multiline} {subequation} {flalign}`,
+    String.raw`\begin{split}x&=1`, String.raw`\begin{gather}x=1\end{split}`,
+    String.raw`\begin{gather}\begin{split}x&=1\end{gather}\end{split}`,
+    String.raw`\begin{gather}x=1 \\end{gather}`, String.raw`\\begin{gather}x=1\\end{gather}`,
+    '`\\begin{split}x&=1\\end{split}`', '```text\n\\begin{multline}x=1\\end{multline}\n```',
+    String.raw`[\begin{gather}x=1\end{gather}](https://example.test)`]) assert.equal(render(md), plain(md), md);
+});
+
+test('mhchem 화학식·반응식·단위를 수식 구분자와 코드펜스에서 렌더링한다', () => {
+  for (const eq of [String.raw`\ce{H2O}`, String.raw`\ce{2H2 + O2 -> 2H2O}`,
+    String.raw`\ce{SO4^2-}`, String.raw`\ce{^{14}_{6}C}`, String.raw`\pu{123 kJ mol-1}`]) {
+    for (const slash of ['\\', '₩', '￦']) {
+      const input = eq.replaceAll('\\', slash);
+      for (const md of [input, `$${input}$`, `$$${input}$$`, `$$\n${input}\n$$`,
+        `물질 \\(${input}\\) 입니다`, `\\[${input}\\]`, '> ' + input,
+        ...['math', 'latex', 'tex'].map(lang => '```' + lang + '\n' + input + '\n```')]) {
+        assert.deepEqual(formulas(md), [eq], md);
+        assert.ok(!/katex-error|#cc0000/.test(render(md)), md);
+      }
+    }
+  }
+  // 원문 주석만 생기는 것이 아니라 아래첨자와 반응 화살표가 실제 MathML에 생겨야 한다.
+  assert.match(render(String.raw`$\ce{H2O}$`), /<msub>/);
+  assert.match(render(String.raw`$\ce{H2 -> 2H}$`), /→/);
+  assert.ok(!isDisplay(String.raw`물 $\ce{H2O}$ 입니다`));
+  assert.ok(isDisplay(String.raw`\ce{H2O}`));
+});
+
+test('화학식 원문 예시·미완성 명령·명령 설명은 글자로 남는다', () => {
+  for (const md of [String.raw`\ce`, String.raw`\ce{H2O`, String.raw`\ce{^{14}C`,
+    String.raw`\\ce{H2O}`, String.raw`\ce{}`, '₩100',
+    '`\\ce{H2O}`', '```text\n\\ce{H2O}\n```', '```\n\\ce{H2O}\n```',
+    '    \\ce{H2O}', '[\\ce{H2O}](https://example.test)']) assert.equal(render(md), plain(md), md);
+});
+
+test('KaTeX가 지원하지 않는 flalign은 행·정렬점·번호를 보존한 align으로 그린다', () => {
+  for (const star of ['', '*']) {
+    const eq = String.raw`\begin{flalign${star}} &x + y = 1 && \\ &2x - y = 3 \tag{A} && \end{flalign${star}}`;
+    const expected = eq.replaceAll(`{flalign${star}}`, `{align${star}}`);
+    for (const slash of ['\\', '₩', '￦']) {
+      const input = eq.replaceAll('\\', slash);
+      for (const md of [input, `$${input}$`, `$$${input}$$`, `$$\n${input}\n$$`,
+        `\\[${input}\\]`, `앞 \\(${input}\\) 뒤`, '> ' + input,
+        ...['math', 'latex', 'tex'].map(lang => '```' + lang + '\n' + input + '\n```')]) {
+        assert.deepEqual(formulas(md), [expected], md);
+        assert.ok(isDisplay(md) && !render(md).includes('katex-error'), md);
+      }
+      for (const md of ['`' + input + '`', '```text\n' + input + '\n```',
+        '```\n' + input + '\n```', '    ' + input]) assert.equal(render(md), plain(md), md);
+    }
+  }
+  const reported = '₩begin{flalign} &x + y = 1 && ₩₩ &2x - y = 3 && ₩end{flalign}';
+  assert.deepEqual(formulas(reported), [String.raw`\begin{align} &x + y = 1 && \\ &2x - y = 3 && \end{align}`]);
+  for (const md of [String.raw`\begin{flalign} x=1`, String.raw`\begin{flalign} x=1 \end{align}`])
+    assert.equal(render(md), plain(md), md);
+});
+
+test('gather와 번호 달린 식은 구분자 누락·인라인 표기에서도 별행으로 복구한다', () => {
+  const equations = [
+    String.raw`\begin{gather} x + y = 10 \\ x - y = 4 \end{gather}`,
+    String.raw`E = mc^2 \tag{1}`,
+    String.raw`\begin{align*} x_1 &= 10 \\ x_2 &= 4 \end{align*}`,
+    String.raw`\begin{equation} E = mc^2 \tag{1} \end{equation}`,
+  ];
+  for (const eq of equations) {
+    for (const md of [eq, `$${eq}$`, `$$${eq}$$`, `앞 $${eq}$ 뒤`, `앞 $$${eq}$$ 뒤`, `앞 \\(${eq}\\) 뒤`, `앞 \\[${eq}\\] 뒤`]) {
+      assert.deepEqual(formulas(md), [eq], md);
+      assert.ok(isDisplay(md), md);
+      assert.ok(!render(md).includes('katex-error'), md);
+      if (md.startsWith('앞')) assert.ok(visible(md).includes('앞') && visible(md).includes('뒤'), md);
+    }
+  }
+});
+
+test('실제 원화 문자는 수식의 명령·줄바꿈에서만 백슬래시로 복구한다', () => {
+  for (const eq of [String.raw`\begin{gather} x + y = 10 \\ x - y = 4 \end{gather}`, String.raw`E = mc^2 \tag{1}`]) {
+    for (const won of ['₩', '￦']) {
+      const broken = eq.replaceAll('\\', won);
+      for (const md of [broken, `$${broken}$`, `$$\n${broken}\n$$`, '```latex\n' + broken + '\n```']) {
+        assert.deepEqual(formulas(md), [eq], md);
+        assert.ok(isDisplay(md) && !render(md).includes('katex-error'), md);
+      }
+    }
+  }
+});
+
+test('구분자 없는 여러 줄 환경은 Markdown이 해석하기 전 첨자·줄바꿈을 보존한다', () => {
+  const eq = '\\begin{gather}\nx_1 + y_1 = 10 \\\\\nx_2 - y_2 = 4\n\\end{gather}';
+  for (const md of [eq, '> ' + eq.replaceAll('\n', '\n> '), '- ' + eq.replaceAll('\n', '\n  ')]) {
+    assert.deepEqual(formulas(md), [eq], md);
+    assert.ok(isDisplay(md) && !render(md).includes('katex-error'), md);
+  }
+});
+
+test('구분자 없는 수식 복구가 코드·금액·설명·미완성 환경을 바꾸지 않는다', () => {
+  const eq = String.raw`\begin{gather} x=1 \\ y=2 \end{gather}`;
+  for (const md of [
+    '`' + eq + '`', '```text\n' + eq + '\n```', '    ' + eq,
+    '₩100, ￦200, ₩begin 사용법', String.raw`설명: E = mc^2 \tag{1}`,
+    String.raw`The equation E = mc^2 \tag{1}`, String.raw`\tag{1}은 식 번호입니다.`,
+    String.raw`\begin{gather} x=1`, String.raw`\begin{gather} x=1 \end{align}`,
+    String.raw`E = mc^2 \\tag{1}`, String.raw`\begin{gather} x=1 \\end{gather}`,
+    '[' + eq + '](https://example.test)',
+  ]) assert.equal(render(md), plain(md), md);
+});
 
 test('이스케이프된 대괄호는 별행 수식의 구분자가 되지 않는다', () => {
   for (const md of [String.raw`\[ x = 1 \\]`, String.raw`\\[ x = 1 \]`, String.raw`\\[ x = 1 \\]`]) {
@@ -79,9 +364,9 @@ test('환경변수·경로의 $는 수식이 아니다', () => {
   assert.deepStrictEqual(formulas('식별자 A$B$C'), []);
 });
 
-test('$$ 인라인·별행 표기는 그대로 동작한다', () => {
+test('$$ 구분자는 문장 안에서도 일관되게 별행 수식으로 동작한다', () => {
   assert.deepStrictEqual(formulas('계산식은 $$E = mc^2$$ 이다.'), ['E = mc^2']);
-  assert.ok(!isDisplay('계산식은 $$E = mc^2$$ 이다.'));
+  assert.ok(isDisplay('계산식은 $$E = mc^2$$ 이다.'));
   // 한 줄로 쓴 $$…$$가 문단을 혼자 차지하면 별행이다. remark-math는 이것을 인라인으로 보지만
   // (별행은 $$가 제 줄에 홀로 설 때뿐이다) 모델은 별행 수식을 거의 언제나 이렇게 쓴다 —
   // 인라인으로 두면 넓은 수식이 말풍선에 잘려 오른쪽을 볼 방법이 없다.
@@ -104,7 +389,7 @@ test('\\( \\) 와 \\[ \\] 표기도 그린다', () => {
   assert.deepStrictEqual(formulas('속도는 \\( v = d/t \\) 이다'), ['v = d/t']);
   assert.deepStrictEqual(formulas('\\[ E = mc^2 \\]'), ['E = mc^2']);
   assert.ok(isDisplay('\\[ E = mc^2 \\]'), '문단을 혼자 차지하면 별행으로');
-  assert.ok(!isDisplay('식 \\[ E = mc^2 \\] 이다'), '문장 안이면 인라인으로');
+  assert.ok(isDisplay('식 \\[ E = mc^2 \\] 이다'), '명시한 별행 구분자는 문장 안에서도 별행으로');
   assert.deepStrictEqual(formulas('- 항목: \\( x^2 \\)'), ['x^2'], '목록 안에서도');
   assert.deepStrictEqual(formulas('> \\[ E = mc^2 \\]'), ['E = mc^2'], '인용문 안에서도');
   assert.deepStrictEqual(formulas('- 항목\n\n  \\[ E = mc^2 \\]'), ['E = mc^2'], '목록 안 단독 줄');
@@ -140,8 +425,8 @@ test('별행 수식은 여는 줄에 이어 써도, 빈 줄 없이 잇달아 써
   const brackets = '\\[ a=1 \\]\n\\[ b=2 \\]';
   assert.deepStrictEqual(formulas(brackets), ['a=1', 'b=2']);
   assert.strictEqual((render(brackets).match(/katex-display/g) ?? []).length, 2);
-  // 글자가 섞인 문단은 그대로 문장 속 표기다
-  assert.ok(!isDisplay('앞 $$a = 1$$ 뒤'));
+  // 별행 구분자의 의미가 주변 문장 유무에 따라 바뀌지 않는다.
+  assert.ok(isDisplay('앞 $$a = 1$$ 뒤'));
   assert.deepStrictEqual(formulas('앞 $$a = 1$$ 뒤'), ['a = 1']);
 });
 
@@ -220,8 +505,10 @@ test('문법이 틀린 수식이 답변 전체를 날리지 않는다', () => {
   const html = render(md);
   assert.ok(html.includes('앞 문장') && html.includes('뒷 문장'));
   assert.ok(html.includes('katex-error'));
-  // 모르는 명령은 .katex 안에 붉은 글자로 들어간다 — CSS가 그 색으로 찾아 줄바꿈을 허용한다
-  assert.ok(render('$$\\foobarbazqux{1}$$').includes('#cc0000'));
+  // 지원하지 않는 명령도 같은 오류 경로로 보내고, 정확한 원문은 펼쳐 볼 수 있게 남긴다.
+  const unknown = render('$$\\foobarbazqux{1}$$');
+  assert.ok(unknown.includes('<details') && unknown.includes('원문 보기'));
+  assert.ok(!unknown.includes('#cc0000') && unknown.includes('\\foobarbazqux{1}'));
 });
 
 test('긴 입력에도 선형으로 동작한다', () => {
@@ -237,7 +524,7 @@ test('이스케이프된 표시(\\$, \\\\( )는 수식의 여닫는 표시가 �
   // markdown에서 `\$`는 글자 $이다 — 모델이 금액을 수식으로 읽힐까 봐 그렇게 적는다. 그것을 여닫는
   // 표시로 읽으면 글자 $가 사라지고 끝에 남은 백슬래시가 조판 오류로 붉게 선다(화면 재현으로 확인:
   // '가격은 \$5이고 이익은 \$.'가 '가격은 \5이고 이익은 \.'로 나왔다).
-  for (const md of ['\\$a\\$', '가격은 \\$5이고 이익은 \\$.', '비용 \\$5 (최소) ~ \\$ 단위', '$a\\$b$']) {
+  for (const md of ['\\$a\\$', '가격은 \\$5이고 이익은 \\$.', '비용 \\$5 (최소) ~ \\$ 단위']) {
     assert.deepStrictEqual(formulas(md), [], md);
     assert.strictEqual(visible(md), plain(md).replace(/<[^>]*>/g, ""), md); // 수식 처리를 뺀 렌더와 글자가 같다
     assert.ok(!render(md).includes('katex-error'), `${md}: 조판 오류가 남았다`);
@@ -248,6 +535,7 @@ test('이스케이프된 표시(\\$, \\\\( )는 수식의 여닫는 표시가 �
   // 이스케이프된 백슬래시 뒤의 진짜 표시는 그대로 수식이다 — 백슬래시가 짝수 개면 표시가 살아 있다
   assert.deepStrictEqual(formulas('\\\\$x$ 뒤'), ['x']);
   assert.deepStrictEqual(formulas('\\\\\\(x\\\\\\)'), ['x\\\\']);
+  assert.deepStrictEqual(formulas('$a\\$b$'), ['a\\$b'], '수식 안의 이스케이프된 달러는 구분자가 아니다');
 });
 
 test('수식 코드펜스는 ```math·```latex·```tex 셋 다 별행 수식으로 그린다', () => {
@@ -293,8 +581,8 @@ test('여러 줄로 이어 쓴 목록 항목·인용문 안의 수식도 그려�
   // 인용문 안에서 수식만 있는 문단은 별행이다
   assert.ok(isDisplay('> \\[a\\]\n> \\[b\\]'));
   assert.deepStrictEqual(formulas('> \\[a\\]\n> \\[b\\]'), ['a', 'b']);
-  // 되돌린 원문이 값과 다른 노드(엔티티)는 여전히 건드리지 않는다 — 실패 방향은 한쪽이다
-  assert.deepStrictEqual(formulas('&amp; 와 $x$'), []);
+  // 엔티티가 같은 문장에 있어도 수식은 원문에서 분리하고, 엔티티는 Markdown이 해독한다.
+  assert.deepStrictEqual(formulas('&amp; 와 $x$'), ['x']);
 });
 
 // 닫히지 않은 \(·\[가 되풀이되는 퇴화한 답변에서 비탐욕 매치는 '여는 표시 수 × 길이'였다(실측: 답변 상한 안의 '\( x '

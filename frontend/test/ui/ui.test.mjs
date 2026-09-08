@@ -17,7 +17,10 @@ import { fileURLToPath } from 'node:url';
 import { findChrome, launchChrome, chromePort, stopProcess, killOnExit, freePort, oneTab, Page, sleep, STATE,
   alive, aliveGroup } from './driver.mjs';
 import { pieSlices, parseChartBlock, MAX_TITLE_LEN } from '../../src/chart.js';
-import { TRACE, READY, PIE_BLOCK, PIE_LONG_NAMES, PIE_SHORT_NAMES, LONG_URL, DATA_URL, MAIL_URL, CAPPED_LABEL, ERROR_LABEL,
+import { MATH_CORPUS, MATH_LAYOUT_CASES } from '../math-corpus.js';
+import { TABLE_FORMULAS, INCOMPLETE_TABLE_FORMULAS } from '../table-math-corpus.js';
+import { checkLatex200 } from './latex-table-200-checks.mjs';
+import { CASES, TRACE, READY, ENVIRONMENT_EXAMPLES, PIE_BLOCK, PIE_LONG_NAMES, PIE_SHORT_NAMES, LONG_URL, DATA_URL, MAIL_URL, CAPPED_LABEL, ERROR_LABEL,
   STREAM_SEARCH, STREAM_SEARCH_LABEL, STREAM_SUMMARY, STREAM_PREVIEW_TEXT,
   ANCHOR_URL, ANCHOR_TEXT, ANCHOR_IMG_TEXT, NESTED_LINK, LONG_CELL, LONG_SERIES_NAMES, LONG_CATEGORY_NAMES,
   BROKEN_RESPONSES, 주소를_가리키는_링크 } from './fixtures.js';
@@ -153,6 +156,178 @@ const seen = sel => page.eval(`(() => { const e = document.querySelector(${JSON.
   return e ? Math.round(e.getBoundingClientRect().top) : null; })()`);
 // Chrome이 없으면 그 자리에서 건너뛴다 (before가 돈 뒤에야 알 수 있으므로 시험 안에서 판단한다)
 const it = (name, fn) => test(name, async t => { if (skip) return t.skip(skip); await fn(t); });
+
+it('200개 수식 표: 데스크톱·모바일에서 모든 행의 원문과 실제 조판 영역을 검증한다', async () => {
+  for (const width of [1000, 380]) {
+    await answered(width, 760, { c: 'latex200' });
+    await page.eval('document.fonts.ready.then(() => true)');
+    await checkLatex200(page);
+    if (process.env.LATEX_200_SCREENSHOT_DIR) {
+      for (const index of [0, 99, 199]) {
+        await page.eval(`document.querySelectorAll('.bubble.assistant tbody tr')[${index}].scrollIntoView({block:'center',behavior:'instant'})`);
+        await settled();
+        const shot = await page.send('Page.captureScreenshot', { format: 'png' });
+        await writeFile(join(process.env.LATEX_200_SCREENSHOT_DIR, `latex-200-${width}-${index + 1}.png`), Buffer.from(shot.data, 'base64'));
+      }
+    }
+  }
+});
+
+it('200개 수식 표: 스트리밍과 최종 답변 모두 200개 수식이 온전히 표시된다', async () => {
+  await page.goto(url(), '.chip');
+  await page.eval(`window.__answer = ${JSON.stringify(CASES.latex200)};
+    window.fetch = async () => new Response(new ReadableStream({
+      start(c) { window.__line = o => c.enqueue(new TextEncoder().encode(JSON.stringify(o) + '\\n')); window.__close = () => c.close(); }
+    }), { headers: { 'Content-Type': 'application/x-ndjson' } }); document.querySelector('.chip').click()`);
+  // 네 구간의 렌더 개수를 확인한 뒤 이어 보낸다. 미리보기와 최종 답변에서 200행의 원문·순서를 전수 검사한다.
+  const lines = CASES.latex200.split('\n');
+  let previous = 0;
+  for (const count of [50, 100, 150, 200]) {
+    const end = count === 200 ? CASES.latex200.length : lines.slice(0, count + 4).join('\n').length;
+    await page.eval(`window.__line({type:'answer_delta', text:window.__answer.slice(${previous}, ${end})})`);
+    await page.until(`document.querySelectorAll('.preview annotation').length === ${count}`);
+    previous = end;
+  }
+  await checkLatex200(page, '.preview');
+  await page.eval(`window.__line({type:'done', answer:window.__answer}); window.__close()`);
+  await page.until(`!document.querySelector('.preview') && !document.querySelector('.typing')`);
+  await checkLatex200(page);
+});
+
+it('표의 수식: 절댓값 뒤가 잘리지 않고 오류 셀·이웃 열이 모바일에서도 보존된다', async () => {
+  for (const width of [1000, 380]) {
+    await answered(width, 760, { c: 'tablemath' });
+    const view = await page.eval(`(() => {
+      const bubble = document.querySelector('.bubble.assistant');
+      return { formulas: [...bubble.querySelectorAll('annotation')].map(e => e.textContent),
+        rows: [...bubble.querySelectorAll('tbody tr')].map(r => [...r.children].map(c => c.innerText)),
+        overflow: document.documentElement.scrollWidth > innerWidth };
+    })()`);
+    assert.deepEqual(view.formulas, [...TABLE_FORMULAS, 'x=1']);
+    assert.ok(view.rows.every(row => row.length === 3));
+    assert.deepEqual(view.rows.slice(0, 3).map(row => row[2]), ['보존 1', '보존 2', '보존 3']);
+    assert.deepEqual(view.rows.slice(3, -1).map(row => row[2]), INCOMPLETE_TABLE_FORMULAS.map((_, i) => `원문 ${i + 1}`));
+    assert.equal(view.rows[view.rows.length - 1][2], '다음 행');
+    assert.ok(!view.rows.flat().some(cell => /₩|\\\\(?:sqrt|frac)|\$/.test(cell)), '수식 원문이 표에 그대로 노출됐다');
+    assert.ok(!view.overflow);
+    await page.eval(`document.querySelectorAll('.math-error summary').forEach(e => e.click())`);
+    assert.deepEqual(await page.eval(`[...document.querySelectorAll('.math-error code')].map(e => e.textContent)`),
+      INCOMPLETE_TABLE_FORMULAS);
+  }
+});
+
+it('표의 수식: 스트리밍 중 절댓값·구분자가 나눠 와도 완성된 행과 최종 원문이 보존된다', async () => {
+  await page.goto(url(), '.chip');
+  await page.eval(`window.__answer = ${JSON.stringify(CASES.tablemath)};
+    window.fetch = async () => new Response(new ReadableStream({
+      start(c) { window.__line = o => c.enqueue(new TextEncoder().encode(JSON.stringify(o) + '\\n')); window.__close = () => c.close(); }
+    }), { headers: { 'Content-Type': 'application/x-ndjson' } }); document.querySelector('.chip').click()`);
+  let previous = 0;
+  // 첫 수식의 절댓값 앞·중간·닫는 $ 앞에서 각각 멈춘다.
+  const ends = [CASES.tablemath.indexOf('|a|') + 1, CASES.tablemath.indexOf('|a|') + 3,
+    CASES.tablemath.indexOf('보존 1'), CASES.tablemath.indexOf('보존 2'), CASES.tablemath.length];
+  for (const end of ends) {
+    await page.eval(`window.__line({type:'answer_delta', text:window.__answer.slice(${previous}, ${end})})`);
+    await page.until(`document.querySelector('.preview')`);
+    previous = end;
+  }
+  await page.until(READY.tablemath);
+  const before = await page.eval(`[...document.querySelectorAll('.preview annotation')].map(e => e.textContent)`);
+  await page.eval(`window.__line({type:'done', answer:window.__answer}); window.__close()`);
+  await page.until(`!document.querySelector('.preview') && !document.querySelector('.typing')`);
+  assert.deepEqual(await page.eval(`[...document.querySelectorAll('.bubble.assistant annotation')].map(e => e.textContent)`), before);
+  assert.equal(await page.eval(`document.querySelectorAll('.bubble.assistant td').length`),
+    (TABLE_FORMULAS.length + INCOMPLETE_TABLE_FORMULAS.length + 1) * 3);
+});
+
+it('수식 파싱 공통 경로: 표·빈 줄·구분자·오류 원문이 데스크톱과 모바일에서 유지된다', async () => {
+  for (const width of [1000, 380]) {
+    await answered(width, 760, { c: 'mathaudit' });
+    const view = await page.eval(`(() => {
+      const bubble = document.querySelector('.bubble.assistant');
+      return { formulas: bubble.querySelectorAll('annotation').length,
+        cells: bubble.querySelectorAll('td').length, text: bubble.innerText,
+        expanded: bubble.querySelector('.math-error').open,
+        overflow: document.documentElement.scrollWidth > innerWidth };
+    })()`);
+    assert.equal(view.formulas, MATH_CORPUS.length + MATH_LAYOUT_CASES.length);
+    assert.equal(view.cells, MATH_CORPUS.length * 2);
+    assert.ok(view.text.includes('앞 설명') && view.text.includes('뒤 설명') && view.text.includes('금액 ₩100, $200'));
+    assert.ok(!view.text.includes('unsupportedExample') && !view.text.includes('LLMMATHPLACEHOLDER'));
+    assert.ok(!view.expanded && !view.overflow);
+    await page.eval(`document.querySelector('.math-error summary').click()`);
+    assert.equal(await page.eval(`document.querySelector('.math-error pre code').textContent`), String.raw`$\unsupportedExample{x}$`);
+    assert.ok(await page.eval(`document.querySelector('.math-error').open`));
+  }
+});
+
+it('Markdown·LaTeX·차트 혼합 답변의 표 전환과 모바일 배치가 유지된다', async () => {
+  for (const width of [1000, 380]) {
+    await answered(width, 760, { c: 'mixed' });
+    assert.deepEqual(await page.eval(`[...document.querySelectorAll('figure.chart figcaption')].map(e => e.textContent)`),
+      ['관측값', '구성 비율']);
+    await page.eval(`document.querySelectorAll('.chart-table summary').forEach(e => e.click())`);
+    assert.deepEqual(await page.eval(`[...document.querySelectorAll('.chart-table')].map(e =>
+      [...e.querySelectorAll('tbody td')].map(c => c.textContent))`), [['A', '2', 'B', '4'], ['A', '2', 'B', '4']]);
+    assert.equal(await page.eval(`document.querySelector('pre code.language-text').textContent.trim()`),
+      String.raw`\begin{gather}원문 예시\end{gather}`);
+    assert.ok(await page.eval(`document.documentElement.scrollWidth <= innerWidth &&
+      document.querySelector('.bubble.assistant').innerText.includes('계산 결과') &&
+      document.querySelectorAll('.math-error').length === 1`));
+  }
+});
+
+it('수식 파싱 공통 경로: 차트가 섞인 스트리밍 미리보기와 최종 답변의 수식·오류 표시가 같다', async () => {
+  await page.goto(url(), '.chip');
+  await page.eval(`window.__answer = ${JSON.stringify(CASES.mixed)};
+    window.fetch = async () => new Response(new ReadableStream({
+      start(c) { window.__line = o => c.enqueue(new TextEncoder().encode(JSON.stringify(o) + '\\n')); window.__close = () => c.close(); }
+    }), { headers: { 'Content-Type': 'application/x-ndjson' } }); document.querySelector('.chip').click()`);
+  await page.eval(`window.__line({type:'answer_delta', text:window.__answer.slice(0, 40)})`);
+  await page.until(`document.querySelector('.preview')`);
+  await page.eval(`window.__line({type:'answer_delta', text:window.__answer.slice(40)})`);
+  await page.until(`document.querySelectorAll('.preview annotation').length === ${MATH_CORPUS.length + MATH_LAYOUT_CASES.length + 4}`);
+  assert.equal(await page.eval(`document.querySelectorAll('.preview figure.chart').length`), 0);
+  assert.equal(await page.eval(`document.querySelector('.preview').innerText.split('(표·차트를 준비하고 있습니다)').length - 1`), 2);
+  const before = await page.eval(`[...document.querySelectorAll('.preview annotation')].map(e => e.textContent)`);
+  await page.eval(`window.__line({type:'done', answer:window.__answer}); window.__close()`);
+  await page.until(`!document.querySelector('.preview') && !document.querySelector('.typing')`);
+  await page.until(READY.mixed);
+  assert.deepEqual(await page.eval(`[...document.querySelectorAll('.bubble.assistant annotation')].map(e => e.textContent)`), before);
+  assert.equal(await page.eval(`document.querySelectorAll('.math-error').length`), 1);
+});
+
+it('LaTeX gather·split·multline·subequations·flalign·화학식이 실제 답변에서 수식으로 표시된다', async () => {
+  for (const width of [1000, 380]) {
+    await answered(width, 760, { c: 'latex' });
+    const result = await page.eval(`(() => {
+      const bubble = document.querySelector('.bubble.assistant');
+      return {
+        errors: bubble.querySelectorAll('.katex-error').length,
+        formulas: [...bubble.querySelectorAll('annotation')].map(e => e.textContent),
+        text: bubble.innerText,
+        code: bubble.querySelector('pre code').textContent,
+        overflow: document.documentElement.scrollWidth > innerWidth,
+        subTags: [...bubble.querySelectorAll('.katex-display .tag .mord.text')]
+          .filter(e => ['(1a)', '(1b)'].includes(e.textContent))
+          .map(e => ({ text: e.textContent, top: e.getBoundingClientRect().top })),
+      };
+    })()`);
+    assert.equal(result.errors, 0);
+    assert.equal(result.formulas.length, 12 + ENVIRONMENT_EXAMPLES.length);
+    assert.ok(result.formulas[6].includes('\\begin{align}') && result.formulas[7].includes('\\begin{align*}'));
+    assert.deepEqual(result.formulas.slice(8, 12), [String.raw`\ce{H2O}`, String.raw`\ce{2H2 + O2 -> 2H2O}`,
+      String.raw`\ce{SO4^2-}`, String.raw`\pu{123 kJ mol-1}`]);
+    assert.ok(!result.text.includes('\\ce') && !result.text.includes('\\pu'));
+    assert.ok(!/\\(?:begin|end)\s*\{/.test(result.text), '환경 명령이 화면 글자로 남았다');
+    assert.deepEqual(result.subTags.map(tag => tag.text), ['(1a)', '(1b)']);
+    assert.ok(result.subTags[1].top > result.subTags[0].top + 5, '하위 식 번호가 같은 줄에 겹친다');
+    assert.ok(result.formulas.every(tex => !tex.includes('₩')));
+    assert.ok(result.text.includes('금액 ₩100, $200') && result.text.includes('앞') && result.text.includes('뒤'));
+    assert.equal(result.code.trim(), String.raw`E = mc^2 \tag{1}`);
+    assert.ok(!result.overflow, `${width}px 화면이 수식 때문에 가로로 넘친다`);
+  }
+});
 
 async function sendQuestion(text, answers) {
   await page.eval(`document.querySelector('textarea').focus()`);

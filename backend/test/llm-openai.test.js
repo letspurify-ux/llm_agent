@@ -3,6 +3,8 @@
 // temperature=0이라 재시도도 같은 응답을 받아 똑같이 실패한다. 로그를 봐도 모델 탓처럼 보인다.
 import { test } from 'node:test';
 import assert from 'node:assert';
+import { MATH_CORPUS, MATH_LAYOUT_CASES } from '../../frontend/test/math-corpus.js';
+import { TABLE_MATH_ANSWER } from '../../frontend/test/table-math-corpus.js';
 
 process.env.LLM_BASE_URL = 'http://test.invalid/v1';
 process.env.LLM_MODEL = 'test';
@@ -704,6 +706,23 @@ test('forceAnswer일 때는 run_query를 결정으로 받지 않는다', async (
 const B = String.fromCharCode(92);
 const answerOf = async content => (await decide(content))?.answer ?? null;
 
+test('화면 수식 코퍼스가 JSON 응답과 모든 스트림 조각 경계에서 같은 원문으로 전달된다', async () => {
+  for (const answer of [...MATH_CORPUS, ...MATH_LAYOUT_CASES, TABLE_MATH_ANSWER]) {
+    const json = JSON.stringify({ action: 'answer', answer });
+    // 독립된 명령 백슬래시만 덜 이스케이프한 모델 출력. 행 구분 \\\\와 JSON 줄바꿈은 보존한다.
+    const underescaped = json.replace(/(?<!\\)\\\\(?=[A-Za-z()[\]])/g, '\\');
+    for (const raw of [json, underescaped]) {
+      assert.equal(await answerOf(raw), answer, raw);
+      for (const size of [1, 7, 1000]) {
+        let preview = '';
+        const parser = answerPreviewer(event => { preview = event.reset ? '' : preview + event.text; });
+        for (let i = 0; i < raw.length; i += size) parser.feed(raw.slice(i, i + size));
+        assert.equal(preview, answer, `${size}자 조각: ${raw}`);
+      }
+    }
+  }
+});
+
 test('JSON에 없는 이스케이프가 답변을 통째로 버리지 않는다', async () => {
   assert.equal(
     await answerOf(`{"action":"answer","answer":"${B}[ x^2 ${B}] 와 $${B}alpha$"}`),
@@ -867,9 +886,11 @@ test('시스템 프롬프트가 프롬프트 표기와 같은 규칙을 말한�
   const sys = (await capturedRequest()).messages[0].content;
   assert.ok(sys.includes(`${TRUNC_MARK} 으로 끝나는 값`), '잘린 값 표시가 상수와 어긋난다');
   assert.match(sys, /콜론 없이/);
-  for (const notation of ['$E=mc^2$', '$$E=mc^2$$', '\\( \\)', '\\[ \\]']) {
+  for (const notation of ['$E=mc^2$', '\\( E=mc^2 \\)', '별행은 $$', '\\[ \\]']) {
     assert.ok(sys.includes(notation), `수식 표기 안내가 빠졌다: ${notation}`);
   }
+  assert.doesNotMatch(sys, /인라인은[^\n]*또는 \$\$/);
+  assert.match(sys, /별행 전용 문법은 반드시/);
   // 백슬래시 두 번 예시는 모델이 그대로 따라 쓰는 문자열이다 — JSON 문자열 안에서 \\frac 이 되어야 한다
   assert.ok(sys.includes('"$$x=\\\\frac{1}{2}$$"'), '이스케이프 예시가 두 번 쓴 백슬래시가 아니다');
   // 수식을 코드블록에 넣으면 글자 그대로 보인다 — 실제로 'latex 수식 10개' 요청의 답이 통째로
