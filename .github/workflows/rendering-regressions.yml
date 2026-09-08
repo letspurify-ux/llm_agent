@@ -1,0 +1,23 @@
+name: Rendering regressions
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  rendering:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            backend/package-lock.json
+      - run: npm ci --prefix frontend
+      - run: npm ci --prefix backend
+      # Hosted runner의 Chrome을 실제로 실행하며, 누락 시 검사는 실패한다.
+      - run: npm --prefix frontend run test:regression

@@ -21,7 +21,7 @@ export const alive = pid => {
 // 우두머리가 죽어도 렌더러 하나가 남으면 그룹은 남는다 — 음수 pid가 그룹이다.
 export const aliveGroup = pid => alive(-pid);
 
-// 설치 위치는 OS마다 다르다. 없으면 UI 검사는 건너뛴다(단위 테스트는 그것과 무관하게 돈다).
+// 선택 실행에서는 생략할 수 있지만 정식 회귀 검사에서는 Chrome 누락도 실패다.
 const CHROME_PATHS = [
   process.env.CHROME_PATH,
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
@@ -30,11 +30,12 @@ const CHROME_PATHS = [
   '/usr/bin/chromium-browser',
 ].filter(Boolean);
 
-export async function findChrome() {
+export async function findChrome({ paths = CHROME_PATHS, required = process.env.REQUIRE_CHROME === '1' } = {}) {
   const { access } = await import('node:fs/promises');
-  for (const p of CHROME_PATHS) {
+  for (const p of paths) {
     try { await access(p); return p; } catch { /* 다음 후보 */ }
   }
+  if (required) throw new Error('정식 화면 회귀 검사에는 Chrome이 필요합니다. 설치 후 CHROME_PATH를 지정하세요.');
   return null;
 }
 

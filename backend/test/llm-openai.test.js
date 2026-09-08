@@ -5,6 +5,10 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { MATH_CORPUS, MATH_LAYOUT_CASES } from '../../frontend/test/math-corpus.js';
 import { TABLE_MATH_ANSWER } from '../../frontend/test/table-math-corpus.js';
+import { LATEX_200_MARKDOWN } from '../../frontend/test/latex-table-200.js';
+import { NESTED_MIXED_ANSWER } from '../../frontend/test/mixed-content-corpus.js';
+import { VALID_EDGE_ANSWER } from '../../frontend/test/valid-math-edge-corpus.js';
+import { TABLE_LINK_ANSWER } from '../../frontend/test/table-link-edge-corpus.js';
 
 process.env.LLM_BASE_URL = 'http://test.invalid/v1';
 process.env.LLM_MODEL = 'test';
@@ -705,6 +709,22 @@ test('forceAnswer일 때는 run_query를 결정으로 받지 않는다', async (
 // '무엇을 검증하는지'가 보이지 않게 된다. B로 한 개를 명시적으로 만든다.
 const B = String.fromCharCode(92);
 const answerOf = async content => (await decide(content))?.answer ?? null;
+
+for (const [name, answer] of Object.entries({
+  '표 안의 200개 수식': LATEX_200_MARKDOWN,
+  '중첩 Markdown·수식·차트·Mermaid': NESTED_MIXED_ANSWER,
+  '정상 입력 경계 78개': VALID_EDGE_ANSWER,
+  '참조 링크와 수식이 있는 표 180개': TABLE_LINK_ANSWER,
+})) test(`화면 회귀 원문 전송: ${name}`, async () => {
+  const raw = JSON.stringify({ action: 'answer', answer });
+  assert.equal(await answerOf(raw), answer, '최종 JSON 응답');
+  for (const size of [1, 7, 1000]) {
+    let preview = '';
+    const parser = answerPreviewer(event => { preview = event.reset ? '' : preview + event.text; });
+    for (let i = 0; i < raw.length; i += size) parser.feed(raw.slice(i, i + size));
+    assert.equal(preview, answer, `${size}자 조각 스트림`);
+  }
+});
 
 test('화면 수식 코퍼스가 JSON 응답과 모든 스트림 조각 경계에서 같은 원문으로 전달된다', async () => {
   for (const answer of [...MATH_CORPUS, ...MATH_LAYOUT_CASES, TABLE_MATH_ANSWER]) {

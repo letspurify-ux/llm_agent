@@ -9,7 +9,8 @@
     "test": "node --test test/*.test.js",
     "test:ui": "node --test --test-concurrency=1 test/ui/ui.test.mjs",
     "test:production": "node --test test/ui/production.test.mjs",
-    "test:all": "npm test && npm run test:ui && npm run test:production"
+    "test:all": "npm test && npm run test:ui && npm run test:production",
+    "test:regression": "node test/run-regressions.mjs"
   },
   "dependencies": {
     "hast-util-from-html-isomorphic": "^2.0.0",

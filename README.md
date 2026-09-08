@@ -186,6 +186,7 @@ npm test          # 순수 함수의 계약(수식 판정·차트 파싱·trace/
 npm run test:ui   # 화면 동작의 계약 — 진짜 Chrome을 headless로 띄운다 (약 2분)
 npm run test:production # 현재 소스를 빌드하고 preview 서버에서 핵심 화면 동작을 검증
 npm run test:all  # 위 셋을 차례로
+npm run test:regression # 필수 전체 회귀: 백엔드 원문 전송 + 위 셋 (Chrome 누락도 실패)
 ```
 
 `npm run test:ui`는 단위 테스트가 닿지 못하는 것을 지킨다: 답이 길어질 때 대화가 언제 따라 내려가고
@@ -196,6 +197,10 @@ npm run test:all  # 위 셋을 차례로
 
 `test:production`은 테스트용 진입점 대신 실제 빌드된 페이지를 열어 대화·수식·차트·흐름도·조회 표와
 후속 질문·홈 복귀를 확인한다. 결함 재현과 수정 내역은 [frontend 검토 기록](docs/frontend-audit.md)에 있다.
+
+수식·Markdown·차트 관련 버그별 정식 테스트는 [회귀 검사 목록](docs/rendering-regressions.md)에 정리했다.
+GitHub Actions는 모든 push/PR에서 `test:regression`을 실행한다. Node 22 이상과 Chrome,
+frontend/backend의 `npm ci`가 필요하며 실제 DB나 LLM 서버는 사용하지 않는다.
 
 #### 다른 PC에서 접속하기
 

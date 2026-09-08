@@ -5,7 +5,13 @@
 // 삼키면 15초를 기다린 끝에 엉뚱한 자리를 탓하는 말이 나온다. 둘 다 검사 결과만 보고는 알 수 없다.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { errorName } from './ui/driver.mjs';
+import { errorName, findChrome } from './ui/driver.mjs';
+
+test('필수 화면 검사는 Chrome이 없을 때 성공이나 건너뛰기로 끝나지 않는다', async () => {
+  await assert.rejects(findChrome({ paths: [], required: true }), /Chrome이 필요/);
+  assert.equal(await findChrome({ paths: [], required: false }), null);
+  assert.equal(await findChrome({ paths: ['/__missing_chrome__', process.execPath], required: true }), process.execPath);
+});
 
 test('오류는 이름으로 가른다 — 스택에 섞인 남의 이름에 속지 않는다', () => {
   // CDP가 이름(className)을 준다. 그것이 있으면 그것이 답이다.
