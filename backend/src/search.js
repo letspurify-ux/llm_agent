@@ -2,7 +2,7 @@
 // 빈 배열은 성공·0건, null은 검색 실패다. 정확한 쿼리명은 임베딩 없이도 찾는다.
 import { query, loadChunkRanges, loadQueriesByNames } from './db.js';
 import { embed, EMBEDDING_MODEL, embeddingHashExpr, isEmbeddingEnabled, warnEmbeddingFailure, embedQueryPrefix } from './embedding.js';
-import { warnOnce, SEARCH_LIMIT, MAX_DOC_LEN, MAX_EMBED_TEXT_LEN, clipText } from './constants.js';
+import { warnOnce, SEARCH_LIMIT, MIN_SEARCH_RESULTS, MAX_DOC_LEN, MAX_EMBED_TEXT_LEN, clipText } from './constants.js';
 import { planRanges, buildItems, sameChunk } from './chunk.js';
 
 const LIMIT = SEARCH_LIMIT; // 검색 한 번이 돌려주는 최대 후보 수 — 기본 20, 환경변수로 낮춘다 (constants.js SEARCH_LIMIT)
@@ -16,13 +16,10 @@ const EF_SEARCH = 150;    // MHNSW 탐색 깊이. 기본값(20)은 1024차원에
 // 되지 않는다 — 한 문서가 적중을 독차지하면 20청크가 문서 1건으로 접히고, 다른 문서는 후보에 오르지도
 // 못한 채 사라진다(실측). 문서 상한을 채우려면 청크를 그 배수만큼 받아야 한다.
 //
-// 종전에는 이 배수를 '안쪽' 질의에 걸었는데 그 자리에서는 아무 일도 하지 않았다: 바깥의 거리 필터
-// (MAX_DIST)는 거리 순서와 단조라, 상위 60건을 걸러 20건을 취하나 상위 20건을 걸러 취하나 결과가 같다.
-// 배수는 '병합 뒤 몇 항목이 남는가'에 걸어야 뜻이 있으므로 바깥 상한에 건다.
+// 거리 문턱 밖의 후보도 함께 받아 둔다. 병합 뒤 최소 개수에 못 미칠 때 가까운 순서로 보충한다.
 export const CHUNK_OVERFETCH = 3;  // (테스트에서 쓰므로 export 한다)
-const MAX_DIST = 0.4;     // 관련도 임계값 (코사인 거리). 실측: 관련 0.30~0.53, 무관 0.58~0.75.
-                          // top-K는 무관해도 항상 K건을 돌려주므로, 이 필터가 없으면 "관련 지식 없음 →
-                          // 일반 지식 답변" 폴백이 무력화된다.
+const MAX_DIST = 0.4; // 기본 관련도 문턱. 최소 개수까지만 문턱 밖의 가까운 후보를 허용한다.
+const selectMatches = rows => rows && rows.filter((row, i) => i < MIN_SEARCH_RESULTS || row._dist <= MAX_DIST);
 // 이전 버전이 저장한 영벡터·극단 벡터를 복구 SQL 실행 전에도 결과에서 제외한다.
 // 범위는 repair-invalid-vectors.sql과 같으며 정상화된 새 벡터의 노름(약 1)은 충분히 안쪽이다.
 const MIN_SAFE_NORM = 1.0842021724855044e-19;
@@ -52,9 +49,35 @@ export const vecTable = table => `vec_${table}`;
 // 성립하지 않았다는 뜻이고(파일 머리말), 병합 실패까지 그 뜻에 섞으면 모델은 '지금은 자료를 확인할
 // 수 없다'고 답한다. 청크 원문은 이미 손에 있으므로 병합 없이 그대로 싣는 편이 낫다.
 export async function searchKnowledge(text) {
-  const hits = await vectorSearch('knowledge_chunk', text, LIMIT * CHUNK_OVERFETCH);
-  if (!hits || !hits.length) return hits;
-  const plans = planRanges(hits);
+  const candidates = await vectorSearch('knowledge_chunk', text, LIMIT * CHUNK_OVERFETCH);
+  if (!candidates || !candidates.length) return candidates;
+  const hits = selectMatches(candidates);
+  let plans = planRanges(hits);
+  const addClosest = rows => {
+    const seen = new Set(hits.map(row => row.seq));
+    for (const row of rows) {
+      // 보충 읽기가 구간 안의 빈 청크를 채우면 흩어진 항목이 다시 합쳐진다.
+      // 읽기 전 임시 항목 수 대신 병합 계획의 수로 최소 개수를 판단한다.
+      if (plans.length >= MIN_SEARCH_RESULTS) break;
+      if (seen.has(row.seq)) continue;
+      seen.add(row.seq);
+      hits.push(row);
+      hits.sort((a, b) => a._dist - b._dist);
+      plans = planRanges(hits);
+    }
+  };
+  addClosest(candidates);
+  // 한 문서가 ANN 후보를 독차지하면 그 밖의 문서가 있어도 병합 결과는 한 건이다.
+  // 이때만 문서별 최근접 청크를 정확 검색해 최소 개수를 보충한다. 이미 확보한 근거는 보존한다.
+  if (plans.length < MIN_SEARCH_RESULTS && candidates.length >= LIMIT * CHUNK_OVERFETCH) {
+    try {
+      const extra = await nearestKnowledgeDocuments(await embedText(text));
+      const knownDocs = new Set(hits.map(row => row.doc_seq));
+      addClosest(extra.filter(row => !knownDocs.has(row.doc_seq)));
+    } catch (e) {
+      warnOnce('search:knowledge-minimum', `minimum candidate refill failed — keeping matched chunks: ${e.message}`);
+    }
+  }
   const fallback = searchItems(plans, hits, hits);
   try {
     // 계획된 범위의 앞뒤 한 조각씩을 함께 읽는다. 항목에 싣지는 않는다(buildItems가 계획된 범위 안에서만
@@ -70,10 +93,10 @@ export async function searchKnowledge(text) {
     const changed = new Set(hits.filter(hit => !sameChunk(hit, current.get(key(hit)))).map(hit => hit.doc_seq));
     // 변경·삭제된 문서는 확보한 적중만 보관한다. 다른 문서의 정상 보충은 계속 사용한다.
     const available = new Map([...rows.filter(row => !changed.has(row.doc_seq)), ...hits].map(row => [key(row), row]));
-    return searchItems(plans, [...available.values()], hits).slice(0, LIMIT);
+    return selectMatches(searchItems(plans, [...available.values()], hits)).slice(0, LIMIT);
   } catch (e) {
     warnOnce('search:merge', `chunk merge failed — falling back to matched chunks: ${e.message}`);
-    return fallback.slice(0, LIMIT);
+    return selectMatches(fallback).slice(0, LIMIT);
   }
 }
 
@@ -93,8 +116,8 @@ function searchItems(plans, rows, hits) {
   return items.sort((a, b) => a._dist - b._dist);
 }
 
-export function searchQaMethods(text) {
-  return vectorSearch('qa_method', text);
+export async function searchQaMethods(text) {
+  return selectMatches(await vectorSearch('qa_method', text));
 }
 
 // 쿼리 직접 검색 — qa_method 등록 없이도 검색어로 쿼리를 찾는 경로 (agent.js 라우팅의 경로B)
@@ -112,7 +135,7 @@ export async function searchQueries(text) {
       warnOnce('search:query-name', `exact query lookup failed: ${e.message}`);
     }
   }
-  return vectorSearch('query_registry', text);
+  return selectMatches(await vectorSearch('query_registry', text));
 }
 
 async function vectorSearch(table, text, limit) {
@@ -225,9 +248,7 @@ async function vecQuery(table, vector, limit) {
          VEC_DISTANCE_EUCLIDEAN(embedding, VEC_FromText(?)) AS _norm
        FROM ${vecTable(table)} ORDER BY _dist LIMIT ${n}
      ) v LEFT JOIN ${table} t ON t.seq = v.seq
-     WHERE v._dist <= ${MAX_DIST}
-       OR COALESCE(v._norm, 0) NOT BETWEEN ${MIN_SAFE_NORM} AND ${MAX_SAFE_NORM}
-     ORDER BY v._dist LIMIT ${n}`,
+     ORDER BY v._dist, v.seq LIMIT ${n}`,
     [EMBEDDING_MODEL, encoded, ZERO_VECTOR]
   );
   const valid = candidates.filter(row => !Number(row._stale) && !Number(row._invalid))
@@ -243,9 +264,8 @@ async function vecQuery(table, vector, limit) {
      WHERE v.embed_hash = ${currentHash}
        AND COALESCE(VEC_DISTANCE_EUCLIDEAN(v.embedding, VEC_FromText(?)), 0)
          BETWEEN ${MIN_SAFE_NORM} AND ${MAX_SAFE_NORM}
-       AND VEC_DISTANCE_COSINE(v.embedding, VEC_FromText(?)) <= ${MAX_DIST}
      ORDER BY _dist, v.seq LIMIT ${n}`,
-    [encoded, EMBEDDING_MODEL, ZERO_VECTOR, encoded]
+    [encoded, EMBEDDING_MODEL, ZERO_VECTOR]
   ).catch(e => {
     // 보충 실패가 이미 확보한 정상 근거까지 버리지 않게 한다. 정상 후보가 하나도
     // 없으면 상위 호출이 null(검색 불가)로 보고하며 0건으로 숨기지 않는다.
@@ -253,4 +273,25 @@ async function vecQuery(table, vector, limit) {
     warnOnce(`search:refill:${table}`, `candidate refill failed on ${table} — keeping validated matches: ${e.message}`);
     return valid;
   });
+}
+
+// 가까운 청크가 한 문서에 몰린 경우에만 사용한다. 판본·벡터 유효성을 먼저 검증하고
+// 문서별 가장 가까운 청크를 뽑으므로, 오래된 벡터나 고아 행으로 최소 개수를 채우지 않는다.
+async function nearestKnowledgeDocuments(vector) {
+  if (!vector) throw new Error('query embedding unavailable');
+  const encoded = JSON.stringify(vector);
+  const currentHash = embeddingHashExpr(SEARCH_COLUMNS.knowledge_chunk.map(c => `t.${c}`));
+  const rows = await query(
+    `SELECT ranked.* FROM (
+       SELECT t.*, VEC_DISTANCE_COSINE(v.embedding, VEC_FromText(?)) AS _dist,
+         ROW_NUMBER() OVER (PARTITION BY t.doc_seq
+           ORDER BY VEC_DISTANCE_COSINE(v.embedding, VEC_FromText(?)), t.seq) AS _doc_rank
+       FROM vec_knowledge_chunk v IGNORE INDEX (embedding) JOIN knowledge_chunk t ON t.seq = v.seq
+       WHERE v.embed_hash = ${currentHash}
+         AND COALESCE(VEC_DISTANCE_EUCLIDEAN(v.embedding, VEC_FromText(?)), 0)
+           BETWEEN ${MIN_SAFE_NORM} AND ${MAX_SAFE_NORM}
+     ) ranked WHERE _doc_rank = 1 ORDER BY _dist, seq LIMIT ${MIN_SEARCH_RESULTS}`,
+    [encoded, encoded, EMBEDDING_MODEL, ZERO_VECTOR]
+  );
+  return rows.map(({ _doc_rank, ...row }) => row);
 }

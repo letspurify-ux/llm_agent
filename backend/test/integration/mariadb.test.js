@@ -473,7 +473,8 @@ test('기존 영벡터 복구 SQL은 정상 벡터를 보존하고 멱등하며 
   assert.equal(fixed.embedded, 3);
   assert.equal(fixed.failed, 0);
   assert.equal((await syncEmbeddings()).embedded, 0);
-  assert.equal((await searchKnowledge('복구 지식\n본문')).length, 1);
+  assert.deepEqual((await searchKnowledge('복구 지식\n본문')).map(row => row.doc_seq), [1, 2],
+    '복구한 최근접 지식이 먼저 나오고, 기존 정상 지식도 최소 개수 보충에 포함된다');
 });
 
 test('복구 SQL 실행 전의 기존 불량 벡터도 정상 검색 결과를 가리거나 적중으로 나오지 않는다', async t => {
@@ -531,7 +532,7 @@ test('검증을 통과한 FP32 극단값도 DB에서 코사인 거리를 계산�
   }
 });
 
-test('세 소스의 실제 검색은 가까운 순서·반환 상한·관련도 문턱과 정상 0건을 지킨다', async t => {
+test('세 소스의 실제 검색은 가까운 순서·반환 상한을 지키고 문턱 밖에서도 최소 3건을 보충한다', async t => {
   await conn.query(await sqlFile('schema.sql'));
   for (let i = 1; i <= SEARCH_LIMIT + 2; i++) {
     await conn.query("INSERT INTO knowledge (title, content) VALUES (?, '본문')", [`검색 경계 지식 ${i}`]);
@@ -555,19 +556,78 @@ test('세 소스의 실제 검색은 가까운 순서·반환 상한·관련도 
           [atDistance((SEARCH_LIMIT + 3 - i) / (SEARCH_LIMIT + 3) * 0.35), i]);
       }
       const ranked = await search(text);
-      assert.deepEqual(ranked.map(row => row.seq), Array.from({ length: SEARCH_LIMIT }, (_, i) => SEARCH_LIMIT + 2 - i));
+      // ANN은 반환 상한 부근의 후보가 달라질 수 있다. 전수 검색과 동일한 ID 집합 대신
+      // 최근접 선두·중복 없음·반환 상한·실제 거리순을 확인한다.
+      assert.equal(ranked.length, SEARCH_LIMIT);
+      assert.equal(ranked[0].seq, SEARCH_LIMIT + 2);
+      assert.equal(new Set(ranked.map(row => row.seq)).size, ranked.length);
       assert.ok(ranked.every((row, i) => i === 0 || ranked[i - 1]._dist <= row._dist));
 
-      // 상한에 가려지지 않는 별도 검색으로 거리 문턱을 확인한다. FP32 반올림에
-      // 의존하지 않도록 현재 문턱(0.4)의 양쪽에 충분한 여유를 둔다.
-      await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?)`, [atDistance(1)]);
-      await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?) WHERE seq = 1`, [atDistance(0.39)]);
-      await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?) WHERE seq = 2`, [atDistance(0.41)]);
-      assert.deepEqual((await search(text)).map(row => row.seq), [1], '관련 없는 후보를 상한까지 채우면 안 된다');
-      await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?) WHERE seq = 1`, [atDistance(0.41)]);
-      assert.deepEqual(await search(text), [], '정상 검색의 무관한 자료는 검색 불가(null)가 아닌 0건이다');
+      // 문턱 안의 결과가 0·1·2건이면 가까운 순서로 3건, 3건 이상이면 문턱을 유지한다.
+      for (const distances of [[0.6, 0.7, 0.8, 0.9], [0.39, 0.41, 0.5, 0.6],
+        [0.2, 0.39, 0.41, 0.6], [0.1, 0.2, 0.39, 0.41], [0.1, 0.2, 0.3, 0.39]]) {
+        await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?)`, [atDistance(1)]);
+        for (const [i, distance] of distances.entries()) {
+          await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?) WHERE seq = ?`, [atDistance(distance), i + 1]);
+        }
+        const count = Math.min(SEARCH_LIMIT, Math.max(3, distances.filter(d => d <= 0.4).length));
+        const rows = await search(text);
+        assert.deepEqual(rows.map(row => row.seq), Array.from({ length: count }, (_, i) => i + 1), `${table}: ${distances}`);
+        assert.ok(rows.every((row, i) => i === 0 || rows[i - 1]._dist <= row._dist));
+      }
+
+      // 가까운 상위 후보가 무효여도 정확 검색으로 현재 유효한 최근접 3건을 보충한다.
+      for (let i = 1; i <= SEARCH_LIMIT + 2; i++) {
+        await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?) WHERE seq = ?`, [atDistance(0.5 + i / 100), i]);
+      }
+      await conn.query(`UPDATE vec_${table} SET embed_hash = 'stale', embedding = VEC_FromText(?) WHERE seq = 1`, [atDistance(0.1)]);
+      await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?) WHERE seq = 2`, [JSON.stringify(Array(1024).fill(0))]);
+      assert.deepEqual((await search(text)).map(row => row.seq), [3, 4, 5]);
+
+      // 유효한 자료 자체가 모자라면 있는 만큼만 반환한다. 빈 테이블은 정상 0건이다.
+      await conn.query(`DELETE FROM vec_${table} WHERE seq NOT IN (3, 4)`);
+      assert.deepEqual((await search(text)).map(row => row.seq), [3, 4]);
+      await conn.query(`DELETE FROM vec_${table}`);
+      assert.deepEqual(await search(text), []);
     });
   }
+});
+
+test('지식 청크가 한 문서에 몰려도 병합 후 가까운 문서로 최소 3건을 보충한다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  const count = SEARCH_LIMIT * 3 + 5;
+  for (let doc = 1; doc <= 5; doc++) {
+    await conn.query("INSERT INTO knowledge (title, content) VALUES (?, '본문')", [`최소 결과 문서 ${doc}`]);
+    const chunks = doc === 1 ? count : 1;
+    for (let no = 1; no <= chunks; no++) {
+      await conn.query(`INSERT INTO knowledge_chunk (doc_seq, chunk_no, chunk_of, doc_hash, title, content)
+        VALUES (?, ?, ?, 'fixture', ?, ?)`, [doc, no, chunks, `문서 ${doc}`, `문서 ${doc} 청크 ${no}`]);
+    }
+  }
+  const text = 'minimum merged knowledge';
+  const slot = slotOf(text);
+  const atDistance = distance => {
+    const values = Array(1024).fill(0);
+    values[slot] = 1 - distance;
+    values[(slot + 1) % values.length] = Math.sqrt(1 - values[slot] ** 2);
+    return JSON.stringify(values);
+  };
+  for (let doc = 1; doc <= 5; doc++) {
+    await conn.query(`INSERT INTO vec_knowledge_chunk (seq, embed_hash, embedding)
+      SELECT seq, MD5(CONCAT_WS(CHAR(10), ?, title, content)), VEC_FromText(?) FROM knowledge_chunk WHERE doc_seq = ?`,
+      [EMBEDDING_MODEL, atDistance(0.5 + doc / 20), doc]);
+  }
+  // 다른 가까운 문서도 판본이 오래됐거나 벡터가 무효하면 보충 대상에서 제외한다.
+  await conn.query("UPDATE vec_knowledge_chunk SET embed_hash = 'stale' WHERE seq = ?", [count + 1]);
+  await conn.query('UPDATE vec_knowledge_chunk SET embedding = VEC_FromText(?) WHERE seq = ?', [JSON.stringify(Array(1024).fill(0)), count + 2]);
+  const before = embedCalls;
+  searchStatements = [];
+  const rows = await searchKnowledge(text);
+  assert.deepEqual(rows.map(row => row.doc_seq), [1, 4, 5]);
+  assert.ok(rows.every((row, i) => i === 0 || rows[i - 1]._dist <= row._dist));
+  assert.equal(embedCalls - before, 1, '문서 보충에서도 같은 질의 임베딩을 재사용한다');
+  assert.equal(searchStatements.filter(entry => entry.sql.includes('ROW_NUMBER()')).length, 1);
+  assert.ok(rows.every(row => !('_doc_rank' in row)));
 });
 
 test('기존 v3 청크는 규칙 변경으로 자동 재분할되며 문서 공백과 seq를 보존한다', async () => {

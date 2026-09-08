@@ -274,6 +274,9 @@ test('설정 파일에 적을 수 있는 환경변수를 실제로 채워도 모
     { env: { ...process.env, ...env }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   assert.equal(load({ SEARCH_LIMIT: '', MAX_SEARCHES: '' }), '20 3', '기본값');
   assert.equal(load({ SEARCH_LIMIT: '10', MAX_SEARCHES: '2' }), '10 2', '값을 채운 설치에서 뜨지 않는다');
+  for (const limit of ['1', '2', '3']) {
+    assert.equal(load({ SEARCH_LIMIT: limit, MAX_SEARCHES: '3' }), '3 3', '검색 후보 최소 3건을 보장한다');
+  }
   assert.equal(load({ SEARCH_LIMIT: '999', MAX_SEARCHES: '9' }), '20 3', '상한을 넘으면 상한으로');
   assert.equal(load({ SEARCH_LIMIT: 'abc' }), '20 3', '오타는 기본값으로');
 });

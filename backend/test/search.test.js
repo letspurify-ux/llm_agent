@@ -11,6 +11,7 @@ import { buildPrompt } from '../src/llm-openai.js';
 import { canGrow } from '../src/chunk.js';
 import { EMBEDDING_MODEL } from '../src/embedding.js';
 import { vector } from './fixtures/vector.js';
+import { SEARCH_LIMIT } from '../src/constants.js';
 import { searchKnowledge, searchQaMethods, searchQueries, warmUpEmbedding, SEARCH_COLUMNS, vecTable, CHUNK_OVERFETCH } from '../src/search.js';
 
 async function withSearchDb(context, query, run) {
@@ -253,6 +254,39 @@ test('한 문서의 두 검색 구간이 보충 읽기 뒤에도 각각 남는�
   }, async () => {
     const items = await searchKnowledge('두 정책 비교');
     assert.deepEqual(items.map(r => [r.from, r.content]), [[3, 'A 절 근거'], [45, 'B 절 근거']]);
+  });
+});
+
+test('지식 보충 읽기가 세 청크를 한 구간으로 합쳐도 다른 가까운 구간으로 최소 3건을 채운다', async context => {
+  const chunks = Array.from({ length: 5 }, (_, i) => ({ seq: i + 1, doc_seq: 1, chunk_no: i + 1,
+    chunk_of: 5, title: '절차', content: `본문 ${i + 1}`, _dist: 0.2 + i / 100 }));
+  const others = [2, 3, 4].map((doc, i) => ({ seq: doc * 10, doc_seq: doc, chunk_no: 1,
+    chunk_of: 1, title: `다른 문서 ${doc}`, content: `다른 본문 ${doc}`, _dist: 0.6 + i / 10 }));
+  await withSearchDb(context, async sql => {
+    if (sql.includes('vec_knowledge_chunk')) return [chunks[0], chunks[2], chunks[4], ...others];
+    if (sql.includes('FROM knowledge_chunk')) return [...chunks, ...others];
+    assert.fail(sql);
+  }, async () => {
+    const rows = await searchKnowledge('병합 후 최소 결과');
+    assert.deepEqual(rows.map(row => row.doc_seq), [1, 2, 3]);
+    assert.deepEqual(rows[0].chunks.map(chunk => chunk.seq), [1, 2, 3, 4, 5]);
+  });
+});
+
+test('문서별 최소 후보 보충이 실패해도 이미 검증한 지식은 보존한다', async context => {
+  const count = SEARCH_LIMIT * CHUNK_OVERFETCH;
+  const hits = Array.from({ length: count }, (_, i) => ({ seq: i + 1, doc_seq: 1, chunk_no: i + 1,
+    chunk_of: count, title: '확보한 지식', content: `청크 ${i + 1}`, _dist: 0.5 + i / 1000 }));
+  let refills = 0;
+  await withSearchDb(context, async sql => {
+    if (sql.includes('ROW_NUMBER()')) { refills++; throw new Error('minimum document refill timeout'); }
+    if (sql.includes('vec_knowledge_chunk') || sql.includes('FROM knowledge_chunk')) return hits;
+    assert.fail(sql);
+  }, async () => {
+    const rows = await searchKnowledge('문서 보충 장애');
+    assert.equal(refills, 1);
+    assert.equal(rows.length, 1);
+    assert.deepEqual(rows[0].chunks.map(chunk => chunk.seq), hits.map(hit => hit.seq));
   });
 });
 

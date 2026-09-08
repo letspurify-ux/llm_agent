@@ -200,12 +200,17 @@ export const MAX_STEPS = 5;
 // 진도를 내지 못하는 것으로 보이면 줄인다. 올리지는 못한다: 이력의 최소 몫이 이 상한을 전제로 검증된다.
 export const MAX_SEARCHES_CEILING = 3;
 export const MAX_SEARCHES = boundedEnv('MAX_SEARCHES', MAX_SEARCHES_CEILING, MAX_SEARCHES_CEILING);
-// 검색 한 번이 소스당 돌려주는 최대 후보 수 (search.js). 환경변수로 '낮출' 수 있다 (SEARCH_LIMIT=1~20) —
+// 검색 한 번이 소스당 돌려주는 최대 후보 수 (search.js). 환경변수로 '낮출' 수 있다 (SEARCH_LIMIT=3~20) —
 // 모델이 검색어를 핵심 낱말로 쓰므로 후보 정밀도가 높고, 후보를 줄이면 스텝마다 다시 보내는 prefill이 그만큼 준다.
 // 근거는 계측이다: 검색 뒤 LLM 호출의 prompt 토큰(trace.timing.llm[].prompt)과 적중 수(search.knowledge 등)가
 // 상한에 붙어 있는가(README '검색 후보 수·검색 횟수 조정'). 올리지는 못한다: 프롬프트 최소 몫이 이 값을 전제한다.
 export const MAX_SEARCH_LIMIT = 20;
-export const SEARCH_LIMIT = boundedEnv('SEARCH_LIMIT', MAX_SEARCH_LIMIT, MAX_SEARCH_LIMIT);
+export const MIN_SEARCH_RESULTS = 3; // 거리 문턱 안의 자료가 적으면 가까운 후보로 보충한다.
+const configuredSearchLimit = boundedEnv('SEARCH_LIMIT', MAX_SEARCH_LIMIT, MAX_SEARCH_LIMIT);
+export const SEARCH_LIMIT = Math.max(MIN_SEARCH_RESULTS, configuredSearchLimit);
+if (configuredSearchLimit < MIN_SEARCH_RESULTS) {
+  console.warn(`[env] SEARCH_LIMIT=${configuredSearchLimit} is below the minimum (${MIN_SEARCH_RESULTS}) — using ${MIN_SEARCH_RESULTS}.`);
+}
 // 이력(history)에 남길 수 있는 줄 수의 상한. 프롬프트 예산의 이력 몫(PROMPT_FLOORS.history)이 '이만큼은
 // 반드시 전부 실린다'를 보장하는 근거이므로, 루프가 이 수를 넘겨 기록하면 그 보장이 조용히 깨진다 —
 // 넘친 만큼 가장 오래된 줄이 프롬프트에서 빠지고, 그것은 앞선 조회가 통째로 헛수고가 됐다는 뜻이다.
