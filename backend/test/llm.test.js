@@ -23,6 +23,32 @@ test('조립할 것이 없으면 null이다', () => {
   assert.equal(renderAnswer({ knowledge: [], history: [] }), null);
 });
 
+test('검색 실패만 있는 Mock 답변은 미등록 자료라고 단정하지 않는다', async t => {
+  const saved = process.env.LLM_PROVIDER;
+  process.env.LLM_PROVIDER = 'mock';
+  t.after(() => { if (saved === undefined) delete process.env.LLM_PROVIDER; else process.env.LLM_PROVIDER = saved; });
+  const base = { question: '사내 운영 규칙', chat: [], knowledge: [], qaMethods: [], queries: [] };
+  const search = { search: base.question, targets: ['knowledge'], hits: { knowledge: null }, failed: ['knowledge'] };
+  for (const forceAnswer of [false, true]) {
+    const decision = await llm.decide({ ...base, history: [search], forceAnswer });
+    assert.equal(decision.action, 'answer');
+    assert.match(decision.answer, /자료 검색.*실패/);
+    assert.doesNotMatch(decision.answer, /등록된 지식에 없는|일반 지식으로 답변/);
+  }
+  const empty = await llm.decide({ ...base, history: [{ ...search, failed: [], hits: { knowledge: 0 } }] });
+  assert.match(empty.answer, /등록된 지식에 없는/, '실제로 성립한 0건 검색은 기존 안내를 유지한다');
+});
+
+test('대체 답변은 일부 검색 실패를 알리면서 확보한 지식과 조회 결과를 보존한다', () => {
+  const answer = renderAnswer({ knowledge: [{ title: '운영 안내', content: '상태 FAILED를 확인한다' }], history: [
+    { search: '운영 규칙', targets: ['knowledge', 'qa_method'], failed: ['qa_method'] },
+    ok('상태_조회', [{ STATUS: 'FAILED' }]),
+  ] });
+  assert.match(answer, /자료 검색.*실패/);
+  assert.match(answer, /상태_조회 조회 결과/);
+  assert.match(answer, /상태 FAILED를 확인한다/);
+});
+
 test('조회 결과를 표로 렌더한다', () => {
   const a = renderAnswer({ knowledge: [], history: [ok('q', [{ A: 1, B: 'x' }])] });
   assert.match(a, /### q 조회 결과/);

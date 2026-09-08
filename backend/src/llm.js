@@ -13,7 +13,7 @@
 // agent.js는 provider가 바뀌어도 변경되지 않는다.
 import { openaiDecide } from './llm-openai.js';
 import { bindNames } from './sql.js';
-import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, MAX_SEARCH_TEXT_LEN, MAX_BATCH_QUERIES, MAX_EXPANDS, MAX_DROPS, SEARCH_TARGETS, normalizeSearchTargets, normalizeItemIds, clipText, nameKey, ownProp, warnOnce, targetDbNames, isPlainObject, stripLoneSurrogates} from './constants.js';
+import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, MAX_SEARCH_TEXT_LEN, MAX_BATCH_QUERIES, MAX_EXPANDS, MAX_DROPS, SEARCH_TARGETS, normalizeSearchTargets, normalizeItemIds, clipText, nameKey, nameIndexOf, ownProp, warnOnce, targetDbNames, isPlainObject, stripLoneSurrogates} from './constants.js';
 import { rowCounts } from './result.js';
 import { escapeCell } from './chart.js';
 import { normalizeResultRead } from './read-result.js';
@@ -307,9 +307,9 @@ function plannedQueries(qaMethods, queries) {
     // NULL을 견딘다 — schema.sql의 NOT NULL이 유일한 방어막이라 컬럼 하나가 완화되거나 임포터가
     // NULL 행을 넣는 순간 여기서 죽는다. 이 값의 다른 소비자(llm-openai clip, embed-sync toText,
     // 벡터 검색 SQL)는 전부 NULL을 견디는데 이 한 곳만 raw로 역참조하고 있었다.
-    const method = String(m.method ?? '').toLowerCase();
+    const method = String(m.method ?? '');
     const found = queries
-      .map(q => ({ q, pos: method.indexOf(nameKey(q.query_name)) }))
+      .map(q => ({ q, pos: nameIndexOf(method, q.query_name) }))
       .filter(x => x.pos >= 0)
       .sort((a, b) => a.pos - b.pos);
     for (const { q } of found) {
@@ -452,6 +452,12 @@ export function renderAnswer({ knowledge, history }) {
     // 이유(context.md 2-5)가 사용자에게도 그대로 성립하는 자리다. 이 답변은 LLM이 죽었을 때 사용자가
     // 읽는 유일한 본문이라 특히 그렇다. 청크가 아닌 항목에는 range가 없어 지금까지와 같은 제목만 나간다.
     parts.push(`### 관련 지식: ${attach.title ?? ''}${attach.range ?? ''}\n\n${content(attach)}`);
+  }
+  // 검색 불가를 빈 자료로만 보면 Mock은 '미등록 지식'이라고 답하고,
+  // 실제 LLM 장애 시의 대체 답변도 부분 검색 실패를 숨긴다. 확보한 결과와 함께 상태를 알린다.
+  if (history.some(h => h.search !== undefined && !h.note && h.failed?.length)) {
+    parts.unshift(`*자료 검색에 실패한 항목이 있습니다. ${parts.length
+      ? '확인된 자료만으로 정리했습니다.' : '잠시 후 다시 시도해주세요.'}*`);
   }
   return parts.length ? parts.join('\n\n') : null;
 }

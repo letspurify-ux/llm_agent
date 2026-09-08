@@ -18,7 +18,7 @@ import { vector } from '../fixtures/vector.js';
 import { EMBEDDING_MODEL, normalizeEmbedding } from '../../src/embedding.js';
 import { SEARCH_LIMIT } from '../../src/constants.js';
 import { buildPrompt } from '../../src/llm-openai.js';
-import { sanitizeDecision } from '../../src/llm.js';
+import { llm, sanitizeDecision } from '../../src/llm.js';
 import { runQuery } from '../../src/oracle.js';
 
 const exec = promisify(execFile);
@@ -556,25 +556,31 @@ test('세 소스의 실제 검색은 가까운 순서·반환 상한을 지키�
           [atDistance((SEARCH_LIMIT + 3 - i) / (SEARCH_LIMIT + 3) * 0.35), i]);
       }
       const ranked = await search(text);
-      // ANN은 반환 상한 부근의 후보가 달라질 수 있다. 전수 검색과 동일한 ID 집합 대신
-      // 최근접 선두·중복 없음·반환 상한·실제 거리순을 확인한다.
+      // ANN은 전수 검색과 다른 후보를 고를 수 있다. 같은 ID 집합 대신
+      // 중복 없음·반환 상한·실제 거리순을 확인한다. 최근접 ID도 ANN의 보장은 아니다.
       assert.equal(ranked.length, SEARCH_LIMIT);
-      assert.equal(ranked[0].seq, SEARCH_LIMIT + 2);
       assert.equal(new Set(ranked.map(row => row.seq)).size, ranked.length);
       assert.ok(ranked.every((row, i) => i === 0 || ranked[i - 1]._dist <= row._dist));
 
       // 문턱 안의 결과가 0·1·2건이면 가까운 순서로 3건, 3건 이상이면 문턱을 유지한다.
+      // 반복 UPDATE 뒤 ANN은 가까운 행도 놓칠 수 있다. 개수·문턱의 정확한 경계는
+      // 최근접 고아 후보로 정확 보충 경로를 실행해 검사한다. 정상 ANN 경로는 위에서 검사했다.
+      await conn.query(`INSERT INTO vec_${table} (seq, embed_hash, embedding) VALUES (-1, 'orphan', VEC_FromText(?))`,
+        [atDistance(0)]);
       for (const distances of [[0.6, 0.7, 0.8, 0.9], [0.39, 0.41, 0.5, 0.6],
         [0.2, 0.39, 0.41, 0.6], [0.1, 0.2, 0.39, 0.41], [0.1, 0.2, 0.3, 0.39]]) {
-        await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?)`, [atDistance(1)]);
+        await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?) WHERE seq > 0`, [atDistance(1)]);
         for (const [i, distance] of distances.entries()) {
           await conn.query(`UPDATE vec_${table} SET embedding = VEC_FromText(?) WHERE seq = ?`, [atDistance(distance), i + 1]);
         }
         const count = Math.min(SEARCH_LIMIT, Math.max(3, distances.filter(d => d <= 0.4).length));
+        searchStatements = [];
         const rows = await search(text);
+        assert.ok(searchStatements.some(entry => entry.sql.includes('IGNORE INDEX (embedding)')), '정확 보충 경로가 실행되어야 한다');
         assert.deepEqual(rows.map(row => row.seq), Array.from({ length: count }, (_, i) => i + 1), `${table}: ${distances}`);
         assert.ok(rows.every((row, i) => i === 0 || rows[i - 1]._dist <= row._dist));
       }
+      await conn.query(`DELETE FROM vec_${table} WHERE seq = -1`);
 
       // 가까운 상위 후보가 무효여도 정확 검색으로 현재 유효한 최근접 3건을 보충한다.
       for (let i = 1; i <= SEARCH_LIMIT + 2; i++) {
@@ -782,6 +788,33 @@ test('Unicode 대소문자 변환이 있는 쿼리명도 정확 검색과 처리
       } finally { process.env.EMBEDDING_URL = saved; }
     });
   }
+});
+
+test('Unicode 이름은 본문 주변 글자와 무관하게 실제 검색에서 Mock 실행까지 연결된다', async t => {
+  await conn.query(await sqlFile('schema.sql'));
+  const names = ['Σ', 'ΟΣ', 'İΣ'];
+  for (const name of names) {
+    await conn.query("INSERT INTO query_registry (query_name, query_sql, target_db_name) VALUES (?, 'SELECT 1 FROM dual', 'DB')", [name]);
+  }
+  const method = 'AΣ를 실행하고 ΟΣA를 실행한 뒤 İΣA를 실행한다';
+  await conn.query('INSERT INTO qa_method (title, method) VALUES (?, ?)', ['Unicode 절차', method]);
+  assert.equal((await syncEmbeddings()).failed, 0);
+  assert.deepEqual((await loadQueriesMentionedIn(method)).map(row => row.query_name), names);
+  const saved = process.env.LLM_PROVIDER;
+  process.env.LLM_PROVIDER = 'mock';
+  t.after(() => { if (saved === undefined) delete process.env.LLM_PROVIDER; else process.env.LLM_PROVIDER = saved; });
+  const executed = [];
+  const result = await handleQuestion('Unicode 절차', [], { deps: {
+    decide: ctx => ctx.history.length
+      ? llm.decide(ctx)
+      : { action: 'search', text: `Unicode 절차\n${method}`, targets: ['qa_method'] },
+    run: async row => {
+      executed.push(row.query_name);
+      return { rows: [{ VALUE: executed.length }], totalRows: 1, capped: false, targetDb: 'DB' };
+    },
+  } });
+  assert.equal(result.trace[0].hits.queries, 3, 'agent가 본문을 먼저 소문자화해 라우팅을 망가뜨리면 안 된다');
+  assert.deepEqual(executed, names, 'Mock의 실행 계획도 실제 라우팅과 같은 이름 판정을 사용한다');
 });
 
 test('등록 1000건의 라우팅은 이름 인덱스와 상위 30건 상세 조회 두 번으로 끝난다', async t => {

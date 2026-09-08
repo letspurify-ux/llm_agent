@@ -1159,10 +1159,10 @@ const DETAIL_TOP = 5;
 // 본문은 검색 결과 순서대로 이어 붙인다 — 위치 순서가 곧 '관련도 높은 처리방법 먼저, 그 안에서는
 // 등장 순서대로'가 된다. method는 NOT NULL이지만 컬럼 하나가 완화되거나 임포터가 NULL을 넣는
 // 순간 여기서 죽는다 — 이 값의 다른 소비자(llm-openai clip, embed-sync toText)는 전부 NULL을 견딘다.
-// 소문자화는 자르기 전에 한다 (자른 뒤에 하면 길이가 상한을 넘을 수 있다).
+// 원문을 상한 안에서 넘긴다. 본문 전체를 소문자화하면 주변 글자 때문에 이름의 판정이 달라진다.
 async function selectQueries(qaMethods, direct) {
   const routeText = clipText(
-    qaMethods.map(m => String(m.method ?? '')).join('\n').toLowerCase(),
+    qaMethods.map(m => String(m.method ?? '')).join('\n'),
     MAX_ROUTE_TEXT_LEN
   );
   const named = await loadQueriesMentionedIn(routeText, MAX_PROMPT_QUERIES);   // 빈 본문이면 왕복하지 않는다 (db.js)

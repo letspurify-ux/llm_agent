@@ -1,6 +1,6 @@
 // MariaDB (agent 관리 DB) 커넥션 풀 + 관리 테이블 로더
 import mariadb from 'mariadb';
-import { numEnv, nameKey, stripLoneSurrogates } from './constants.js';
+import { numEnv, nameKey, nameIndexOf, stripLoneSurrogates } from './constants.js';
 
 // 풀은 처음 쓸 때 만든다 — import만으로 만들면 이 모듈을 (간접적으로라도) 불러오는 모든 코드가
 // DB에 접속을 시도한다. 검색 로직만 import하는 테스트가 MariaDB 기동 여부에 따라 10초씩 매달리는 식이다.
@@ -179,12 +179,10 @@ const queriesByIds = ids => ids.length
 // 본문에 맞는 상위 후보만 PK로 읽는다. 등록된 SQL·설명 전체를 전송하거나 캐시하지 않는다.
 // limit은 호출부의 후보 상한이다. 두 SELECT 사이 변경된 이름도 상세를 받은 뒤 재검증한다.
 export async function loadQueriesMentionedIn(text, limit = Infinity) {
-  const body = String(text ?? '').toLowerCase();
+  const body = String(text ?? '');
   if (!body.trim() || limit <= 0) return [];
-  const matching = rows => rows.map(r => {
-    const name = nameKey(r.query_name);
-    return { ...r, _pos: name ? body.indexOf(name) : -1 };
-  }).filter(r => r._pos >= 0).sort((a, b) => a._pos - b._pos || a.seq - b.seq);
+  const matching = rows => rows.map(r => ({ ...r, _pos: nameIndexOf(body, r.query_name) }))
+    .filter(r => r._pos >= 0).sort((a, b) => a._pos - b._pos || a.seq - b.seq);
   const refs = matching(await queryNames()).slice(0, limit);
   return matching(await queriesByIds(refs.map(r => r.seq)));
 }

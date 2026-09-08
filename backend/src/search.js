@@ -124,6 +124,7 @@ export async function searchQaMethods(text) {
 export async function searchQueries(text) {
   const name = String(text ?? '').trim();
   if (!name) return [];
+  let exactFailed = false;
   // query_name의 UNIQUE 인덱스로 정확한 이름을 먼저 해석한다. 적중하면 임베딩도 필요 없다.
   // VARCHAR(100)의 이름과 소문자 변형은 UTF-16 최대 200자다.
   // İ → i + 결합점처럼 문자 수도 늘 수 있으므로 코드포인트 100자로 제한하지 않는다.
@@ -132,10 +133,14 @@ export async function searchQueries(text) {
       const exact = await loadQueriesByNames([name]);
       if (exact.length) return exact.map(row => ({ ...row, exact: true }));
     } catch (e) {
+      exactFailed = true;
       warnOnce('search:query-name', `exact query lookup failed: ${e.message}`);
     }
   }
-  return selectMatches(await vectorSearch('query_registry', text));
+  const matches = selectMatches(await vectorSearch('query_registry', text));
+  // 아직 임베딩되지 않은 등록명도 정확 조회로 찾을 수 있다. 그 조회가 실패했으면
+  // 빈 벡터 결과만으로 정상 0건이라고 단정하지 않는다. 그래야 같은 검색을 재시도할 수 있다.
+  return exactFailed && !matches?.length ? null : matches;
 }
 
 async function vectorSearch(table, text, limit) {

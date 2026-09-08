@@ -199,6 +199,49 @@ test('정확한 이름이 없으면 벡터 검색으로 이어진다', async con
   });
 });
 
+test('정확 이름 조회가 실패하고 벡터 후보도 없으면 검색 불가로 남겨 재시도할 수 있다', async context => {
+  const registered = { seq: 9, query_name: 'pending_query', query_sql: 'SELECT 1 FROM dual' };
+  let nameReads = 0;
+  await withSearchDb(context, async sql => {
+    if (sql.includes('query_name IN')) {
+      if (++nameReads === 1) throw new Error('fixture temporary exact lookup failure');
+      return [registered];
+    }
+    // 새 등록 직후 아직 벡터 동기화가 되지 않은 쿼리다.
+    if (sql.includes('vec_query_registry')) return [];
+    assert.fail(sql);
+  }, async () => {
+    const snapshots = [];
+    const events = [];
+    let turn = 0;
+    const result = await handleQuestion('pending_query 조회', [], { onEvent: e => events.push(e), deps: {
+      decide: async ctx => {
+        snapshots.push(buildPrompt(ctx));
+        return ++turn <= 2
+          ? { action: 'search', text: registered.query_name, targets: ['query'] }
+          : { action: 'answer', answer: '확인 완료' };
+      },
+    } });
+    assert.deepEqual(result.trace[0].failed, ['query'], '이름을 읽지 못했는데 정상 0건으로 기록했다');
+    assert.equal(result.trace[0].hits.queries, 0);
+    assert.match(snapshots[1], /쿼리 검색 불가/);
+    assert.equal(nameReads, 2, '장애를 정상 0건으로 오인하면 같은 검색의 복구 시도가 차단된다');
+    assert.equal(result.search.searches, 2);
+    assert.equal(result.search.queries, 1);
+    assert.ok(snapshots[2].includes(registered.query_name));
+    assert.deepEqual(events.filter(e => e.type === 'search_done').map(e => e.failed ?? []), [['query'], []]);
+  });
+});
+
+test('정확 이름 조회가 실패해도 성공한 벡터 후보는 보존한다', async context => {
+  const match = { seq: 4, query_name: 'semantic_match', query_sql: 'SELECT 1 FROM dual', _dist: 0.2 };
+  await withSearchDb(context, async sql => {
+    if (sql.includes('query_name IN')) throw new Error('fixture exact lookup failure with vector result');
+    if (sql.includes('vec_query_registry')) return [match];
+    assert.fail(sql);
+  }, async () => assert.deepEqual(await searchQueries('이름 조회 장애 중 검색'), [match]));
+});
+
 test('라우팅은 이름만 훑고 상위 후보의 상세만 읽으며 중간 이름 변경은 제외한다', async context => {
   const names = Array.from({ length: 100 }, (_, i) => ({ seq: i + 1, query_name: `q${String(i).padStart(3, '0')}` }));
   let reads = 0;
@@ -213,6 +256,24 @@ test('라우팅은 이름만 훑고 상위 후보의 상세만 읽으며 중간 
     const rows = await loadQueriesMentionedIn([...names].reverse().map(r => r.query_name).join(' '), 3);
     assert.deepEqual(rows.map(r => r.seq), [100, 98]);
     assert.equal(reads, 2);
+  });
+});
+
+test('본문 주변 글자가 대소문자 변환을 바꿔도 실제로 적힌 쿼리명을 라우팅한다', async context => {
+  const registered = [
+    { seq: 1, query_name: 'Σ', query_sql: 'SELECT 1 FROM dual' },
+    { seq: 2, query_name: 'ΟΣ', query_sql: 'SELECT 2 FROM dual' },
+    { seq: 3, query_name: 'İΣ', query_sql: 'SELECT 3 FROM dual' },
+  ];
+  await withSearchDb(context, async (sql, params) => {
+    if (sql === 'SELECT seq, query_name FROM query_registry') return registered;
+    if (sql.includes('WHERE seq IN')) return registered.filter(row => params.includes(row.seq));
+    assert.fail(sql);
+  }, async () => {
+    // Σ는 홀로 소문자화하면 σ지만 AΣ 안에서는 ς가 된다. ΟΣ는 뒤에 A가 오면 반대다.
+    assert.deepEqual((await loadQueriesMentionedIn('AΣ를 먼저 실행하고 ΟΣA를 실행')).map(row => row.query_name), ['Σ', 'ΟΣ']);
+    assert.deepEqual((await loadQueriesMentionedIn('İΣA 실행')).map(row => row.query_name), ['İΣ', 'Σ']);
+    assert.deepEqual(await loadQueriesMentionedIn('ς 실행'), [], '다른 nameKey를 가진 소문자를 동일 이름으로 취급하지 않는다');
   });
 });
 
@@ -271,6 +332,34 @@ test('지식 보충 읽기가 세 청크를 한 구간으로 합쳐도 다른 �
     assert.deepEqual(rows.map(row => row.doc_seq), [1, 2, 3]);
     assert.deepEqual(rows[0].chunks.map(chunk => chunk.seq), [1, 2, 3, 4, 5]);
   });
+});
+
+test('세 소스는 ANN이 반환한 후보의 거리 문턱과 최소 3건을 적용한다', async t => {
+  const cases = [
+    { distances: [], ids: [] },
+    { distances: [0.8, 0.9], ids: [1, 2] },
+    { distances: [0.6, 0.7, 0.8, 0.9], ids: [1, 2, 3] },
+    { distances: [0.39, 0.41, 0.5, 0.6], ids: [1, 2, 3] },
+    { distances: [0.2, 0.39, 0.41, 0.6], ids: [1, 2, 3] },
+    { distances: [0.1, 0.2, 0.3, 0.4, 0.40001], ids: [1, 2, 3, 4] },
+  ];
+  for (const [source, search] of [['knowledge', searchKnowledge], ['qa_method', searchQaMethods], ['query', searchQueries]]) {
+    await t.test(source, async t => {
+      let candidates = [];
+      await withSearchDb(t, async sql => {
+        if (sql.includes('query_name IN')) return [];
+        if (sql.includes('FROM knowledge_chunk')) return candidates;
+        return candidates.slice(0, source === 'knowledge' ? SEARCH_LIMIT * CHUNK_OVERFETCH : SEARCH_LIMIT);
+      }, async () => {
+        for (const { distances, ids } of cases) {
+          candidates = distances.map((_dist, i) => ({ seq: i + 1, _dist, title: `자료 ${i + 1}`,
+            content: '본문', method: '처리방법', query_name: `q${i + 1}`,
+            ...(source === 'knowledge' && { doc_seq: i + 1, chunk_no: 1, chunk_of: 1 }) }));
+          assert.deepEqual((await search(`거리 경계 ${source}`)).map(row => row.seq), ids.slice(0, SEARCH_LIMIT));
+        }
+      });
+    });
+  }
 });
 
 test('문서별 최소 후보 보충이 실패해도 이미 검증한 지식은 보존한다', async context => {

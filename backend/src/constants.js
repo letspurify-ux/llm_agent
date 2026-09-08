@@ -462,6 +462,26 @@ export const MAX_BIND_NAME_LEN = 128;
 // 한 곳이라도 ===로 남으면 그 경로에서만 가드가 조용히 무력화된다.
 export const nameKey = s => String(s ?? '').trim().toLowerCase();
 
+// 이름이 적힌 원문 구간 자체를 nameKey로 확인한다. 본문 전체를 먼저 소문자화하면
+// Σ의 변환이 주변 글자에 따라 바뀌어, 실제로 적힌 이름도 누락되거나 다른 이름에 적중한다.
+// 정규식은 리터럴 후보를 찾는 데만 쓰고 더 넓은 /iu 동등성(ς/σ, ſ/s)은 nameKey로 재검증한다.
+export function nameIndexOf(text, name) {
+  const body = String(text ?? '');
+  const key = nameKey(name);
+  if (!key) return -1;
+  // JS 기본 소문자화에서 여러 코드포인트로 늘어나는 İ도 양쪽 표기를 받는다.
+  const literal = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    .replaceAll('i\u0307', '(?:i\u0307|İ)');
+  const pattern = new RegExp(literal, 'giu');
+  let match;
+  while ((match = pattern.exec(body))) {
+    if (nameKey(match[0]) === key) return match.index;
+    // 거절한 후보와 겹치는 다음 후보도 본다 (예: ſss 안의 등록명 ss).
+    pattern.lastIndex = match.index + (body.codePointAt(match.index) > 0xffff ? 2 : 1);
+  }
+  return -1;
+}
+
 // target_db.db_name의 VARCHAR(100)은 Unicode 문자 수다. 실행 식별자를 보존하려면
 // 프롬프트·결정·실행 경계의 UTF-16 상한은 보충 평면 문자까지 200칸이어야 한다.
 export const MAX_TARGET_DB_NAME_LEN = 200;

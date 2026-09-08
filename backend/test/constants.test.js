@@ -6,10 +6,24 @@ import assert from 'node:assert';
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { clipText, nameKey, stripLoneSurrogates, numEnv, bindValue, warnOnce, targetDbNames, joinUrl, isPlainObject,
+import { clipText, nameKey, nameIndexOf, stripLoneSurrogates, numEnv, bindValue, warnOnce, targetDbNames, joinUrl, isPlainObject,
   readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_COMPLETION_TOKENS, normalizeSearchTargets, SEARCH_TARGETS, boundedEnv,
   MAX_SEARCHES, MAX_SEARCHES_CEILING, SEARCH_LIMIT, MAX_SEARCH_LIMIT,
   parseItemId, normalizeItemIds, MAX_EXPANDS, MAX_DOC_LEN, MAX_EXPANDED_ITEM_LEN, MAX_PROMPT_TOTAL_LEN, PROMPT_FRAME_RESERVE, PROMPT_FLOORS as FLOORS, PROMPT_CEILINGS } from '../src/constants.js';
+
+test('이름의 본문 대조는 Unicode 변형·겹친 후보·리터럴 기호와 원문 위치를 보존한다', () => {
+  for (const [text, name, position] of [
+    ['AΣ 실행', 'Σ', 1], ['ΟΣA 실행', 'ΟΣ', 0], ['ς 실행', 'Σ', -1],
+    ['İΣA 실행', 'İΣ', 0], ['i\u0307ς 실행', 'İΣ', 0],
+    ['İ 뒤 Q를 실행', 'q', 4], ['ſss 실행', 'ss', 1], ['ſ 실행', 's', -1],
+    ['𐐀조회 실행', '𐐨조회', 0], ['K조회 실행', 'k조회', 0],
+    ['résumé 실행', 'resume', -1], ['📈조회 실행', '📊조회', -1],
+    ['Q_1 Q.2 Q+3 Q[4] Q(5) Q$6 Q%7', 'q.2', 4],
+    ['Q_1 Q.2 Q+3 Q[4] Q(5) Q$6 Q%7', 'q+3', 8],
+    ['Q[4] 실행', 'q[4]', 0], ['다른 qX2 실행', 'q.2', -1],
+    ['빈 이름은 매칭하지 않는다', '', -1],
+  ]) assert.equal(nameIndexOf(text, name), position, `${JSON.stringify(text)} / ${name}`);
+});
 
 test('절단이 서로게이트 쌍을 쪼개지 않는다', () => {
   // 쪼개면 짝 잃은 코드유닛이 남아 JSON은 통과하지만 유효한 UTF-8이 아니게 된다 —
