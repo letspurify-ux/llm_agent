@@ -24,7 +24,16 @@ test('production 교차 조합 회귀: 오류 격리·중첩 참조·각주·Mer
   const { stdout } = await promisify(execFile)(process.execPath,
     [join(ROOT, 'test/review/rendering-browser.mjs'), '--production'], { cwd: ROOT, timeout: 85_000 });
   const result = JSON.parse(stdout);
-  assert.equal(result.pass, 124);
+  assert.equal(result.pass, 150);
+  assert.equal(result.fail, 0);
+});
+
+test('production 직렬화 표의 원자 경계: 코드·링크·이미지·수식과 이웃 시각화', { timeout: 90_000 }, async () => {
+  const { stdout } = await promisify(execFile)(process.execPath,
+    [join(ROOT, 'test/review/rendering-browser.mjs'), '--production', '--group=serialized-boundaries'],
+    { cwd: ROOT, timeout: 85_000 });
+  const result = JSON.parse(stdout);
+  assert.equal(result.pass, 42);
   assert.equal(result.fail, 0);
 });
 

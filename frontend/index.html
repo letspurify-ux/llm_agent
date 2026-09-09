@@ -169,9 +169,9 @@
            word-break를 앞에 함께 둔다 (지원 범위는 App.jsx의 빌드 타깃 주석 참고). */
         word-break: break-word;
         overflow-wrap: anywhere;
-        /* 최후의 그물. 위 규칙들과 코드블록·표·별행수식의 가로 스크롤이 실제 사례를 모두 덮지만,
-           끊을 수도 스크롤할 수도 없는 내용(넓은 인라인 수식 등)이 오면 여전히 말풍선을 뚫는다 —
-           그런 것은 잘라서라도 상자 안에 가둔다. 세로로 뚫는 것(\rule{500em})은 여기서 못 막는다
+        /* 최후의 그물. 텍스트 줄바꿈과 코드·표·수식의 개별 스크롤이 내용을 표시하고,
+           바깥 말풍선은 예기치 않은 가로 넘침을 가둔다. 넓은 인라인 수식도
+           InlineMath가 끝까지 읽을 수 있는 스크롤 영역으로 만든다. 세로로 뚫는 것(\rule{500em})은 여기서 못 막는다
            (clip은 가로만 자른다) — 그쪽은 KaTeX의 maxSize가 막는다 (math.js).
            auto가 아니라 clip인 이유: auto는 세로 overflow까지 visible이 아니게 만들어 인라인
            수식의 위아래가 잘리고 스크롤바가 생긴다. clip은 가로만 자르고 세로는 건드리지 않는다.
@@ -220,6 +220,9 @@
       .md img { max-width: 100%; }
 
       /* ===== 차트·흐름도 (App.jsx ChartBlock / MermaidBlock) ===== */
+      /* 그림의 글자 폭은 별도로 측정한다. 표 머리글·바깥 서식의 굵기/기울임이 나중에
+         상속되면 측정값과 실제 라벨 폭이 달라져 글자가 잘린다. 그림 내부의 강조는 유지한다. */
+      .md .chart, .md .mermaid { font-weight: 400; font-style: normal; letter-spacing: normal; }
       /* 폭을 고정값으로 두는 이유: 말풍선은 내용 폭으로 크기가 정해지는데(shrink-to-fit) 차트는 스스로
          폭이 없다(ResponsiveContainer는 부모를 채울 뿐이다). 글 한 줄 아래 놓인 차트가 그 한 줄 폭으로
          쪼그라드는 것을 막는다. max-width: 100%는 실제 배치 때 말풍선 폭(78% 상한)에 맞춰 다시 줄인다. */
@@ -262,14 +265,13 @@
       /* .bubble의 줄바꿈 규칙(overflow-wrap: anywhere)이 여기까지 상속되면, KaTeX가 span으로
          조립한 수식을 기호 한가운데서 끊어 분수·근호가 어긋난 채 렌더된다 — 수식 안에서만 되돌린다. */
       .md .katex { word-break: normal; overflow-wrap: normal; }
-      /* 폭이 말풍선을 넘는 '인라인' 수식은 CSS로 접거나 스크롤시킬 수 없다. 세 가지를 다 재봤고
-         전부 다른 것을 망가뜨렸다:
-           - .katex를 inline-block+overflow로 → 기준선이 바뀌어 문장 속 수식이 전부 5px 들려 올라간다.
-           - .md p에 overflow-x: auto  → overflow-y까지 visible이 아니게 되어 분수·합기호의 위아래가 잘린다.
-           - .katex .text에 white-space: normal → KaTeX가 글자마다 span을 두므로 한 글자씩 줄바꿈된다.
-         KaTeX가 .base에 white-space: nowrap을 걸어 두는 한 인라인 수식은 통째로 한 덩어리다.
-         그래서 넓은 수식은 별행($$)으로 쓰게 하고(백엔드 시스템 프롬프트), 그래도 넘치는 것은
-         위 .bubble의 overflow-x: clip이 상자 안에 가둔다. */
+      /* 넘치는 인라인 수식만 InlineMath가 전환한다. 짧은 수식의 기준선과
+         행 높이는 그대로이며, grid의 실제 내용 높이로 큰 분수·근호를 보존한다.
+         아래 여백은 고전 스크롤바가 분모를 가리지 않도록 확보한다. */
+      .md .katex.math-scroll { display: inline-grid; max-width: 100%; overflow-x: auto;
+        overflow-y: hidden; padding: 4px 0 16px; }
+      .md .math-scroll > .katex-html { min-width: max-content; }
+      .md .math-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
       /* 별행 수식($$)은 말풍선보다 넓어질 수 있다. 코드블록·표와 같은 처방으로 가로 스크롤에 가둔다.
          세로 여백은 남긴다 — 적분·행렬처럼 키 큰 수식이 위아래로 잘리는 것을 막는다.
          아래 여백이 위보다 두꺼운 이유: 가로 스크롤바가 생기면 그 두께(윈도우·리눅스는 겹치지 않는
@@ -474,6 +476,8 @@
         .md .chart { break-inside: avoid; }
         /* 종이에는 가로 스크롤이 없다 — 코드는 접어서 보여 준다 */
         .md pre { white-space: pre-wrap; overflow: visible; }
+        .md .katex.math-scroll { max-width: none; overflow: visible; padding: 0;
+          zoom: var(--math-print-scale, 1); }
         /* 답변 안의 표도 같다. 화면에서는 넓은 표를 가로 스크롤(.md table의 overflow-x)로 가두는데,
            종이에서 그것은 '오른쪽을 그냥 버린다'가 된다 — 그러고도 아무 표시가 남지 않는다
            (실측: 열 14개짜리 표의 오른쪽 587px이 인쇄물에서 사라졌다). 조회 결과 표(.trace-grid)는

@@ -34,13 +34,16 @@ import { CASES, TRACE, READY, ENVIRONMENT_EXAMPLES, PIE_BLOCK, PIE_LONG_NAMES, P
   BROKEN_RESPONSES, 주소를_가리키는_링크 } from './fixtures.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
-const PROBE = join(ROOT, 'ui-probe.html');
+// 같은 체크아웃에서 별도 검사를 실행해도 HTML 변경으로 서로를 다시
+// 로드하거나, 먼저 끝난 검사가 상대의 페이지를 지우지 않게 한다.
+const PROBE_NAME = `ui-probe-${process.pid}.html`;
+const PROBE = join(ROOT, PROBE_NAME);
 
 // 포트는 그때그때 빈 것을 받는다. 번호를 박아 두면 남의 개발 서버와 부딪혔을 때 검사가 실패로 남고,
 // 앞선 실행이 남긴 브라우저가 있으면 이번에 띄운 것이 아니라 그것에 붙는다(디버깅 포트는 Chrome이
 // 고른 뒤 프로필에 적어 주는 값을 읽는다 — driver.mjs chromePort).
 let port; let vite; let chromeBin; let chrome; let profile; let page; let skip = null;
-const url = (c = 'rich') => `http://localhost:${port}/ui-probe.html?case=${c}`;
+const url = (c = 'rich') => `http://localhost:${port}/${PROBE_NAME}?case=${c}`;
 
 before(async () => {
   chromeBin = await findChrome();
@@ -1228,8 +1231,13 @@ it('답을 기다리는 동안 폈다 접은 패널은 따라가기를 되돌려
 
 it('표를 굴리는 동안에는 멈추고, 손을 뗀 여운이 지나면 밀린 것을 따라잡는다', async () => {
   await answered();
-  await page.eval(`document.querySelector('details.trace > summary').click()`); await sleep(900);
-  await page.eval(`document.querySelector('.chat').scrollTop = 99999`); await sleep(500);
+  await page.eval(`document.querySelector('details.trace > summary').click()`);
+  await page.until(`document.querySelector('details.trace')?.open && document.querySelector('.trace-grid')`,
+    { what: '스크롤할 조회 표가 실제로 펼쳐지기' });
+  await settled();
+  await page.eval(`document.querySelector('.chat').scrollTop = 99999`);
+  await settled();
+  assert.ok((await state()).rest < 8, `스크롤 검사 시작 전 바닥에 도달하지 못했다: ${JSON.stringify(await state())}`);
   const grid = await page.eval(`(() => {
     const chat = document.querySelector('.chat').getBoundingClientRect();
     for (const e of document.querySelectorAll('.trace-grid')) {
@@ -1238,7 +1246,12 @@ it('표를 굴리는 동안에는 멈추고, 손을 뗀 여운이 지나면 밀�
       if (vis > 60) return { x: Math.round(r.left + 80), y: Math.round(Math.max(r.top, chat.top) + 25) };
     }
     return null; })()`);
-  assert.ok(grid, '바닥에 붙은 채 보이는 표가 없다 (검사의 전제)');
+  assert.ok(grid, `바닥에 붙은 채 보이는 표가 없다 (검사의 전제): ${JSON.stringify(await page.eval(`({
+    open: document.querySelector('details.trace')?.open,
+    tables: [...document.querySelectorAll('.trace-grid')].map(e => e.getBoundingClientRect().toJSON()),
+    chat: document.querySelector('.chat').getBoundingClientRect().toJSON(),
+    visibility: document.visibilityState
+  })`))}`);
   const before = await seen('.trace-step');
   await page.wheel(grid.x, grid.y, 0, 120);            // 표를 가로로 굴린다
   await grow(); await sleep(350);                      // 여운(App.jsx BUSY_MS = 600ms) 안

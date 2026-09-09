@@ -1,4 +1,5 @@
-import { collectMathSpans } from '../../shared/math-spans.mjs';
+import { analyzeRichStructure } from '../../shared/rich-table-structure.mjs';
+import { fromMarkdown } from 'mdast-util-from-markdown';
 import { restoreTableVisualizations } from './remark-rich-table.js';
 import { markCellTextSyntax, sliceCellText } from './cell-text.js';
 export { MAX_MATH_SPAN, normalizeMath, unwrapMath } from '../../shared/math-spans.mjs';
@@ -18,7 +19,15 @@ export default function remarkPreserveMath() {
   const processor = this;
   return (tree, file) => {
     const source = String(file);
-    const { candidates, referenceEdits, definitions } = collectMathSpans(tree, source, value => processor.parse(value));
+    // 앞 단계에서 보호한 시각화도 언어 소유 범위를 유지한다. 임시 코드의
+    // 이름에 기대어 재추론하지 않고, 그 단계가 남긴 정확한 치환 범위를 전달한다.
+    const visualizations = file.data.richTablePattern ? [...source.matchAll(file.data.richTablePattern)]
+      .map(match => ({ start: match.index, end: match.index + match[0].length })) : [];
+    const { candidates, referenceEdits, definitions } = analyzeRichStructure(source, tree,
+      value => processor.parse(value), value => fromMarkdown(value, {
+        extensions: [...processor.data('micromarkExtensions'), { disable: { null: ['table'] } }],
+        mdastExtensions: processor.data('fromMarkdownExtensions'),
+      }), visualizations);
     if (!candidates.length) return tree;
     const edits = [...candidates, ...referenceEdits].sort((a, b) => a.start - b.start);
     let prefix = 'LLMMATHPLACEHOLDER';

@@ -29,6 +29,7 @@ Node 22 이상과 Chrome이 필요하다. 필요하면 `CHROME_PATH`로 실행 �
 | 원화/전각 백슬래시, 제어 공백·기호, `ce`/`pu` | 같은 math 테스트, [200개 표](../frontend/test/latex-table-200.test.js) | 명령 정규화·화학식 렌더 확인, 통화·코드 원문 보존 |
 | 표의 근호·적분·곡률, 공백·절댓값 파이프 때문에 수식과 셀 잘림 | math 테스트, 200개 표 테스트 | 정상 540개 조합, 오류 90개 조합의 원문·열·이웃 셀·다음 행 보존 |
 | 미완성 구분자·중괄호·미지원 명령이 다음 수식이나 답변을 삼킴 | math 테스트, [valid-math-edge.test.js](../frontend/test/valid-math-edge.test.js) | 오류의 정확한 원문, 다른 목록·인용문 경계, 뒤의 정상 수식 보존 |
+| 수신 조각 끝의 Mermaid 구분자가 앞 셀 수식을 닫아 완성된 이웃 수식 누락 | [math-atomic-end.test.js](../frontend/test/math-atomic-end.test.js), [cell-ownership.test.js](../frontend/test/cell-ownership.test.js) | 반개방 원자 범위의 끝 포함 판정, 정상 인접 수식·TeX 인자 보존, 실제·직렬화 셀의 수신 접두사 검증 |
 | Markdown이 수식의 `_`, `*`, 백슬래시, 엔티티를 먼저 해석함 | math 테스트 | 24식 × 4구분자 × 6위치 = 576개 조합의 수식·구조 대조 |
 | 구분자 없는 번호 수식이 인용/목록 기호를 가져가거나 번호 목록에서 누락 | [mixed-content.test.js](../frontend/test/mixed-content.test.js) | LF/CRLF, 5종 컨테이너에서 수식과 목록·인용 구조 동시 확인 |
 | 깊은 중첩 인용문, 다음 줄 tag, 소수점 식, 참조 링크 속 수식 누락 | valid-math-edge 테스트 | 78개 정상 예제와 144개 서식 조합, 합친 문서의 정확한 원문·링크·구조 확인 |
@@ -41,6 +42,9 @@ Node 22 이상과 Chrome이 필요하다. 필요하면 `CHROME_PATH`로 실행 �
 | 미완성 수식이 뒤의 코드 블록·정상 수식을 삼킴, 수식 모양 각주 식별자, 연속 `$x$$y$` 누락 | [rendering-combinations.test.js](../frontend/test/rendering-combinations.test.js) | 정상 쌍·오류 격리·컨테이너·개행 등 1,198개 입력 대조 |
 | 표의 `\\<br>` 원문 노출, 한 셀의 수식·목록·인용·설명·시각화 분리 | [rich-table.test.js](../frontend/test/rich-table.test.js), [rich-table-checks.mjs](../frontend/test/ui/rich-table-checks.mjs) | 실제 블록 구조·셀 수·이웃 값·수식 원문과 데스크톱/320px 그림 크기 확인 |
 | 표 안 및 독립 문단의 직렬화된 Mermaid/chart가 코드로 남음 | 같은 rich-table 테스트, ui/production 테스트 | `<br>`·리터럴 `\\n`·백틱 변형·스트림 접두사·미리보기에서 최종 그림으로 전환 |
+| 수식·시각화 머리글의 파이프 때문에 표 발견·조회 주입이 실패하거나 다음 행과 백틱이 결합 | [rich-table-structure.test.js](../frontend/test/rich-table-structure.test.js), backend 문법·production 테스트 | 원문 좌표·행별 소유 범위·수식·조회값·주소·이웃 셀과 머리글 그림의 글자 폭 대조 |
+| 직렬화 표의 링크·이미지·수식이 다른 행을 삼키거나 TeX 제어 단어가 개행으로 변환 | [serialized-boundaries.test.js](../frontend/test/serialized-boundaries.test.js), backend 문법·production 테스트 | 경계 조합 1,600개·TeX 320개·스트림 접두사 326개, 실제 개발·배포 화면 20회 |
+| 같은 행의 다른 셀에서 열린 코드·이미지·HTML·수식이 이웃을 소유하거나 행 첫 단어 때문에 직렬화 복원이 실패 | [cell-ownership.test.js](../frontend/test/cell-ownership.test.js), production 테스트 | 셀 조합 2,000개·행 복원 1,120개, 원문·조회 숫자·미리보기·SVG·MathML·스크롤 도달 대조. [설계 검토](cell-ownership-review.md) |
 | 표 셀 안의 하위 목록·인용·작업 목록이 평탄화되고 그림이 목록 밖으로 이동 | [cell-blocks.test.js](../frontend/test/cell-blocks.test.js), production 테스트 | 900개 조합의 컨테이너 구조·정확한 콘텐츠 경로, 실제 중첩 DOM과 그림 크기 확인 |
 | 표 셀의 이스케이프·문자 참조가 수식 복원 뒤 목록·인용·제목·체크박스로 바뀜 | 같은 cell-blocks 테스트, production 테스트 | 문자 출처 3,150개·작업 목록 50개 입력의 실제 원문·블록 구조·수식·그림·이웃 셀 및 모든 스트림 접두사 보존 |
 | 양끝 파이프 없는 표의 가장자리 차트 조회 누락과 산문 코드 예시의 오주입 | 같은 cell-blocks 테스트, [markdown-syntax.test.js](../backend/test/markdown-syntax.test.js) | 300개 표·셀 위치·컨테이너·개행 조합의 조회값·이웃 셀과 코드 예시 원문 보존 |
@@ -60,6 +64,7 @@ Node 22 이상과 Chrome이 필요하다. 필요하면 `CHROME_PATH`로 실행 �
 | 개발 모드만 통과하고 배포 빌드에서 회귀 | [production.test.mjs](../frontend/test/ui/production.test.mjs) | 실제 빌드에서 200개 표·78개 정상 예제·180개 링크 표와 복합 콘텐츠 검사 |
 | Chrome 누락으로 화면 검사가 생략되는데 전체 성공 | [driver.test.js](../frontend/test/driver.test.js), [필수 실행기](../frontend/test/run-regressions.mjs) | 브라우저 없는 필수 모드는 예외, 전체 실행은 REQUIRE_CHROME=1 전달 |
 | Linux에서 패널을 펼칠 때 머리글이 63px 이동 | ui.test의 `펼침(⚡ 실행된 쿼리·표로 보기)` 및 진행 중 펼침/접힘 검사 | 클릭 직전 좌표와 펼친 뒤 좌표의 차이가 6px 미만, 머리글 위치 복원 |
+| 긴 인라인 분수·근호가 중첩 목록·링크에서 잘려 끝을 읽을 수 없음 | [inline-math.test.mjs](../frontend/test/ui/inline-math.test.mjs) | 개발·새 배포 앱에서 양 끝 스크롤 도달, 짧은 수식 줄 높이, 세로 범위, 화면 크기 변경·키보드·스트림·인쇄·초기화 확인 |
 | 한 라벨의 첫 글자 조각만 측정해 흐름도 일부 글자가 8px로 축소 | ui.test의 `좁은 화면: 흐름도 글자` | 모든 tspan의 실제 높이가 9px 이상, 인쇄에서는 최소 폭 해제 |
 
 차트 파싱·빈 데이터·오류 데이터, Markdown 링크·코드·이미지, Mermaid 보안, 미리보기 상태의
@@ -72,6 +77,12 @@ Node 22 이상과 Chrome이 필요하다. 필요하면 `CHROME_PATH`로 실행 �
 화면 배치 결함이면 UI 공통 판정과 production 경로에도 포함한다.
 
 ## 실행 결과
+
+2026-09-09 공통 표 구조·셀 소유권·수신 끝 경계·인라인 수식 배치를 통합한 최종
+소스에서 백엔드 전체 574개, 프런트엔드 단위 347개, Chrome UI 88개, production
+4개와 인라인 수식 개발·배포 2개가 통과했다. 실패·취소·건너뜀은 0개이며,
+production에는 192회 화면 조합을 포함한다. 검사 전후 133개 파일 해시도 일치했다.
+[완료 검토 기록](nested-rendering-follow-up.md)에 구조 계약과 검증 이력을 정리했다.
 
 2026-09-09 공통 문법 경계·Mermaid 네이티브 수식 엔진 재설계의 구조와
 추가 검증은 [아키텍처 검토 기록](nested-rendering-architecture-review.md)에 정리했다.
@@ -144,3 +155,7 @@ Mermaid 라벨과 주소·툴팁·접근성 설명의 구분 및 shape 속성 �
 
 여러 줄 Mermaid 수식과 verb 내부 달러, 실패 라벨의 원문 격리, 오류 안내 뒤의
 목록 기호 배치는 [Mermaid 내부 TeX 경계 검토](mermaid-tex-boundaries-review.md)에 기록했다.
+
+머리글의 내부 언어를 포함한 표 구조와 원문 소유 범위는
+[표 구조 분석 검토](rich-table-structure-review.md)에, 직렬화 개행 복원에서의
+같은 행 경계 적용은 [직렬화 표 검토](serialized-table-ownership-review.md)에 기록했다.

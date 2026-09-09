@@ -18,7 +18,7 @@ const indexedRuns = (source, pattern, ranges, offset) => {
   return runs;
 };
 
-export function* inlineCodeSpans(source, ranges = [], offset = 0) {
+export function* inlineCodeSpans(source, ranges = [], offset = 0, { visualizationCandidates = false, includeUnclosed = false } = {}) {
   // 주소·속성에 있는 홑백틱을 먼저 제외한다. 짝을 만든 뒤 제외하면 그 백틱이
   // 이웃 시각화의 여는 기호를 닫는 기호로 소비해 오른쪽 셀까지 잃는다.
   const runs = indexedRuns(source, /`+/g, ranges, offset);
@@ -34,7 +34,14 @@ export function* inlineCodeSpans(source, ranges = [], offset = 0) {
       if (!open || !escapedAt(source, open.start + 1) ||
         !/^[ \t]*(?:chart|mermaid)(?=(?:\\r)?\\n|\\?<br\s*\/?>)/i.test(source.slice(open.end))) continue;
     }
-    if (!open.close) continue;
+    // 구조 발견용 후보 수집에서는 미완성 일반 코드의 짝을 먼저 확정하지 않는다.
+    // 실행 여부와 실제 소유 범위는 호출자가 확정된 Markdown 컨테이너에서 판정한다.
+    if (visualizationCandidates && !/^[ \t]*(?:chart|mermaid)(?=(?:\\r)?\\n|\\?<br\s*\/?>)/i.test(source.slice(open.end))) continue;
+    if (!open.close) {
+      if (visualizationCandidates && includeUnclosed) yield { start: open.start, end: source.length,
+        bodyStart: open.end, bodyEnd: source.length, value: source.slice(open.end), incomplete: true };
+      continue;
+    }
     consumed = open.close.end;
     yield { start: open.start, end: consumed, bodyStart: open.end, bodyEnd: open.close.start,
       value: source.slice(open.end, open.close.start) };
@@ -43,7 +50,7 @@ export function* inlineCodeSpans(source, ranges = [], offset = 0) {
 
 // Markdown 파서가 확정한 주소·HTML·코드블록은 직렬화 시각화로 재해석하지 않는다.
 // 링크의 표시 글자는 확장을 허용하지만 목적지·참조 이름은 그대로 둔다.
-export function markdownLiteralRanges(tree) {
+export function markdownLiteralRanges(tree, source) {
   const ranges = [];
   const pending = [tree];
   while (pending.length) {
@@ -56,6 +63,12 @@ export function markdownLiteralRanges(tree) {
       continue;
     }
     if (node.type === 'link' || node.type === 'linkReference') {
+      // 자동 링크에는 별도의 표시문이 없다. 표시 글자도 주소 자체이므로
+      // 그 안의 백틱을 실행하면 화면과 href 양쪽이 함께 변형된다.
+      if (start && end && source[start.offset] !== '[') {
+        ranges.push([start.offset, end.offset]);
+        continue;
+      }
       const labelEnd = node.children.at(-1)?.position?.end.offset;
       if (labelEnd !== undefined && end) ranges.push([labelEnd, end.offset]);
     }

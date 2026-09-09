@@ -13,6 +13,10 @@ import { resolveChartData, resolveTableData } from '../../../backend/src/chart.j
 import { NESTED_BOUNDARY_ANSWER, NESTED_LITERAL_MATH } from '../nested-boundaries-corpus.js';
 import { CELL_BLOCKS_ANSWER, CELL_CHART, CELL_LITERAL_ANSWER } from '../cell-blocks-corpus.js';
 import { MERMAID_MATH_CASES, MERMAID_MULTILINE_MATH, MERMAID_NATIVE_MATH_CASES } from '../mermaid-math-corpus.js';
+import { STRUCTURE_HEADERS, STRUCTURE_URL, STRUCTURE_DEFINITION, structureTable } from '../rich-table-structure-corpus.js';
+import { MIXED_WRAPPERS } from '../mixed-content-corpus.js';
+import { SERIALIZED_ATOMS, serializedBoundaryTable } from '../serialized-boundaries-corpus.js';
+import { CELL_ATOMS, cellOwnershipTable } from '../cell-ownership-corpus.js';
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const VITE = join(ROOT, 'node_modules/vite/bin/vite.js');
@@ -25,6 +29,44 @@ const serializedTable = [
 ].join('\\r\\n');
 const literalChart = '`chart<br>data:step1`';
 const cases = [
+  { id: 'serialized-control-words', group: 'serialized-boundaries',
+    // 목록 안의 '- | -'는 GFM에서도 하위 목록이다. 구분 행 앞에 |를
+    // 명시해 실제 표에서 짧은 구분 행과 영문 첫 셀의 개행 복원을 확인한다.
+    answer: MIXED_WRAPPERS.quoteList(['L | R', '| - | - |',
+      'u | `mermaid\\nflowchart LR\\nu["$$x^2$$"] --> v`',
+      'eq | `mermaid\\nflowchart LR\\neq["$$x^2$$"] --> done`',
+      'ot | `chart\\ntype:bar\\nLABEL | VALUE\\n--- | ---\\nu | 7`'].join('\n')).replaceAll('\n', '\\n'),
+    expected: { charts: 1, diagrams: 2, tables: 2, mermaidMath: 2, errors: 0,
+      formulas: [], cellVisualsSized: true, diagramLabelWidthsFit: true, diagramMathSized: true } },
+  ...CELL_ATOMS.map(atom => ({
+    id: 'cell-ownership-' + atom.id, group: 'serialized-boundaries',
+    answer: resolveChartData(MIXED_WRAPPERS.quoteList(cellOwnershipTable(atom, { header: '$|h|$' }))
+      .replaceAll('\n', '\\r\\n'), [[{ A: 'FOUND_ROW | 원문', B: 7 }]]).replaceAll('\n', '\\n'),
+    expected: { charts: 1, diagrams: 1, tables: 2, mermaidMath: 1, errors: atom.error ? 1 : 0,
+      formulas: ['|h|', 'z^2'], foundRow: true, cellVisualsSized: true, cellOwnershipIntact: true,
+      structureEndsReachable: true, diagramLabelWidthsFit: true, diagramMathSized: true,
+      ...(atom.error && { errorSources: [atom.open] }) },
+  })),
+  ...SERIALIZED_ATOMS.map(atom => ({
+    id: 'serialized-boundary-' + atom.id, group: 'serialized-boundaries',
+    answer: resolveChartData(MIXED_WRAPPERS.quoteList(serializedBoundaryTable(atom, { header: '$|h|$' }))
+      .replaceAll('\n', '\\r\\n'), [[{ A: 'FOUND_ROW | 원문', B: 7 }]]).replaceAll('\n', '\\n'),
+    expected: { charts: 1, diagrams: 1, tables: 2, mermaidMath: 1, errors: atom.error ? 1 : 0,
+      formulas: ['|h|', 'z^2'], foundRow: true, cellVisualsSized: true, serializedOwnershipIntact: true,
+      structureEndsReachable: true, diagramLabelWidthsFit: true, diagramMathSized: true,
+      ...(atom.error && { errorSources: [atom.open] }) },
+  })),
+  ...STRUCTURE_HEADERS.map(header => ({
+    id: 'table-structure-' + header.id,
+    answer: resolveChartData(MIXED_WRAPPERS.quoteList(structureTable(header.source)) + STRUCTURE_DEFINITION,
+      [[{ A: 'FOUND_ROW', B: 7 }]]),
+    expected: { charts: header.chart ? 2 : 1, diagrams: header.diagram ? 2 : 1,
+      tables: header.chart ? 3 : 2, mermaidMath: header.diagram ? 2 : 1,
+      errors: header.error ? 1 : 0, formulas: [...(header.math && !header.error ? [header.math] : []), 'z^2'],
+      foundRow: true, cellVisualsSized: true, structureIntact: true, structureLink: true,
+      structureEndsReachable: true, diagramLabelWidthsFit: true, diagramMathSized: true,
+      headerDiagrams: header.diagram ? 1 : 0, headerCharts: header.chart ? 1 : 0 },
+  })),
   ...[...MERMAID_MATH_CASES, ...MERMAID_NATIVE_MATH_CASES].map(({ id, source, nodes, label, bold, href, accessibleTitle, mathText, fractions, mathCount = 1,
     errors = 0, errorSources }) => ({
     id: 'mermaid-mixed-' + id,
@@ -123,15 +165,27 @@ try {
       : originalFetch(url, opts);
   ` });
   const results = [];
-  for (const { id, answer, expected, label } of cases) for (const width of [1000, 320]) {
+  const selectedCase = process.argv.find(arg => arg.startsWith('--case='))?.slice(7);
+  const selectedGroup = process.argv.find(arg => arg.startsWith('--group='))?.slice(8) ?? 'core';
+  if (selectedCase) assert.ok(cases.some(item => item.id === selectedCase), '존재하지 않는 브라우저 검사 사례');
+  else assert.ok(cases.some(item => (item.group ?? 'core') === selectedGroup), '존재하지 않는 브라우저 검사 그룹');
+  const selected = cases.filter(item => selectedCase ? item.id === selectedCase : (item.group ?? 'core') === selectedGroup);
+  for (const { id, answer, expected, label } of selected) for (const width of [1000, 320]) {
     await page.viewport(width, 760);
     await page.goto(url, '.chip');
     await page.eval(`window.__reviewAnswer=${JSON.stringify(answer)};document.querySelector('.chip').click()`);
     await page.until(`document.querySelector('.bubble.assistant') && !document.querySelector('.typing')`);
-    // 깨진 조합의 결함 판정을 시간제한 오류에 의존하지 않는다. 존재해야 하는 요소를
-    // 기다리는 대신 실제 남은 폴백/원문/그림 중 하나가 확정됐는지 기다린다.
-    if (expected.diagrams) await page.until(`document.querySelector('.mermaid svg') || document.querySelector('.math-error')`)
-      .catch(error => { throw new Error(`${id}/${width}: ${error.message}\n${JSON.stringify(page.logs)}`); });
+    // 다른 셀의 수식 오류는 비동기 그림의 완료 신호가 아니다. 필요한 그림이
+    // 모두 게시된 뒤 크기·내용을 판정하고, 실패하면 아래 진단에 원문을 남긴다.
+    if (expected.diagrams) await page.until(`document.querySelectorAll('.mermaid svg').length === ${expected.diagrams}`)
+      .catch(async error => {
+        const state = await page.eval(`({ visibility: document.visibilityState,
+          text: document.querySelector('.bubble.assistant')?.innerText,
+          codes: [...document.querySelectorAll('.bubble.assistant pre code')].map(node => node.textContent),
+          diagrams: document.querySelectorAll('.mermaid svg').length,
+          charts: document.querySelectorAll('figure.chart .recharts-surface').length })`).catch(() => null);
+        throw new Error(`${id}/${width}: ${error.message}\n${JSON.stringify({ state, logs: page.logs })}`);
+      });
     // production의 지연 로딩 동안에는 데이터 표만 먼저 표시된다.
     if (expected.charts) await page.until(`document.querySelectorAll('figure.chart .recharts-surface').length === ${expected.charts}`);
     await page.eval('document.fonts.ready.then(() => true)');
@@ -149,6 +203,19 @@ try {
           return end.left >= box.left - 1 && end.right <= box.right + 1;
         });
         table.scrollLeft = left;
+        return visible;
+      };
+      const outerTable = b.querySelector('blockquote > ol table');
+      const structureEndsReachable = () => {
+        if (!outerTable?.tBodies[0]) return false;
+        const left = outerTable.scrollLeft;
+        outerTable.scrollLeft = outerTable.scrollWidth;
+        const box = outerTable.getBoundingClientRect();
+        const visible = [...outerTable.tBodies[0].rows].every(row => {
+          const end = row.cells[row.cells.length - 1]?.getBoundingClientRect();
+          return end && end.left >= box.left - 1 && end.right <= box.right + 1;
+        });
+        outerTable.scrollLeft = left;
         return visible;
       };
       return {
@@ -197,6 +264,41 @@ try {
         cellVisualsSized: [...b.querySelectorAll('.rich-cell .recharts-surface, .rich-cell .mermaid svg')]
           .every(e => { const r = e.getBoundingClientRect(); return r.width > 40 && r.height > 20; }),
         cellEndsReachable: cellEndsReachable(),
+        structureIntact: outerTable?.tHead?.rows[0]?.cells.length === 3 &&
+          outerTable.tBodies[0]?.rows.length === 4 && [...outerTable.tBodies[0].rows].every((row, i) =>
+            row.cells.length === 3 && row.cells[2].textContent === ['MATH_END', 'DIAGRAM_END', 'QUERY_END', 'LINK_END'][i]) &&
+          !!outerTable.querySelector('td > blockquote > ul .chart') && !!outerTable.querySelector('td > ul .mermaid'),
+        serializedOwnershipIntact: outerTable?.tHead?.rows[0]?.cells.length === 3 &&
+          outerTable.tBodies[0]?.rows.length === 5 && [...outerTable.tBodies[0].rows].every((row, i) =>
+            row.cells.length === 3 && row.cells[2].textContent === ['OPEN_END', 'MATH_END', 'QUERY_END', 'DIAGRAM_END', 'CLOSE_END'][i]) &&
+          !!outerTable.querySelector('td > blockquote > ul .chart') && !!outerTable.querySelector('td > ul .mermaid'),
+        cellOwnershipIntact: outerTable?.tHead?.rows[0]?.cells.length === 7 &&
+          outerTable.tBodies[0]?.rows.length === 1 && (() => {
+            const cells = outerTable.tBodies[0].rows[0].cells;
+            return cells.length === 7 && cells[0].textContent === 'LEFT' && cells[6].textContent === 'RIGHT' &&
+              cells[2].querySelector('blockquote > ul annotation')?.textContent === 'z^2' &&
+              !!cells[3].querySelector('ul .mermaid svg') && !!cells[4].querySelector('blockquote > ul .chart .recharts-surface');
+          })(),
+        structureLink: literalCell('BODY_LITERAL')?.querySelector('a')?.textContent === ${JSON.stringify(STRUCTURE_URL)} &&
+          literalCell('BODY_LITERAL')?.querySelector('a')?.getAttribute('href') === 'https://example.test/%60chart%5Cndata:step1%60',
+        structureEndsReachable: structureEndsReachable(),
+        headerDiagrams: outerTable?.tHead?.querySelectorAll('.mermaid svg').length,
+        headerCharts: outerTable?.tHead?.querySelectorAll('figure.chart .recharts-surface').length,
+        diagramLabelWidthsFit: [...b.querySelectorAll('.mermaid foreignObject')].every(node => {
+          const range = document.createRange();
+          range.selectNodeContents(node);
+          const text = range.getBoundingClientRect(), box = node.getBoundingClientRect();
+          // Range의 높이는 MathML 글리프 바깥의 선택 행 상자도 포함한다. 여기서는
+          // 서식 상속 때문에 글자가 옆으로 잘리는 폭을 검사하고 수식 크기는 별도로 잰다.
+          return text.left >= box.left - 1 && text.right <= box.right + 1;
+        }),
+        diagramLabelBoxes: [...b.querySelectorAll('.mermaid foreignObject')].map(node => {
+          const range = document.createRange(); range.selectNodeContents(node);
+          const text = range.getBoundingClientRect(), box = node.getBoundingClientRect();
+          return { text: node.textContent, fontWeight: getComputedStyle(node).fontWeight,
+            left: text.left - box.left, right: text.right - box.right,
+            top: text.top - box.top, bottom: text.bottom - box.bottom };
+        }),
         placeholders: /LLMRICHTABLE|LLMMATHPLACEHOLDER|LLMCELLNODE/.test(b.innerHTML),
         overflow: document.documentElement.scrollWidth - innerWidth,
       };
@@ -241,6 +343,10 @@ try {
   }
   console.log(JSON.stringify({ mode: production ? 'production' : 'development', pass: results.filter(r => r.pass).length,
     fail: results.filter(r => !r.pass).length, results }, null, 2));
+  // 자식 프로세스의 전체 stdout은 Node 오류 표시에서 잘릴 수 있다. 실패의
+  // 식별자·판정값은 별도로 남겨 재현 사례를 잃지 않는다. 판정 조건은 같다.
+  const failures = results.filter(result => !result.pass);
+  if (failures.length) console.error(JSON.stringify(failures.map(({ id, width, failures }) => ({ id, width, failures }))));
   process.exitCode = results.some(r => !r.pass) ? 1 : 0;
 } finally {
   page?.ws.close();

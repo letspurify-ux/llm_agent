@@ -1,8 +1,17 @@
+import { texGroupEnds } from './tex-environments.mjs';
+
 // 완성한 수식은 호출자가 먼저 보호한다. 이 함수는 닫는 표시가 없는 명확한 TeX 입력만
 // 표의 원문 셀에 가둔다. 수식의 빠진 내용이나 괄호를 추측해서 채우지 않는다.
 export function incompleteTableMath(source, rows, protectedRanges, completed) {
   const occupied = [...protectedRanges, ...completed].sort((a, b) => a.start - b.start);
   const result = [];
+  let groups;
+  const inArgument = (span, start, end) => {
+    groups ??= texGroupEnds(source);
+    for (const [open, close] of groups)
+      if (open >= start && open < span.start && close >= span.end && close < end) return true;
+    return false;
+  };
   let rangeIndex = 0;
   for (const row of rows) {
     while (rangeIndex < occupied.length && occupied[rangeIndex].end <= row.start) rangeIndex++;
@@ -40,8 +49,13 @@ export function incompleteTableMath(source, rows, protectedRanges, completed) {
       let cellEnd = remaining > 0 && after.length >= remaining ? after[after.length - remaining] : end;
       // 다음 수식의 시작을 알면 그 경계를 넘어 원문을 가져오지 않는다.
       const next = /\$[ \t]*(?:\\[A-Za-z]+|[A-Za-z][^|\r\n]*[=^_])|\\[([]/.exec(masked.slice(start + match[0].length));
-      if (next) {
-        const nextStart = start + match[0].length + next.index;
+      // 완성된 수식·코드·주소는 위에서 가렸으므로 masked에서는 다시 찾을 수 없다.
+      // 아직 덜 받은 행의 열 수를 채우려고 그 원자를 앞 오류에 포함하지 않는다.
+      // TeX 인자 안의 리터럴은 그 인자가 소유하므로 독립된 이웃으로 취급하지 않는다.
+      const ownedStart = occupied.reduce((nearest, span) => span.start > row.start + start && span.start < row.end &&
+        !inArgument(span, row.start + start, row.end) ? Math.min(nearest, span.start - row.start) : nearest, Infinity);
+      const nextStart = Math.min(ownedStart, next ? start + match[0].length + next.index : Infinity);
+      if (nextStart < Infinity) {
         const boundary = after.filter(i => i < nextStart).pop();
         if (boundary !== undefined) cellEnd = Math.min(cellEnd, boundary);
       }

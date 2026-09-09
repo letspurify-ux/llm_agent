@@ -6,6 +6,7 @@ import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { unified } from 'unified';
 import remarkParse from 'remark-parse';
+import { fromMarkdown } from 'mdast-util-from-markdown';
 import remarkGfmBounded from '../src/remark-gfm.js';
 import { MIXED_WRAPPERS } from './mixed-content-corpus.js';
 
@@ -38,4 +39,15 @@ test('같은 파서로 다시 분석해도 이전 문서의 링크 후보 상태
   const control = unified().use(remarkParse).use(remarkGfm);
   for (const source of ['문자만', ...cases, '문자만', ...cases.toReversed()])
     assert.deepEqual(bounded.parse(source), control.parse(source));
+});
+
+test('확장을 독립 구조 분석에 전달해도 GFM 자동 링크 경계가 유지된다', () => {
+  const bounded = unified().use(remarkParse).use(remarkGfmBounded).freeze();
+  const control = unified().use(remarkParse).use(remarkGfm).freeze();
+  const parse = (processor, source) => fromMarkdown(source, {
+    extensions: [...processor.data('micromarkExtensions'), { disable: { null: ['table'] } }],
+    mdastExtensions: processor.data('fromMarkdownExtensions'),
+  });
+  for (const source of [...cases, 'https://example.test/`chart\\ndata:step1`'])
+    assert.deepEqual(parse(bounded, source), parse(control, source));
 });

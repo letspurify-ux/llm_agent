@@ -1,6 +1,6 @@
 // 수식이 소유한 원문 범위를 서버와 화면에서 같은 규칙으로 판정한다.
 // parse는 호출자의 Markdown 파서이며, 여기서는 AST나 원문을 변경하지 않는다.
-import { mathEnvironments, verbEnd } from './tex-environments.mjs';
+import { mathEnvironments, verbEnd, texGroupEnds } from './tex-environments.mjs';
 import { incompleteTableMath } from './table-math.mjs';
 
 export const MAX_MATH_SPAN = 5000;
@@ -64,7 +64,7 @@ export function unwrapMath(tex) {
 }
 
 const offsets = node => [node.position?.start?.offset, node.position?.end?.offset];
-export function collectMathSpans(tree, source, parse) {
+export function collectMathSpans(tree, source, parse, structure = tree, atomicRanges = []) {
   const normalized = normalizeMath(source); // 길이가 같으므로 원문 좌표가 유지된다.
   const protectedRanges = [], noBare = [], candidates = [], contexts = [], tableRows = [], textScopes = [], tagScopes = [], referenceEdits = [];
   const tableSeparators = [], blockCodes = [], knownLinks = new Set(), definitions = new Map();
@@ -75,7 +75,22 @@ export function collectMathSpans(tree, source, parse) {
     return { quotes: 0, boundaryEnd: source.length };
   };
   const protect = (start, end) => { if (start !== undefined && end !== undefined) protectedRanges.push({ start, end }); };
-  const inspect = (node, quotes = 0, inTable = false, tableWidth = 0, boundaryEnd = source.length) => {
+  for (const { start, end } of atomicRanges) protect(start, end);
+  let groups;
+  // 모든 범위는 [start, end)다. 최초 AST와 후속 스캐너가 같은 소유권
+  // 판정을 사용해야, 수신 조각의 끝이나 다시 파싱한 경계에서 뜻이 바뀌지 않는다.
+  const owns = (range, offset) => !!range && range.start <= offset && offset < range.end;
+  const conflictsWithAtom = (start, end) => atomicRanges.some(range => {
+    if (range.end <= start || range.start >= end) return false;
+    if (owns(range, start) || owns(range, end - 1)) return true;
+    // TeX 인자 안의 코드 모양 글자는 TeX 원문이다. 독립된 시각화는
+    // 바깥 수식의 오류 복구 영역에 포함되지 않는다. 명령 이름은 해석하지 않는다.
+    groups ??= texGroupEnds(source);
+    return ![...groups].some(([open, close]) => open >= start && open < range.start && close >= range.end && close < end);
+  });
+  // 구조 좌표와 값의 출처를 분리한다. 표 발견용 AST의 가려진 글자를 TeX 값으로
+  // 읽지 않으면서, 새로 발견한 표에서도 수식이 다른 행·셀을 삼키지 않도록 한다.
+  const inspectStructure = (node, quotes = 0, inTable = false, tableWidth = 0, boundaryEnd = source.length) => {
     const [start, end] = offsets(node);
     if (node.type === 'blockquote') quotes++;
     if (['blockquote', 'listItem', 'footnoteDefinition'].includes(node.type)) boundaryEnd = Math.min(boundaryEnd, end);
@@ -83,16 +98,21 @@ export function collectMathSpans(tree, source, parse) {
       inTable = true; tableWidth = node.children[0].children.length;
       tableSeparators.push({ start: offsets(node.children[0])[1], end: node.children[1] ? offsets(node.children[1])[0] : end });
     }
-    if (node.type === 'definition') {
-      hasDefinitions = true;
-      if (!definitions.has(node.identifier)) definitions.set(node.identifier, node);
-    }
     if (node.type === 'tableRow') tableRows.push({ start, end, width: tableWidth });
     if (['paragraph', 'heading', 'tableRow'].includes(node.type)) textScopes.push({ start, end });
     if (['paragraph', 'heading', 'tableCell'].includes(node.type) && node.children?.length) {
       tagScopes.push({ start: offsets(node.children[0])[0], end: offsets(node.children.at(-1))[1], quotes });
     }
     if (start !== undefined) contexts.push({ start, end, quotes, inTable, boundaryEnd });
+    for (const child of node.children ?? []) inspectStructure(child, quotes, inTable, tableWidth, boundaryEnd);
+  };
+  inspectStructure(structure);
+  const inspect = node => {
+    const [start, end] = offsets(node);
+    if (node.type === 'definition') {
+      hasDefinitions = true;
+      if (!definitions.has(node.identifier)) definitions.set(node.identifier, node);
+    }
     if (node.type === 'code') {
       protect(start, end);
       blockCodes.push({ start, end });
@@ -122,6 +142,9 @@ export function collectMathSpans(tree, source, parse) {
       }
     }
     if (node.type === 'math' || node.type === 'inlineMath') {
+      // 첫 Markdown 파싱이 확장 코드의 내부 구분자로 수식을 닫았으면
+      // 그 수식 노드도 잠정 판정이다. 바깥 스캐너가 같은 원자 경계로 다시 읽는다.
+      if (conflictsWithAtom(start, end)) return;
       protect(start, end);
       const raw = source.slice(start, end);
       if (node.type === 'math') {
@@ -139,7 +162,7 @@ export function collectMathSpans(tree, source, parse) {
       candidates.push({ start, end, value: node.meta ? `${node.meta}\n${node.value}`.trim() : node.value, display: true });
       return;
     }
-    for (const child of node.children ?? []) inspect(child, quotes, inTable, tableWidth, boundaryEnd);
+    for (const child of node.children ?? []) inspect(child);
   };
   inspect(tree);
   // 첫 표 파싱은 수식 안의 |에서도 셀을 나눠 링크 전체를 놓칠 수 있다. 구분 행만 같은
@@ -156,11 +179,10 @@ export function collectMathSpans(tree, source, parse) {
       if (['link', 'linkReference'].includes(node.type) && !knownLinks.has(start) &&
         (node.type === 'link' || definitions.has(node.identifier)) &&
         tableRows.some(row => row.start <= start && row.end >= end)) {
-        const ctx = contextAt(start);
         // [수식][ref]의 뒷부분만 독립된 [ref]로 읽었던 보정은 폐기한다.
         for (let i = referenceEdits.length - 1; i >= 0; i--)
           if (referenceEdits[i].linkStart > start && referenceEdits[i].linkStart < end) referenceEdits.splice(i, 1);
-        inspect(node, ctx.quotes, true, 0, ctx.boundaryEnd);
+        inspect(node);
         return;
       }
       for (const child of node.children ?? []) collect(child);
@@ -211,7 +233,7 @@ export function collectMathSpans(tree, source, parse) {
   for (let i = 0; i < source.length; i++) {
     if (!['$', '\\'].includes(normalized[i])) continue;
     const protectedRange = firstRange(i);
-    if (protectedRange && protectedRange.start <= i) { i = protectedRange.end - 1; continue; }
+    if (owns(protectedRange, i)) { i = protectedRange.end - 1; continue; }
     if (escapedAt(source, i)) continue;
     while (rowIndex < tableRows.length && tableRows[rowIndex].end <= i) rowIndex++;
     const row = tableRows[rowIndex];
@@ -254,8 +276,10 @@ export function collectMathSpans(tree, source, parse) {
     }
     // 시작/끝이 코드·주소 안에 있으면 제외한다. 수식에 완전히 포함된 `·[링크]는 TeX 본문이다.
     const endRange = firstRange(end - 1);
-    if (end < 0 || end > limit || blockCodes.some(r => r.start > start && r.start < end) ||
-      (endRange && endRange.start < end && endRange.end > end) ||
+    if (end < 0 || end > limit || conflictsWithAtom(start, end) || blockCodes.some(r => r.start > start && r.start < end) ||
+      // end는 마지막 문자 다음 좌표다. 수신 조각 끝과 원자 끝이 같아도
+      // 마지막 닫는 기호는 그 원자의 소유이며 바깥 수식을 닫을 수 없다.
+      owns(endRange, end - 1) ||
       (bare && noBare.some(r => r.start <= start && r.end >= end))) continue;
     candidates.push({ start, end, value: texAt(contentStart, contentEnd), display });
     i = end - 1;

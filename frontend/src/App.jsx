@@ -13,6 +13,7 @@ import { readEvents } from './stream.js';
 import { PreviewPre } from './preview.js';
 // 답변 속 주소를 어떻게 다룰지의 판정은 markdown.js에 있다 (순수 함수라 회귀 테스트가 붙는다).
 import { linkTarget, imageTarget, mdProps, scopeMarkdownIds } from './markdown.js';
+import InlineMath from './InlineMath.jsx';
 
 const NO_REHYPE = [];
 function useMarkdownPlugins(base = NO_REHYPE) {
@@ -185,6 +186,11 @@ function PreOrBlock({ node, children, ...props }) {
 // 링크 안인가. 그 안에서는 <a>를 또 열 수 없다 — 중첩 앵커는 DOM이 받아들이지 않고(React가 경고를
 // 내며 그대로 그린다) 바깥 링크가 눌리지 않게 된다. 그림(AltImage)이 이것을 보고 글자로만 남는다.
 const InLink = createContext(false);
+function MarkdownSpan({ node, ...props }) {
+  const inLink = useContext(InLink);
+  return props.className?.split(' ').includes('katex')
+    ? <InlineMath {...props} inLink={inLink} /> : <span {...props} />;
+}
 function NewTabLink({ node, href, children, ...props }) {
   // 열 주소와 얹을 속성을 한 번에 받는다(markdown.js linkTarget) — 걷어낸 값으로 판정해 놓고
   // 걷어내기 전 주소를 href에 쓰는 어긋남을 만들 수 없게. 걷어내면 아무것도 남지 않는 주소는
@@ -220,8 +226,8 @@ function AltImage({ node, src, alt, title }) {
 
 // 플러그인 배열과 마찬가지로 모듈 상수여야 한다 — 새 객체를 넘기면 매 렌더가 파이프라인 재구축이다.
 // (urlTransform과 img를 한 벌로 묶는 이유는 위 TABLE_MD 참고)
-const MAIN_MD = mdProps({ pre: PreOrBlock, a: NewTabLink, img: AltImage });
-const PREVIEW_MD = mdProps({ pre: PreviewPre, a: NewTabLink, img: AltImage });
+const MAIN_MD = mdProps({ pre: PreOrBlock, a: NewTabLink, img: AltImage, span: MarkdownSpan });
+const PREVIEW_MD = mdProps({ pre: PreviewPre, a: NewTabLink, img: AltImage, span: MarkdownSpan });
 
 // 미리보기 본문도 memo 뒤에 둔다 — 완성된 답을 Message(memo)로 감싼 것과 같은 이유이고, 다른 것은
 // 이쪽이 '살아 있는 화면'이라 값을 치르는 순간이 하필 사용자가 무언가를 하고 있을 때라는 점뿐이다.

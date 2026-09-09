@@ -1,6 +1,6 @@
 // Mermaid 원문의 수식 경계. 직렬화 복원과 화면 렌더가 같은 범위를 사용한다.
 import { closingMathDelimiter } from './math-spans.mjs';
-import { verbEnd } from './tex-environments.mjs';
+import { verbEnd, texGroupEnds } from './tex-environments.mjs';
 export const MATH_ADAPTER_KEY = 'llm-agent.mermaid.math.v1';
 const mask = value => value.replace(/[^\r\n]/g, ' ');
 export function executableMermaidSource(source) {
@@ -56,16 +56,7 @@ export function scopedMermaidMathExpressions(source, { lineBreaks } = {}) {
         (closer === '}' && text[next] === ',')) return false;
     }
     const groups = [];
-    const braces = [], braceEnds = new Map();
-    // 미완성 그룹마다 닫는 기호를 다시 찾으면 중괄호가 많은 입력에서 제곱
-    // 비용이 든다. 완성된 그룹의 좌표를 한 번의 순회로 계산한다.
-    for (let i = start; i < end; i++) {
-      const c = text[i];
-      if (c === '\\') { i = Math.max(i + 1, verbEnd(text, i)); continue; }
-      if (c === '%') { while (i < end && !/[\r\n]/.test(text[i])) i++; continue; }
-      if (c === '{') braces.push(i);
-      else if (c === '}' && braces.length) braceEnds.set(braces.pop(), i);
-    }
+    const braceEnds = texGroupEnds(text, start, end);
     for (let i = start; i < end; i++) {
       const c = text[i];
       if (c === '\\') { i = Math.max(i + 1, verbEnd(text, i)); continue; }

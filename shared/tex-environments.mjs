@@ -19,6 +19,20 @@ export function verbEnd(tex, start) {
   return end < 0 ? tex.length - 1 : end;
 }
 
+// 완성된 TeX 인자의 좌표를 한 번의 순회로 계산한다. 미완성 여는 중괄호가
+// 반복돼도 각 위치에서 닫는 기호를 다시 찾지 않는다. 모든 호출 경로에서
+// 이스케이프·주석·verb가 같은 그룹 경계를 사용한다.
+export function texGroupEnds(tex, start = 0, end = tex.length) {
+  const stack = [], groups = new Map();
+  for (let i = start; i < end; i++) {
+    if (tex[i] === '\\') { i = Math.max(i + 1, verbEnd(tex, i)); continue; }
+    if (tex[i] === '%') { while (i < end && !/[\r\n]/.test(tex[i])) i++; continue; }
+    if (tex[i] === '{') stack.push(i);
+    else if (tex[i] === '}' && stack.length) groups.set(stack.pop(), i);
+  }
+  return groups;
+}
+
 export function requiresDisplay(tex) {
   for (let i = 0; i < tex.length; i++) {
     if (tex[i] === '%') { while (i < tex.length && !/[\r\n]/.test(tex[i])) i++; continue; }

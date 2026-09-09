@@ -28,7 +28,9 @@ export default function remarkGfmBounded(options) {
     (Array.isArray(constructs) ? constructs : [constructs]).map(construct => guards[construct.name] ? {
       ...construct,
       previous(code) {
-        return guards[construct.name](this.now().offset) &&
+        // 확장을 별도 fromMarkdown 구조 분석에 넘기면 this.parser를 거치지 않는다.
+        // 원문 문맥이 없는 호출에서는 기본 GFM 판정을 그대로 사용한다.
+        return (!source || guards[construct.name](this.now().offset)) &&
           (!construct.previous || construct.previous.call(this, code));
       },
     } : construct),

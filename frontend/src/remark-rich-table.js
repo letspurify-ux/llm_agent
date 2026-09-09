@@ -4,6 +4,7 @@ import { decodeSerializedLines, decodeVisualizationBreaks } from './serialized-m
 import { fromMarkdown } from 'mdast-util-from-markdown';
 import { markCellTextSyntax, sliceCellText } from './cell-text.js';
 import { inlineCodeSpans, markdownLiteralRanges, codeSpanInLiteral } from '../../shared/inline-code.mjs';
+import { analyzeRichStructure } from '../../shared/rich-table-structure.mjs';
 const BR = /\\?<br\s*\/?>/gi;
 
 // 다른 문법(예: LaTeX)이 보호 구간 전체를 포함하면 그 문법에 원문을 돌려준다.
@@ -31,21 +32,23 @@ export function remarkProtectTableVisualizations() {
     };
     collectDefinitions(tree);
     const visit = node => {
-      if (node.type === 'tableRow' || node.type === 'paragraph') {
+      if (node.type === 'tableCell' || node.type === 'paragraph') {
         const start = node.position.start.offset;
         const row = source.slice(start, node.position.end.offset);
         if (!/`[ \t]*(?:chart|mermaid)(?=(?:\\r)?\\n|\\?<br\s*\/?>)/i.test(row)) return;
         // 표 구분자를 제외한 한 행을 분석하면 | 때문에 잘렸던 주소·HTML도 온전히
         // 인식된다. 주소/속성에 적힌 백틱은 실행할 코드가 아니다.
-        const protectedRanges = markdownLiteralRanges(processor.parse(row +
-          (definitions.length ? '\n\n' + definitions.join('\n') : '')));
+        const inlinePrefix = node.type === 'tableCell' ? 'x ' : '';
+        const rowSource = inlinePrefix + row + (definitions.length ? '\n\n' + definitions.join('\n') : '');
+        const protectedRanges = markdownLiteralRanges(processor.parse(rowSource), rowSource)
+          .map(([start, end]) => [start - inlinePrefix.length, end - inlinePrefix.length]);
         for (const span of inlineCodeSpans(row, protectedRanges)) {
           if (!/^(chart|mermaid)(?=(?:\\r)?\\n|\\?<br\s*\/?>)/i.test(span.value.trim())) continue;
           if (codeSpanInLiteral(span, protectedRanges)) continue;
           if (node.type === 'paragraph' && (row.slice(0, span.start).trim() || row.slice(span.end).trim())) continue;
           // 바깥 GFM 표의 이스케이프 한 겹을 벗긴다. 내부 표 값의 \|는
           // 바깥 셀에서 \\\|로 써야 하며, 코드 노드로 재파싱하며 잃지 않도록 보관한다.
-          const body = node.type === 'tableRow' ? span.value.replace(/(\\+)\|/g,
+          const body = node.type === 'tableCell' ? span.value.replace(/(\\+)\|/g,
             (_whole, slashes) => '\\'.repeat(Math.floor(slashes.length / 2)) + '|') : span.value;
           const token = prefix + values.size;
           values.set(token, body);
@@ -57,7 +60,11 @@ export function remarkProtectTableVisualizations() {
       if (node.type === 'code') return;
       for (const child of node.children ?? []) visit(child);
     };
-    visit(tree);
+    const { structure } = analyzeRichStructure(source, tree, value => processor.parse(value), value => fromMarkdown(value, {
+      extensions: [...processor.data('micromarkExtensions'), { disable: { null: ['table'] } }],
+      mdastExtensions: processor.data('fromMarkdownExtensions'),
+    }));
+    visit(structure);
     if (!edits.length) return tree;
     let result = '', at = 0;
     for (const edit of edits) { result += source.slice(at, edit.start) + edit.value; at = edit.end; }

@@ -75,7 +75,8 @@ function serializedChartBlocks(text, syntax) {
   if (!/`[ \t]*chart(?=(?:\\r)?\\n|\\?<br\s*\/?>)/i.test(text)) return [];
   const literalRanges = syntax.literals;
   const blocks = [];
-  for (const line of text.matchAll(/[^\r\n]+/g)) {
+  for (const [from, to] of [...syntax.tableCells, ...syntax.standalone].sort((a, b) => a[0] - b[0])) {
+    const line = [text.slice(from, to)]; line.index = from;
     for (const span of inlineCodeSpans(line[0], literalRanges, line.index)) {
       if (codeSpanInLiteral(span, literalRanges, line.index)) continue;
       const raw = span.value.trim();
@@ -84,7 +85,7 @@ function serializedChartBlocks(text, syntax) {
       // 양끝 |는 GFM에서 선택이다. 문자 유무로 판정하면 가장자리 셀을 놓치고,
       // 반대로 표가 아닌 산문의 | 사이에 있는 코드 예시를 조회로 바꾼다.
       const contains = ([start, end]) => start <= line.index + span.start && end >= line.index + span.end;
-      const inCell = syntax.tableRows.some(contains);
+      const inCell = syntax.tableCells.some(contains);
       if (!inCell && !syntax.standalone.some(range => contains(range) &&
         !text.slice(range[0], line.index + span.start).trim() &&
         !text.slice(line.index + span.end, range[1]).trim())) continue;

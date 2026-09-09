@@ -9,7 +9,8 @@
     "test": "node --test --test-concurrency=1 test/*.test.js",
     "test:ui": "node --test --test-concurrency=1 test/ui/ui.test.mjs",
     "test:production": "node --test test/ui/production.test.mjs",
-    "test:all": "npm test && npm run test:ui && npm run test:production",
+    "test:inline-math": "node --test test/ui/inline-math.test.mjs",
+    "test:all": "npm test && npm run test:ui && npm run test:production && npm run test:inline-math",
     "test:regression": "node test/run-regressions.mjs"
   },
   "dependencies": {
