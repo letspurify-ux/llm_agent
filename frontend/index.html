@@ -60,6 +60,12 @@
         border-bottom: 1px solid var(--border);
         position: sticky; top: 0; z-index: 10;
       }
+      .brand-home {
+        display: inline-flex; align-items: center; gap: 12px;
+        min-width: 0; padding: 0; border: 0; background: transparent; color: inherit;
+        font: inherit; text-align: left; cursor: pointer;
+      }
+      .brand-home:focus-visible { outline: 3px solid #c7c3ff; outline-offset: 4px; border-radius: 13px; }
       .logo {
         width: 40px; height: 40px; border-radius: 12px;
         background: var(--grad);
@@ -67,9 +73,10 @@
         font-size: 19px; font-weight: 800; color: #fff;
         box-shadow: 0 4px 14px rgba(79, 70, 229, 0.35);
       }
-      .header h1 { margin: 0; font-size: 17px; font-weight: 800; letter-spacing: -0.2px; }
-      .header h1 span { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
-      .header p { margin: 1px 0 0; font-size: 12px; color: var(--muted); }
+      .brand-copy { display: flex; flex-direction: column; min-width: 0; }
+      .brand-title { font-size: 17px; font-weight: 800; letter-spacing: -0.2px; }
+      .brand-title > span { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+      .brand-subtitle { margin-top: 1px; font-size: 12px; color: var(--muted); }
       /* 대화를 접고 첫 화면(빈 상태)으로 되돌리는 단추. 화면이 하나뿐인 앱이라
          '홈'은 이동할 다른 주소가 아니라 대화를 비운 그 첫 화면이다. */
       .home-btn {
@@ -88,6 +95,10 @@
       @media (max-width: 480px) {
         .home-btn { padding: 8px 11px; }
         .home-btn .home-label { display: none; }
+        .brand-home { gap: 8px; }
+        .brand-home .logo { flex-shrink: 0; width: 34px; height: 34px; }
+        .brand-title { font-size: 15px; }
+        .brand-subtitle { font-size: 11px; }
       }
       /* 좁은 화면에서 말풍선 78%는 낭비다 — 320px 창에서 답변 안의 표는 159px, 열 두 개도 못 담는
          세로 띠가 된다. 답변은 폭을 다 쓰게 하고(누구의 말인지는 색·모서리·정렬이 이미 말한다),
@@ -440,7 +451,6 @@
       }
       .send:hover:not(:disabled) { transform: scale(1.06); }
       .send:disabled { opacity: 0.35; cursor: default; box-shadow: none; }
-      .send.stop { background: #4b5563; box-shadow: 0 4px 12px rgba(75, 85, 99, 0.28); }
       .stop-icon { width: 13px; height: 13px; border-radius: 3px; background: currentColor; }
 
       /* ===== 동작 줄이기 =====

@@ -960,6 +960,19 @@ export default function App() {
     inputRef.current?.focus();
   }
 
+  function goHomeFromBrand() {
+    if (adminOpen) {
+      if (adminState.busy || (adminState.dirty && !window.confirm('저장하지 않은 변경 사항을 버리고 채팅으로 돌아가시겠습니까?'))) return;
+      stopGlide();
+      setAdminOpen(false);
+      setAdminState({ dirty: false, busy: false });
+      goHome();
+      requestAnimationFrame(() => inputRef.current?.focus());
+      return;
+    }
+    goHome();
+  }
+
   // 대화는 남기고 현재 답만 접는다. goHome과 달리 세대를 바꾸지 않으므로 ask의 finally가 지금까지
   // 받은 미리보기를 정식 말풍선으로 옮기고 입력을 다시 열 수 있다.
   function stopResponse() {
@@ -1175,11 +1188,10 @@ export default function App() {
   return (
     <div className="app">
       <header className="header">
-        <div className="logo">S</div>
-        <div>
-          <h1><span>SPACE</span> Assistant</h1>
-          <p>지식 · 운영 DB 조회 기반</p>
-        </div>
+        <button type="button" className="brand-home" onClick={goHomeFromBrand} aria-label="홈으로 이동">
+          <span className="logo" aria-hidden="true">S</span>
+          <span className="brand-copy"><span className="brand-title"><span>SPACE</span> Assistant</span><span className="brand-subtitle">지식 · 운영 DB 조회 기반</span></span>
+        </button>
         {/* 대화가 없고 기다리는 것도 없으면 되돌아갈 곳이 없다 — 그때는 눌리지 않게 둔다
             (입력창의 초안은 홈이 아니어도 남는 것이므로 이 판단에 넣지 않는다). */}
         <button
