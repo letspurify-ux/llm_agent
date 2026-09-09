@@ -201,8 +201,8 @@
       .md th { background: #f1f3fb; font-weight: 600; }
       .md .rich-cell { white-space: normal; vertical-align: top; }
       .md .rich-cell > p:last-child { margin-bottom: 0; }
-      .md .rich-cell > .chart, .md .rich-cell > .mermaid { width: 480px; max-width: min(480px, 72vw); }
-      .md .rich-cell > .chart-table { max-width: min(480px, 72vw); }
+      .md .rich-cell .chart, .md .rich-cell .mermaid { width: 480px; max-width: min(480px, 72vw); }
+      .md .rich-cell .chart-table { max-width: min(480px, 72vw); }
       .md tr:nth-child(even) td { background: #fafbfe; }
       .md code { background: #eef0fa; padding: 1px 6px; border-radius: 5px; font-size: 12.5px; }
       /* 코드블록(```). 이 규칙이 없으면 <pre> 기본값(white-space: pre)대로 한 줄을 끝까지 늘여
@@ -252,7 +252,8 @@
       .md .chart .recharts-tooltip-wrapper, .md .chart .recharts-legend-wrapper { overflow-wrap: anywhere; }
       /* mermaid는 SVG에 자기 폭(max-width: NNNpx)을 인라인으로 쓴다 — 말풍선보다 넓으면 줄인다 */
       .md .mermaid { margin: 8px 0; overflow-x: auto; }
-      .md .mermaid svg { max-width: 100%; height: auto; }
+      /* SVG의 인라인 기준선이 목록 기호를 그림 맨 아래로 끌어내리지 않도록 한다. */
+      .md .mermaid svg { display: block; max-width: 100%; height: auto; }
 
       /* ===== 수식 (KaTeX) ===== */
       /* .bubble의 줄바꿈 규칙(overflow-wrap: anywhere)이 여기까지 상속되면, KaTeX가 span으로

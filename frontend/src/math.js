@@ -1,5 +1,5 @@
 // 코드·주소를 구분한 뒤 수식 원문을 보존하여 Markdown을 파싱한다. KaTeX 렌더링은 한 경로로 모은다.
-import remarkGfm from 'remark-gfm';
+import remarkGfm from './remark-gfm.js';
 import remarkMath from 'remark-math';
 import katex from 'katex';
 import 'katex/contrib/mhchem';
@@ -79,5 +79,6 @@ function rehypeMath() {
 }
 
 export const REHYPE_PLUGINS = [rehypeMath];
-export const REMARK_PLUGINS = [remarkGfm, [remarkMath, { singleDollarTextMath: false }], remarkProtectTableVisualizations,
-  remarkSerializedMarkdown, remarkPreserveMath, remarkRichTable];
+// 개행 복구가 새 표를 만들 수 있으므로, 복구된 AST에서 시각화의 내부 |를 보호한다.
+export const REMARK_PLUGINS = [remarkGfm, [remarkMath, { singleDollarTextMath: false }], remarkSerializedMarkdown,
+  remarkProtectTableVisualizations, remarkPreserveMath, remarkRichTable];

@@ -24,7 +24,7 @@ test('production 교차 조합 회귀: 오류 격리·중첩 참조·각주·Mer
   const { stdout } = await promisify(execFile)(process.execPath,
     [join(ROOT, 'test/review/rendering-browser.mjs'), '--production'], { cwd: ROOT, timeout: 85_000 });
   const result = JSON.parse(stdout);
-  assert.equal(result.pass, 20);
+  assert.equal(result.pass, 74);
   assert.equal(result.fail, 0);
 });
 

@@ -5,7 +5,8 @@ import { findChrome } from './ui/driver.mjs';
 await findChrome({ required: true });
 const env = { ...process.env, REQUIRE_CHROME: '1' };
 for (const [command, args, cwd] of [
-  [process.execPath, ['--test', 'test/llm-openai.test.js'], new URL('../../backend/', import.meta.url)],
+  [process.execPath, ['--test', '--test-concurrency=1', 'test/llm-openai.test.js', 'test/chart.test.js',
+    'test/markdown-syntax.test.js'], new URL('../../backend/', import.meta.url)],
   [process.platform === 'win32' ? 'npm.cmd' : 'npm', ['run', 'test:all'], new URL('../', import.meta.url)],
 ]) {
   const result = spawnSync(command, args, { cwd, env, stdio: 'inherit' });

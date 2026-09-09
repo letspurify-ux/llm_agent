@@ -17,6 +17,9 @@
 
 import { nameKey, clipText, TRUNC_MARK, ownProp } from './constants.js';
 import { columnOmissionKey } from './result.js';
+import { inlineCodeSpans, codeSpanInLiteral } from '../../shared/inline-code.mjs';
+import { answerSyntax } from './markdown-syntax.js';
+import { decodeSerializedLines, decodeVisualizationBreaks } from '../../shared/serialized-markdown.mjs';
 
 // 생략 안내의 출처로 판정한다. 실제 컬럼 이름이 '…'일 수 있고, 안내 이름도 행마다 다를 수 있다.
 const dataKeys = row => Object.keys(row ?? {}).filter(k => k !== columnOmissionKey(row));
@@ -38,80 +41,58 @@ export const MAX_CHART_BLOCK_ROWS = 100;
 // 예산은 채울 블록 수로 나눠 준다(아래 resolveChartData) — 먼저 온 블록이 다 쓰면 뒤 블록은 표를 잃는다.
 export const MAX_CHART_INJECT_LEN = 30_000;
 
-// 백틱·물결표 3개 이상의 펜스를 받으며 들여쓰기와 여는 펜스를 보존한다.
-// 닫는 펜스는 같은 글자이고 여는 펜스 이상 길이여야 한다. 빈 본문도 독립 블록으로 처리한다.
-// 바깥 펜스의 종류·길이를 추적해 다른 코드블록 안의 예시를 실제 참조로 실행하지 않는다.
-// 반환 항목은 [전체 블록, 들여쓰기, 여는 펜스, 펜스 글자, 본문]과 원문 index다.
-function fencedBlocks(text, language) {
+// 파서가 확정한 코드 노드에서 닫힌 펜스만 선택한다. 들여쓰기·인용 기호의
+// 유효성은 AST가 결정하고, 치환할 때 필요한 원래 컨테이너 접두사만 보관한다.
+function fencedBlocks(text, language, syntax) {
   const blocks = [];
-  let open = null;
-  for (const line of text.matchAll(/([^\r\n]*)(\r\n|\r|\n|$)/g)) {
-    if (!line[0]) continue;
-    let content = line[1];
-    if (open?.container) {
-      if (content.startsWith(open.container)) content = content.slice(open.container.length);
-      else if (content.trim() === open.container.trim()) content = '';
-      else if (content.trim()) open = null; // 목록·인용문 밖의 펜스는 별개다.
-    }
-    const mark = /^([ \t]*(?:(?:>[ \t]?|(?:[-+*]|\d+[.)])[ \t]+)[ \t]*)*)((`|~)\3{2,})(.*)$/.exec(content);
-    if (!mark) continue;
-    if (open) {
-      if (/^[ \t]*$/.test(mark[1]) && mark[3] === open.ch && mark[2].length >= open.fence.length && !mark[4].trim()) {
-        if (open.language === language || language === '*') {
-          const end = line.index + line[1].length + (line[2] === '\r\n' ? 1 : 0);
-          let body = text.slice(open.bodyStart, line.index).replace(/(?:\r\n|\r|\n)$/, '');
-          if (open.container) body = body.split(/\r\n|\r|\n/).map(value =>
-            value.startsWith(open.container) ? value.slice(open.container.length) : '').join('\n');
-          const block = [text.slice(open.index, end), open.container ? '' : open.indent,
-            open.fence, open.ch, body];
-          block.index = open.index;
-          if (open.container) block.container = { first: open.indent, rest: open.container };
-          blocks.push(block);
-        }
-        open = null;
-      }
-      continue;
-    }
-    if (mark[3] === '`' && mark[4].includes('`')) continue;
-    open = { index: line.index, bodyStart: line.index + line[0].length,
-      indent: mark[1], fence: mark[2], ch: mark[3], language: mark[4].trim().split(/\s+/)[0].toLowerCase() };
-    if (/[>\d.*+-]/.test(mark[1])) open.container = mark[1].replace(/(?:[-+*]|\d+[.)])([ \t]+)/g,
-      match => ' '.repeat(match.length));
-  }
-  if (open && language === '*') {
-    const block = [text.slice(open.index)];
-    block.index = open.index;
+  for (const node of syntax.codes.values()) {
+    if (node.lang?.toLowerCase() !== language) continue;
+    const { start, end } = node.position;
+    const raw = text.slice(start.offset, end.offset);
+    const open = /^(`{3,}|~{3,})/.exec(raw);
+    if (!open) continue;
+    const lastNewline = Math.max(raw.lastIndexOf('\n'), raw.lastIndexOf('\r'));
+    if (lastNewline < 0) continue;
+    const close = /^([ \t>]*)(`{3,}|~{3,})[ \t]*$/.exec(raw.slice(lastNewline + 1));
+    if (!close || close[2][0] !== open[1][0] || close[2].length < open[1].length) continue;
+    // 들여쓰기가 너무 깊은 마지막 백틱은 닫는 펜스가 아니라 코드 본문이다.
+    const bodyLines = node.value ? node.value.split(/\r\n?|\n/).length : 0;
+    if (raw.split(/\r\n?|\n/).length < bodyLines + 2) continue;
+    const index = Math.max(text.lastIndexOf('\n', start.offset - 1), text.lastIndexOf('\r', start.offset - 1)) + 1;
+    const first = text.slice(index, start.offset), rest = close[1];
+    const finish = end.offset + (text.startsWith('\r\n', end.offset) ? 1 : 0);
+    const block = [text.slice(index, finish), '', open[1], open[1][0], node.value];
+    block.index = index;
+    if (first || rest) block.container = { first, rest };
     blocks.push(block);
   }
-  return blocks;
+  return blocks.sort((a, b) => a.index - b.index);
 }
 
 // 표 셀 또는 독립 문단의 `chart<br>...` / `chart\n...`도 같은 데이터 계약이다.
 // 일반 펜스 안의 예제와 일반 인라인 코드 안의 중첩 백틱은 건드리지 않는다.
-function serializedChartBlocks(text) {
-  const protectedBlocks = fencedBlocks(text, '*');
+function serializedChartBlocks(text, syntax) {
+  if (!/`[ \t]*chart(?=(?:\\r)?\\n|\\?<br\s*\/?>)/i.test(text)) return [];
+  const literalRanges = syntax.literals;
   const blocks = [];
-  let protectedAt = 0;
   for (const line of text.matchAll(/[^\r\n]+/g)) {
-    while (protectedBlocks[protectedAt] && protectedBlocks[protectedAt].index + protectedBlocks[protectedAt][0].length <= line.index) protectedAt++;
-    if (protectedBlocks[protectedAt]?.index <= line.index) continue;
-    const runs = /(?:\\?`)+/g;
-    for (let mark; (mark = runs.exec(line[0]));) {
-      const fence = mark[0];
-      const end = line[0].indexOf(fence, runs.lastIndex);
-      if (end < 0) break;
-      const raw = line[0].slice(runs.lastIndex, end);
-      runs.lastIndex = end + fence.length;
+    for (const span of inlineCodeSpans(line[0], literalRanges, line.index)) {
+      if (codeSpanInLiteral(span, literalRanges, line.index)) continue;
+      const raw = span.value.trim();
       const start = /^chart(?:(?:\\r)?\\n|\\?<br\s*\/?>)/i.exec(raw);
       if (!start) continue;
-      const left = line[0].slice(0, mark.index), right = line[0].slice(runs.lastIndex);
-      const inCell = left.includes('|') && right.includes('|');
-      if (!inCell && (left.replace(/^\s*(?:(?:>\s*|[-+*]\s+|\d+[.)]\s+)\s*)*/, '').trim() || right.trim())) continue;
-      let body = raw.slice(start[0].length).replace(/\\\\|\\r\\n|\\n(?=[^A-Za-z]|$)|\\n(?=(?:type|title|x|y|y2|xtype|data)\s*:)|\\?<br\s*\/?>/gi,
-        match => match === '\\\\' ? match : '\n');
+      // 양끝 |는 GFM에서 선택이다. 문자 유무로 판정하면 가장자리 셀을 놓치고,
+      // 반대로 표가 아닌 산문의 | 사이에 있는 코드 예시를 조회로 바꾼다.
+      const contains = ([start, end]) => start <= line.index + span.start && end >= line.index + span.end;
+      const inCell = syntax.tableRows.some(contains);
+      if (!inCell && !syntax.standalone.some(range => contains(range) &&
+        !text.slice(range[0], line.index + span.start).trim() &&
+        !text.slice(line.index + span.end, range[1]).trim())) continue;
+      let body = /<br/i.test(start[0]) ? decodeVisualizationBreaks(raw.slice(start[0].length))
+        : decodeSerializedLines(raw.slice(start[0].length));
       if (inCell) body = body.replace(/(\\+)\|/g, (_whole, slashes) => '\\'.repeat(Math.floor(slashes.length / 2)) + '|');
-      const block = [line[0].slice(mark.index, runs.lastIndex), '', '```', '`', body];
-      block.index = line.index + mark.index;
+      const block = [line[0].slice(span.start, span.end), '', '```', '`', body];
+      block.index = line.index + span.start;
       block.serialized = { inCell };
       blocks.push(block);
     }
@@ -426,13 +407,15 @@ const note = (config, why, indent = '') => {
 // 넓은 표가 앞에 오면 그 표는 몫만큼만 싣고 뒤의 좁은 표가 남긴 몫은 돌려받지 못한다 — 그 대신 어느 블록도
 // 표를 통째로 잃지는 않는다.
 export function resolveChartData(answer, steps) {
-  const text = String(answer ?? '');
-  if (!/(?:`|~~~)[ \t]*chart/i.test(text)) return text;
+  const original = String(answer ?? '');
+  if (!/(?:`|~~~)[ \t]*chart/i.test(original)) return original;
   const needsFill = body => { const b = splitBlock(body); return b.config.data !== undefined && !b.hasTable; };
-  const blocks = [...fencedBlocks(text, 'chart'), ...serializedChartBlocks(text)].sort((a, b) => a.index - b.index);
+  const syntax = answerSyntax(original, { serialized: /`[ \t]*chart(?=(?:\\r)?\\n|\\?<br\s*\/?>)/i.test(original) });
+  const text = syntax.source;
+  const blocks = [...fencedBlocks(text, 'chart', syntax), ...serializedChartBlocks(text, syntax)].sort((a, b) => a.index - b.index);
   let blocksLeft = blocks.filter(m => needsFill(m[4] ?? '')).length;
   let budget = MAX_CHART_INJECT_LEN;
-  return replaceBlocks(text, blocks, (whole, indent, fence, _ch, body = '', sourceBlock) => {
+  const resolved = replaceBlocks(text, blocks, (whole, indent, fence, _ch, body = '', sourceBlock) => {
     const { config, lines, hasTable } = splitBlock(body);
     if (config.data === undefined) return whole;
     // 표가 함께 있으면 표가 우선이다 — data 줄만 지운다 (프런트는 어차피 무시하지만, 이력으로
@@ -471,6 +454,7 @@ export function resolveChartData(answer, steps) {
     // 행 상한이나 예산에 걸려 다 싣지 못한 표는 그 사실을 차트 아래 밝힌다 — 그래프만 보면 그것이 전부로 읽힌다.
     return taken < rows.length ? `${block}\n${indent}_(표는 ${rows.length}행 중 처음 ${taken}행까지만 실었습니다)_` : block;
   });
+  return resolved === text ? original : resolved;
 }
 
 // ===== 조회 결과 표 (```table 블록) =====
@@ -519,7 +503,7 @@ export function resolveTableData(answer, steps) {
   // 예산은 '채울 블록'에만 나눈다 — 참조 없는 블록까지 세면 아무것도 쓰지 않는 블록이 몫을 가져가
   // 정작 채우는 표가 잘린다 (실측: 참조 없는 블록 넷이 섞이자 87행이 17행이 됐다).
   // 차트 쪽(resolveChartData)이 needsFill로 미리 거르는 것과 같은 이유·같은 방식이다.
-  const blocks = fencedBlocks(text, 'table');
+  const blocks = fencedBlocks(text, 'table', answerSyntax(text));
   let blocksLeft = blocks.filter(m => refOf(m[4] ?? '').ref !== undefined).length;
   let budget = MAX_TABLE_INJECT_LEN;
   return replaceBlocks(text, blocks, (whole, indent, _fence, _ch, body = '') => {

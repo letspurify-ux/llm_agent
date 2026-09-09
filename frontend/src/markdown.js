@@ -5,6 +5,7 @@
 // 않는다 — 링크가 같은 탭에서 열려 대화가 통째로 사라지거나, 주소 하나가 사용자가 누르기도 전에
 // 바깥으로 나가는 요청이 된다.
 import { defaultUrlTransform } from 'react-markdown';
+import { mermaidMathExpressions } from './mermaid-math.js';
 
 // 각 markdown 렌더의 ID 공간을 분리한다. 같은 번호의 각주가 여러 답변에 있어도
 // 본문·각주·되돌아가기·접근성 설명이 그 답변 안에서 연결되어야 한다.
@@ -160,13 +161,12 @@ const unescaped = s => {
   return cur;
 };
 
-// 수식만 KaTeX가 만든 MathML로 넣을 때의 HTML 라벨 허용 조건. 모델이 작성한
-// HTML·문자 참조·Markdown 이미지가 섞인 그림은 기존 SVG 텍스트 경로를 유지한다.
-export const mermaidMathLabels = text => {
-  if (!/\b(?:flowchart|graph)\s+(?:TB|TD|BT|LR|RL)\b/.test(text) || !/\$\$[^\r\n]+?\$\$/.test(text)) return false;
-  const labels = unescaped(text.replace(/\$\$[^\r\n]+?\$\$/g, 'MATH'));
-  return !/<|&|#[A-Za-z0-9]+;|!\s*\[/.test(labels);
-};
+// 실제 그림 종류는 Mermaid의 판정을 받는다. '<'·'&'는 연결 문법에도 쓰이므로
+// 원문 전체의 문자 유무로 수식 지원을 끄면 정상 화살표·줄바꿈·서식까지 깨진다.
+// 여기서는 후보만 찾고 실제 라벨 여부는 prepareMermaidMath가 파서로 확인한다.
+// HTML 라벨의 자원 요소·속성은 Mermaid.jsx의 잠긴 DOMPurify 설정이 제거한다.
+export const mermaidMathLabels = (text, diagramType) =>
+  ['flowchart', 'flowchart-v2', 'flowchart-elk'].includes(diagramType) && mermaidMathExpressions(text).length > 0;
 
 // 흐름도 원문에 그림 노드(`A@{ img: "주소" }`)가 있는가. mermaid는 이 노드의 크기를 재려고 그리는 도중에
 // 그 주소를 new Image()로 불러온다 — 사용자가 누르기도 전에, 그리고 그림이 화면에 서기도 전에 요청이

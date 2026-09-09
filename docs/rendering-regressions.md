@@ -15,7 +15,7 @@ npm --prefix frontend run test:regression
 ```
 
 Node 22 이상과 Chrome이 필요하다. 필요하면 `CHROME_PATH`로 실행 파일을 지정한다.
-이 명령은 백엔드 응답 전송 검사, 프런트엔드 전체 단위 검사, 실제 Chrome UI 검사,
+이 명령은 백엔드 응답 전송·조회 주입·문법 경계 검사, 프런트엔드 전체 단위 검사, 실제 Chrome UI 검사,
 현재 소스를 새로 빌드하는 production 검사를 순서대로 실행한다. 어느 단계든 실패하면 종료 코드가
 실패이며, Chrome이 없으면 검사를 건너뛰지 않고 실패한다. 실제 DB·LLM 접속은 필요 없다.
 [CI](../.github/workflows/rendering-regressions.yml)도 모든 push/PR에서 같은 명령을 실행한다.
@@ -41,9 +41,16 @@ Node 22 이상과 Chrome이 필요하다. 필요하면 `CHROME_PATH`로 실행 �
 | 미완성 수식이 뒤의 코드 블록·정상 수식을 삼킴, 수식 모양 각주 식별자, 연속 `$x$$y$` 누락 | [rendering-combinations.test.js](../frontend/test/rendering-combinations.test.js) | 정상 쌍·오류 격리·컨테이너·개행 등 1,198개 입력 대조 |
 | 표의 `\\<br>` 원문 노출, 한 셀의 수식·목록·인용·설명·시각화 분리 | [rich-table.test.js](../frontend/test/rich-table.test.js), [rich-table-checks.mjs](../frontend/test/ui/rich-table-checks.mjs) | 실제 블록 구조·셀 수·이웃 값·수식 원문과 데스크톱/320px 그림 크기 확인 |
 | 표 안 및 독립 문단의 직렬화된 Mermaid/chart가 코드로 남음 | 같은 rich-table 테스트, ui/production 테스트 | `<br>`·리터럴 `\\n`·백틱 변형·스트림 접두사·미리보기에서 최종 그림으로 전환 |
+| 표 셀 안의 하위 목록·인용·작업 목록이 평탄화되고 그림이 목록 밖으로 이동 | [cell-blocks.test.js](../frontend/test/cell-blocks.test.js), production 테스트 | 900개 조합의 컨테이너 구조·정확한 콘텐츠 경로, 실제 중첩 DOM과 그림 크기 확인 |
+| 표 셀의 이스케이프·문자 참조가 수식 복원 뒤 목록·인용·제목·체크박스로 바뀜 | 같은 cell-blocks 테스트, production 테스트 | 문자 출처 3,150개·작업 목록 50개 입력의 실제 원문·블록 구조·수식·그림·이웃 셀 및 모든 스트림 접두사 보존 |
+| 양끝 파이프 없는 표의 가장자리 차트 조회 누락과 산문 코드 예시의 오주입 | 같은 cell-blocks 테스트, [markdown-syntax.test.js](../backend/test/markdown-syntax.test.js) | 300개 표·셀 위치·컨테이너·개행 조합의 조회값·이웃 셀과 코드 예시 원문 보존 |
+| Mermaid/chart의 정상 LaTeX 명령과 수식 내부 `<br>`가 직렬화 개행으로 변환됨 | cell-blocks 테스트, production 테스트 | 600개 수식 원문 조합과 실제 SVG 안의 MathML·문자열 확인 |
 | 인용문·목록·직렬화된 표 셀 차트의 조회 참조 누락 | rendering-combinations·rich-table 테스트, [rendering-browser.mjs](../frontend/test/review/rendering-browser.mjs) | 서버가 실제 조회 결과를 채우고 `|`·백슬래시·`<br>`·코드 모양의 값을 그대로 보존, 예산 상한 확인 |
 | 이중 이스케이프된 근의 공식·개행, 이스케이프된 인용 기호 | rich-table 테스트 | 근의 공식과 조건의 정확한 TeX 원문, 정상 `\\nu`·행 구분자·코드·주소 보존 |
 | Mermaid 흐름도 수식 라벨이 달러 원문으로 남음 | ui/production 테스트 | 실제 MathML 조판 크기, 혼합 그림 렌더, 수식·다른 라벨의 이미지 자동 요청 차단 |
+| Mermaid의 양방향 화살표·다중 연결·줄바꿈·문자 참조가 수식을 끄거나 주석·설정의 수식 예시가 실행됨 | [mermaid-math.test.js](../frontend/test/mermaid-math.test.js), ui/production 테스트 | 실제 그림 종류, 240개 중첩 원문, 메타데이터 보존, MathML 내용·크기·노드 수·서식과 이미지 자동 요청 0 확인 |
+| Mermaid 수식 치환이 링크·툴팁·접근성 설명을 변경하거나 shape 라벨의 따옴표·문장부호와 충돌 | 같은 mermaid-math·production 테스트 | 540개 중첩 원문, 실제 파서가 확인한 라벨, MathML 의미·링크 주소·접근성 제목과 74회 전체 화면 조합 검사 |
+| 목록 안 Mermaid의 기호가 그림 맨 아래로 내려감 | production 교차 조합 테스트 | Chrome `::marker`와 그림 시작점의 실제 좌표를 대조 |
 | 스트림 중간의 수식/표/펜스, reset, 중단·재시도, 홈 이동 뒤 늦은 응답 | [ui.test.mjs](../frontend/test/ui/ui.test.mjs), [stream.test.js](../frontend/test/stream.test.js) | 미완성 미리보기·완료 답변·대화 이력 분리, UTF-8/JSON 조각 경계 보존 |
 | JSON 디코딩에서 TeX 백슬래시가 제어 문자로 변환되거나 응답 소실 | [llm-openai.test.js](../backend/test/llm-openai.test.js) | 정상/덜 이스케이프된 기존 코퍼스 및 최신 4개 전체 문서의 최종 원문·1/7/1000자 조각 대조 |
 | 개발 모드만 통과하고 배포 빌드에서 회귀 | [production.test.mjs](../frontend/test/ui/production.test.mjs) | 실제 빌드에서 200개 표·78개 정상 예제·180개 링크 표와 복합 콘텐츠 검사 |
@@ -62,11 +69,40 @@ Node 22 이상과 Chrome이 필요하다. 필요하면 `CHROME_PATH`로 실행 �
 
 ## 실행 결과
 
+2026-09-09 라벨 문법 경계 최종 검토에서 백엔드 전체 569개, 프런트엔드 단위
+317개, Chrome UI 87개, production 3개가 통과했다(실패·취소·건너뜀 0개).
+필수 실행기 기준 551개이며 production에는 실제 앱 74회 조합 검사가 포함된다.
+분수·문장부호·달러 문자가 섞인 최종 개발 화면 74회도 통과했다.
+[검토 기록](mermaid-label-ownership-review.md)에 재현·수정·완료 증거를 정리했다.
+
+2026-09-09 최종 Mermaid 연결·서식·수식 검토에서 백엔드 전체 569개,
+프런트엔드 단위 316개, Chrome UI 87개, production 3개가 통과했다
+(실패·취소·건너뜀 0개). 필수 실행기 기준 550개이며 production에는 실제 앱
+54회 조합 검사가 포함된다. [추가 검토 기록](mermaid-math-rendering-review.md)에
+현재 증거와 중간 실행의 시간 초과 재확인 결과를 기록했다.
+
+2026-09-09 최종 추가 검토에서 백엔드 전체 569개, 프런트엔드 단위 313개,
+Chrome UI 87개, production 3개가 통과했다(실패·취소·건너뜀 0개).
+필수 실행기에는 백엔드 전송·조회·문법 경계 144개를 포함해 총 547개가 들어간다.
+기존 중첩 조합 1,800개, 추가 문자 출처 조합 3,200개와 배포 앱 38회 검증은 이 테스트들에 포함된다.
+자세한 검증은 [표 셀 블록 검토](cell-block-rendering-review.md)에 기록했다.
+
+최초 전체 실행의 새 배포 판정은 차트 범례의 `ul`도 Markdown 목록으로 세어 실패했다.
+실제 DOM과 `Chart.jsx`를 확인해 그림 내부의 목록과 본문 구조를 구분했고,
+배포 검사 3개를 다시 실행해 모두 통과했다. 마지막 출처 보존 보완 후 관련 단위
+검사 23개도 재확인했다. 개발 화면 38회는 별도 실행에서 모두 통과했다.
+
+이전 단계의 실행 기록:
+
 2026-09-09 수정 후 필수 회귀 검사에서 백엔드 전송 103개, 프런트 단위 287개, Chrome UI 87개,
 production 3개, 총 480개가 통과했다(실패·취소·건너뜀 0개). 정적 교차 조합 1,198개와
 production 화면 20개를 포함한다. 마지막 직렬화 명령 보존 보완의 단위 검사 8개도 재실행해 통과했다.
 이후 조회값의 문자 `<br>` 보호를 추가하고 프런트 단위 288개·백엔드 전체 564개를 재실행해 모두 통과했다.
 자세한 수정 전 재현과 검증 범위는 [조합 정밀 검토](rendering-combination-review.md)에 기록했다.
+
+백틱 길이·일반 코드·LaTeX 내부의 시각화·주소/참조 보호·GFM 성능에 대한 후속 검토는
+[중첩 렌더링 정밀 검토](nested-rendering-review.md)에 기록했다. `nested-boundaries.test.js`와
+`gfm-boundaries.test.js`도 위 회귀 명령에 포함된다.
 
 2026-09-08 로컬에서 `npm --prefix frontend run test:regression`으로 백엔드 전송 103개,
 프런트엔드 단위 273개, 실제 Chrome UI 84개, production 2개, 총 462개가 통과했다.
@@ -76,3 +112,15 @@ production 화면 20개를 포함한다. 마지막 직렬화 명령 보존 보�
 CI 최초 실행에서는 한글 글꼴이 없는 환경의 차트 검사 전제 실패도 확인했다.
 Linux 작업에 `fonts-noto-cjk` 설치를 추가했고, 위 두 화면 문제는 원격 재현 결과에 따라
 수정했다. 패널 검사는 좌표 측정과 클릭을 같은 JS 작업으로 묶어 통신 사이의 이동도 배제한다.
+## 추가 검토
+
+개행 복원 순서, 서버와 화면의 수식 경계 공유, AST 기반 조회 펜스 선택, 주소의 백틱과 이웃 시각화 충돌은 [중첩 문법 경계 추가 검토](rendering-ownership-review.md)에 재현·수정·검증 범위를 정리했다.
+
+표 셀 내부의 다단 목록·인용·작업 목록과 선택적 가장자리 파이프에 대한 검토는
+[표 셀 블록 검토](cell-block-rendering-review.md)에 기록했다.
+
+Mermaid의 연결·서식·메타데이터와 수식 조합, 목록 기호 배치는
+[Mermaid 수식 추가 검토](mermaid-math-rendering-review.md)에 재현과 검증 범위를 기록했다.
+
+Mermaid 라벨과 주소·툴팁·접근성 설명의 구분 및 shape 속성 안 수식은
+[라벨 문법 경계 검토](mermaid-label-ownership-review.md)에 기록했다.

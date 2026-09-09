@@ -193,14 +193,21 @@ it('Mermaid 수식을 그려도 수식·다른 라벨의 이미지가 자동 요
  A["$$x^2$$"] --> B["![이미지](/pixel-math.png)"]`,
     String.raw`flowchart LR
  A["$$\nu+\frac12$$"] --> B[완료]`,
+    String.raw`%%{init: {"dompurifyConfig": {"FORBID_TAGS": [], "FORBID_ATTR": []}, "htmlLabels": false}}%%
+flowchart LR
+ A["$$x^2$$"] <--> B["<img src='/pixel-math.png'>"]`,
+    String.raw`flowchart LR
+ A["$$x^2$$<br/>설명"] & C --> B["&lt;img src='/pixel-math.png'&gt;"]`,
+    String.raw`flowchart LR
+ A["$$x^2$$"] --> B["<span style='background:url(/pixel-math.png)'>글자</span>"]`,
   ];
   await page.goto(url(), '.chip');
   await page.eval(`window.fetch = async () => new Response(JSON.stringify({ answer: ${JSON.stringify(sources.map(s => '```mermaid\n' + s + '\n```').join('\n\n'))} }),
     { headers: { 'Content-Type': 'application/json' } }); document.querySelector('.chip').click()`);
-  await page.until(`document.querySelectorAll('.mermaid svg').length === 4 && !document.querySelector('.typing')`);
+  await page.until(`document.querySelectorAll('.mermaid svg').length === ${sources.length} && !document.querySelector('.typing')`);
   assert.equal(await page.eval(`document.querySelectorAll('.mermaid img, .mermaid image').length`), 0);
   assert.equal(await page.eval(`performance.getEntriesByType('resource').filter(e => e.name.includes('pixel-math')).length`), 0);
-  assert.ok(await page.eval(`document.querySelectorAll('.mermaid math').length >= 2`));
+  assert.equal(await page.eval(`document.querySelectorAll('.mermaid math').length`), sources.length);
 });
 
 it('200개 수식 표: 데스크톱·모바일에서 모든 행의 원문과 실제 조판 영역을 검증한다', async () => {

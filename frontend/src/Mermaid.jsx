@@ -5,6 +5,7 @@ import mermaid from 'mermaid';
 // 그림 안 링크의 주소 규칙과 그림 노드의 판정은 답변의 링크·그림과 같은 자리에 있다 (markdown.js).
 import { rawLinkTarget, mermaidLoadsImage, mermaidFetchesViaStyle, mermaidMathLabels } from './markdown.js';
 import { renderMathML } from './math.js';
+import { prepareMermaidMath, mermaidMathML } from './mermaid-math.js';
 
 const MERMAID_CONFIG = {
   startOnLoad: false,
@@ -27,6 +28,12 @@ const MERMAID_CONFIG = {
   // 같은 문을 지나므로 함께 막힌다. 지키는 키는 어느 깊이에 있든 걸러진다(flowchart.htmlLabels도).
   // 기본 목록을 이어받아 늘린다 — 통째로 다시 적으면 mermaid가 기본 목록에 키를 더한 날 그것을 조용히 잃는다.
   secure: [...(mermaid.mermaidAPI?.defaultConfig?.secure ?? []), 'htmlLabels', 'dompurifyConfig'],
+  // 라벨 문자의 사전 차단 대신 HTML을 DOM에 넣는 라이브러리 경로에서 제거한다.
+  // 일반 라벨과 수식 라벨 모두 같은 제한을 받으며 본문 설정이 덮어쓸 수 없다.
+  dompurifyConfig: {
+    FORBID_TAGS: ['img', 'image', 'style', 'iframe', 'object', 'embed', 'video', 'audio', 'source', 'link'],
+    FORBID_ATTR: ['src', 'srcset', 'style'],
+  },
   // 문법이 틀린 그림에 mermaid가 '폭탄' 오류 SVG를 문서에 직접 끼워 넣는 것을 막는다 —
   // 그 경우는 아래에서 원문 코드로 되돌린다.
   suppressErrorRendering: true,
@@ -36,17 +43,17 @@ const MERMAID_CONFIG = {
 mermaid.initialize(MERMAID_CONFIG);
 
 // 설정은 전역이므로 설정 변경과 실제 렌더를 같은 직렬 작업으로 묶는다. 수식 라벨은
-// 본문과 같은 제한의 KaTeX가 만든 MathML만 주입한다. 모델의 HTML은 허용하지 않는다.
+// 본문과 같은 제한의 KaTeX가 만든 MathML을 주입하고 라벨 HTML은 잠긴 설정으로 정화한다.
 let renderQueue = Promise.resolve();
 function renderDiagram(id, text) {
-  const task = renderQueue.then(() => {
-    const math = mermaidMathLabels(text);
-    const source = math ? text.replace(/\$\$([^\r\n]+?)\$\$/g,
-      (_, tex) => renderMathML(tex).replaceAll('"', "'")) : text;
-    mermaid.initialize({ ...MERMAID_CONFIG, htmlLabels: math, ...(math ? {
-      dompurifyConfig: { FORBID_TAGS: ['img', 'image', 'style', 'iframe', 'object', 'embed', 'video', 'audio', 'source', 'link'],
-        FORBID_ATTR: ['src', 'srcset', 'style'] },
-    } : {}) });
+  const task = renderQueue.then(async () => {
+    // 직전 그림의 본문 설정과 무관한 기본 설정에서 종류를 판정한다.
+    mermaid.initialize(MERMAID_CONFIG);
+    const candidate = mermaidMathLabels(text, mermaid.detectType(text.replace(/\r\n?/g, '\n')));
+    const { source, math } = candidate ? await prepareMermaidMath(text,
+      source => mermaid.mermaidAPI.getDiagramFromText(source), tex => mermaidMathML(renderMathML(tex)))
+      : { source: text, math: false };
+    mermaid.initialize({ ...MERMAID_CONFIG, htmlLabels: math });
     return mermaid.render(id, source);
   });
   renderQueue = task.catch(() => {});

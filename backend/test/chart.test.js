@@ -72,6 +72,23 @@ import { resolveChartData, MAX_CHART_COLS, MAX_CHART_CELL_LEN, MAX_CHART_INJECT_
 import { TRUNC_MARK, MAX_CELL_LEN } from '../src/constants.js';
 import { parseChartBlock } from '../../frontend/src/chart.js';
 
+test('직렬화 chart는 정확히 같은 길이의 백틱에서 닫고 주소·HTML·코드 예시는 보존한다', () => {
+  const steps = [[{ LABEL: 'FOUND_ROW', VALUE: 7 }]];
+  const table = body => '| A | B |\n|---|---|\n| ' + body + ' | RIGHT |';
+  const code = '`chart<br>data:step1`';
+  for (const source of [table(`[LINK](https://example.test/${code})`),
+    table(`<span title="${code}">TEXT</span>`), table('``예시 ' + code + ' 끝``'),
+    table(`[LINK][${code}]`) + `\n\n[${code}]: https://example.test`, '    ' + code,
+    '``코드 예시\n| LEFT | ' + code + ' | RIGHT |\n``']) {
+    assert.equal(resolveChartData(source, steps), source);
+  }
+  const resolved = resolveChartData(table('`chart\\ntitle: 값 ``인용``\\ndata:step1`'), steps);
+  assert.ok(resolved.includes('FOUND_ROW'));
+  assert.ok(resolved.includes('title: 값 ``인용``'));
+  assert.ok(resolved.endsWith(' | RIGHT |'));
+  assert.ok(!resolved.includes('data:step1'));
+});
+
 const rows = [
   { MONTH: '2024-01', CNT: 120, AMT: 1000.5, NOTE: 'a|b' },
   { MONTH: '2024-02', CNT: null, AMT: 2500, NOTE: 'x\ny' },
@@ -352,7 +369,8 @@ test('0건·없는 스텝·번호 없는 참조는 안내 문장으로, 참조 �
   // 코드블록으로 남기면 화면이 파이프 원문을 코드로 보여주고(프런트는 chart·mermaid 펜스만 따로 알아본다)
   // 사용자는 그것이 무엇인지 모른다.
   assert.strictEqual(resolveTableData(tblock('| a | b |\n| 1 | 2 |'), [rows]), '| a | b |\n| 1 | 2 |');
-  assert.strictEqual(resolveTableData(tblock('그냥 글', '  '), [rows]), '그냥 글');
+  // 펜스를 벗겨도 원래 들여쓰기를 유지한다. 목록 안에서도 본문이 밖으로 빠지지 않는다.
+  assert.strictEqual(resolveTableData(tblock('그냥 글', '  '), [rows]), '  그냥 글');
   // 이 블록을 쓰려다 step만 빠뜨린 경우는 다르다 — 본문을 그대로 내보내면 'cols: A' 같은 설정 줄이
   // 답변 글자로 사용자에게 보인다.
   assert.match(resolveTableData(tblock('cols: A\nlimit: 5'), [rows]), /^_표를 채우지 못했습니다: step 참조가 없습니다_$/);
