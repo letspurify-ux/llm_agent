@@ -16,6 +16,25 @@ const ran = (name, params, rows = [{ A: 1 }]) => ({ query_name: name, params, ro
 const failed = (name, params) => ({ query_name: name, params, error: 'ORA-00942' });
 const BINDS = ['job_id'];
 
+test('요청 취소는 신호를 모르는 LLM 대기도 즉시 끝내고 폴백 답변을 만들지 않는다', async () => {
+  const controller = new AbortController();
+  let release;
+  const waiting = new Promise(resolve => { release = resolve; });
+  const request = handleQuestion('중지할 질문', [], {
+    signal: controller.signal,
+    deps: { decide: () => waiting },
+  });
+  controller.abort();
+  const outcome = await Promise.race([
+    request.then(value => ({ value }), error => ({ error })),
+    new Promise(resolve => setTimeout(() => resolve('매달림'), 500)),
+  ]);
+  release({ action: 'answer', answer: '늦은 답' });
+  assert.notEqual(outcome, '매달림');
+  assert.equal(outcome.error?.name, 'AbortError');
+  assert.equal(outcome.value, undefined, '취소를 정상 답변이나 폴백으로 바꿨다');
+});
+
 test('같은 쿼리·같은 파라미터의 재실행을 막는다', () => {
   const history = [ran('batch_job_status', { job_id: 'B1' })];
   assert.match(loopGuard(history, 'batch_job_status', BINDS, { job_id: 'B1' }), /이미 같은 파라미터/);

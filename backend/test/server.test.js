@@ -197,6 +197,8 @@ test('요청 경로에서 새어 나온 예외도, 답 없이 매달린 요청�
 describe('진행 상황 스트림', () => {
   let llm; let llmPort; let sproc; let sport; let slog = '';
   const script = [];   // 가짜 LLM이 차례로 돌려줄 결정 JSON
+  const HOLD = '__hold_open_until_cancelled__';
+  let heldStarts = 0; let heldCloses = 0;
   const sbase = () => `http://127.0.0.1:${sport}`;
   const 살아있나2 = () => !!sproc && sproc.exitCode === null && sproc.signalCode === null;
 
@@ -210,6 +212,13 @@ describe('진행 상황 스트림', () => {
       req.on('end', () => {
         const content = script.shift() ?? '{"action":"answer","answer":"대본이 끝났다"}';
         const wantsStream = (() => { try { return JSON.parse(body).stream === true; } catch { return false; } })();
+        if (content === HOLD) {
+          heldStarts++;
+          res.setHeader('Content-Type', 'text/event-stream');
+          res.flushHeaders();
+          res.once('close', () => { heldCloses++; });
+          return;
+        }
         if (!wantsStream) {
           res.setHeader('Content-Type', 'application/json');
           res.end(JSON.stringify({ choices: [{ message: { content }, finish_reason: 'stop' }] }));
@@ -319,6 +328,27 @@ describe('진행 상황 스트림', () => {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'y', history: [] }),
     });
     assert.equal((await next.json()).answer, '다음 답');
+  });
+
+  test('클라이언트 중지는 진행 중인 상류 LLM 연결까지 끊고 재시도하지 않는다', async () => {
+    script.length = 0;
+    const beforeStarts = heldStarts; const beforeCloses = heldCloses;
+    script.push(HOLD);
+    const ctrl = new AbortController();
+    const res = await fetch(`${sbase()}/api/chat`, {
+      method: 'POST', signal: ctrl.signal,
+      headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
+      body: JSON.stringify({ message: '오래 걸리는 답', history: [] }),
+    });
+    for (let i = 0; i < 50 && heldStarts === beforeStarts; i++) await sleep(20);
+    assert.equal(heldStarts, beforeStarts + 1, '상류 LLM 호출이 시작되지 않았다');
+    ctrl.abort();
+    await res.body?.cancel().catch(() => {});
+    for (let i = 0; i < 50 && heldCloses === beforeCloses; i++) await sleep(20);
+    assert.equal(heldCloses, beforeCloses + 1, '클라이언트 연결만 닫히고 상류 LLM은 계속 생성 중이다');
+    await sleep(100);
+    assert.equal(heldStarts, beforeStarts + 1, '취소된 LLM 호출을 재시도했다');
+    assert.ok(살아있나2(), '취소 처리 중 서버가 내려갔다');
   });
 });
 

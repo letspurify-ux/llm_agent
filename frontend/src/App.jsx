@@ -397,7 +397,7 @@ function ProgressList({ items }) {
   );
 }
 
-const Message = memo(function Message({ role, text, trace }) {
+const Message = memo(function Message({ role, text, trace, stopped }) {
   const rehypePlugins = useMarkdownPlugins(REHYPE_PLUGINS);
   // 말풍선 하나가 던져도 나머지 대화는 남는다 (Boundary 참고). 경계를 memo 안에 두는 이유는
   // 바깥에 두면 대화가 늘 때마다 경계가 다시 렌더되기 때문이다 — 여기 두면 memo가 함께 막는다.
@@ -423,6 +423,7 @@ const Message = memo(function Message({ role, text, trace }) {
               <TracePanel trace={trace} />
             </Boundary>
           )}
+          {stopped && <p className="stopped-note">응답 생성이 중지되었습니다.</p>}
         </div>
       </div>
     </Boundary>
@@ -466,6 +467,7 @@ export default function App() {
   const pendingSendRef = useRef(false); // 조합 중에 눌린 Enter — 조합이 확정되면 그때 보낸다
   const sendingRef = useRef(false);   // 전송 진행 중 (loading state와 달리 같은 tick에도 즉시 보인다)
   const abortRef = useRef(null);      // 진행 중인 요청 (홈으로 돌아갈 때 끊는다)
+  const stopRequestedRef = useRef(false); // 정지 단추가 끊은 요청인가 (타임아웃·홈과 구분)
   // 대화의 세대 번호. 홈으로 돌아갈 때마다 올라가고, ask는 시작 시점의 값을 들고 있다가
   // 응답을 반영하기 전에 대조한다 — 끊긴 요청의 뒤늦은 응답이 새 대화에 끼어드는 것을 막는다.
   const sessionRef = useRef(0);
@@ -934,6 +936,7 @@ export default function App() {
     sessionRef.current += 1;
     abortRef.current?.abort();
     abortRef.current = null;
+    stopRequestedRef.current = false;
     sendingRef.current = false;
     pendingSendRef.current = false; // 조합 중에 눌려 대기하던 Enter도 함께 없앤다
     historyRef.current = [];
@@ -944,6 +947,14 @@ export default function App() {
     resetPreview();
     setStatus('');
     inputRef.current?.focus();
+  }
+
+  // 대화는 남기고 현재 답만 접는다. goHome과 달리 세대를 바꾸지 않으므로 ask의 finally가 지금까지
+  // 받은 미리보기를 정식 말풍선으로 옮기고 입력을 다시 열 수 있다.
+  function stopResponse() {
+    if (!sendingRef.current || !abortRef.current) return;
+    stopRequestedRef.current = true;
+    abortRef.current.abort();
   }
 
   // 입력창에서 보내는 경로. setInput('')을 ask가 아니라 여기서 하는 이유:
@@ -1027,6 +1038,8 @@ export default function App() {
     let answer = '서버와 통신하지 못했습니다.';
     let trace;
     let answered = false; // 서버가 실제로 '답'을 돌려줬는가 (통신 실패·타임아웃·서버 오류와 구분)
+    let stopped = false;  // 사용자가 정지 단추로 접었는가
+    let stoppedPartial = ''; // 화면에 이미 보인 답변 조각 — resetPreview 전에 확보한다
     let timer;            // finally에서 지운다 (세우기 전에 던졌으면 undefined — clearTimeout은 무해하다)
     // 플래그를 세우는 것까지 try 안에서 한다 — 세운 뒤 try 밖에서 무엇이든 던지면 finally가 돌지 않아
     // 플래그가 걸린 채 영구히 남는다. 그러면 화면은 멀쩡한데 전송만 막힌다
@@ -1035,6 +1048,7 @@ export default function App() {
     const session = sessionRef.current;
     try {
       sendingRef.current = true;
+      stopRequestedRef.current = false;
       // AbortSignal.timeout()이 아니라 AbortController를 쓴다 — 전자는 Chrome 103/Safari 16 이상이고
       // Vite 기본 빌드 타깃(chrome87/safari14)은 문법만 변환할 뿐 런타임 API를 폴리필하지 않는다.
       // 구형 브라우저에서 fetch 호출 전에 TypeError가 나고, 그게 아래 catch에 삼켜져
@@ -1103,7 +1117,12 @@ export default function App() {
       // 진짜 통신 실패와 구분되지 않는다(실측: 홈을 누를 때마다 '[chat] request failed: AbortError').
       // 그리고 이 길은 '콘솔이 조용한가'를 보는 UI 검사가 영영 지나갈 수 없는 길이 된다.
       // 오류가 아니라 우리가 한 일이므로 알림으로만 남긴다 (Mermaid.jsx의 정책 경로와 같은 결).
-      if (e?.name === 'AbortError') console.info('[chat] 요청을 끊었습니다 (홈으로 돌아갔거나 시간이 다 됐습니다)');
+      if (stopRequestedRef.current) {
+        stopped = true;
+        stoppedPartial = previewBufRef.current;
+        answer = stoppedPartial;
+        console.info('[chat] 사용자가 응답 생성을 중지했습니다');
+      } else if (e?.name === 'AbortError') console.info('[chat] 요청을 끊었습니다 (홈으로 돌아갔거나 시간이 다 됐습니다)');
       else console.error('[chat] request failed:', e);
     } finally {
       clearTimeout(timer);
@@ -1119,12 +1138,16 @@ export default function App() {
         // 누를 수 있는 단추가 아무 일도 하지 않는 화면이 된다(위 sendingRef 주석과 같은 걱정이다).
         try {
           abortRef.current = null;
-          if (answered) historyRef.current = [...historyRef.current, { role: 'assistant', text: answer }];
-          setMessages(m => [...m, { role: 'assistant', text: answer, trace }]);
+          // 보인 조각이 있으면 다음 질문의 맥락에도 남긴다. 빈 중지 안내만 모델의 과거 답변으로
+          // 보내지는 않는다 — 실제로 생성된 답이 아니기 때문이다.
+          if (answered || (stopped && stoppedPartial.trim())) {
+            historyRef.current = [...historyRef.current, { role: 'assistant', text: answer }];
+          }
+          setMessages(m => [...m, { role: 'assistant', text: answer, trace, stopped }]);
           // 도착했다는 사실만 알린다 — 답변 본문은 길고(상한 70,000자) 표·차트가 섞여 있어 읽어 주면
           // 오히려 화면과 어긋난다. 사용자는 이 신호를 듣고 말풍선으로 옮겨 가 자기 속도로 읽는다.
           // 답하지 못한 경우는 그 짧은 문구가 곧 상태다 — '도착했습니다'로 뭉개면 실패가 성공으로 읽힌다.
-          setStatus(answered ? '답변이 도착했습니다.' : answer);
+          setStatus(stopped ? '응답 생성을 중지했습니다.' : answered ? '답변이 도착했습니다.' : answer);
         } catch (e) {
           console.error('[chat] 답을 화면에 얹지 못했습니다:', e);
         } finally {
@@ -1132,6 +1155,7 @@ export default function App() {
           setProgress([]);
           resetPreview();
           sendingRef.current = false;
+          stopRequestedRef.current = false;
         }
       }
     }
@@ -1269,7 +1293,16 @@ export default function App() {
             maxLength={2000}  /* 입력 단계 안내용 사본 — 실제 제한은 서버가 검증한다 (backend constants.js MAX_QUESTION_LEN) */
             autoFocus
           />
-          <button className="send" disabled={loading || !input.trim()} aria-label="전송">➤</button>
+          <button
+            type={loading ? 'button' : 'submit'}
+            className={`send${loading ? ' stop' : ''}`}
+            onClick={loading ? stopResponse : undefined}
+            disabled={!loading && !input.trim()}
+            aria-label={loading ? '응답 생성 중지' : '전송'}
+            title={loading ? '응답 생성 중지' : '전송'}
+          >
+            {loading ? <span className="stop-icon" aria-hidden="true" /> : '➤'}
+          </button>
         </form>
       </div>
     </div>

@@ -92,7 +92,8 @@ function openStream(res) {
   // 헤더를 먼저 내보낸다 — 첫 이벤트가 검색 뒤에야 나오는데, 그때까지 헤더도 없으면 클라이언트는
   // 응답이 시작됐는지조차 모른다(중간 프록시의 응답 대기 상한에도 걸린다).
   res.flushHeaders();
-  // 끊긴 소켓에 쓰는 것은 무해하다(버려진다) — 루프는 답을 끝까지 만들고 chat_log에 남긴다.
+  // 쓰기 직전 연결이 끊기는 작은 경주는 무해하다(소켓이 버린다). 보통의 연결 종료는 아래
+  // /api/chat 경계가 AbortSignal로 에이전트와 상류 작업까지 중지한다.
   const line = obj => { res.write(`${JSON.stringify(obj)}\n`); };
   return { write: line, end: obj => { line(obj); res.end(); } };
 }
@@ -154,6 +155,11 @@ const recordRejected = (question, reason, extra) =>
 // 그래서 본문 '전체'를 하나의 try로 감싼다: 검증도, chat_log 기록도, 답을 만들기 전의 줄들도
 // 모두 그 안에 있어야 그 문이 닫힌다(앞서는 handleQuestion 위쪽이 밖에 있었다).
 app.post('/api/chat', async (req, res) => {
+  // 브라우저가 정지 버튼·홈·탭 닫기로 응답 연결을 끊으면 이 요청의 실제 작업도 함께 접는다.
+  // close는 정상 res.end 뒤에도 오므로 writableEnded를 확인해야 완성된 요청을 취소로 오인하지 않는다.
+  const controller = new AbortController();
+  const onClose = () => { if (!res.writableEnded) controller.abort(); };
+  res.once('close', onClose);
   // 오류 기록에 쓸 질문. try 밖에 두어야 어느 줄에서 던지든 catch가 그때까지 읽어낸 것을 남긴다.
   let message = '';
   try {
@@ -183,7 +189,13 @@ app.post('/api/chat', async (req, res) => {
     // history: 클라이언트가 보내는 최근 대화 [{role:'user'|'assistant', text}] (서버는 상태를 저장하지 않는다)
     const { answer, trace, search, fullRows, timing } = await handleQuestion(message, req.body?.history, {
       onEvent: stream ? e => stream.write(e) : undefined,
+      signal: controller.signal,
     });
+    // 작업이 끝나는 순간과 소켓 종료가 겹친 경우에도 끊긴 요청을 정상 답변으로 기록하지 않는다.
+    if (controller.signal.aborted) {
+      recordChatLog(message, null, { outcome: 'cancelled' });
+      return;
+    }
     // 대화 로그 (비동기 — 기록 실패가 응답을 막지 않는다). search(검색 요약)를 함께 남겨
     // "검색 0건이라 못 답한 질문"을 SQL로 바로 찾을 수 있게 하고, timing으로 어디가 느린지를 남긴다
     // (README의 chat_log 예시 참고).
@@ -196,6 +208,12 @@ app.post('/api/chat', async (req, res) => {
     if (stream) stream.end({ type: 'done', ...body });
     else res.json(body);
   } catch (e) {
+    // 사용자가 끊은 요청은 서버 오류가 아니다. 소켓은 이미 닫혀 있어 응답을 다시 쓸 수도 없고,
+    // 오류 줄을 남기면 정상적인 정지 동작이 장애 알림과 운영 로그를 오염시킨다.
+    if (controller.signal.aborted) {
+      recordChatLog(message, null, { outcome: 'cancelled' });
+      return;
+    }
     console.error('[chat error]', e);
     // 답하지 못한 질문 중 가장 중요한 부류가 이것이다 — 반드시 기록한다.
     // 오류 원문은 chat_log에만 남긴다(화면에는 아래 일반 문구만 나간다). trace.steps[].error가
@@ -211,6 +229,8 @@ app.post('/api/chat', async (req, res) => {
     // error 유무로 실패를 판정하는 클라이언트가 서버 오류를 정상 답변으로 읽는다.
     if (!res.headersSent) res.status(500).json({ error: SERVER_ERROR });
     else if (!res.writableEnded) { res.write(`${JSON.stringify({ type: 'error', error: SERVER_ERROR })}\n`); res.end(); }
+  } finally {
+    res.off('close', onClose);
   }
 });
 

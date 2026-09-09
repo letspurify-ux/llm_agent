@@ -101,6 +101,56 @@ test('Oracle 세션 초기화 SQL에도 조회 타임아웃을 적용한다', as
   assert.equal(calls[0].timeout, calls[1].timeout);
 });
 
+test('요청 취소는 실행 중인 Oracle 문장을 끊고 커넥션을 반납한다', async t => {
+  const saved = { ORACLE_MOCK: process.env.ORACLE_MOCK, ORACLE_DRIVER: process.env.ORACLE_DRIVER };
+  process.env.ORACLE_MOCK = '0'; process.env.ORACLE_DRIVER = 'thin';
+  const entered = deferred();
+  let rejectExecution; let breaks = 0; let closes = 0;
+  t.mock.method(mariadb, 'createPool', () => ({
+    getConnection: async () => ({
+      query: async () => [{ db_name: 'CANCEL_DB', db_type: 'oracle', connection_info: 'test.invalid', db_user: 'test', db_password: 'test' }],
+      release: async () => {},
+    }), end: async () => {},
+  }));
+  t.mock.method(oracledb, 'createPool', async config => ({
+    async getConnection() {
+      const conn = {
+        callTimeout: 0,
+        async execute(sql) {
+          if (/^ALTER SESSION/.test(sql)) return { rows: [] };
+          entered.resolve();
+          return new Promise((_resolve, reject) => { rejectExecution = reject; });
+        },
+        async breakExecution() {
+          breaks++;
+          rejectExecution?.(Object.assign(new Error('ORA-01013: user requested cancel'), { errorNum: 1013 }));
+        },
+        async close() { closes++; },
+      };
+      await new Promise((resolve, reject) => config.sessionCallback(conn, '', error => error ? reject(error) : resolve()));
+      return conn;
+    },
+    close: async () => {},
+  }));
+  t.after(async () => {
+    await closeOraclePools(); await closePool();
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  });
+
+  const controller = new AbortController();
+  const running = runQuery(
+    { query_name: 'q', query_sql: 'SELECT 1 FROM dual', target_db_name: 'CANCEL_DB' },
+    {}, undefined, undefined, controller.signal,
+  );
+  await entered.promise;
+  controller.abort();
+  await assert.rejects(running, /ORA-01013/);
+  assert.equal(breaks, 1);
+  assert.equal(closes, 1, '취소한 쿼리의 풀 커넥션을 반납하지 않았다');
+});
+
 // 등록 행은 있는데 접속에 쓸 값이 비어 있으면 접속을 시도하지 않는다.
 // ENV: 경로(resolvePassword)는 처음부터 그렇게 한다 — 그 주석이 근거까지 적어 두었다:
 // "시도하면 DB는 ORA-01017을 돌려주고, 운영자는 설정 누락이 아니라 저장된 자격증명이 틀렸다고 읽는다.

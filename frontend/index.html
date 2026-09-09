@@ -397,6 +397,7 @@
       /* 답변 미리보기 (App.jsx) — 아직 오는 중인 글자라 조금 흐리게. 답이 오면 정식 말풍선이 그 자리를 대신한다. */
       .preview { margin-top: 8px; opacity: 0.8; }
       .preview-raw { margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; opacity: 0.8; }
+      .stopped-note { margin: 10px 0 0; color: var(--muted); font-size: 12px; font-style: italic; }
 
       /* ===== 입력창 ===== */
       .composer-wrap { padding: 12px 20px 20px; }
@@ -439,6 +440,8 @@
       }
       .send:hover:not(:disabled) { transform: scale(1.06); }
       .send:disabled { opacity: 0.35; cursor: default; box-shadow: none; }
+      .send.stop { background: #4b5563; box-shadow: 0 4px 12px rgba(75, 85, 99, 0.28); }
+      .stop-icon { width: 13px; height: 13px; border-radius: 3px; background: currentColor; }
 
       /* ===== 동작 줄이기 =====
          OS에서 '동작 줄이기'를 켠 사람에게 움직임은 취향이 아니라 멀미다(전정 장애). 여기서는 자리를

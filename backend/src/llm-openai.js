@@ -21,6 +21,7 @@ import { knowledgeView } from './context-items.js';
 import { rowCounts, columnOmissionKey, withColumnOmission } from './result.js';
 import { numberFromString } from './numbers.js';
 import { clipDisplayValue, promptParams } from './prompt-values.js';
+import { throwIfAborted } from './abort.js';
 
 // 추론 강도. 기본을 low로 두는 이유: 이 에이전트가 모델에게 요구하는 건 매 스텝 결정 JSON 하나이고,
 // 판단 근거(지식·처리방법·실행 이력)는 프롬프트에 이미 다 들어가 있다. 길게 생각할수록
@@ -173,14 +174,17 @@ const TIMEOUT_MS = 120_000;
 //   onAnswerDelta({text})   답변 문자열이 흘러오는 동안의 조각(디코딩된 답변 글자) — 화면의 미리보기.
 //   onAnswerDelta({reset})  재시도로 앞선 조각을 버려야 한다.
 export async function openaiDecide(ctx) {
+  throwIfAborted(ctx.signal);
   const userPrompt = buildPrompt(ctx);
   const deadline = Date.now() + TIMEOUT_MS;
   for (let attempt = 0; attempt < 2; attempt++) {
+    throwIfAborted(ctx.signal);
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     const preview = ctx.onAnswerDelta ? answerPreviewer(ctx.onAnswerDelta) : null;
     try {
-      const { content, usage } = await chatCompletion(userPrompt, remaining, { onContent: preview?.feed });
+      const { content, usage } = await chatCompletion(userPrompt, remaining, { onContent: preview?.feed, signal: ctx.signal });
+      throwIfAborted(ctx.signal);
       if (usage) ctx.onUsage?.(usage);
       const decision = parseDecision(content, ctx.forceAnswer);
       if (decision) {
@@ -207,6 +211,9 @@ export async function openaiDecide(ctx) {
         `hasBrace=${content.includes('{')} hasThinkTag=${/<\/?think\b/i.test(content)}`
       );
     } catch (e) {
+      // 사용자가 끊은 요청은 실패도 아니고 재시도 대상도 아니다. 여기서 삼키면 같은 요청을 한 번 더
+      // 생성해 정지 버튼이 오히려 LLM 호출을 늘린다.
+      throwIfAborted(ctx.signal);
       // 원인 사슬까지 남긴다 — fetch의 접속 거부·DNS·TLS 실패는 message가 전부 'fetch failed'다 (constants.errorText).
       console.warn(`[llm] call failed (attempt ${attempt + 1}/2):`, errorText(e));
       if (preview?.emitted) ctx.onAnswerDelta({ reset: true });
@@ -559,12 +566,15 @@ export function answerPreviewer(onDelta) {
 // 있다(IDLE_TIMEOUT_MS) ② 답변 문자열이 흘러오는 동안 화면에 미리보기를 낼 수 있다(onContent → answerPreviewer)
 // ③ 첫 조각이 오는 시각이 '모델이 생각을 끝냈다'는 신호다. 스트림을 주지 않는 서버(JSON 하나로 답하는 프록시나
 // 테스트 더블)는 예전 길로 읽는다 — 두 길이 같은 값을 돌려준다.
-async function chatCompletion(userPrompt, timeoutMs, { onContent } = {}) {
+async function chatCompletion(userPrompt, timeoutMs, { onContent, signal } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (process.env.LLM_API_KEY) headers.Authorization = `Bearer ${process.env.LLM_API_KEY}`;
 
   // 두 상한을 한 신호로 — 전체(timeoutMs)와 유휴(IDLE_TIMEOUT_MS). 유휴 타이머는 조각이 올 때마다 다시 건다.
   const ctl = new AbortController();
+  const onAbort = () => ctl.abort();
+  if (signal?.aborted) ctl.abort();
+  else signal?.addEventListener('abort', onAbort, { once: true });
   let why = null;
   const total = setTimeout(() => { why = `LLM 응답이 ${Math.round(timeoutMs / 1000)}초 안에 끝나지 않았습니다`; ctl.abort(); }, timeoutMs);
   let idle;
@@ -634,12 +644,16 @@ async function chatCompletion(userPrompt, timeoutMs, { onContent } = {}) {
     }
     return { content, usage };
   } catch (e) {
+    // 외부 요청 취소는 우리 타임아웃 문구로 바꾸지 않는다. 호출부가 이를 정상적인 사용자 중지로
+    // 분류하고 오류 로그·재시도를 만들지 않아야 한다.
+    throwIfAborted(signal);
     // 우리가 끊은 것은 이유를 말한다 — AbortError 한 줄로는 전체 상한인지 멈춤인지 알 수 없다.
     if (why && (e?.name === 'AbortError' || ctl.signal.aborted)) throw new Error(why);
     throw e;
   } finally {
     clearTimeout(total);
     clearTimeout(idle);
+    signal?.removeEventListener('abort', onAbort);
   }
 }
 

@@ -10,6 +10,7 @@ import { loadTargetDb } from './db.js';
 import { withColumnOmission } from './result.js';
 import { bindNames, assertReadOnly } from './sql.js';
 import { MAX_ROWS, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK, MAX_TARGET_DB_NAME_LEN, MAX_BATCH_QUERIES, numEnv, nameKey, safeError, clipText, warnOnce, ownProp, bindValue, targetDbNames, isPlainObject } from './constants.js';
+import { throwIfAborted } from './abort.js';
 
 // 드라이버 경계에서 타입을 확정한다. LOB은 기본값이 Lob 스트림 객체라 커넥션을 닫으면 무효가 되고
 // JSON 직렬화 시 순환 참조로 예외가 난다 — CLOB만이 아니라 NCLOB/BLOB도 같은 위험이므로 전부 다룬다.
@@ -240,7 +241,8 @@ export function resolveTargetDb(registryRow, chosen) {
 
 const NOT_CLIPPED_COPY = () => false;
 
-export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLIPPED_COPY, chosenDb = null) {
+export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLIPPED_COPY, chosenDb = null, signal) {
+  throwIfAborted(signal);
   // 가드가 '실행용 SQL'까지 함께 돌려준다 — 무엇을 허용했는지 아는 쪽이 무엇을 실행할지도 정한다.
   // 실행부가 따로 문자열을 손보면 둘의 판단이 갈라진다 (sql.js assertReadOnly 주석 참고).
   // 등록 SQL 자체가 실행 불가면(등록 실수) 어떤 파라미터로도 시작되지 않는다 — 헛돈 스텝으로 표시하고
@@ -277,9 +279,13 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
   // (MOCK_DATA 주석과 같은 원칙: 두 경로가 같은 판정을 지나야 한다).
   const targetDbName = resolveTargetDb(registryRow, chosenDb);
 
-  if (oracleMock()) return capResult(mockResult(registryRow.query_name, binds), targetDbName);
+  if (oracleMock()) {
+    throwIfAborted(signal);
+    return capResult(mockResult(registryRow.query_name, binds), targetDbName);
+  }
 
   const target = await loadTargetDb(targetDbName);
+  throwIfAborted(signal);
   if (!target) {
     // 등록된 조회대상 DB 이름은 서버 내부 식별자다 — safe 표시를 달면 이 문구가 그대로 사용자
     // trace 패널로 나간다(result.js clientTrace). 우리가 쓴 문구라는 사실이 그 안에 담긴 값까지
@@ -339,7 +345,14 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
   }
 
   const { conn, release } = await acquireConnection(target);
+  // node-oracledb의 breakExecution은 이 커넥션에서 실행 중인 문장을 취소한다. 요청마다 풀에서 독점해
+  // 쓰는 커넥션이므로 다른 사용자의 쿼리를 끊지 않는다. 실패해도 원래 실행/취소 결과를 보존한다.
+  const onAbort = () => {
+    try { Promise.resolve(conn.breakExecution?.()).catch(() => {}); } catch { /* 이미 닫혔거나 실행 전이다 */ }
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
   try {
+    throwIfAborted(signal);
     // 조회 타임아웃 — 느린 쿼리(락 대기, 잘못된 실행계획)가 요청을 무한 대기시키지 않게.
     // 초과 시 오류가 나고 agent가 history에 기록해 LLM이 안내 답변한다.
     // 반드시 try 안에서 설정한다 — 드라이버가 던지면 밖에서는 finally의 close가 실행되지 않아 커넥션이 샌다.
@@ -356,8 +369,10 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
       fetchArraySize: MAX_ROWS + 1,
       prefetchRows: MAX_ROWS + 2,
     });
+    throwIfAborted(signal);
     return capResult(result.rows ?? [], targetDbName);
   } finally {
+    signal?.removeEventListener('abort', onAbort);
     // 풀 커넥션의 close()는 반납이다. 실패가 원본 쿼리 오류를 덮어쓰지 않게 삼킨다.
     await release();
   }

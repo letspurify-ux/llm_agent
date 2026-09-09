@@ -2184,6 +2184,39 @@ it('복합 콘텐츠: 연결 중단 후 재시도에서 미완성 답변이 기�
   await checkMixedContent(page, '.row.assistant:last-child .bubble.assistant');
 });
 
+it('응답 중지는 요청을 끊고 보이던 조각을 남긴 뒤 다음 질문을 허용한다', async () => {
+  await controlledMixedStream();
+  const partial = '중지 전까지 받은 답변';
+  await emitMixed(0, { type: 'answer_delta', text: partial });
+  await page.until(`document.querySelector('.preview')?.textContent.includes(${JSON.stringify(partial)})`);
+  assert.equal(await page.eval(`document.querySelector('.send').getAttribute('aria-label')`), '응답 생성 중지');
+  await page.eval(`(() => {
+    document.querySelector('.send').click();
+    // 이 검사의 fetch는 브라우저 네트워크 대신 만든 스트림이므로 abort가 본문에 주는 효과도 직접 재현한다.
+    window.__streams[0].error(new DOMException('aborted', 'AbortError'));
+  })()`);
+  await page.until(`!document.querySelector('.typing') && document.querySelector('.stopped-note')`);
+  assert.deepStrictEqual(await page.eval(`({
+    aborted: window.__signals[0].aborted,
+    partial: document.querySelector('.bubble.assistant .md').textContent.trim(),
+    note: document.querySelector('.stopped-note').textContent,
+    label: document.querySelector('.send').getAttribute('aria-label'),
+    failed: document.querySelector('.chat').textContent.includes('서버와 통신하지 못했습니다.'),
+  })`), {
+    aborted: true, partial, note: '응답 생성이 중지되었습니다.', label: '전송', failed: false,
+  });
+
+  await page.eval(`document.querySelector('textarea').focus()`);
+  await page.send('Input.insertText', { text: '이어서 설명해줘' });
+  await page.key('Enter', 'Enter', 13);
+  await page.until(`window.__streams.length === 2`);
+  assert.deepStrictEqual(await page.eval(`window.__requests[1].history.map(m => [m.role, m.text])`), [
+    ['user', 'SPACE 시스템이 뭐야?'], ['assistant', partial],
+  ]);
+  await emitMixed(1, { type: 'done', answer: '이어진 답' });
+  await page.until(`!document.querySelector('.typing') && document.querySelectorAll('.row.assistant').length === 2`);
+});
+
 it('복합 콘텐츠: 홈 이동 후 늦은 이전 조각·reset·완료가 새 답변을 훼손하지 않는다', async () => {
   await controlledMixedStream();
   await emitMixed(0, { type: 'answer_delta', text: NESTED_MIXED_ANSWER });

@@ -23,6 +23,26 @@ const { sanitizeDecision } = await import('../src/llm.js');
 
 const CTX = { question: 'q', chat: [], knowledge: [], qaMethods: [], queries: [], history: [] };
 
+test('요청 취소는 진행 중인 상류 LLM fetch를 끊고 재시도하지 않는다', async context => {
+  const controller = new AbortController();
+  let calls = 0; let upstreamAborted = false;
+  context.mock.method(globalThis, 'fetch', async (_url, { signal }) => {
+    calls++;
+    return new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => {
+        upstreamAborted = true;
+        reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+      }, { once: true });
+    });
+  });
+  const pending = openaiDecide({ ...CTX, signal: controller.signal });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  controller.abort();
+  await assert.rejects(pending, error => error?.name === 'AbortError');
+  assert.equal(upstreamAborted, true);
+  assert.equal(calls, 1, '사용자가 끊은 호출을 재시도했다');
+});
+
 test('SSE의 여러 data 줄과 CR·CRLF 경계를 나눠 받은 응답을 읽는다', async context => {
   for (const newline of ['\n', '\r', '\r\n']) {
     const decision = { action: 'answer', answer: '여러 줄 이벤트' };

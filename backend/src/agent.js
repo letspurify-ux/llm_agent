@@ -15,6 +15,7 @@ import { bindNames } from './sql.js';
 import { llm, renderAnswer, clipAnswer } from './llm.js';
 import { resolveChartData, resolveTableData, MAX_TABLE_CELL_LEN, MAX_CHART_CELL_LEN } from './chart.js';
 import { MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_RESULT_READS, MAX_DOC_LEN, MAX_PROMPT_ITEM_LEN, MAX_RESULT_ROWS, parseItemId, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_CELL_LEN, TRUNC_MARK, SEARCH_TARGETS, nameKey, clipText, stripLoneSurrogates, bindValue, targetDbNames, indentLines } from './constants.js';
+import { abortable, throwIfAborted } from './abort.js';
 
 // MAX_STEPS는 constants.js에 있다 — 실행 이력의 프롬프트 몫이 그 값에 묶여 있다.
 const MAX_LOOP_MS = 180_000;   // 요청 시작부터 재는 예산(검색 포함). 초과하면 남은 스텝을 포기하고 강제 답변으로 간다.
@@ -300,13 +301,15 @@ async function growItem(row, loadChunks = loadChunkRanges) {
 // hits의 키는 ctx 목록 이름과 같다 — chat_log의 search 요약과 같은 이름을 쓰게.
 const HIT_KEY = { knowledge: 'knowledge', qa_method: 'qaMethods', query: 'queries' };
 
-export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps } = {}) {
+export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps, signal } = {}) {
   // deps는 테스트가 검색·조회·LLM을 스텁으로 바꿔 끼우는 자리다. 이 루프의 판정(검색 반복·상한·강제
   // 답변 전환·이력 기록 모양)은 DB 없이 검증할 수 있어야 한다 — loopGuard를 순수 함수로 떼어낸 것과
   // 같은 이유다: 어긋나도 오류를 남기지 않는 종류의 실패라 테스트가 유일한 방어선이다.
   const { search = runSearch, run = runQuery, decide: decideFn = llm.decide, loadChunks = loadChunkRanges } = deps ?? {};
   const question = normalizeQuestion(rawQuestion);
   const chat = normalizeChat(rawChat);
+  const checkAborted = () => throwIfAborted(signal);
+  checkAborted();
   const started = Date.now();
   // 예산은 요청 시작점에서 잡는다 — 검색(임베딩 타임아웃 최대 60초)도 이 예산 안에서 돈다.
   const deadline = started + MAX_LOOP_MS;
@@ -315,12 +318,12 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
   const timing = { llm: [], search: [], oracle: [] };
   const timed = async (bucket, fn) => {
     const t0 = Date.now();
-    try { return await fn(); } finally { bucket.push(Date.now() - t0); }
+    try { return await abortable(fn(), signal); } finally { bucket.push(Date.now() - t0); }
   };
   // 진행 이벤트(검색·조회의 시작과 끝). 듣는 쪽(server.js의 스트림 응답)이 던져도 루프는 계속된다 —
   // 화면 표시가 답을 막으면 안 된다.
   const emit = (type, data) => {
-    if (!onEvent) return;
+    if (!onEvent || signal?.aborted) return;
     try { onEvent({ type, ...data }); } catch (e) { console.warn('[agent] progress listener failed:', e?.message ?? e); }
   };
 
@@ -338,6 +341,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
   // 조회 원본·실행 이력은 유지하고 resultViews로 해당 실행의 표시 범위만 교체한다.
   const ctx = () => ({
     question, chat, knowledge, qaMethods, queries,
+    signal,
     history: history.map(h => resultViews.has(h) ? { ...h, ...resultViews.get(h) } : h),
     contextNote, resultReadsLeft: Math.max(0, MAX_RESULT_READS - resultReads),
     searched: [...succeeded], tried: searched.size > 0,
@@ -374,7 +378,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
     timing.llm.push(entry);
     const t0 = Date.now();
     try {
-      return await decide({
+      return await abortable(decide({
         ...c,
         onUsage: u => {
           // 파싱 실패 뒤 재시도까지 실제 사용량에 합산한다.
@@ -393,7 +397,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
         // 표시 변환의 실패도 decide의 기존 예외 경계에서 처리한다.
         for (const h of input.history) clippedCopy.recordParams(h.params);
         return decideFn(input);
-      });
+      }), signal);
     } finally {
       entry.ms = Date.now() - t0;
     }
@@ -492,7 +496,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
           done.push(id);
           continue;
         }
-        const grown = await growItem(row, loadChunks);
+        const grown = await abortable(growItem(row, loadChunks), signal);
         // 본문이 늘지 않아도(읽기 실패·상한 포화) 청구에는 할 일이 하나 남아 있다 — '앞으로 가져오기'다.
         // 그 일은 DB를 읽지 않으며, 표시 예산에 밀려 보관 목록에만 있던 항목에는 그것이 곧 '본문이 실리는가'를
         // 가른다. 시스템 프롬프트가 "보관 목록의 ID를 청구하면 저장된 본문을 다시 우선 표시한다"고, context.md 2절이
@@ -650,8 +654,9 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
     const seenInBatch = new Set();
     let wastedCount = 0;
     for (const item of batch) {
+      checkAborted();
       const { row: registryRow, error: resolveError, hint: resolveHint } =
-        await resolveQuery(item.query_name, queries, resolveCache);
+        await abortable(resolveQuery(item.query_name, queries, resolveCache), signal);
       // 이력에는 항상 정규 이름(등록된 철자)을 남긴다 — 가드와 프롬프트가 같은 이름을 보게.
       const canonicalName = registryRow?.query_name ?? item.query_name;
       const binds = registryRow ? bindNames(registryRow.query_sql) : null;
@@ -712,13 +717,15 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       try {
         // 대상 DB 선택은 실행 경계가 판정한다 (oracle.js resolveTargetDb) — 여기서 미리 고르거나 검증하지 않는다.
         // 돌려받은 targetDb는 등록 철자이므로 이력·trace·프롬프트가 같은 이름을 본다.
-        const { rows, totalRows, capped, targetDb } = await run(registryRow, item.params, clippedCopy.isCopy, dbChoice);
+        const { rows, totalRows, capped, targetDb } = await run(registryRow, item.params, clippedCopy.isCopy, dbChoice, signal);
+        checkAborted();
         clippedCopy.record(rows);
         Object.assign(entry, { targetDb, rows: capRows(rows), totalRows, capped });
         fullRows.set(entry, rows);
         progressed = true;
         emit('run_query_done', { id, query_name: canonicalName, targetDb, rowCount: capped ? `${totalRows}+` : totalRows });
       } catch (e) {
+        checkAborted();
         // 실패도 이력에 남기고 루프를 계속한다 — LLM이 에러를 보고 재시도/우회/답변을 판단.
         // 메시지가 비면 안 된다: error가 falsy면 프롬프트·답변 조립이 이 기록을 '오류'로 보지 않고
         // rows가 있는 정상 결과로 취급해 들어간다.
@@ -738,6 +745,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
   };
 
   for (let i = 0; i < MAX_STEPS + MAX_SEARCHES + MAX_EXPANDS + MAX_RESULT_READS; i++) {
+    checkAborted();
     // 이력 줄 수도 상한이다 — 결정 하나가 조회 여럿을 만들 수 있으므로(일괄 조회) 반복 수만으로는 줄 수가
     // 묶이지 않는다. 넘기면 프롬프트의 이력 몫이 보장하는 '전부 실린다'가 깨져 가장 오래된 조회 결과가
     // 조용히 빠진다 (constants.MAX_HISTORY_ROWS).
@@ -848,8 +856,9 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
       // 요청한 대상 전부가 '검색 불가'였던 것으로 기록하고 루프를 계속한다.
       let result;
       try {
-        result = await timed(timing.search, () => search(text, targets));
+        result = await timed(timing.search, () => search(text, targets, signal));
       } catch (e) {
+        checkAborted();
         console.warn('[agent] search failed:', e?.message ?? e);
         const asked = t => (targets.includes(t) ? null : undefined);
         result = {
@@ -918,7 +927,9 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps 
   // 안전장치: 상한 초과(또는 가드 반복) 시 강제 답변.
   // 그마저 실패하면 fallbackAnswer가 손에 든 것으로 답을 조립한다.
   const finalCtx = { ...ctx(), forceAnswer: true };
+  checkAborted();
   const final = await decideSafe(finalCtx);
+  checkAborted();
   const answer = answerOf(final) || fallbackAnswer(finalCtx);
   return done(finish(answer), true);
 }
@@ -1075,6 +1086,7 @@ async function decide(ctx, fn = llm.decide) {
   try {
     return await fn(ctx);
   } catch (e) {
+    throwIfAborted(ctx.signal);
     // 원문은 로그에만 — 스키마명·호스트가 섞일 수 있고, 사용자 문구는 호출부가 만든다.
     console.error('[agent] LLM decision failed:', e);
     return null;
