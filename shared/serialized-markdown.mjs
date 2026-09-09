@@ -1,24 +1,26 @@
 import { collectMathSpans } from './math-spans.mjs';
+import { scopedMermaidMathExpressions } from './mermaid-math-spans.mjs';
 import { mergeLiteralRanges, inlineCodeSpans, markdownLiteralRanges } from './inline-code.mjs';
 
 // 모델이 JSON 이스케이프를 한 겹 더 남긴 경우만 복구한다. 코드·표 셀은 각자의 문법을 유지한다.
 const N_COMMAND = /^\\n(?:u|eq|e|abla|ot|ewcommand|ewenvironment|ewline|olimits|onumber|eg|i|otin|rightarrow|leftarrow|subseteq|supseteq|parallel|exists|leq|geq|less|gtr|earrow|warrow|mid|cong|sim|simeq|shortmid|shortparallel|prec|succ|preceq|succeq)(?![A-Za-z])/;
-function replaceOutsideMath(value, pattern, replace) {
+function replaceOutsideMath(value, pattern, replace, language) {
   // Mermaid 라벨의 $$...$$·TeX 구분자 내부는 개행 직렬화 문법이 아니다.
   // 명령 이름을 나열하면 새 명령·매크로마다 다시 깨지므로 수식 범위 전체를 보존한다.
-  const spans = collectMathSpans({ type: 'root', children: [] }, value).candidates
-    .sort((a, b) => a.start - b.start);
+  const spans = language === 'mermaid'
+    ? scopedMermaidMathExpressions(value, { lineBreaks: pattern })
+    : collectMathSpans({ type: 'root', children: [] }, value).candidates.sort((a, b) => a.start - b.start);
   let index = 0;
   return value.replace(pattern, (match, offset) => {
     while (index < spans.length && spans[index].end <= offset) index++;
     return index < spans.length && spans[index].start <= offset ? match : replace(match, offset);
   });
 }
-export function decodeSerializedLines(value) {
+export function decodeSerializedLines(value, language) {
   return replaceOutsideMath(value, /\\\\|\\r\\n|\\n|\\r(?![A-Za-z])/g, (match, offset) =>
-    match === '\\\\' || N_COMMAND.test(value.slice(offset)) ? match : '\n');
+    match === '\\\\' || N_COMMAND.test(value.slice(offset)) ? match : '\n', language);
 }
-export const decodeVisualizationBreaks = value => replaceOutsideMath(value, /\\?<br\s*\/?>/gi, () => '\n');
+export const decodeVisualizationBreaks = (value, language) => replaceOutsideMath(value, /\\?<br\s*\/?>/gi, () => '\n', language);
 export function decodeMathEscapes(value) {
   // 정상 TeX의 \\ 행 구분자는 건드리지 않는다. 직렬화된 개행과 이중 명령이 함께 있거나,
   // $$ 안의 앞뒤에 직렬화된 개행이 남은 경우가 추가 이스케이프의 증거다.

@@ -30,4 +30,62 @@ export const MERMAID_MATH_CASES = [
   { id: 'node-unquoted', source: 'flowchart LR\nA[$$x^2+(a|b)$$] --> B', nodes: 2 },
   { id: 'token-literal', source: 'flowchart LR\nA["LLMMERMAIDMATH0END $$x^2$$"] --> B', nodes: 2,
     label: 'LLMMERMAIDMATH0END' },
+  { id: 'verb-dollars', source: String.raw`flowchart LR
+A["$$x^2+\verb|$$|$$"] --> B`, nodes: 2, mathText: '$$' },
+  { id: 'invalid-label-isolation', source: String.raw`flowchart LR
+A["$$\unknown{x}$$"] --> B["$$x^2$$"] --> C[정상]`, nodes: 3, errors: 1,
+    errorSources: [String.raw`$$\unknown{x}$$`], label: '수식 오류 1' },
+  { id: 'unclosed-label-before-math', source: 'flowchart LR\nA["$$unfinished"] --> B["$$x^2$$"] --> C',
+    nodes: 3, label: '$$unfinished' },
+  { id: 'unclosed-label-after-math', source: 'flowchart LR\nA["$$x^2$$"] --> B["cost $$"] --> C["literal $$"]',
+    nodes: 3, label: 'cost $$' },
+  { id: 'unclosed-edge-before-math', source: 'flowchart LR\nA -->|"cost $$"| B["$$x^2$$"] --> C', nodes: 3 },
+  { id: 'unclosed-accessibility-before-math', source: 'flowchart LR\naccTitle: cost $$\nA["$$x^2$$"] --> B',
+    nodes: 2, accessibleTitle: 'cost $$' },
+  { id: 'unclosed-link-before-math', source: 'flowchart LR\nA --> B\nclick A "https://example.test/$$"\nB["$$x^2$$"]',
+    nodes: 2, href: 'https://example.test/$$' },
+  { id: 'unclosed-subgraph-before-math', source: 'flowchart LR\nsubgraph S["cost $$"]\nA["$$x^2$$"] --> B\nend', nodes: 2 },
+  { id: 'unclosed-label-before-extended-math', source: String.raw`flowchart LR
+A["$$\frac{1"] --> B@{label: '$$x^2+\frac{1}{2}$$'} --> C`, nodes: 3, fractions: 1, label: '$$\\frac{1' },
+  { id: 'unclosed-edge-before-extended-math', source: String.raw`flowchart LR
+A -- cost $$ --> B -->|"$$x^2+\text{a"b}$$"| C`, nodes: 3 },
+  { id: 'parenthesis-node-math', source: 'flowchart LR\nA(($$x^2+(a|b)$$)) --> B', nodes: 2 },
+  { id: 'unquoted-root-math', source: String.raw`flowchart LR
+A[$$\sqrt[3]{x^2}$$] --> B`, nodes: 2 },
+];
+
+export const MERMAID_MULTILINE_MATH = String.raw`\begin{aligned}
+ x^2 &= 1 \\
+ y &= \frac{1}{2}
+\end{aligned}`;
+
+export const MERMAID_NATIVE_MATH_CASES = [
+  { id: 'sequence-verb', source: String.raw`sequenceDiagram
+A->>B: $$x^2+\verb|$$|$$`, mathText: '$$' },
+  { id: 'sequence-literal-br', source: String.raw`sequenceDiagram
+A->>B: $$x^2+\text{a<br>b}$$`, mathText: 'a<br>b' },
+  { id: 'sequence-aligned', source: String.raw`sequenceDiagram
+A->>B: $$\begin{aligned}x^2&=1\\y&=\frac{1}{2}\end{aligned}$$`, fractions: 1 },
+  { id: 'sequence-invalid-isolation', source: String.raw`sequenceDiagram
+A->>B: $$\unknown{x}$$
+B-->>A: $$x^2$$`, errors: 1, errorSources: [String.raw`$$\unknown{x}$$`] },
+  { id: 'state-verb', source: String.raw`stateDiagram-v2
+s1: $$x^2+\verb|$$|$$
+[*] --> s1`, mathText: '$$' },
+  { id: 'class-verb', source: String.raw`classDiagram
+class A["$$x^2+\verb|$$|$$"]`, mathText: '$$' },
+  { id: 'class-literal-br', source: String.raw`classDiagram
+class A["$$x^2+\text{a<br>b}$$"]`, mathText: 'a<br>b' },
+  { id: 'state-literal-br', source: String.raw`stateDiagram-v2
+s1: $$x^2+\text{a<br>b}$$
+[*] --> s1`, mathText: 'a<br>b' },
+  { id: 'state-invalid-isolation', source: String.raw`stateDiagram-v2
+bad: $$\unknown{x}$$
+good: $$x^2$$
+[*] --> bad
+bad --> good`, errors: 1, errorSources: [String.raw`$$\unknown{x}$$`] },
+  { id: 'class-invalid-isolation', source: String.raw`classDiagram
+class A["$$\unknown{x}$$"]
+class B["$$x^2$$"]
+A --> B`, errors: 1, errorSources: [String.raw`$$\unknown{x}$$`] },
 ];

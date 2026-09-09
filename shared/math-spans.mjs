@@ -20,7 +20,7 @@ const escapedAt = (s, i) => {
 // Markdown 수식 구분자와 TeX 문법 검증은 별개다. 중괄호 오류가 있어도 수식 범위는 보호해야
 // 내부 |가 표를 쪼개지 않는다. 명령의 인자 끝(})을 찾을 때만 중괄호 깊이를 검사한다.
 // 길이를 제한하므로 스트리밍 도중 닫히지 않은 시작 기호가 반복되어도 탐색량이 제한된다.
-function closingAt(source, start, closing, end = source.length) {
+export function closingMathDelimiter(source, start, closing, end = source.length) {
   let depth = 0, comment = false;
   const groups = closing === '}';
   const limit = Math.min(end, start + MAX_MATH_SPAN);
@@ -49,7 +49,7 @@ function commandEnd(source, start, names) {
   re.lastIndex = start;
   const match = re.exec(source);
   if (!match) return -1;
-  const close = closingAt(source, re.lastIndex, '}');
+  const close = closingMathDelimiter(source, re.lastIndex, '}');
   return close >= 0 && source.slice(re.lastIndex, close).trim() ? close + 1 : -1;
 }
 
@@ -57,7 +57,7 @@ function commandEnd(source, start, names) {
 export function unwrapMath(tex) {
   const source = normalizeMath(tex).trim();
   for (const [open, close] of [['$$', '$$'], ['\\[', '\\]'], ['\\(', '\\)'], ['$', '$']]) {
-    if (source.startsWith(open) && closingAt(source, open.length, close) === source.length - close.length)
+    if (source.startsWith(open) && closingMathDelimiter(source, open.length, close) === source.length - close.length)
       return source.slice(open.length, -close.length).trim();
   }
   return source;
@@ -226,18 +226,18 @@ export function collectMathSpans(tree, source, parse) {
     else if (normalized.startsWith('\\(', i) || normalized.startsWith('\\[', i)) {
       display = normalized[i + 1] === '[';
       contentStart = i + 2;
-      contentEnd = closingAt(normalized, contentStart, display ? '\\]' : '\\)', limit);
+      contentEnd = closingMathDelimiter(normalized, contentStart, display ? '\\]' : '\\)', limit);
       if (contentEnd >= 0) end = contentEnd + 2;
     } else if (normalized.startsWith('$$', i)) {
       const fence = /^\${2,}/.exec(normalized.slice(i))[0];
       contentStart = i + fence.length;
-      contentEnd = closingAt(normalized, contentStart, fence, limit);
+      contentEnd = closingMathDelimiter(normalized, contentStart, fence, limit);
       if (contentEnd >= 0) { end = contentEnd + fence.length; display = true; }
     } else if (normalized[i] === '$' && normalized[i + 1] !== '$' &&
       (normalized[i - 1] !== '$' || candidates.at(-1)?.end === i)) {
       contentStart = i + 1;
       // 통화의 $와 다음 문단·표에 있는 수식의 $를 연결하지 않는다.
-      contentEnd = closingAt(normalized, contentStart, '$', scope && scope.start <= i ? Math.min(limit, scope.end) : limit);
+      contentEnd = closingMathDelimiter(normalized, contentStart, '$', scope && scope.start <= i ? Math.min(limit, scope.end) : limit);
       if (contentEnd >= 0) {
         const tex = normalized.slice(contentStart, contentEnd).trim();
         const nextOpener = /\s/.test(normalized[contentEnd - 1]) && (normalized[contentEnd + 1] === '\\' ||

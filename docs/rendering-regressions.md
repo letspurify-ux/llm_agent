@@ -51,6 +51,10 @@ Node 22 이상과 Chrome이 필요하다. 필요하면 `CHROME_PATH`로 실행 �
 | Mermaid의 양방향 화살표·다중 연결·줄바꿈·문자 참조가 수식을 끄거나 주석·설정의 수식 예시가 실행됨 | [mermaid-math.test.js](../frontend/test/mermaid-math.test.js), ui/production 테스트 | 실제 그림 종류, 240개 중첩 원문, 메타데이터 보존, MathML 내용·크기·노드 수·서식과 이미지 자동 요청 0 확인 |
 | Mermaid 수식 치환이 링크·툴팁·접근성 설명을 변경하거나 shape 라벨의 따옴표·문장부호와 충돌 | 같은 mermaid-math·production 테스트 | 540개 중첩 원문, 실제 파서가 확인한 라벨, MathML 의미·링크 주소·접근성 제목과 74회 전체 화면 조합 검사 |
 | 목록 안 Mermaid의 기호가 그림 맨 아래로 내려감 | production 교차 조합 테스트 | Chrome `::marker`와 그림 시작점의 실제 좌표를 대조 |
+| Mermaid의 여러 줄 수식·verb 달러가 잘리고, 실패한 라벨 하나가 전체 그림을 지움 | mermaid-math·ui·production 테스트 | 공통 TeX 경계, 600개 중첩 원문, 실제 앱 84회, 오류 라벨의 원문·정상 노드·목록 기호·스트림 완료·리셋 확인 |
+| 미완성 Mermaid 수식이 다른 라벨·노드·연결·주소·접근성 제목을 삼키고 직렬화 개행을 가림 | [mermaid-boundaries.test.js](../frontend/test/mermaid-boundaries.test.js), mermaid-math·production 테스트 | 구분자 소유 라벨, 그래프 구조 불변, 648개 경계 조합·72개 직렬화·1,200개 중첩 원문 |
+| 시퀀스·상태·클래스의 별도 수식 정규식과 br 전역 변환 때문에 동일한 TeX 오류가 반복 | [mermaid-native-math.test.js](../frontend/test/mermaid-native-math.test.js), ui·production 테스트 | 본문 엔진과 MathML 대조, verb·문자 br·실패 라벨 격리, 반복 측정 오류 중복·리셋, 이미지 자동 요청 0 |
+| Mermaid 업데이트나 사전 번들 캐시가 공유 수식 엔진 연결을 무효화 | 같은 native 테스트, 실제 개발·배포 검사 | 버전·연결 지점 변경 시 실패, 변환 내용으로 캐시 무효화, 배포 앱 124회 교차 조합 |
 | 스트림 중간의 수식/표/펜스, reset, 중단·재시도, 홈 이동 뒤 늦은 응답 | [ui.test.mjs](../frontend/test/ui/ui.test.mjs), [stream.test.js](../frontend/test/stream.test.js) | 미완성 미리보기·완료 답변·대화 이력 분리, UTF-8/JSON 조각 경계 보존 |
 | JSON 디코딩에서 TeX 백슬래시가 제어 문자로 변환되거나 응답 소실 | [llm-openai.test.js](../backend/test/llm-openai.test.js) | 정상/덜 이스케이프된 기존 코퍼스 및 최신 4개 전체 문서의 최종 원문·1/7/1000자 조각 대조 |
 | 개발 모드만 통과하고 배포 빌드에서 회귀 | [production.test.mjs](../frontend/test/ui/production.test.mjs) | 실제 빌드에서 200개 표·78개 정상 예제·180개 링크 표와 복합 콘텐츠 검사 |
@@ -68,6 +72,19 @@ Node 22 이상과 Chrome이 필요하다. 필요하면 `CHROME_PATH`로 실행 �
 화면 배치 결함이면 UI 공통 판정과 production 경로에도 포함한다.
 
 ## 실행 결과
+
+2026-09-09 공통 문법 경계·Mermaid 네이티브 수식 엔진 재설계의 구조와
+추가 검증은 [아키텍처 검토 기록](nested-rendering-architecture-review.md)에 정리했다.
+아래 84회 검증 등은 해당 단계의 실행 이력이며, 최신 교차 조합은 124회다.
+백엔드 전체 569개, 프런트 단위 327개, Chrome UI 88개, production 3개가
+모두 통과했다(실패·취소·건너뜀 0개). 필수 실행기 기준 562개다. 마지막
+어댑터 경로 보완 후 단위 3개와 배포 3개·124회 화면 조합도 재확인했다.
+
+2026-09-09 Mermaid 내부 TeX 경계 후속 검토에서 백엔드 전체 569개,
+프런트엔드 단위 320개, Chrome UI 88개, production 3개가 통과했다
+(실패·취소·건너뜀 0개). 필수 실행기 기준 555개이며 production의 실제 앱
+조합 84회를 포함한다. 개발 화면 84회도 통과했다.
+[검토 기록](mermaid-tex-boundaries-review.md)에 재현·수정·완료 증거를 정리했다.
 
 2026-09-09 라벨 문법 경계 최종 검토에서 백엔드 전체 569개, 프런트엔드 단위
 317개, Chrome UI 87개, production 3개가 통과했다(실패·취소·건너뜀 0개).
@@ -124,3 +141,6 @@ Mermaid의 연결·서식·메타데이터와 수식 조합, 목록 기호 배�
 
 Mermaid 라벨과 주소·툴팁·접근성 설명의 구분 및 shape 속성 안 수식은
 [라벨 문법 경계 검토](mermaid-label-ownership-review.md)에 기록했다.
+
+여러 줄 Mermaid 수식과 verb 내부 달러, 실패 라벨의 원문 격리, 오류 안내 뒤의
+목록 기호 배치는 [Mermaid 내부 TeX 경계 검토](mermaid-tex-boundaries-review.md)에 기록했다.

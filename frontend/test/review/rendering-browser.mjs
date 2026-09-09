@@ -12,7 +12,7 @@ import { findChrome, launchChrome, chromePort, stopProcess, killOnExit, freePort
 import { resolveChartData, resolveTableData } from '../../../backend/src/chart.js';
 import { NESTED_BOUNDARY_ANSWER, NESTED_LITERAL_MATH } from '../nested-boundaries-corpus.js';
 import { CELL_BLOCKS_ANSWER, CELL_CHART, CELL_LITERAL_ANSWER } from '../cell-blocks-corpus.js';
-import { MERMAID_MATH_CASES } from '../mermaid-math-corpus.js';
+import { MERMAID_MATH_CASES, MERMAID_MULTILINE_MATH, MERMAID_NATIVE_MATH_CASES } from '../mermaid-math-corpus.js';
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const VITE = join(ROOT, 'node_modules/vite/bin/vite.js');
@@ -25,18 +25,28 @@ const serializedTable = [
 ].join('\\r\\n');
 const literalChart = '`chart<br>data:step1`';
 const cases = [
-  ...MERMAID_MATH_CASES.map(({ id, source, nodes, label, bold, href, accessibleTitle, mathText, fractions, mathCount = 1 }) => ({
+  ...[...MERMAID_MATH_CASES, ...MERMAID_NATIVE_MATH_CASES].map(({ id, source, nodes, label, bold, href, accessibleTitle, mathText, fractions, mathCount = 1,
+    errors = 0, errorSources }) => ({
     id: 'mermaid-mixed-' + id,
     answer: '> 1. 혼합\n>\n' + ['| L | M | R |', '|---|---|---|',
       '| $z=9$ | 앞<br>- ```mermaid\\n' + source.replaceAll('\n', '\\n') + '``` | RIGHT |']
       .map(line => '>    ' + line).join('\n'),
-    expected: { diagrams: 1, mermaidMath: mathCount, errors: 0, formulas: ['z=9'],
-      diagramNodes: nodes, diagramMathSized: true, diagramNested: true,
+    expected: { diagrams: 1, mermaidMath: mathCount, errors, formulas: ['z=9'],
+      ...(nodes !== undefined && { diagramNodes: nodes }), diagramMathSized: true, diagramNested: true,
       diagramMarkerAligned: true,
       ...(label && { diagramLabel: true }), ...(bold && { diagramBold: true }),
       ...(href && { diagramHref: href }), ...(accessibleTitle && { diagramAccessibleTitle: accessibleTitle }),
-      ...(mathText && { diagramMathText: mathText }), ...(fractions && { diagramFractions: fractions }) },
+      ...(mathText && { diagramMathText: mathText }), ...(fractions && { diagramFractions: fractions }),
+      ...(errorSources && { errorSources }) },
     label,
+  })),
+  ...['\n', '\r\n', '\r'].map((newline, index) => ({
+    id: 'mermaid-multiline-' + index,
+    answer: ('본문 $z=9$\n\n> 1. 여러 줄 수식\n>\n' +
+      ('```mermaid\nflowchart LR\nA["$$' + MERMAID_MULTILINE_MATH + '$$"] --> B\n```')
+        .split('\n').map(line => '>    ' + line).join('\n')).replaceAll('\n', newline),
+    expected: { diagrams: 1, mermaidMath: 1, errors: 0, formulas: ['z=9'],
+      diagramNodes: 2, diagramMathSized: true, diagramFractions: 1 },
   })),
   { id: 'cell-literal-block-markers', answer: CELL_LITERAL_ANSWER,
     expected: { charts: 1, diagrams: 1, tables: 2, mermaidMath: 1, errors: 0, formulas: ['z=9'],
@@ -147,6 +157,7 @@ try {
         diagrams: b.querySelectorAll('.mermaid svg').length,
         tables: b.querySelectorAll('table').length,
         errors: b.querySelectorAll('.math-error').length,
+        errorSources: [...b.querySelectorAll('.math-error pre code')].map(node => node.textContent),
         formulas: [...b.querySelectorAll('annotation')].map(e => e.textContent),
         mermaidMath: b.querySelectorAll('.mermaid math').length,
         diagramNodes: b.querySelectorAll('.mermaid g.node').length,

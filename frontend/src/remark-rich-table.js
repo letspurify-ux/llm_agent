@@ -79,9 +79,10 @@ export function tableVisualization(value) {
   const fence = /^(?:`+|~{3,})/.exec(raw)?.[0];
   if (fence && body.endsWith(fence)) body = body.slice(0, -fence.length);
   // \n으로 직렬화된 조회 데이터의 '<br>' 값은 그대로다. br 구분자를 선택한 코드만 변환한다.
-  body = /<br/i.test(match[0]) ? decodeVisualizationBreaks(body) : decodeSerializedLines(body);
+  const language = match[1].toLowerCase();
+  body = /<br/i.test(match[0]) ? decodeVisualizationBreaks(body, language) : decodeSerializedLines(body, language);
   body = body.trim();
-  return { type: 'code', lang: match[1].toLowerCase(), value: body };
+  return { type: 'code', lang: language, value: body };
 }
 
 // 강조·링크 안의 줄바꿈도 서식을 유지하면서 줄 단위로 나눈다.

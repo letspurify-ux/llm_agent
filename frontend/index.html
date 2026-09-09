@@ -254,6 +254,9 @@
       .md .mermaid { margin: 8px 0; overflow-x: auto; }
       /* SVG의 인라인 기준선이 목록 기호를 그림 맨 아래로 끌어내리지 않도록 한다. */
       .md .mermaid svg { display: block; max-width: 100%; height: auto; }
+      /* 그림 뒤에 오류 원문(details)이 있어도 목록 기호의 첫 기준선은 그림 위다.
+         높이 없는 줄은 SVG를 밀지 않고, 아래 summary가 첫 글줄이 되는 것을 막는다. */
+      .md li > .mermaid::before { content: "\200b"; display: block; height: 0; }
 
       /* ===== 수식 (KaTeX) ===== */
       /* .bubble의 줄바꿈 규칙(overflow-wrap: anywhere)이 여기까지 상속되면, KaTeX가 span으로

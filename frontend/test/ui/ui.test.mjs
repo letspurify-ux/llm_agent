@@ -27,6 +27,7 @@ import { checkValidEdges } from './valid-edge-checks.mjs';
 import { checkTableLinks } from './table-link-checks.mjs';
 import { checkRichTables } from './rich-table-checks.mjs';
 import { TABLE_LINK_ANSWER, TABLE_LINK_EXPECTED } from '../table-link-edge-corpus.js';
+import { MERMAID_MATH_CASES, MERMAID_MULTILINE_MATH, MERMAID_NATIVE_MATH_CASES } from '../mermaid-math-corpus.js';
 import { CASES, TRACE, READY, ENVIRONMENT_EXAMPLES, PIE_BLOCK, PIE_LONG_NAMES, PIE_SHORT_NAMES, LONG_URL, DATA_URL, MAIL_URL, CAPPED_LABEL, ERROR_LABEL,
   STREAM_SEARCH, STREAM_SEARCH_LABEL, STREAM_SUMMARY, STREAM_PREVIEW_TEXT,
   ANCHOR_URL, ANCHOR_TEXT, ANCHOR_IMG_TEXT, NESTED_LINK, LONG_CELL, LONG_SERIES_NAMES, LONG_CATEGORY_NAMES,
@@ -200,6 +201,15 @@ flowchart LR
  A["$$x^2$$<br/>설명"] & C --> B["&lt;img src='/pixel-math.png'&gt;"]`,
     String.raw`flowchart LR
  A["$$x^2$$"] --> B["<span style='background:url(/pixel-math.png)'>글자</span>"]`,
+    String.raw`sequenceDiagram
+A->>B: $$x^2+\text{<img src='/pixel-math.png'>}$$`,
+    String.raw`sequenceDiagram
+A->>B: $$x^2$$ <img src='/pixel-math.png'>`,
+    String.raw`stateDiagram-v2
+s1: $$x^2$$ <img src='/pixel-math.png'>
+[*] --> s1`,
+    String.raw`classDiagram
+class A["$$x^2$$ <img src='/pixel-math.png'>"]`,
   ];
   await page.goto(url(), '.chip');
   await page.eval(`window.fetch = async () => new Response(JSON.stringify({ answer: ${JSON.stringify(sources.map(s => '```mermaid\n' + s + '\n```').join('\n\n'))} }),
@@ -208,6 +218,44 @@ flowchart LR
   assert.equal(await page.eval(`document.querySelectorAll('.mermaid img, .mermaid image').length`), 0);
   assert.equal(await page.eval(`performance.getEntriesByType('resource').filter(e => e.name.includes('pixel-math')).length`), 0);
   assert.equal(await page.eval(`document.querySelectorAll('.mermaid math').length`), sources.length);
+});
+
+it('Mermaid의 여러 줄·verb·미완성 수식과 실패 라벨은 중첩 차트와 함께 스트림 완료·원문 펼침·리셋을 유지한다', async () => {
+  const diagram = id => '`mermaid\\n' + [...MERMAID_MATH_CASES, ...MERMAID_NATIVE_MATH_CASES].find(c => c.id === id).source.replaceAll('\n', '\\n') + '`';
+  const answer = '본문 $z=9$\n\n' + [
+    '| L | M | R |', '|---|---|---|',
+    '| 정상 | 앞<br>- ' + diagram('verb-dollars') + ' | RIGHT_VERB |',
+    '| 오류 | 앞<br>- ' + diagram('invalid-label-isolation') + ' | RIGHT_ERROR |',
+    '| 경계 | 앞<br>- ' + diagram('unclosed-label-before-extended-math') + ' | RIGHT_BOUNDARY |',
+    '| 시퀀스 | 앞<br>- ' + diagram('sequence-verb') + ' | RIGHT_SEQUENCE |',
+    '| 조회 | `chart<br>type:bar<br>| A | B |<br>|---|---|<br>| a | 7 |` | RIGHT_CHART |',
+  ].map(line => '> ' + line).join('\n') + '\n\n```mermaid\nflowchart LR\nA["$$' + MERMAID_MULTILINE_MATH + '$$"] --> B\n```';
+  await page.viewport(320, 760);
+  await page.goto(url(), '.chip');
+  await page.eval(`window.__answer = ${JSON.stringify(answer)};
+    window.fetch = async () => new Response(new ReadableStream({
+      start(c) { window.__line = o => c.enqueue(new TextEncoder().encode(JSON.stringify(o) + '\\n')); window.__close = () => c.close(); }
+    }), { headers: { 'Content-Type': 'application/x-ndjson' } }); document.querySelector('.chip').click()`);
+  let at = 0;
+  for (const end of [answer.indexOf('verb|') + 6, answer.indexOf('unknown') + 4, answer.indexOf('frac{1') + 5, answer.length]) {
+    await page.eval(`window.__line({ type: 'answer_delta', text: window.__answer.slice(${at}, ${end}) })`);
+    await page.until(`document.querySelector('.preview annotation')?.textContent === 'z=9'`);
+    assert.equal(await page.eval(`document.querySelectorAll('.preview .mermaid').length`), 0);
+    assert.equal(await page.eval(`/LLMRICHTABLE|LLMMATHPLACEHOLDER|LLMCELLNODE/.test(document.querySelector('.preview').textContent)`), false);
+    at = end;
+  }
+  await page.until(`!document.querySelector('.preview .math-error') && document.querySelector('.preview')?.textContent.includes('RIGHT_CHART')`);
+  await page.eval(`window.__line({ type: 'done', answer: window.__answer }); window.__close()`);
+  await page.until(`document.querySelectorAll('.mermaid svg').length === 5 && document.querySelector('figure.chart .recharts-surface') && !document.querySelector('.typing')`);
+  assert.equal(await page.eval(`document.querySelectorAll('.mermaid math').length`), 5);
+  assert.deepEqual(await page.eval(`[...document.querySelectorAll('.mermaid svg')].map(svg => svg.querySelectorAll('g.node').length)`), [2, 3, 3, 0, 2]);
+  assert.equal(await page.eval(`document.querySelectorAll('.math-error').length`), 1);
+  await page.eval(`document.querySelector('.math-error').open = true`);
+  assert.equal(await page.eval(`document.querySelector('.math-error code').textContent`), String.raw`$$\unknown{x}$$`);
+  assert.deepEqual(await page.eval(`['RIGHT_VERB', 'RIGHT_ERROR', 'RIGHT_BOUNDARY', 'RIGHT_SEQUENCE', 'RIGHT_CHART'].map(text => document.querySelector('.bubble.assistant').textContent.includes(text))`), [true, true, true, true, true]);
+  assert.equal(await page.eval(`document.documentElement.scrollWidth - innerWidth`), 0);
+  await page.eval(`document.querySelector('.home-btn').click()`);
+  await page.until(`document.querySelector('.empty') && !document.querySelector('.math-error, .mermaid, .row')`);
 });
 
 it('200개 수식 표: 데스크톱·모바일에서 모든 행의 원문과 실제 조판 영역을 검증한다', async () => {

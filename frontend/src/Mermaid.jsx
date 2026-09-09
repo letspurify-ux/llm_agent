@@ -5,7 +5,8 @@ import mermaid from 'mermaid';
 // 그림 안 링크의 주소 규칙과 그림 노드의 판정은 답변의 링크·그림과 같은 자리에 있다 (markdown.js).
 import { rawLinkTarget, mermaidLoadsImage, mermaidFetchesViaStyle, mermaidMathLabels } from './markdown.js';
 import { renderMathML } from './math.js';
-import { prepareMermaidMath, mermaidMathML } from './mermaid-math.js';
+import { prepareMermaidMath, mermaidMathML, mermaidMathExpressions } from './mermaid-math.js';
+import { withNativeMermaidMath } from './mermaid-native-math.js';
 
 const MERMAID_CONFIG = {
   startOnLoad: false,
@@ -50,11 +51,13 @@ function renderDiagram(id, text) {
     // 직전 그림의 본문 설정과 무관한 기본 설정에서 종류를 판정한다.
     mermaid.initialize(MERMAID_CONFIG);
     const candidate = mermaidMathLabels(text, mermaid.detectType(text.replace(/\r\n?/g, '\n')));
-    const { source, math } = candidate ? await prepareMermaidMath(text,
+    const { source, math, errors = [] } = candidate ? await prepareMermaidMath(text,
       source => mermaid.mermaidAPI.getDiagramFromText(source), tex => mermaidMathML(renderMathML(tex)))
       : { source: text, math: false };
-    mermaid.initialize({ ...MERMAID_CONFIG, htmlLabels: math });
-    return mermaid.render(id, source);
+    // 상태도 등의 공통 라벨 렌더러도 MathML을 배치할 HTML 경로가 필요하다.
+    // 글자/수식 모두 같은 잠긴 sanitizer를 사용하므로 그림 종류에 의존하지 않는다.
+    mermaid.initialize({ ...MERMAID_CONFIG, htmlLabels: math || mermaidMathExpressions(text).length > 0 });
+    return withNativeMermaidMath(() => mermaid.render(id, source), errors);
   });
   renderQueue = task.catch(() => {});
   return task;
@@ -64,13 +67,14 @@ function renderDiagram(id, text) {
 const MIN_LABEL_PX = 9;
 
 export default function Mermaid({ text }) {
-  const [svg, setSvg] = useState(null);
+  const [rendered, setRendered] = useState(null);
+  const svg = rendered?.svg ?? null;
   const boxRef = useRef(null);
   // mermaid.render는 문서에 이 id의 요소를 만들었다 지운다 — useId의 콜론은 CSS 선택자로 못 쓴다.
   const id = `mmd${useId().replace(/[^A-Za-z0-9]/g, '')}`;
   useEffect(() => {
     let alive = true;
-    setSvg(null);
+    setRendered(null);
     // 그리는 도중에 주소를 불러오는 그림은 그리지 않는다 — 그림 노드(`A@{ img: "주소" }`)와, 설정 자리의
     // CSS가 바깥을 부르는 것(지시문의 themeCSS·fontFamily에 든 url(…))이다(markdown.js mermaidLoadsImage·
     // mermaidFetchesViaStyle). 둘 다 그린 뒤에는 늦다 — mermaid가 크기를 재려고 SVG를 문서에 넣는 순간
@@ -80,7 +84,7 @@ export default function Mermaid({ text }) {
       return;
     }
     // 그리지 못하면(문법 오류 등) svg를 null로 둔 채 끝낸다 — 아래에서 원문을 코드로 보여준다.
-    renderDiagram(id, text).then(r => { if (alive) setSvg(r.svg); }, e => console.warn('[mermaid] render failed:', e?.message ?? e));
+    renderDiagram(id, text).then(r => { if (alive) setRendered(r); }, e => console.warn('[mermaid] render failed:', e?.message ?? e));
     return () => { alive = false; };
   }, [text, id]);
   // 그림 안의 링크(`click A "주소"`)는 답변의 링크와 같은 규칙으로 연다 — 새 탭, 페이지 안 앵커만
@@ -130,7 +134,9 @@ export default function Mermaid({ text }) {
       // 넘겼다고 멈추면 그보다 작은 글자가 못 읽는 채 남기 때문이다.
       // 한 라벨 안에서도 한글·영문 및 줄마다 글리프 높이가 다를 수 있다.
       // 첫 tspan만 재면 나머지 줄의 작은 글자가 검사에서 빠진다.
-      const labels = [...el.querySelectorAll('.nodeLabel, text')].flatMap(n => {
+      // 연결선·하위 그래프의 라벨과 MathML도 같은 읽기 크기를 보장한다.
+      // 노드만 재면 긴 연결선 수식이 모바일에서 더 작아져도 놓치게 된다.
+      const labels = [...el.querySelectorAll('.nodeLabel, .edgeLabel, .cluster-label, text, math')].flatMap(n => {
         const spans = [...n.querySelectorAll('tspan')];
         return spans.length ? spans : [n];
       });
@@ -160,5 +166,11 @@ export default function Mermaid({ text }) {
   }, [svg]);
   // 그리는 동안과 실패했을 때는 원문 코드. 실패는 모델의 문법 실수가 대부분이라 원문이 곧 설명이다.
   if (svg === null) return <pre><code>{text}</code></pre>;
-  return <div className="mermaid" ref={boxRef} dangerouslySetInnerHTML={{ __html: svg }} />;
+  return <>
+    <div className="mermaid" ref={boxRef} dangerouslySetInnerHTML={{ __html: svg }} />
+    {rendered.mathErrors.map((source, index) => <details className="math-error katex-error" key={index}>
+      <summary>그림의 수식 오류 {index + 1} · 원문 보기</summary>
+      <pre><code>{source}</code></pre>
+    </details>)}
+  </>;
 }

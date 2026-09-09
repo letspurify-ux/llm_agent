@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import { mermaidMathAdapter } from './mermaid-math-adapter.mjs';
 
 // 외부(다른 PC) 접속 허용. vite는 기본적으로 localhost에만 바인딩해서 같은 PC에서만 열린다 —
 // true면 모든 인터페이스(0.0.0.0)에 붙어 사내망의 다른 PC가 `http://<이 PC의 IP>:5173`으로 들어온다.
@@ -27,7 +28,7 @@ const server = {
 };
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [mermaidMathAdapter(), react()],
   server,
   // 빌드 타깃을 적어 둔다. vite 6부터 기본값이 'baseline-widely-available'(chrome107·safari16 등)로
   // 올라가, 올리는 것만으로 구형 브라우저가 조용히 떨어져 나간다 — 이 화면은 사내 PC에서 열리고
