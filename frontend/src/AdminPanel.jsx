@@ -29,6 +29,7 @@ const valuesOf = (kind, row) => Object.fromEntries(SECTIONS[kind].fields.map(([k
   key === 'db_type' ? String(row[key] || 'oracle').toLowerCase() : row[key] ?? '',
 ]));
 const dbNames = text => text.split(';').map(s => s.trim()).filter(Boolean);
+const REQUIRED_ERROR = '필수 입력 항목을 확인해주세요.';
 
 export default function AdminPanel({ onStateChange }) {
   const [kind, setKind] = useState('databases');
@@ -47,12 +48,18 @@ export default function AdminPanel({ onStateChange }) {
   const [options, setOptions] = useState([]);
   const [optionSearch, setOptionSearch] = useState('');
   const [optionError, setOptionError] = useState('');
+  const [fieldErrors, setFieldErrors] = useState({});
   const [token, setToken] = useState('');
   const [keyInput, setKeyInput] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [authAttempted, setAuthAttempted] = useState(false);
   const [needsAuth, setNeedsAuth] = useState(false);
   const generation = useRef(0);
   const mutation = useRef(false);
   const firstField = useRef(null);
+  const feedbackRef = useRef(null);
+  const optionErrorRef = useRef(null);
+  const fieldRefs = useRef({});
   const config = SECTIONS[kind];
   const dirty = !!editor && JSON.stringify(draft) !== baseline;
 
@@ -68,9 +75,12 @@ export default function AdminPanel({ onStateChange }) {
       });
       if (response.status === 204) return null;
       const data = await response.json().catch(() => { throw new Error('서버 응답을 읽지 못했습니다. 백엔드 실행 상태를 확인해주세요.'); });
-      if (response.status === 401) { setNeedsAuth(true); setList(null); }
+      if (response.status === 401) {
+        setNeedsAuth(true); setList(null);
+        if (authAttempted) setAuthError('인증에 실패했습니다. 관리자 인증 키를 확인한 후 다시 입력해주세요.');
+      }
       if (!response.ok) throw new Error(data.error || '요청을 처리하지 못했습니다.');
-      setNeedsAuth(false);
+      setNeedsAuth(false); setAuthError(''); setAuthAttempted(false);
       return data;
     } catch (e) {
       if (controller.signal.aborted && !signal?.aborted) throw new Error('서버 응답이 늦어지고 있습니다. 목록을 새로고침해 저장 여부를 확인해주세요.');
@@ -80,11 +90,21 @@ export default function AdminPanel({ onStateChange }) {
       clearTimeout(timer);
       signal?.removeEventListener('abort', abort);
     }
-  }, [token]);
+  }, [token, authAttempted]);
 
   useEffect(() => {
     onStateChange({ dirty, busy });
   }, [dirty, busy, onStateChange]);
+  useEffect(() => {
+    const key = Object.keys(fieldErrors)[0];
+    const target = key ? fieldRefs.current[key] : needsAuth && (authError || (authAttempted && error)) ? feedbackRef.current : error ? feedbackRef.current : optionError ? optionErrorRef.current : null;
+    if (!target) return undefined;
+    const frame = requestAnimationFrame(() => {
+      target.scrollIntoView({ behavior: 'smooth', block: key ? 'center' : 'start' });
+      if (key) target.querySelector('input:not([type="checkbox"]), textarea, select')?.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [error, optionError, fieldErrors, authError, authAttempted, needsAuth]);
   useEffect(() => {
     if (!dirty && !busy) return;
     const warn = e => { e.preventDefault(); e.returnValue = ''; };
@@ -122,7 +142,8 @@ export default function AdminPanel({ onStateChange }) {
   }
   function clearEditor() {
     generation.current += 1;
-    setEditor(null); setDraft({}); setBaseline(''); setOpening(false); setOptionSearch('');
+    setEditor(null); setDraft({}); setBaseline(''); setOpening(false); setOptionSearch(''); setFieldErrors({}); setError(''); setOptionError('');
+    fieldRefs.current = {};
   }
   function changeSection(next) {
     if (next === kind || !canLeave()) return;
@@ -131,7 +152,7 @@ export default function AdminPanel({ onStateChange }) {
   async function openEditor(item) {
     if (!canLeave()) return;
     const current = ++generation.current;
-    setError(''); setNotice(''); setOpening(true);
+    setError(''); setNotice(''); setFieldErrors({}); setOpening(true);
     try {
       const row = item ? await api(`${kind}/${item.seq}`) : {};
       if (current !== generation.current) return;
@@ -140,9 +161,35 @@ export default function AdminPanel({ onStateChange }) {
     } catch (e) { if (current === generation.current) setError(e.message); }
     finally { if (current === generation.current) setOpening(false); }
   }
+  function validateRequiredFields() {
+    const missing = {};
+    for (const [key, label, type, , required] of config.fields) {
+      const keepPassword = key === 'db_password' && !!editor?.seq;
+      if (!required || keepPassword) continue;
+      const value = draft[key] ?? '';
+      const empty = type === 'databases' ? dbNames(value).length === 0 : !String(value).trim();
+      if (empty) missing[key] = `${label}을(를) 입력해주세요.`;
+    }
+    if (!Object.keys(missing).length) return true;
+    setFieldErrors(missing);
+    setError(REQUIRED_ERROR);
+    return false;
+  }
+  function updateField(key, value) {
+    setDraft(d => ({ ...d, [key]: value }));
+    setFieldErrors(errors => {
+      if (!errors[key]) return errors;
+      const next = { ...errors };
+      delete next[key];
+      return next;
+    });
+    setError(current => current === REQUIRED_ERROR ? '' : current);
+  }
   async function save(e) {
     e.preventDefault();
     if (mutation.current) return;
+    setFieldErrors({});
+    if (!validateRequiredFields()) return;
     mutation.current = true; setBusy(true); setError(''); setNotice('');
     try {
       const row = await api(`${kind}${editor.seq ? `/${editor.seq}` : ''}`, {
@@ -167,23 +214,26 @@ export default function AdminPanel({ onStateChange }) {
 
   return <main className="admin" aria-label="관리자 화면">
     <div className="admin-shell">
-      <div className="admin-heading"><div><p className="admin-eyebrow">SPACE / 관리</p><h2>관리자 화면</h2></div><span className="admin-pill">에이전트 설정</span></div>
       <nav className="admin-tabs" aria-label="관리 항목">
         {Object.entries(SECTIONS).map(([key, section], index) => <button type="button" key={key}
           aria-current={kind === key ? 'page' : undefined} disabled={busy} onClick={() => changeSection(key)}>
           <span className="admin-tab-number" aria-hidden="true">0{index + 1}</span>{section.label}
         </button>)}
       </nav>
-      {needsAuth ? <form className="admin-auth" onSubmit={e => { e.preventDefault(); setToken(keyInput); setKeyInput(''); setRefresh(n => n + 1); }}>
+      {needsAuth ? <form className="admin-auth" noValidate onSubmit={e => {
+        e.preventDefault();
+        if (!keyInput.trim()) { setAuthError('관리자 인증 키를 입력해주세요.'); return; }
+        setAuthError(''); setAuthAttempted(true); setToken(keyInput); setKeyInput(''); setRefresh(n => n + 1);
+      }}>
         <h3>관리자 인증</h3><p>서버에 설정된 관리자 인증 키를 입력하세요.</p>
-        <label htmlFor="admin-token">관리자 인증 키</label><input id="admin-token" type="password" autoComplete="off" required value={keyInput} onChange={e => setKeyInput(e.target.value)} />
-        {error && <p role="alert" className="admin-error">{error}</p>}<button className="admin-primary" type="submit">인증하기</button>
+        <label htmlFor="admin-token">관리자 인증 키</label><input id="admin-token" type="password" autoComplete="off" required aria-invalid={authError ? 'true' : undefined} aria-describedby={authError ? 'admin-token-error' : undefined} value={keyInput} onChange={e => { setKeyInput(e.target.value); setAuthError(''); setError(''); }} />
+        {(authError || (authAttempted && error)) && <p id="admin-token-error" ref={feedbackRef} role="alert" className="admin-error">{authError || error}</p>}<button className="admin-primary" type="submit">인증하기</button>
       </form> : <>
         <div className="admin-section-heading"><div><h3>{config.title}</h3><p>{config.description}</p></div>
           <button className="admin-primary" type="button" disabled={busy || opening || loading} onClick={() => openEditor(null)}><span aria-hidden="true">＋</span> {config.label} 추가</button>
         </div>
         <div className="admin-feedback" aria-live="polite">
-          {error && <div role="alert" className="admin-error">{error}</div>}
+          {error && <div ref={feedbackRef} role="alert" className="admin-error">{error}</div>}
           {notice && <div role="status" className="admin-success">{notice}</div>}
         </div>
         <div className={`admin-workspace${editor ? ' has-editor' : ''}`}>
@@ -210,33 +260,37 @@ export default function AdminPanel({ onStateChange }) {
           </section>
           {editor && <section className="admin-editor" aria-label={`${config.label} 편집`} aria-busy={busy || opening}>
             <div className="admin-editor-heading"><div><p>{editor.seq ? `항목 #${editor.seq}` : '새 항목'}</p><h3>{config.label} {editor.seq ? '수정' : '추가'}</h3></div><span className={`admin-dirty${dirty ? ' changed' : ''}`}>{dirty ? '저장하지 않음' : editor.seq ? '저장됨' : '새 항목'}</span></div>
-            <form onSubmit={save}>
+            <form noValidate onSubmit={save}>
               <fieldset disabled={busy || opening} className="admin-fields">
                 {config.fields.map(([key, label, type, limit, required, placeholder], index) => {
                   const id = `admin-field-${key}`;
                   const keepPassword = key === 'db_password' && !!editor.seq;
+                  const fieldError = fieldErrors[key];
                   const props = { id, ref: index === 0 ? firstField : undefined, value: draft[key] ?? '', required: required && !keepPassword,
-                    maxLength: limit || undefined, placeholder, onChange: e => setDraft(d => ({ ...d, [key]: e.target.value })) };
-                  return <div className="admin-field" key={key}>
+                    maxLength: limit || undefined, placeholder, 'aria-invalid': fieldError ? 'true' : undefined,
+                    'aria-describedby': fieldError ? `${id}-error` : undefined, onChange: e => updateField(key, e.target.value) };
+                  return <div className="admin-field" key={key} ref={node => { fieldRefs.current[key] = node; }}>
                     {type === 'databases' ? <span className="admin-field-label" id={`${id}-label`}>{label} <b>*</b></span>
                       : <label htmlFor={id}>{label}{required && !keepPassword && <b> *</b>}{limit && type === 'textarea' && <small>{(draft[key] || '').length} / {limit}</small>}</label>}
                     {type === 'select' ? <select {...props}><option value="oracle">Oracle</option></select>
-                      : type === 'databases' ? <div className="admin-db-picker" role="group" aria-labelledby={`${id}-label`}>
+                      : type === 'databases' ? <div className={`admin-db-picker${fieldError ? ' has-error' : ''}`} role="group" aria-labelledby={`${id}-label`} aria-invalid={fieldError ? 'true' : undefined} aria-describedby={fieldError ? `${id}-error` : undefined}>
                         <input type="search" aria-label="대상 DB 목록 검색" placeholder="등록된 DB 검색" value={optionSearch} onChange={e => setOptionSearch(e.target.value)}
                           onKeyDown={e => { if (e.key === 'Enter') e.preventDefault(); }} />
-                        {optionError ? <p className="admin-error">{optionError}</p> : !options.length ? <p>등록된 DB가 없습니다. DB 탭에서 먼저 추가해주세요.</p> : <div className="admin-db-options">
+                        {optionError ? <p ref={optionErrorRef} role="alert" className="admin-error">{optionError}</p> : !options.length ? <p>등록된 DB가 없습니다. DB 탭에서 먼저 추가해주세요.</p> : <div className="admin-db-options">
                           {options.filter(option => option.db_name.toLowerCase().includes(optionSearch.toLowerCase())).map(option => <label key={option.seq}>
-                            <input type="checkbox" checked={dbNames(draft[key]).some(n => n.toLowerCase() === option.db_name.toLowerCase())} onChange={e => setDraft(d => ({ ...d, [key]: (e.target.checked ? [...dbNames(d[key]), option.db_name] : dbNames(d[key]).filter(n => n.toLowerCase() !== option.db_name.toLowerCase())).join(';') }))} />{option.db_name}
+                            <input type="checkbox" checked={dbNames(draft[key]).some(n => n.toLowerCase() === option.db_name.toLowerCase())} onChange={e => updateField(key, (e.target.checked ? [...dbNames(draft[key]), option.db_name] : dbNames(draft[key]).filter(n => n.toLowerCase() !== option.db_name.toLowerCase())).join(';'))} />{option.db_name}
                           </label>)}
                         </div>}
                         <div className="admin-selected-dbs" aria-label="선택한 대상 DB">
                           {dbNames(draft[key]).map(name => <span key={name}>{name}<button type="button" aria-label={`${name} 선택 해제`}
-                            onClick={() => setDraft(d => ({ ...d, [key]: dbNames(d[key]).filter(n => n !== name).join(';') }))}>×</button></span>)}
+                            onClick={() => updateField(key, dbNames(draft[key]).filter(n => n !== name).join(';'))}>×</button></span>)}
                         </div>
                         <small>{draft[key] ? '목록에 없는 기존 DB도 위에서 선택 해제할 수 있습니다.' : '선택한 DB가 없습니다.'} 여러 DB를 선택할 수 있습니다.</small>
+                        {fieldError && <p id={`${id}-error`} role="alert" className="admin-field-error">{fieldError}</p>}
                       </div>
                         : type === 'textarea' || type === 'sql' ? <textarea {...props} className={type === 'sql' ? 'admin-sql' : ''} rows={['content', 'method', 'query_sql'].includes(key) ? 12 : 3} spellCheck={type === 'sql' ? false : undefined} />
                           : <input {...props} type={type} autoComplete={type === 'password' ? 'new-password' : 'off'} placeholder={keepPassword ? '변경할 때만 입력하세요' : placeholder} />}
+                    {type !== 'databases' && fieldError && <p id={`${id}-error`} role="alert" className="admin-field-error">{fieldError}</p>}
                     {keepPassword && <small>현재 비밀번호: {editor.has_password ? '설정됨' : '없음'}. 비워 두면 기존 값을 유지합니다.</small>}
                     {key === 'db_password' && <small>서버 환경변수를 사용하려면 ENV:변수명 형식으로 입력하세요.</small>}
                     {key === 'query_sql' && <small>SELECT 또는 WITH 조회만 등록할 수 있습니다. 입력값은 :파라미터 바인드를 사용하세요.</small>}

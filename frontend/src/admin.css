@@ -1,6 +1,6 @@
 .admin-nav-button { margin-left: 0; }
 .admin { flex: 1; min-height: 0; overflow: auto; background: var(--bg); }
-.admin-shell { max-width: 1440px; margin: 0 auto; padding: 30px 36px 24px; }
+.admin-shell { max-width: 1440px; margin: 0 auto; padding: 26px 36px 24px; }
 .admin button, .admin input, .admin textarea, .admin select { font: inherit; }
 .admin button { cursor: pointer; }
 .admin button:disabled { cursor: default; opacity: .5; }
@@ -9,7 +9,7 @@
 .admin-eyebrow { margin: 0 0 7px; font-size: 11px; letter-spacing: 1.4px; color: var(--muted); }
 .admin-heading h2 { margin: 0; font-size: 25px; letter-spacing: -.8px; }
 .admin-pill { color: var(--accent); background: #eeecff; border: 1px solid #ddd9fe; border-radius: 20px; font-size: 12px; padding: 6px 12px; white-space: nowrap; }
-.admin-tabs { display: flex; gap: 5px; padding: 5px; background: #eaeef5; border-radius: 12px; margin: 24px 0 26px; width: fit-content; }
+.admin-tabs { display: flex; gap: 5px; padding: 5px; background: #eaeef5; border-radius: 12px; margin: 0 0 26px; width: fit-content; }
 .admin-tabs button { border: 0; border-radius: 8px; padding: 11px 25px; background: transparent; color: var(--muted); font-size: 14px; font-weight: 650; }
 .admin-tabs button[aria-current] { background: var(--surface); color: var(--accent); box-shadow: 0 2px 5px #1a22330b; }
 .admin-tab-number { font-size: 10px; margin-right: 9px; opacity: .7; }
@@ -21,7 +21,8 @@
 .admin-secondary { background: var(--surface); border: 1px solid var(--border); color: var(--text); }
 .admin-secondary:hover:not(:disabled) { border-color: #b8b4eb; background: #f9f8ff; }
 .admin-delete { color: #b42332; background: #fff; border: 1px solid #f1ced3; }
-.admin-feedback { margin-top: 18px; }
+.admin-feedback { position: sticky; top: 0; z-index: 5; margin-top: 18px; padding: 3px 0 1px; background: var(--bg); }
+.admin-feedback:empty { display: none; }
 .admin-error, .admin-success { padding: 12px 15px; border-radius: 8px; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; margin: 0 0 14px; }
 .admin-error { background: #fff1f2; color: #a62537; border: 1px solid #f4cbd1; }
 .admin-success { background: #edf9f2; color: #246044; border: 1px solid #c7e6d4; }
@@ -64,7 +65,9 @@
 .admin-field textarea { resize: vertical; line-height: 1.75; min-height: 85px; }
 .admin-field .admin-sql { background: #f7f8fd; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; tab-size: 2; }
 .admin-field small { display: block; color: var(--muted); font-size: 11px; line-height: 1.6; margin-top: 6px; overflow-wrap: anywhere; }
+.admin-field-error { color: #a62537; font-size: 12px; font-weight: 650; line-height: 1.5; margin: 8px 0 0; }
 .admin-db-picker { padding: 12px; border: 1px solid var(--border); border-radius: 7px; }
+.admin-db-picker.has-error { border-color: #e5aab3; background: #fffafa; box-shadow: 0 0 0 2px #fbe4e7; }
 .admin-db-picker p { color: var(--muted); font-size: 12px; }
 .admin-db-options { max-height: 160px; overflow: auto; margin: 8px 0; }
 .admin-db-options label { display: flex; align-items: center; gap: 8px; padding: 6px 2px; font-size: 12px; overflow-wrap: anywhere; }
@@ -80,7 +83,7 @@
 .admin-auth p, .admin-auth label { font-size: 13px; color: var(--muted); }
 .admin-auth input { margin: 8px 0 16px; }
 @media (max-width: 900px) {
-  .admin-shell { padding: 24px 20px; }
+  .admin-shell { padding: 26px 20px 24px; }
   .admin-workspace.has-editor { grid-template-columns: minmax(0, 1fr); }
   .admin-workspace.has-editor .admin-editor { grid-row: 1; }
 }
@@ -89,7 +92,7 @@
   .header > .logo { flex-shrink: 0; width: 34px; height: 34px; }
   .header h1 { font-size: 15px; }
   .header .home-btn { padding: 8px; }
-  .admin-shell { padding: 20px 12px; }
+  .admin-shell { padding: 26px 12px 24px; }
   .admin-heading h2 { font-size: 22px; }
   .admin-tabs { width: 100%; }
   .admin-tabs button { flex: 1; padding: 10px 5px; }

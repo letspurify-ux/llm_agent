@@ -109,7 +109,15 @@ test(`${production ? 'production' : 'dev'} 관리 화면 검색·페이지 이�
   await tab(4); await loaded(); await click('.admin-section-heading .admin-primary');
   await fill('#admin-field-query_name', 'CUSTOMER_ORDERS'); await fill('#admin-field-query_desc', '고객별 주문 상태 조회');
   await fill('#admin-field-query_sql', 'SELECT * FROM orders WHERE customer_id = :customer_id');
-  await page.until(`document.querySelector('.admin-db-options input')`); await click('.admin-db-options input');
+  await page.until(`document.querySelector('.admin-db-options input')`);
+  await page.eval(`document.querySelector('.admin').scrollTop = document.querySelector('.admin').scrollHeight`);
+  const writesBeforeMissingTargetDb = await page.eval(`window.__requests.filter(r => r.method === 'POST' && r.url.endsWith('/queries')).length`);
+  await click('.admin-form-actions [type=submit]');
+  await page.until(`document.querySelector('#admin-field-target_db_name-error')?.textContent.includes('대상 DB')`);
+  assert.equal(await page.eval(`window.__requests.filter(r => r.method === 'POST' && r.url.endsWith('/queries')).length`), writesBeforeMissingTargetDb, '대상 DB가 없으면 저장 요청을 보내지 않는다');
+  assert.equal(await page.eval(`document.querySelector('.admin-db-picker').getAttribute('aria-invalid')`), 'true');
+  assert.ok(await page.eval(`(() => { const r = document.querySelector('#admin-field-target_db_name-error').getBoundingClientRect(); return r.top < innerHeight && r.bottom > 0; })()`), '검증 오류 필드가 화면에 들어온다');
+  await click('.admin-db-options input');
   await click('.admin-form-actions [type=submit]'); await page.until(`document.querySelector('.admin-success')`);
   assert.equal(await page.eval(`window.__records.queries[0].target_db_name`), 'ORDER_DB');
   // 대상 DB 검색창의 Enter가 아직 저장하지 않은 다른 변경까지 제출해서는 안 된다.
@@ -165,6 +173,7 @@ test(`${production ? 'production' : 'dev'} 관리 화면 검색·페이지 이�
   await page.until(`document.querySelector('#admin-token')`);
   await fill('#admin-token', 'wrong-key'); await click('.admin-auth [type=submit]');
   await page.until(`document.querySelector('.admin-auth .admin-error')`);
+  assert.match(await page.eval(`document.querySelector('.admin-auth .admin-error').textContent`), /인증에 실패했습니다/);
   await fill('#admin-token', 'test-admin-key'); await click('.admin-auth [type=submit]');
   await page.until(`document.querySelector('.admin-record')`);
   await click('[aria-label="채팅으로 돌아가기"]'); await click('[aria-label="관리자 화면 열기"]');
