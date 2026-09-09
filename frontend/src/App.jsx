@@ -14,6 +14,7 @@ import { PreviewPre } from './preview.js';
 // 답변 속 주소를 어떻게 다룰지의 판정은 markdown.js에 있다 (순수 함수라 회귀 테스트가 붙는다).
 import { linkTarget, imageTarget, mdProps, scopeMarkdownIds } from './markdown.js';
 import InlineMath from './InlineMath.jsx';
+import AdminPanel from './AdminPanel.jsx';
 
 const NO_REHYPE = [];
 function useMarkdownPlugins(base = NO_REHYPE) {
@@ -443,6 +444,8 @@ const BUSY_MS = 600;
 const SCROLL_KEYS = new Set(['PageUp', 'PageDown', 'ArrowUp', 'ArrowDown', 'Home', 'End', ' ']);
 
 export default function App() {
+  const [adminOpen, setAdminOpen] = useState(false);
+  const [adminState, setAdminState] = useState({ dirty: false, busy: false });
   const previewPlugins = useMarkdownPlugins(REHYPE_PLUGINS);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -503,6 +506,7 @@ export default function App() {
   const stopGlide = () => { if (glideRef.current) cancelAnimationFrame(glideRef.current.raf); glideRef.current = null; };
   function glide(el, target, instant) {
     stopGlide();
+    if (!el.clientHeight) return;
     // '동작 줄이기'를 켠 사람에게는 한 번에 놓는다. 브라우저의 smooth 스크롤은 이 설정을 스스로 지켰지만
     // 우리가 프레임을 직접 놓기 시작한 이상 지키는 것도 우리 몫이다 — 화면이 흐르는 것 자체가 어지러운
     // 사람들이 있다. 매번 다시 묻는 이유는 설정이 대화 도중에도 바뀌기 때문이다.
@@ -593,6 +597,7 @@ export default function App() {
     const el = chatRef.current;
     if (!el) return;
     emptyRef.current = !last;
+    if (!el.clientHeight) return;
     if (!last || last.role === 'user' || (stuckRef.current && !holding())) {
       glide(el, restOf(el));
       stuckRef.current = true; // 새 말풍선은 바닥으로 내려가 보는 것이 뜻이다 — 내려가는 동안 커지는 것도 따라간다
@@ -600,6 +605,9 @@ export default function App() {
     if (typeof ResizeObserver === 'undefined') return;
     if (!growRef.current) {
       growRef.current = new ResizeObserver(entries => {
+        // 숨김은 실제로 바닥에 도착한 것이 아니다. 0 크기로 따라가기 상태나
+        // scrollTop을 바꾸면 관리자 화면을 닫을 때 읽던 위치를 잃는다.
+        if (!el.clientHeight) return;
         // 건너뛰든 따라가든 '크기가 여기까지 변했다'는 것은 남긴다 — 그러지 않으면 onChatScroll의
         // 기준이 낡아, 한참 뒤의 평범한 스크롤까지 크기 변화 중인 것으로 보인다.
         lastHeightRef.current = el.scrollHeight;
@@ -808,7 +816,7 @@ export default function App() {
 
     const app = el?.parentElement;
     const onOutsideWheel = e => {
-      if (!el || el.contains(e.target)) return;
+      if (!el || !el.clientHeight || el.contains(e.target)) return;
       // 확대 제스처(트랙패드 핀치, Ctrl+휠)는 휠 이벤트로 오지만 스크롤이 아니다 — 확대만 하고 지나간다.
       // 가로로만 스친 것(deltaY 0)도 여기서 할 일이 없다: 아래에서 0을 더하면 스크롤 이벤트조차 나지
       // 않아, 따라가던 미끄러짐만 소리 없이 끊기고 답의 끝이 화면 밑에 남는다.
@@ -860,6 +868,7 @@ export default function App() {
   // 내용이 줄어 브라우저가 scrollTop을 깎은 경우는 바닥에 닿은 것이라 앞 조건에서 붙은 채로 남는다.
   function onChatScroll(e) {
     const el = e.currentTarget;
+    if (!el.clientHeight) return;
     // 이 스크롤이 우리가 놓은 것인가(미끄러지는 중이고 그 값이 우리가 마지막에 쓴 값인가).
     // 2px: 배율 화면의 반올림 차이는 1px 미만, 휠 한 칸·화살표 키는 40px 이상.
     const ours = glideRef.current && Math.abs(el.scrollTop - glideRef.current.expect) <= 2;
@@ -881,7 +890,9 @@ export default function App() {
   // useEffect가 아니라 useLayoutEffect인 이유: 그리기 전에 높이가 정해져야 한 프레임 깜빡이지 않는다.
   function fitInput() {
     const el = inputRef.current;
-    if (!el) return;
+    // 관리자 화면에서는 채팅 입력창이 숨겨져 있다. 이때의 0 높이를 기록하면
+    // 복귀한 뒤에도 여러 줄 초안이 접히고 스크롤까지 꺼진 채 남는다.
+    if (!el || !el.getClientRects().length) return;
     // 지금 높이를 먼저 풀어야 한다 — 그러지 않으면 scrollHeight가 이미 늘어난 높이에 갇혀
     // 줄을 지워도 다시 줄어들지 않는다 (한 번 커지면 그대로 남는다).
     el.style.height = 'auto';
@@ -900,7 +911,7 @@ export default function App() {
       el.scrollTop = el.scrollHeight;
     }
   }
-  useLayoutEffect(fitInput, [input]);
+  useLayoutEffect(fitInput, [input, adminOpen]);
   // 창 폭이 바뀌면 같은 글이 다른 줄 수로 감기는데 높이는 글이 바뀔 때만 재므로 그대로 남는다 —
   // 창을 좁히면 마지막 줄이 입력창 밑으로 잘려 보이지 않고(스크롤은 꺼져 있다), 넓히면 빈 줄이 남는다.
   useEffect(() => {
@@ -927,7 +938,7 @@ export default function App() {
     setPreview('');
   };
 
-  // 첫 화면(빈 상태)으로 되돌린다. 화면이 하나뿐이라 '홈으로 이동'은 곧 대화를 접는 것이다.
+  // 채팅의 첫 화면(빈 상태)으로 되돌린다. '홈'은 대화를 접고 새로 시작하는 동작이다.
   // 답을 기다리는 중에도 눌릴 수 있다 — 요청 상한이 450초라 그때까지 막아두면
   // 사실상 되돌아갈 수 없는 시간이 생긴다. 그래서 진행 중인 요청은 여기서 끊는다.
   function goHome() {
@@ -1176,18 +1187,30 @@ export default function App() {
           className="home-btn"
           onClick={goHome}
           disabled={messages.length === 0 && !loading}
+          style={adminOpen ? { display: 'none' } : undefined}
           title="새 대화로 시작합니다"
         >
           <span aria-hidden="true">⌂</span><span className="home-label">홈</span>
         </button>
+        <button type="button" className="home-btn admin-nav-button" style={adminOpen ? { marginLeft: 'auto' } : undefined}
+          aria-label={adminOpen ? '채팅으로 돌아가기' : '관리자 화면 열기'} aria-pressed={adminOpen}
+          disabled={adminOpen && adminState.busy}
+          onClick={() => {
+            if (adminOpen && adminState.dirty && !window.confirm('저장하지 않은 변경 사항을 버리고 채팅으로 돌아가시겠습니까?')) return;
+            if (!adminOpen) stopGlide();
+            setAdminOpen(open => !open);
+            setAdminState({ dirty: false, busy: false });
+          }}>{adminOpen ? '채팅으로' : '관리자'}</button>
       </header>
+
+      {adminOpen && <AdminPanel onStateChange={setAdminState} />}
 
       {/* 답이 도착한 것을 알리는 한 줄. 늘 그 자리에 있어야 한다 — 알릴 때 이 요소를 함께 만들어 넣으면
           화면낭독기가 '바뀐 것'으로 보지 못해 아무것도 읽지 않는 브라우저가 있다. 비어 있는 동안에는
           접근성 트리에 글자가 없어 사용자에게도 보이지 않는다. */}
       <p className="sr-only" role="status">{status}</p>
 
-      <main className="chat" ref={chatRef} onScroll={onChatScroll}>
+      <main className="chat" ref={chatRef} onScroll={onChatScroll} style={adminOpen ? { display: 'none' } : undefined}>
         <div className="chat-inner">
           {messages.length === 0 && !loading && (
             <div className="empty">
@@ -1222,7 +1245,7 @@ export default function App() {
         </div>
       </main>
 
-      <div className="composer-wrap">
+      <div className="composer-wrap" style={adminOpen ? { display: 'none' } : undefined}>
         <form className="composer" onSubmit={e => { e.preventDefault(); submitInput(); }}>
           <textarea
             ref={inputRef}

@@ -20,7 +20,7 @@
 - **agent 관리 DB**: MariaDB — `knowledge`(지식), `qa_method`(Q&A 처리 방법), `query_registry`(쿼리 관리), `target_db`(조회대상 DB 접속 정보)
 - **조회용 DB**: Oracle (node-oracledb — 기본은 Thin 모드라 Instant Client 불필요, `.env`의 `ORACLE_DRIVER=oci`로 Thick(OCI) 모드 전환 가능). 여러 개 등록 가능
 - **LLM**: vLLM / OpenRouter 등 OpenAI 호환 API. 개발용 규칙 기반 Mock 내장
-- **UI**: React(Vite) 채팅 화면. 답변은 markdown(표·제목·목록)으로 구조화되어 렌더링(react-markdown + remark-gfm), 수식은 KaTeX. 관리 데이터는 SQL로 직접 입력
+- **UI**: React(Vite) 채팅 화면과 관리자 화면. 답변은 markdown(표·제목·목록)으로 구조화되어 렌더링(react-markdown + remark-gfm), 수식은 KaTeX. 상단 **관리자**에서 DB·지식·방법·쿼리를 검색하고 추가·수정·삭제할 수 있다.
 
 ## 대화 맥락
 
@@ -40,6 +40,7 @@
 backend/
   sql/schema.sql, seed.sql   # MariaDB DDL + 데모 데이터
   src/server.js              # Express, POST /api/chat
+  src/admin.js               # 관리자 CRUD·검색 API, 입력 검증·참조 보호
   src/agent.js               # agentic loop (핵심 제어 흐름)
   src/llm.js                 # LLM 인터페이스 + Mock (provider 선택)
   src/llm-openai.js          # OpenAI 호환 클라이언트 (vLLM/OpenRouter)
@@ -48,6 +49,7 @@ backend/
   src/oracle.js              # Oracle 실행기 + SELECT 전용 가드 + mock 모드
 frontend/
   src/App.jsx                # Vite + React 채팅 UI (단일 컴포넌트)
+  src/AdminPanel.jsx         # DB·지식·방법·쿼리 관리 및 검색 화면
   src/math.js                # 답변 안의 수식 표기 판정(remark 플러그인) + 렌더러 설정
 ```
 
@@ -109,13 +111,17 @@ mariadb --default-character-set=utf8mb4 < backend/sql/schema.sql
 mariadb --default-character-set=utf8mb4 < backend/sql/seed.sql
 ```
 
-앱 계정 생성 (agent 서버는 관리 테이블을 읽기만 하므로 SELECT 권한이면 충분).
+앱 계정 생성 (관리자 화면의 저장·삭제를 위해 관리 테이블에도 쓰기 권한이 필요하다).
 `<비밀번호>`는 직접 정하고, 같은 값을 `backend/.env`의 `MARIADB_PASSWORD`에 채운다
 (문서에 고정 비밀번호를 적어 두면 저장소에 공개된 자격증명이 운영까지 그대로 따라간다):
 
 ```bash
 mariadb -e "CREATE USER IF NOT EXISTS 'agent'@'localhost' IDENTIFIED BY '<비밀번호>';
 GRANT SELECT ON llm_agent.* TO 'agent'@'localhost';
+GRANT INSERT, UPDATE, DELETE ON llm_agent.target_db      TO 'agent'@'localhost';
+GRANT INSERT, UPDATE, DELETE ON llm_agent.knowledge      TO 'agent'@'localhost';
+GRANT INSERT, UPDATE, DELETE ON llm_agent.qa_method      TO 'agent'@'localhost';
+GRANT INSERT, UPDATE, DELETE ON llm_agent.query_registry TO 'agent'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.knowledge_chunk     TO 'agent'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_knowledge_chunk TO 'agent'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_qa_method       TO 'agent'@'localhost';
@@ -184,6 +190,7 @@ cd frontend && npm install && npm run dev
 ```bash
 npm test          # 순수 함수의 계약(수식 판정·차트 파싱·trace/CSV·주소 규칙)과 띄운 것을 내리는 규칙 — 몇 초
 npm run test:ui   # 화면 동작의 계약 — 진짜 Chrome을 headless로 띄운다 (약 2분)
+npm run test:admin # 관리자 검색·페이지 이동·저장·인증·작은 화면 검증
 npm run test:production # 현재 소스를 빌드하고 preview 서버에서 핵심 화면 동작을 검증
 npm run test:all  # 위 셋을 차례로
 npm run test:regression # 필수 전체 회귀: 백엔드 원문 전송 + 위 셋 (Chrome 누락도 실패)
@@ -201,6 +208,48 @@ npm run test:regression # 필수 전체 회귀: 백엔드 원문 전송 + 위 �
 수식·Markdown·차트 관련 버그별 정식 테스트는 [회귀 검사 목록](docs/rendering-regressions.md)에 정리했다.
 GitHub Actions는 모든 push/PR에서 `test:regression`을 실행한다. Node 22 이상과 Chrome,
 frontend/backend의 `npm ci`가 필요하며 실제 DB나 LLM 서버는 사용하지 않는다.
+
+#### 관리자 화면
+
+상단 **관리자**를 누르면 기존 대화와 입력 중인 질문을 유지하면서 설정 화면을 연다.
+**채팅으로**를 누르면 대화로 돌아간다. 네 탭에서 목록 검색과 항목 추가·수정·삭제를 지원한다.
+
+| 탭 | 관리 내용 | 검색 대상 |
+| --- | --- | --- |
+| DB | 조회 대상 Oracle DB의 이름·접속 주소·사용자명·비밀번호 | 이름·유형·접속 주소·사용자명 (비밀번호 제외) |
+| 지식 | 제목·원문 | 제목·본문 |
+| 방법 | 제목·Q&A 처리 절차 | 제목·처리 방법 본문 |
+| 쿼리 | 이름·SQL·입력/출력 설명·대상 DB | 이름·SQL·모든 설명·대상 DB |
+
+검색은 서버에서 전체 데이터를 대상으로 부분 일치로 수행하며, 결과는 최근 등록순으로
+20개씩 나눈다. `%`와 `_`도 검색어 그대로 취급한다. 쿼리의 대상 DB는 여러 개 선택할 수 있고
+DB 선택 목록 안에서도 이름으로 검색할 수 있다. 검색 대상이 많아도 본문 전체를 브라우저로
+내려받지 않으며 편집할 때 해당 항목만 읽는다.
+
+- 저장한 원본은 MariaDB에 즉시 반영된다. 검색 색인은 기존 임베딩 동기화 주기에 따라 갱신된다
+  (기본 60초, `EMBED_SYNC_INTERVAL=0`이면 `npm run embed`를 직접 실행).
+- DB 탭의 비밀번호는 관리용 MariaDB가 아니라 **조회 대상 Oracle DB**의 비밀번호다. 조회 API에 포함하지 않으며, 수정 시 비워 두면 기존 값을 유지한다.
+  운영 비밀번호는 기존 방식대로 `ENV:변수명`을 사용한다.
+- SELECT/WITH 조회 SQL만 등록할 수 있다. 쿼리에서 사용 중인 DB, 처리 방법에서 언급한 쿼리는
+  참조를 먼저 변경해야 삭제하거나 이름을 바꿀 수 있다. SQL로 직접 변경하는 작업은 이 검사와 별개다.
+- 저장 전 탭 전환·닫기·새로고침 시 변경 내용 유실을 확인하며, 저장 실패 시 입력 내용을 유지한다.
+- 항목을 연 뒤 다른 화면에서 수정했다면 오래된 수정·삭제는 거부한다. 입력 내용을 보관하고 항목을
+  다시 열어 최신 내용과 합친다. 서버를 재시작한 경우에도 항목을 다시 읽어야 한다.
+- `backend/.env`에 `ADMIN_TOKEN`을 설정하고 백엔드를 재시작하면 관리자 API의 읽기·쓰기에
+  인증 키가 필요하다. 키는 브라우저 메모리에만 보관한다. 미설정 상태는 기존 페이지와 같은
+  사내망 전용 모드이며 사용자별 권한 관리는 제공하지 않는다.
+
+기존 설치의 앱 계정에 SELECT만 부여했다면 위의 관리 테이블 네 개에 대한
+`GRANT INSERT, UPDATE, DELETE`도 적용한다. 권한이 없으면 화면에서 저장 오류를 안내한다.
+기존 DB에 `schema.sql`을 다시 실행하지 않는다.
+
+API: `/api/admin/{databases,knowledge,methods,queries}`의 GET(검색 `q`, 페이지 `page`),
+POST(추가), `/:id`의 GET/PUT/DELETE. 대상 DB 선택 목록은 `/api/admin/database-options`.
+모든 요청은 `X-Admin-Request: 1`, 인증 키가 설정됐다면 `X-Admin-Token` 헤더가 필요하다.
+PUT/DELETE에는 해당 항목 GET 응답의 `ETag`를 `If-Match` 헤더로 보낸다. 버전이 없으면 428,
+이미 바뀌었으면 409로 응답하며 데이터는 변경하지 않는다. DB 비밀번호는 응답에 포함하지 않는다.
+
+관리자 화면의 결함 재현과 수정·검증 범위는 [관리자 검토 기록](docs/admin-review.md)에 정리했다.
 
 #### 다른 PC에서 접속하기
 
@@ -823,7 +872,7 @@ GROUP BY searches ORDER BY searches;
 
 ## 향후 확장 지점
 
-- **새 쿼리/지식 추가**: 코드 변경 없이 MariaDB 테이블에 INSERT (임베딩은 1분 내 자동 동기화).
+- **새 쿼리/지식 추가**: 관리자 화면에서 추가하거나 MariaDB 테이블에 INSERT (임베딩은 기본 1분 주기로 자동 동기화).
   단일 쿼리는 `query_desc`만 성실히 작성하면 되고, 다단계 절차는 `qa_method.method` 본문에 `query_name`을 순서대로 언급
 - **임베딩 모델 교체**: `EMBEDDING_MODEL`만 변경 (1024차원 유지 시). vLLM/TEI 등 OpenAI 호환 서버는 `EMBEDDING_URL`로 전환.
   지시문을 학습한 모델(Qwen3-Embedding·Harrier 계열)은 `EMBEDDING_QUERY_PREFIX`로 **질의에만** 접두를 붙인다

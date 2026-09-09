@@ -176,7 +176,7 @@ CREATE TABLE vec_query_registry (
   VECTOR INDEX (embedding) DISTANCE=cosine
 );
 
--- 앱 계정은 관리 테이블 4개는 SELECT만, 파생 테이블(knowledge_chunk, vec_*, chat_log)에는 쓰기가 필요하다.
+-- 관리자 화면을 사용하면 관리 테이블 4개에도 INSERT, UPDATE, DELETE 권한이 필요하다 (README 참고).
 -- (테이블 단위 권한은 이름으로 저장되므로 이 파일을 다시 돌려도 살아남는다 — 재부여 불필요)
 --   GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.knowledge_chunk TO 'agent'@'localhost';
 --   GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_knowledge_chunk TO 'agent'@'localhost';

@@ -9,6 +9,7 @@ import { warmUpEmbedding } from './search.js';
 import { insertChatLog, cleanupChatLogs, closePool } from './db.js';
 import { numEnv, warnOnce, clipText, MAX_QUESTION_LEN } from './constants.js';
 import { clientTrace } from './result.js';
+import { createAdminRouter } from './admin.js';
 
 // 종료가 시작됐는지 — 새 주기 작업을 시작하지 않기 위해 아래 runJob이 함께 본다.
 // (선언을 shutdown 옆이 아니라 여기 두는 이유는 그 참조가 정의보다 먼저 평가되기 때문이다)
@@ -58,6 +59,7 @@ if (!oracleMock() && oracleDriver() === 'oci') {
 }
 
 const app = express();
+app.use('/api/admin', createAdminRouter());
 // 기본값(100kb)은 표 형태 답변이 쌓인 대화 이력에 부족하다 — 초과하면 핸들러에 닿기도 전에
 // 413이 나고 클라이언트는 그 뒤 모든 요청이 같은 이유로 실패한다.
 app.use(express.json({ limit: '1mb' }));

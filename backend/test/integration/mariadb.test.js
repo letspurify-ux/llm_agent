@@ -9,6 +9,7 @@ import { once } from 'node:events';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import mariadb from 'mariadb';
+import express from 'express';
 import { closePool, loadChunkRanges, loadQueriesByNames, loadQueriesMentionedIn, insertChatLog } from '../../src/db.js';
 import { syncEmbeddings, syncSummary, SKIP } from '../../src/embed-sync.js';
 import { handleQuestion } from '../../src/agent.js';
@@ -20,8 +21,10 @@ import { SEARCH_LIMIT } from '../../src/constants.js';
 import { buildPrompt } from '../../src/llm-openai.js';
 import { llm, sanitizeDecision } from '../../src/llm.js';
 import { runQuery } from '../../src/oracle.js';
+import { createAdminRouter, createAdminStore } from '../../src/admin.js';
 
 const exec = promisify(execFile);
+const networkFetch = globalThis.fetch;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const sqlFile = name => readFile(new URL(`../../sql/${name}`, import.meta.url), 'utf8');
 let dir, server, conn;
@@ -35,6 +38,109 @@ let registryStatements = [];
 // 대역이 만드는 벡터의 one-hot 위치 — 텍스트만으로 정해진다. 응답 순서가 뒤바뀌어도 어느 행의
 // 벡터인지 이 값으로 되짚을 수 있다 (embedding.js가 index로 짝짓는 것을 검증하는 근거).
 const slotOf = text => createHash('sha256').update(text).digest().readUInt16BE(0) % 1024;
+
+test('관리자 검토: 다른 화면의 저장 내용을 오래된 수정·삭제가 덮어쓰지 않는다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  const store = createAdminStore();
+  const first = await store.save('knowledge', { title: '동시 편집', content: '원문' });
+  const saved = await store.save('knowledge', { title: first.title, content: '다른 관리자가 저장함' }, first.seq, first.revision);
+  await assert.rejects(store.save('knowledge', { title: first.title, content: '오래된 화면의 수정' }, first.seq, first.revision), { status: 409 });
+  await assert.rejects(store.remove('knowledge', first.seq, first.revision), { status: 409 });
+  assert.equal((await store.get('knowledge', first.seq)).content, saved.content);
+  const concurrent = await Promise.allSettled(['동시 변경 A', '동시 변경 B'].map(content =>
+    store.save('knowledge', { title: first.title, content }, first.seq, saved.revision)));
+  assert.equal(concurrent.filter(r => r.status === 'fulfilled').length, 1);
+  assert.equal(concurrent.filter(r => r.status === 'rejected' && r.reason.status === 409).length, 1);
+});
+
+test('관리자 검토: HTTP 수정·삭제의 If-Match와 비밀번호 변경 감지가 DB까지 연결된다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  const app = express();
+  app.use('/api/admin', createAdminRouter({ token: 'test-key' }));
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const base = `http://127.0.0.1:${server.address().port}/api/admin/databases`;
+  const headers = { 'Content-Type': 'application/json', 'X-Admin-Request': '1', 'X-Admin-Token': 'test-key' };
+  try {
+    const db = { db_name: 'OPS', db_type: 'oracle', connection_info: 'localhost:1521/FREEPDB1', db_user: 'reader', db_password: 'first-secret' };
+    const created = await networkFetch(base, { method: 'POST', headers, body: JSON.stringify(db) });
+    assert.equal(created.status, 201);
+    const row = await created.json();
+    const tag = created.headers.get('etag');
+    assert.equal(tag, `"${row.revision}"`);
+    assert.ok(!JSON.stringify(row).includes('first-secret'));
+    assert.equal(Object.hasOwn(row, '_fingerprint'), false);
+    assert.equal(Object.hasOwn(row, 'db_password'), false);
+    const url = `${base}/${row.seq}`;
+    const same = await networkFetch(url, { headers });
+    assert.equal(same.headers.get('etag'), tag, '읽기만 하면 revision이 바뀌지 않는다');
+    const body = JSON.stringify({ ...db, db_password: 'second-secret' });
+    assert.equal((await networkFetch(url, { method: 'PUT', headers, body })).status, 428);
+    const changed = await networkFetch(url, { method: 'PUT', headers: { ...headers, 'If-Match': tag }, body });
+    assert.equal(changed.status, 200);
+    const next = await changed.json();
+    const nextTag = changed.headers.get('etag');
+    assert.notEqual(nextTag, tag, '비밀번호만 바뀌어도 오래된 수정을 차단한다');
+    assert.ok(!JSON.stringify(next).includes('second-secret'));
+    assert.equal((await networkFetch(url, { method: 'PUT', headers: { ...headers, 'If-Match': tag }, body })).status, 409);
+    assert.equal((await networkFetch(url, { method: 'DELETE', headers })).status, 428);
+    assert.equal((await networkFetch(url, { method: 'DELETE', headers: { ...headers, 'If-Match': tag } })).status, 409);
+    assert.equal((await networkFetch(url, { method: 'DELETE', headers: { ...headers, 'If-Match': nextTag } })).status, 204);
+    assert.equal((await networkFetch(url, { headers })).status, 404);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+test('관리자 검토: 대상 DB 이름 둘레의 탭·개행·유니코드 공백도 사용 중 참조다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  const store = createAdminStore();
+  const db = await store.save('databases', { db_name: 'OPS', db_type: 'oracle', connection_info: 'localhost:1521/FREEPDB1', db_user: 'reader', db_password: 'private-value' });
+  for (const space of ['\t', '\r\n', '\u00a0', '\u2003', '\u2028', '\u3000', '\ufeff']) {
+    await conn.query('DELETE FROM query_registry');
+    await conn.query('INSERT INTO query_registry (query_name, query_sql, target_db_name) VALUES (?, ?, ?)', ['uses_ops', 'SELECT 1 FROM dual', `UNKNOWN;${space}OPS${space}`]);
+    await assert.rejects(store.remove('databases', db.seq, db.revision), { status: 409 }, `공백 ${JSON.stringify(space)}`);
+  }
+});
+
+test('관리자 CRUD·전체 검색·페이지 이동·참조 보호는 실제 MariaDB에 반영된다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  const store = createAdminStore();
+  let db = await store.save('databases', { db_name: 'OPS', db_type: 'oracle', connection_info: 'localhost:1521/FREEPDB1', db_user: 'reader', db_password: 'private-value' });
+  assert.equal(db.has_password, 1);
+  assert.equal(Object.hasOwn(db, 'db_password'), false);
+  db = await store.save('databases', { ...db, db_password: '', db_user: 'new_reader' }, db.seq, db.revision);
+  assert.equal((await conn.query('SELECT db_password FROM target_db WHERE seq = ?', [db.seq]))[0].db_password, 'private-value');
+  let q = await store.save('queries', { query_name: 'orders', query_desc: '주문 조회', input_desc: 'customer_id: 고객 식별자', query_sql: 'SELECT * FROM orders WHERE customer_id = :customer_id', output_desc: '주문일', target_db_name: 'ops' });
+  assert.equal(q.target_db_name, 'OPS');
+  assert.equal((await store.list('queries', { q: ':customer_id' })).total, 1);
+  assert.equal((await store.list('queries', { q: '주문일' })).total, 1);
+  assert.equal((await store.list('databases', { q: 'new_reader' })).total, 1);
+  assert.equal((await store.list('databases', { q: 'private-value' })).total, 0);
+  // 기존 SQL 입력의 공백·대소문자, DB collation의 악센트 동등성도 참조 검사에서 지킨다.
+  await conn.query("UPDATE query_registry SET target_db_name = ' UNKNOWN ; óps ' WHERE seq = ?", [q.seq]);
+  await assert.rejects(store.remove('databases', db.seq, db.revision), { status: 409 });
+  await assert.rejects(store.save('databases', { ...db, db_name: 'RENAMED', db_password: '' }, db.seq, db.revision), { status: 409 });
+  q = await store.get('queries', q.seq);
+  q = await store.save('queries', { ...q, target_db_name: 'OPS' }, q.seq, q.revision);
+  const method = await store.save('methods', { title: '주문 절차', method: 'orders 쿼리로 주문을 조회합니다.' });
+  await assert.rejects(store.remove('queries', q.seq, q.revision), { status: 409 });
+  await assert.rejects(store.save('queries', { ...q, query_name: 'new_orders' }, q.seq, q.revision), { status: 409 });
+  await assert.rejects(store.save('queries', { ...q, query_name: 'bad', target_db_name: 'MISSING' }), { status: 400 });
+  assert.equal((await store.list('queries')).total, 1, '실패한 저장은 롤백된다');
+  for (let i = 0; i < 23; i++) await store.save('knowledge', { title: `문서 ${i}`, content: i === 0 ? '할인율 10%_literal' : '검색용 본문' });
+  assert.equal((await store.list('knowledge')).items.length, 20);
+  assert.equal((await store.list('knowledge', { page: '2' })).items.length, 3);
+  assert.equal((await store.list('knowledge', { q: '%_' })).total, 1);
+  assert.equal((await store.list('knowledge', { q: "' OR 1=1 --" })).total, 0);
+  let doc = await store.get('knowledge', (await store.list('knowledge', { q: '%_' })).items[0].seq);
+  doc = await store.save('knowledge', { title: doc.title, content: '수정한 본문' }, doc.seq, doc.revision);
+  assert.equal((await store.get('knowledge', doc.seq)).content, '수정한 본문');
+  await store.remove('knowledge', doc.seq, doc.revision);
+  await assert.rejects(store.get('knowledge', doc.seq), { status: 404 });
+  await store.remove('methods', method.seq, method.revision);
+  await store.remove('queries', q.seq, q.revision);
+  await store.remove('databases', db.seq, db.revision);
+  assert.equal((await store.databaseOptions()).length, 0);
+});
 
 test('실제 DB에 등록한 보충 평면 문자의 대상 DB 이름을 검색·선택·이력에서 보존한다', async () => {
   await conn.query(await sqlFile('schema.sql'));
