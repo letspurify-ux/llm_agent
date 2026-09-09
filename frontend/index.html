@@ -100,7 +100,7 @@
         .brand-title { font-size: 15px; }
         .brand-subtitle { font-size: 11px; }
       }
-      /* 좁은 화면에서 말풍선 78%는 낭비다 — 320px 창에서 답변 안의 표는 159px, 열 두 개도 못 담는
+      /* 좁은 화면에서 말풍선의 기본 90% 제한도 낭비다 — 320px 창에서 답변 안의 표는 159px, 열 두 개도 못 담는
          세로 띠가 된다. 답변은 폭을 다 쓰게 하고(누구의 말인지는 색·모서리·정렬이 이미 말한다),
          내가 한 말은 오른쪽에 붙은 것이 보이도록 조금 남긴다. 바깥 여백도 함께 줄여 글이 들어갈
          자리를 실제로 만든다. .bubble 정의보다 아래에 두어야 하므로 규칙은 파일 끝에 있다
@@ -108,7 +108,7 @@
 
       /* ===== 채팅 영역 ===== */
       /* .chat이 페이지의 스크롤 상자다(문서 자체는 스크롤되지 않는다). 창 너비 전체를 차지해 스크롤바가
-         창 오른쪽 끝에 오고, 820px 열은 안쪽 .chat-inner가 잡는다. */
+         창 오른쪽 끝에 오고, 1024px 열은 안쪽 .chat-inner가 잡는다. */
       .chat {
         flex: 1; overflow-y: auto;
         display: flex; flex-direction: column;
@@ -146,7 +146,7 @@
       .chat-inner {
         /* 내용이 적어도 스크롤 상자 높이만큼은 차지해 빈 화면(.empty)의 margin: auto가 가운데를 잡는다 */
         flex: 1 0 auto;
-        width: 100%; max-width: 820px; margin: 0 auto;
+        width: 100%; max-width: 1024px; margin: 0 auto;
         padding: 24px 20px 8px;
         display: flex; flex-direction: column; gap: 16px;
       }
@@ -173,7 +173,7 @@
       .row { display: flex; }
       .row.user { justify-content: flex-end; }
       .bubble {
-        max-width: 78%; padding: 12px 16px; font-size: 14px; line-height: 1.6;
+        max-width: 90%; padding: 12px 16px; font-size: 14px; line-height: 1.6;
         /* 말풍선 '상자'는 max-width로 묶이지만 내용은 그렇지 않다 — URL·식별자처럼 공백 없는
            긴 토큰은 기본값(overflow-wrap: normal)에서 줄바꿈 지점이 없어 상자를 그대로 뚫고 나간다.
            표준은 anywhere지만 Safari 15.4 미만은 모르므로, 구형에서도 같은 효과를 내는
@@ -236,7 +236,7 @@
       .md .chart, .md .mermaid { font-weight: 400; font-style: normal; letter-spacing: normal; }
       /* 폭을 고정값으로 두는 이유: 말풍선은 내용 폭으로 크기가 정해지는데(shrink-to-fit) 차트는 스스로
          폭이 없다(ResponsiveContainer는 부모를 채울 뿐이다). 글 한 줄 아래 놓인 차트가 그 한 줄 폭으로
-         쪼그라드는 것을 막는다. max-width: 100%는 실제 배치 때 말풍선 폭(78% 상한)에 맞춰 다시 줄인다. */
+         쪼그라드는 것을 막는다. max-width: 100%는 실제 배치 때 말풍선 폭(90% 상한)에 맞춰 다시 줄인다. */
       .md .chart { width: 640px; max-width: 100%; margin: 10px 0 6px; min-width: 0; }
       .md .chart figcaption { font-size: 13px; font-weight: 600; color: var(--text); margin: 0 0 6px 4px; }
       .md .chart-note { font-size: 12px; color: var(--muted); margin: 2px 0 0 4px; }
@@ -415,7 +415,7 @@
       .composer {
         /* 여러 줄로 자란 뒤에도 보내기 단추는 맨 아래 줄에 붙어 있게 한다(center면 가운데로 떠오른다). */
         display: flex; align-items: flex-end; gap: 8px;
-        width: 100%; max-width: 820px; margin: 0 auto;
+        width: 100%; max-width: 1024px; margin: 0 auto;
         background: var(--surface); border: 1px solid var(--border);
         /* 999px(알약)이 아닌 이유: 여러 줄로 자라면 그 곡률이 상자 높이의 절반까지 커져
            입력창이 타원처럼 보인다. 한 줄일 때의 모습은 이 값으로도 거의 같다(높이 54px → 곡률 27px). */

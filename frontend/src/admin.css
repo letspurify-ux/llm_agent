@@ -1,6 +1,6 @@
 .admin-nav-button { margin-left: 0; }
 .admin { flex: 1; min-height: 0; overflow: auto; background: var(--bg); }
-.admin-shell { max-width: 1440px; margin: 0 auto; padding: 26px 36px 24px; }
+.admin-shell { max-width: 1024px; margin: 0 auto; padding: 26px 36px 24px; }
 .admin button, .admin input, .admin textarea, .admin select { font: inherit; }
 .admin button { cursor: pointer; }
 .admin button:disabled { cursor: default; opacity: .5; }
