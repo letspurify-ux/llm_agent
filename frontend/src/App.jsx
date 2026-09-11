@@ -15,6 +15,7 @@ import { PreviewPre } from './preview.js';
 import { linkTarget, imageTarget, mdProps, scopeMarkdownIds } from './markdown.js';
 import InlineMath from './InlineMath.jsx';
 import AdminPanel from './AdminPanel.jsx';
+import RobotIcon from './RobotIcon.jsx';
 
 const NO_REHYPE = [];
 function useMarkdownPlugins(base = NO_REHYPE) {
@@ -1189,7 +1190,7 @@ export default function App() {
     <div className="app">
       <header className="header">
         <button type="button" className="brand-home" onClick={goHomeFromBrand} aria-label="홈으로 이동">
-          <span className="logo" aria-hidden="true">S</span>
+          <span className="logo" aria-hidden="true"><RobotIcon /></span>
           <span className="brand-copy"><span className="brand-title"><span>SPACE</span> Assistant</span><span className="brand-subtitle">지식 · 운영 DB 조회 기반</span></span>
         </button>
         {/* 대화가 없고 기다리는 것도 없으면 되돌아갈 곳이 없다 — 그때는 눌리지 않게 둔다
@@ -1226,7 +1227,7 @@ export default function App() {
         <div className="chat-inner">
           {messages.length === 0 && !loading && (
             <div className="empty">
-              <div className="empty-icon">S</div>
+              <div className="empty-icon" aria-hidden="true"><RobotIcon /></div>
               <h2>무엇을 도와드릴까요?</h2>
               <p>저장된 지식과 운영 DB 조회를 결합해 답변합니다.</p>
               <div className="chips">

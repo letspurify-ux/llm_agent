@@ -11,7 +11,7 @@ import { pieData, fmtScaledNum, chartNotes, fmtNum, pieLabelsOverflow, fitText }
 // 첫 색은 앱의 강조색(index.html --accent)을 따라가고, 나머지는 서로 구별되는 고정 팔레트다.
 // 강조색은 이 모듈이 처음 실행될 때 한 번 읽는다 — 차트가 나올 시점에는 문서가 이미 그려져 있다.
 const accent = (typeof getComputedStyle === 'function' && typeof document !== 'undefined'
-  && getComputedStyle(document.documentElement).getPropertyValue('--accent').trim()) || '#4f46e5';
+  && getComputedStyle(document.documentElement).getPropertyValue('--accent').trim()) || '#2563eb';
 const PALETTE = [accent, '#0ea5e9', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#14b8a6', '#f97316', '#64748b'];
 const color = i => PALETTE[i % PALETTE.length];
 

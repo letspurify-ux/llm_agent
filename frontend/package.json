@@ -25,7 +25,8 @@
     "react-markdown": "^10.1.0",
     "recharts": "^3.10.1",
     "remark-gfm": "^4.0.1",
-    "remark-math": "^6.0.0"
+    "remark-math": "^6.0.0",
+    "three": "^0.186.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.1",

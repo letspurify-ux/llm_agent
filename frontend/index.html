@@ -20,14 +20,14 @@
     <title>SPACE Assistant</title>
     <style>
       :root {
-        --bg: #f5f7fb;
+        --bg: #f3f8ff;
         --surface: #ffffff;
-        --border: #e4e9f2;
-        --text: #1a2233;
-        --muted: #67728a;
-        --accent: #4f46e5;
-        --accent-2: #7c3aed;
-        --grad: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+        --border: #dce8f5;
+        --text: #19324d;
+        --muted: #607890;
+        --accent: #2563eb;
+        --accent-2: #0369a1;
+        --grad: linear-gradient(135deg, #2563eb 0%, #0369a1 100%);
       }
       * { box-sizing: border-box; }
       html, body, #root { height: 100%; }
@@ -65,17 +65,20 @@
         min-width: 0; padding: 0; border: 0; background: transparent; color: inherit;
         font: inherit; text-align: left; cursor: pointer;
       }
-      .brand-home:focus-visible { outline: 3px solid #c7c3ff; outline-offset: 4px; border-radius: 13px; }
+      .brand-home:focus-visible { outline: 3px solid #93c5fd; outline-offset: 4px; border-radius: 13px; }
       .logo {
         width: 40px; height: 40px; border-radius: 12px;
-        background: var(--grad);
+        background: #fff;
         display: flex; align-items: center; justify-content: center;
         font-size: 19px; font-weight: 800; color: #fff;
-        box-shadow: 0 4px 14px rgba(79, 70, 229, 0.35);
+        box-shadow: 0 2px 10px rgba(30, 64, 105, 0.08), inset 0 0 0 1px #e0eaf5;
       }
+      .robot-icon { position: relative; display: block; width: 100%; height: 100%; border-radius: inherit; overflow: hidden; background: radial-gradient(circle at 35% 25%, #173f68, #071426); }
+      .robot-icon canvas, .robot-fallback { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+      .robot-ready .robot-fallback { visibility: hidden; }
       .brand-copy { display: flex; flex-direction: column; min-width: 0; }
       .brand-title { font-size: 17px; font-weight: 800; letter-spacing: -0.2px; }
-      .brand-title > span { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+      .brand-title > span { background: linear-gradient(135deg, #2563eb, #0ea5e9); -webkit-background-clip: text; background-clip: text; color: transparent; }
       .brand-subtitle { margin-top: 1px; font-size: 12px; color: var(--muted); }
       /* 대화를 접고 첫 화면(빈 상태)으로 되돌리는 단추. 화면이 하나뿐인 앱이라
          '홈'은 이동할 다른 주소가 아니라 대화를 비운 그 첫 화면이다. */
@@ -126,7 +129,7 @@
            된다. local은 내용에 붙어 함께 스크롤되므로 장식은 대화의 첫머리(빈 화면·첫 질문)에서 보이고
            길어지면 위로 올라간다. 마지막 단색이 실제로 불투명을 보장하는 층이다. */
         background:
-          radial-gradient(1200px 500px at 80% -160px, #e4e0ff 0%, transparent 60%),
+          radial-gradient(1200px 500px at 80% -160px, #dbeafe 0%, transparent 60%),
           radial-gradient(900px 400px at -10% 120px, #dceafe 0%, transparent 55%),
           var(--bg);
         background-attachment: local;
@@ -154,9 +157,9 @@
       .empty { margin: auto; text-align: center; padding: 40px 0; }
       .empty-icon {
         width: 72px; height: 72px; border-radius: 22px; margin: 0 auto 16px;
-        background: var(--grad); display: flex; align-items: center; justify-content: center;
+        background: #fff; display: flex; align-items: center; justify-content: center;
         font-size: 32px; font-weight: 800; color: #fff;
-        box-shadow: 0 10px 30px rgba(79, 70, 229, 0.35);
+        box-shadow: 0 8px 24px rgba(30, 64, 105, 0.08), inset 0 0 0 1px #e0eaf5;
       }
       .empty h2 { margin: 0 0 6px; font-size: 22px; font-weight: 800; letter-spacing: -0.3px; }
       .empty p { margin: 0 0 20px; color: var(--muted); font-size: 14px; }
@@ -194,11 +197,11 @@
       .bubble.user {
         background: var(--grad); color: #fff;
         border-radius: 18px 18px 4px 18px;
-        box-shadow: 0 4px 14px rgba(79, 70, 229, 0.3);
+        box-shadow: 0 4px 14px rgba(37, 99, 235, 0.3);
         white-space: pre-wrap;
       }
       .bubble.assistant {
-        background: var(--surface); border: 1px solid var(--border);
+        background: #f5faff; border: 1px solid var(--border);
         border-radius: 18px 18px 18px 4px;
         box-shadow: 0 2px 10px rgba(16, 24, 40, 0.05);
       }
@@ -209,19 +212,19 @@
       .md ul, .md ol { margin: 4px 0 8px; padding-left: 20px; }
       .md table { border-collapse: collapse; margin: 8px 0; display: block; overflow-x: auto; }
       .md th, .md td { border: 1px solid var(--border); padding: 6px 12px; font-size: 13px; text-align: left; white-space: nowrap; }
-      .md th { background: #f1f3fb; font-weight: 600; }
+      .md th { background: #edf5ff; font-weight: 600; }
       .md .rich-cell { white-space: normal; vertical-align: top; }
       .md .rich-cell > p:last-child { margin-bottom: 0; }
       .md .rich-cell .chart, .md .rich-cell .mermaid { width: 480px; max-width: min(480px, 72vw); }
       .md .rich-cell .chart-table { max-width: min(480px, 72vw); }
       .md tr:nth-child(even) td { background: #fafbfe; }
-      .md code { background: #eef0fa; padding: 1px 6px; border-radius: 5px; font-size: 12.5px; }
+      .md code { background: #e8f2ff; padding: 1px 6px; border-radius: 5px; font-size: 12.5px; }
       /* 코드블록(```). 이 규칙이 없으면 <pre> 기본값(white-space: pre)대로 한 줄을 끝까지 늘여
          말풍선 밖으로 수백 px 삐져나간다 — 위의 줄바꿈 규칙은 pre에 닿지 않으므로
          (줄바꿈을 막는 것이 pre의 정의다) 대신 가로 스크롤로 가둔다. .trace-grid와 같은 처방이다. */
       .md pre {
         margin: 8px 0; padding: 10px 12px; border-radius: 10px;
-        background: #f1f3fb; border: 1px solid var(--border);
+        background: #edf5ff; border: 1px solid var(--border);
         overflow-x: auto; font-size: 12.5px; line-height: 1.5;
       }
       /* 블록 안의 code에는 인라인용 알약 배경·여백을 걷어낸다 — 두 배경이 겹쳐 얼룩덜룩해진다 */
@@ -308,7 +311,7 @@
       .trace summary {
         cursor: pointer; color: var(--muted); user-select: none;
         display: inline-flex; align-items: center; gap: 6px;
-        padding: 4px 10px; border-radius: 999px; background: #f1f3fb;
+        padding: 4px 10px; border-radius: 999px; background: #edf5ff;
       }
       .trace summary:hover { color: var(--accent); }
       /* 스텝 하나(머리띠 + 표)를 한 상자로 묶어 테두리와 둥근 모서리를 여기서 그리고, 여기서 자른다.
@@ -328,17 +331,17 @@
       .trace-head {
         display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px;
         padding: 7px 10px;
-        background: #0f172a; color: #c7d2fe; font-size: 11.5px; line-height: 1.5;
+        background: #0f172a; color: #bfdbfe; font-size: 11.5px; line-height: 1.5;
       }
       .trace-head code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
-      .trace-head .trace-count { color: #a5b4fc; }
+      .trace-head .trace-count { color: #93c5fd; }
       /* 이력의 절대 순번 (App.jsx TraceStep 주석) — 답변 본문이 말하는 번호와 같은 값이다 */
-      .trace-head .trace-no { color: #8f99e0; font-variant-numeric: tabular-nums; flex: none; }
+      .trace-head .trace-no { color: #6f9dcb; font-variant-numeric: tabular-nums; flex: none; }
       .trace-head .trace-csv {
         margin-left: auto; padding: 2px 10px; border-radius: 999px; cursor: pointer;
-        border: 1px solid #3b4a6b; background: transparent; color: #c7d2fe; font-size: 11px;
+        border: 1px solid #3b4a6b; background: transparent; color: #bfdbfe; font-size: 11px;
       }
-      .trace-head .trace-csv:hover { border-color: #a5b4fc; color: #fff; }
+      .trace-head .trace-csv:hover { border-color: #93c5fd; color: #fff; }
       /* 조회된 행 전부를 싣는 표. 세로는 이 높이 안에서, 가로는 표 너비만큼 스크롤한다 — 1000행 × 30열이
          말풍선을 세로로 끝없이 늘이거나(스크롤 따라가기가 그 아래 답변을 놓친다) 가로로 뚫지 않게.
          머리글은 스크롤해도 붙어 있다(sticky) — 열이 많으면 몇 행만 내려가도 무슨 열인지 잊는다. */
@@ -351,9 +354,9 @@
          '더 있다'는 것을 알 길이 없다 — 세로·가로 둘 다. (표준 scrollbar-width/color를 함께 쓰면 Chrome이
          이 규칙을 무시하고 overlay로 돌아가므로 여기서는 -webkit- 규칙만 쓴다. Firefox는 시스템 설정을 따른다.) */
       .trace-grid::-webkit-scrollbar { width: 11px; height: 11px; }
-      .trace-grid::-webkit-scrollbar-track, .trace-grid::-webkit-scrollbar-corner { background: #f1f3fb; }
-      .trace-grid::-webkit-scrollbar-thumb { background: #b9c0ec; border-radius: 999px; border: 2px solid #f1f3fb; }
-      .trace-grid::-webkit-scrollbar-thumb:hover { background: #8f99e0; }
+      .trace-grid::-webkit-scrollbar-track, .trace-grid::-webkit-scrollbar-corner { background: #edf5ff; }
+      .trace-grid::-webkit-scrollbar-thumb { background: #b2cde8; border-radius: 999px; border: 2px solid #edf5ff; }
+      .trace-grid::-webkit-scrollbar-thumb:hover { background: #6f9dcb; }
       /* 표는 내용 폭대로 자란다(max-content). 그냥 두면 표가 상자 폭에 맞춰 열을 줄이는데, .bubble에서
          물려받은 overflow-wrap: anywhere 때문에 글자 단위로 접혀 텍스트 열 하나가 한 글자 폭의 세로 띠가 된다. */
       .trace-grid table { width: max-content; border-collapse: separate; border-spacing: 0; font-size: 12px; line-height: 1.45; }
@@ -367,7 +370,7 @@
          anywhere가 아니라 break-word인 이유는 위와 같다 — break-word는 열의 최소 폭 계산에 끼어들지 않아
          긴 단어가 있을 때만 그 자리에서 접힌다. */
       .trace-grid .cell { max-width: 24rem; white-space: pre-wrap; word-break: normal; overflow-wrap: break-word; }
-      .trace-grid th { position: sticky; top: 0; z-index: 1; background: #f1f3fb; font-weight: 600; color: var(--text); }
+      .trace-grid th { position: sticky; top: 0; z-index: 1; background: #edf5ff; font-weight: 600; color: var(--text); }
       .trace-grid tr > :last-child { border-right: 0; }
       .trace-grid tbody tr:last-child td { border-bottom: 0; }
       /* 행 번호 열은 가로로 스크롤해도 붙어 있다 — 열이 많은 표에서 몇 번째 행을 보고 있는지 놓치지 않게. */
@@ -375,7 +378,7 @@
         position: sticky; left: 0; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums;
         background: var(--surface);
       }
-      .trace-grid th.idx { z-index: 2; background: #f1f3fb; }
+      .trace-grid th.idx { z-index: 2; background: #edf5ff; }
       .trace-grid td.num { text-align: right; font-variant-numeric: tabular-nums; }
       /* 종이에서만 보이는 한 줄 — 인쇄된 표가 잘려 보이는 이유와 전체를 가져가는 길을 알려 준다 */
       .trace-print-note { display: none; font-size: 11px; color: var(--muted); margin: 4px 0 0; }
@@ -383,7 +386,7 @@
       /* ===== 타이핑 인디케이터 ===== */
       .typing { display: flex; gap: 5px; padding: 6px 2px; }
       .typing i {
-        width: 7px; height: 7px; border-radius: 50%; background: #a5b4fc;
+        width: 7px; height: 7px; border-radius: 50%; background: #93c5fd;
         animation: blink 1.2s infinite;
       }
       .typing i:nth-child(2) { animation-delay: 0.2s; }
@@ -423,7 +426,7 @@
         box-shadow: 0 8px 30px rgba(16, 24, 40, 0.09);
         transition: border-color 0.15s ease, box-shadow 0.15s ease;
       }
-      .composer:focus-within { border-color: var(--accent); box-shadow: 0 8px 30px rgba(79, 70, 229, 0.18); }
+      .composer:focus-within { border-color: var(--accent); box-shadow: 0 8px 30px rgba(37, 99, 235, 0.18); }
       .composer textarea {
         flex: 1; border: none; outline: none; background: transparent;
         font-size: 14.5px; color: var(--text); font-family: inherit;
@@ -446,7 +449,7 @@
         width: 42px; height: 42px; border-radius: 50%; border: none; flex-shrink: 0;
         background: var(--grad); color: #fff; font-size: 17px; cursor: pointer;
         display: flex; align-items: center; justify-content: center;
-        box-shadow: 0 4px 12px rgba(79, 70, 229, 0.35);
+        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.35);
         transition: transform 0.12s ease, opacity 0.15s ease;
       }
       .send:hover:not(:disabled) { transform: scale(1.06); }
