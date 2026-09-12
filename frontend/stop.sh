@@ -3,6 +3,7 @@
 cd "$(dirname "$0")"
 
 PID_FILE=.frontend.pid
+OWNER_FILE=.frontend.owner
 
 # Same command and project-directory check as start.sh.
 source ./process.sh
@@ -27,4 +28,4 @@ if is_ours "$PID"; then
 else
   echo "[frontend] PID $PID is already gone (or the PID was reused by an unrelated process, so it is left untouched)."
 fi
-rm -f "$PID_FILE"
+rm -f "$PID_FILE" "$OWNER_FILE"

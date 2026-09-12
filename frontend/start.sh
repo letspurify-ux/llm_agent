@@ -5,6 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 PID_FILE=.frontend.pid
+OWNER_FILE=.frontend.owner
 LOG_FILE=logs/frontend.log
 
 # Verify both the command and project directory, using the same check as stop.sh.
@@ -14,6 +15,8 @@ if [ -f "$PID_FILE" ] && is_ours "$(cat "$PID_FILE")"; then
   echo "[frontend] already running (PID $(cat "$PID_FILE")) — log: $LOG_FILE"
   exit 0
 fi
+
+rm -f "$OWNER_FILE"
 
 if [ ! -d node_modules ]; then
   echo "[frontend] node_modules not found — running npm install."
@@ -28,9 +31,12 @@ echo $! > "$PID_FILE"
 
 sleep 1
 if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+  PID=$(cat "$PID_FILE")
+  START_TIME=$(ps -p "$PID" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//') || START_TIME=''
+  printf '%s %s\n' "$PID" "$START_TIME" > "$OWNER_FILE"
   echo "[frontend] started (PID $(cat "$PID_FILE")) — see the log for the URL: $LOG_FILE"
 else
   echo "[frontend] failed to start — check the log: $LOG_FILE"
-  rm -f "$PID_FILE"
+  rm -f "$PID_FILE" "$OWNER_FILE"
   exit 1
 fi

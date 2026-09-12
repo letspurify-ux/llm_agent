@@ -49,6 +49,15 @@ test('stop.sh는 다른 프로젝트의 Vite PID를 자기 서버로 오인하�
   assert.ok(alive(p.pid), '다른 프로젝트의 Vite가 종료됐다');
 });
 
+test('stop.sh는 자기 소유 표지가 남아도 다른 프로젝트의 Vite를 종료하지 않는다', posix, async t => {
+  const [ours, other] = await projects(t);
+  const p = await foreignVite(t, other);
+  await writeFile(join(ours, '.frontend.pid'), String(p.pid));
+  await writeFile(join(ours, '.frontend.owner'), `${p.pid} `);
+  await exec('bash', ['stop.sh'], { cwd: ours });
+  assert.ok(alive(p.pid), '오래된 소유 표지가 다른 서버를 종료했다');
+});
+
 test('start.sh는 다른 프로젝트의 Vite가 살아 있어도 자기 서버를 시작한다', posix, async t => {
   const [ours, other] = await projects(t);
   const p = await foreignVite(t, other);
