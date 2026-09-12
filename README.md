@@ -434,6 +434,8 @@ y2: 성공률
 | 배치 재시작 방법 알려줘 | 쿼리 0회 — 지식만으로 답변 |
 | BATCH001 작업 상태 알려줘 | `batch_job_status` 1회 → FAILED 결과 + 재시작 지식 결합 답변 |
 | 홍길동 고객 주문 상태 알려줘 | 2단계 — `find_customer_id` 결과의 CUSTOMER_ID로 `order_status_by_customer` 실행 |
+| 홍길동 주문 목록을 프로시저로 조회해줘 | `get_customer_orders_proc` 1회 — `GET_CUSTOMER_ORDERS`의 OUT REF CURSOR 결과 |
+| 홍길동 주문 합계를 함수로 계산해줘 | `get_customer_order_total_fn` 1회 — `GET_CUSTOMER_ORDER_TOTAL`의 NUMBER 반환값 |
 | 오늘 며칠이야 | **실제 LLM 필요** — 쿼리 0회. 프롬프트 끝에 실린 현재 시각(KST, 요일 포함)으로 바로 답한다. "어제", "이번 주" 같은 상대 날짜도 같은 값을 기준으로 절대 날짜로 바꾼다 (`today_date`는 DB 서버 시각 자체를 확인할 때만 실행된다) |
 | 실패한 배치 다 보여줘 | **실제 LLM 필요** — `batch_list_by_status` 1회. `qa_method` 없이 `query_desc`만으로 선택되는 경로B 데모 |
 | 쿠버네티스가 뭐야 (등록되지 않은 질문) | LLM의 일반 지식으로 답변 — "*등록된 지식에 없는 내용이라 일반 지식으로 답변합니다.*" 표시가 붙음 (Mock은 안내 문구만 표시) |
@@ -565,7 +567,10 @@ JSON 하나로 답하는 프록시도 같은 길로 읽는다.
 mariadb --default-character-set=utf8mb4 -u <관리자> -p < backend/sql/migrate-routines.sql
 ```
 
-관리자 화면의 쿼리 탭에서 실행 유형과 SQL, 바인드 설정(JSON)을 입력한다.
+관리자 화면의 쿼리 탭에서 실행 유형과 SQL을 입력한다. 바인드 설정은 프로시저·함수에만 표시된다.
+`SQL에서 불러오기`로 바인드 이름을 가져온 뒤 각 행에서 방향·자료형·문자열 출력 크기를 선택한다.
+행을 직접 추가하거나 삭제할 수도 있다. 함수 반환값과 커서는 OUT으로 고정되며, 설정은 저장 시 자동으로 JSON으로 변환된다.
+기존 JSON 설정도 폼으로 불러온다. 쿼리로 전환해 저장하면 바인드 설정은 비워진다.
 Oracle에 이미 존재하고 대상 계정에 EXECUTE 권한이 있는 조회용 루틴을 등록한다.
 
 | 유형 | 실행 SQL 예시 | 결과 |

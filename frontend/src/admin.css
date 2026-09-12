@@ -105,3 +105,18 @@
   .admin-pagination > div { gap: 6px; }
   .header .admin-nav-button { padding: 8px 10px; font-size: 12px; }
 }
+
+.admin-bindings { min-width: 0; }
+.admin-bind-help, .admin-bind-empty { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 0 0 12px; }
+.admin-bind-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.admin-bind-row { background: #f8f9fd; border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+.admin-bind-row-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; font-size: 12px; font-weight: 600; }
+.admin-bind-row-heading em { display: inline-block; color: var(--accent); font-style: normal; font-size: 10px; margin-left: 8px; }
+.admin-bind-remove { background: transparent; border: 0; color: #a62537; padding: 4px; font-size: 12px !important; }
+.admin-bind-row label { display: block; min-width: 0; font-size: 12px; color: var(--text); }
+.admin-bind-row input, .admin-bind-row select { margin-top: 5px; }
+.admin-bind-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 10px 0; }
+.admin-bind-row select { padding: 9px 4px; }
+.admin-bind-row .admin-bind-warning, .admin-bind-recovery { color: #a62537; }
+.admin-bind-recovery { font-size: 12px; line-height: 1.6; }
+@media (max-width: 480px) { .admin-bind-options { grid-template-columns: minmax(0, 1fr); } }

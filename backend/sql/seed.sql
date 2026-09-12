@@ -2,6 +2,8 @@
 --  1) "배치 재시작 방법 알려줘"        → 지식만으로 답변 (쿼리 0회)
 --  2) "BATCH001 작업 상태 알려줘"      → batch_job_status 1회 실행 후 답변
 --  3) "홍길동 고객 주문 상태 알려줘"    → find_customer_id → order_status_by_customer 2단계 실행 후 답변
+--  4) "홍길동 주문 목록을 프로시저로 조회해줘" → get_customer_orders_proc 1회 실행
+--  5) "홍길동 주문 합계를 함수로 계산해줘"      → get_customer_order_total_fn 1회 실행
 
 SET NAMES utf8mb4;
 USE llm_agent;
@@ -36,7 +38,9 @@ ON DUPLICATE KEY UPDATE content = VALUES(content);
 
 INSERT INTO qa_method (title, method) VALUES
 ('배치 작업 상태 확인', '배치 작업 상태 질문이면 batch_job_status 쿼리를 실행한다. :job_id 는 질문에서 추출한다(예: BATCH001). STATUS가 FAILED면 배치 재시작 방법 지식을 함께 안내한다.'),
-('고객 주문 상태 확인', '1단계: find_customer_id 쿼리로 고객명(:customer_name)으로 CUSTOMER_ID를 조회한다. 2단계: 조회된 CUSTOMER_ID로 order_status_by_customer 쿼리를 실행하여 최근 주문 상태로 답변한다.')
+('고객 주문 상태 확인', '1단계: find_customer_id 쿼리로 고객명(:customer_name)으로 CUSTOMER_ID를 조회한다. 2단계: 조회된 CUSTOMER_ID로 order_status_by_customer 쿼리를 실행하여 최근 주문 상태로 답변한다.'),
+('프로시저로 고객 주문 목록 조회', '고객 ID(:customer_id)의 주문 목록을 프로시저로 조회할 때 get_customer_orders_proc를 실행한다. 질문에서 고객명을 받으면 먼저 find_customer_id로 CUSTOMER_ID를 확인한 뒤 프로시저를 실행한다.'),
+('함수로 고객 주문 합계 조회', '고객 ID(:customer_id)의 주문 합계를 함수로 계산할 때 get_customer_order_total_fn을 실행한다. 질문에서 고객명을 받으면 먼저 find_customer_id로 CUSTOMER_ID를 확인한 뒤 함수를 실행한다.')
 ON DUPLICATE KEY UPDATE method = VALUES(method);
 
 INSERT INTO query_registry (query_name, query_desc, input_desc, query_sql, output_desc, target_db_name) VALUES
@@ -54,6 +58,27 @@ INSERT INTO query_registry (query_name, query_desc, input_desc, query_sql, outpu
  '최근 주문 5건의 상태와 금액', 'ORDER_DB')
 ON DUPLICATE KEY UPDATE query_desc = VALUES(query_desc), input_desc = VALUES(input_desc),
   query_sql = VALUES(query_sql), output_desc = VALUES(output_desc), target_db_name = VALUES(target_db_name);
+
+-- Oracle 테스트 DB의 루틴을 관리 화면과 에이전트에서 바로 실행할 수 있도록 등록한다.
+-- 프로시저는 단독 OUT REF CURSOR, 함수는 OUT NUMBER 반환값을 사용한다.
+INSERT INTO query_registry
+  (query_name, query_type, bind_config, query_desc, input_desc, query_sql, output_desc, target_db_name)
+VALUES
+('get_customer_orders_proc', 'PROCEDURE',
+ '{"customer_id":{"dir":"IN","type":"STRING"},"rows":{"dir":"OUT","type":"CURSOR"}}',
+ '고객 ID로 주문 목록을 조회하는 Oracle 프로시저. 프로시저·REF CURSOR 실행 테스트에 사용한다.',
+ ':customer_id = 고객 ID (예: C-1001)',
+ 'BEGIN APP_USER.GET_CUSTOMER_ORDERS(:customer_id, :rows); END;',
+ 'rows OUT REF CURSOR: 주문번호, 상태, 주문일, 금액', 'ORDER_DB'),
+('get_customer_order_total_fn', 'FUNCTION',
+ '{"customer_id":{"dir":"IN","type":"STRING"},"total_amount":{"dir":"OUT","type":"NUMBER"}}',
+ '고객 ID로 주문 금액 합계를 반환하는 Oracle 함수. 함수·스칼라 OUT 실행 테스트에 사용한다.',
+ ':customer_id = 고객 ID (예: C-1001)',
+ 'BEGIN :total_amount := APP_USER.GET_CUSTOMER_ORDER_TOTAL(:customer_id); END;',
+ 'total_amount: 고객 주문 금액 합계', 'ORDER_DB')
+ON DUPLICATE KEY UPDATE query_type = VALUES(query_type), bind_config = VALUES(bind_config),
+  query_desc = VALUES(query_desc), input_desc = VALUES(input_desc), query_sql = VALUES(query_sql),
+  output_desc = VALUES(output_desc), target_db_name = VALUES(target_db_name);
 
 -- qa_method 없이 단독 등록된 쿼리 — query_desc만으로 검색·선택되는 경로B 데모.
 -- 주의: 이 경로는 LLM_PROVIDER=openai에서만 시연된다. Mock은 매칭된 qa_method 본문에 이름이

@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import './admin.css';
+import BindConfigEditor from './BindConfigEditor.jsx';
+import { readBindings, serializeBindings } from './admin-bindings.js';
 
 const SECTIONS = {
   databases: { label: 'DB', title: '조회 대상 DB 설정', description: '에이전트가 실제로 조회할 Oracle DB의 접속 정보를 관리합니다. 관리용 MariaDB 설정은 서버 환경변수에서 관리합니다.', name: 'db_name', search: 'DB 이름, 접속 주소, 사용자명 검색',
@@ -21,14 +23,14 @@ const SECTIONS = {
       ['query_desc', '쿼리 설명', 'textarea', null, false, '어떤 질문에 사용하는 쿼리인지 설명하세요.'],
       ['target_db_name', '대상 DB', 'databases', 500, true],
       ['query_sql', '실행 SQL', 'sql', null, true, 'SELECT * FROM orders WHERE customer_id = :customer_id'],
-      ['bind_config', '바인드 설정 (JSON)', 'sql', null, false, '{"id":{"dir":"IN","type":"STRING"},"result":{"dir":"OUT","type":"CURSOR"}}'],
+      ['bind_config', '바인드 설정', 'bindings', null, false],
       ['input_desc', '입력 설명', 'textarea', 1000, false, '예: customer_id — 고객 번호 (필수, 숫자)'],
       ['output_desc', '출력 설명', 'textarea', null, false, '조회 결과의 컬럼과 의미를 설명하세요.'],
     ] },
 };
-const blank = kind => Object.fromEntries(SECTIONS[kind].fields.map(([key]) => [key, key === 'db_type' ? 'oracle' : key === 'query_type' ? 'QUERY' : '']));
+const blank = kind => Object.fromEntries(SECTIONS[kind].fields.map(([key]) => [key, key === 'db_type' ? 'oracle' : key === 'query_type' ? 'QUERY' : key === 'bind_config' ? readBindings('') : '']));
 const valuesOf = (kind, row) => Object.fromEntries(SECTIONS[kind].fields.map(([key]) => [key,
-  key === 'db_type' ? String(row[key] || 'oracle').toLowerCase() : key === 'query_type' ? row[key] ?? 'QUERY' : key === 'bind_config' && row[key] && typeof row[key] === 'object' ? JSON.stringify(row[key], null, 2) : row[key] ?? '',
+  key === 'db_type' ? String(row[key] || 'oracle').toLowerCase() : key === 'query_type' ? row[key] ?? 'QUERY' : key === 'bind_config' ? readBindings(row[key]) : row[key] ?? '',
 ]));
 const dbNames = text => text.split(';').map(s => s.trim()).filter(Boolean);
 const REQUIRED_ERROR = '필수 입력 항목을 확인해주세요.';
@@ -172,6 +174,10 @@ export default function AdminPanel({ onStateChange }) {
       const empty = type === 'databases' ? dbNames(value).length === 0 : !String(value).trim();
       if (empty) missing[key] = `${label}을(를) 입력해주세요.`;
     }
+    if (kind === 'queries' && draft.query_type !== 'QUERY') {
+      try { serializeBindings(draft.bind_config, draft.query_sql, draft.query_type); }
+      catch (e) { missing.bind_config = e.message; }
+    }
     if (!Object.keys(missing).length) return true;
     setFieldErrors(missing);
     setError(REQUIRED_ERROR);
@@ -195,7 +201,8 @@ export default function AdminPanel({ onStateChange }) {
     mutation.current = true; setBusy(true); setError(''); setNotice('');
     try {
       const row = await api(`${kind}${editor.seq ? `/${editor.seq}` : ''}`, {
-        method: editor.seq ? 'PUT' : 'POST', body: JSON.stringify(draft),
+        method: editor.seq ? 'PUT' : 'POST', body: JSON.stringify(kind === 'queries'
+          ? { ...draft, bind_config: serializeBindings(draft.bind_config, draft.query_sql, draft.query_type) } : draft),
         ...(editor.seq ? { headers: { 'If-Match': `"${editor.revision}"` } } : {}),
       });
       const next = valuesOf(kind, row);
@@ -265,6 +272,7 @@ export default function AdminPanel({ onStateChange }) {
             <form noValidate onSubmit={save}>
               <fieldset disabled={busy || opening} className="admin-fields">
                 {config.fields.map(([key, label, type, limit, required, placeholder], index) => {
+                  if (type === 'bindings' && draft.query_type === 'QUERY') return null;
                   const id = `admin-field-${key}`;
                   const keepPassword = key === 'db_password' && !!editor.seq;
                   const fieldError = fieldErrors[key];
@@ -272,9 +280,10 @@ export default function AdminPanel({ onStateChange }) {
                     maxLength: limit || undefined, placeholder, 'aria-invalid': fieldError ? 'true' : undefined,
                     'aria-describedby': fieldError ? `${id}-error` : undefined, onChange: e => updateField(key, e.target.value) };
                   return <div className="admin-field" key={key} ref={node => { fieldRefs.current[key] = node; }}>
-                    {type === 'databases' ? <span className="admin-field-label" id={`${id}-label`}>{label} <b>*</b></span>
+                    {type === 'databases' || type === 'bindings' ? <span className="admin-field-label" id={`${id}-label`}>{label}{required && <b>*</b>}</span>
                       : <label htmlFor={id}>{label}{required && !keepPassword && <b> *</b>}{limit && type === 'textarea' && <small>{(draft[key] || '').length} / {limit}</small>}</label>}
-                    {type === 'select' ? <select {...props}>{key === 'query_type' ? <><option value="QUERY">쿼리 (QUERY)</option><option value="PROCEDURE">프로시저 (PROCEDURE)</option><option value="FUNCTION">함수 (FUNCTION)</option></> : <option value="oracle">Oracle</option>}</select>
+                    {type === 'bindings' ? <BindConfigEditor id={id} value={draft.bind_config} sql={draft.query_sql} queryType={draft.query_type} invalid={!!fieldError} onChange={value => updateField(key, value)} />
+                      : type === 'select' ? <select {...props}>{key === 'query_type' ? <><option value="QUERY">쿼리 (QUERY)</option><option value="PROCEDURE">프로시저 (PROCEDURE)</option><option value="FUNCTION">함수 (FUNCTION)</option></> : <option value="oracle">Oracle</option>}</select>
                       : type === 'databases' ? <div className={`admin-db-picker${fieldError ? ' has-error' : ''}`} role="group" aria-labelledby={`${id}-label`} aria-invalid={fieldError ? 'true' : undefined} aria-describedby={fieldError ? `${id}-error` : undefined}>
                         <input type="search" aria-label="대상 DB 목록 검색" placeholder="등록된 DB 검색" value={optionSearch} onChange={e => setOptionSearch(e.target.value)}
                           onKeyDown={e => { if (e.key === 'Enter') e.preventDefault(); }} />
@@ -296,7 +305,6 @@ export default function AdminPanel({ onStateChange }) {
                     {keepPassword && <small>현재 비밀번호: {editor.has_password ? '설정됨' : '없음'}. 비워 두면 기존 값을 유지합니다.</small>}
                     {key === 'db_password' && <small>서버 환경변수를 사용하려면 ENV:변수명 형식으로 입력하세요.</small>}
                     {key === 'query_sql' && <small>{draft.query_type === 'PROCEDURE' ? '예: BEGIN app.get_orders(:id, :result); END;' : draft.query_type === 'FUNCTION' ? '예: BEGIN :result := app.get_total(:id); END;' : 'SELECT 또는 WITH 조회를 등록하세요. 입력값은 :파라미터 바인드를 사용하세요.'}</small>}
-                    {key === 'bind_config' && <small>{draft.query_type === 'QUERY' ? '쿼리는 비워두세요. SQL에서 입력 바인드를 자동으로 추출합니다.' : '모든 바인드의 dir(IN/OUT/INOUT), type(STRING/NUMBER/CURSOR)을 설정하세요. 함수 반환값은 OUT입니다. 출력은 스칼라 여러 개 또는 단독 OUT CURSOR 1개를 지원합니다. STRING 출력의 maxSize는 최대 32767바이트입니다. 조회용 루틴만 등록하세요.'}</small>}
                     {key === 'method' && <small>사용할 쿼리 이름을 본문에 적으면 에이전트가 해당 쿼리를 찾습니다.</small>}
                   </div>;
                 })}

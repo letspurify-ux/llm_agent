@@ -142,26 +142,61 @@ test(`${production ? 'production' : 'dev'} 관리 화면 검색·페이지 이�
   await click('[aria-label="OLD_DB 선택 해제"]'); await click('.admin-db-options input');
   await click('.admin-form-actions [type=submit]'); await page.until(`document.querySelector('.admin-success')`);
   assert.equal(await page.eval(`window.__records.queries[0].target_db_name`), 'ORDER_DB');
-  // 실행 유형과 바인드 JSON의 저장·재조회를 확인한다.
+  // 쿼리에는 바인드 폼이 없으며 루틴은 JSON 입력 없이 편집·저장·재조회된다.
+  const select = (selector, value) => page.eval(`(() => { const el = document.querySelector(${JSON.stringify(selector)}); el.value = ${JSON.stringify(value)}; el.dispatchEvent(new Event('change', { bubbles: true })); })()`);
   assert.equal(await page.eval(`document.querySelector('#admin-field-query_type').value`), 'QUERY');
+  assert.equal(await page.eval(`!!document.querySelector('#admin-field-bind_config')`), false);
   for (const type of ['PROCEDURE', 'FUNCTION']) {
-    await page.eval(`(() => { const el = document.querySelector('#admin-field-query_type'); el.value = '${type}'; el.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+    await select('#admin-field-query_type', type);
     const sql = type === 'PROCEDURE' ? 'BEGIN app.orders(:id, :result); END;' : 'BEGIN :result := app.total(:id); END;';
-    const binds = JSON.stringify({ id: { dir: 'IN', type: 'STRING' }, result: { dir: 'OUT', type: type === 'PROCEDURE' ? 'CURSOR' : 'NUMBER' } });
-    await fill('#admin-field-query_sql', sql); await fill('#admin-field-bind_config', binds);
+    await fill('#admin-field-query_sql', sql);
+    await click('.admin-bind-actions button:first-child');
+    await click('.admin-bind-actions button:first-child');
+    assert.equal(await page.eval(`document.querySelectorAll('.admin-bind-row').length`), 2, '불러오기를 반복해도 행이 중복되지 않는다');
+    await select('#admin-field-bind_config-1-type', type === 'PROCEDURE' ? 'CURSOR' : 'NUMBER');
+    assert.equal(await page.eval(`document.querySelector('#admin-field-bind_config-1-dir').value`), 'OUT');
+    assert.equal(await page.eval(`document.querySelector('#admin-field-bind_config-1-dir').disabled`), true);
+    assert.equal(await page.eval(`!!document.querySelector('#admin-field-bind_config-0-size')`), false);
+    const binds = { id: { dir: 'IN', type: 'STRING' }, result: { dir: 'OUT', type: type === 'PROCEDURE' ? 'CURSOR' : 'NUMBER' } };
     await click('.admin-form-actions [type=submit]'); await page.until(`document.querySelector('.admin-success')`); await loaded();
     assert.equal(await page.eval(`window.__records.queries[0].query_type`), type);
-    assert.equal(await page.eval(`window.__records.queries[0].bind_config`), binds);
+    assert.deepEqual(JSON.parse(await page.eval(`window.__records.queries[0].bind_config`)), binds);
     assert.match(await page.eval(`document.querySelector('.admin-record').textContent`), type === 'PROCEDURE' ? /프로시저/ : /함수/);
     await click('.admin-record');
     await page.until(`document.querySelector('#admin-field-query_type')?.value === '${type}'`);
-    assert.equal(await page.eval(`document.querySelector('#admin-field-bind_config').value`), binds);
+    assert.equal(await page.eval(`document.querySelector('#admin-field-bind_config-1-type').value`), binds.result.type);
   }
-  await page.eval('window.__confirm = false');
+  // 직접 추가/삭제와 중복 검사. 중복 이름을 객체로 합쳐 조용히 덮어쓰면 안 된다.
+  await click('.admin-bind-actions button:last-child');
+  await fill('#admin-field-bind_config-2-name', 'ID');
+  const writesBeforeDuplicate = await page.eval(`window.__requests.filter(r => r.method === 'PUT').length`);
+  await click('.admin-form-actions [type=submit]');
+  await page.until(`document.querySelector('#admin-field-bind_config-error')?.textContent.includes('중복')`);
+  assert.equal(await page.eval(`window.__requests.filter(r => r.method === 'PUT').length`), writesBeforeDuplicate);
+  await click('[aria-label="3번 바인드 삭제"]');
+  await select('#admin-field-bind_config-1-type', 'STRING');
+  await fill('#admin-field-bind_config-1-size', '2048');
+  await click('.admin-form-actions [type=submit]'); await page.until(`document.querySelector('.admin-success')`); await loaded();
+  await click('.admin-record'); await page.until(`document.querySelector('#admin-field-bind_config-1-size')?.value === '2048'`);
+  assert.equal(await page.eval(`JSON.parse(window.__records.queries[0].bind_config).result.maxSize`), 2048);
+  // 유형만 잠시 바꾸면 초안은 보존하지만 QUERY로 저장할 때는 숨긴 설정을 전송하지 않는다.
+  await select('#admin-field-query_type', 'QUERY');
+  assert.equal(await page.eval(`!!document.querySelector('#admin-field-bind_config')`), false);
+  await select('#admin-field-query_type', 'FUNCTION');
+  assert.equal(await page.eval(`document.querySelector('#admin-field-bind_config-1-size').value`), '2048');
   if (process.env.ADMIN_SCREENSHOT) {
+    await page.eval(`document.querySelector('#admin-field-bind_config').scrollIntoView({ block: 'center' })`);
     const shot = await page.send('Page.captureScreenshot', { format: 'png' });
     await writeFile(process.env.ADMIN_SCREENSHOT, Buffer.from(shot.data, 'base64'));
   }
+  await page.viewport(320, 760);
+  assert.ok(await page.eval(`document.documentElement.scrollWidth <= innerWidth && document.querySelector('.admin').scrollWidth <= innerWidth`), '바인드 폼도 작은 화면에서 넘치지 않는다');
+  await page.viewport(1280, 900);
+  await select('#admin-field-query_type', 'QUERY');
+  await fill('#admin-field-query_sql', 'SELECT :id FROM dual');
+  await click('.admin-form-actions [type=submit]'); await page.until(`document.querySelector('.admin-success')`); await loaded();
+  assert.equal(await page.eval(`window.__records.queries[0].bind_config`), '');
+  await page.eval('window.__confirm = false');
   await page.viewport(320, 760);
   assert.ok(await page.eval(`document.documentElement.scrollWidth <= innerWidth && document.querySelector('.admin').scrollWidth <= innerWidth`), '작은 화면에서 가로 넘침이 없다');
   await click('.admin-delete');
