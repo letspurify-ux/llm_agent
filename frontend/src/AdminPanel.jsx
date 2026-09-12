@@ -14,19 +14,21 @@ const SECTIONS = {
     fields: [['title', '제목', 'text', 200, true, '예: SPACE 시스템 소개'], ['content', '지식 본문', 'textarea', null, true, '업무 지식이나 문서 내용을 입력하세요.']] },
   methods: { label: '방법', title: 'Q&A 처리 방법', description: '질문을 해결하는 절차와 사용할 쿼리를 관리합니다.', name: 'title', search: '방법 제목, 처리 절차, 쿼리 이름 검색',
     fields: [['title', '제목', 'text', 200, true, '예: 주문 상태 확인'], ['method', '처리 방법', 'textarea', null, true, '처리 순서와 사용할 쿼리 이름을 구체적으로 입력하세요.']] },
-  queries: { label: '쿼리', title: '쿼리 관리', description: '답변에 사용할 조회 SQL과 입력·출력 설명을 관리합니다.', name: 'query_name', search: '쿼리 이름, SQL, 설명, 대상 DB 검색',
+  queries: { label: '쿼리', title: '쿼리 관리', description: '답변에 사용할 조회 SQL, 프로시저, 함수와 입력·출력 설명을 관리합니다.', name: 'query_name', search: '쿼리 이름, SQL, 설명, 대상 DB 검색',
     fields: [
+      ['query_type', '실행 유형', 'select', 20, true],
       ['query_name', '쿼리 이름', 'text', 100, true, '예: CUSTOMER_ORDERS'],
       ['query_desc', '쿼리 설명', 'textarea', null, false, '어떤 질문에 사용하는 쿼리인지 설명하세요.'],
       ['target_db_name', '대상 DB', 'databases', 500, true],
-      ['query_sql', '조회 SQL', 'sql', null, true, 'SELECT * FROM orders WHERE customer_id = :customer_id'],
+      ['query_sql', '실행 SQL', 'sql', null, true, 'SELECT * FROM orders WHERE customer_id = :customer_id'],
+      ['bind_config', '바인드 설정 (JSON)', 'sql', null, false, '{"id":{"dir":"IN","type":"STRING"},"result":{"dir":"OUT","type":"CURSOR"}}'],
       ['input_desc', '입력 설명', 'textarea', 1000, false, '예: customer_id — 고객 번호 (필수, 숫자)'],
       ['output_desc', '출력 설명', 'textarea', null, false, '조회 결과의 컬럼과 의미를 설명하세요.'],
     ] },
 };
-const blank = kind => Object.fromEntries(SECTIONS[kind].fields.map(([key]) => [key, key === 'db_type' ? 'oracle' : '']));
+const blank = kind => Object.fromEntries(SECTIONS[kind].fields.map(([key]) => [key, key === 'db_type' ? 'oracle' : key === 'query_type' ? 'QUERY' : '']));
 const valuesOf = (kind, row) => Object.fromEntries(SECTIONS[kind].fields.map(([key]) => [key,
-  key === 'db_type' ? String(row[key] || 'oracle').toLowerCase() : row[key] ?? '',
+  key === 'db_type' ? String(row[key] || 'oracle').toLowerCase() : key === 'query_type' ? row[key] ?? 'QUERY' : key === 'bind_config' && row[key] && typeof row[key] === 'object' ? JSON.stringify(row[key], null, 2) : row[key] ?? '',
 ]));
 const dbNames = text => text.split(';').map(s => s.trim()).filter(Boolean);
 const REQUIRED_ERROR = '필수 입력 항목을 확인해주세요.';
@@ -250,7 +252,7 @@ export default function AdminPanel({ onStateChange }) {
                   : !list.items.length ? <div className="admin-empty"><span className="admin-empty-mark" aria-hidden="true">{search ? '⌕' : '＋'}</span><h4>{search ? '검색 결과가 없습니다' : `등록된 ${config.label} 항목이 없습니다`}</h4><p>{search ? '다른 검색어로 찾아보세요.' : '첫 항목을 추가해 설정을 시작하세요.'}</p>{search && <button type="button" className="admin-secondary" onClick={() => { setSearch(''); setPage(1); }}>검색 초기화</button>}</div>
                     : list.items.map(item => <button type="button" key={item.seq} className={`admin-record${editor?.seq === item.seq ? ' selected' : ''}`}
                       aria-pressed={editor?.seq === item.seq} disabled={busy || opening} onClick={() => openEditor(item)}>
-                      <span className="admin-record-id">#{item.seq}</span><span className="admin-record-copy"><strong>{item.name}</strong><span>{item.summary || '설명이 없습니다.'}</span></span><span className="admin-record-arrow" aria-hidden="true">↗</span>
+                      <span className="admin-record-id">#{item.seq}</span><span className="admin-record-copy"><strong>{kind === 'queries' && item.query_type && `[${({ QUERY: '쿼리', PROCEDURE: '프로시저', FUNCTION: '함수' })[item.query_type] || item.query_type}] `}{item.name}</strong><span>{item.summary || '설명이 없습니다.'}</span></span><span className="admin-record-arrow" aria-hidden="true">↗</span>
                     </button>)}
             </div>
             {list && !loading && list.total > 0 && <div className="admin-pagination">
@@ -272,7 +274,7 @@ export default function AdminPanel({ onStateChange }) {
                   return <div className="admin-field" key={key} ref={node => { fieldRefs.current[key] = node; }}>
                     {type === 'databases' ? <span className="admin-field-label" id={`${id}-label`}>{label} <b>*</b></span>
                       : <label htmlFor={id}>{label}{required && !keepPassword && <b> *</b>}{limit && type === 'textarea' && <small>{(draft[key] || '').length} / {limit}</small>}</label>}
-                    {type === 'select' ? <select {...props}><option value="oracle">Oracle</option></select>
+                    {type === 'select' ? <select {...props}>{key === 'query_type' ? <><option value="QUERY">쿼리 (QUERY)</option><option value="PROCEDURE">프로시저 (PROCEDURE)</option><option value="FUNCTION">함수 (FUNCTION)</option></> : <option value="oracle">Oracle</option>}</select>
                       : type === 'databases' ? <div className={`admin-db-picker${fieldError ? ' has-error' : ''}`} role="group" aria-labelledby={`${id}-label`} aria-invalid={fieldError ? 'true' : undefined} aria-describedby={fieldError ? `${id}-error` : undefined}>
                         <input type="search" aria-label="대상 DB 목록 검색" placeholder="등록된 DB 검색" value={optionSearch} onChange={e => setOptionSearch(e.target.value)}
                           onKeyDown={e => { if (e.key === 'Enter') e.preventDefault(); }} />
@@ -293,7 +295,8 @@ export default function AdminPanel({ onStateChange }) {
                     {type !== 'databases' && fieldError && <p id={`${id}-error`} role="alert" className="admin-field-error">{fieldError}</p>}
                     {keepPassword && <small>현재 비밀번호: {editor.has_password ? '설정됨' : '없음'}. 비워 두면 기존 값을 유지합니다.</small>}
                     {key === 'db_password' && <small>서버 환경변수를 사용하려면 ENV:변수명 형식으로 입력하세요.</small>}
-                    {key === 'query_sql' && <small>SELECT 또는 WITH 조회만 등록할 수 있습니다. 입력값은 :파라미터 바인드를 사용하세요.</small>}
+                    {key === 'query_sql' && <small>{draft.query_type === 'PROCEDURE' ? '예: BEGIN app.get_orders(:id, :result); END;' : draft.query_type === 'FUNCTION' ? '예: BEGIN :result := app.get_total(:id); END;' : 'SELECT 또는 WITH 조회를 등록하세요. 입력값은 :파라미터 바인드를 사용하세요.'}</small>}
+                    {key === 'bind_config' && <small>{draft.query_type === 'QUERY' ? '쿼리는 비워두세요. SQL에서 입력 바인드를 자동으로 추출합니다.' : '모든 바인드의 dir(IN/OUT/INOUT), type(STRING/NUMBER/CURSOR)을 설정하세요. 함수 반환값은 OUT입니다. 출력은 스칼라 여러 개 또는 단독 OUT CURSOR 1개를 지원합니다. STRING 출력의 maxSize는 최대 32767바이트입니다. 조회용 루틴만 등록하세요.'}</small>}
                     {key === 'method' && <small>사용할 쿼리 이름을 본문에 적으면 에이전트가 해당 쿼리를 찾습니다.</small>}
                   </div>;
                 })}

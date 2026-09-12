@@ -15,7 +15,7 @@ import {
   readCapped, MAX_UPSTREAM_JSON_BYTES, MAX_UPSTREAM_ERROR_BYTES, numEnv,
   indentLines, errorText,
 } from './constants.js';
-import { bindNames } from './sql.js';
+import { inputBindNames } from './execution.js';
 import { canGrow } from './chunk.js';
 import { knowledgeView } from './context-items.js';
 import { rowCounts, columnOmissionKey, withColumnOmission } from './result.js';
@@ -880,7 +880,7 @@ const MAX_PROMPT_BIND_NAMES = 20;
 // 결정 경계(llm.js)가 그 길이를 유효하다고 통과시키는 것과 어긋나면 안 된다.
 // 상한 자체는 등록 경계(sql.js assertReadOnly)가 강제하므로 여기 오는 이름은 이미 그 안에 있다.
 const bindList = q => {
-  const binds = bindNames(q.query_sql);
+  const binds = inputBindNames(q);
   const shown = binds.slice(0, MAX_PROMPT_BIND_NAMES).map(n => `:${clip(n, MAX_BIND_NAME_LEN)}`).join(', ');
   const omitted = binds.length - Math.min(binds.length, MAX_PROMPT_BIND_NAMES);
   return `${shown || '없음'}${omitted ? ` 외 ${omitted}개` : ''}`;
@@ -903,17 +903,19 @@ const dbList = q => {
 // 후보가 둘 이상인지 — 짧은 형태에 대상DB를 실을지 가르는 기준이다 (아래 queryItemShort 주석).
 const hasDbChoice = q => targetDbNames(q.target_db_name).length > 1;
 
+const routineLabel = q => q.query_type === 'PROCEDURE' ? ' / 유형(PROCEDURE; 바인드는 IN/INOUT만 입력)' : q.query_type === 'FUNCTION' ? ' / 유형(FUNCTION; 바인드는 IN/INOUT만 입력)' : '';
+
 const queryItem = q =>
   `- ${clip(q.query_name, MAX_PROMPT_QUERY_NAME_LEN)}: ${clip(oneLine(q.query_desc))}` +
   ` / 입력(${clip(oneLine(q.input_desc)) || '설명 미등록 — 값의 의미·형식을 추측하지 말 것'}) / 출력(${clip(oneLine(q.output_desc), 300)})` +
-  ` / 바인드(${bindList(q)}) / 대상DB(${dbList(q)})` +
+  routineLabel(q) + ` / 바인드(${bindList(q)}) / 대상DB(${dbList(q)})` +
   (q.selected ? ` / SQL: ${clip(oneLine(q.query_sql), MAX_PROMPT_SQL_LEN)}` : '');
 
 // 짧은 형태에서도 입력 의미·형식은 보존한다. 대상 DB는 선택지가 여러 개인 경우 표시한다.
 const MAX_PROMPT_SHORT_DESC_LEN = 120;
 const queryItemShort = q =>
   `- ${clip(q.query_name, MAX_PROMPT_QUERY_NAME_LEN)}: ${clip(oneLine(q.query_desc), MAX_PROMPT_SHORT_DESC_LEN)} / 바인드(${bindList(q)})` +
-  ` / 입력(${clip(oneLine(q.input_desc)) || '설명 미등록 — 값의 의미·형식을 추측하지 말 것'})` +
+  routineLabel(q) + ` / 입력(${clip(oneLine(q.input_desc)) || '설명 미등록 — 값의 의미·형식을 추측하지 말 것'})` +
   (hasDbChoice(q) ? ` / 대상DB(${dbList(q)})` : '');
 
 // 설명이 없거나 잘린 부분을 추측해 실행하지 않도록 안내한다.

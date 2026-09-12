@@ -12,7 +12,7 @@
 // LLM_PROVIDER=openai 이면 vLLM/OpenRouter(OpenAI 호환 API), 아니면 규칙 기반 Mock.
 // agent.js는 provider가 바뀌어도 변경되지 않는다.
 import { openaiDecide } from './llm-openai.js';
-import { bindNames } from './sql.js';
+import { inputBindNames } from './execution.js';
 import { MAX_ROWS, TRUNC_MARK, MAX_BIND_LEN, MAX_ANSWER_LEN, MAX_BIND_NAME_LEN, MAX_TARGET_DB_NAME_LEN, MAX_SEARCH_TEXT_LEN, MAX_BATCH_QUERIES, MAX_EXPANDS, MAX_DROPS, SEARCH_TARGETS, normalizeSearchTargets, normalizeItemIds, clipText, nameKey, nameIndexOf, ownProp, warnOnce, targetDbNames, isPlainObject, stripLoneSurrogates} from './constants.js';
 import { rowCounts } from './result.js';
 import { escapeTableCell } from './chart.js';
@@ -350,7 +350,7 @@ function fillParams(registryRow, ctx) {
   // 현재 질문을 먼저 본다 — 이전 질문의 오래된 값이 현재 대상을 덮어쓰지 않도록.
   const texts = [ctx.question, ...(ctx.chat || []).filter(m => m.role === 'user').map(m => m.text).reverse()];
 
-  for (const name of bindNames(registryRow.query_sql)) {
+  for (const name of inputBindNames(registryRow)) {
     let value = valueFromHistory(name, ctx.history);
     // 소유 키만 본다 (constants.ownProp) — 바인드명이 '__proto__' 같은 프로토타입 멤버와 겹치면
     // 함수가 아닌 값을 호출하다 결정 루프 전체가 죽는다 (oracle.js mockResult와 같은 이유·같은 방식).

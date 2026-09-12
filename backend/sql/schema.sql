@@ -82,12 +82,14 @@ CREATE TABLE qa_method (
   UNIQUE KEY uk_title (title)   -- knowledge.title과 같은 이유 (위 주석 참고)
 );
 
--- 쿼리 관리: 조회용 DB에 실행할 수 있는 쿼리 목록. query_sql은 :param 바인드 변수 사용.
--- 보안: SELECT(또는 WITH) 조회 쿼리만 등록할 것 — 서버가 실행 직전 SELECT 전용 가드로 차단하지만,
---       조회 계정(target_db.db_user) 자체를 read-only 권한으로 두는 것을 권장한다.
+-- 조회 실행 관리: SQL 및 검증된 조회용 프로시저·함수. query_sql은 :param 바인드 변수 사용.
+-- QUERY는 SELECT/WITH만, 루틴은 단일 호출 블록만 허용한다. 루틴은 읽기 전용 트랜잭션에서 실행한다.
+-- 대상 계정에는 필요한 SELECT와 검증된 루틴의 EXECUTE 권한만 부여한다.
 CREATE TABLE query_registry (
   seq            INT AUTO_INCREMENT PRIMARY KEY,
   query_name     VARCHAR(100) NOT NULL UNIQUE,
+  query_type     VARCHAR(20) NOT NULL DEFAULT 'QUERY' CHECK (query_type IN ('QUERY', 'PROCEDURE', 'FUNCTION')),
+  bind_config    TEXT NULL,    -- 루틴 바인드 JSON: {"id":{"dir":"IN","type":"STRING"},"rows":{"dir":"OUT","type":"CURSOR"}}
   query_desc     TEXT,          -- 용도 요약: "어떤 질문일 때 무엇을 조회하는 쿼리인지".
                                 -- 벡터 검색과 LLM의 쿼리 선택 근거이므로 성실히 작성할 것
   input_desc     TEXT,

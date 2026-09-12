@@ -60,7 +60,7 @@ test(`${production ? 'production' : 'dev'} 관리 화면 검색·페이지 이�
         const q = parsed.searchParams.get('q').toLowerCase();
         const matches = rows.filter(row => Object.values(row).join(' ').toLowerCase().includes(q)).slice().reverse();
         const page = Math.min(Number(parsed.searchParams.get('page')), Math.max(1, Math.ceil(matches.length / 20)));
-        return json({ items: matches.slice((page - 1) * 20, page * 20).map(row => ({ seq: row.seq, name: row.title || row.db_name || row.query_name, summary: row.content || row.method || row.query_desc || row.connection_info })), total: matches.length, page, pageSize: 20 });
+        return json({ items: matches.slice((page - 1) * 20, page * 20).map(row => ({ seq: row.seq, query_type: row.query_type, name: row.title || row.db_name || row.query_name, summary: row.content || row.method || row.query_desc || row.connection_info })), total: matches.length, page, pageSize: 20 });
       }
       if (window.__reject) return json({ error: '같은 이름의 항목이 이미 있습니다.' }, 409);
       if (id && opts.headers['If-Match'] !== '"' + rows.find(row => row.seq === Number(id)).revision + '"') return json({ error: '다른 화면에서 변경되었습니다.' }, 409);
@@ -116,7 +116,7 @@ test(`${production ? 'production' : 'dev'} 관리 화면 검색·페이지 이�
   await page.until(`document.querySelector('#admin-field-target_db_name-error')?.textContent.includes('대상 DB')`);
   assert.equal(await page.eval(`window.__requests.filter(r => r.method === 'POST' && r.url.endsWith('/queries')).length`), writesBeforeMissingTargetDb, '대상 DB가 없으면 저장 요청을 보내지 않는다');
   assert.equal(await page.eval(`document.querySelector('.admin-db-picker').getAttribute('aria-invalid')`), 'true');
-  assert.ok(await page.eval(`(() => { const r = document.querySelector('#admin-field-target_db_name-error').getBoundingClientRect(); return r.top < innerHeight && r.bottom > 0; })()`), '검증 오류 필드가 화면에 들어온다');
+  await page.until(`(() => { const r = document.querySelector('#admin-field-target_db_name-error').getBoundingClientRect(); return r.top < innerHeight && r.bottom > 0; })()`); // smooth 스크롤 완료를 기다린다.
   await click('.admin-db-options input');
   await click('.admin-form-actions [type=submit]'); await page.until(`document.querySelector('.admin-success')`);
   assert.equal(await page.eval(`window.__records.queries[0].target_db_name`), 'ORDER_DB');
@@ -142,6 +142,21 @@ test(`${production ? 'production' : 'dev'} 관리 화면 검색·페이지 이�
   await click('[aria-label="OLD_DB 선택 해제"]'); await click('.admin-db-options input');
   await click('.admin-form-actions [type=submit]'); await page.until(`document.querySelector('.admin-success')`);
   assert.equal(await page.eval(`window.__records.queries[0].target_db_name`), 'ORDER_DB');
+  // 실행 유형과 바인드 JSON의 저장·재조회를 확인한다.
+  assert.equal(await page.eval(`document.querySelector('#admin-field-query_type').value`), 'QUERY');
+  for (const type of ['PROCEDURE', 'FUNCTION']) {
+    await page.eval(`(() => { const el = document.querySelector('#admin-field-query_type'); el.value = '${type}'; el.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+    const sql = type === 'PROCEDURE' ? 'BEGIN app.orders(:id, :result); END;' : 'BEGIN :result := app.total(:id); END;';
+    const binds = JSON.stringify({ id: { dir: 'IN', type: 'STRING' }, result: { dir: 'OUT', type: type === 'PROCEDURE' ? 'CURSOR' : 'NUMBER' } });
+    await fill('#admin-field-query_sql', sql); await fill('#admin-field-bind_config', binds);
+    await click('.admin-form-actions [type=submit]'); await page.until(`document.querySelector('.admin-success')`); await loaded();
+    assert.equal(await page.eval(`window.__records.queries[0].query_type`), type);
+    assert.equal(await page.eval(`window.__records.queries[0].bind_config`), binds);
+    assert.match(await page.eval(`document.querySelector('.admin-record').textContent`), type === 'PROCEDURE' ? /프로시저/ : /함수/);
+    await click('.admin-record');
+    await page.until(`document.querySelector('#admin-field-query_type')?.value === '${type}'`);
+    assert.equal(await page.eval(`document.querySelector('#admin-field-bind_config').value`), binds);
+  }
   await page.eval('window.__confirm = false');
   if (process.env.ADMIN_SCREENSHOT) {
     const shot = await page.send('Page.captureScreenshot', { format: 'png' });

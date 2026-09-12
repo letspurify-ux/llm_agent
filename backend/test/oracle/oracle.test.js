@@ -19,35 +19,38 @@ import { parseChartBlock } from '../../../frontend/src/chart.js';
 import { handleQuestion } from '../../src/agent.js';
 
 const exec = promisify(execFile);
-const container = `backend-oracle-test-${randomUUID().slice(0, 8)}`;
+const existingContainer = process.env.ORACLE_TEST_EXISTING_CONTAINER;
+const container = existingContainer || `backend-oracle-test-${randomUUID().slice(0, 8)}`;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 let created = false, owner, reader;
 
 before(async () => {
-  const image = process.env.ORACLE_TEST_IMAGE || 'gvenzl/oracle-free:latest';
-  // 이미 설치된 이미지만 쓴다. 테스트가 대형 이미지를 자동 다운로드하지 않는다.
-  await exec('docker', ['image', 'inspect', image]);
-  await exec('docker', ['run', '--rm', '-d', '--name', container,
-    '-p', '127.0.0.1::1521', '-e', 'ORACLE_RANDOM_PASSWORD=yes', image]);
-  created = true;
-  let ready = false;
-  const deadline = Date.now() + 90_000;
-  while (Date.now() < deadline) {
-    try { await exec('docker', ['exec', container, 'healthcheck.sh'], { timeout: 5000 }); ready = true; break; }
-    catch { await sleep(500); }
-  }
-  assert.ok(ready, '임시 Oracle DB 기동 시간 초과');
-  const sql = 'WHENEVER SQLERROR EXIT FAILURE\nALTER SESSION SET CONTAINER = FREEPDB1;\n'
-    + await readFile(new URL('../../sql/oracle-init.sql', import.meta.url), 'utf8');
-  const init = spawn('docker', ['exec', '-i', '-e', 'NLS_LANG=.AL32UTF8', container, 'sqlplus', '-s', '/', 'as', 'sysdba']);
-  let output = '';
-  init.stdout.on('data', data => { output += data; });
-  init.stderr.on('data', data => { output += data; });
-  init.stdin.end(sql);
-  const [code] = await once(init, 'close');
-  assert.equal(code, 0, output);
+  if (!existingContainer) {
+    const image = process.env.ORACLE_TEST_IMAGE || 'gvenzl/oracle-free:latest';
+    // 이미 설치된 이미지만 쓴다. 테스트가 대형 이미지를 자동 다운로드하지 않는다.
+    await exec('docker', ['image', 'inspect', image]);
+    await exec('docker', ['run', '--rm', '-d', '--name', container,
+      '-p', '127.0.0.1::1521', '-e', 'ORACLE_RANDOM_PASSWORD=yes', image]);
+    created = true;
+    let ready = false;
+    const deadline = Date.now() + 90_000;
+    while (Date.now() < deadline) {
+      try { await exec('docker', ['exec', container, 'healthcheck.sh'], { timeout: 5000 }); ready = true; break; }
+      catch { await sleep(500); }
+    }
+    assert.ok(ready, '임시 Oracle DB 기동 시간 초과');
+    const sql = 'WHENEVER SQLERROR EXIT FAILURE\nALTER SESSION SET CONTAINER = FREEPDB1;\n'
+      + await readFile(new URL('../../sql/oracle-init.sql', import.meta.url), 'utf8');
+    const init = spawn('docker', ['exec', '-i', '-e', 'NLS_LANG=.AL32UTF8', container, 'sqlplus', '-s', '/', 'as', 'sysdba']);
+    let output = '';
+    init.stdout.on('data', data => { output += data; });
+    init.stderr.on('data', data => { output += data; });
+    init.stdin.end(sql);
+    const [code] = await once(init, 'close');
+    assert.equal(code, 0, output);
+  } // 기존 테스트 DB는 초기화하거나 샘플 데이터를 덮어쓰지 않는다.
   const { stdout } = await exec('docker', ['port', container, '1521/tcp']);
-  const connectString = `${stdout.trim()}/FREEPDB1`;
+  const connectString = `${stdout.trim().split('\n')[0].replace('0.0.0.0:', '127.0.0.1:')}/FREEPDB1`;
   owner = await oracledb.getConnection({ user: 'APP_USER', password: 'app_user_1234', connectString });
   reader = await oracledb.getConnection({ user: 'VOC_READER', password: 'voc_reader_1234', connectString });
   owner.callTimeout = 5000; reader.callTimeout = 5000;
@@ -271,4 +274,110 @@ test('조회 가드와 실제 READ 계정이 행 잠금·쓰기를 차단한다'
     await assert.rejects(reader.execute(sql), error =>
       /ORA-(?:01031: insufficient privileges|419\d{2}: missing (?:SELECT|DELETE) privilege)/.test(error.message));
   }
+});
+
+// 기존 테스트 컨테이너에서도 기존 객체/권한을 변경하지 않고 고유 이름의 fixture만 생성·정리한다.
+async function oracleAdminSql(sql) {
+  const child = spawn('docker', ['exec', '-i', '-e', 'NLS_LANG=.AL32UTF8', container, 'sqlplus', '-s', '/', 'as', 'sysdba']);
+  let output = '';
+  child.stdout.on('data', data => { output += data; });
+  child.stderr.on('data', data => { output += data; });
+  child.stdin.end(`WHENEVER SQLERROR EXIT FAILURE\nALTER SESSION SET CONTAINER=FREEPDB1;\n${sql}\nEXIT\n`);
+  const [code] = await once(child, 'close');
+  assert.equal(code, 0, output);
+}
+
+test('등록 프로시저·함수: REF CURSOR, 스칼라 OUT/INOUT, 정밀도, 읽기 전용 실행', async t => {
+  const prefix = `AGRT${randomUUID().replaceAll('-', '').slice(0, 8)}_`;
+  const scoped = sql => sql.replaceAll('routine_', prefix);
+  const objects = [];
+  const ddl = async sql => {
+    await oracleAdminSql(`ALTER SESSION SET CURRENT_SCHEMA=APP_USER;\n${scoped(sql)}${/^CREATE OR REPLACE/.test(sql) ? '\n/' : ';'}`);
+    const created = /^CREATE (?:OR REPLACE )?(PROCEDURE|FUNCTION|TABLE|PACKAGE) (routine_[a-z_]+)/.exec(sql);
+    if (created) objects.push([created[1], scoped(created[2])]);
+  };
+  t.after(async () => {
+    for (const [type, name] of objects.reverse()) await oracleAdminSql(`DROP ${type} APP_USER.${name};`);
+  });
+  await ddl(`CREATE OR REPLACE PROCEDURE routine_rows(p_count IN NUMBER, p_rows OUT SYS_REFCURSOR) AS
+    BEGIN OPEN p_rows FOR SELECT LEVEL AS N FROM dual CONNECT BY LEVEL <= p_count; END;`);
+  await ddl(`CREATE OR REPLACE FUNCTION routine_total(p_id IN NUMBER) RETURN NUMBER AS
+    BEGIN RETURN p_id + 1; END;`);
+  await ddl(`CREATE OR REPLACE PROCEDURE routine_scalars(p_text IN OUT VARCHAR2, p_out OUT VARCHAR2) AS
+    BEGIN p_text := p_text || ' 확인'; p_out := NULL; END;`);
+  await ddl(`CREATE OR REPLACE FUNCTION routine_cursor RETURN SYS_REFCURSOR AS c SYS_REFCURSOR;
+    BEGIN OPEN c FOR SELECT 42 AS VALUE FROM dual; RETURN c; END;`);
+  await ddl(`CREATE OR REPLACE PACKAGE routine_overload AS
+    FUNCTION choose(p_value NUMBER) RETURN VARCHAR2;
+    FUNCTION choose(p_value VARCHAR2) RETURN VARCHAR2;
+    PROCEDURE bump(p_value IN OUT NUMBER);
+  END;`);
+  await ddl(`CREATE OR REPLACE PACKAGE BODY routine_overload AS
+    FUNCTION choose(p_value NUMBER) RETURN VARCHAR2 AS BEGIN RETURN 'number'; END;
+    FUNCTION choose(p_value VARCHAR2) RETURN VARCHAR2 AS BEGIN RETURN 'string'; END;
+    PROCEDURE bump(p_value IN OUT NUMBER) AS BEGIN p_value := p_value + 1; END;
+  END;`);
+  await ddl('GRANT EXECUTE ON routine_overload TO VOC_READER');
+  await ddl('CREATE TABLE routine_write_probe (id NUMBER)');
+  await ddl(`CREATE OR REPLACE PROCEDURE routine_write(p_out OUT NUMBER) AS
+    BEGIN INSERT INTO routine_write_probe VALUES (1); p_out := 1; END;`);
+  await ddl(`CREATE OR REPLACE PROCEDURE routine_raise_proc(p_out OUT VARCHAR2) AS
+    BEGIN RAISE_APPLICATION_ERROR(-20001, 'procedure fixture failure'); END;`);
+  await ddl(`CREATE OR REPLACE FUNCTION routine_raise_fn RETURN VARCHAR2 AS
+    BEGIN RAISE_APPLICATION_ERROR(-20002, 'function fixture failure'); END;`);
+  for (const name of ['routine_rows', 'routine_total', 'routine_scalars', 'routine_cursor', 'routine_write', 'routine_raise_proc', 'routine_raise_fn']) {
+    await ddl(`GRANT EXECUTE ON ${name} TO VOC_READER`);
+  }
+  const row = (query_type, query_sql, bind_config) => ({ ...registry(scoped(query_sql)), query_type, bind_config: JSON.stringify(bind_config) });
+  const proc = row('PROCEDURE', 'BEGIN app_user.routine_rows(:count, :rows); END;',
+    { count: { dir: 'IN', type: 'NUMBER' }, rows: { dir: 'OUT', type: 'CURSOR' } });
+  const cursor = await runQuery(proc, { count: MAX_ROWS + 1, rows: 'LLM OUT 값은 무시' });
+  assert.equal(cursor.capped, true);
+  assert.equal(cursor.rows.length, MAX_ROWS);
+  assert.equal(cursor.rows[0].N, 1);
+  const fn = row('FUNCTION', 'BEGIN :value := app_user.routine_total(:id); END;',
+    { id: { dir: 'IN', type: 'NUMBER' }, value: { dir: 'OUT', type: 'NUMBER' } });
+  assert.deepEqual((await runQuery(fn, { ID: '123456789012345678' })).rows, [{ value: '123456789012345679' }]);
+  assert.deepEqual((await runQuery(row('PROCEDURE', 'BEGIN app_user.routine_scalars(:text, :value); END;',
+    { text: { dir: 'INOUT', type: 'STRING' }, value: { dir: 'OUT', type: 'STRING' } }), { text: '주문' })).rows,
+    [{ text: '주문 확인', value: null }]);
+  assert.deepEqual((await runQuery(row('FUNCTION', 'BEGIN :rows := app_user.routine_cursor(); END;',
+    { rows: { dir: 'OUT', type: 'CURSOR' } }))).rows, [{ VALUE: 42 }]);
+  await assert.rejects(runQuery(row('PROCEDURE', 'BEGIN app_user.routine_write(:value); END;',
+    { value: { dir: 'OUT', type: 'NUMBER' } })), e => e.errorNum === 1456);
+  for (const type of ['STRING', 'NUMBER']) {
+    const selected = await runQuery(row('FUNCTION', 'BEGIN :result := app_user.routine_overload.choose(:value); END;',
+      { result: { dir: 'OUT', type: 'STRING' }, value: { dir: 'IN', type } }), { value: '12' });
+    assert.deepEqual(selected.rows, [{ result: type.toLowerCase() }]);
+  }
+  assert.deepEqual((await runQuery(row('PROCEDURE', 'BEGIN app_user.routine_overload.bump(:value); END;',
+    { value: { dir: 'INOUT', type: 'NUMBER' } }), { value: '123456789012345678' })).rows, [{ value: '123456789012345679' }]);
+  const count = await owner.execute(scoped('SELECT COUNT(*) AS N FROM routine_write_probe'), [], { outFormat: oracledb.OUT_FORMAT_OBJECT });
+  assert.equal(count.rows[0].N, 0);
+  // 실제 DB 예외도 해당 조회에만 남고, 같은 요청의 다른 조회와 최종 답변으로 이어진다.
+  const failedProc = { ...row('PROCEDURE', 'BEGIN app_user.routine_raise_proc(:value); END;',
+    { value: { dir: 'OUT', type: 'STRING' } }), seq: 901, query_name: 'failed_proc' };
+  const failedFn = { ...row('FUNCTION', 'BEGIN :value := app_user.routine_raise_fn(); END;',
+    { value: { dir: 'OUT', type: 'STRING' } }), seq: 902, query_name: 'failed_fn' };
+  const healthy = { ...registry('SELECT :value AS VALUE FROM dual'), seq: 903, query_name: 'healthy' };
+  for (const batch of [false, true]) {
+    const calls = [
+      { query_name: 'failed_proc', params: {} },
+      { query_name: 'healthy', params: { value: 'first' } },
+      { query_name: 'failed_fn', params: {} },
+    ];
+    const decisions = [{ action: 'search', text: 'test', targets: ['query'] },
+      ...(batch ? [{ action: 'run_queries', queries: calls }] : calls.map(call => ({ action: 'run_query', ...call }))),
+      { action: 'run_query', query_name: 'healthy', params: { value: 'next' } },
+      { action: 'answer', answer: '후속 조회 완료' }];
+    const result = await handleQuestion('오류 후 계속', [], { deps: {
+      decide: async () => decisions.shift(), run: runQuery,
+      search: async () => ({ queries: [failedProc, failedFn, healthy] }),
+    } });
+    assert.equal(result.answer, '후속 조회 완료');
+    assert.deepEqual(result.trace.filter(step => step.error).map(step => step.query_name), ['failed_proc', 'failed_fn']);
+    assert.deepEqual(result.trace.filter(step => step.query_name === 'healthy').map(step => step.rows[0].VALUE), ['first', 'next']);
+  }
+  // 실패한 읽기 전용 트랜잭션도 풀에 남지 않아 후속 실행이 정상 동작한다.
+  assert.deepEqual((await runQuery(fn, { id: 1 })).rows, [{ value: '2' }]);
 });

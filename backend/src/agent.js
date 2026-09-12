@@ -11,7 +11,7 @@ import { absorbKnowledge, knowledgeView } from './context-items.js';
 import { normalizeResultRead, readStoredResult } from './read-result.js';
 import { promptParams } from './prompt-values.js';
 import { runQuery } from './oracle.js';
-import { bindNames } from './sql.js';
+import { inputBindNames } from './execution.js';
 import { llm, renderAnswer, clipAnswer } from './llm.js';
 import { resolveChartData, resolveTableData, MAX_TABLE_CELL_LEN, MAX_CHART_CELL_LEN } from './chart.js';
 import { MAX_STEPS, MAX_SEARCHES, MAX_HISTORY_ROWS, MAX_EXPANDS, MAX_RESULT_READS, MAX_DOC_LEN, MAX_PROMPT_ITEM_LEN, MAX_RESULT_ROWS, parseItemId, MAX_CHAT_TURNS, MAX_CHAT_LEN, MAX_CELL_LEN, TRUNC_MARK, SEARCH_TARGETS, nameKey, clipText, stripLoneSurrogates, bindValue, targetDbNames, indentLines } from './constants.js';
@@ -659,7 +659,7 @@ export async function handleQuestion(rawQuestion, rawChat = [], { onEvent, deps,
         await abortable(resolveQuery(item.query_name, queries, resolveCache), signal);
       // 이력에는 항상 정규 이름(등록된 철자)을 남긴다 — 가드와 프롬프트가 같은 이름을 보게.
       const canonicalName = registryRow?.query_name ?? item.query_name;
-      const binds = registryRow ? bindNames(registryRow.query_sql) : null;
+      const binds = registryRow ? inputBindNames(registryRow) : null;
       // 이 항목이 실제로 향하는 대상 DB. 가드·이력·실행이 같은 값을 봐야 한다.
       const dbChoice = effectiveTargetDb(registryRow, item.target_db);
       const base = { query_name: canonicalName, params: item.params, ...(dbChoice && { targetDb: dbChoice }) };

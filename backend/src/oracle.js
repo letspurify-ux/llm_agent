@@ -8,7 +8,7 @@ export { numberFromString } from './numbers.js';
 import { createHash } from 'node:crypto';
 import { loadTargetDb } from './db.js';
 import { withColumnOmission } from './result.js';
-import { bindNames, assertReadOnly } from './sql.js';
+import { executionSpec } from './execution.js';
 import { MAX_ROWS, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK, MAX_TARGET_DB_NAME_LEN, MAX_BATCH_QUERIES, numEnv, nameKey, safeError, clipText, warnOnce, ownProp, bindValue, targetDbNames, isPlainObject } from './constants.js';
 import { throwIfAborted } from './abort.js';
 
@@ -73,6 +73,7 @@ oracledb.fetchTypeHandler = md => {
 // 이 포맷을 따른다. 서버 설정에 따라 달라지던 것이 고정되는 것이므로 등록 쿼리는 포맷을 명시할 것.
 const NLS_SESSION_FORMATS =
   "ALTER SESSION SET NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS'" +
+  " NLS_NUMERIC_CHARACTERS='.,'" +
   " NLS_TIMESTAMP_FORMAT='YYYY-MM-DD HH24:MI:SS.FF3'" +
   " NLS_TIMESTAMP_TZ_FORMAT='YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM'";
 
@@ -247,16 +248,16 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
   // 실행부가 따로 문자열을 손보면 둘의 판단이 갈라진다 (sql.js assertReadOnly 주석 참고).
   // 등록 SQL 자체가 실행 불가면(등록 실수) 어떤 파라미터로도 시작되지 않는다 — 헛돈 스텝으로 표시하고
   // 다음 행동을 함께 준다 (wasted 주석). 가드는 판정만 하고 hint를 모르므로 여기서 붙인다.
-  let sql;
+  let spec;
   try {
-    sql = assertReadOnly(registryRow.query_sql);
+    spec = executionSpec(registryRow);
   } catch (e) {
     throw wasted(Object.assign(e, { hint: e.hint ?? UNRUNNABLE_HINT }));
   }
 
   // SQL에 실제로 있는 바인드만 추려서 전달한다 — LLM이 여분 파라미터를 주면
   // 드라이버가 바인드 수 불일치(NJS-098)로 실패하므로 필터가 필요하다.
-  const names = bindNames(registryRow.query_sql);
+  const names = spec.inputs;
   // 값 조회는 constants.bindValue 하나로 한다 — 소유 키만 읽고(바인드명이 '__proto__' 같은
   // 프로토타입 멤버와 겹치면 Object.prototype이 돌아와 '값 없음'이어야 할 판정이 '값이 아닌
   // 구조'로 어긋난다), 대소문자는 Oracle과 같이 무시한다(:job_id와 :JOB_ID는 같은 바인드다).
@@ -271,7 +272,9 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
       '질문이나 실행 이력에서 값을 확인하고, 알 수 없으면 사용자에게 되묻거나 다른 쿼리를 선택하라'
     );
   }
-  const binds = Object.fromEntries(names.map(n => [n, val(n)]));
+  const inputValues = Object.fromEntries(names.map(n => [n, val(n)]));
+  const binds = spec.type === 'QUERY' ? inputValues : routineBinds(spec, val);
+  const sql = spec.sql;
 
   // 대상 DB 확정은 mock 판정보다 먼저 한다. 등록 문자열만 보는 순수 판정이라 관리 DB를 건드리지
   // 않고, 여기서 갈라 두면 mock으로 검증한 시나리오가 실 접속에서 그대로 재현된다 —
@@ -281,6 +284,7 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
 
   if (oracleMock()) {
     throwIfAborted(signal);
+    if (spec.type !== 'QUERY') throw wasted(safeError('프로시저·함수는 ORACLE_MOCK에서 실행할 수 없습니다. 실제 Oracle 연결을 사용해주세요.', UNRUNNABLE_HINT));
     return capResult(mockResult(registryRow.query_name, binds), targetDbName);
   }
 
@@ -351,6 +355,7 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
     try { Promise.resolve(conn.breakExecution?.()).catch(() => {}); } catch { /* 이미 닫혔거나 실행 전이다 */ }
   };
   signal?.addEventListener('abort', onAbort, { once: true });
+  let cursor;
   try {
     throwIfAborted(signal);
     // 조회 타임아웃 — 느린 쿼리(락 대기, 잘못된 실행계획)가 요청을 무한 대기시키지 않게.
@@ -363,19 +368,60 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
     // sql은 가드가 승인하며 만든 실행용 형태다 — 여기서 다시 손보지 않는다.
     // fetchArraySize·prefetchRows를 행 상한에 맞춘다 — 기본값(100)이면 상한(1,001행)까지 왕복이 11번이다.
     // 행 수 상한이 곧 메모리 상한이므로 한 번에 받아도 크기는 같다.
+    if (spec.type !== 'QUERY') await conn.execute('SET TRANSACTION READ ONLY');
+    throwIfAborted(signal);
     const result = await conn.execute(sql, binds, {
+      autoCommit: false,
       outFormat: oracledb.OUT_FORMAT_OBJECT,
       maxRows: MAX_ROWS + 1,
       fetchArraySize: MAX_ROWS + 1,
       prefetchRows: MAX_ROWS + 2,
     });
+    if (spec.type !== 'QUERY') {
+      const outputs = spec.bindings.filter(b => b.dir !== 'IN');
+      const cursorBind = outputs.find(b => b.type === 'CURSOR');
+      if (cursorBind) {
+        cursor = result.outBinds?.[cursorBind.name];
+        throwIfAborted(signal);
+        if (!cursor || typeof cursor.getRows !== 'function') throw safeError('루틴이 유효한 REF CURSOR를 반환하지 않았습니다. 빈 결과도 열린 커서로 반환해주세요.');
+        const rows = await cursor.getRows(MAX_ROWS + 1);
+        throwIfAborted(signal);
+        return capResult(rows, targetDbName);
+      }
+      throwIfAborted(signal);
+      return capResult([Object.fromEntries(outputs.map(b => [b.name, result.outBinds?.[b.name] ?? null]))], targetDbName);
+    }
     throwIfAborted(signal);
     return capResult(result.rows ?? [], targetDbName);
   } finally {
     signal?.removeEventListener('abort', onAbort);
-    // 풀 커넥션의 close()는 반납이다. 실패가 원본 쿼리 오류를 덮어쓰지 않게 삼킨다.
-    await release();
+    // 정리 오류가 해당 조회의 결과/오류를 덮거나 다음 조회로 번지지 않게 한다.
+    // 정리되지 않은 세션은 풀에 돌려주지 않고 폐기한다.
+    let drop = false;
+    try { if (cursor) await cursor.close(); } catch { drop = true; }
+    try { if (spec.type !== 'QUERY') await conn.rollback(); } catch { drop = true; }
+    await release(drop);
   }
+}
+
+// NUMBER OUT도 문자열로 받는다. OUT 바인드는 fetchTypeHandler를 거치지 않으므로
+// NUMBER로 직접 받으면 큰 정수의 정밀도가 이미 사라진다. Oracle의 암묵 변환을 사용한다.
+function routineBinds(spec, val) {
+  const directions = { IN: oracledb.BIND_IN, OUT: oracledb.BIND_OUT, INOUT: oracledb.BIND_INOUT };
+  return Object.fromEntries(spec.bindings.map(b => {
+    const input = b.dir !== 'OUT';
+    let value = input ? val(b.name) : undefined;
+    if (input && b.type === 'NUMBER') {
+      if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(String(value))
+        || !Number.isFinite(Number(value)) || (typeof value === 'number' && Number.isInteger(value) && !Number.isSafeInteger(value))) {
+        throw safeError(`:${b.name}에는 유효한 숫자를 입력해주세요. 큰 정수는 문자열로 전달해주세요.`);
+      }
+    }
+    if (input) value = String(value);
+    return [b.name, { dir: directions[b.dir], type: b.type === 'CURSOR' ? oracledb.CURSOR : oracledb.STRING,
+      ...(b.type !== 'CURSOR' && b.dir !== 'IN' && { maxSize: b.maxSize ?? 32767 }),
+      ...(input && { val: value }) }];
+  }));
 }
 
 // ===== 대상 DB별 커넥션 풀 =====
@@ -463,8 +509,11 @@ async function acquireConnection(target) {
   try {
     const pool = await entry.pending;
     const conn = await pool.getConnection();
-    return { conn, release: async () => {
-      try { await conn.close(); } catch { /* 원래 조회 결과를 보존한다 */ }
+    return { conn, release: async (drop = false) => {
+      try { await conn.close(drop ? { drop: true } : {}); } catch {
+        // 정상 반납 자체가 실패한 연결도 재사용하지 않는다. 폐기 실패는 원래 오류를 보존한다.
+        if (!drop) { try { await conn.close({ drop: true }); } catch { /* 이미 끊긴 연결 */ } }
+      }
       finally { await releasePoolEntry(entry); }
     } };
   } catch (e) {

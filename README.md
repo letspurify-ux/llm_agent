@@ -62,7 +62,9 @@ mariadb --default-character-set=utf8mb4 < backend/sql/schema.sql
 ```
 
 > **이미 운영 중인 DB에는 실행하지 말 것** — schema.sql은 맨 앞에서 모든 테이블을 DROP한다.
-> 기존 설치에 변경분만 반영하려면 아래 마이그레이션을 쓴다:
+> 기존 설치는 앱 업데이트 전에 `backend/sql/migrate-routines.sql`을 적용한다.
+> 기존 실행 항목을 `QUERY`로 유지하면서 `query_type`, `bind_config`만 추가하며 재실행할 수 있다.
+> 더 오래된 설치의 변경분은 아래 마이그레이션을 쓴다:
 >
 > ```sql
 > -- chat_log.answer: TEXT(65,535바이트)로는 결과가 큰 대화가 strict 모드에서 통째로 기록되지 않는다
@@ -230,7 +232,7 @@ DB 선택 목록 안에서도 이름으로 검색할 수 있다. 검색 대상�
   (기본 60초, `EMBED_SYNC_INTERVAL=0`이면 `npm run embed`를 직접 실행).
 - DB 탭의 비밀번호는 관리용 MariaDB가 아니라 **조회 대상 Oracle DB**의 비밀번호다. 조회 API에 포함하지 않으며, 수정 시 비워 두면 기존 값을 유지한다.
   운영 비밀번호는 기존 방식대로 `ENV:변수명`을 사용한다.
-- SELECT/WITH 조회 SQL만 등록할 수 있다. 쿼리에서 사용 중인 DB, 처리 방법에서 언급한 쿼리는
+- 실행 유형에서 쿼리·프로시저·함수를 선택한다. 쿼리는 SELECT/WITH, 루틴은 아래의 단일 호출 형식을 사용한다. 쿼리에서 사용 중인 DB, 처리 방법에서 언급한 쿼리는
   참조를 먼저 변경해야 삭제하거나 이름을 바꿀 수 있다. SQL로 직접 변경하는 작업은 이 검사와 별개다.
 - 저장 전 탭 전환·닫기·새로고침 시 변경 내용 유실을 확인하며, 저장 실패 시 입력 내용을 유지한다.
 - 항목을 연 뒤 다른 화면에서 수정했다면 오래된 수정·삭제는 거부한다. 입력 내용을 보관하고 항목을
@@ -550,6 +552,75 @@ JSON 하나로 답하는 프록시도 같은 길로 읽는다.
 2. `.env`에서 `ORACLE_MOCK=0`, 참조하는 비밀번호 환경변수(`ORDER_DB_PASSWORD`) 설정
 3. `query_registry`의 쿼리를 실제 테이블 구조에 맞게 등록
 
+### 프로시저와 함수 등록
+
+`query_registry`를 공통 실행 목록으로 사용한다. `query_type`은 `QUERY`(기본값),
+`PROCEDURE`, `FUNCTION`이고, 이름·설명·대상 DB·벡터 검색·처리 방법에서의 참조는 동일하다.
+기존 INSERT는 컬럼을 추가하지 않아도 QUERY로 등록된다. 루틴 등록 후에는 기존 쿼리처럼
+임베딩 동기화를 실행하고, `query_desc`에는 용도, `input_desc`에는 입력값의 의미와 형식을 적는다.
+
+기존 관리 DB는 **앱 업데이트 전에** 아래 파일을 적용한다. `schema.sql`로 초기화하지 않는다.
+
+```bash
+mariadb --default-character-set=utf8mb4 -u <관리자> -p < backend/sql/migrate-routines.sql
+```
+
+관리자 화면의 쿼리 탭에서 실행 유형과 SQL, 바인드 설정(JSON)을 입력한다.
+Oracle에 이미 존재하고 대상 계정에 EXECUTE 권한이 있는 조회용 루틴을 등록한다.
+
+| 유형 | 실행 SQL 예시 | 결과 |
+|---|---|---|
+| QUERY | `SELECT * FROM orders WHERE customer_id = :id` | 조회 행 |
+| PROCEDURE | `BEGIN app.get_orders(:id, :result); END;` | `result` OUT CURSOR의 행 |
+| FUNCTION | `BEGIN :result := app.get_total(:id); END;` | `result` 컬럼 한 행 |
+
+프로시저 예시의 바인드 설정:
+
+```json
+{
+  "id": { "dir": "IN", "type": "STRING" },
+  "result": { "dir": "OUT", "type": "CURSOR" }
+}
+```
+
+함수 예시의 바인드 설정:
+
+```json
+{
+  "id": { "dir": "IN", "type": "STRING" },
+  "result": { "dir": "OUT", "type": "NUMBER" }
+}
+```
+
+- 루틴의 모든 바인드에 `dir`(`IN`, `OUT`, `INOUT`)과 `type`(`STRING`, `NUMBER`, `CURSOR`)을 명시한다. QUERY는 설정을 비워둔다.
+- 모델에는 IN/INOUT 이름만 입력 바인드로 제공한다. OUT 값과 함수 반환값은 서버가 받으며, 루프의 중복 실행 판정도 실제 입력만 비교한다.
+- 출력은 여러 스칼라 OUT/INOUT 또는 **단독 OUT CURSOR 1개**를 지원한다. CURSOR 반환 함수도 가능하다. 출력 없는 프로시저, 여러 커서, 커서와 스칼라의 혼합, 객체·컬렉션·LOB 바인드는 지원하지 않는다.
+- 스칼라는 바인드 이름을 컬럼명으로 한 행에 반환한다. NUMBER 출력은 큰 수의 정밀도를 보존하도록 문자열로 받는다. STRING 출력의 `maxSize`는 1~32767바이트이며 기본값은 32767이다. 받은 결과에는 기존 행·컬럼·셀 길이 제한을 적용한다.
+- 입력값은 기존 쿼리처럼 필수이며 null·빈 문자열은 받지 않는다. 날짜는 STRING과 루틴의 명시적 변환을 사용한다. 빈 조회 결과는 NULL 커서 대신 열린 빈 REF CURSOR로 반환해야 한다.
+- 호출 이름은 `루틴`, `패키지.루틴`, `스키마.패키지.루틴` 형태를 지원한다. 인수는 바인드만 사용하며 `p_id => :id` 같은 명명 인수도 가능하다. 주석·리터럴·추가 문장·DECLARE·SQL*Plus의 `/`는 넣지 않는다.
+- 루틴은 `ORACLE_MOCK=0`인 실제 Oracle에서 실행한다. mock에서는 지원하지 않는다는 오류를 반환한다.
+
+프로시저·함수의 실행/결과 읽기 오류는 해당 조회 이력의 실패로 기록하고 에이전트 흐름을 계속한다.
+병렬 실행에서는 실패한 항목과 관계없이 다른 항목의 결과를 보존한다. 커서 닫기·rollback·연결 반납의
+오류가 원래 결과를 덮지 않으며, 정리에 실패한 연결은 재사용하지 않도록 폐기한다.
+
+루틴은 읽기 전용 트랜잭션과 `autoCommit: false`로 실행하고 결과를 읽은 뒤 rollback한다.
+루틴 내부의 일반 DML은 거부되지만, 명시적 COMMIT/ROLLBACK이나 자율 트랜잭션·외부 호출의
+부작용까지 SQL 호출 형식 검사로 보장할 수는 없다. 따라서 조회 전용으로 검증한 루틴만 등록하고
+대상 계정에는 해당 루틴의 EXECUTE 권한만 추가한다. 데이터를 변경하는 업무 실행은 이 기능의 범위에 포함하지 않는다.
+
+기존 테스트 Oracle 컨테이너에서 루틴 통합 검증만 실행하려면:
+
+```bash
+cd backend
+ORACLE_TEST_EXISTING_CONTAINER=oracle1521 node --test --test-name-pattern='등록 프로시저' test/oracle/oracle.test.js
+```
+
+이 모드는 새 DB를 만들거나 기존 데이터를 초기화하지 않는다. 기존 `APP_USER`, `VOC_READER`
+샘플 계정을 사용하며, 고유 이름의 검증용 루틴과 테이블만 생성한 뒤 정리한다.
+
+바인드 방향과 REF CURSOR 처리 방식은 [node-oracledb 바인드 문서](https://node-oracledb.readthedocs.io/en/latest/user_guide/bind.html)를 따른다.
+
 ### 같은 쿼리를 여러 DB 중 하나에서 실행하기
 
 `target_db_name`에 `;`로 후보를 나열하면 LLM이 그중 하나를 골라 실행한다. 하나만 적으면 지금까지와 같이 그 DB로 고정된다.
@@ -607,7 +678,7 @@ could not be initialized …`가 남고 조회는 전부 실패한다 — 이 �
 
 ## 보안
 
-- **조회 전용 가드**: 실행 직전 SELECT/WITH로 시작하는 단일 문장만 허용 — UPDATE/DELETE/DDL/다중 문장은 차단된다 (`sql.js`의 `assertReadOnly`).
+- **조회 전용 가드**: QUERY 유형은 실행 직전 SELECT/WITH로 시작하는 단일 문장만 허용 — UPDATE/DELETE/DDL/다중 문장은 차단된다 (`sql.js`의 `assertReadOnly`).
   `SELECT … FOR UPDATE`도 거부한다 — 조회 문장이라 '첫 키워드' 검사는 통과하지만 조회대상 DB의 행에 잠금을 걸어 운영 트랜잭션을 대기시킨다.
   문자열 리터럴·주석 경계는 정규식이 아니라 단일 패스 스캐너로 판정한다 — Oracle q-quote(`q'!...!'`)는 구분자가 임의 문자라
   일부만 모델링하면 리터럴에 숨은 세미콜론을 놓치거나 정상 쿼리를 오탐한다. 경계를 확정할 수 없는 SQL(닫히지 않은 리터럴)은 거부한다.

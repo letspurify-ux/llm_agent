@@ -983,3 +983,26 @@ test('등록 1000건의 라우팅은 이름 인덱스와 상위 30건 상세 조
   assert.equal(registryStatements[0].sql, 'SELECT seq, query_name FROM query_registry');
   assert.equal(registryStatements[1].args[0].length, 30);
 });
+
+test('루틴 마이그레이션은 기존 쿼리를 보존하며 반복 적용·관리자 CRUD를 지원한다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  await conn.query('ALTER TABLE query_registry DROP COLUMN bind_config, DROP COLUMN query_type');
+  await conn.query("INSERT INTO query_registry (query_name, query_sql, target_db_name) VALUES ('legacy', 'SELECT 1 FROM dual', 'OPS')");
+  await conn.query(await sqlFile('migrate-routines.sql'));
+  await conn.query(await sqlFile('migrate-routines.sql'));
+  const [legacy] = await conn.query("SELECT * FROM query_registry WHERE query_name='legacy'");
+  assert.equal(legacy.query_type, 'QUERY');
+  assert.equal(legacy.bind_config, null);
+  assert.equal(legacy.query_sql, 'SELECT 1 FROM dual');
+  await conn.query("INSERT INTO target_db (db_name, connection_info, db_user, db_password) VALUES ('OPS', 'unused', 'reader', 'unused')");
+  const store = createAdminStore();
+  const saved = await store.save('queries', { query_name: 'routine', query_type: 'FUNCTION',
+    query_sql: 'BEGIN :result := app.total(:id); END;', target_db_name: 'OPS',
+    bind_config: '{"id":{"dir":"IN","type":"NUMBER"},"result":{"dir":"OUT","type":"NUMBER"}}' });
+  assert.equal(saved.query_type, 'FUNCTION');
+  assert.equal(JSON.parse(saved.bind_config).result.dir, 'OUT');
+  assert.equal((await store.list('queries', { q: 'FUNCTION' })).items[0].query_type, 'FUNCTION');
+  const edited = await store.save('queries', { ...saved, query_desc: '수정' }, saved.seq, saved.revision);
+  assert.equal(edited.query_type, 'FUNCTION');
+  await store.remove('queries', edited.seq, edited.revision);
+});

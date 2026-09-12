@@ -1,7 +1,7 @@
 import express from 'express';
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { query, getConnection, releaseConnection } from './db.js';
-import { assertReadOnly } from './sql.js';
+import { executionSpec } from './execution.js';
 import { nameIndexOf, targetDbNames } from './constants.js';
 
 const resources = {
@@ -16,11 +16,12 @@ const resources = {
     title: [200, true], method: [null, true],
   } },
   queries: { table: 'query_registry', name: 'query_name', summary: 'query_desc', fields: {
+    query_type: [20, true], bind_config: [null, false],
     query_name: [100, true], query_desc: [null, false], input_desc: [1000, false],
     query_sql: [null, true], output_desc: [null, false], target_db_name: [500, true],
   } },
 };
-const labels = { db_name: 'DB 이름', db_type: 'DB 유형', connection_info: '접속 주소',
+const labels = { query_type: '실행 유형', bind_config: '바인드 설정', db_name: 'DB 이름', db_type: 'DB 유형', connection_info: '접속 주소',
   db_user: '조회 대상 DB 사용자명', db_password: '조회 대상 DB 비밀번호', title: '제목', content: '지식 본문',
   method: '처리 방법', query_name: '쿼리 이름', query_desc: '쿼리 설명', input_desc: '입력 설명',
   query_sql: 'SQL', output_desc: '출력 설명', target_db_name: '대상 DB' };
@@ -63,7 +64,7 @@ export function validateAdminRecord(kind, body, editing = false) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw problem(400, '입력 내용을 확인해주세요.');
   const result = {};
   for (const [key, [limit, required]] of Object.entries(config.fields)) {
-    const raw = Object.hasOwn(body, key) ? body[key] : '';
+    const raw = Object.hasOwn(body, key) ? body[key] : key === 'query_type' ? 'QUERY' : '';
     if (typeof raw !== 'string') throw problem(400, `${labels[key]}은(는) 문자열이어야 합니다.`);
     // 본문·SQL과 비밀번호의 원문 공백은 보존한다.
     const value = ['content', 'method', 'query_sql', 'db_password'].includes(key) ? raw : raw.trim();
@@ -83,7 +84,7 @@ export function validateAdminRecord(kind, body, editing = false) {
     }
   }
   if (kind === 'queries') {
-    try { assertReadOnly(result.query_sql); } catch (e) { throw problem(400, e.message); }
+    try { executionSpec(result); } catch (e) { throw problem(400, e.message); }
     const names = targetDbNames(result.target_db_name);
     if (!names.length) throw problem(400, '대상 DB를 하나 이상 선택해주세요.');
     result.target_db_name = names.join(';');
@@ -152,7 +153,7 @@ export function createAdminStore(read = query, transaction = writeTransaction) {
       const [count] = await read(`SELECT COUNT(*) AS total FROM ${config.table} ${where}`, params);
       const total = Number(count.total);
       const currentPage = Math.min(Number(page), Math.max(1, Math.ceil(total / 20)));
-      const items = await read(`SELECT seq, ${config.name} AS name, LEFT(${config.summary}, 160) AS summary
+      const items = await read(`SELECT seq, ${config.name} AS name, LEFT(${config.summary}, 160) AS summary${kind === 'queries' ? ', query_type' : ''}
         FROM ${config.table} ${where} ORDER BY seq DESC LIMIT 20 OFFSET ?`, [...params, (currentPage - 1) * 20]);
       return { items, total, page: currentPage, pageSize: 20 };
     },
