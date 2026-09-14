@@ -48,7 +48,6 @@ export function mountRobot(host) {
     return pivot;
   });
   [-1, 1].forEach(side => sphere(robot, blue, side * 0.25, -1.05, 0.1, 0.2, 0.12, 0.25));
-  const motion = matchMedia('(prefers-reduced-motion: reduce)');
   let visible = true;
   let lost = false;
   let targetX = 0;
@@ -58,11 +57,11 @@ export function mountRobot(host) {
   function frame(now) {
     time += last ? Math.min((now - last) / 1000, 0.05) : 0;
     last = now;
-    const t = motion.matches ? 0 : time;
+    const t = time;
     robot.position.y = Math.sin(t * 2) * 0.065;
     robot.rotation.z = Math.sin(t * 1.3) * 0.035;
-    head.rotation.y += ((motion.matches ? 0 : targetX * 0.35 + Math.sin(t * 0.8) * 0.09) - head.rotation.y) * 0.09;
-    head.rotation.x += ((motion.matches ? 0 : targetY * 0.2) - head.rotation.x) * 0.09;
+    head.rotation.y += (targetX * 0.35 + Math.sin(t * 0.8) * 0.09 - head.rotation.y) * 0.09;
+    head.rotation.x += (targetY * 0.2 - head.rotation.x) * 0.09;
     const blink = t % 4.3;
     eyes.forEach(eye => { eye.scale.y = 0.14 * (blink > 3.95 && blink < 4.13 ? 0.12 : 1); });
     arms[0].rotation.z = -0.15 + Math.sin(t * 2) * 0.08;
@@ -75,7 +74,7 @@ export function mountRobot(host) {
     last = 0;
     if (lost || !visible || document.hidden) return;
     frame(performance.now());
-    if (!motion.matches) renderer.setAnimationLoop(frame);
+    renderer.setAnimationLoop(frame);
   }
   function resize() {
     const { width, height } = host.getBoundingClientRect();
@@ -103,7 +102,6 @@ export function mountRobot(host) {
   window.addEventListener('pointermove', pointer, { passive: true });
   window.addEventListener('blur', reset);
   document.addEventListener('visibilitychange', sync);
-  motion.addEventListener('change', sync);
   renderer.domElement.addEventListener('webglcontextlost', contextLost);
   renderer.domElement.addEventListener('webglcontextrestored', contextRestored);
   return () => {
@@ -113,7 +111,6 @@ export function mountRobot(host) {
     window.removeEventListener('pointermove', pointer);
     window.removeEventListener('blur', reset);
     document.removeEventListener('visibilitychange', sync);
-    motion.removeEventListener('change', sync);
     renderer.domElement.removeEventListener('webglcontextlost', contextLost);
     renderer.domElement.removeEventListener('webglcontextrestored', contextRestored);
     scene.traverse(object => { object.geometry?.dispose(); });
