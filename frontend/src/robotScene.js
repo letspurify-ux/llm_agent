@@ -42,7 +42,6 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
   const dark = material(0x222e43, 0.27, 0.08);
   const joint = material(0x68758f, 0.5, 0.18);
   const eyesMaterial = luminous(0xb0f7ec);
-  const blush = luminous(0xd7a4b6);
 
   function geometry(id, create) {
     if (!geometries.has(id)) geometries.set(id, create());
@@ -114,7 +113,6 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
   panel(head, lavender, 0, -0.025, 0.365, 1.045, 0.69, 0.245);
   panel(head, dark, 0, -0.025, 0.405, 0.96, 0.61, 0.22);
   const eyes = [-0.225, 0.225].map(x => sphere(head, eyesMaterial, x, 0.005, 0.449, 0.059, 0.099, 0.024));
-  [-0.32, 0.32].forEach(x => sphere(head, blush, x, -0.12, 0.448, 0.055, 0.028, 0.012));
   tube(head, eyesMaterial, [[-0.085, -0.135, 0.45], [0, -0.22, 0.452], [0.085, -0.135, 0.45]], 0.013);
   // Small satin ear caps and a single offset antenna give the silhouette its character.
   [-1, 1].forEach(side => {
