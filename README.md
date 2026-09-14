@@ -554,6 +554,13 @@ JSON 하나로 답하는 프록시도 같은 길로 읽는다.
 2. `.env`에서 `ORACLE_MOCK=0`, 참조하는 비밀번호 환경변수(`ORDER_DB_PASSWORD`) 설정
 3. `query_registry`의 쿼리를 실제 테이블 구조에 맞게 등록
 
+QUERY·PROCEDURE·FUNCTION은 모두 실행할 커넥션에서 `DBMS_OUTPUT.ENABLE(NULL)`을 호출해
+`SERVEROUTPUT ON` 상태로 동작한다. 매 실행 전에 이전 버퍼를 비우고, 조회 결과를 읽고 커서를
+닫은 뒤 버퍼를 정리한다. `DBMS_OUTPUT` 버퍼를 컬렉션이나 파이프라인 함수로 읽어 OUT CURSOR를
+만드는 루틴도 이 설정을 사용한다. 앱은 버퍼를 별도로 읽어 답변에 붙이지 않으므로, 결과로 사용할
+내용은 해당 실행의 조회 행이나 OUT 바인드로 반환해야 한다. 버퍼는 별도 실행 간에 공유하지 않는다.
+이 동작은 `ORACLE_ROUTINE_READ_ONLY` 설정과 관계없이 적용된다.
+
 ### 프로시저와 함수 등록
 
 `query_registry`를 공통 실행 목록으로 사용한다. `query_type`은 `QUERY`(기본값),

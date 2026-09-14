@@ -287,6 +287,100 @@ async function oracleAdminSql(sql) {
   assert.equal(code, 0, output);
 }
 
+test('DBMS_OUTPUT: 쿼리·프로시저·함수의 출력 3행과 재사용 세션 버퍼 정리', async t => {
+  const packageName = `AGOUT${randomUUID().replaceAll('-', '').slice(0, 8)}`;
+  const qualified = `APP_USER.${packageName}`;
+  const savedReadOnly = process.env.ORACLE_ROUTINE_READ_ONLY;
+  let created = false, testPool;
+  await closeOraclePools();
+  const createPool = oracledb.createPool.bind(oracledb);
+  // 매번 같은 실제 세션을 사용해 이전 실행의 버퍼가 남지 않는지도 확인한다.
+  t.mock.method(oracledb, 'createPool', async options => {
+    testPool = await createPool({ ...options, poolMin: 1, poolMax: 1 });
+    return testPool;
+  });
+  t.after(async () => {
+    await closeOraclePools();
+    if (created) await oracleAdminSql(`DROP PACKAGE ${qualified};`);
+    if (savedReadOnly === undefined) delete process.env.ORACLE_ROUTINE_READ_ONLY;
+    else process.env.ORACLE_ROUTINE_READ_ONLY = savedReadOnly;
+  });
+  await oracleAdminSql(`CREATE OR REPLACE PACKAGE ${qualified} AS
+    FUNCTION drain RETURN SYS.DBMSOUTPUT_LINESARRAY PIPELINED;
+    FUNCTION emit_rows RETURN SYS.DBMSOUTPUT_LINESARRAY PIPELINED;
+    PROCEDURE by_collection(p_rows OUT SYS_REFCURSOR);
+    PROCEDURE by_cursor(p_rows OUT SYS_REFCURSOR);
+    FUNCTION cursor_fn RETURN SYS_REFCURSOR;
+    FUNCTION count_fn RETURN NUMBER;
+    PROCEDURE leftover(p_value OUT NUMBER);
+    PROCEDURE fail_output(p_value OUT NUMBER);
+  END;\n/`);
+  created = true;
+  await oracleAdminSql(`CREATE OR REPLACE PACKAGE BODY ${qualified} AS
+    PROCEDURE write_lines IS BEGIN
+      DBMS_OUTPUT.PUT_LINE('row 1'); DBMS_OUTPUT.PUT_LINE('row 2'); DBMS_OUTPUT.PUT_LINE('row 3');
+    END;
+    FUNCTION drain RETURN SYS.DBMSOUTPUT_LINESARRAY PIPELINED IS
+      v_line VARCHAR2(32767); v_status INTEGER;
+    BEGIN LOOP
+      DBMS_OUTPUT.GET_LINE(v_line, v_status); EXIT WHEN v_status = 1; PIPE ROW(v_line);
+    END LOOP; RETURN; END;
+    FUNCTION emit_rows RETURN SYS.DBMSOUTPUT_LINESARRAY PIPELINED IS
+      v_line VARCHAR2(32767); v_status INTEGER;
+    BEGIN write_lines; LOOP
+      DBMS_OUTPUT.GET_LINE(v_line, v_status); EXIT WHEN v_status = 1; PIPE ROW(v_line);
+    END LOOP; RETURN; END;
+    PROCEDURE by_collection(p_rows OUT SYS_REFCURSOR) IS
+      v_lines SYS.DBMSOUTPUT_LINESARRAY := SYS.DBMSOUTPUT_LINESARRAY(); v_count INTEGER := 100;
+    BEGIN write_lines; DBMS_OUTPUT.GET_LINES(v_lines, v_count);
+      OPEN p_rows FOR SELECT COLUMN_VALUE AS LINE FROM TABLE(v_lines) WHERE ROWNUM <= v_count;
+    END;
+    PROCEDURE by_cursor(p_rows OUT SYS_REFCURSOR) IS BEGIN write_lines;
+      OPEN p_rows FOR SELECT COLUMN_VALUE AS LINE FROM TABLE(${qualified}.drain());
+    END;
+    FUNCTION cursor_fn RETURN SYS_REFCURSOR IS c SYS_REFCURSOR; BEGIN by_cursor(c); RETURN c; END;
+    FUNCTION count_fn RETURN NUMBER IS
+      v_lines SYS.DBMSOUTPUT_LINESARRAY := SYS.DBMSOUTPUT_LINESARRAY(); v_count INTEGER := 100;
+    BEGIN write_lines; DBMS_OUTPUT.GET_LINES(v_lines, v_count); RETURN v_count; END;
+    PROCEDURE leftover(p_value OUT NUMBER) IS BEGIN write_lines; p_value := 1; END;
+    PROCEDURE fail_output(p_value OUT NUMBER) IS BEGIN write_lines;
+      RAISE_APPLICATION_ERROR(-20001, 'output fixture failure');
+    END;
+  END;\n/\nGRANT EXECUTE ON ${qualified} TO VOC_READER;`);
+  const spec = (query_type, sql, name = 'rows', type = 'CURSOR') => ({ ...registry(sql), query_type,
+    bind_config: query_type === 'QUERY' ? '' : JSON.stringify({ [name]: { dir: 'OUT', type } }) });
+  const cases = [
+    spec('QUERY', `SELECT COLUMN_VALUE AS LINE FROM TABLE(${qualified}.emit_rows())`),
+    spec('PROCEDURE', `BEGIN ${qualified}.by_collection(:rows); END;`),
+    spec('PROCEDURE', `BEGIN ${qualified}.by_cursor(:rows); END;`),
+    spec('FUNCTION', `BEGIN :rows := ${qualified}.cursor_fn(); END;`),
+  ];
+  const expected = [{ LINE: 'row 1' }, { LINE: 'row 2' }, { LINE: 'row 3' }];
+  const assertBufferEmpty = async () => {
+    const conn = await testPool.getConnection();
+    try {
+      // ENABLE만 호출하므로, 앱이 버퍼를 비우지 않았다면 남은 줄이 여기서 검출된다.
+      const r = await conn.execute('BEGIN DBMS_OUTPUT.ENABLE(NULL); DBMS_OUTPUT.GET_LINE(:line, :status); END;',
+        { line: { dir: oracledb.BIND_OUT, type: oracledb.STRING, maxSize: 32767 },
+          status: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER } });
+      assert.equal(r.outBinds.status, 1, '풀에 반납한 세션에 이전 DBMS_OUTPUT이 남았다');
+    } finally { await conn.close(); }
+  };
+  for (const readOnly of ['1', '0']) {
+    process.env.ORACLE_ROUTINE_READ_ONLY = readOnly;
+    for (const row of cases) {
+      const result = await runQuery(row);
+      assert.deepEqual(result.rows, expected, `${row.query_type}, READ_ONLY=${readOnly}`);
+      assert.equal(result.totalRows, 3);
+    }
+    assert.deepEqual((await runQuery(spec('FUNCTION', `BEGIN :count := ${qualified}.count_fn(); END;`, 'count', 'NUMBER'))).rows, [{ count: '3' }]);
+    await runQuery(spec('PROCEDURE', `BEGIN ${qualified}.leftover(:value); END;`, 'value', 'NUMBER'));
+    await assertBufferEmpty();
+    await assert.rejects(runQuery(spec('PROCEDURE', `BEGIN ${qualified}.fail_output(:value); END;`, 'value', 'NUMBER')), e => e.errorNum === 20001);
+    await assertBufferEmpty();
+  }
+});
+
 test('등록 프로시저·함수: REF CURSOR, 스칼라 OUT/INOUT, 정밀도, 읽기 전용 실행', async t => {
   const prefix = `AGRT${randomUUID().replaceAll('-', '').slice(0, 8)}_`;
   const scoped = sql => sql.replaceAll('routine_', prefix);

@@ -77,6 +77,10 @@ const NLS_SESSION_FORMATS =
   " NLS_TIMESTAMP_FORMAT='YYYY-MM-DD HH24:MI:SS.FF3'" +
   " NLS_TIMESTAMP_TZ_FORMAT='YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM'";
 
+// SERVEROUTPUT ON에 해당하는 세션 설정. 풀의 이전 호출이 남긴 버퍼도 먼저 비운다.
+const PREPARE_DBMS_OUTPUT = 'BEGIN DBMS_OUTPUT.DISABLE; DBMS_OUTPUT.ENABLE(NULL); END;';
+const CLEAR_DBMS_OUTPUT = 'BEGIN DBMS_OUTPUT.DISABLE; END;';
+
 // 조회 타임아웃(ms). 0/음수/NaN/빈 값은 기본값으로 되돌린다 —
 // 드라이버는 NaN에 NJS-004를 던지고, 0은 "타임아웃 없음"이라 오타 하나가 무한 대기를 만든다.
 const TIMEOUT_MS = numEnv('ORACLE_TIMEOUT_MS', 30_000);
@@ -368,6 +372,7 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
   };
   signal?.addEventListener('abort', onAbort, { once: true });
   let cursor;
+  let outputPrepared = false;
   try {
     throwIfAborted(signal);
     // 조회 타임아웃 — 느린 쿼리(락 대기, 잘못된 실행계획)가 요청을 무한 대기시키지 않게.
@@ -381,6 +386,11 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
     // fetchArraySize·prefetchRows를 행 상한에 맞춘다 — 기본값(100)이면 상한(1,001행)까지 왕복이 11번이다.
     // 행 수 상한이 곧 메모리 상한이므로 한 번에 받아도 크기는 같다.
     if (spec.type !== 'QUERY' && oracleRoutineReadOnly()) await conn.execute('SET TRANSACTION READ ONLY');
+    throwIfAborted(signal);
+    // QUERY 안의 함수도 DBMS_OUTPUT을 쓸 수 있다. 매 실행의 같은 커넥션에서 활성화하며,
+    // 반환 커서가 버퍼를 읽을 수 있으므로 GET_LINE(S)로 먼저 소비하지 않는다.
+    outputPrepared = true;
+    await conn.execute(PREPARE_DBMS_OUTPUT);
     throwIfAborted(signal);
     const result = await conn.execute(sql, binds, {
       autoCommit: false,
@@ -412,6 +422,8 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
     let drop = false;
     try { if (cursor) await cursor.close(); } catch { drop = true; }
     try { if (spec.type !== 'QUERY') await conn.rollback(); } catch { drop = true; }
+    // 결과 fetch·커서 닫기가 끝나야 버퍼를 지울 수 있다. 실패·취소 때도 다음 요청에 남기지 않는다.
+    try { if (outputPrepared) await conn.execute(CLEAR_DBMS_OUTPUT); } catch { drop = true; }
     await release(drop);
   }
 }

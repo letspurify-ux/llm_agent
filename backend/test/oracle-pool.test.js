@@ -117,7 +117,7 @@ test('요청 취소는 실행 중인 Oracle 문장을 끊고 커넥션을 반납
       const conn = {
         callTimeout: 0,
         async execute(sql) {
-          if (/^ALTER SESSION/.test(sql)) return { rows: [] };
+          if (/^ALTER SESSION|^BEGIN DBMS_OUTPUT\./.test(sql)) return { rows: [] };
           entered.resolve();
           return new Promise((_resolve, reject) => { rejectExecution = reject; });
         },
