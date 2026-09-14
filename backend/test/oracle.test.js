@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import oracledb from 'oracledb';
-import { runQuery, normalizeCells, numberFromString, oracleMock, oracleDriver, resolveTargetDb, localDateTime } from '../src/oracle.js';
+import { runQuery, normalizeCells, numberFromString, oracleMock, oracleRoutineReadOnly, oracleDriver, resolveTargetDb, localDateTime } from '../src/oracle.js';
 import { targetDbNames } from '../src/constants.js';
 import { llmProvider, sanitizeDecision } from '../src/llm.js';
 import { MAX_CELL_LEN, MAX_RESULT_COLS, MAX_TARGET_DB_NAME_LEN, TRUNC_MARK } from '../src/constants.js';
@@ -137,6 +137,32 @@ test('ORACLE_MOCK 표기를 흡수하고 모르는 값은 실제 접속으로 �
     console.warn = origWarn;
     process.env.ORACLE_MOCK = saved ?? '1';   // 이 파일의 나머지 테스트가 mock 경로를 쓴다
   }
+});
+
+test('ORACLE_ROUTINE_READ_ONLY는 명시적으로 끌 때만 해제하고 미설정·오타는 읽기 전용을 유지한다', t => {
+  const saved = process.env.ORACLE_ROUTINE_READ_ONLY;
+  const warned = [];
+  t.mock.method(console, 'warn', message => warned.push(String(message)));
+  t.after(() => {
+    if (saved === undefined) delete process.env.ORACLE_ROUTINE_READ_ONLY;
+    else process.env.ORACLE_ROUTINE_READ_ONLY = saved;
+  });
+  delete process.env.ORACLE_ROUTINE_READ_ONLY;
+  assert.equal(oracleRoutineReadOnly(), true, '미설정');
+  for (const value of ['', '  ', '1', 'true', 'TRUE', ' yes ', 'on']) {
+    process.env.ORACLE_ROUTINE_READ_ONLY = value;
+    assert.equal(oracleRoutineReadOnly(), true, value);
+  }
+  for (const value of ['0', 'false', 'FALSE', ' no ', 'off', ' OFF ']) {
+    process.env.ORACLE_ROUTINE_READ_ONLY = value;
+    assert.equal(oracleRoutineReadOnly(), false, value);
+  }
+  for (const value of ['maybe', '2', 'flase']) {
+    process.env.ORACLE_ROUTINE_READ_ONLY = value;
+    assert.equal(oracleRoutineReadOnly(), true, value);
+  }
+  assert.equal(warned.length, 3);
+  assert.ok(warned.every(message => message.includes('ORACLE_ROUTINE_READ_ONLY')));
 });
 
 test('ORACLE_DRIVER 표기를 흡수하고 모르는 값은 thin으로 두되 알린다', () => {

@@ -92,19 +92,31 @@ const TRANSPORT_CONNECT_TIMEOUT_S = 5;
 // 모르는 값은 '실제 접속'으로 두되(현재 동작 유지) 반드시 소리가 나게 한다 — 조용히 mock으로
 // 돌리면 운영 DB를 조회한다고 믿는 답변이 stub 데이터로 나간다.
 // 값은 호출 시점에 읽는다 (test/oracle.test.js가 import 뒤에 설정한다).
-const MOCK_ON = ['1', 'true', 'yes', 'on'];
-const MOCK_OFF = ['0', 'false', 'no', 'off'];
+const FLAG_ON = ['1', 'true', 'yes', 'on'];
+const FLAG_OFF = ['0', 'false', 'no', 'off'];
 
 export function oracleMock() {
   const raw = process.env.ORACLE_MOCK;
   if (raw === undefined || String(raw).trim() === '') return false;
   const v = nameKey(raw);
-  if (MOCK_ON.includes(v)) return true;
-  if (MOCK_OFF.includes(v)) return false;
+  if (FLAG_ON.includes(v)) return true;
+  if (FLAG_OFF.includes(v)) return false;
   // scope는 설정 항목마다 따로 둔다 — LLM_PROVIDER와 한 scope('setup')를 쓰면 둘 다 오타인
   // 흔한 경우에 두 문구가 번갈아 들어와 warnOnce의 억제가 통째로 무력해진다 (llm.js 참고).
-  warnOnce('setup:oracle-mock', `unknown ORACLE_MOCK ${JSON.stringify(raw)} — treating it as off, so queries go to the real Oracle (valid: ${[...MOCK_ON, ...MOCK_OFF].join(', ')}). Check backend/.env.`);
+  warnOnce('setup:oracle-mock', `unknown ORACLE_MOCK ${JSON.stringify(raw)} — treating it as off, so queries go to the real Oracle (valid: ${[...FLAG_ON, ...FLAG_OFF].join(', ')}). Check backend/.env.`);
   return false;
+}
+
+// 루틴 내부에서 DML이 필요한 경우에만 읽기 전용 트랜잭션을 해제한다.
+// 미설정·빈 값·오타는 기존 읽기 전용 동작을 유지한다. autoCommit과 rollback은 별개다.
+export function oracleRoutineReadOnly() {
+  const raw = process.env.ORACLE_ROUTINE_READ_ONLY;
+  if (raw === undefined || String(raw).trim() === '') return true;
+  const v = nameKey(raw);
+  if (FLAG_ON.includes(v)) return true;
+  if (FLAG_OFF.includes(v)) return false;
+  warnOnce('setup:oracle-routine-read-only', `unknown ORACLE_ROUTINE_READ_ONLY ${JSON.stringify(raw)} — keeping routine transactions read-only (valid: ${[...FLAG_ON, ...FLAG_OFF].join(', ')}). Check backend/.env.`);
+  return true;
 }
 
 // ORACLE_DRIVER의 단일 해석 지점 — ORACLE_MOCK·LLM_PROVIDER와 같은 규칙으로 읽는다.
@@ -368,7 +380,7 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
     // sql은 가드가 승인하며 만든 실행용 형태다 — 여기서 다시 손보지 않는다.
     // fetchArraySize·prefetchRows를 행 상한에 맞춘다 — 기본값(100)이면 상한(1,001행)까지 왕복이 11번이다.
     // 행 수 상한이 곧 메모리 상한이므로 한 번에 받아도 크기는 같다.
-    if (spec.type !== 'QUERY') await conn.execute('SET TRANSACTION READ ONLY');
+    if (spec.type !== 'QUERY' && oracleRoutineReadOnly()) await conn.execute('SET TRANSACTION READ ONLY');
     throwIfAborted(signal);
     const result = await conn.execute(sql, binds, {
       autoCommit: false,
