@@ -1227,7 +1227,7 @@ export default function App() {
         <div className="chat-inner">
           {messages.length === 0 && !loading && (
             <div className="empty">
-              <div className="empty-icon" aria-hidden="true"><RobotIcon /></div>
+              <div className="empty-icon" aria-hidden="true"><RobotIcon variant="standing" /></div>
               <h2>무엇을 도와드릴까요?</h2>
               <p>저장된 지식과 운영 DB 조회를 결합해 답변합니다.</p>
               <div className="chips">
