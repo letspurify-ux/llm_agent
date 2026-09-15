@@ -28,7 +28,7 @@
         --accent: #4f46e5;
         --accent-2: #7c3aed;
         --grad: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
-        --robot-bg: #f0ecf8 radial-gradient(circle at 35% 22%, #fffdf7 0%, #f0ecf8 58%, #e4e1f1 100%);
+        --robot-bg: #071426 radial-gradient(circle at 35% 25%, #173f68, #071426);
       }
       * { box-sizing: border-box; }
       html, body, #root { height: 100%; }
@@ -464,7 +464,6 @@
          기다리는 중이라는 깜빡임은 투명도만 남겨 둔다: 아예 멈추면 멈춘 화면과 구별되지 않는다.
          대화를 따라가는 스크롤은 CSS가 아니라 App.jsx의 glide가 같은 질문을 하고 한 번에 놓는다. */
       @media (prefers-reduced-motion: reduce) {
-        .robot-ready canvas { animation: none; opacity: 1; }
         .bubble { animation: none; }
         .typing i { animation-name: blink-fade; }
         .home-btn:hover:not(:disabled), .chip:hover { transform: none; }

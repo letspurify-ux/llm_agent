@@ -155,7 +155,7 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
     shadow.rotation.x = -Math.PI / 2;
   }
 
-  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+  // Keep the mascot animated even when the OS disables visual effects.
   let visible = true;
   let lost = false;
   let disposed = false;
@@ -168,7 +168,7 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
     if (last !== null && now - last < 1000 / 30) return;
     const dt = last === null ? 0 : Math.min((now - last) / 1000, 0.1);
     last = now;
-    if (!reducedMotion.matches) elapsed += dt;
+    elapsed += dt;
     const t = elapsed;
     const ease = 1 - Math.exp(-6 * dt);
     head.rotation.y += (targetX * 0.35 + Math.sin(t * 0.7) * 0.045 - head.rotation.y) * ease;
@@ -194,7 +194,7 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
     last = null;
     if (disposed || lost || !visible || document.hidden) return;
     frame(performance.now());
-    if (!reducedMotion.matches) renderer.setAnimationLoop(frame);
+    renderer.setAnimationLoop(frame);
   }
   function resize() {
     const { width, height } = host.getBoundingClientRect();
@@ -206,14 +206,12 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
     sync();
   }
   function pointer(event) {
-    if (reducedMotion.matches) return;
     const rect = host.getBoundingClientRect();
     // Track the whole page relative to each robot, with a gradual response outside its icon.
     targetX = THREE.MathUtils.clamp((event.clientX - rect.left - rect.width / 2) / 250, -1, 1);
     targetY = THREE.MathUtils.clamp((event.clientY - rect.top - rect.height / 2) / 250, -1, 1);
   }
   function reset() { targetX = 0; targetY = 0; }
-  function motionChanged() { reset(); elapsed = 0; sync(); }
   function contextLost(event) { event.preventDefault(); lost = true; revealed = false; host.classList.remove('robot-ready'); sync(); }
   function contextRestored() { lost = false; sync(); }
   const observer = new ResizeObserver(resize);
@@ -226,7 +224,6 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
   window.addEventListener('pointermove', pointer, { passive: true });
   window.addEventListener('blur', reset);
   document.addEventListener('visibilitychange', sync);
-  reducedMotion.addEventListener('change', motionChanged);
   renderer.domElement.addEventListener('webglcontextlost', contextLost);
   renderer.domElement.addEventListener('webglcontextrestored', contextRestored);
   return () => {
@@ -237,7 +234,6 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
     window.removeEventListener('pointermove', pointer);
     window.removeEventListener('blur', reset);
     document.removeEventListener('visibilitychange', sync);
-    reducedMotion.removeEventListener('change', motionChanged);
     renderer.domElement.removeEventListener('webglcontextlost', contextLost);
     renderer.domElement.removeEventListener('webglcontextrestored', contextRestored);
     geometries.forEach(value => value.dispose());
