@@ -37,8 +37,9 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
     materials.add(value);
     return value;
   }
-  const pearl = material(0xfffaf0, 0.3, 0.06);
-  const lavender = material(0x9a93d2, 0.36, 0.12);
+  const pearl = material(0xffffff, 0.3, 0.06);
+  // Use a clearer blue accent so the mascot reads as blue instead of washed-out lavender.
+  const blue = material(0x4d8fce, 0.34, 0.14);
   const dark = material(0x222e43, 0.27, 0.08);
   const joint = material(0x68758f, 0.5, 0.18);
   const eyesMaterial = luminous(0xb0f7ec);
@@ -102,7 +103,7 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
   robot.add(body);
   // A little pear-shaped body and oversized head give the standing mascot a softer silhouette.
   sphere(body, pearl, 0, 0, 0, 0.4, 0.37, 0.3);
-  panel(body, lavender, 0, 0.025, 0.294, 0.19, 0.17, 0.025, 0.018);
+  panel(body, blue, 0, 0.025, 0.294, 0.19, 0.17, 0.025, 0.018);
   cylinder(robot, joint, 0, 1.6, 0, 0.12, 0.14, 0.15);
 
   const head = new THREE.Group();
@@ -110,17 +111,17 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
   head.scale.setScalar(1.08);
   robot.add(head);
   box(head, pearl, 0, 0, 0, 1.19, 0.92, 0.77, 0.25);
-  panel(head, lavender, 0, -0.025, 0.365, 1.045, 0.69, 0.245);
+  panel(head, blue, 0, -0.025, 0.365, 1.045, 0.69, 0.245);
   panel(head, dark, 0, -0.025, 0.405, 0.96, 0.61, 0.22);
   const eyes = [-0.225, 0.225].map(x => sphere(head, eyesMaterial, x, 0.005, 0.449, 0.059, 0.099, 0.024));
   tube(head, eyesMaterial, [[-0.085, -0.135, 0.45], [0, -0.22, 0.452], [0.085, -0.135, 0.45]], 0.013);
   // Small satin ear caps and a single offset antenna give the silhouette its character.
   [-1, 1].forEach(side => {
-    sphere(head, lavender, side * 0.603, -0.015, -0.01, 0.095, 0.18, 0.18);
+    sphere(head, blue, side * 0.603, -0.015, -0.01, 0.095, 0.18, 0.18);
     sphere(head, pearl, side * 0.668, -0.015, 0, 0.04, 0.1, 0.105);
   });
   rod(head, joint, [0.28, 0.42, -0.04], [0.36, 0.65, -0.04], 0.022);
-  const antenna = sphere(head, lavender, 0.36, 0.65, -0.04, 0.08, 0.08, 0.08);
+  const antenna = sphere(head, blue, 0.36, 0.65, -0.04, 0.08, 0.08, 0.08);
   sphere(head, pearl, 0.34, 0.676, 0.019, 0.024, 0.024, 0.01);
 
   const arms = [];
@@ -133,8 +134,8 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
       foot.rotation.y = side * 0.15;
       robot.add(foot);
       box(foot, pearl, 0, 0, 0.035, 0.34, 0.23, 0.43, 0.1);
-      box(foot, lavender, 0, -0.095, 0.035, 0.33, 0.055, 0.42, 0.025);
-      sphere(robot, lavender, side * 0.39, 1.39, 0, 0.1, 0.1, 0.11);
+      box(foot, blue, 0, -0.095, 0.035, 0.33, 0.055, 0.42, 0.025);
+      sphere(robot, blue, side * 0.39, 1.39, 0, 0.1, 0.1, 0.11);
       const arm = new THREE.Group();
       arm.position.set(side * 0.4, 1.38, 0);
       robot.add(arm);
