@@ -89,9 +89,9 @@ const lastLineBreak = s => Math.max(s.lastIndexOf('\n'), s.lastIndexOf('\r'));
 // 함수로 떼어낸 이유: 답변이 시스템을 빠져나가는 경로가 둘인데 하나만 묶여 있었다.
 //   ① LLM의 결정 — 아래 sanitizeDecision
 //   ② LLM이 끝내 결정을 내지 못했을 때의 폴백 — agent.js fallbackAnswer가 renderAnswer로 직접 조립한다
-// ②는 sanitizeDecision을 거치지 않으므로 조회 결과와 지식 본문(TEXT 64KB)이 통째로 실린 채
+// ②는 sanitizeDecision을 거치지 않으므로 조회 결과와 지식·처리방법 본문이 통째로 실린 채
 // 응답 본문과 chat_log.answer로 나갔다 — MAX_ANSWER_LEN이 존재하는 이유로 주석이 지목한
-// 바로 그 경로('64KB짜리 지식 본문을 그대로 실은 폴백 답변')가 정작 이 상한 밖에 있었다.
+// 바로 그 경로('긴 지식 본문을 그대로 실은 폴백 답변')가 정작 이 상한 밖에 있었다.
 // 상한을 아는 쪽이 자르는 함수도 갖고, 두 경로가 같은 함수를 부른다.
 export function clipAnswer(answer) {
   const s = String(answer ?? '');
@@ -430,7 +430,7 @@ export function renderAnswer({ knowledge, history }) {
   // (h.rows는 성공 시 빈 배열이라도 존재하므로 length가 아니라 유무로 판정한다)
   const querySucceeded = history.some(h => h.rows);
   // 비교할 셀 값 집합을 지식 루프 '밖에서' 한 번만 만든다. 지식마다 이력을 다시 훑으면
-  // (지식 20건 × 행 20개 × 컬럼 30개 = 12,000회) 매번 최대 64KB짜리 TEXT 본문을 스캔하며
+  // (지식 20건 × 행 20개 × 컬럼 30개 = 12,000회) 매번 긴 등록 본문을 스캔하며
   // 그동안 이벤트 루프가 통째로 막힌다 — find는 '맞는 지식이 없을 때'(가장 흔한 경우)
   // 언제나 전액을 지불하므로 최악이 곧 평상시다. 값은 많아야 수백 개이고 전부 짧다(MAX_CELL_LEN).
   const cellValues = querySucceeded

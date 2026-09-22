@@ -6,12 +6,14 @@ import { createAdminRouter, createAdminStore, validateAdminRecord } from '../src
 const database = { db_name: 'OPS', db_type: 'oracle', connection_info: 'localhost:1521/FREEPDB1', db_user: 'reader', db_password: 'ENV:OPS_PASSWORD' };
 const query = { query_name: 'orders', query_desc: '', query_sql: 'SELECT * FROM orders WHERE id = :id', input_desc: 'id: 숫자', output_desc: '', target_db_name: 'OPS' };
 
-test('관리 데이터 검증: 필수값·DB 유형·문자/바이트 상한·조회 SQL', () => {
+test('관리 데이터 검증: 필수값·DB 유형·필드별 문자/바이트 상한·조회 SQL', () => {
   assert.deepEqual(validateAdminRecord('databases', database), database);
   assert.equal(validateAdminRecord('knowledge', { title: ' 문서 ', content: '\n본문\n' }).content, '\n본문\n');
   assert.equal(validateAdminRecord('knowledge', { title: '😀'.repeat(200), content: '본문' }).title.length, 400);
+  const longContent = '가'.repeat(21_846);
+  assert.equal(validateAdminRecord('knowledge', { title: '긴 문서', content: longContent }).content, longContent);
   for (const [kind, body] of [
-    ['knowledge', { title: ' ', content: 'a' }], ['knowledge', { title: 'a', content: '가'.repeat(21846) }],
+    ['knowledge', { title: ' ', content: 'a' }], ['methods', { title: 'a', method: longContent }],
     ['methods', { title: 'a', method: [] }], ['databases', { ...database, db_type: 'mysql' }],
     ['databases', { ...database, db_name: 'A;B' }], ['databases', { ...database, db_password: 'ENV:' }],
     ['queries', { ...query, query_sql: 'DELETE FROM orders' }], ['queries', { ...query, target_db_name: ' ; ' }],
@@ -82,4 +84,28 @@ test('관리 API는 인증·잘못된 본문·충돌·DB 실패에 JSON으로 �
     assert.equal(res.status, status);
     assert.ok(!(await res.text()).includes('do-not-leak'));
   }
+});
+
+test('관리 API는 1MB를 넘는 지식 본문도 신규 저장 요청으로 전달한다', async t => {
+  let saved;
+  const app = express();
+  app.use('/api/admin', createAdminRouter({
+    token: 'test-key',
+    store: { save: async (kind, body) => {
+      saved = { kind, body };
+      return { ...body, seq: 1, revision: 'a'.repeat(64) };
+    } },
+  }));
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise(resolve => server.once('listening', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const content = 'a'.repeat(1_100_000);
+  const headers = { 'Content-Type': 'application/json', 'X-Admin-Request': '1', 'X-Admin-Token': 'test-key' };
+  const res = await fetch(`http://127.0.0.1:${server.address().port}/api/admin/knowledge`, {
+    method: 'POST', headers, body: JSON.stringify({ title: '긴 문서', content }),
+  });
+  assert.equal(res.status, 201);
+  await res.arrayBuffer();
+  assert.equal(saved.kind, 'knowledge');
+  assert.equal(saved.body.content, content);
 });

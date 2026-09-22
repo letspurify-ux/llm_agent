@@ -760,7 +760,8 @@ async function readEventStream(res, signal, onChunk, onContent) {
   return { content, usage, finish, error };
 }
 
-// 검색 결과 본문(knowledge.content / qa_method.method / query_sql)은 전부 TEXT라 그 자체로는 상한이 없다.
+// 검색 결과 본문(knowledge.content는 LONGTEXT, qa_method.method/query_sql은 TEXT)은 저장 크기와
+// 별개로 그 자체의 프롬프트 상한이 없다.
 // 항목 하나가 컨텍스트를 통째로 잡아먹지 않게 항목별로 자르고, 항목 수가 많을 때를 대비해
 // 섹션 합계에도 예산을 둔다. 자른 사실은 모델에게도 보이게 남긴다(TRUNC_MARK) —
 // 잘린 줄 모르면 끊긴 문장을 근거로 단정한다.

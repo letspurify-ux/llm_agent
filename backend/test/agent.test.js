@@ -263,7 +263,7 @@ test('조립할 것이 하나도 없으면 실패만 알린다', () => {
 
 test('폴백 답변도 답변 상한 안에서 나간다', () => {
   // 이 답은 llm.decide를 거치지 않아 sanitizeDecision(MAX_ANSWER_LEN) 밖에 있었다 — 조립 재료가
-  // 조회 결과(스텝 × 행 × 컬럼)와 지식 본문(TEXT 64KB)이라 정상 답변보다 오히려 커진다.
+  // 조회 결과(스텝 × 행 × 컬럼)와 지식 본문이라 정상 답변보다 오히려 커진다.
   // 실측 57만 자짜리 답변이 응답 본문과 chat_log.answer로 그대로 나갔다: 상한이 존재하는 이유로
   // constants.js가 지목한 바로 그 경로가 정작 그 상한 밖에 있었다.
   const rows = Array.from({ length: MAX_RESULT_ROWS }, (_, i) =>

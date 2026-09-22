@@ -21,6 +21,7 @@ const resources = {
     query_sql: [null, true], output_desc: [null, false], target_db_name: [500, true],
   } },
 };
+const MAX_TEXT_BYTES = 65535;
 const labels = { query_type: '실행 유형', bind_config: '바인드 설정', db_name: 'DB 이름', db_type: 'DB 유형', connection_info: '접속 주소',
   db_user: '조회 대상 DB 사용자명', db_password: '조회 대상 DB 비밀번호', title: '제목', content: '지식 본문',
   method: '처리 방법', query_name: '쿼리 이름', query_desc: '쿼리 설명', input_desc: '입력 설명',
@@ -70,8 +71,12 @@ export function validateAdminRecord(kind, body, editing = false) {
     const value = ['content', 'method', 'query_sql', 'db_password'].includes(key) ? raw : raw.trim();
     if (key === 'db_password' && editing && value === '') continue;
     if (required && !value.trim()) throw problem(400, `${labels[key]}을(를) 입력해주세요.`);
-    if (limit ? Array.from(value).length > limit : Buffer.byteLength(value, 'utf8') > 65535) {
-      throw problem(400, `${labels[key]}이(가) 너무 깁니다. ${limit ? `${limit}자` : 'UTF-8 기준 65,535바이트'} 이내로 입력해주세요.`);
+    // 지식 원문은 LONGTEXT에 보관하므로 TEXT의 65,535바이트 제한을 적용하지 않는다.
+    // 나머지 TEXT 컬럼은 스키마와 같은 상한을 유지한다.
+    const byteLimit = kind === 'knowledge' && key === 'content' ? null : MAX_TEXT_BYTES;
+    const tooLong = limit ? Array.from(value).length > limit : byteLimit !== null && Buffer.byteLength(value, 'utf8') > byteLimit;
+    if (tooLong) {
+      throw problem(400, `${labels[key]}이(가) 너무 깁니다. ${limit ? `${limit}자` : `UTF-8 기준 ${byteLimit.toLocaleString('en-US')}바이트`} 이내로 입력해주세요.`);
     }
     if (value.includes('\0')) throw problem(400, `${labels[key]}에 사용할 수 없는 문자가 있습니다.`);
     result[key] = value;
@@ -217,7 +222,9 @@ export function createAdminRouter({ store = createAdminStore(), token = process.
     }
     next();
   });
-  router.use(express.json({ limit: '1mb' }));
+  // knowledge.content은 LONGTEXT까지 받을 수 있어 기존 1MB 요청 제한으로는 충분하지 않다.
+  // 인증 미들웨어 뒤에 있어 관리자 인증을 통과한 요청에만 큰 본문을 허용한다.
+  router.use(express.json({ limit: '4gb' }));
   const handle = fn => async (req, res) => {
     try { await fn(req, res); }
     catch (e) {

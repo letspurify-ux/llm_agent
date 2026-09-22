@@ -64,6 +64,11 @@ mariadb --default-character-set=utf8mb4 < backend/sql/schema.sql
 > **이미 운영 중인 DB에는 실행하지 말 것** — schema.sql은 맨 앞에서 모든 테이블을 DROP한다.
 > 기존 설치는 앱 업데이트 전에 `backend/sql/migrate-routines.sql`을 적용한다.
 > 기존 실행 항목을 `QUERY`로 유지하면서 `query_type`, `bind_config`만 추가하며 재실행할 수 있다.
+> 지식 본문을 65,535바이트보다 길게 저장하려면 기존 설치에 `backend/sql/migrate-knowledge-content.sql`도 적용한다.
+>
+> ```bash
+> mariadb --default-character-set=utf8mb4 -u <관리자> -p < backend/sql/migrate-knowledge-content.sql
+> ```
 > 더 오래된 설치의 변경분은 아래 마이그레이션을 쓴다:
 >
 > ```sql

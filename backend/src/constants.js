@@ -73,7 +73,7 @@ export const TRUNC_MARK = '…(생략)';
 export const MAX_RESULT_COLS = 30;
 
 // ===== 프롬프트 길이 예산 =====
-// knowledge.content / qa_method.method / query_sql은 전부 TEXT(최대 64KB)이고, 조회 결과 행도
+// knowledge.content는 LONGTEXT이고 qa_method.method / query_sql은 TEXT이며, 조회 결과 행도
 // 컬럼 수 상한까지(MAX_RESULT_COLS × MAX_CELL_LEN ≈ 6천 자) 커진다 — 어느 쪽도 그 자체로는
 // 프롬프트 크기를 묶어주지 않는다. 긴 문서 몇 건이나
 // 컬럼 많은 쿼리 한 건이 등록되는 것만으로 컨텍스트를 넘겨 그 뒤 모든 질문이 'LLM 호출 실패'로 끝난다.
@@ -354,7 +354,7 @@ export const MAX_BIND_LEN = MAX_QUESTION_LEN;
 // LLM 답변(answer)의 상한 — 바인드 값과 같은 이유로 같은 경계(llm.js sanitizeDecision)에서 적용한다.
 // 결정에 실려 오는 세 값 중 이것만 상한이 없었다: query_name은 200자, params는 MAX_BIND_LEN으로
 // 묶으면서 정작 가장 큰 값이 그대로 통과했다. answer는 응답 JSON·chat_log.answer·화면으로 나가며
-// JSON 직렬화를 두 번 지난다 — 퇴화한 응답(temperature=0의 반복)이나 64KB짜리 지식 본문을 그대로
+// JSON 직렬화를 두 번 지난다 — 퇴화한 응답(temperature=0의 반복)이나 긴 지식 본문을 그대로
 // 실은 폴백 답변(llm.js renderAnswer) 하나가 응답과 로그를 통째로 부풀린다.
 // 값의 근거: 정상 답변은 프롬프트에 실린 근거(MAX_PROMPT_TOTAL_LEN)보다 길 수 없다.
 // 그보다 넉넉히 잡아 정당한 답변은 건드리지 않으면서 퇴화한 응답만 묶는다.

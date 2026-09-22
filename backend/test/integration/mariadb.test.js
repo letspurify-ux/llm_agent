@@ -103,6 +103,7 @@ test('관리자 검토: 대상 DB 이름 둘레의 탭·개행·유니코드 공
 
 test('관리자 CRUD·전체 검색·페이지 이동·참조 보호는 실제 MariaDB에 반영된다', async () => {
   await conn.query(await sqlFile('schema.sql'));
+  assert.equal((await conn.query("SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'knowledge' AND COLUMN_NAME = 'content'"))[0].DATA_TYPE, 'longtext');
   const store = createAdminStore();
   let db = await store.save('databases', { db_name: 'OPS', db_type: 'oracle', connection_info: 'localhost:1521/FREEPDB1', db_user: 'reader', db_password: 'private-value' });
   assert.equal(db.has_password, 1);
@@ -129,6 +130,11 @@ test('관리자 CRUD·전체 검색·페이지 이동·참조 보호는 실제 M
   for (let i = 0; i < 23; i++) await store.save('knowledge', { title: `문서 ${i}`, content: i === 0 ? '할인율 10%_literal' : '검색용 본문' });
   assert.equal((await store.list('knowledge')).items.length, 20);
   assert.equal((await store.list('knowledge', { page: '2' })).items.length, 3);
+  const longContent = '가'.repeat(21_846);
+  let longDoc = await store.save('knowledge', { title: '긴 문서', content: longContent });
+  assert.equal((await store.get('knowledge', longDoc.seq)).content, longContent);
+  longDoc = await store.save('knowledge', { title: longDoc.title, content: `${longContent}수정` }, longDoc.seq, longDoc.revision);
+  assert.equal((await store.get('knowledge', longDoc.seq)).content, `${longContent}수정`);
   assert.equal((await store.list('knowledge', { q: '%_' })).total, 1);
   assert.equal((await store.list('knowledge', { q: "' OR 1=1 --" })).total, 0);
   let doc = await store.get('knowledge', (await store.list('knowledge', { q: '%_' })).items[0].seq);
@@ -246,6 +252,16 @@ test('청크 마이그레이션은 기존 벡터를 보존하고 구 테이블 �
   await conn.query('DROP TABLE vec_store');
   await conn.query(migration);
   assert.equal((await conn.query('SELECT embed_hash FROM vec_qa_method WHERE seq = 7'))[0].embed_hash, 'a'.repeat(32));
+});
+
+test('기존 knowledge 본문도 마이그레이션으로 LONGTEXT가 된다', async () => {
+  await conn.query(await sqlFile('schema.sql'));
+  await conn.query('ALTER TABLE knowledge MODIFY COLUMN content TEXT NOT NULL');
+  await conn.query(await sqlFile('migrate-knowledge-content.sql'));
+  assert.equal((await conn.query("SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'knowledge' AND COLUMN_NAME = 'content'"))[0].DATA_TYPE, 'longtext');
+  const content = '가'.repeat(21_846);
+  await conn.query('INSERT INTO knowledge (title, content) VALUES (?, ?)', ['마이그레이션 문서', content]);
+  assert.equal((await conn.query('SELECT content FROM knowledge WHERE title = ?', ['마이그레이션 문서']))[0].content, content);
 });
 
 test('실제 DB에서 스키마·시드·동기화가 멱등하고 원문 수정·삭제가 반영된다', async () => {

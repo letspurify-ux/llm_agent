@@ -42,7 +42,7 @@ DROP TABLE IF EXISTS target_db;
 CREATE TABLE knowledge (
   seq     INT AUTO_INCREMENT PRIMARY KEY,
   title   VARCHAR(200) NOT NULL,
-  content TEXT NOT NULL,
+  content LONGTEXT NOT NULL,
   UNIQUE KEY uk_title (title)
 );
 

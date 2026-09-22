@@ -1066,8 +1066,8 @@ const LLM_FAILED_NOTE = '*LLM 응답을 받지 못해, 조회 결과와 등록�
 // 사라지고, 반대로 표시 없이 조립해 내보내면 실패한 사실이 사라진다 — 둘 다 남긴다.
 // (테스트에서 쓰므로 export 한다 — 두 실패 모드 다 오류를 남기지 않아 회귀가 보이지 않는다)
 // 크기는 LLM의 답변과 같은 경계로 묶는다 (llm.js clipAnswer). 이 답은 llm.decide를 거치지 않아
-// sanitizeDecision의 상한 밖에 있었는데, 조립 재료가 조회 결과(스텝 × 행 × 컬럼)와 지식 본문
-// (TEXT 64KB)이라 정상 답변보다 오히려 커질 수 있다 — 실측 57만 자짜리 답변이 응답 본문과
+// sanitizeDecision의 상한 밖에 있었는데, 조립 재료가 조회 결과(스텝 × 행 × 컬럼)와 지식·처리방법 본문이라
+// 정상 답변보다 오히려 커질 수 있다 — 실측 57만 자짜리 답변이 응답 본문과
 // chat_log.answer로 그대로 나갔다. MAX_ANSWER_LEN이 막겠다고 주석에 적어둔 바로 그 경로다.
 export function fallbackAnswer(ctx) {
   // 버린 항목은 여기서도 뺀다. 프롬프트에서 뺀 것(llm-openai.js live)을 폴백이 '관련 지식'으로 붙이면, 모델이
