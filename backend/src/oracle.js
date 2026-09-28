@@ -11,6 +11,7 @@ import { withColumnOmission } from './result.js';
 import { executionSpec } from './execution.js';
 import { MAX_ROWS, MAX_CELL_LEN, MAX_RESULT_COLS, TRUNC_MARK, MAX_TARGET_DB_NAME_LEN, MAX_BATCH_QUERIES, numEnv, nameKey, safeError, clipText, warnOnce, ownProp, bindValue, targetDbNames, isPlainObject } from './constants.js';
 import { throwIfAborted } from './abort.js';
+import { passwordEnvReference } from './password-ref.js';
 
 // 드라이버 경계에서 타입을 확정한다. LOB은 기본값이 Lob 스트림 객체라 커넥션을 닫으면 무효가 되고
 // JSON 직렬화 시 순환 참조로 예외가 난다 — CLOB만이 아니라 NCLOB/BLOB도 같은 위험이므로 전부 다룬다.
@@ -734,16 +735,21 @@ function bindProblem(v, isClippedCopy) {
 // 접두사 판정은 대소문자를 가리지 않는다 — 'env:'로 등록하면 그 문자열 자체가 비밀번호로 전송돼
 // 매 조회마다 ORA-01017이 나고, 바로 위 주석이 막으려던 계정 잠금(FAILED_LOGIN_ATTEMPTS)이
 // 그대로 재현된다. 게다가 오류 원문은 화면에 나가지 않으므로 원인이 보이지 않는다.
-const ENV_PREFIX = /^\s*env:/i;
-
 function resolvePassword(stored) {
-  if (typeof stored === 'string' && ENV_PREFIX.test(stored)) {
-    const name = stored.replace(ENV_PREFIX, '').trim();
-    const value = process.env[name];
+  const reference = passwordEnvReference(stored);
+  if (reference) {
+    if (!reference.valid) {
+      warnOnce('oracle:target-db-password', 'target DB password env var reference is invalid');
+      throw wasted(safeError(
+        '조회대상 DB 접속 정보가 서버에 설정되어 있지 않습니다.',
+        '설정 문제라 재시도해도 결과가 같다 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라'
+      ));
+    }
+    const value = process.env[reference.name];
     if (!value) {
       // 환경변수 이름도 서버 내부 식별자다 — 위 target_db 이름과 같은 이유로 화면에 내보내지 않는다.
       // 운영자가 필요로 하는 정보라 로그에는 반드시 남긴다(그게 이 실패의 유일한 단서다).
-      warnOnce('oracle:target-db-password', `target DB password env var is not set: ${name}`);
+      warnOnce('oracle:target-db-password', `target DB password env var is not set: ${reference.name}`);
       throw wasted(safeError(
         '조회대상 DB 접속 정보가 서버에 설정되어 있지 않습니다.',
         '설정 문제라 재시도해도 결과가 같다 — 다른 쿼리를 선택하거나 지금까지의 정보로 답변하라'

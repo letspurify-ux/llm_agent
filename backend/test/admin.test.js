@@ -31,6 +31,15 @@ test('비밀번호를 비워 수정하면 기존 값을 덮어쓰지 않고, 새
   assert.equal(validateAdminRecord('databases', { ...database, db_password: '  secret  ' }).db_password, '  secret  ');
 });
 
+test('환경변수 비밀번호 참조는 조회 경로와 같은 대소문자·공백·이름 규칙으로 검사한다', () => {
+  const reference = ' Env:ORDER_DB_PW ';
+  assert.equal(validateAdminRecord('databases', { ...database, db_password: reference }).db_password, reference);
+  for (const db_password of ['ENV:1', 'env:1', ' env: ', 'EnV:BAD-NAME', 'ENV:GOOD NAME']) {
+    assert.throws(() => validateAdminRecord('databases', { ...database, db_password }), { status: 400 });
+  }
+  assert.equal(validateAdminRecord('databases', { ...database, db_password: 'plain-secret' }).db_password, 'plain-secret');
+});
+
 test('검색은 비밀번호를 제외한 전체 필드에 바인드하고, 범위를 벗어난 페이지를 보정한다', async () => {
   const statements = [];
   const store = createAdminStore(async (sql, args) => {

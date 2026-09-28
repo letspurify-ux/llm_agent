@@ -3,6 +3,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypt
 import { query, getConnection, releaseConnection } from './db.js';
 import { executionSpec } from './execution.js';
 import { nameIndexOf, targetDbNames } from './constants.js';
+import { passwordEnvReference } from './password-ref.js';
 
 const resources = {
   databases: { table: 'target_db', name: 'db_name', summary: 'connection_info', fields: {
@@ -84,7 +85,8 @@ export function validateAdminRecord(kind, body, editing = false) {
   if (kind === 'databases') {
     if (result.db_type !== 'oracle') throw problem(400, '현재 조회 DB는 Oracle만 지원합니다.');
     if (result.db_name.includes(';')) throw problem(400, 'DB 이름에는 세미콜론을 사용할 수 없습니다.');
-    if (result.db_password?.startsWith('ENV:') && !/^ENV:[A-Za-z_][A-Za-z0-9_]*$/.test(result.db_password)) {
+    const passwordRef = passwordEnvReference(result.db_password);
+    if (passwordRef && !passwordRef.valid) {
       throw problem(400, '환경변수 참조는 ENV:변수명 형식으로 입력해주세요.');
     }
   }

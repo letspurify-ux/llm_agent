@@ -245,4 +245,13 @@ test('ENV: 비밀번호는 서버 환경변수에서 읽고, 비어 있으면 �
   row = { ...base, db_password: ' Env:ORDER_DB_PW ' };
   await assert.rejects(runQuery(registry), e => /ORA-12541/.test(e.message));
   assert.deepEqual(받은비밀번호, ['진짜비밀번호']);
+
+  // 이전 버전에 저장된 잘못된 참조도 평문 비밀번호로 Oracle에 전달하지 않는다.
+  for (const db_password of ['env:1', ' ENV:', ' EnV:BAD-NAME ']) {
+    row = { ...base, db_password };
+    받은비밀번호.length = 0;
+    await assert.rejects(runQuery(registry), e =>
+      e.safe === true && e.wastedStep === true && /접속 정보가 서버에 설정되어 있지 않습니다/.test(e.message));
+    assert.equal(받은비밀번호.length, 0, `${db_password}: 잘못된 참조로 접속을 시도했다`);
+  }
 });
