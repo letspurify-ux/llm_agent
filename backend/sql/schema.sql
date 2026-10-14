@@ -83,7 +83,9 @@ CREATE TABLE qa_method (
 );
 
 -- 조회 실행 관리: SQL 및 검증된 조회용 프로시저·함수. query_sql은 :param 바인드 변수 사용.
--- QUERY는 SELECT/WITH만, 루틴은 단일 호출 블록만 허용한다. 루틴은 읽기 전용 트랜잭션에서 실행한다.
+-- QUERY는 SELECT/WITH만, 루틴은 단일 호출 블록만 허용한다. 루틴은 읽기 전용 트랜잭션에서 실행하지만
+-- 쓰기 차단 경계는 아니다 — 루틴 안의 COMMIT 뒤 DML과 자율 트랜잭션(SELECT가 부르는 함수 포함)은 기록된다.
+-- 루틴은 정의자 권한으로 돌아 대상 계정 권한으로도 막히지 않으므로, 쓰기가 없는지 검토한 루틴만 등록한다.
 -- 대상 계정에는 필요한 SELECT와 검증된 루틴의 EXECUTE 권한만 부여한다.
 CREATE TABLE query_registry (
   seq            INT AUTO_INCREMENT PRIMARY KEY,

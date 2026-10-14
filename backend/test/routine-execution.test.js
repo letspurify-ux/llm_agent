@@ -51,7 +51,7 @@ test('QUERY와 스칼라 루틴도 재사용 커넥션에서 매번 출력 버�
     const result = await runQuery({ query_name: 'probe', query_type, query_sql, target_db_name: 'OUTPUT',
       bind_config: query_type === 'QUERY' ? '' : '{"count":{"dir":"OUT","type":"NUMBER"}}' });
     assert.deepEqual(result.rows, query_type === 'QUERY'
-      ? [{ LINE: 'row 1' }, { LINE: 'row 2' }, { LINE: 'row 3' }] : [{ count: '3' }]);
+      ? [{ LINE: 'row 1' }, { LINE: 'row 2' }, { LINE: 'row 3' }] : [{ count: 3 }]);
     assert.equal(enabled, false);
     assert.deepEqual(buffer, [], '커넥션 반납 전에 출력 버퍼를 비우지 않았다');
   }
@@ -145,3 +145,42 @@ for (const queryType of ['PROCEDURE', 'FUNCTION']) for (const readOnly of [undef
     } else assert.deepEqual(calls.slice(-3), [['rollback'], ['output-clear'], ['release']]);
   });
 }
+
+test('스칼라 NUMBER 출력은 조회 컬럼처럼 무손실일 때만 숫자가 되고, 범위 밖 NUMBER 입력은 접속 전에 거부한다', async t => {
+  const saved = { ORACLE_MOCK: process.env.ORACLE_MOCK, ORACLE_DRIVER: process.env.ORACLE_DRIVER };
+  process.env.ORACLE_MOCK = '0'; process.env.ORACLE_DRIVER = 'thin';
+  const executed = [];
+  t.mock.method(mariadb, 'createPool', () => ({
+    getConnection: async () => ({ query: async () => [{ db_name: 'NUMBERS', db_type: 'oracle',
+      connection_info: 'unused', db_user: 'reader', db_password: 'unused' }], release: async () => {} }), end: async () => {},
+  }));
+  t.mock.method(oracledb, 'createPool', async () => ({ getConnection: async () => ({
+    execute: async (sql, binds) => {
+      if (!sql.startsWith('DECLARE')) return {};
+      executed.push(binds.n.val);
+      // Oracle의 NUMBER→VARCHAR2 암묵 변환이 실제로 내는 표기 (실 Oracle 실측)
+      return { outBinds: { half: '.5', neg: '-.5', whole: '3', big: '123456789012345679', third: '.3333333333333333333333333333333333333333', none: null, text: '3' } };
+    },
+    rollback: async () => {}, close: async () => {},
+  }), close: async () => {} }));
+  t.after(async () => {
+    await closeOraclePools(); await closePool();
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  });
+  const number = dir => ({ dir, type: 'NUMBER' });
+  const row = { query_name: 'numbers', query_type: 'PROCEDURE', target_db_name: 'NUMBERS',
+    query_sql: 'BEGIN app.numbers(:n, :half, :neg, :whole, :big, :third, :none, :text); END;',
+    bind_config: JSON.stringify({ n: number('IN'), half: number('OUT'), neg: number('OUT'), whole: number('OUT'),
+      big: number('OUT'), third: number('OUT'), none: number('OUT'), text: { dir: 'OUT', type: 'STRING' } }) };
+  assert.deepEqual((await runQuery(row, { n: '1' })).rows, [{ half: 0.5, neg: -0.5, whole: 3,
+    big: '123456789012345679', third: '.3333333333333333333333333333333333333333', none: null, text: '3' }]);
+  for (const n of ['0', '0e999', '-0.000', '1e-130', '-1E-130', '9.99e125', '0.000123e-126', 1e-130, 2.5e-7, '123456789012345678901234567890e96']) {
+    await runQuery(row, { n });
+  }
+  for (const n of ['1e126', '-1e126', '10e125', '1e-131', '0.1e-130', '1e-400', '123456789012345678901234567890e97', '+1e+126', 1e-131]) {
+    await assert.rejects(runQuery(row, { n }), e => e.safe === true && /NUMBER 범위/.test(e.message), String(n));
+  }
+  assert.equal(executed.length, 11, '범위 밖 값은 접속(실행)하기 전에 거부되어야 한다');
+});

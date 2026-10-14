@@ -373,7 +373,7 @@ test('DBMS_OUTPUT: 쿼리·프로시저·함수의 출력 3행과 재사용 세�
       assert.deepEqual(result.rows, expected, `${row.query_type}, READ_ONLY=${readOnly}`);
       assert.equal(result.totalRows, 3);
     }
-    assert.deepEqual((await runQuery(spec('FUNCTION', `BEGIN :count := ${qualified}.count_fn(); END;`, 'count', 'NUMBER'))).rows, [{ count: '3' }]);
+    assert.deepEqual((await runQuery(spec('FUNCTION', `BEGIN :count := ${qualified}.count_fn(); END;`, 'count', 'NUMBER'))).rows, [{ count: 3 }]);
     await runQuery(spec('PROCEDURE', `BEGIN ${qualified}.leftover(:value); END;`, 'value', 'NUMBER'));
     await assertBufferEmpty();
     await assert.rejects(runQuery(spec('PROCEDURE', `BEGIN ${qualified}.fail_output(:value); END;`, 'value', 'NUMBER')), e => e.errorNum === 20001);
@@ -473,5 +473,5 @@ test('등록 프로시저·함수: REF CURSOR, 스칼라 OUT/INOUT, 정밀도, �
     assert.deepEqual(result.trace.filter(step => step.query_name === 'healthy').map(step => step.rows[0].VALUE), ['first', 'next']);
   }
   // 실패한 읽기 전용 트랜잭션도 풀에 남지 않아 후속 실행이 정상 동작한다.
-  assert.deepEqual((await runQuery(fn, { id: 1 })).rows, [{ value: '2' }]);
+  assert.deepEqual((await runQuery(fn, { id: 1 })).rows, [{ value: 2 }]);
 });

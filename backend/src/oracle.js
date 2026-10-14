@@ -114,6 +114,9 @@ export function oracleMock() {
 
 // 루틴 내부에서 DML이 필요한 경우에만 읽기 전용 트랜잭션을 해제한다.
 // 미설정·빈 값·오타는 기존 읽기 전용 동작을 유지한다. autoCommit과 rollback은 별개다.
+// 읽기 전용 트랜잭션은 실수로 섞인 DML을 막을 뿐 쓰기 차단 경계가 아니다(실 Oracle 실측): 루틴 안의
+// COMMIT은 이 트랜잭션을 끝내 그 뒤의 DML을 일반 트랜잭션으로 기록하고, 자율 트랜잭션은 처음부터 별개다.
+// 루틴은 정의자 권한으로 돌아 조회 계정 권한으로도 막히지 않는다 — 경계는 등록 전 루틴 검토다(README).
 export function oracleRoutineReadOnly() {
   const raw = process.env.ORACLE_ROUTINE_READ_ONLY;
   if (raw === undefined || String(raw).trim() === '') return true;
@@ -412,7 +415,12 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
         return capResult(rows, targetDbName);
       }
       throwIfAborted(signal);
-      return capResult([Object.fromEntries(outputs.map(b => [b.name, result.outBinds?.[b.name] ?? null]))], targetDbName);
+      // NUMBER 출력은 문자열로 받았으므로(routineBinds) 조회 컬럼과 같은 변환기를 거친다 — 정밀도를 잃지 않는
+      // 값만 숫자가 된다. 거치지 않으면 같은 3이 SELECT에서는 3, 함수에서는 '3'(0.5는 '.5')으로 나간다.
+      return capResult([Object.fromEntries(outputs.map(b => {
+        const value = result.outBinds?.[b.name] ?? null;
+        return [b.name, b.type === 'NUMBER' ? numberFromString(value) : value];
+      }))], targetDbName);
     }
     throwIfAborted(signal);
     return capResult(result.rows ?? [], targetDbName);
@@ -431,6 +439,19 @@ export async function runQuery(registryRow, params = {}, isClippedCopy = NOT_CLI
 
 // NUMBER OUT도 문자열로 받는다. OUT 바인드는 fetchTypeHandler를 거치지 않으므로
 // NUMBER로 직접 받으면 큰 정수의 정밀도가 이미 사라진다. Oracle의 암묵 변환을 사용한다.
+const NUMBER_TEXT = /^[+-]?(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/;
+
+// Oracle NUMBER가 담을 수 있는 크기인가. 범위 밖은 오류 없이 바뀐다(실측: 1e126 → '~'(무한대),
+// 1e-131 → 0) — 다른 값으로 조용히 조회하는 셈이라 접속 전에 거부한다. 판정은 표기의 자릿수로 한다
+// (JS number로 바꾸면 1e-400이 0이 되어 '0이라 괜찮다'로 통과한다).
+function inOracleNumberRange(text) {
+  const [, int = '', frac = '', exp = '0'] = NUMBER_TEXT.exec(text) ?? [];
+  const lead = (int + frac).search(/[1-9]/);
+  if (lead < 0) return true;                       // 0은 언제나 담긴다
+  const magnitude = int.length - 1 - lead + Number(exp);
+  return magnitude >= -130 && magnitude < 126;
+}
+
 function routineBinds(spec, val) {
   const directions = { IN: oracledb.BIND_IN, OUT: oracledb.BIND_OUT, INOUT: oracledb.BIND_INOUT };
   return Object.fromEntries(spec.bindings.map(b => {
@@ -440,6 +461,9 @@ function routineBinds(spec, val) {
       if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(String(value))
         || !Number.isFinite(Number(value)) || (typeof value === 'number' && Number.isInteger(value) && !Number.isSafeInteger(value))) {
         throw safeError(`:${b.name}에는 유효한 숫자를 입력해주세요. 큰 정수는 문자열로 전달해주세요.`);
+      }
+      if (!inOracleNumberRange(String(value))) {
+        throw safeError(`:${b.name}의 값이 Oracle NUMBER 범위(0 또는 절댓값 1e-130 이상 1e126 미만)를 벗어났습니다.`);
       }
     }
     if (input) value = String(value);
