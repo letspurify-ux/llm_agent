@@ -54,6 +54,28 @@ fn project_field() -> Value {
     json!({"type":"string","description":"Project name from the runtime state's projects. May be omitted only when exactly one project is configured."})
 }
 
+/// With two or more projects a source call must name one, so the definitions
+/// sent to the model require `project` and list the configured names: an
+/// omitted or misspelt project is otherwise refused and costs a request.
+pub fn require_project(definitions: &mut [Value], projects: &[Project]) {
+    if projects.len() < 2 {
+        return;
+    }
+    let names: Vec<&str> = projects.iter().map(|p| p.name.as_str()).collect();
+    for definition in definitions {
+        let parameters = &mut definition["function"]["parameters"];
+        if parameters["properties"].get("project").is_none() {
+            continue;
+        }
+        parameters["properties"]["project"] = json!({"type":"string","enum":names,"description":"Project name from the runtime state's projects (a file_read cursor keeps the project it was issued in)."});
+        if let Some(required) = parameters["required"].as_array_mut()
+            && !required.iter().any(|field| field == "project")
+        {
+            required.insert(0, json!("project"));
+        }
+    }
+}
+
 /// Limits a tool call works within.
 #[derive(Clone, Debug)]
 pub struct ToolConfig {
@@ -1919,6 +1941,27 @@ pub fn relativize_paths(value: &mut Value, root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_projects_make_the_project_required_and_listed() {
+        let offered: BTreeSet<&str> = ["file_read", "source_search", "history", "search"].into_iter().collect();
+        let project = |name: &str| Project { name: name.into(), ..Default::default() };
+        let mut one = ToolRegistry::definitions(&offered);
+        require_project(&mut one, &[project("app")]);
+        assert_eq!(one, ToolRegistry::definitions(&offered), "one project may be omitted");
+        let mut two = ToolRegistry::definitions(&offered);
+        require_project(&mut two, &[project("app"), project("batch")]);
+        for definition in &two {
+            let parameters = &definition["function"]["parameters"];
+            match definition["function"]["name"].as_str().unwrap() {
+                "file_read" | "source_search" => {
+                    assert_eq!(parameters["properties"]["project"]["enum"], json!(["app", "batch"]));
+                    assert_eq!(parameters["required"][0], "project", "{parameters}");
+                }
+                _ => assert!(parameters["properties"].get("project").is_none()),
+            }
+        }
+    }
 
     fn workspace(root: &Path) -> Workspace {
         Workspace {

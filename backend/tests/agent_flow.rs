@@ -292,3 +292,56 @@ async fn project_sources_are_read_and_old_bundles_leave_the_context() {
         "the current question stays"
     );
 }
+
+/// With two projects the model is told to name one; a call that omits it
+/// still runs when its path exists in only one project. Needs no MariaDB.
+#[tokio::test]
+async fn an_omitted_project_is_taken_from_a_path_found_in_one_project() {
+    let dir = tempfile::tempdir().unwrap();
+    for (project, file, text) in [
+        ("app", "src/search.rs", "const MAX_DIST: f64 = 0.4;\n"),
+        ("app", "README.md", "app\n"),
+        ("batch", "jobs/run.sh", "echo run\n"),
+        ("batch", "README.md", "batch\n"),
+    ] {
+        let path = dir.path().join(project).join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let mut config = llm_agent::config::Config::default();
+    config.mariadb.port = 9;
+    config.llm.base_url = "http://127.0.0.1:9/v1".into();
+    config.llm.model = "gpt-4o".into();
+    for name in ["app", "batch"] {
+        config.projects.push(llm_agent::config::Project {
+            name: name.into(),
+            root: dir.path().join(name),
+            ..Default::default()
+        });
+    }
+    let llm = Scripted::new(vec![
+        calls(vec![
+            call("r1", "file_read", json!({"path":"jobs/run.sh"})),
+            call("r2", "file_read", json!({"path":"README.md"})),
+            call("r3", "source_search", json!({"query":"MAX_DIST"})),
+        ]),
+        text("끝"),
+    ]);
+    let (app, _dir) = app(config, llm.clone());
+    let (result, _) = ask(&app, "projects", "배치 실행 스크립트 봐줘", vec![]).await;
+    assert_eq!(result.unwrap().answer, "끝");
+
+    let requests = llm.requests();
+    let read = requests[0]["tools"].as_array().unwrap().iter().find(|t| t["function"]["name"] == "file_read").unwrap();
+    assert_eq!(read["function"]["parameters"]["required"][0], "project");
+    assert_eq!(read["function"]["parameters"]["properties"]["project"]["enum"], json!(["app", "batch"]));
+
+    let found = tool_result(&requests[1], "r1");
+    assert_eq!(found["status"], "ok", "{found}");
+    assert!(found["data"]["content"]["numbered_text"].as_str().unwrap().starts_with("1|echo run"), "{found}");
+    assert!(found["data"]["adjusted_arguments"][0].as_str().unwrap().contains("batch was used"), "{found}");
+    let both = tool_result(&requests[1], "r2");
+    assert!(both["error"].as_str().unwrap().contains("exists in app, batch"), "{both}");
+    let search = tool_result(&requests[1], "r3");
+    assert!(search["error"].as_str().unwrap().starts_with("project_required"), "{search}");
+}

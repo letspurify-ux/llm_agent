@@ -170,7 +170,8 @@ async fn run(
         }
         let offered = offered_tools(config, c, final_round);
         let state = runtime_state(config, message, rounds, remaining, final_round, &offered, partial.is_empty(), notice.take());
-        let definitions = ToolRegistry::definitions(&offered.iter().map(String::as_str).collect());
+        let mut definitions = ToolRegistry::definitions(&offered.iter().map(String::as_str).collect());
+        tools::require_project(&mut definitions, &config.projects);
         let mut request = context::request(&c.history, &state, &model, definitions.clone());
         let mut estimate = context::count(&request, &model);
         let evicted = context::evict(c, config, estimate, &[question_bundle]);
@@ -433,31 +434,75 @@ enum Prepared {
     Skipped(Value),
 }
 
-/// The project a source call names, the project of the file cursor it
-/// continues, or the only configured project.
-fn resolve_project(config: &Config, name: &str, args: &Value, cursors: &BTreeMap<String, FileCursor>) -> std::result::Result<Project, String> {
+/// The project of a source call: the project of the file cursor it
+/// continues, the project it names, the only configured project, or the one
+/// project its path resolves in. The note, when there is one, tells the
+/// model which project was used instead of what it sent.
+fn resolve_project(
+    config: &Config,
+    name: &str,
+    args: &Value,
+    cursors: &BTreeMap<String, FileCursor>,
+) -> std::result::Result<(Project, Option<String>), String> {
     if name == "history" {
-        return Ok(config.projects.first().cloned().unwrap_or_else(|| Project {
+        let project = config.projects.first().cloned().unwrap_or_else(|| Project {
             name: "-".into(),
             root: std::env::temp_dir(),
             ..Default::default()
-        }));
+        });
+        return Ok((project, None));
     }
-    let wanted = args["project"].as_str().map(js_trim).filter(|s| !s.is_empty()).map(str::to_owned).or_else(|| {
-        (name == "file_read")
-            .then(|| args["cursor"].as_str().and_then(|id| cursors.get(id)).map(|c| c.project.clone()))
-            .flatten()
-    });
     let names = || config.projects.iter().map(|p| p.name.clone()).collect::<Vec<_>>().join(", ");
-    match wanted {
-        Some(wanted) => config
+    let find = |wanted: &str| {
+        config
             .projects
             .iter()
-            .find(|p| name_key(&p.name) == name_key(&wanted))
+            .find(|p| name_key(&p.name) == name_key(wanted))
             .cloned()
-            .ok_or_else(|| format!("project_not_found: no project is named {wanted:?}; configured projects: {}", names())),
-        None if config.projects.len() == 1 => Ok(config.projects[0].clone()),
-        None => Err(format!("project_required: name the project (one of: {})", names())),
+            .ok_or_else(|| format!("project_not_found: no project is named {wanted:?}; configured projects: {}", names()))
+    };
+    let sent = args["project"].as_str().map(js_trim).filter(|s| !s.is_empty());
+    // A cursor reads the file of the project it was issued in, whatever
+    // project the call names.
+    let cursor = (name == "file_read")
+        .then(|| args["cursor"].as_str().and_then(|id| cursors.get(id)))
+        .flatten();
+    if let Some(cursor) = cursor {
+        let project = find(&cursor.project)?;
+        let note = sent
+            .filter(|sent| name_key(sent) != name_key(&project.name))
+            .map(|sent| format!("project {sent:?} was replaced by {}, the project of the cursor", project.name));
+        return Ok((project, note));
+    }
+    if let Some(sent) = sent {
+        return find(sent).map(|project| (project, None));
+    }
+    if config.projects.len() == 1 {
+        return Ok((config.projects[0].clone(), None));
+    }
+    // An omitted project is taken from a path that resolves in exactly one
+    // project: refusing it would cost a model request to repeat the call.
+    let Some(path) = args["path"].as_str().map(js_trim).filter(|p| !p.is_empty()) else {
+        return Err(format!("project_required: name the project (one of: {})", names()));
+    };
+    let found: Vec<&Project> = config
+        .projects
+        .iter()
+        .filter(|p| tools::read_path(p, path).is_ok())
+        .collect();
+    match found.as_slice() {
+        [only] => Ok((
+            (*only).clone(),
+            Some(format!("project was omitted; {} was used, the only project where {path:?} exists", only.name)),
+        )),
+        [] => Err(format!(
+            "project_required: name the project (one of: {}); {path:?} was not found in any of them",
+            names()
+        )),
+        several => Err(format!(
+            "project_required: {path:?} exists in {}; name the project",
+            several.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
+        )),
     }
 }
 
@@ -527,7 +572,12 @@ async fn execute_batch(
                 }
             }
             if ToolRegistry::source_specs().iter().any(|s| s.name == call.name) {
-                let project = resolve_project(config, &call.name, &args, &c.file_cursors)?;
+                let (project, note) = resolve_project(config, &call.name, &args, &c.file_cursors)?;
+                if let Some(note) = note {
+                    let mut notes = args["__adjusted"].as_array().cloned().unwrap_or_default();
+                    notes.push(json!(note));
+                    args["__adjusted"] = json!(notes);
+                }
                 if call.name != "history" {
                     roots.insert(index, root(&project).display().to_string());
                 }
@@ -947,6 +997,59 @@ impl Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_project_comes_from_the_cursor_the_name_or_a_path_found_in_one_project() {
+        let dir = tempfile::tempdir().unwrap();
+        for (project, file) in [("a", "only_a.txt"), ("b", "only_b.txt"), ("a", "README.md"), ("b", "README.md")] {
+            std::fs::create_dir_all(dir.path().join(project)).unwrap();
+            std::fs::write(dir.path().join(project).join(file), "x\n").unwrap();
+        }
+        let mut config = Config::default();
+        for name in ["a", "b"] {
+            config.projects.push(Project {
+                name: name.into(),
+                root: dir.path().join(name),
+                ..Default::default()
+            });
+        }
+        let none = BTreeMap::new();
+        let resolve = |name: &str, args: Value, cursors: &BTreeMap<String, FileCursor>| {
+            resolve_project(&config, name, &args, cursors).map(|(p, note)| (p.name, note))
+        };
+
+        assert_eq!(resolve("file_read", json!({"project":"B","path":"README.md"}), &none).unwrap(), ("b".into(), None));
+        let (project, note) = resolve("file_read", json!({"path":"only_b.txt"}), &none).unwrap();
+        assert_eq!(project, "b");
+        assert!(note.unwrap().contains("only project where"));
+        let absolute = dir.path().join("a/only_a.txt").display().to_string();
+        assert_eq!(resolve("code_outline", json!({"path":absolute}), &none).unwrap().0, "a");
+        assert_eq!(resolve("file_list", json!({"path":"."}), &none).unwrap_err(), "project_required: \".\" exists in a, b; name the project");
+        let both = resolve("file_read", json!({"path":"README.md"}), &none).unwrap_err();
+        assert!(both.starts_with("project_required") && both.contains("exists in a, b"), "{both}");
+        let missing = resolve("file_read", json!({"path":"nowhere.txt"}), &none).unwrap_err();
+        assert!(missing.contains("was not found in any of them"), "{missing}");
+        let searched = resolve("source_search", json!({"query":"x"}), &none).unwrap_err();
+        assert_eq!(searched, "project_required: name the project (one of: a, b)");
+        assert!(resolve("file_read", json!({"project":"c"}), &none).unwrap_err().starts_with("project_not_found"));
+
+        let mut cursors = BTreeMap::new();
+        cursors.insert(
+            "k1".to_owned(),
+            FileCursor { project: "b".into(), path: "README.md".into(), hash: String::new(), start_line: 1, max_lines: 10, offset: 0 },
+        );
+        let (project, note) = resolve("file_read", json!({"project":"a","cursor":"k1"}), &cursors).unwrap();
+        assert_eq!(project, "b");
+        assert!(note.unwrap().contains("the project of the cursor"));
+        assert_eq!(resolve("file_read", json!({"cursor":"k1"}), &cursors).unwrap(), ("b".into(), None));
+        // Only a file_read cursor names a project.
+        assert!(resolve("file_list", json!({"cursor":"k1"}), &cursors).is_err());
+
+        let mut single = config.clone();
+        single.projects.truncate(1);
+        let (project, note) = resolve_project(&single, "source_search", &json!({"query":"x"}), &none).unwrap();
+        assert_eq!((project.name, note), ("a".into(), None));
+    }
 
     #[test]
     fn search_summary_keeps_never_looked_apart_from_found_nothing() {
