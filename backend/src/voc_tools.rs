@@ -99,7 +99,7 @@ pub fn specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "result_read",
-            description: "Read stored rows of an earlier query_run by its step without querying the DB again: offset (0-based row, default 0), limit (default 50, max 200) and cols (exact column names; default all). Cells cut at 200 characters stay cut.",
+            description: "Read stored rows of an earlier query_run by its step without querying the DB again: offset (0-based row, default 0), limit (default 50, max 200) and cols (exact column names; default all). Cells cut at 4,000 characters stay cut.",
             source: false,
             parameters: schema(
                 json!({"step":{"type":"integer","minimum":1},"offset":number(),"limit":{"type":"integer","minimum":1,"maximum":READ_MAX},"cols":{"type":"array","items":{"type":"string"}}}),
@@ -117,7 +117,14 @@ pub struct Clipped(BTreeSet<String>);
 impl Clipped {
     /// Cell lengths values are cut at: driver cells, answer table and chart
     /// cells (and one less when a surrogate pair was not split).
-    const LENGTHS: [usize; 6] = [200, 199, 120, 119, 60, 59];
+    const LENGTHS: [usize; 6] = [
+        crate::oracle::MAX_CELL_LEN,
+        crate::oracle::MAX_CELL_LEN - 1,
+        120,
+        119,
+        60,
+        59,
+    ];
 
     pub fn from_results(results: &BTreeMap<u64, StoredResult>) -> Self {
         let mut set = BTreeSet::new();
@@ -1126,6 +1133,10 @@ mod tests {
         });
         let mut clipped = Clipped::from_results(&results);
         assert!(clipped.contains(&long));
+        // A driver cell cut at its limit and quoted in an answer.
+        let quoted = "q".repeat(crate::oracle::MAX_CELL_LEN);
+        clipped.learn_text(&format!("비고: {quoted}{TRUNC_MARK} 입니다"));
+        assert!(clipped.contains(&quoted));
         let cell = "a\\|b".to_owned() + &"c".repeat(116);
         clipped.learn_text(&format!("| ID | {cell}{TRUNC_MARK} |"));
         assert!(clipped.contains(&("a|b".to_owned() + &"c".repeat(116))));

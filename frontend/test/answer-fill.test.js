@@ -7,7 +7,7 @@ import assert from 'node:assert';
 import { columnOmissionKey, attachColumnOmission } from '../src/answer-fill-support.js';
 
 // 드라이버 경계의 셀 상한(backend MAX_CELL_LEN)과 열 상한(MAX_RESULT_COLS).
-const MAX_CELL_LEN = 200;
+const MAX_CELL_LEN = 4000;
 const MAX_RESULT_COLS = 30;
 
 // 서버가 넓은 행을 자를 때 남기는 모양: 앞 30열 + 생략 안내 열(이름이 겹치면 '…'를 늘린다).
@@ -437,11 +437,11 @@ test('참조 없는 블록은 채울 표의 예산을 나눠 갖지 않는다', 
 });
 
 // 답변에 채워 넣는 표·차트의 칸은 이 저장소의 다른 절단과 같은 규칙으로 잘려야 한다 — 잘렸으면 표시가 붙는다.
-// 표시 없이 자르던 동안 사용자는 120자짜리 값을 온전한 값으로 읽었고(드라이버 경계가 200자에서 붙인 표시까지
+// 표시 없이 자르던 동안 사용자는 120자짜리 값을 온전한 값으로 읽었고(드라이버 경계가 셀 상한에서 붙인 표시까지
 // 함께 잘려 나갔다), 다음 턴에 그 값을 옮겨 적은 바인드는 잘린 값 가드(agent.js clippedCopyDetector)가 표시를
 // 근거로 앞부분을 찾으므로 한 번도 걸리지 않았다 — 잘린 조각으로 조회가 실행돼 0건 오답이 됐다(실측).
 test('표·차트의 칸을 자르면 잘렸다는 표시를 붙이고, 상한 안의 값과 숫자는 건드리지 않는다', () => {
-  // 드라이버 경계에서 이미 잘린 값(200자 + 표시)도 표의 상한에서 한 번 더 잘리며 표시는 하나만 남는다
+  // 드라이버 경계에서 이미 잘린 값(셀 상한 + 표시)도 표의 상한에서 한 번 더 잘리며 표시는 하나만 남는다
   const fromDriver = 'd'.repeat(MAX_CELL_LEN) + TRUNC_MARK;
   const rows = [{ EXACT: 'e'.repeat(MAX_TABLE_CELL_LEN), OVER: 'o'.repeat(MAX_TABLE_CELL_LEN + 1), DRV: fromDriver, N: 42, S: '12345678901234567' }];
   const line = resolveTableData(tblock('step: 1'), [rows]).split('\n')[2].split('|').map(c => c.trim());

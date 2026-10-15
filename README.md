@@ -814,7 +814,7 @@ INSERT INTO query_registry (query_name, query_desc, input_desc, query_sql, outpu
 - **설정의 비밀값**(LLM API 키·관리 DB 비밀번호·관리자 인증 키)은 `backend/config.credentials.json`(소유자만 읽기)에만 저장되고 화면·API 응답으로 돌아오지 않는다
 - 관리 DB 조회 한도(설정 '관리 DB → 쿼리 한도', 기본 30초) — 검색은 답변 루프의 시간 검사보다 앞에서 돌기 때문에, 여기가 매달리면 요청 상한이 통째로 성립하지 않는다
 - 조회 쿼리 한도(설정 'Oracle → 조회 한도', 기본 30초) — 느린 쿼리가 요청을 무한 대기시키지 않는다. 한도·정지·연결 끊김에는 실행 중인 문장을 `break`로 끊는다
-- 조회 결과는 1,000행(`MAX_ROWS`) 제한. 셀당 200자 절단은 드라이버 경계(`oracle.rs`)에서, 모델에게 보이는 행 수는 `query_run`의 미리보기와 `result_read`가 정한다.
+- 조회 결과는 1,000행(`MAX_ROWS`) 제한. 셀당 4,000자 절단은 드라이버 경계(`oracle.rs`)에서, 모델에게 보이는 행 수는 `query_run`의 미리보기와 `result_read`가 정한다.
   LOB/이진 값도 이 경계에서 문자열로 정규화된다
 
 ## 검색 (벡터 — 10,000건 이상 대응)

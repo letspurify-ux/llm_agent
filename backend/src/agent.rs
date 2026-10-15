@@ -630,7 +630,6 @@ async fn execute_batch(
         model: config.llm.model.clone(),
         result_tokens: config.result_budget(),
         tool_timeout_secs: config.agent.tool_timeout_secs,
-        repeated_read_limit: config.agent.repeated_read_limit,
     };
     // Values shown cut short so far, before the history moves to the
     // source-tool thread.
@@ -780,7 +779,6 @@ async fn execute_batch(
             model: config.llm.model.clone(),
             result_tokens: config.result_budget(),
             tool_timeout_secs: config.agent.tool_timeout_secs,
-            repeated_read_limit: config.agent.repeated_read_limit,
         },
         file_cursors: BTreeMap::new(),
         list_cursor_scopes: VecDeque::new(),

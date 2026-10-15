@@ -60,7 +60,6 @@ export const SETTING_GROUPS = [
       ['agent.history_bytes', '대화 이력 보관 (MiB)', 'mib'],
       ['agent.result_store_bytes', '조회 결과 보관 (MiB)', 'mib'],
       ['agent.tool_timeout_secs', '소스 도구 한도 (초)', 'number'],
-      ['agent.repeated_read_limit', '같은 범위 반복 읽기 허용', 'number'],
       ['agent.session_idle_minutes', '대화 보관 (분, 마지막 사용 후)', 'number'],
       ['agent.max_sessions', '보관 대화 수', 'number'],
     ] },

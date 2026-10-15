@@ -27,7 +27,7 @@ const dataValue = (row, key) => key === columnOmissionKey(row) ? undefined : own
 // x·y·y2 지정이 없을 때 싣는 열 수. 넓은 결과(SELECT *)를 그대로 실으면 표가 화면을 넘고, 프런트도
 // 시리즈 6개까지만 그린다.
 export const MAX_CHART_COLS = 8;
-// 셀 하나. 차트의 축 라벨·툴팁에 들어갈 값이라 프롬프트용 상한(MAX_CELL_LEN 200)보다 짧다.
+// 셀 하나. 차트의 축 라벨·툴팁에 들어갈 값이라 프롬프트용 상한(MAX_CELL_LEN 4,000)보다 짧다.
 export const MAX_CHART_CELL_LEN = 60;
 // 블록 하나에 싣는 행 수. 프런트가 그리는 행 수(frontend/src/chart.js MAX_CHART_ROWS)와 같다 — 그 위의 행은
 // 그려지지 않는 채 답변만 키운다. 조회 상한 MAX_ROWS(1000행)를 한 블록에 다 실으면 아래 총량 예산을 혼자 다 써서
@@ -175,7 +175,7 @@ const CONFIG_RE = /^\s*(type|title|x|y|y2|xtype|data)\s*:\s*(.*?)\s*$/i;
 //
 // 자른 셀에는 TRUNC_MARK를 붙인다 — 이 저장소의 다른 절단(backend/src/oracle.rs의 셀 절단, backend/src/text.rs clip_marked)과 같은
 // 규칙이다. 표시 없이 자르던 동안 두 가지가 조용히 어긋났다(실측). ① 사용자는 표의 값을 온전한 값으로 읽는다 —
-// 드라이버 경계는 200자에서 표시를 붙이는데 그 표시까지 여기서 함께 잘려 나갔다. ② 그 답변은 다음 턴의 대화 이력으로
+// 드라이버 경계는 셀 상한(4,000자)에서 표시를 붙이는데 그 표시까지 여기서 함께 잘려 나갔다. ② 그 답변은 다음 턴의 대화 이력으로
 // 되돌아오고, 모델이 표의 값을 바인드로 옮겨 적으면 잘린 값 가드(backend/src/voc_tools.rs Clipped)는 표시를 근거로
 // 앞부분을 찾으므로 표시가 없는 이 절단은 한 번도 인식하지 못했다 — 잘린 조각으로 조회가 실행돼 0건이 나오고
 // 모델은 그것을 "없다"로 읽는다. 표시가 붙으면 모델은 시스템 프롬프트의 규칙(표시로 끝나는 값은 바인드로 쓰지

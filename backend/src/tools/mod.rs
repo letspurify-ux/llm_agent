@@ -82,8 +82,11 @@ pub struct ToolConfig {
     pub model: String,
     pub result_tokens: usize,
     pub tool_timeout_secs: u64,
-    pub repeated_read_limit: usize,
 }
+
+/// Identical unchanged reads already in context before another is
+/// suppressed (force_read reads anyway).
+pub const REPEATED_READ_LIMIT: usize = 2;
 impl ToolConfig {
     pub fn result_budget(&self) -> usize {
         self.result_tokens
@@ -1621,9 +1624,9 @@ fn read_file(
                 && metadata.read_offset == offset
                 && (metadata.read_max_lines == lines || metadata.content.truncated)
         })
-        .take(s.config.repeated_read_limit)
+        .take(REPEATED_READ_LIMIT)
         .count();
-    if prior >= s.config.repeated_read_limit && !args["force_read"].as_bool().unwrap_or(false) {
+    if prior >= REPEATED_READ_LIMIT && !args["force_read"].as_bool().unwrap_or(false) {
         return Ok(
             json!({"path":path,"hash":digest,"total_lines":total_lines,"repeated_read":true,"suppressed":true,"guidance":"Unchanged range already present repeatedly in active context. Reuse it, continue it with its next_cursor, read another range, or force_read=true for deliberate verification."}),
         );
@@ -2128,7 +2131,6 @@ mod tests {
                 model: "gpt-4o".into(),
                 result_tokens: 4000,
                 tool_timeout_secs: 30,
-                repeated_read_limit: 2,
             },
             file_cursors: BTreeMap::new(),
             list_cursor_scopes: VecDeque::new(),

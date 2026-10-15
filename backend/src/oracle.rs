@@ -24,8 +24,10 @@ use tokio_util::sync::CancellationToken;
 
 /// Rows kept per result; one more is fetched to tell a capped result.
 pub const MAX_ROWS: usize = 1000;
-/// Characters (UTF-16) kept per cell.
-pub const MAX_CELL_LEN: usize = 200;
+/// Characters (UTF-16) kept per cell: a long message or note column is read
+/// whole, and a large CLOB is still bounded (rows × cells stay in memory for
+/// result_read and the answer's tables).
+pub const MAX_CELL_LEN: usize = 4_000;
 const MAX_TARGET_DB_NAME_LEN: usize = 200;
 const MAX_DB_LIST_LEN: usize = 200;
 const POOL_MAX: u32 = 8;

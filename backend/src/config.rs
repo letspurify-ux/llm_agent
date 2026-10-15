@@ -348,9 +348,11 @@ pub struct AgentConfig {
     #[serde(skip_serializing)]
     pub max_tool_calls: Option<usize>,
     pub tool_timeout_secs: u64,
-    /// Identical unchanged reads already in context before a read is
-    /// suppressed.
-    pub repeated_read_limit: usize,
+    /// Former setting for identical unchanged reads before a read is
+    /// suppressed; fixed now (`tools::REPEATED_READ_LIMIT`). Read so an older
+    /// `config.toml` loads; not used and not written back.
+    #[serde(skip_serializing)]
+    pub repeated_read_limit: Option<usize>,
     pub session_idle_minutes: u64,
     pub max_sessions: usize,
     /// Bytes of fetched query rows one conversation keeps for result_read
@@ -369,7 +371,7 @@ impl Default for AgentConfig {
             batch_tokens: None,
             max_tool_calls: None,
             tool_timeout_secs: 30,
-            repeated_read_limit: 2,
+            repeated_read_limit: None,
             session_idle_minutes: 60,
             max_sessions: 200,
             result_store_bytes: 32 * 1024 * 1024,
@@ -484,7 +486,6 @@ impl Config {
         }
         if a.run_seconds == 0
             || a.tool_timeout_secs == 0
-            || a.repeated_read_limit == 0
             || a.history_bytes < 64 * 1024
             || a.session_idle_minutes == 0
             || a.max_sessions == 0
@@ -816,12 +817,12 @@ mod tests {
         let path = dir.path().join("config.toml");
         let mut text = toml::to_string_pretty(&Config::default()).unwrap();
         assert!(!text.contains("batch_tokens"));
-        text = text.replace("[agent]\n", "[agent]\nbatch_tokens = 8000\nmax_rounds = 24\nmax_tool_calls = 8\n");
+        text = text.replace("[agent]\n", "[agent]\nbatch_tokens = 8000\nmax_rounds = 24\nmax_tool_calls = 8\nrepeated_read_limit = 3\n");
         std::fs::write(&path, text).unwrap();
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.agent.batch_tokens, Some(8000));
         let written = toml::to_string_pretty(&loaded).unwrap();
-        for former in ["batch_tokens", "max_rounds", "max_tool_calls"] {
+        for former in ["batch_tokens", "max_rounds", "max_tool_calls", "repeated_read_limit"] {
             assert!(!written.contains(former), "{former} is not written back");
         }
         // A result limit the former batch limit allowed, past half the input

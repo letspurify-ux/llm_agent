@@ -24,8 +24,8 @@ export const NODE_NAMES = Array.from({ length: MAX_PIE_SLICES + 2 }, (_, i) => �
 // 애먼 앱을 탓한다. 모두 양수이면서 내림차순이라 '기타'로 모이는 것은 늘 작은 값들이다.
 export const NODE_VALUES = NODE_NAMES.map((_, i) => (NODE_NAMES.length - i) * 8);
 
-// 조회 결과의 셀 하나가 이만큼 길 수 있다. 서버의 셀 상한(backend/src/oracle.rs MAX_CELL_LEN 200자)보다
-// 넉넉히 잡는다 — 그 상한이 늘어도 이 픽스처가 먼저 걸리게. 띄어쓰기가 없어야 한다: 줄바꿈으로 접히는
+// 조회 결과의 셀 하나가 이만큼 길 수 있다(서버의 셀 상한 backend/src/oracle.rs MAX_CELL_LEN은 4,000자) —
+// 축·범례·툴팁의 상한(30·60자)을 한참 넘는 길이면 '화면 밖으로 나가는가'를 재기에 충분하다. 띄어쓰기가 없어야 한다: 줄바꿈으로 접히는
 // 글자는 상자를 밀어내지 않으므로, 접히지 않는 한 덩어리라야 '화면 밖으로 나가는가'를 실제로 잰다.
 export const LONG_CELL = '노드'.repeat(120);
 
