@@ -168,7 +168,7 @@ impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
             url: String::new(),
-            model: "bge-m3".into(),
+            model: "qwen3-embedding:0.6b".into(),
             query_prefix: String::new(),
             sync_interval_secs: 60,
             max_distance: 0.4,

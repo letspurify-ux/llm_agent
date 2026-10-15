@@ -39,7 +39,7 @@ stop.bat
 
 ## 백엔드 연결
 
-관리자 화면 **설정 → 임베딩·검색**에 아래 값이 있어야 한다 (`backend/config.toml`의 `[embedding]` — 기본 모델이 bge-m3다).
+관리자 화면 **설정 → 임베딩·검색**에 아래 값이 있어야 한다 (`backend/config.toml`의 `[embedding]` — 기본 모델은 qwen3-embedding:0.6b이므로 bge-m3를 쓰려면 모델을 바꾼다).
 **연결 확인**으로 1024차원 응답이 오는지 볼 수 있다.
 
 ```toml

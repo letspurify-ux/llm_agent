@@ -229,6 +229,12 @@ cd frontend && npm install && npm run dev
 
 `http://localhost:5173` 접속 (`/api`는 vite proxy로 백엔드(`127.0.0.1:3001`, 포트를 바꿨다면 `BACKEND_PORT`)에 전달).
 
+인프라(MariaDB·Oracle·Ollama)와 두 앱을 한 번에 올리고 내리려면 `./start_all.sh` / `./stop_all.sh`,
+Windows는 `start_all.bat` / `stop_all.bat`을 쓴다(`--apps-only`는 앱만). Windows판은 MSI가 등록한 MariaDB 서비스
+(이름이 다르면 `MARIADB_SERVICE`), Docker Desktop의 `oracle1521` 컨테이너, PATH의 `ollama`를 전제한다. 서비스 시작·중지에는
+관리자 권한이 필요해서 일반 창에서 실행하면 UAC 확인이 한 번 뜨고, Docker Desktop이 꺼져 있으면 대신 띄우지 않고 Oracle만 건너뛴다.
+`stop_all.bat`은 Ollama 트레이 앱까지 끝낸다(`setup/qwen3-embedding/stop.bat`과 같다).
+
 `start_all.sh` 또는 각 앱의 `start.sh`로 실행하면 `backend/logs/backend.log`와
 `frontend/logs/frontend.log`에 표준 출력·오류를 기록한다. UTC 날짜 기준 **오늘과 이전 2일분**만
 보관하며(최대 72시간), 자정에 지난 로그를 `backend.log.YYYY-MM-DD` / `frontend.log.YYYY-MM-DD`로
@@ -236,6 +242,7 @@ cd frontend && npm install && npm run dev
 최초 적용 시 기록별 날짜를 판별할 수 없는 기존 누적 로그는 삭제한다. 같은 날 재시작한 새 로그는 유지한다.
 `tail -F backend/logs/backend.log`로 날짜가 바뀌어도 계속 추적할 수 있다. 날짜 기준 보관이므로
 3일 안에 발생하는 로그의 총용량 제한은 없다. `cargo run` / `npm run dev`의 직접 실행은 콘솔 출력만 한다.
+Windows의 `start.bat`(`start_all.bat`도 이것을 부른다)은 같은 파일에 덧붙이기만 하고 날짜별 정리는 하지 않는다.
 로그 보관·종료 동작 검증: 저장소 루트에서 `node --test scripts/retained-log.test.cjs`.
 
 #### 회귀 검증
@@ -821,7 +828,7 @@ INSERT INTO query_registry (query_name, query_desc, input_desc, query_sql, outpu
 - **지식 청킹**: 긴 지식은 `knowledge_chunk`로 나뉘어 검색된다(원문은 `knowledge`에 그대로).
   임베딩 상한(4,000자) 때문에 긴 문서의 뒷부분이 어떤 검색어로도 걸리지 않던 문제를 없앤다 —
   검색·읽기 규칙은 `context.md` 4절
-- **임베딩**: 로컬 Ollama의 OpenAI 호환 API (`backend/src/embedding.rs`). 기본 모델 bge-m3(1024차원). 기동 시 한 번 예열한다
+- **임베딩**: 로컬 Ollama의 OpenAI 호환 API (`backend/src/embedding.rs`). 기본 모델 qwen3-embedding:0.6b(1024차원, bge-m3도 쓸 수 있다). 기동 시 한 번 예열한다
 - **동기화**: `backend/src/embed_sync.rs`가 원본 텍스트의 MD5를 비교해 신규/변경분만 임베딩(diff, 멱등).
   서버 기동 시 1회 + 설정의 동기화 주기(기본 60초) + `llm-agent embed-sync` 수동.
   청크 규칙·해시 식은 Node 백엔드와 바이트 단위로 같아, 이전한 설치에서 다시 나누거나 다시 임베딩하지 않는다.
@@ -855,15 +862,15 @@ brew services run ollama
 ```
 
 ```bash
-ollama pull bge-m3
+ollama pull qwen3-embedding:0.6b
 ```
 
-Windows: `setup/bge-m3/start.bat` 실행 (설치 확인·모델 다운로드·검증까지 자동, 중지는 `stop.bat`).
-자세한 내용은 [setup/bge-m3/README.md](setup/bge-m3/README.md) 참고.
+Windows: `setup/qwen3-embedding/start.bat` 실행 (설치 확인·모델 다운로드·검증까지 자동, 중지는 `stop.bat`).
+자세한 내용은 [setup/qwen3-embedding/README.md](setup/qwen3-embedding/README.md) 참고 — 관련도 거리 문턱(설정, 기본 0.4)을
+그대로 써도 되는지 실측한 표와, `registry.ollama.ai`가 막힌 사내망에 모델을 파일로 반입하는 절차가 함께 있다.
 
-**다른 모델을 쓰려면** — `qwen3-embedding:0.6b`(1024차원, 640MB)용 같은 형식의 스크립트가
-[setup/qwen3-embedding/](setup/qwen3-embedding/README.md)에 있다. 관련도 거리 문턱(설정, 기본 0.4)을 그대로 써도 되는지
-실측한 표와, `registry.ollama.ai`가 막힌 사내망에 모델을 파일로 반입하는 절차가 함께 있다.
+**bge-m3를 쓰려면** — 같은 1024차원이라 설정 탭의 임베딩 모델만 `bge-m3`로 바꾸면 된다(1.2GB). 같은 형식의 스크립트가
+[setup/bge-m3/](setup/bge-m3/README.md)에 있다.
 
 **모델을 내리지 않게 한다.** Ollama는 5분 유휴 뒤 모델을 메모리에서 내리고 다음 요청에서 다시 올리므로(수 초),
 한산한 시간대의 첫 질문이 그 비용을 그대로 낸다. `OLLAMA_KEEP_ALIVE=-1`로 끈다 — macOS는

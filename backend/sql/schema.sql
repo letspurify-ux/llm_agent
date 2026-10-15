@@ -161,7 +161,7 @@ CREATE TABLE chat_log (
 CREATE TABLE vec_knowledge_chunk (
   seq        INT NOT NULL PRIMARY KEY,   -- knowledge_chunk.seq
   embed_hash CHAR(32) NOT NULL,          -- 변경 감지용 MD5(모델명+원문) — MariaDB가 계산한다 (embed-sync.js hashExpr)
-  embedding  VECTOR(1024) NOT NULL,      -- bge-m3 1024차원 (모델을 바꿔도 1024차원 유지)
+  embedding  VECTOR(1024) NOT NULL,      -- qwen3-embedding:0.6b 1024차원 (모델을 바꿔도 1024차원 유지)
   VECTOR INDEX (embedding) DISTANCE=cosine  -- 검색이 VEC_DISTANCE_COSINE을 쓰므로 반드시 cosine으로.
                                             -- 기본값(euclidean)이면 인덱스를 타지 못해 풀스캔이 된다
 );

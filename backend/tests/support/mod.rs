@@ -4,7 +4,7 @@
 //! Database tests run when LLM_AGENT_TEST_MARIADB is set
 //! (`user:password@host:port`); without it they pass with a notice. Search
 //! tests also need an embedding server (LLM_AGENT_TEST_EMBEDDING, default
-//! http://localhost:11434/v1 with bge-m3).
+//! http://localhost:11434/v1 with qwen3-embedding:0.6b).
 #![allow(dead_code)]
 
 use async_trait::async_trait;

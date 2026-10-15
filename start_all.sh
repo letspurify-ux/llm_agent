@@ -10,7 +10,7 @@
 #   Oracle 없음  → 설정의 Oracle mock을 켜면 데모 데이터로 동작
 #   Ollama 없음  → 검색이 통째로 성립하지 않는다. 서버는 뜨고 답변도 나가지만 지식·처리방법·쿼리를
 #                  하나도 찾지 못하고, 그 사실이 화면과 chat_log에 '검색 불가'로 남는다
-#                  (검색은 벡터 단일 경로다 — backend/src/search.rs, setup/bge-m3/README.md).
+#                  (검색은 벡터 단일 경로다 — backend/src/search.rs, setup/qwen3-embedding/README.md).
 #   MariaDB 없음 → 이건 진짜로 못 뜬다. 유일하게 필수라 아래에서 따로 다룬다.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -43,7 +43,7 @@ config_value() {
 env_value() { [ -f "$1" ] && sed -n "s/^$2=//p" "$1" | tail -1 | tr -d '"'; }
 EMBEDDING_MODEL=${EMBEDDING_MODEL:-$(config_value embedding model)}
 EMBEDDING_MODEL=${EMBEDDING_MODEL:-$(env_value backend/.env EMBEDDING_MODEL)}
-EMBEDDING_MODEL=${EMBEDDING_MODEL:-bge-m3}
+EMBEDDING_MODEL=${EMBEDDING_MODEL:-qwen3-embedding:0.6b}
 # Oracle은 컨테이너 안에서 인스턴스가 열릴 때까지 시간이 걸린다(콜드 스타트 1분 내외).
 ORACLE_WAIT_S=${ORACLE_WAIT_S:-180}
 
@@ -98,7 +98,7 @@ if [ "$APPS_ONLY" -eq 0 ]; then
 
   # --- Ollama (임베딩) — 검색의 유일한 경로다 ---
   if ! have ollama; then
-    warn "Ollama 미설치 — 검색이 성립하지 않는다. 지식·처리방법·쿼리를 하나도 찾지 못한다 (setup/bge-m3/README.md)"
+    warn "Ollama 미설치 — 검색이 성립하지 않는다. 지식·처리방법·쿼리를 하나도 찾지 못한다 (setup/qwen3-embedding/README.md)"
   elif curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
     ok "Ollama 이미 실행 중"
   else
@@ -112,12 +112,12 @@ if [ "$APPS_ONLY" -eq 0 ]; then
   fi
 
   # 모델이 없으면 임베딩 호출이 매번 실패하고, 그것은 곧 검색이 없다는 뜻이다(벡터 단일 경로).
-  # 답변은 나가지만 등록된 자료를 하나도 못 찾는다. 있는지만 보고, 없으면 받는다(최초 1회 ~1.2GB).
+  # 답변은 나가지만 등록된 자료를 하나도 못 찾는다. 있는지만 보고, 없으면 받는다(최초 1회).
   if have ollama && curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
     if ollama list 2>/dev/null | grep -q "^${EMBEDDING_MODEL}"; then
       ok "임베딩 모델 $EMBEDDING_MODEL 준비됨"
     else
-      echo "  [.] $EMBEDDING_MODEL 내려받는 중 (최초 1회, ~1.2GB)..."
+      echo "  [.] $EMBEDDING_MODEL 내려받는 중 (최초 1회, 수 분 걸릴 수 있다)..."
       if ollama pull "$EMBEDDING_MODEL" >/dev/null 2>&1; then ok "$EMBEDDING_MODEL 준비됨"
       else warn "$EMBEDDING_MODEL 다운로드 실패 — 이 모델 없이는 검색이 성립하지 않는다"; fi
     fi
