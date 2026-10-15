@@ -172,6 +172,13 @@ async fn run(
         let state = runtime_state(config, message, rounds, remaining, final_round, &offered, partial.is_empty(), notice.take());
         let mut definitions = ToolRegistry::definitions(&offered.iter().map(String::as_str).collect());
         tools::require_project(&mut definitions, &config.projects);
+        // What this response's tool results may fill: the input budget less
+        // what eviction cannot remove (the frame and the question).
+        let room = {
+            let frame = context::count(&context::request(&Default::default(), &state, &model, definitions.clone()), &model);
+            let budget = (config.input_budget() as f64 / context::token_ratio(c, &model)) as usize;
+            budget.saturating_sub(frame + context::bundle_tokens(&c.history, question_bundle, &model) + 512)
+        };
         let mut request = context::request(&c.history, &state, &model, definitions.clone());
         let mut estimate = context::count(&request, &model);
         let evicted = context::evict(c, config, estimate, &[question_bundle]);
@@ -309,6 +316,7 @@ async fn run(
             &mut tracker,
             &mut trace,
             &mut event_id,
+            room,
         )
         .await;
         timing.tools.push(json!({"ms":tool_started.elapsed().as_millis() as u64,"calls":completion.calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()}));
@@ -518,12 +526,13 @@ async fn execute_batch(
     tracker: &mut FailureTracker,
     trace: &mut Vec<Value>,
     event_id: &mut u64,
+    room: usize,
 ) -> Vec<Value> {
     let calls = &completion.calls;
     let limit = config.tool_call_limit();
-    let share = (config.batch_budget() / calls.len().clamp(1, limit))
-        .min(config.result_budget())
-        .max(crate::config::MIN_RESULT_TOKENS);
+    // Every result gets the whole result budget, however many calls the
+    // response made; `fit_batch` keeps their sum within `room`.
+    let share = config.result_budget();
     let mut prepared: Vec<Prepared> = Vec::with_capacity(calls.len());
     let mut ids: Vec<u64> = vec![];
     let mut batch_runs = BTreeSet::new();
@@ -697,7 +706,6 @@ async fn execute_batch(
             cancel,
             results: &c.results,
             executed: &c.executed,
-            hints: &c.knowledge_hints,
             clipped: &clipped,
             result_tokens: share,
         };
@@ -798,11 +806,6 @@ async fn execute_batch(
         };
         let mut data_result = run.result;
         match run.effect {
-            Effect::Hints(hints) => {
-                for (doc, chunk) in hints {
-                    c.knowledge_hints.insert(doc, chunk);
-                }
-            }
             Effect::Stored { result, signature } => {
                 let rows = result.rows.clone();
                 let omitted = result.omitted_column_key.clone();
@@ -869,6 +872,9 @@ async fn execute_batch(
         let bounded = tools::bound_result(&mut workspace, call, &args, result, share);
         results[index] = Some(bounded);
     }
+    workspace.file_cursors = std::mem::take(&mut c.file_cursors);
+    fit_batch(&mut workspace, calls, &prepared, &mut results, room);
+    c.file_cursors = workspace.file_cursors;
     c.history = workspace.history;
     let mut messages = vec![assistant_message(completion)];
     for (index, call) in calls.iter().enumerate() {
@@ -901,6 +907,80 @@ async fn execute_batch(
         messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));
     }
     messages
+}
+
+/// Cuts the largest results until this response's tool messages fit `room`:
+/// what is left of the context with every older bundle evicted. Each result
+/// already fits the result budget, so this only acts on a response with many
+/// large results. A cut result is paged or archived in history with its
+/// start, as `bound_result` does at the budget.
+fn fit_batch(ws: &mut Workspace, calls: &[ToolCall], prepared: &[Prepared], results: &mut [Option<Value>], room: usize) {
+    let model = ws.config.model.clone();
+    let fixed: usize = calls
+        .iter()
+        .zip(prepared)
+        .filter_map(|(call, p)| match p {
+            Prepared::Done(r) | Prepared::Skipped(r) => Some(tools::result_tokens(call, r, &model)),
+            _ => None,
+        })
+        .sum();
+    // A message token is at least one byte, with its content escaped once
+    // more and the estimate's quarter: most responses stop here uncounted.
+    let most: usize = results
+        .iter()
+        .flatten()
+        .map(|r| tools::model_result(r).to_string().len() * 5 / 2 + 128)
+        .sum();
+    if fixed + most <= room {
+        return;
+    }
+    let mut sizes: Vec<usize> = calls
+        .iter()
+        .zip(results.iter())
+        .map(|(call, r)| r.as_ref().map_or(0, |r| tools::result_tokens(call, r, &model)))
+        .collect();
+    let mut settled = vec![false; calls.len()];
+    loop {
+        let total = fixed + sizes.iter().sum::<usize>();
+        if total <= room {
+            return;
+        }
+        let Some((index, size)) = sizes
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(i, size)| !settled[*i] && *size > crate::config::MIN_RESULT_TOKENS)
+            .max_by_key(|(_, size)| *size)
+        else {
+            return;
+        };
+        let (args, project) = match &prepared[index] {
+            Prepared::Voc { args } => (args.clone(), None),
+            Prepared::Source { args, project } => (args.clone(), Some(project.clone())),
+            _ => {
+                settled[index] = true;
+                continue;
+            }
+        };
+        let mut args = args;
+        if let Some(fields) = args.as_object_mut() {
+            fields.remove("project");
+            fields.remove("__adjusted");
+        }
+        if let Some(project) = project {
+            ws.project = project;
+        }
+        let limit = size.saturating_sub(total - room).max(crate::config::MIN_RESULT_TOKENS);
+        let Some(result) = results[index].take() else {
+            settled[index] = true;
+            continue;
+        };
+        let cut = tools::bound_result(ws, &calls[index], &args, result, limit);
+        let cut_size = tools::result_tokens(&calls[index], &cut, &model);
+        settled[index] = cut_size >= size || cut_size <= limit;
+        sizes[index] = cut_size;
+        results[index] = Some(cut);
+    }
 }
 
 fn search_targets(args: &Value) -> Value {

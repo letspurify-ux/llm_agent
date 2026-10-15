@@ -186,7 +186,7 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "file_read",
-                description: "Read a project file or one of the project's reference documents: path (relative to the project root, or the reference document path exactly as listed), 1-based start_line and max_lines (line count, default 120). Example: {project:\"app\",path:\"src/agent.rs\",start_line:160,max_lines:140}. If truncated, continue ONLY with {cursor: next_cursor.cursor}; never combine cursor with path/start_line/max_lines. A cursor completes the original requested range and expires if the file changes. Once that range is complete, next_line indicates where a NEW range can start. Text arrives as N|line labels where N is the absolute line number. Use force_read=true only to re-read the same unchanged range on purpose.",
+                description: "Read a project file or one of the project's reference documents: path (relative to the project root, or the reference document path exactly as listed), 1-based start_line and max_lines (line count, default and most 2000; one result holds at most the result limit). Example: {project:\"app\",path:\"src/agent.rs\",start_line:160,max_lines:140}. If truncated, continue ONLY with {cursor: next_cursor.cursor}; never combine cursor with path/start_line/max_lines. A cursor completes the original requested range and expires if the file changes. Once that range is complete, next_line indicates where a NEW range can start. Text arrives as N|line labels where N is the absolute line number. Use force_read=true only to re-read the same unchanged range on purpose.",
                 source: true,
                 parameters: schema(
                     json!({"project":project_field(),"path":string(),"cursor":string(),"start_line":{"type":"integer","minimum":1},"max_lines":{"type":"integer","minimum":1,"maximum":2000},"limit":{"type":"integer","minimum":1,"maximum":2000,"description":"Compatibility alias for max_lines (number of lines). Prefer max_lines; never use a different value alongside max_lines."},"force_read":{"type":"boolean"}}),
@@ -1570,7 +1570,7 @@ fn read_file(
         );
     }
     let start = n(args, "start_line", 1).max(1);
-    let lines = n(args, "max_lines", 120).clamp(1, 2000);
+    let lines = n(args, "max_lines", 2000).clamp(1, 2000);
     let offset = n(args, "offset", 0);
     let total_lines = contents.lines().count();
     if start > total_lines {
@@ -1664,6 +1664,19 @@ pub fn result_tokens(call: &crate::llm::ToolCall, result: &Value, model: &str) -
         &json!({"role":"tool","tool_call_id":call.id,"content":model_result(result).to_string()}),
         model,
     )
+}
+
+/// Room left for the call ID and an `adjusted_arguments` note when a result
+/// is fitted before they are known.
+pub const MESSAGE_MARGIN: usize = 120;
+
+/// `result_tokens` for a result fitted before its call ID and argument notes
+/// are attached: the same message, with room for them.
+pub fn message_tokens(result: &Value, model: &str) -> usize {
+    context::count(
+        &json!({"role":"tool","tool_call_id":"","content":model_result(result).to_string()}),
+        model,
+    ) + MESSAGE_MARGIN
 }
 
 /// What the model sees of a result: file text as `N|line` labels, without
@@ -1951,9 +1964,22 @@ pub fn bound_result(
             return output;
         }
     }
-    let mut compact = json!({"status":result["status"],"truncated":true,"data":{"message":"Result retained in history; follow next_cursor."},"next_cursor":{"tool":"history","action":"read","id":archive,"offset":0}});
+    let mut compact = json!({"status":result["status"],"truncated":true,"data":{"message":"Result retained in history; preview is its start. Read the rest with next_cursor (history read, offset) or find a part with history search."},"next_cursor":{"tool":"history","action":"read","id":archive,"offset":0}});
     if let Some(data) = arguments::compact_data(&result["data"]) {
         compact["data"] = data;
+    } else if result["status"] == "ok" {
+        // As a tool output saved to a file: the start of it, within the limit.
+        let shown = model_result(&result)["data"].to_string();
+        let mut room = limit.saturating_sub(result_tokens(call, &compact, &model));
+        while room > 0 {
+            let mut candidate = compact.clone();
+            candidate["data"]["preview"] = json!(context::truncate(&shown, room, &model).0);
+            if result_tokens(call, &candidate, &model) <= limit {
+                compact = candidate;
+                break;
+            }
+            room = room * 3 / 4;
+        }
     }
     if let Some(recovery) = result.get("recovery") {
         compact["recovery"] = recovery.clone();
@@ -2159,6 +2185,32 @@ mod tests {
         let next = envelope(execute(&mut ws, "file_read", json!({"cursor":cursor}), &Default::default()));
         assert_eq!(next["status"], "ok", "{next}");
         assert!(next["data"]["content"]["line_start"].as_u64().unwrap() > 1);
+    }
+
+    #[test]
+    fn file_read_reads_2000_lines_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=2500).map(|i| format!("{i}\n")).collect();
+        std::fs::write(dir.path().join("n.txt"), &body).unwrap();
+        let mut ws = workspace(dir.path());
+        ws.config.result_tokens = 25_000;
+        let result = envelope(execute(&mut ws, "file_read", json!({"path":"n.txt"}), &Default::default()));
+        assert_eq!(result["data"]["content"]["line_end"], 2000, "{result}");
+        assert_eq!(result["data"]["next_line"], 2001);
+    }
+
+    #[test]
+    fn an_archived_result_shows_its_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = workspace(dir.path());
+        let call = crate::llm::ToolCall { id: "s1".into(), name: "search".into(), arguments: "{}".into() };
+        let data = json!({"text":"q","results":{"knowledge":{"status":"ok","note":"근거 문장 ".repeat(800)}}});
+        let bounded = bound_result(&mut ws, &call, &json!({}), envelope(Ok(data)), 600);
+        assert_eq!(bounded["next_cursor"]["tool"], "history", "{bounded}");
+        let preview = bounded["data"]["preview"].as_str().unwrap();
+        assert!(preview.starts_with("{\"text\":\"q\""), "{preview}");
+        assert!(preview.len() > 200, "{preview}");
+        assert!(result_tokens(&call, &bounded, "gpt-4o") <= 600);
     }
 
     #[test]

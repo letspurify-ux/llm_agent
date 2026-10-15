@@ -48,7 +48,7 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     fragment(
         "등록 자료 찾기",
-        "search는 요약과 ID만 돌려준다. distance가 작을수록 가깝다. 답에 쓸 지식은 knowledge_read로, 처리 방법은 method_read로 본문을 읽어라. 지식은 조각(chunk) 단위로 나뉘어 있어 필요한 구간만 읽고, 이어지는 내용은 next_cursor로 읽는다.",
+        "search는 요약과 ID만 돌려준다. distance가 작을수록 가깝다. 답에 쓸 지식은 knowledge_read로, 처리 방법은 method_read로 본문을 읽어라. knowledge_read는 문서를 처음부터 한 번에 담을 수 있는 만큼 읽는다. 한 번에 다 오지 않은 긴 문서는 next_cursor로 잇거나, search의 matched_chunks를 start_chunk로 주어 필요한 구간부터 읽는다.",
     ),
     fragment(
         "등록 자료 찾기",
@@ -278,6 +278,14 @@ pub fn request(history: &SessionHistory, state: &Value, model: &str, tools: Vec<
         request["tools"] = json!(tools);
     }
     request
+}
+
+/// Tokens of one history bundle as the model receives it (0 when it is gone).
+pub fn bundle_tokens(history: &SessionHistory, id: u64, model: &str) -> usize {
+    history.bundles.iter().find(|b| b.id == id).map_or(0, |bundle| {
+        let delivered: Vec<Value> = bundle.messages.iter().cloned().map(model_message).collect();
+        count(&json!(delivered), model)
+    })
 }
 
 /// Records a provider-reported input size against the local estimate.

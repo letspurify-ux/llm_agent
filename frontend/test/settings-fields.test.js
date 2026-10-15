@@ -11,7 +11,7 @@ const SERVER = {
   mariadb: { host: 'localhost', port: 3306, user: 'agent', database: 'llm_agent', pool_size: 21, timeout_ms: 30000 },
   oracle: { client_lib_dir: '', client_config_dir: '', timeout_ms: 30000, routine_read_only: true, mock: false },
   agent: { max_rounds: 24, run_seconds: 400, high_water: 0.9, low_water: 0.5, history_bytes: 16777216, result_tokens: null,
-    batch_tokens: null, max_tool_calls: null, tool_timeout_secs: 30, repeated_read_limit: 2, session_idle_minutes: 60, max_sessions: 200, result_store_bytes: 33554432 },
+    max_tool_calls: null, tool_timeout_secs: 30, repeated_read_limit: 2, session_idle_minutes: 60, max_sessions: 200, result_store_bytes: 33554432 },
   server: { port: 3001, chat_log_retention_days: 3 },
 };
 

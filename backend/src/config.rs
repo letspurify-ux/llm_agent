@@ -11,14 +11,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Shares of `context_tokens` one tool result, and all results of one model
-/// response, may fill when `result_tokens` or `batch_tokens` is unset
-/// (MnemoArc's defaults: 4,000 and 8,000 tokens at a 128K context).
-pub const RESULT_SHARE: usize = 32;
-pub const BATCH_SHARE: usize = 16;
+/// Tokens one tool result may fill when `result_tokens` is unset, as Claude
+/// Code bounds a file read: each result on its own, however many calls one
+/// response makes. A context smaller than 8 × this gives each result an
+/// eighth of it.
+pub const DEFAULT_RESULT_TOKENS: usize = 25_000;
+pub const RESULT_CONTEXT_SHARE: usize = 8;
 pub const MIN_RESULT_TOKENS: usize = 200;
-/// Tool calls one model response may run when the setting is left empty
-/// (fewer when the response's result budget cannot give each 200 tokens).
+/// Tool calls one model response may run when the setting is left empty.
 pub const DEFAULT_TOOL_CALLS: usize = 32;
 /// Vector width of the `vec_*` tables (schema.sql).
 pub const EMBEDDING_DIMENSIONS: usize = 1024;
@@ -334,11 +334,15 @@ pub struct AgentConfig {
     pub low_water: f64,
     /// Bytes of history (active and evicted) one conversation keeps.
     pub history_bytes: usize,
+    /// Tokens of one tool result. Empty: see `Config::result_budget`.
     pub result_tokens: Option<usize>,
+    /// Former limit on all results of one response, which divided it among
+    /// the calls. Still read so an older `config.toml` loads; not used and
+    /// not written back.
+    #[serde(skip_serializing)]
     pub batch_tokens: Option<usize>,
     /// Tool calls run from one model response; calls past it are refused
-    /// unrun and the model resends them in its next response. Empty: see
-    /// `Config::tool_call_limit`.
+    /// unrun and the model resends them in its next response. Empty: 32.
     pub max_tool_calls: Option<usize>,
     pub tool_timeout_secs: u64,
     /// Identical unchanged reads already in context before a read is
@@ -449,33 +453,26 @@ pub fn credentials_path(config: &Path) -> PathBuf {
 }
 
 impl Config {
-    pub fn batch_budget(&self) -> usize {
-        self.agent
-            .batch_tokens
-            .unwrap_or_else(|| (self.llm.context_tokens / BATCH_SHARE).max(MIN_RESULT_TOKENS))
-    }
+    /// Tokens of one tool result: the setting, or 25,000 (in a smaller
+    /// context an eighth of it, and never past half the input budget).
     pub fn result_budget(&self) -> usize {
-        self.agent
-            .result_tokens
-            .unwrap_or_else(|| (self.llm.context_tokens / RESULT_SHARE).max(MIN_RESULT_TOKENS))
+        self.agent.result_tokens.unwrap_or_else(|| {
+            DEFAULT_RESULT_TOKENS
+                .min(self.llm.context_tokens / RESULT_CONTEXT_SHARE)
+                .min(self.input_budget() / 2)
+                .max(MIN_RESULT_TOKENS)
+        })
     }
-    /// Tool calls one response runs: the setting, or 32 capped so each call
-    /// keeps at least MIN_RESULT_TOKENS of the response's result budget.
+    /// Tool calls one response runs: the setting, or 32.
     pub fn tool_call_limit(&self) -> usize {
-        self.agent
-            .max_tool_calls
-            .unwrap_or_else(|| DEFAULT_TOOL_CALLS.min(self.batch_budget() / MIN_RESULT_TOKENS))
-            .max(1)
+        self.agent.max_tool_calls.unwrap_or(DEFAULT_TOOL_CALLS).max(1)
     }
-    /// Input tokens a request may use: the context minus one response, one
-    /// response's tool results and a small frame.
+    /// Input tokens a request may use: the context minus one response and a
+    /// small frame.
     pub fn input_budget(&self) -> usize {
-        self.llm.context_tokens.saturating_sub(
-            self.llm
-                .output_tokens
-                .saturating_add(self.batch_budget())
-                .saturating_add(1024),
-        )
+        self.llm
+            .context_tokens
+            .saturating_sub(self.llm.output_tokens.saturating_add(1024))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -505,26 +502,24 @@ impl Config {
         {
             bail!("실행·도구 시간 한도는 {MAX_TIMEOUT_SECS}초, 대화 보관 시간은 {MAX_IDLE_MINUTES}분 이하여야 합니다.");
         }
-        if self.result_budget() < MIN_RESULT_TOKENS || self.batch_budget() < MIN_RESULT_TOKENS {
+        if self.result_budget() < MIN_RESULT_TOKENS {
             bail!("도구 결과 한도는 {MIN_RESULT_TOKENS} 토큰 이상이어야 합니다.");
-        }
-        if self.result_budget() > self.batch_budget() {
-            bail!("결과 하나의 한도가 응답 하나의 결과 한도보다 클 수 없습니다.");
         }
         if let Some(calls) = a.max_tool_calls {
             let most = crate::llm::MAX_TOOL_CALLS;
             if !(1..=most).contains(&calls) {
                 bail!("한 응답의 도구 호출 수는 1~{most} 사이여야 합니다.");
             }
-            if calls.saturating_mul(MIN_RESULT_TOKENS) > self.batch_budget() {
-                bail!(
-                    "한 응답의 도구 호출 수({calls}) × {MIN_RESULT_TOKENS} 토큰이 한 응답의 도구 결과 합({} 토큰)을 넘습니다. 호출 수를 줄이거나 결과 합을 늘려주세요.",
-                    self.batch_budget()
-                );
-            }
         }
         if self.input_budget() < 4096 {
-            bail!("컨텍스트가 출력·도구 결과를 빼고 4,096 토큰 이상 남아야 합니다. 출력 한도를 줄이거나 컨텍스트를 늘려주세요.");
+            bail!("컨텍스트가 출력을 빼고 4,096 토큰 이상 남아야 합니다. 출력 한도를 줄이거나 컨텍스트를 늘려주세요.");
+        }
+        if self.result_budget() > self.input_budget() / 2 {
+            bail!(
+                "도구 결과 하나의 한도({} 토큰)는 출력을 뺀 컨텍스트의 절반({} 토큰) 이하여야 합니다.",
+                self.result_budget(),
+                self.input_budget() / 2
+            );
         }
         if self.oracle.timeout_ms == 0 {
             bail!("Oracle 시간 한도는 0보다 커야 합니다.");
@@ -792,28 +787,57 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_limit_follows_the_setting_and_the_result_budget() {
+    fn tool_call_limit_follows_the_setting() {
         let mut config = Config::default();
         config.llm.model = "m".into();
         assert_eq!(config.tool_call_limit(), DEFAULT_TOOL_CALLS);
-        // A small context leaves each call at least 200 tokens: 32k / 16 / 200.
+        // The number of calls no longer depends on the context.
         config.llm.context_tokens = 32_000;
         config.llm.output_tokens = 4_096;
-        assert_eq!(config.tool_call_limit(), 10);
+        assert_eq!(config.tool_call_limit(), DEFAULT_TOOL_CALLS);
         config.validate().unwrap();
-        // An explicit value is used as is once the result budget can hold it.
         config.agent.max_tool_calls = Some(64);
-        assert!(config.validate().unwrap_err().to_string().contains("호출 수를 줄이거나"));
-        config.llm.context_tokens = 400_000;
-        config.agent.batch_tokens = Some(64 * MIN_RESULT_TOKENS);
         config.validate().unwrap();
         assert_eq!(config.tool_call_limit(), 64);
-        config.agent.max_tool_calls = Some(2);
-        assert_eq!(config.tool_call_limit(), 2);
         for wrong in [0, crate::llm::MAX_TOOL_CALLS + 1] {
             config.agent.max_tool_calls = Some(wrong);
             assert!(config.validate().unwrap_err().to_string().contains("1~"), "{wrong}");
         }
+    }
+
+    #[test]
+    fn one_result_gets_25k_tokens_or_less_in_a_small_context() {
+        let budget = |context: usize, output: usize| {
+            let mut config = Config::default();
+            config.llm.context_tokens = context;
+            config.llm.output_tokens = output;
+            (config.result_budget(), config.input_budget())
+        };
+        assert_eq!(budget(230_000, 16_384), (25_000, 212_592));
+        assert_eq!(budget(128_000, 16_384).0, 16_000);
+        assert_eq!(budget(16_000, 2_000).0, 2_000);
+        // A large output reserve leaves half the input budget at most.
+        assert_eq!(budget(64_000, 50_000), (6_488, 12_976));
+        let mut config = Config::default();
+        config.llm.context_tokens = 230_000;
+        config.agent.result_tokens = Some(150_000);
+        assert!(config.validate().unwrap_err().to_string().contains("절반"));
+        config.agent.result_tokens = Some(60_000);
+        config.validate().unwrap();
+        assert_eq!(config.result_budget(), 60_000);
+    }
+
+    #[test]
+    fn a_config_written_with_the_former_batch_limit_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut text = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!text.contains("batch_tokens"));
+        text = text.replace("[agent]\n", "[agent]\nbatch_tokens = 8000\n");
+        std::fs::write(&path, text).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.agent.batch_tokens, Some(8000));
+        assert!(!toml::to_string_pretty(&loaded).unwrap().contains("batch_tokens"));
     }
 
     #[test]

@@ -24,10 +24,10 @@ use tokio_util::sync::CancellationToken;
 /// Search results per target: default and cap.
 pub const SEARCH_DEFAULT: usize = 10;
 pub const SEARCH_MAX: usize = 50;
-/// Knowledge chunks per read: default and cap (a chunk is up to 1,000
-/// characters).
-pub const CHUNKS_DEFAULT: usize = 6;
-pub const CHUNKS_MAX: usize = 30;
+/// Knowledge chunks one read fetches at most (a chunk is up to 1,000
+/// characters): far past what one result budget holds, so a read stops at
+/// the budget.
+pub const CHUNKS_MAX: usize = 500;
 /// Items per method_read / query_describe call.
 pub const ITEMS_MAX: usize = 10;
 /// Query rows shown with a run: default and cap.
@@ -58,7 +58,7 @@ pub fn specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "knowledge_read",
-            description: "Read a knowledge document by its ID from search (k<number>). Documents are stored in chunks of up to 1,000 characters; start_chunk (default: the best-matching chunk of the last search, else 1) and max_chunks (default 6, max 30) choose the range. Continue with next_cursor to read further; chunk_of tells how many chunks the document has.",
+            description: "Read a knowledge document by its ID from search (k<number>). By default it reads from the start as far as one result holds, so most documents arrive whole (complete_to_end). Documents are stored in chunks of up to 1,000 characters and chunk_of tells how many a document has. For a document longer than one read, continue with next_cursor, or start at a chunk from search's matched_chunks with start_chunk; max_chunks reads fewer chunks.",
             source: false,
             parameters: schema(
                 json!({"id":string(),"start_chunk":{"type":"integer","minimum":1},"max_chunks":{"type":"integer","minimum":1,"maximum":CHUNKS_MAX},"cursor":string()}),
@@ -193,8 +193,6 @@ fn unescape_cell(cell: &str) -> String {
 /// What one tool run changes in the conversation once the batch is done.
 pub enum Effect {
     None,
-    /// Best matching chunk per document, for knowledge_read defaults.
-    Hints(Vec<(i64, i64)>),
     /// Rows to store under a new step; `signature` identifies the call.
     Stored { result: StoredResult, signature: String },
     /// A failed run; it still takes a step number in the trace.
@@ -233,7 +231,6 @@ pub struct Context<'a> {
     pub cancel: &'a CancellationToken,
     pub results: &'a BTreeMap<u64, StoredResult>,
     pub executed: &'a HashMap<String, u64>,
-    pub hints: &'a HashMap<i64, i64>,
     pub clipped: &'a Clipped,
     pub result_tokens: usize,
 }
@@ -305,7 +302,6 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
     let mut results = Map::new();
     let mut hits = json!({});
     let mut failed = vec![];
-    let mut hints = vec![];
     let page_info = |more: bool, beyond: usize| {
         json!({"next_offset":more.then_some(offset + limit),"beyond_threshold":beyond})
     };
@@ -320,7 +316,6 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
                             .items
                             .iter()
                             .map(|d| {
-                                hints.push((d.doc_seq, d.best_chunk));
                                 json!({
                                     "id":format!("k{}", d.doc_seq),"title":d.title,"chunk_of":d.chunk_of,
                                     "matched_chunks":chunk_list(&d.chunks),"best_chunk":d.best_chunk,
@@ -429,7 +424,7 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
     fit_search(&mut data, cx.result_tokens, &config.llm.model);
     Run {
         result: Ok(data),
-        effect: Effect::Hints(hints),
+        effect: Effect::None,
         hits: Some((hits, failed)),
         public_error: None,
     }
@@ -437,9 +432,11 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
 
 /// Fits a search result to the result budget: shorter excerpts first, then
 /// fewer items (the continuation offset follows what was kept), so the list
-/// reaches the model instead of an archive pointer.
+/// reaches the model instead of an archive pointer. The tool message is
+/// measured as the model receives it, as `bound_result` measures it.
 fn fit_search(data: &mut Value, budget: usize, model: &str) {
-    let fits = |d: &Value| crate::context::tokens(&d.to_string(), model) + 80 <= budget;
+    let size = |d: &Value| crate::tools::message_tokens(&crate::tools::envelope(Ok(d.clone())), model);
+    let fits = |d: &Value| size(d) <= budget;
     if fits(data) {
         return;
     }
@@ -469,26 +466,34 @@ fn fit_search(data: &mut Value, budget: usize, model: &str) {
             return;
         }
     }
+    // Items leave from the longest list until their own size covers the
+    // excess; the whole message is measured again after each round.
     loop {
-        let Some(targets) = data["results"].as_object_mut() else {
+        let excess = size(data).saturating_sub(budget);
+        if excess == 0 {
             return;
-        };
-        let longest = targets
-            .iter()
-            .filter_map(|(k, v)| v["items"].as_array().map(|items| (k.clone(), items.len())))
-            .filter(|(_, n)| *n > 1)
-            .max_by_key(|(_, n)| *n);
-        let Some((key, _)) = longest else {
-            return;
-        };
-        let target = &mut targets[&key];
-        let items = target["items"].as_array_mut().unwrap();
-        items.pop();
-        let kept = items.len() as u64;
-        target["next_offset"] = json!(offset + kept);
-        target["items_cut_for_size"] = json!(true);
-        if fits(data) {
-            return;
+        }
+        let mut freed = 0;
+        while freed < excess {
+            let Some(targets) = data["results"].as_object_mut() else {
+                return;
+            };
+            let longest = targets
+                .iter()
+                .filter_map(|(k, v)| v["items"].as_array().map(|items| (k.clone(), items.len())))
+                .filter(|(_, n)| *n > 1)
+                .max_by_key(|(_, n)| *n);
+            let Some((key, _)) = longest else {
+                return;
+            };
+            let target = &mut targets[&key];
+            let items = target["items"].as_array_mut().unwrap();
+            if let Some(item) = items.pop() {
+                freed += crate::context::tokens(&item.to_string(), model).max(1);
+            }
+            let kept = items.len() as u64;
+            target["next_offset"] = json!(offset + kept);
+            target["items_cut_for_size"] = json!(true);
         }
     }
 }
@@ -543,11 +548,10 @@ async fn knowledge_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
             )
         }
     };
-    let max_chunks = limit_arg(args, "max_chunks", CHUNKS_DEFAULT, CHUNKS_MAX) as i64;
+    let max_chunks = limit_arg(args, "max_chunks", CHUNKS_MAX, CHUNKS_MAX) as i64;
     let start = args["start_chunk"]
         .as_i64()
         .or(cursor_start)
-        .or_else(|| cx.hints.get(&doc).map(|best| (best - 1).max(1)))
         .unwrap_or(1)
         .clamp(1, MAX_OFFSET as i64);
     let cfg = &cx.config.mariadb;
@@ -561,7 +565,7 @@ async fn knowledge_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
         )
         .await?;
     let model = cx.config.llm.model.as_str();
-    let budget = cx.result_tokens.saturating_sub(400).max(200);
+    let budget = cx.result_tokens;
     if rows.is_empty() {
         // Not chunked yet (the sync runs every minute): read the document.
         let doc_rows = cx
@@ -604,34 +608,74 @@ async fn knowledge_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
     Ok(fit_chunks(doc, &title, total, chunks, budget, model))
 }
 
-/// As many whole chunks as fit the result budget (at least one).
+/// As many whole chunks as fit the result budget, measured as the tool
+/// message the model receives (at least one, cut when it alone is larger).
 fn fit_chunks(doc: i64, title: &str, total: i64, chunks: Vec<(i64, String)>, budget: usize, model: &str) -> Value {
+    let first = chunks.first().map_or(1, |c| c.0);
+    let build = |taken: usize, text: String| {
+        let last = chunks.get(taken.saturating_sub(1)).map_or(first, |c| c.0);
+        let mut out = json!({
+            "id":format!("k{doc}"),"title":title,"chunk_of":total,
+            "chunks":if first == last { first.to_string() } else { format!("{first}-{last}") },
+            "text":text
+        });
+        if last < total {
+            out["next_cursor"] = json!(format!("k{doc}:{}", last + 1));
+        } else {
+            out["complete_to_end"] = json!(true);
+        }
+        out
+    };
+    let size = |out: &Value| crate::tools::message_tokens(&crate::tools::envelope(Ok(out.clone())), model);
+    let join = |taken: usize| crate::chunk::join_chunks(chunks[..taken].iter().map(|(no, c)| (*no, c.as_str())));
+    // Each chunk counted once, without the overlap the join removes, to
+    // choose how many; the joined message is then measured, and chunks leave
+    // from the end until it fits.
+    if chunks.is_empty() {
+        return build(0, String::new());
+    }
+    let sizes: Vec<usize> = chunks
+        .iter()
+        .enumerate()
+        .map(|(i, (no, content))| match i.checked_sub(1).map(|p| &chunks[p]) {
+            Some((before, previous)) if *before == no - 1 => {
+                crate::context::tokens(&crate::chunk::cut_seam(previous, content), model)
+            }
+            _ => crate::context::tokens(content, model),
+        })
+        .collect();
+    let mut sum = size(&build(0, String::new()));
     let mut taken = 0;
-    let mut text = String::new();
-    for i in 0..chunks.len() {
-        let candidate = crate::chunk::join_chunks(chunks[..=i].iter().map(|(no, c)| (*no, c.as_str())));
-        if i > 0 && crate::context::tokens(&candidate, model) > budget {
+    while taken < sizes.len() && (taken == 0 || sum + sizes[taken] <= budget) {
+        sum += sizes[taken];
+        taken += 1;
+    }
+    loop {
+        let out = build(taken, join(taken));
+        let excess = size(&out).saturating_sub(budget);
+        if excess == 0 {
+            return out;
+        }
+        if taken == 1 {
             break;
         }
-        text = candidate;
-        taken = i + 1;
+        let mut freed = 0;
+        while taken > 1 && freed < excess {
+            taken -= 1;
+            freed += sizes[taken].max(1);
+        }
     }
-    if taken == 1 && crate::context::tokens(&text, model) > budget {
-        text = crate::context::truncate(&text, budget, model).0 + TRUNC_MARK;
+    // One chunk larger than the budget: its start.
+    let whole = join(1);
+    let mut room = budget.saturating_sub(size(&build(1, String::new())));
+    loop {
+        let (head, _) = crate::context::truncate(&whole, room, model);
+        let out = build(1, head + TRUNC_MARK);
+        if room == 0 || size(&out) <= budget {
+            return out;
+        }
+        room = room * 9 / 10;
     }
-    let first = chunks.first().map_or(1, |c| c.0);
-    let last = chunks.get(taken.saturating_sub(1)).map_or(first, |c| c.0);
-    let mut out = json!({
-        "id":format!("k{doc}"),"title":title,"chunk_of":total,
-        "chunks":if first == last { first.to_string() } else { format!("{first}-{last}") },
-        "text":text
-    });
-    if last < total {
-        out["next_cursor"] = json!(format!("k{doc}:{}", last + 1));
-    } else {
-        out["complete_to_end"] = json!(true);
-    }
-    out
 }
 
 async fn method_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
@@ -915,18 +959,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn search_results_shrink_to_the_budget() {
+    fn search_results_shrink_to_the_budget_as_the_model_receives_them() {
         let item = |i: usize| json!({"id":format!("k{i}"),"title":"제목","excerpt":"근거 문장 ".repeat(60)});
-        let mut data = json!({"text":"q","offset":0,"results":{
+        let base = json!({"text":"q","offset":0,"results":{
             "knowledge":{"status":"ok","items":(0..10).map(item).collect::<Vec<_>>()},
             "qa_method":{"status":"ok","items":(0..10).map(item).collect::<Vec<_>>()}
         }});
-        fit_search(&mut data, 250, "gpt-4o");
-        assert!(crate::context::tokens(&data.to_string(), "gpt-4o") <= 250);
+        let message = |d: &Value| crate::tools::message_tokens(&crate::tools::envelope(Ok(d.clone())), "gpt-4o");
+        let mut data = base.clone();
+        fit_search(&mut data, 400, "gpt-4o");
+        assert!(message(&data) <= 400, "{}", message(&data));
         assert_eq!(data["excerpts_shortened"], true);
         let k = data["results"]["knowledge"]["items"].as_array().unwrap().len();
-        assert!(k >= 1 && k < 10);
+        assert!((1..10).contains(&k));
         assert_eq!(data["results"]["knowledge"]["next_offset"], k as u64);
+        // A list fitted on its data alone used to cross the budget once
+        // delivered and was archived anyway; now it fits as delivered.
+        for budget in (400..message(&base)).step_by(397) {
+            let mut data = base.clone();
+            fit_search(&mut data, budget, "gpt-4o");
+            let single = data["results"].as_object().unwrap().values().all(|t| t["items"].as_array().unwrap().len() <= 1);
+            assert!(single || message(&data) <= budget, "{budget}: {}", message(&data));
+        }
         let mut small = json!({"text":"q","offset":0,"results":{"query":{"items":[item(1)]}}});
         let before = small.clone();
         fit_search(&mut small, 4000, "gpt-4o");
@@ -969,11 +1023,19 @@ mod tests {
     }
 
     #[test]
-    fn chunks_fill_the_budget_and_continue() {
-        let chunks: Vec<(i64, String)> = (1..=4).map(|i| (i, format!("{i}번 ").repeat(200))).collect();
-        let out = fit_chunks(7, "제목", 9, chunks, 600, "gpt-4o");
-        assert_eq!(out["id"], "k7");
-        assert!(out["next_cursor"].as_str().unwrap().starts_with("k7:"));
-        assert!(crate::context::tokens(out["text"].as_str().unwrap(), "gpt-4o") <= 600);
+    fn documents_arrive_whole_or_in_whole_chunks_within_the_budget() {
+        let chunks = |n: i64| (1..=n).map(|i| (i, format!("{i}번 ").repeat(200))).collect::<Vec<_>>();
+        let message = |v: &Value| crate::tools::message_tokens(&crate::tools::envelope(Ok(v.clone())), "gpt-4o");
+        let whole = fit_chunks(7, "제목", 4, chunks(4), 25_000, "gpt-4o");
+        assert_eq!((whole["chunks"].clone(), whole["complete_to_end"].clone()), (json!("1-4"), json!(true)));
+        let part = fit_chunks(7, "제목", 9, chunks(9), 1_500, "gpt-4o");
+        assert!(part["next_cursor"].as_str().unwrap().starts_with("k7:"), "{part}");
+        assert!(message(&part) <= 1_500, "{}", message(&part));
+        assert!(!part["text"].as_str().unwrap().ends_with(TRUNC_MARK));
+        // One chunk larger than the budget shows its start.
+        let cut = fit_chunks(7, "제목", 9, chunks(9), 400, "gpt-4o");
+        assert_eq!(cut["chunks"], "1");
+        assert!(cut["text"].as_str().unwrap().ends_with(TRUNC_MARK));
+        assert!(message(&cut) <= 400, "{}", message(&cut));
     }
 }

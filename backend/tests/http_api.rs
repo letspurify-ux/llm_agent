@@ -235,9 +235,9 @@ async fn projects_settings_and_folders_are_editable() {
         .admin("PUT", "settings", Some(json!({"config":{"agent":{"low_water":0.95}}})), saved.etag.as_deref())
         .await;
     assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
-    // More calls than the response's result budget can give 200 tokens each.
+    // More calls than one response can carry.
     let too_many = client
-        .admin("PUT", "settings", Some(json!({"config":{"agent":{"max_tool_calls":200}}})), saved.etag.as_deref())
+        .admin("PUT", "settings", Some(json!({"config":{"agent":{"max_tool_calls":llm_agent::llm::MAX_TOOL_CALLS + 1}}})), saved.etag.as_deref())
         .await;
     assert_eq!(too_many.status, StatusCode::BAD_REQUEST);
     assert!(too_many.body["error"].as_str().unwrap().contains("도구 호출 수"), "{}", too_many.text);

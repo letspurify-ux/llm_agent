@@ -247,7 +247,6 @@ async fn project_sources_are_read_and_old_bundles_leave_the_context() {
     config.llm.context_tokens = 16_000;
     config.llm.output_tokens = 2_000;
     config.agent.result_tokens = Some(3_000);
-    config.agent.batch_tokens = Some(3_000);
     let guide = dir.path().join("guide.md").display().to_string();
     let llm = Scripted::new(vec![
         calls(vec![
@@ -291,6 +290,67 @@ async fn project_sources_are_read_and_old_bundles_leave_the_context() {
         messages(last, "user").iter().any(|m| m["content"] == "큰 파일 봐줘"),
         "the current question stays"
     );
+}
+
+/// Every result gets the whole result budget however many calls one response
+/// makes; only results that cannot fit the context even with every older
+/// bundle evicted are cut, the largest first. Needs no MariaDB.
+#[tokio::test]
+async fn each_result_gets_the_whole_budget_and_an_overflowing_response_is_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    let body: String = (1..=3000).map(|i| format!("line {i} {}\n", "word ".repeat(12))).collect();
+    std::fs::write(root.join("big.txt"), &body).unwrap();
+    let config = |context: usize, output: usize, result: usize| {
+        let mut config = llm_agent::config::Config::default();
+        config.mariadb.port = 9;
+        config.llm.base_url = "http://127.0.0.1:9/v1".into();
+        config.llm.model = "gpt-4o".into();
+        config.llm.context_tokens = context;
+        config.llm.output_tokens = output;
+        config.agent.result_tokens = Some(result);
+        config.projects.push(llm_agent::config::Project {
+            name: "app".into(),
+            root: root.clone(),
+            ..Default::default()
+        });
+        config
+    };
+    let reads = |prefix: &str| {
+        calls((1..=4).map(|i| call(&format!("{prefix}{i}"), "file_read", json!({"path":"big.txt","start_line":i * 500}))).collect())
+    };
+    let delivered = |request: &Value, id: &str| {
+        let message = messages(request, "tool").into_iter().find(|m| m["tool_call_id"] == id).unwrap();
+        llm_agent::context::count(&message, "gpt-4o")
+    };
+
+    // Four large reads in one response each fill the 3,000 tokens (the
+    // former split gave each a quarter of 8,000).
+    let llm = Scripted::new(vec![reads("a"), text("끝")]);
+    let (whole, _whole_dir) = app(config(128_000, 16_384, 3_000), llm.clone());
+    let (result, _) = ask(&whole, "whole", "큰 파일 넷 봐줘", vec![]).await;
+    assert_eq!(result.unwrap().answer, "끝");
+    let request = llm.requests()[1].clone();
+    for id in ["a1", "a2", "a3", "a4"] {
+        let tokens = delivered(&request, id);
+        assert!((2_500..=3_000).contains(&tokens), "{id}: {tokens}");
+        assert_eq!(tool_result(&request, id)["next_cursor"]["tool"], "file_read");
+    }
+
+    // In a 16K context four 6,000-token results cannot all stay: the
+    // largest are cut until the response fits, and the question goes on.
+    let llm = Scripted::new(vec![reads("b"), text("끝")]);
+    let (small, _small_dir) = app(config(16_000, 2_000, 6_000), llm.clone());
+    let (result, _) = ask(&small, "cut", "큰 파일 넷 봐줘", vec![]).await;
+    assert_eq!(result.unwrap().answer, "끝");
+    let request = llm.requests()[1].clone();
+    let sizes: Vec<usize> = ["b1", "b2", "b3", "b4"].iter().map(|id| delivered(&request, id)).collect();
+    assert!(sizes.iter().sum::<usize>() < 12_000, "{sizes:?}");
+    assert!(sizes.iter().all(|size| *size <= 6_000), "{sizes:?}");
+    for id in ["b1", "b2", "b3", "b4"] {
+        assert_eq!(tool_result(&request, id)["status"], "ok", "{id}");
+    }
 }
 
 /// With two projects the model is told to name one; a call that omits it

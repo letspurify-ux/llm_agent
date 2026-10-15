@@ -159,8 +159,6 @@ pub struct Conversation {
     /// Executed query calls (name, target, params) → step, to refuse an
     /// identical repeat.
     pub executed: HashMap<String, u64>,
-    /// Best matching chunk per knowledge document in recent searches.
-    pub knowledge_hints: HashMap<i64, i64>,
     /// Provider/estimate token ratios for calibration (MnemoArc).
     pub token_ratios: VecDeque<f64>,
     pub last_used: Instant,
@@ -175,7 +173,6 @@ impl Conversation {
             results: BTreeMap::new(),
             next_step: 1,
             executed: HashMap::new(),
-            knowledge_hints: HashMap::new(),
             token_ratios: VecDeque::new(),
             last_used: Instant::now(),
         }
