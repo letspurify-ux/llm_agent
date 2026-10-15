@@ -121,7 +121,7 @@ CREATE TABLE target_db (
 -- 3일 지난 행은 서버가 기동 시 + 1시간 주기로 정리한다 (server.js).
 CREATE TABLE chat_log (
   seq        INT AUTO_INCREMENT PRIMARY KEY,
-  question   TEXT NOT NULL,        -- 서버가 2,000자로 제한한다 (server.js)
+  question   TEXT NOT NULL,        -- 서버가 20,000자로 제한한다 (agent.rs MAX_QUESTION_LEN) — UTF-8 60,000바이트 이하라 TEXT에 든다
   answer     MEDIUMTEXT,           -- TEXT(65,535바이트)로는 부족하다: 20행×다컬럼 표에 셀당 200자면
                                    -- utf8mb4 한글 기준 100KB를 넘고, strict 모드에서 INSERT가 거부돼
                                    -- 하필 '결과가 큰 대화'만 로그에서 빠진다

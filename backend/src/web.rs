@@ -181,7 +181,7 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Result<Byte
     let length = utf16_len(&message);
     if length > MAX_QUESTION_LEN {
         rejected(&app, &message, "too_long", Some(length));
-        return error(StatusCode::BAD_REQUEST, "질문이 너무 깁니다 (최대 2,000자).");
+        return error(StatusCode::BAD_REQUEST, "질문이 너무 깁니다 (최대 20,000자).");
     }
     let question = Question {
         conversation_id: conversation_id(&body),

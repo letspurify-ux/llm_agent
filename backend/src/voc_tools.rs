@@ -722,7 +722,7 @@ async fn method_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
         let queries = db::queries_mentioned_in(&cx.app.db, cfg, &method, 20).await?;
         items.push(json!({
             "id":format!("m{seq}"),"title":db::text(row, "title"),
-            "method":clip_marked(&method, 4000),
+            "method":method,
             "queries":queries.iter().map(query_summary).collect::<Vec<_>>()
         }));
     }
@@ -749,13 +749,14 @@ async fn query_describe(cx: &Context<'_>, args: &Value) -> Result<Value> {
         .iter()
         .map(|row| {
             let mut item = query_summary(row);
-            item["description"] = json!(clip_marked(&db::text(row, "query_desc"), 2000));
-            item["input_desc"] = json!(clip_marked(&db::text(row, "input_desc"), 1000));
-            item["output_desc"] = json!(clip_marked(&db::text(row, "output_desc"), 2000));
-            item["sql"] = json!(clip_marked(&db::text(row, "query_sql"), 2000));
+            // Whole, as a file read is: the result limit bounds them.
+            item["description"] = json!(db::text(row, "query_desc"));
+            item["input_desc"] = json!(db::text(row, "input_desc"));
+            item["output_desc"] = json!(db::text(row, "output_desc"));
+            item["sql"] = json!(db::text(row, "query_sql"));
             let bind_config = db::text(row, "bind_config");
             if !bind_config.trim().is_empty() {
-                item["bind_config"] = json!(clip_marked(&bind_config, 1000));
+                item["bind_config"] = json!(bind_config);
             }
             item
         })

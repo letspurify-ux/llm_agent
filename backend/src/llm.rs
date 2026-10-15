@@ -30,8 +30,8 @@ pub const MAX_TOOL_CALL_ID_BYTES: usize = 256;
 pub const MAX_TOOL_NAME_BYTES: usize = 128;
 pub const MAX_COMPLETION_BYTES: usize = 8 * 1024 * 1024;
 /// Safety bound on the calls assembled from one response. The agent runs
-/// at most `agent.max_tool_calls` of them (a setting up to this bound) and
-/// refuses the rest; only a response past this bound is rejected outright.
+/// every call of a response; only a response past this bound is rejected
+/// as malformed.
 pub const MAX_TOOL_CALLS: usize = 256;
 
 pub fn validate_completion_bounds(completion: &Completion) -> Result<()> {

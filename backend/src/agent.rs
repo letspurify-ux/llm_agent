@@ -27,9 +27,15 @@ use tokio_util::sync::CancellationToken;
 
 /// Turns of the browser's history used to restore a lost conversation.
 pub const MAX_CHAT_TURNS: usize = 6;
-pub const MAX_CHAT_LEN: usize = 1500;
-/// Characters (UTF-16) of a question.
-pub const MAX_QUESTION_LEN: usize = 2000;
+pub const MAX_CHAT_LEN: usize = 10_000;
+/// Characters (UTF-16) of a question: a pasted log or SQL fits, and its
+/// UTF-8 stays within chat_log's TEXT column (3 bytes a unit at most).
+pub const MAX_QUESTION_LEN: usize = 20_000;
+/// Characters of the question repeated in each request's runtime state; the
+/// whole question is in the conversation.
+const STATE_QUESTION_LEN: usize = 2_000;
+/// Responses that still call tools after tools were withheld.
+const WITHHELD_RETRIES: usize = 2;
 /// Prefix of the conversation a request without `conversation_id` gets
 /// (web.rs). Client ids cannot contain ':', so none is taken for one. Nothing
 /// can continue it, so it is dropped when its run ends rather than kept for
@@ -153,6 +159,7 @@ async fn run(
     let mut trace: Vec<Value> = vec![];
     let mut tracker = FailureTracker::default();
     let mut rounds = 0usize;
+    let mut withheld = 0usize;
     let mut empty = 0usize;
     let mut outages = 0usize;
     let mut partial: Vec<String> = vec![];
@@ -163,13 +170,14 @@ async fn run(
             bail!("cancelled");
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let final_round = rounds + 1 >= config.agent.max_rounds
-            || remaining.as_secs() <= FINAL_RESERVE_SECS;
+        // A question runs until it answers; near its time the model is asked
+        // to answer with what it has.
+        let final_round = remaining.as_secs() <= FINAL_RESERVE_SECS;
         if remaining.is_zero() {
             bail!(UserFacing("답변 시간이 다 되어 마무리하지 못했습니다. 질문을 좁혀 다시 시도해주세요.".into()));
         }
         let offered = offered_tools(config, c, final_round);
-        let state = runtime_state(config, message, rounds, remaining, final_round, &offered, partial.is_empty(), notice.take());
+        let state = runtime_state(config, message, remaining, final_round, &offered, partial.is_empty(), notice.take());
         let mut definitions = ToolRegistry::definitions(&offered.iter().map(String::as_str).collect());
         tools::require_project(&mut definitions, &config.projects);
         // What eviction cannot remove: the frame and the question.
@@ -296,7 +304,8 @@ async fn run(
             // Tools were withheld; a provider that still sends calls gets
             // one more request.
             notice = Some("도구를 더 쓸 수 없다. 지금까지 확보한 근거로 최종 답변만 써라.".into());
-            if rounds > config.agent.max_rounds + 1 {
+            withheld += 1;
+            if withheld > WITHHELD_RETRIES {
                 bail!(UserFacing("모델이 답변 대신 도구 호출을 반복해 답변을 마무리하지 못했습니다.".into()));
             }
             continue;
@@ -388,7 +397,6 @@ fn weekday(n: u32) -> &'static str {
 fn runtime_state(
     config: &Config,
     message: &str,
-    rounds: usize,
     remaining: Duration,
     final_round: bool,
     offered: &[String],
@@ -406,9 +414,7 @@ fn runtime_state(
     };
     let mut guidance = json!({
         "instruction":instruction,
-        "remaining_model_requests":config.agent.max_rounds.saturating_sub(rounds),
         "remaining_seconds":remaining.as_secs(),
-        "max_tool_calls":config.tool_call_limit(),
     });
     if let Some(notice) = notice {
         guidance["notice"] = json!(notice);
@@ -416,7 +422,7 @@ fn runtime_state(
     let mut state = json!({
         "run_guidance":guidance,
         "now":format!("{} ({}) KST", now.format("%Y-%m-%d %H:%M"), weekday(now.weekday().num_days_from_monday())),
-        "current_question":clip_utf16(message, MAX_QUESTION_LEN),
+        "current_question":crate::text::clip_marked(message, STATE_QUESTION_LEN),
     });
     if !config.embedding.enabled() {
         state["search"] = json!("unavailable: 임베딩이 설정되지 않아 의미 검색을 쓸 수 없다. 정확한 쿼리 이름 조회만 된다.");
@@ -437,9 +443,6 @@ enum Prepared {
     Source { args: Value, project: Project },
     /// Refused before running (its result is the refusal).
     Done(Value),
-    /// Past the response's tool call limit: never started, so it shows no
-    /// progress line or trace step and is not counted as a tool failure.
-    Skipped(Value),
 }
 
 /// The project of a source call: the project of the file cursor it
@@ -529,7 +532,6 @@ async fn execute_batch(
     room: usize,
 ) -> Vec<Value> {
     let calls = &completion.calls;
-    let limit = config.tool_call_limit();
     // Every result gets the whole result budget, however many calls the
     // response made; `fit_batch` keeps their sum within `room`.
     let share = config.result_budget();
@@ -539,13 +541,6 @@ async fn execute_batch(
     let root = |p: &Project| p.root.canonicalize().unwrap_or_else(|_| p.root.clone());
     let mut roots: BTreeMap<usize, String> = BTreeMap::new();
     for (index, call) in calls.iter().enumerate() {
-        if index >= limit {
-            ids.push(0);
-            prepared.push(Prepared::Skipped(tools::envelope(Err(anyhow::anyhow!(
-                "tool_call_limit: 한 응답에서 도구는 {limit}개까지만 실행한다. 이 호출은 실행하지 않았다 — 앞 호출들의 결과를 본 뒤 필요하면 다음 응답에서 다시 불러라"
-            )))));
-            continue;
-        }
         *event_id += 1;
         ids.push(*event_id);
         let raw = if call.arguments.trim().is_empty() { "{}" } else { call.arguments.as_str() };
@@ -560,9 +555,6 @@ async fn execute_batch(
                 } else {
                     format!("unsupported_tool: {} does not exist", call.name)
                 });
-            }
-            if let Some(refusal) = tracker.refusal(&call.name) {
-                return Err(refusal);
             }
             let mut args = parsed.clone()?;
             let adjusted = tools::normalize_arguments(&call.name, &mut args);
@@ -606,7 +598,6 @@ async fn execute_batch(
         let args = match &prepared[index] {
             Prepared::Voc { args } | Prepared::Source { args, .. } => args.clone(),
             Prepared::Done(_) => serde_json::from_str(&call.arguments).unwrap_or(Value::Null),
-            Prepared::Skipped(_) => continue,
         };
         match call.name.as_str() {
             "search" => events.send(json!({"type":"search","id":id,"text":args["query"],"targets":search_targets(&args)})),
@@ -877,13 +868,11 @@ async fn execute_batch(
     let mut finals: Vec<Value> = Vec::with_capacity(calls.len());
     for (index, call) in calls.iter().enumerate() {
         let mut result = match &prepared[index] {
-            Prepared::Done(result) | Prepared::Skipped(result) => result.clone(),
+            Prepared::Done(result) => result.clone(),
             _ => results[index].take().unwrap_or_else(|| tools::envelope(Err(anyhow::anyhow!("cancelled")))),
         };
-        if !matches!(prepared[index], Prepared::Skipped(_)) {
-            tracker.observe(&call.name, &call.arguments, &mut result);
-            tools::recovery::attach(offered, &mut result);
-        }
+        tracker.observe(&call.name, &call.arguments, &mut result);
+        tools::recovery::attach(offered, &mut result);
         finals.push(result);
     }
     let assistant = assistant_message(completion);
@@ -894,10 +883,6 @@ async fn execute_batch(
     c.history = workspace.history;
     let mut messages = vec![assistant];
     for (index, (call, result)) in calls.iter().zip(finals).enumerate() {
-        if let Prepared::Skipped(_) = &prepared[index] {
-            messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));
-            continue;
-        }
         if !matches!(call.name.as_str(), "search" | "query_run") {
             let root = result["root"].as_str().map(std::path::PathBuf::from).unwrap_or_default();
             trace.push(json!({"tool":call.name,"summary":tools::call_summary(&root, &call.name, &call.arguments),"status":result["status"]}));
@@ -943,7 +928,7 @@ fn fit_batch(ws: &mut Workspace, calls: &[ToolCall], prepared: &[Prepared], resu
         .zip(results.iter())
         .map(|(call, r)| tools::result_tokens(call, r, &model))
         .collect();
-    // Refusals and unrun calls are small and kept as they are.
+    // Refusals are small and kept as they are.
     let mut settled: Vec<bool> = prepared
         .iter()
         .map(|p| !matches!(p, Prepared::Voc { .. } | Prepared::Source { .. }))

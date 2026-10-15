@@ -191,38 +191,54 @@ async fn cancelling_stops_the_run_and_unknown_tools_are_refused() {
 }
 
 #[tokio::test]
-async fn calls_past_the_tool_call_setting_wait_for_the_next_response() {
+async fn every_call_of_a_response_runs() {
     let Some(db) = TestDb::create("calls") else {
         return skip("LLM_AGENT_TEST_MARIADB is not set");
     };
-    let mut config = db.config();
-    config.agent.max_tool_calls = Some(2);
-    let llm = Scripted::new(vec![
-        calls(vec![
-            call("d1", "query_describe", json!({"names":["batch_job_status"]})),
-            call("d2", "query_describe", json!({"names":["find_customer_id"]})),
-            call("d3", "query_describe", json!({"names":["today_date"]})),
-        ]),
-        calls(vec![call("d4", "query_describe", json!({"names":["today_date"]}))]),
-        text("끝"),
-    ]);
-    let (app, _dir) = app(config, llm.clone());
-    let (result, events) = ask(&app, "calls", "쿼리 셋 설명해줘", vec![]).await;
+    let names = ["batch_job_status", "find_customer_id", "today_date"];
+    let batch = (0..40).map(|i| call(&format!("d{i}"), "query_describe", json!({"names":[names[i % 3]]}))).collect();
+    let llm = Scripted::new(vec![calls(batch), text("끝")]);
+    let (app, _dir) = app(db.config(), llm.clone());
+    let (result, events) = ask(&app, "calls", "쿼리 설명해줘", vec![]).await;
     let answer = result.unwrap();
     assert_eq!(answer.answer, "끝");
     let requests = llm.requests();
     let state = messages(&requests[0], "user").last().unwrap()["content"].as_str().unwrap().to_owned();
-    assert!(state.contains("\"max_tool_calls\":2"), "{state}");
-    // The third call is answered (every call needs a result) but not run.
-    assert_eq!(tool_result(&requests[1], "d1")["status"], "ok");
-    assert_eq!(tool_result(&requests[1], "d2")["status"], "ok");
-    let skipped = tool_result(&requests[1], "d3");
-    assert_eq!(skipped["recovery"]["code"], "tool_call_limit", "{skipped}");
-    assert_eq!(tool_result(&requests[2], "d4")["status"], "ok", "resent in the next response, it runs");
-    // No progress line or trace step for the call that never started.
-    assert_eq!(ev(&events, "tool").len(), 3);
-    assert_eq!(ev(&events, "tool_done").len(), 3);
-    assert_eq!(answer.trace.iter().filter(|s| s["tool"] == "query_describe").count(), 3);
+    assert!(!state.contains("max_tool_calls") && !state.contains("remaining_model_requests"), "{state}");
+    for i in 0..40 {
+        assert_eq!(tool_result(&requests[1], &format!("d{i}"))["status"], "ok", "d{i}");
+    }
+    assert_eq!(ev(&events, "tool_done").len(), 40);
+    assert_eq!(answer.trace.iter().filter(|s| s["tool"] == "query_describe").count(), 40);
+}
+
+/// A question runs until it answers: past the former 24 model requests, and
+/// a tool that keeps failing still runs. Needs no MariaDB.
+#[tokio::test]
+async fn a_question_runs_until_it_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "a\n").unwrap();
+    let mut config = llm_agent::config::Config::default();
+    config.mariadb.port = 9;
+    config.llm.base_url = "http://127.0.0.1:9/v1".into();
+    config.llm.model = "gpt-4o".into();
+    config.projects.push(llm_agent::config::Project {
+        name: "app".into(),
+        root: root.clone(),
+        ..Default::default()
+    });
+    let mut script: Vec<_> = (0..30).map(|i| calls(vec![call(&format!("f{i}"), "file_read", json!({"path":format!("missing{i}.txt")}))])).collect();
+    script.push(text("끝"));
+    let llm = Scripted::new(script);
+    let (long_app, _long_dir) = app(config, llm.clone());
+    let (result, _) = ask(&long_app, "long", "없는 파일들 찾아봐", vec![]).await;
+    assert_eq!(result.unwrap().answer, "끝");
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 31);
+    let last = tool_result(&requests[30], "f29");
+    assert_eq!(last["recovery"]["code"], "file_not_found", "the 30th failure still ran: {last}");
 }
 
 #[tokio::test]

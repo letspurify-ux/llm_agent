@@ -10,8 +10,8 @@ const SERVER = {
   embedding: { url: '', model: 'bge-m3', query_prefix: 'Instruct\\nQuery: ', sync_interval_secs: 60, max_distance: 0.4, ef_search: 150, timeout_secs: 60 },
   mariadb: { host: 'localhost', port: 3306, user: 'agent', database: 'llm_agent', pool_size: 21, timeout_ms: 30000 },
   oracle: { client_lib_dir: '', client_config_dir: '', timeout_ms: 30000, routine_read_only: true, mock: false },
-  agent: { max_rounds: 24, run_seconds: 400, high_water: 0.9, low_water: 0.5, history_bytes: 16777216, result_tokens: null,
-    max_tool_calls: null, tool_timeout_secs: 30, repeated_read_limit: 2, session_idle_minutes: 60, max_sessions: 200, result_store_bytes: 33554432 },
+  agent: { run_seconds: 400, high_water: 0.9, low_water: 0.5, history_bytes: 16777216, result_tokens: null,
+    tool_timeout_secs: 30, repeated_read_limit: 2, session_idle_minutes: 60, max_sessions: 200, result_store_bytes: 33554432 },
   server: { port: 3001, chat_log_retention_days: 3 },
 };
 
@@ -20,8 +20,7 @@ test('설정 값은 화면 글자로 갔다가 같은 값으로 돌아온다', (
   assert.equal(form['agent.high_water'], '90');
   assert.equal(form['agent.history_bytes'], '16');
   assert.equal(form['agent.result_tokens'], '');
-  assert.equal(form['agent.max_tool_calls'], '');
-  assert.equal(configOf({ ...form, 'agent.max_tool_calls': '48' }).config.agent.max_tool_calls, 48);
+  assert.equal(configOf({ ...form, 'agent.result_tokens': '8000' }).config.agent.result_tokens, 8000);
   const { config, problems } = configOf(form);
   assert.deepEqual(problems, []);
   assert.deepEqual(config, SERVER);

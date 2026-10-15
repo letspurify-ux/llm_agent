@@ -18,8 +18,6 @@ use std::{
 pub const DEFAULT_RESULT_TOKENS: usize = 25_000;
 pub const RESULT_CONTEXT_SHARE: usize = 8;
 pub const MIN_RESULT_TOKENS: usize = 200;
-/// Tool calls one model response may run when the setting is left empty.
-pub const DEFAULT_TOOL_CALLS: usize = 32;
 /// Vector width of the `vec_*` tables (schema.sql).
 pub const EMBEDDING_DIMENSIONS: usize = 1024;
 /// Upper bound of the seconds settings (one day).
@@ -323,10 +321,13 @@ impl Default for OracleConfig {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {
-    /// Model requests per question before a final answer is asked for
-    /// without tools.
-    pub max_rounds: usize,
-    /// Seconds a question may run; the browser gives up at 450.
+    /// Former limit on model requests per question; a question now runs
+    /// until it answers or `run_seconds` is near. Read so an older
+    /// `config.toml` loads; not used and not written back.
+    #[serde(skip_serializing)]
+    pub max_rounds: Option<usize>,
+    /// Seconds a question may run; the browser gives up at 450. Near the
+    /// end the model is asked to answer without tools.
     pub run_seconds: u64,
     /// Share of the input budget that starts evicting old history bundles.
     pub high_water: f64,
@@ -341,8 +342,10 @@ pub struct AgentConfig {
     /// not written back.
     #[serde(skip_serializing)]
     pub batch_tokens: Option<usize>,
-    /// Tool calls run from one model response; calls past it are refused
-    /// unrun and the model resends them in its next response. Empty: 32.
+    /// Former limit on tool calls run from one response; every call runs
+    /// now (a response past `llm::MAX_TOOL_CALLS` is malformed). Read so an
+    /// older `config.toml` loads; not used and not written back.
+    #[serde(skip_serializing)]
     pub max_tool_calls: Option<usize>,
     pub tool_timeout_secs: u64,
     /// Identical unchanged reads already in context before a read is
@@ -357,7 +360,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_rounds: 24,
+            max_rounds: None,
             run_seconds: 400,
             high_water: 0.9,
             low_water: 0.5,
@@ -463,10 +466,6 @@ impl Config {
                 .max(MIN_RESULT_TOKENS)
         })
     }
-    /// Tool calls one response runs: the setting, or 32.
-    pub fn tool_call_limit(&self) -> usize {
-        self.agent.max_tool_calls.unwrap_or(DEFAULT_TOOL_CALLS).max(1)
-    }
     /// Input tokens a request may use: the context minus one response and a
     /// small frame.
     pub fn input_budget(&self) -> usize {
@@ -483,8 +482,7 @@ impl Config {
         if !(0.0 < a.low_water && a.low_water < a.high_water && a.high_water < 1.0) {
             bail!("컨텍스트 비우기 비율은 0 < 하한 < 상한 < 1 이어야 합니다.");
         }
-        if a.max_rounds == 0
-            || a.run_seconds == 0
+        if a.run_seconds == 0
             || a.tool_timeout_secs == 0
             || a.repeated_read_limit == 0
             || a.history_bytes < 64 * 1024
@@ -504,12 +502,6 @@ impl Config {
         }
         if self.result_budget() < MIN_RESULT_TOKENS {
             bail!("도구 결과 한도는 {MIN_RESULT_TOKENS} 토큰 이상이어야 합니다.");
-        }
-        if let Some(calls) = a.max_tool_calls {
-            let most = crate::llm::MAX_TOOL_CALLS;
-            if !(1..=most).contains(&calls) {
-                bail!("한 응답의 도구 호출 수는 1~{most} 사이여야 합니다.");
-            }
         }
         if self.input_budget() < 4096 {
             bail!("컨텍스트가 출력을 빼고 4,096 토큰 이상 남아야 합니다. 출력 한도를 줄이거나 컨텍스트를 늘려주세요.");
@@ -797,25 +789,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_limit_follows_the_setting() {
-        let mut config = Config::default();
-        config.llm.model = "m".into();
-        assert_eq!(config.tool_call_limit(), DEFAULT_TOOL_CALLS);
-        // The number of calls no longer depends on the context.
-        config.llm.context_tokens = 32_000;
-        config.llm.output_tokens = 4_096;
-        assert_eq!(config.tool_call_limit(), DEFAULT_TOOL_CALLS);
-        config.validate().unwrap();
-        config.agent.max_tool_calls = Some(64);
-        config.validate().unwrap();
-        assert_eq!(config.tool_call_limit(), 64);
-        for wrong in [0, crate::llm::MAX_TOOL_CALLS + 1] {
-            config.agent.max_tool_calls = Some(wrong);
-            assert!(config.validate().unwrap_err().to_string().contains("1~"), "{wrong}");
-        }
-    }
-
-    #[test]
     fn one_result_gets_25k_tokens_or_less_in_a_small_context() {
         let budget = |context: usize, output: usize| {
             let mut config = Config::default();
@@ -843,11 +816,14 @@ mod tests {
         let path = dir.path().join("config.toml");
         let mut text = toml::to_string_pretty(&Config::default()).unwrap();
         assert!(!text.contains("batch_tokens"));
-        text = text.replace("[agent]\n", "[agent]\nbatch_tokens = 8000\n");
+        text = text.replace("[agent]\n", "[agent]\nbatch_tokens = 8000\nmax_rounds = 24\nmax_tool_calls = 8\n");
         std::fs::write(&path, text).unwrap();
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.agent.batch_tokens, Some(8000));
-        assert!(!toml::to_string_pretty(&loaded).unwrap().contains("batch_tokens"));
+        let written = toml::to_string_pretty(&loaded).unwrap();
+        for former in ["batch_tokens", "max_rounds", "max_tool_calls"] {
+            assert!(!written.contains(former), "{former} is not written back");
+        }
         // A result limit the former batch limit allowed, past half the input
         // budget now, is lowered on load; the server still starts.
         let mut old = Config::default();

@@ -218,14 +218,17 @@ async fn projects_settings_and_folders_are_editable() {
         .admin(
             "PUT",
             "settings",
-            Some(json!({"config":{"agent":{"max_rounds":12,"max_tool_calls":8}},"secrets":{"llm_api_key":"sk-new"}})),
+            Some(json!({"config":{"agent":{"run_seconds":300,"result_tokens":8000}},"secrets":{"llm_api_key":"sk-new"}})),
             Some(&revision),
         )
         .await;
     assert_eq!(saved.status, StatusCode::OK, "{}", saved.text);
-    assert_eq!(saved.body["config"]["agent"]["max_rounds"], 12);
-    assert_eq!(saved.body["config"]["agent"]["max_tool_calls"], 8);
-    assert_eq!(app.config().tool_call_limit(), 8);
+    assert_eq!(saved.body["config"]["agent"]["run_seconds"], 300);
+    assert_eq!(saved.body["config"]["agent"]["result_tokens"], 8000);
+    assert_eq!(app.config().result_budget(), 8000);
+    // The former limits are gone from the settings (sent by an older screen,
+    // they are accepted and dropped).
+    assert!(saved.body["config"]["agent"].get("max_rounds").is_none() && saved.body["config"]["agent"].get("max_tool_calls").is_none());
     assert_eq!(saved.body["secrets"]["llm_api_key"], true);
     assert!(!saved.text.contains("sk-new"));
     assert_eq!(app.config().llm.api_key.as_ref().unwrap().0, "sk-new");
@@ -235,12 +238,12 @@ async fn projects_settings_and_folders_are_editable() {
         .admin("PUT", "settings", Some(json!({"config":{"agent":{"low_water":0.95}}})), saved.etag.as_deref())
         .await;
     assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
-    // More calls than one response can carry.
-    let too_many = client
-        .admin("PUT", "settings", Some(json!({"config":{"agent":{"max_tool_calls":llm_agent::llm::MAX_TOOL_CALLS + 1}}})), saved.etag.as_deref())
+    // One result larger than half the input budget.
+    let too_large = client
+        .admin("PUT", "settings", Some(json!({"config":{"agent":{"result_tokens":10_000_000,"max_rounds":12}}})), saved.etag.as_deref())
         .await;
-    assert_eq!(too_many.status, StatusCode::BAD_REQUEST);
-    assert!(too_many.body["error"].as_str().unwrap().contains("도구 호출 수"), "{}", too_many.text);
+    assert_eq!(too_large.status, StatusCode::BAD_REQUEST);
+    assert!(too_large.body["error"].as_str().unwrap().contains("절반"), "{}", too_large.text);
     let checked = client.admin("POST", "settings/check", Some(json!({"target":"mariadb"})), None).await;
     assert_eq!(checked.body["ok"], true, "{}", checked.text);
 
@@ -264,9 +267,13 @@ async fn chat_streams_ndjson_and_logs_each_outcome() {
 
     let r = client.send("POST", "/api/chat", Some(json!({"message":"  "})), None, false).await;
     assert_eq!((r.status, r.body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("message가 필요합니다.")));
-    let long = "가".repeat(2001);
+    let long = "가".repeat(llm_agent::agent::MAX_QUESTION_LEN + 1);
     let r = client.send("POST", "/api/chat", Some(json!({"message":long})), None, false).await;
-    assert_eq!(r.body["error"], "질문이 너무 깁니다 (최대 2,000자).");
+    assert_eq!(r.body["error"], "질문이 너무 깁니다 (최대 20,000자).");
+    // The longest question fits chat_log's TEXT column (3 UTF-8 bytes a unit).
+    let longest = "가".repeat(llm_agent::agent::MAX_QUESTION_LEN);
+    let config = app.config();
+    llm_agent::db::insert_chat_log(&app.db, &config.mariadb, &longest, None, &json!({"v":5})).await.unwrap();
     let request = Request::builder()
         .method("POST")
         .uri("/api/chat")

@@ -903,7 +903,7 @@ it('산점도는 점으로, y2는 오른쪽 축의 선으로 그려진다', asyn
 
 it('요청 이력은 최근 대화로 제한되고 차트의 값이 남으며 중복 제출은 한 번만 전송된다', async () => {
   await page.goto(url(), '.chip');
-  const answer = '```chart\ntype: bar\ntitle: 매출\n| 월 | 값 |\n|---|---|\n| 9월 | 123 |\n```\n' + '설명'.repeat(1000);
+  const answer = '```chart\ntype: bar\ntitle: 매출\n| 월 | 값 |\n|---|---|\n| 9월 | 123 |\n```\n' + '설명'.repeat(6000);
   await page.eval(`window.__requests = []; window.fetch = async (url, opts) => {
     window.__requests.push(JSON.parse(opts.body));
     return new Response(JSON.stringify({ answer: ${JSON.stringify(answer)} }), { headers: { 'Content-Type': 'application/json' } });
@@ -913,7 +913,8 @@ it('요청 이력은 최근 대화로 제한되고 차트의 값이 남으며 �
   assert.equal(history.length, 6);
   assert.equal(history[0].text, '질문 2');
   for (const turn of history.filter(m => m.role === 'assistant')) {
-    assert.ok(turn.text.length <= 1500);
+    // 턴당 상한(HISTORY_LEN, 서버 MAX_CHAT_LEN과 같은 값)까지 자른다.
+    assert.ok(turn.text.length <= 10000 && turn.text.length > 9000, String(turn.text.length));
     assert.match(turn.text, /9월.*123/);
     assert.doesNotMatch(turn.text, /```chart|type: bar/);
   }

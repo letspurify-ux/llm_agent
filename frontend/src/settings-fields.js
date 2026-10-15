@@ -53,12 +53,10 @@ export const SETTING_GROUPS = [
   { id: 'agent', title: '실행·컨텍스트',
     description: '질문 하나가 쓸 수 있는 모델 요청과 시간, 그리고 대화 맥락을 비우는 기준입니다.',
     fields: [
-      ['agent.max_rounds', '질문당 모델 요청 수', 'number', '다 쓰면 도구 없이 답을 요청합니다.'],
-      ['agent.run_seconds', '질문당 시간 (초)', 'number', '화면은 450초에 요청을 끊습니다.'],
+      ['agent.run_seconds', '질문당 시간 (초)', 'number', '질문은 답할 때까지 모델을 부릅니다. 끝나기 45초 전에는 도구 없이 답하게 합니다. 화면은 450초에 요청을 끊습니다.'],
       ['agent.high_water', '맥락 비우기 시작 (%)', 'percent', '입력 예산의 이 비율을 넘으면 오래된 대화·도구 결과부터 맥락에서 뺍니다.'],
       ['agent.low_water', '맥락 비우기 목표 (%)', 'percent'],
       ['agent.result_tokens', '도구 결과 하나 (토큰)', 'optionalNumber', '비우면 25,000(컨텍스트가 작으면 그 1/8). 호출마다 따로 받고, 한 응답의 결과가 맥락에 다 들어가지 않을 때만 큰 결과부터 줄입니다.'],
-      ['agent.max_tool_calls', '한 응답의 도구 호출 수', 'optionalNumber', '비우면 32. 넘는 호출은 실행하지 않고 다음 응답에서 다시 부르게 합니다.'],
       ['agent.history_bytes', '대화 이력 보관 (MiB)', 'mib'],
       ['agent.result_store_bytes', '조회 결과 보관 (MiB)', 'mib'],
       ['agent.tool_timeout_secs', '소스 도구 한도 (초)', 'number'],

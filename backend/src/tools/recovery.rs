@@ -3,7 +3,7 @@
 //! the model's behalf or relaxes validation.
 use super::*;
 use serde::Serialize;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 
 /// Structured failure details survive the common envelope.
 /// Display retains the stable prefix used by recovery classification.
@@ -105,8 +105,6 @@ pub fn describe(message: &str) -> Value {
         (Class::InvalidInput, "correct_arguments")
     } else if code == "repeated_call" {
         (Class::InvalidInput, "use_previous_result")
-    } else if code == "tool_call_limit" {
-        (Class::Capacity, "resend_in_next_response")
     } else if code.contains("conflict")
         || code.contains("changed")
         || code.contains("stale")
@@ -160,29 +158,15 @@ pub fn attach(offered: &[String], result: &mut Value) {
     }
 }
 
-/// Repeated failures within one question. The same failing call is marked
-/// so the model changes approach instead of resending it, and a tool that
-/// keeps failing is refused for the rest of the question.
+/// Repeated failures within one question: the same failing call is marked
+/// so the model changes approach instead of resending it.
 #[derive(Default)]
 pub struct FailureTracker {
-    by_tool: BTreeMap<String, usize>,
     recent: VecDeque<(String, [u8; 32])>,
 }
 
 impl FailureTracker {
-    /// Failures of one tool within a question before it is refused.
-    pub const TOOL_FAILURE_LIMIT: usize = 8;
     const RECENT_CALLS: usize = 64;
-
-    /// The refusal for a tool that has failed too often, before running it.
-    pub fn refusal(&self, name: &str) -> Option<String> {
-        (self.by_tool.get(name).copied().unwrap_or(0) >= Self::TOOL_FAILURE_LIMIT).then(|| {
-            format!(
-                "tool_recovery_limit: {name} failed {} times in this question; it is not run again. Answer with the evidence gathered so far, or use another tool",
-                Self::TOOL_FAILURE_LIMIT
-            )
-        })
-    }
 
     /// Records a finished call; a failure repeated with identical arguments
     /// is annotated.
@@ -190,7 +174,6 @@ impl FailureTracker {
         if !is_failure(result) || result["status"] == "cancelled" {
             return;
         }
-        *self.by_tool.entry(name.to_owned()).or_default() += 1;
         let digest: [u8; 32] = Sha256::digest(arguments.as_bytes()).into();
         let key = (name.to_owned(), digest);
         if self.recent.contains(&key) {
@@ -219,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn identical_failures_are_marked_and_tools_refused() {
+    fn identical_failures_are_marked_and_tools_still_run() {
         let mut tracker = FailureTracker::default();
         let mut first = json!({"status":"error","error":"x"});
         tracker.observe("file_read", "{}", &mut first);
@@ -227,10 +210,13 @@ mod tests {
         let mut second = json!({"status":"error","error":"x"});
         tracker.observe("file_read", "{}", &mut second);
         assert_eq!(second["repeated_failure"], true);
-        for _ in 0..FailureTracker::TOOL_FAILURE_LIMIT {
-            tracker.observe("file_read", "{\"a\":1}", &mut json!({"status":"error"}));
+        // However often a tool fails with other arguments, a new call is not
+        // marked: the tool is never refused.
+        for i in 0..20 {
+            tracker.observe("file_read", &format!("{{\"a\":{i}}}"), &mut json!({"status":"error"}));
         }
-        assert!(tracker.refusal("file_read").is_some());
-        assert!(tracker.refusal("file_list").is_none());
+        let mut fresh = json!({"status":"error","error":"x"});
+        tracker.observe("file_read", "{\"b\":1}", &mut fresh);
+        assert!(fresh.get("repeated_failure").is_none());
     }
 }

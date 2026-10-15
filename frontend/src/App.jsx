@@ -42,7 +42,7 @@ const Mermaid = lazy(() => import('./Mermaid.jsx'));
 // 적용되므로 요청 크기를 실제로 묶어두는 것은 이쪽뿐이다 — 넘기면 서버의 본문 크기 제한(1MB)에 걸려
 // 이후 모든 요청이 같은 이유로 실패한다(이력은 줄지 않으므로 대화가 복구되지 않는다).
 const HISTORY_TURNS = 6;
-const HISTORY_LEN = 1500;
+const HISTORY_LEN = 10000;
 
 // 단순 slice는 경계의 서로게이트 쌍(이모지 등)을 반으로 쪼개 짝 잃은 코드유닛을 남기고,
 // 그 값은 서버를 거쳐 LLM 프롬프트로 가는 인코딩 단계에서 U+FFFD로 조용히 훼손된다.
@@ -1367,7 +1367,7 @@ export default function App() {
               submitInput();
             }}
             placeholder="질문을 입력하세요 (Alt+Enter 줄바꿈)"
-            maxLength={2000}  /* 입력 단계 안내용 사본 — 실제 제한은 서버가 검증한다 (backend/src/agent.rs MAX_QUESTION_LEN) */
+            maxLength={20000}  /* 입력 단계 안내용 사본 — 실제 제한은 서버가 검증한다 (backend/src/agent.rs MAX_QUESTION_LEN) */
             autoFocus
           />
           <button
