@@ -172,13 +172,10 @@ async fn run(
         let state = runtime_state(config, message, rounds, remaining, final_round, &offered, partial.is_empty(), notice.take());
         let mut definitions = ToolRegistry::definitions(&offered.iter().map(String::as_str).collect());
         tools::require_project(&mut definitions, &config.projects);
-        // What this response's tool results may fill: the input budget less
-        // what eviction cannot remove (the frame and the question).
-        let room = {
-            let frame = context::count(&context::request(&Default::default(), &state, &model, definitions.clone()), &model);
-            let budget = (config.input_budget() as f64 / context::token_ratio(c, &model)) as usize;
-            budget.saturating_sub(frame + context::bundle_tokens(&c.history, question_bundle, &model) + 512)
-        };
+        // What eviction cannot remove: the frame and the question.
+        let kept = context::count(&context::request(&Default::default(), &state, &model, definitions.clone()), &model)
+            + context::bundle_tokens(&c.history, question_bundle, &model)
+            + 512;
         let mut request = context::request(&c.history, &state, &model, definitions.clone());
         let mut estimate = context::count(&request, &model);
         let evicted = context::evict(c, config, estimate, &[question_bundle]);
@@ -304,6 +301,9 @@ async fn run(
             }
             continue;
         }
+        // What this response's tool results may fill, at the token ratio its
+        // own usage has just updated: the next request is checked with it.
+        let room = ((config.input_budget() as f64 / context::token_ratio(c, &model)) as usize).saturating_sub(kept);
         let tool_started = Instant::now();
         let messages = execute_batch(
             app,
@@ -872,22 +872,32 @@ async fn execute_batch(
         let bounded = tools::bound_result(&mut workspace, call, &args, result, share);
         results[index] = Some(bounded);
     }
-    workspace.file_cursors = std::mem::take(&mut c.file_cursors);
-    fit_batch(&mut workspace, calls, &prepared, &mut results, room);
-    c.file_cursors = workspace.file_cursors;
-    c.history = workspace.history;
-    let mut messages = vec![assistant_message(completion)];
+    // Every result as the model receives it (repeat warnings and recovery
+    // hints attached), fitted beside the response's own calls.
+    let mut finals: Vec<Value> = Vec::with_capacity(calls.len());
     for (index, call) in calls.iter().enumerate() {
         let mut result = match &prepared[index] {
-            Prepared::Done(result) => result.clone(),
-            Prepared::Skipped(result) => {
-                messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));
-                continue;
-            }
+            Prepared::Done(result) | Prepared::Skipped(result) => result.clone(),
             _ => results[index].take().unwrap_or_else(|| tools::envelope(Err(anyhow::anyhow!("cancelled")))),
         };
-        tracker.observe(&call.name, &call.arguments, &mut result);
-        tools::recovery::attach(offered, &mut result);
+        if !matches!(prepared[index], Prepared::Skipped(_)) {
+            tracker.observe(&call.name, &call.arguments, &mut result);
+            tools::recovery::attach(offered, &mut result);
+        }
+        finals.push(result);
+    }
+    let assistant = assistant_message(completion);
+    let room = room.saturating_sub(context::count(&assistant, &config.llm.model));
+    workspace.file_cursors = std::mem::take(&mut c.file_cursors);
+    fit_batch(&mut workspace, calls, &prepared, &mut finals, room);
+    c.file_cursors = workspace.file_cursors;
+    c.history = workspace.history;
+    let mut messages = vec![assistant];
+    for (index, (call, result)) in calls.iter().zip(finals).enumerate() {
+        if let Prepared::Skipped(_) = &prepared[index] {
+            messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));
+            continue;
+        }
         if !matches!(call.name.as_str(), "search" | "query_run") {
             let root = result["root"].as_str().map(std::path::PathBuf::from).unwrap_or_default();
             trace.push(json!({"tool":call.name,"summary":tools::call_summary(&root, &call.name, &call.arguments),"status":result["status"]}));
@@ -910,38 +920,36 @@ async fn execute_batch(
 }
 
 /// Cuts the largest results until this response's tool messages fit `room`:
-/// what is left of the context with every older bundle evicted. Each result
-/// already fits the result budget, so this only acts on a response with many
-/// large results. A cut result is paged or archived in history with its
-/// start, as `bound_result` does at the budget.
-fn fit_batch(ws: &mut Workspace, calls: &[ToolCall], prepared: &[Prepared], results: &mut [Option<Value>], room: usize) {
+/// what is left of the context with every older bundle evicted and the
+/// response's own calls in place. Each result already fits the result
+/// budget, so this only acts on a response with many large results. A cut
+/// result is paged or archived in history with its start, as
+/// `bound_result` does at the budget.
+fn fit_batch(ws: &mut Workspace, calls: &[ToolCall], prepared: &[Prepared], results: &mut [Value], room: usize) {
     let model = ws.config.model.clone();
-    let fixed: usize = calls
+    // A message token is at least one byte of the message, whose content is
+    // escaped once more, plus the estimate's quarter: most responses stop
+    // here uncounted.
+    let most: usize = calls
         .iter()
-        .zip(prepared)
-        .filter_map(|(call, p)| match p {
-            Prepared::Done(r) | Prepared::Skipped(r) => Some(tools::result_tokens(call, r, &model)),
-            _ => None,
-        })
+        .zip(results.iter())
+        .map(|(call, r)| ((tools::model_result(r).to_string().len() * 2 + call.id.len()) * 5).div_ceil(4) + 64)
         .sum();
-    // A message token is at least one byte, with its content escaped once
-    // more and the estimate's quarter: most responses stop here uncounted.
-    let most: usize = results
-        .iter()
-        .flatten()
-        .map(|r| tools::model_result(r).to_string().len() * 5 / 2 + 128)
-        .sum();
-    if fixed + most <= room {
+    if most <= room {
         return;
     }
     let mut sizes: Vec<usize> = calls
         .iter()
         .zip(results.iter())
-        .map(|(call, r)| r.as_ref().map_or(0, |r| tools::result_tokens(call, r, &model)))
+        .map(|(call, r)| tools::result_tokens(call, r, &model))
         .collect();
-    let mut settled = vec![false; calls.len()];
+    // Refusals and unrun calls are small and kept as they are.
+    let mut settled: Vec<bool> = prepared
+        .iter()
+        .map(|p| !matches!(p, Prepared::Voc { .. } | Prepared::Source { .. }))
+        .collect();
     loop {
-        let total = fixed + sizes.iter().sum::<usize>();
+        let total = sizes.iter().sum::<usize>();
         if total <= room {
             return;
         }
@@ -954,32 +962,25 @@ fn fit_batch(ws: &mut Workspace, calls: &[ToolCall], prepared: &[Prepared], resu
         else {
             return;
         };
-        let (args, project) = match &prepared[index] {
-            Prepared::Voc { args } => (args.clone(), None),
-            Prepared::Source { args, project } => (args.clone(), Some(project.clone())),
-            _ => {
-                settled[index] = true;
-                continue;
+        let mut args = match &prepared[index] {
+            Prepared::Voc { args } => args.clone(),
+            Prepared::Source { args, project } => {
+                ws.project = project.clone();
+                args.clone()
             }
+            _ => unreachable!("only run calls are cut"),
         };
-        let mut args = args;
         if let Some(fields) = args.as_object_mut() {
             fields.remove("project");
             fields.remove("__adjusted");
         }
-        if let Some(project) = project {
-            ws.project = project;
-        }
         let limit = size.saturating_sub(total - room).max(crate::config::MIN_RESULT_TOKENS);
-        let Some(result) = results[index].take() else {
-            settled[index] = true;
-            continue;
-        };
+        let result = std::mem::take(&mut results[index]);
         let cut = tools::bound_result(ws, &calls[index], &args, result, limit);
         let cut_size = tools::result_tokens(&calls[index], &cut, &model);
         settled[index] = cut_size >= size || cut_size <= limit;
         sizes[index] = cut_size;
-        results[index] = Some(cut);
+        results[index] = cut;
     }
 }
 

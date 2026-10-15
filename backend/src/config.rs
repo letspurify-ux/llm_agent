@@ -562,6 +562,16 @@ impl Config {
             config.apply_credentials(secrets);
         }
         config.number_projects();
+        // The former per-response limit allowed one result past half the
+        // input budget; such a file still starts, with the limit lowered.
+        let half = config.input_budget() / 2;
+        if let Some(tokens) = config.agent.result_tokens
+            && tokens > half
+            && half >= MIN_RESULT_TOKENS
+        {
+            eprintln!("[config] agent.result_tokens {tokens} is past half the input budget; {half} is used");
+            config.agent.result_tokens = Some(half);
+        }
         config.validate()?;
         Ok(config)
     }
@@ -838,6 +848,16 @@ mod tests {
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.agent.batch_tokens, Some(8000));
         assert!(!toml::to_string_pretty(&loaded).unwrap().contains("batch_tokens"));
+        // A result limit the former batch limit allowed, past half the input
+        // budget now, is lowered on load; the server still starts.
+        let mut old = Config::default();
+        old.agent.result_tokens = Some(60_000);
+        let text = toml::to_string_pretty(&old).unwrap().replace("[agent]\n", "[agent]\nbatch_tokens = 60000\n");
+        std::fs::write(&path, text).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.result_budget(), loaded.input_budget() / 2);
+        // Saved from the settings screen, the same value is still refused.
+        assert!(old.validate().unwrap_err().to_string().contains("절반"));
     }
 
     #[test]

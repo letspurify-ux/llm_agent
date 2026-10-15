@@ -1642,12 +1642,15 @@ fn read_file(
             Some(_) => false,
         }
     };
-    let line_end = observed_start + shown.lines().count().saturating_sub(1);
+    let truncated = content["truncated"].as_bool().unwrap();
+    // A range shown to its end with a final line break ends in an empty
+    // line, which `lines` does not count; cut there, the next line is unread.
+    let empty_last = !truncated && shown.ends_with('\n');
+    let line_end = observed_start + shown.lines().count().saturating_sub(1) + usize::from(empty_last);
     content["line_start"] = json!(observed_start);
     content["line_end"] = json!(line_end);
     content["first_line_complete"] = json!(first_line_complete);
     content["last_line_complete"] = json!(last_line_complete);
-    let truncated = content["truncated"].as_bool().unwrap();
     let next_line = if truncated {
         Some(start)
     } else {
@@ -1725,11 +1728,15 @@ pub fn model_result(result: &Value) -> Value {
     if text.is_empty() {
         return shown;
     }
-    let numbered = text
+    let mut numbered = text
         .split_inclusive('\n')
         .enumerate()
         .map(|(index, line)| format!("{}|{}", start + index as u64, line))
         .collect::<String>();
+    // The empty line a fully shown range ends in gets its number too.
+    if text.ends_with('\n') && content["truncated"] == false {
+        numbered.push_str(&format!("{}|", start + text.matches('\n').count() as u64));
+    }
     let fields = content.as_object_mut().unwrap();
     fields.remove("text");
     fields.insert("numbered_text".into(), json!(numbered));
@@ -1830,31 +1837,16 @@ pub fn bound_result(
     {
         return page;
     }
-    let old_archive = result["archive_id"]
-        .as_u64()
-        .or_else(|| {
-            (result["next_cursor"]["tool"] == "history")
-                .then(|| result["next_cursor"]["id"].as_u64())
-                .flatten()
-        })
-        .filter(|id| s.history.read(*id).is_ok());
-    let archive = if call.name == "history" && args["action"] == "read" {
-        args["id"].as_u64().unwrap_or_default()
-    } else if let Some(id) = old_archive {
-        id
-    } else {
-        let id = s.history.push(
-            vec![json!({"role":"tool_archive","call_id":call.id,"result":result})],
-            true,
-        );
-        if let Some(bundle) = s.history.bundles.back_mut() {
-            bundle.active = false;
-        }
-        id
-    };
+    // A file read continues from the file with its cursor: it is archived
+    // only when its text cannot be narrowed to the limit.
+    let reads_file = matches!(call.name.as_str(), "file_read" | "symbol_read")
+        && output["data"]["content"]["text"].is_string();
     output["truncated"] = json!(true);
-    output["archive_id"] = json!(archive);
-    output["next_cursor"] = json!({"tool":"history","action":"read","id":archive,"offset":0});
+    if !reads_file {
+        let archive = archive_for(s, call, args, &result);
+        output["archive_id"] = json!(archive);
+        output["next_cursor"] = json!({"tool":"history","action":"read","id":archive,"offset":0});
+    }
     for pointer in ["/data/content/text", "/data/text"] {
         let Some(text) = output
             .pointer(pointer)
@@ -1903,18 +1895,17 @@ pub fn bound_result(
                 v["data"]["truncated"] = json!(true);
                 v["data"]["next_offset"] = json!(offset);
                 v["next_cursor"]["offset"] = json!(offset);
+            } else if let Some(data) = v["data"].as_object_mut() {
+                // A knowledge read cut inside its text: its end and cursor lie
+                // past the cut; the archive continues it.
+                data.remove("complete_to_end");
+                data.remove("next_cursor");
             }
             v
         };
-        let (mut low, mut high) = (0, chars.len());
-        while low < high {
-            let mid = (low + high).div_ceil(2);
-            if result_tokens(call, &candidate(mid, s), &model) <= limit {
-                low = mid;
-            } else {
-                high = mid - 1;
-            }
-        }
+        let low = longest_within(chars.len(), limit, |length| {
+            result_tokens(call, &candidate(length, s), &model)
+        });
         output = candidate(low, s);
         if low > 0 && result_tokens(call, &output, &model) <= limit {
             if narrowed_cursor.is_some()
@@ -1926,6 +1917,15 @@ pub fn bound_result(
             return output;
         }
     }
+    let archive = match output["archive_id"].as_u64() {
+        Some(id) => id,
+        None => {
+            let id = archive_for(s, call, args, &result);
+            output["archive_id"] = json!(id);
+            output["next_cursor"] = json!({"tool":"history","action":"read","id":id,"offset":0});
+            id
+        }
+    };
     // Collections stay structured: a shortened native page resumes at the
     // first omitted item, other collections continue in the archive.
     for field in ["paths", "matches", "items", "rows", "hits", "outline", "files", "counts"] {
@@ -1951,6 +1951,14 @@ pub fn bound_result(
         output["data"][field] = Value::Array(items[..low].to_vec());
         if low > 0 {
             output["data"][format!("{field}_omitted")] = json!(items.len() - low);
+            // Rows read from an offset continue right after those shown, and
+            // a history search after the last match shown.
+            if let (Some(offset), true) = (output["data"]["offset"].as_u64(), output["data"].get("next_offset").is_some()) {
+                output["data"]["next_offset"] = json!(offset + low as u64);
+            }
+            if call.name == "history" && field == "items" {
+                output["data"]["next_cursor"] = items[low - 1]["id"].clone();
+            }
             let start = args["cursor"]
                 .as_str()
                 .and_then(|cursor| cursor.rsplit_once(':'))
@@ -1968,8 +1976,12 @@ pub fn bound_result(
     if let Some(data) = arguments::compact_data(&result["data"]) {
         compact["data"] = data;
     } else if result["status"] == "ok" {
-        // As a tool output saved to a file: the start of it, within the limit.
-        let shown = model_result(&result)["data"].to_string();
+        // As a tool output saved to a file: the start of it, within the limit
+        // (a stub cut again keeps showing the start of the result).
+        let shown = match result["data"]["preview"].as_str() {
+            Some(preview) if result["next_cursor"]["tool"] == "history" => preview.to_owned(),
+            _ => model_result(&result)["data"].to_string(),
+        };
         let mut room = limit.saturating_sub(result_tokens(call, &compact, &model));
         while room > 0 {
             let mut candidate = compact.clone();
@@ -1991,6 +2003,60 @@ pub fn bound_result(
         compact["data"] = Value::Null;
     }
     compact
+}
+
+/// The longest length up to `n` whose `size` stays within `limit`, for a size
+/// that grows about linearly with the length kept (text cut at a character):
+/// aimed between the lengths known to fit and not to fit, a few measures of
+/// the whole message rather than a binary search, stopping within 1% of the
+/// limit.
+fn longest_within(n: usize, limit: usize, size: impl Fn(usize) -> usize) -> usize {
+    let (mut low, mut high) = (0usize, n);
+    let (mut low_size, mut high_size) = (size(0), size(n));
+    if high_size <= limit {
+        return n;
+    }
+    if low_size > limit {
+        return 0;
+    }
+    while high - low > 1 && limit - low_size > limit / 100 {
+        let share = (limit - low_size) as f64 / (high_size - low_size).max(1) as f64;
+        let aim = (low + (share * (high - low) as f64) as usize).clamp(low + 1, high - 1);
+        let measured = size(aim);
+        if measured <= limit {
+            (low, low_size) = (aim, measured);
+        } else {
+            (high, high_size) = (aim, measured);
+        }
+    }
+    low
+}
+
+/// The history bundle holding `result` whole: the one it is already read
+/// from or archived in, or a new inactive one.
+fn archive_for(s: &mut Workspace, call: &crate::llm::ToolCall, args: &Value, result: &Value) -> u64 {
+    if call.name == "history" && args["action"] == "read" {
+        return args["id"].as_u64().unwrap_or_default();
+    }
+    let old = result["archive_id"]
+        .as_u64()
+        .or_else(|| {
+            (result["next_cursor"]["tool"] == "history")
+                .then(|| result["next_cursor"]["id"].as_u64())
+                .flatten()
+        })
+        .filter(|id| s.history.read(*id).is_ok());
+    if let Some(id) = old {
+        return id;
+    }
+    let id = s.history.push(
+        vec![json!({"role":"tool_archive","call_id":call.id,"result":result})],
+        true,
+    );
+    if let Some(bundle) = s.history.bundles.back_mut() {
+        bundle.active = false;
+    }
+    id
 }
 
 /// Removes the project root prefix from `path` values. Reference documents
@@ -2200,6 +2266,131 @@ mod tests {
     }
 
     #[test]
+    fn a_large_default_read_is_cut_to_the_limit_without_an_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=3000).map(|i| format!("    let value_{i} = compute(alpha, beta, {i});\n")).collect();
+        std::fs::write(dir.path().join("big.rs"), &body).unwrap();
+        let mut ws = workspace(dir.path());
+        ws.config.result_tokens = 25_000;
+        let call = crate::llm::ToolCall { id: "f".into(), name: "file_read".into(), arguments: "{}".into() };
+        let args = json!({"path":"big.rs"});
+        let result = envelope(execute(&mut ws, "file_read", args.clone(), &Default::default()));
+        let result = limit_result(&mut ws, &call, &args, result, 25_000);
+        assert!(result_tokens(&call, &result, "gpt-4o") <= 25_000);
+        assert!(result_tokens(&call, &result, "gpt-4o") > 20_000, "the limit is used");
+        // The file is the archive: the cursor reads on from it.
+        assert!(result.get("archive_id").is_none(), "{}", result["archive_id"]);
+        assert!(ws.history.bundles.is_empty());
+        let cursor = result["next_cursor"]["cursor"].as_str().unwrap().to_owned();
+        let next = envelope(execute(&mut ws, "file_read", json!({"cursor":cursor}), &Default::default()));
+        let shown_end = result["data"]["content"]["line_end"].as_u64().unwrap();
+        assert!(next["data"]["content"]["line_start"].as_u64().unwrap() >= shown_end, "{next}");
+    }
+
+    #[test]
+    fn a_cut_history_search_continues_after_the_last_match_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = workspace(dir.path());
+        for i in 0..30 {
+            ws.history.push(vec![json!({"role":"tool","content":format!("needle {i} {}", "건초 ".repeat(40))})], true);
+        }
+        for bundle in ws.history.bundles.iter_mut() {
+            bundle.active = false;
+        }
+        let call = crate::llm::ToolCall { id: "h".into(), name: "history".into(), arguments: "{}".into() };
+        let args = json!({"action":"search","query":"needle","limit":10});
+        let result = envelope(execute(&mut ws, "history", args.clone(), &Default::default()));
+        assert_eq!(result["data"]["items"].as_array().unwrap().len(), 10);
+        let full = result_tokens(&call, &result, "gpt-4o");
+        let cut = bound_result(&mut ws, &call, &args, result, full / 3);
+        let items = cut["data"]["items"].as_array().unwrap();
+        assert!(!items.is_empty() && items.len() < 10, "{cut}");
+        assert_eq!(cut["data"]["next_cursor"], items.last().unwrap()["id"], "{cut}");
+    }
+
+    /// Random files read at random ranges and limits, cut again at a smaller
+    /// limit now and then (as a response that does not fit the context is):
+    /// following the cursors gives back the requested range exactly, and
+    /// no message passes its limit. FIT_FUZZ sets the number of reads.
+    #[test]
+    fn random_file_reads_continue_without_gaps() {
+        let runs: usize = std::env::var("FIT_FUZZ").ok().and_then(|n| n.parse().ok()).unwrap_or(8);
+        let mut seed: u64 = 0xf11e;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n.max(1)
+        };
+        let pieces = ["let x = 1;", "가상계측 값", "\"quoted\"", "back\\slash", "\ttab", "😀", "{ }", "|", "    "];
+        let dir = tempfile::tempdir().unwrap();
+        let call = crate::llm::ToolCall { id: "call_f".into(), name: "file_read".into(), arguments: "{}".into() };
+        for run in 0..runs {
+            let mut body = String::new();
+            for _ in 0..1 + next(3000) {
+                let width = if next(50) == 0 { 2000 + next(4000) } else { next(12) };
+                for _ in 0..width {
+                    body.push_str(pieces[next(pieces.len())]);
+                    body.push(' ');
+                }
+                body.push_str(if next(10) == 0 { "\r\n" } else { "\n" });
+            }
+            if next(3) == 0 {
+                body.pop();
+            }
+            let name = format!("f{run}.txt");
+            std::fs::write(dir.path().join(&name), &body).unwrap();
+            let mut ws = workspace(dir.path());
+            ws.config.result_tokens = 300 + next(30_000);
+            let total = body.lines().count();
+            let start = 1 + next(total);
+            let mut args = json!({"path":name,"start_line":start});
+            if next(2) == 0 {
+                args["max_lines"] = json!(1 + next(2000));
+            }
+            let max_lines = args["max_lines"].as_u64().map_or(2000, |n| n as usize);
+            let byte_start: usize = body.split_inclusive('\n').take(start - 1).map(str::len).sum();
+            let byte_len: usize = body[byte_start..].split_inclusive('\n').take(max_lines).map(str::len).sum();
+            let range = &body[byte_start..byte_start + byte_len];
+            let expected = range.strip_suffix("\r\n").or_else(|| range.strip_suffix('\n')).unwrap_or(range);
+            let mut shown = String::new();
+            let mut request = args.clone();
+            for _ in 0..10_000 {
+                let budget = ws.config.result_tokens;
+                let result = envelope(execute(&mut ws, "file_read", request.clone(), &Default::default()));
+                assert_eq!(result["status"], "ok", "run {run}: {result}");
+                let mut result = limit_result(&mut ws, &call, &request, result, budget);
+                let mut limit = budget;
+                if next(3) == 0 {
+                    limit = 200 + next(budget);
+                    result = bound_result(&mut ws, &call, &request, result, limit);
+                }
+                assert!(result_tokens(&call, &result, "gpt-4o") <= limit, "run {run}: {} > {limit}", result_tokens(&call, &result, "gpt-4o"));
+                shown.push_str(result["data"]["content"]["text"].as_str().unwrap());
+                match result["next_cursor"]["cursor"].as_str() {
+                    Some(cursor) if result["next_cursor"]["tool"] == "file_read" => request = json!({"cursor":cursor}),
+                    _ => break,
+                }
+            }
+            assert!(shown == expected, "run {run}: start {start}, max_lines {max_lines}: shown {} of {} chars", shown.chars().count(), expected.chars().count());
+        }
+    }
+
+    #[test]
+    fn a_range_ending_in_an_empty_line_numbers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("e.rs"), "fn a() {\n}\n\nfn b() {}\n").unwrap();
+        let mut ws = workspace(dir.path());
+        let result = envelope(execute(&mut ws, "file_read", json!({"path":"e.rs","max_lines":3}), &Default::default()));
+        assert_eq!(result["data"]["content"]["line_end"], 3, "{result}");
+        assert_eq!(result["data"]["next_line"], 4);
+        let shown = model_result(&result);
+        assert_eq!(shown["data"]["content"]["numbered_text"], "1|fn a() {\n2|}\n3|");
+        // Cut right after a line break, the next line has not been shown.
+        let whole = envelope(execute(&mut ws, "file_read", json!({"path":"e.rs"}), &Default::default()));
+        assert_eq!(whole["data"]["content"]["line_end"], 4);
+        assert_eq!(model_result(&whole)["data"]["content"]["numbered_text"], "1|fn a() {\n2|}\n3|\n4|fn b() {}");
+    }
+
+    #[test]
     fn an_archived_result_shows_its_start() {
         let dir = tempfile::tempdir().unwrap();
         let mut ws = workspace(dir.path());
@@ -2211,6 +2402,46 @@ mod tests {
         assert!(preview.starts_with("{\"text\":\"q\""), "{preview}");
         assert!(preview.len() > 200, "{preview}");
         assert!(result_tokens(&call, &bounded, "gpt-4o") <= 600);
+        // Cut again (a response that does not fit the context), it keeps the
+        // same archive and still shows the result's start, not the stub's.
+        let again = bound_result(&mut ws, &call, &json!({}), bounded.clone(), 300);
+        assert_eq!(again["next_cursor"], bounded["next_cursor"]);
+        let shorter = again["data"]["preview"].as_str().unwrap();
+        assert!(preview.starts_with(shorter) && shorter.len() < preview.len(), "{shorter}");
+        assert!(result_tokens(&call, &again, "gpt-4o") <= 300);
+    }
+
+    #[test]
+    fn a_cut_result_keeps_no_continuation_past_what_it_shows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = workspace(dir.path());
+        // A knowledge read cut inside its text no longer claims the end or
+        // a cursor past the cut; the archive continues it.
+        let call = crate::llm::ToolCall { id: "k".into(), name: "knowledge_read".into(), arguments: "{}".into() };
+        let read = json!({"id":"k1","title":"t","chunk_of":3,"chunks":"1-3","text":"근거 문장 ".repeat(800),"complete_to_end":true});
+        let cut = bound_result(&mut ws, &call, &json!({"id":"k1"}), envelope(Ok(read)), 600);
+        assert!(cut["data"]["text"].as_str().unwrap().len() < 4000, "{cut}");
+        assert!(cut["data"].get("complete_to_end").is_none() && cut["data"].get("next_cursor").is_none(), "{cut}");
+        assert_eq!(cut["next_cursor"]["tool"], "history");
+        let call = crate::llm::ToolCall { id: "k".into(), name: "knowledge_read".into(), arguments: "{}".into() };
+        let read = json!({"id":"k1","title":"t","chunk_of":9,"chunks":"1-3","text":"근거 문장 ".repeat(800),"next_cursor":"k1:4"});
+        let cut = bound_result(&mut ws, &call, &json!({"id":"k1"}), envelope(Ok(read)), 600);
+        assert!(cut["data"].get("next_cursor").is_none(), "{cut}");
+        // Rows read from an offset continue right after the rows shown.
+        let call = crate::llm::ToolCall { id: "r".into(), name: "result_read".into(), arguments: "{}".into() };
+        let rows: Vec<Value> = (0..200).map(|i| json!({"ID":i,"NOTE":"값 ".repeat(20)})).collect();
+        let read = json!({"step":1,"query_name":"q","total_rows":500,"capped":false,"offset":100,"columns":["ID","NOTE"],"rows":rows,"next_offset":300});
+        let cut = bound_result(&mut ws, &call, &json!({"step":1,"offset":100}), envelope(Ok(read)), 1500);
+        let shown = cut["data"]["rows"].as_array().unwrap().len() as u64;
+        assert!(shown > 0 && shown < 200, "{shown}");
+        assert_eq!(cut["data"]["next_offset"], 100 + shown);
+        // The last page had no next offset; cut, it has one.
+        let rows: Vec<Value> = (0..100).map(|i| json!({"ID":i,"NOTE":"값 ".repeat(20)})).collect();
+        let read = json!({"step":1,"query_name":"q","total_rows":500,"capped":false,"offset":400,"columns":["ID","NOTE"],"rows":rows,"next_offset":null});
+        let cut = bound_result(&mut ws, &call, &json!({"step":1,"offset":400}), envelope(Ok(read)), 1500);
+        let shown = cut["data"]["rows"].as_array().unwrap().len() as u64;
+        assert!(shown > 0 && shown < 100, "{shown}");
+        assert_eq!(cut["data"]["next_offset"], 400 + shown);
     }
 
     #[test]

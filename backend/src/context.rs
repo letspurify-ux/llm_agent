@@ -217,36 +217,35 @@ pub fn count(value: &Value, model: &str) -> usize {
 pub fn truncate(text: &str, limit: usize, model: &str) -> (String, bool) {
     let bpe = tokenizer(model);
     let (mut counted, mut end) = (0usize, 0usize);
-    let mut over = false;
     for segment in segments(text) {
-        counted += bpe.encode_with_special_tokens(segment).len();
-        end += segment.len();
-        if scaled(counted, model) > limit {
-            over = true;
-            break;
+        let n = bpe.encode_with_special_tokens(segment).len();
+        if scaled(counted + n, model) <= limit {
+            counted += n;
+            end += segment.len();
+            continue;
         }
-    }
-    if !over {
-        return (text.into(), false);
-    }
-    let head = &text[..end];
-    let prefix = |length: usize| {
-        let end = head
-            .char_indices()
-            .nth(length)
-            .map_or(head.len(), |(byte, _)| byte);
-        &head[..end]
-    };
-    let (mut low, mut high) = (0, head.chars().count());
-    while low < high {
-        let mid = (low + high).div_ceil(2);
-        if tokens(prefix(mid), model) <= limit {
-            low = mid
-        } else {
-            high = mid - 1
+        // The cut falls in this segment: a prefix ending in it counts as the
+        // segments before it and its own part, so only this segment is
+        // searched. A prefix shorter than a backed-off segment can split
+        // apart from the whole text; the result is checked as `tokens` counts.
+        let cuts: Vec<usize> = segment.char_indices().map(|(at, _)| at).collect();
+        let (mut low, mut high) = (0, cuts.len());
+        while low < high {
+            let mid = (low + high).div_ceil(2);
+            let part = &segment[..cuts.get(mid).copied().unwrap_or(segment.len())];
+            if scaled(counted + bpe.encode_with_special_tokens(part).len(), model) <= limit {
+                low = mid
+            } else {
+                high = mid - 1
+            }
         }
+        let mut cut = end + cuts.get(low).copied().unwrap_or(segment.len());
+        while cut > 0 && tokens(&text[..cut], model) > limit {
+            cut = text[..cut].char_indices().next_back().map_or(0, |(at, _)| at);
+        }
+        return (text[..cut].to_owned(), true);
     }
-    (prefix(low).into(), true)
+    (text.into(), false)
 }
 
 /// A history message as the model receives it: tool results through
@@ -370,6 +369,42 @@ mod tests {
         assert_eq!(tokens(&prose, "gpt-4o"), whole);
         let (cut, truncated) = truncate(&prose, 1000, "gpt-4o");
         assert!(truncated && tokens(&cut, "gpt-4o") <= 1000 && tokens(&cut, "gpt-4o") >= 990);
+    }
+
+    #[test]
+    fn truncate_keeps_the_longest_prefix_within_the_limit() {
+        // The former search over the whole head, as the reference.
+        let reference = |text: &str, limit: usize, model: &str| {
+            let chars: Vec<usize> = text.char_indices().map(|(at, _)| at).chain([text.len()]).collect();
+            let (mut low, mut high) = (0, chars.len() - 1);
+            while low < high {
+                let mid = (low + high).div_ceil(2);
+                if tokens(&text[..chars[mid]], model) <= limit { low = mid } else { high = mid - 1 }
+            }
+            text[..chars[low]].to_owned()
+        };
+        let mut seed: u64 = 0x7a11;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n.max(1)
+        };
+        let pieces = ["word ", "가상계측 ", "\n", "  ", "=", "😀", "\"q\" ", "x", "1234 "];
+        for _ in 0..30 {
+            let mut text = String::new();
+            for _ in 0..next(1500) {
+                let piece = pieces[next(pieces.len())];
+                for _ in 0..1 + if next(20) == 0 { next(400) } else { 0 } {
+                    text.push_str(piece);
+                }
+            }
+            for model in ["gpt-4o", "unknown-model"] {
+                let limit = next(tokens(&text, model) + 10);
+                let (cut, truncated) = truncate(&text, limit, model);
+                assert!(text.starts_with(&cut) && tokens(&cut, model) <= limit);
+                assert_eq!(truncated, cut.len() < text.len());
+                assert_eq!(cut, reference(&text, limit, model), "limit {limit}");
+            }
+        }
     }
 
     #[test]

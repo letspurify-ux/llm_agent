@@ -353,6 +353,190 @@ async fn each_result_gets_the_whole_budget_and_an_overflowing_response_is_cut() 
     }
 }
 
+/// The response's own tool calls stay in context with its results: a large
+/// argument leaves less room for them. Needs no MariaDB.
+#[tokio::test]
+async fn an_overflowing_response_leaves_room_for_its_own_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    let body: String = (1..=3000).map(|i| format!("line {i} {}\n", "word ".repeat(12))).collect();
+    std::fs::write(root.join("big.txt"), &body).unwrap();
+    let mut config = llm_agent::config::Config::default();
+    config.mariadb.port = 9;
+    config.llm.base_url = "http://127.0.0.1:9/v1".into();
+    config.llm.model = "gpt-4o".into();
+    config.llm.context_tokens = 16_000;
+    config.llm.output_tokens = 2_000;
+    config.agent.result_tokens = Some(6_000);
+    config.projects.push(llm_agent::config::Project {
+        name: "app".into(),
+        root: root.clone(),
+        ..Default::default()
+    });
+    // About 3,000 tokens of search text ride in the assistant message.
+    let long_query: String = (0..1500).map(|i| format!("term{i} ")).collect();
+    let mut batch: Vec<_> = (1..=4).map(|i| call(&format!("r{i}"), "file_read", json!({"path":"big.txt","start_line":i * 500}))).collect();
+    batch.push(call("q", "source_search", json!({"query":long_query})));
+    let llm = Scripted::new(vec![calls(batch), text("끝")]);
+    let (small, _small_dir) = app(config, llm.clone());
+    let (result, _) = ask(&small, "args", "큰 파일 넷 봐줘", vec![]).await;
+    assert_eq!(result.unwrap().answer, "끝");
+}
+
+/// A model whose provider counts `ratio` times the local estimate, as an
+/// unknown tokenizer does.
+struct Ratio {
+    replies: std::sync::Mutex<std::collections::VecDeque<llm_agent::llm::Completion>>,
+    ratio: f64,
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for Ratio {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &llm_agent::config::LlmConfig,
+        _cancel: CancellationToken,
+        _deltas: tokio::sync::mpsc::Sender<String>,
+    ) -> anyhow::Result<llm_agent::llm::Completion> {
+        let estimate = llm_agent::context::count(&request, &config.model);
+        let mut reply = self.replies.lock().unwrap().pop_front().unwrap_or_else(|| text("(끝난 대본)"));
+        reply.usage = Some(llm_agent::llm::Usage { input: (estimate as f64 * self.ratio) as usize, output: 50, cached: None });
+        Ok(reply)
+    }
+}
+
+/// The room for a response's results follows the provider's count of the
+/// request that asked for them, so the next request still fits. Needs no
+/// MariaDB.
+#[tokio::test]
+async fn a_provider_count_above_the_estimate_still_leaves_room_for_the_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    let body: String = (1..=20000).map(|i| format!("line {i} {}\n", "word ".repeat(12))).collect();
+    std::fs::write(root.join("big.txt"), &body).unwrap();
+    for (ratio, context, output, result, reads) in [(1.1, 16_000, 2_000, 6_000, 4), (1.02, 230_000, 16_384, 25_000, 10)] {
+        let mut config = llm_agent::config::Config::default();
+        config.mariadb.port = 9;
+        config.llm.base_url = "http://127.0.0.1:9/v1".into();
+        config.llm.model = "unknown-tokenizer".into();
+        config.llm.context_tokens = context;
+        config.llm.output_tokens = output;
+        config.agent.result_tokens = Some(result);
+        config.projects.push(llm_agent::config::Project {
+            name: "app".into(),
+            root: root.clone(),
+            ..Default::default()
+        });
+        let batch = calls((0..reads).map(|i| call(&format!("r{i}"), "file_read", json!({"path":"big.txt","start_line":1 + i * 2000}))).collect());
+        let llm = std::sync::Arc::new(Ratio { replies: std::sync::Mutex::new(vec![batch, text("끝")].into()), ratio });
+        let (ratio_app, _ratio_dir) = app(config, llm);
+        let (result, _) = ask(&ratio_app, "ratio", "큰 파일 봐줘", vec![]).await;
+        assert_eq!(result.map(|a| a.answer).map_err(|e| e.to_string()), Ok("끝".to_owned()), "ratio {ratio}, context {context}");
+    }
+}
+
+/// A model whose provider count of each request is the local estimate times
+/// the next ratio of a list (a tokenizer that differs by request).
+struct Ratios {
+    replies: std::sync::Mutex<std::collections::VecDeque<llm_agent::llm::Completion>>,
+    ratios: std::sync::Mutex<std::collections::VecDeque<f64>>,
+    seen: std::sync::Mutex<Vec<(usize, f64)>>,
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for Ratios {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &llm_agent::config::LlmConfig,
+        _cancel: CancellationToken,
+        _deltas: tokio::sync::mpsc::Sender<String>,
+    ) -> anyhow::Result<llm_agent::llm::Completion> {
+        let estimate = llm_agent::context::count(&request, &config.model);
+        let ratio = self.ratios.lock().unwrap().pop_front().unwrap_or(1.0);
+        self.seen.lock().unwrap().push((estimate, ratio));
+        let mut reply = self.replies.lock().unwrap().pop_front().unwrap_or_else(|| text("끝"));
+        reply.usage = Some(llm_agent::llm::Usage { input: (estimate as f64 * ratio) as usize, output: 50, cached: None });
+        Ok(reply)
+    }
+}
+
+/// Random contexts, provider ratios and responses of large reads, searches
+/// and long arguments: every question is answered, none ends because the
+/// conversation outgrew the context. FIT_FUZZ sets the number of questions.
+/// Needs no MariaDB.
+#[tokio::test]
+async fn random_responses_never_outgrow_the_context() {
+    let runs: usize = std::env::var("FIT_FUZZ").ok().and_then(|n| n.parse().ok()).unwrap_or(6);
+    let mut seed: u64 = 0xa9e7;
+    let mut next = |n: usize| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as usize) % n.max(1)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let body: String = (1..=20000).map(|i| format!("line {i} {}\n", "word \"q\" ".repeat(8))).collect();
+    std::fs::write(root.join("big.txt"), &body).unwrap();
+    let wide: String = (1..=400).map(|i| format!("{i} {}\n", "가나다 ".repeat(700))).collect();
+    std::fs::write(root.join("wide.txt"), &wide).unwrap();
+    for i in 0..40 {
+        std::fs::write(root.join(format!("src/m{i}.rs")), format!("fn f{i}() {{ let needle = {i}; }}\n").repeat(200)).unwrap();
+    }
+    for run in 0..runs {
+        let context = [32_000, 64_000, 128_000, 230_000][next(4)];
+        let mut config = llm_agent::config::Config::default();
+        config.mariadb.port = 9;
+        config.llm.base_url = "http://127.0.0.1:9/v1".into();
+        config.llm.model = "unknown-tokenizer".into();
+        config.llm.context_tokens = context;
+        config.llm.output_tokens = [2_000, 4_096, 16_384][next(3)].min(context / 4);
+        if next(2) == 0 {
+            let half = config.input_budget() / 2;
+            config.agent.result_tokens = Some(200 + next(half - 200));
+        }
+        config.projects.push(llm_agent::config::Project {
+            name: "app".into(),
+            root: root.clone(),
+            ..Default::default()
+        });
+        let mut script = vec![];
+        for batch in 0..1 + next(4) {
+            let mut calls_in_batch = vec![];
+            // A response's arguments are model output: within its limit.
+            let mut terms_left = config.llm.output_tokens / 6;
+            for i in 0..1 + next(12) {
+                let id = format!("b{batch}c{i}");
+                calls_in_batch.push(match next(5) {
+                    0 => call(&id, "file_read", json!({"path":"big.txt","start_line":1 + next(19000)})),
+                    1 => call(&id, "file_read", json!({"path":"wide.txt","start_line":1 + next(300),"max_lines":1 + next(200)})),
+                    2 => call(&id, "source_search", json!({"query":"needle","before":next(5),"after":next(5),"limit":100})),
+                    3 => call(&id, "file_list", json!({"path_glob":"**/*","mode":"paths","limit":1000})),
+                    _ => {
+                        let terms = next(terms_left + 1);
+                        terms_left -= terms;
+                        call(&id, "source_search", json!({"query":(0..terms.max(1)).map(|k| format!("t{k} ")).collect::<String>()}))
+                    }
+                });
+            }
+            script.push(calls(calls_in_batch));
+        }
+        script.push(text("끝"));
+        let ratios = (0..script.len()).map(|_| 0.7 + next(61) as f64 / 100.0).collect();
+        let shape: Vec<Vec<(String, usize)>> = script
+            .iter()
+            .map(|c| c.calls.iter().map(|k| (k.name.clone(), k.arguments.len())).collect())
+            .collect();
+        let llm = std::sync::Arc::new(Ratios { replies: std::sync::Mutex::new(script.into()), ratios: std::sync::Mutex::new(ratios), seen: Default::default() });
+        let summary = format!("output {} result {:?} input {}", config.llm.output_tokens, config.agent.result_tokens, config.input_budget());
+        let (fuzz_app, _fuzz_dir) = app(config, llm.clone());
+        let (result, _) = ask(&fuzz_app, &format!("fuzz{run}"), "큰 자료 봐줘", vec![]).await;
+        let seen = llm.seen.lock().unwrap().clone();
+        assert_eq!(result.map(|a| a.answer).map_err(|e| e.to_string()), Ok("끝".to_owned()), "run {run}, context {context}, {summary}, requests {seen:?}, script {shape:?}");
+    }
+}
+
 /// With two projects the model is told to name one; a call that omits it
 /// still runs when its path exists in only one project. Needs no MariaDB.
 #[tokio::test]

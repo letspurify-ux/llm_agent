@@ -73,12 +73,16 @@ pub fn call_summary(root: &Path, name: &str, arguments: &str) -> String {
             _ => args["id"].as_u64().map_or_else(String::new, |id| format!("#{id}")),
         },
         "search" => quoted(&args["query"]),
-        "knowledge_read" => join([
-            args["id"].as_str().unwrap_or("").to_owned(),
-            args["start_chunk"]
-                .as_u64()
-                .map_or_else(String::new, |n| format!("{n}번째 조각부터")),
-        ]),
+        "knowledge_read" => match args["cursor"].as_str().and_then(|c| c.split_once(':')) {
+            // A continuation carries its document and chunk in the cursor.
+            Some((doc, chunk)) if args["id"].is_null() => format!("{doc} {chunk}번째 조각부터 이어 읽기"),
+            _ => join([
+                args["id"].as_str().unwrap_or("").to_owned(),
+                args["start_chunk"]
+                    .as_u64()
+                    .map_or_else(String::new, |n| format!("{n}번째 조각부터")),
+            ]),
+        },
         "method_read" | "query_describe" => {
             let key = if name == "method_read" { "ids" } else { "names" };
             args[key]
@@ -219,6 +223,8 @@ mod tests {
             "소스 검색 \"a\" | \"b\" src/**"
         );
         assert_eq!(call_summary(root, "result_read", r#"{"step":3}"#), "조회 결과 읽기 실행 3");
+        assert_eq!(call_summary(root, "knowledge_read", r#"{"id":"k8"}"#), "지식 읽기 k8");
+        assert_eq!(call_summary(root, "knowledge_read", r#"{"cursor":"k32:39"}"#), "지식 읽기 k32 39번째 조각부터 이어 읽기");
         assert_eq!(call_summary(root, "unknown", "not json"), "unknown");
     }
 }

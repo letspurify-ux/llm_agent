@@ -634,36 +634,49 @@ fn fit_chunks(doc: i64, title: &str, total: i64, chunks: Vec<(i64, String)>, bud
     if chunks.is_empty() {
         return build(0, String::new());
     }
-    let sizes: Vec<usize> = chunks
-        .iter()
-        .enumerate()
-        .map(|(i, (no, content))| match i.checked_sub(1).map(|p| &chunks[p]) {
+    // Chunks past the budget are not counted: a long document fetches many.
+    let mut sizes: Vec<usize> = vec![];
+    let mut sum = size(&build(0, String::new()));
+    for (i, (no, content)) in chunks.iter().enumerate() {
+        let added = match i.checked_sub(1).map(|p| &chunks[p]) {
             Some((before, previous)) if *before == no - 1 => {
                 crate::context::tokens(&crate::chunk::cut_seam(previous, content), model)
             }
             _ => crate::context::tokens(content, model),
-        })
-        .collect();
-    let mut sum = size(&build(0, String::new()));
-    let mut taken = 0;
-    while taken < sizes.len() && (taken == 0 || sum + sizes[taken] <= budget) {
-        sum += sizes[taken];
-        taken += 1;
+        };
+        if i > 0 && sum + added > budget {
+            break;
+        }
+        sum += added;
+        sizes.push(added);
     }
-    loop {
+    let mut taken = sizes.len();
+    let fitted = loop {
         let out = build(taken, join(taken));
         let excess = size(&out).saturating_sub(budget);
         if excess == 0 {
-            return out;
+            break Some(out);
         }
         if taken == 1 {
-            break;
+            break None;
         }
         let mut freed = 0;
         while taken > 1 && freed < excess {
             taken -= 1;
             freed += sizes[taken].max(1);
         }
+    };
+    if let Some(mut out) = fitted {
+        // Chunks counted apart are not their joined count: one more may fit.
+        while taken < chunks.len() {
+            let bigger = build(taken + 1, join(taken + 1));
+            if size(&bigger) > budget {
+                break;
+            }
+            taken += 1;
+            out = bigger;
+        }
+        return out;
     }
     // One chunk larger than the budget: its start.
     let whole = join(1);
@@ -985,6 +998,102 @@ mod tests {
         let before = small.clone();
         fit_search(&mut small, 4000, "gpt-4o");
         assert_eq!(small, before);
+    }
+
+    /// Random documents split as the sync splits them, read at random
+    /// budgets: the delivered message stays within the budget, the text is
+    /// the joined chunk range, the continuation is right, and no further
+    /// whole chunk would have fitted. FIT_FUZZ sets the number of documents.
+    #[test]
+    fn random_documents_fit_their_budget_as_delivered() {
+        let runs: usize = std::env::var("FIT_FUZZ").ok().and_then(|n| n.parse().ok()).unwrap_or(40);
+        let mut seed: u64 = 0x5eed;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n.max(1)
+        };
+        let words = ["가상계측", "배치", "재시작", "vLLM", "memory", "\"quoted\"", "back\\slash", "{ \"k\": 1 }", "`code`", "|표|", "줄\n", "\n\n", "  ", "😀", "x".repeat(40).leak() as &str];
+        let message = |v: &Value| crate::tools::message_tokens(&crate::tools::envelope(Ok(v.clone())), "gpt-4o");
+        let (mut maximal, mut cases) = (0, 0);
+        for _ in 0..runs {
+            let length = 200 + next(30_000);
+            let mut doc = String::new();
+            while doc.chars().count() < length {
+                doc.push_str(words[next(words.len())]);
+                doc.push(' ');
+            }
+            let parts = crate::chunk::split_content(&doc);
+            let total = parts.len() as i64;
+            let start = 1 + next(parts.len());
+            let chunks: Vec<(i64, String)> = parts.iter().cloned().enumerate().map(|(i, c)| (i as i64 + 1, c)).skip(start - 1).collect();
+            let budget = 300 + next(12_000);
+            let out = fit_chunks(9, "제목", total, chunks.clone(), budget, "gpt-4o");
+            assert!(message(&out) <= budget, "budget {budget}: {}", message(&out));
+            let text = out["text"].as_str().unwrap();
+            let range = out["chunks"].as_str().unwrap();
+            let last: i64 = range.rsplit('-').next().unwrap().parse().unwrap();
+            assert_eq!(range.split('-').next().unwrap().parse::<usize>().unwrap(), start);
+            let taken = (last - start as i64 + 1) as usize;
+            let joined = crate::chunk::join_chunks(chunks[..taken].iter().map(|(no, c)| (*no, c.as_str())));
+            if let Some(head) = text.strip_suffix(TRUNC_MARK) {
+                assert_eq!(taken, 1);
+                assert!(joined.starts_with(head));
+            } else {
+                assert_eq!(text, joined);
+            }
+            if last < total {
+                assert_eq!(out["next_cursor"], format!("k9:{}", last + 1));
+            } else {
+                assert_eq!(out["complete_to_end"], true);
+            }
+            if !text.ends_with(TRUNC_MARK) && taken < chunks.len() {
+                cases += 1;
+                let more = crate::chunk::join_chunks(chunks[..=taken].iter().map(|(no, c)| (*no, c.as_str())));
+                let mut bigger = out.clone();
+                bigger["text"] = json!(more);
+                bigger["chunks"] = json!(format!("{start}-{}", last + 1));
+                if last + 1 < total {
+                    bigger["next_cursor"] = json!(format!("k9:{}", last + 2));
+                } else {
+                    bigger.as_object_mut().unwrap().remove("next_cursor");
+                    bigger["complete_to_end"] = json!(true);
+                }
+                if message(&bigger) > budget {
+                    maximal += 1;
+                }
+            }
+        }
+        assert_eq!(maximal, cases, "a whole chunk more would have fitted");
+    }
+
+    #[test]
+    fn random_search_lists_fit_their_budget_as_delivered() {
+        let runs: usize = std::env::var("FIT_FUZZ").ok().and_then(|n| n.parse().ok()).unwrap_or(40);
+        let mut seed: u64 = 0xfeed;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n.max(1)
+        };
+        let message = |d: &Value| crate::tools::message_tokens(&crate::tools::envelope(Ok(d.clone())), "gpt-4o");
+        for _ in 0..runs {
+            let mut results = Map::new();
+            for target in ["knowledge", "qa_method", "query"] {
+                let items: Vec<Value> = (0..next(51))
+                    .map(|i| json!({"id":format!("k{i}"),"title":"제목 \"따옴표\" \\ 백슬래시","distance":0.3,"excerpt":"근거 문장 \"인용\" \\n ".repeat(next(30))}))
+                    .collect();
+                results.insert(target.into(), json!({"status":"ok","next_offset":null,"beyond_threshold":0,"items":items}));
+            }
+            let mut data = json!({"text":"q","limit":50,"offset":0,"results":results});
+            let budget = 300 + next(20_000);
+            fit_search(&mut data, budget, "gpt-4o");
+            let single = data["results"].as_object().unwrap().values().all(|t| t["items"].as_array().unwrap().len() <= 1);
+            assert!(single || message(&data) <= budget, "budget {budget}: {}", message(&data));
+            for target in data["results"].as_object().unwrap().values() {
+                if target["items_cut_for_size"] == true {
+                    assert_eq!(target["next_offset"], target["items"].as_array().unwrap().len() as u64);
+                }
+            }
+        }
     }
 
     #[test]
