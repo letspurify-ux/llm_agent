@@ -22,3 +22,4 @@ pub mod admin;
 pub mod app;
 pub mod agent;
 pub mod web;
+pub mod ui;

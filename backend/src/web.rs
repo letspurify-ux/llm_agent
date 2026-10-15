@@ -11,7 +11,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -31,10 +31,17 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/health", get(|| async { Json(json!({"ok":true})) }))
         .route("/api/chat", post(chat).layer(DefaultBodyLimit::max(CHAT_BODY_LIMIT)))
         .nest("/api/admin", crate::admin::router(app.clone()))
-        .fallback(|| async {
-            (StatusCode::NOT_FOUND, Json(json!({"error":"요청한 경로를 찾을 수 없습니다."})))
-        })
+        .fallback(fallback)
         .with_state(app)
+}
+
+/// Unknown API paths answer JSON; any other GET is the built-in screen.
+async fn fallback(method: Method, uri: Uri) -> Response {
+    let api = uri.path() == "/api" || uri.path().starts_with("/api/");
+    if api || !matches!(method, Method::GET | Method::HEAD) {
+        return error(StatusCode::NOT_FOUND, "요청한 경로를 찾을 수 없습니다.");
+    }
+    crate::ui::serve(uri).await
 }
 
 fn error(status: StatusCode, message: &str) -> Response {

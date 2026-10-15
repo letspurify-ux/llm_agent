@@ -387,3 +387,36 @@ async fn conversations_are_released_when_requests_end() {
         );
     }
 }
+
+/// One binary serves the screen too: `/` and the built files from the
+/// embedded frontend/dist, while unknown API paths stay JSON 404s.
+#[tokio::test]
+async fn the_binary_serves_the_built_screen() {
+    let mut config = llm_agent::config::Config::default();
+    config.mariadb.port = 9;
+    let (app, _dir) = app(config, Scripted::new(vec![]));
+    let get = |method: &str, path: &str| {
+        let router = web::router(app.clone());
+        let request = Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
+        async move { router.oneshot(request).await.unwrap() }
+    };
+    let index = get("GET", "/").await;
+    if index.status() == StatusCode::SERVICE_UNAVAILABLE {
+        return skip("frontend/dist was not built when this binary was compiled");
+    }
+    assert_eq!(index.status(), StatusCode::OK);
+    assert_eq!(index.headers()[header::CONTENT_TYPE], "text/html; charset=utf-8");
+    assert_eq!(index.headers()[header::CACHE_CONTROL], "no-cache");
+    let html = String::from_utf8(index.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    let script = html.split("src=\"").nth(1).and_then(|rest| rest.split('"').next()).expect("index.html loads a script");
+    let asset = get("GET", script).await;
+    assert_eq!(asset.status(), StatusCode::OK, "{script}");
+    assert_eq!(asset.headers()[header::CONTENT_TYPE], "text/javascript; charset=utf-8");
+    assert!(asset.headers()[header::CACHE_CONTROL].to_str().unwrap().contains("immutable"));
+
+    assert_eq!(get("GET", "/assets/missing.js").await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(get("POST", "/").await.status(), StatusCode::NOT_FOUND);
+    let api = get("GET", "/api/missing").await;
+    assert_eq!(api.status(), StatusCode::NOT_FOUND);
+    assert!(api.headers()[header::CONTENT_TYPE].to_str().unwrap().starts_with("application/json"));
+}

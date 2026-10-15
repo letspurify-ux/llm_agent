@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# 로컬 개발 스택 전체 기동 (macOS/Linux) — 인프라 3종 + 백엔드/프론트엔드.
+# 로컬 스택 전체 기동 (macOS/Linux) — 인프라 3종 + 앱(화면을 내장한 백엔드 실행 파일 하나).
 #
-# 앱은 각 디렉터리의 start.sh를 부른다. 여기서 nohup·PID 파일을 다시 쓰지 않는 이유:
+# 앱은 backend/start.sh를 부른다(화면 빌드·실행 파일 빌드도 거기서 한다). Vite 개발 서버
+# (frontend/start.sh)는 화면을 고칠 때만 따로 띄운다.
+#
+# 앱 시작은 backend/start.sh에 맡긴다. 여기서 nohup·PID 파일을 다시 쓰지 않는 이유:
 # 그 사본이 생기는 순간 "떠 있는지 어떻게 판정하는가"가 두 벌이 되고, 한쪽만 고치면
 # start_all로 띄운 프로세스를 stop.sh가 못 잡거나 그 반대가 된다.
 #
@@ -21,8 +24,8 @@ for arg in "$@"; do
     -a|--apps-only) APPS_ONLY=1 ;;
     -h|--help)
       echo "사용법: $0 [--apps-only]"
-      echo "  (기본)         MariaDB·Oracle·Ollama를 기동한 뒤 백엔드·프론트엔드를 띄운다"
-      echo "  --apps-only    인프라는 건드리지 않고 백엔드·프론트엔드만 띄운다"
+      echo "  (기본)         MariaDB·Oracle·Ollama를 기동한 뒤 앱(화면을 내장한 백엔드)을 띄운다"
+      echo "  --apps-only    인프라는 건드리지 않고 앱만 띄운다"
       exit 0 ;;
     *) echo "알 수 없는 인자: $arg (--help 참고)"; exit 2 ;;
   esac
@@ -130,8 +133,10 @@ fi
 # 시작하므로, MariaDB보다 먼저 뜨면 그 두 작업이 접속 실패로 죽는다.
 echo "== 앱 =="
 ./backend/start.sh
-./frontend/start.sh
 
+PORT=$(config_value server port)
+PORT=${PORT:-$(env_value backend/.env PORT)}
 echo
-echo "로그: backend/logs/backend.log · frontend/logs/frontend.log"
+echo "화면: http://localhost:${PORT:-3001}  (같은 망의 다른 PC는 http://<이 PC의 IP>:${PORT:-3001})"
+echo "로그: backend/logs/backend.log"
 echo "중지: ./stop_all.sh"

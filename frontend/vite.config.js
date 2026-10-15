@@ -19,6 +19,11 @@ const allowedHosts = (process.env.FRONTEND_ALLOWED_HOSTS || '')
 
 const server = {
   host,
+  // 브라우저와의 웹소켓을 끈다. 켜 두면 그 연결이 끊길 때(절전 복귀, 사내 프록시의 유휴 연결 정리,
+  // 개발 서버 재시작) Vite 클라이언트가 서버를 기다렸다가 페이지를 새로고침해, 화면의 대화가 통째로 사라졌다.
+  // hmr: false만으로는 막히지 않는다(연결은 그대로 열리고 끊기면 새로고침한다 — 헤드리스 Chrome으로 확인).
+  // 대신 프런트 코드를 고치면 브라우저를 직접 새로고침한다. 배포는 백엔드 실행 파일이 빌드본을 내장해 서빙한다.
+  ws: false,
   ...(allowedHosts.length ? { allowedHosts } : {}),
   // 백엔드 포트의 사본 — backend/.env의 PORT를 바꿨다면 여기가 조용히 어긋난다.
   // 그때는 BACKEND_PORT로 맞춘다: BACKEND_PORT=4001 npm run dev

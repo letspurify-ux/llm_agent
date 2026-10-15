@@ -1,7 +1,8 @@
-﻿# 로컬 개발 스택 전체 기동 (Windows) — start_all.sh의 Windows판: 인프라 3종 + 백엔드/프론트엔드.
+﻿# 로컬 스택 전체 기동 (Windows) — start_all.sh의 Windows판: 인프라 3종 + 앱(화면을 내장한 백엔드 실행 파일 하나).
 # 사용: start_all.bat [--apps-only]
 #
-# 앱은 각 디렉터리의 start.bat을 부른다. 여기서 'start' 창과 창 제목 판정을 다시 쓰지 않는 이유:
+# 앱은 backend\start.bat을 부른다(화면 빌드·실행 파일 빌드도 거기서 한다). Vite 개발 서버
+# (frontend\start.bat)는 화면을 고칠 때만 따로 띄운다. 여기서 'start' 창과 창 제목 판정을 다시 쓰지 않는 이유:
 # 그 사본이 생기는 순간 "떠 있는지 어떻게 판정하는가"가 두 벌이 되고, 한쪽만 고치면
 # start_all로 띄운 프로세스를 stop.bat이 못 잡거나 그 반대가 된다.
 #
@@ -23,8 +24,8 @@ foreach ($arg in $args) {
     if (@('-a', '--apps-only') -contains $arg) { $AppsOnly = $true }
     elseif (@('-h', '--help', '/?') -contains $arg) {
         Write-Host '사용법: start_all.bat [--apps-only]'
-        Write-Host '  (기본)         MariaDB·Oracle·Ollama를 기동한 뒤 백엔드·프론트엔드를 띄운다'
-        Write-Host '  --apps-only    인프라는 건드리지 않고 백엔드·프론트엔드만 띄운다'
+        Write-Host '  (기본)         MariaDB·Oracle·Ollama를 기동한 뒤 앱(화면을 내장한 백엔드)을 띄운다'
+        Write-Host '  --apps-only    인프라는 건드리지 않고 앱만 띄운다'
         exit 0
     }
     else { Write-Host "알 수 없는 인자: $arg (--help 참고)"; exit 2 }
@@ -73,6 +74,7 @@ function Get-Setting($section, $key, $envKey, $default) {
 $EmbeddingModel = Get-Setting 'embedding' 'model' 'EMBEDDING_MODEL' 'qwen3-embedding:0.6b'
 $DbHost = Get-Setting 'mariadb' 'host' 'MARIADB_HOST' 'localhost'
 $DbPort = [int](Get-Setting 'mariadb' 'port' 'MARIADB_PORT' 3306)
+$AppPort = Get-Setting 'server' 'port' 'PORT' 3001
 
 # 관리 DB가 접속을 받는지는 포트로 본다 — mysqladmin은 MSI 설치에서 PATH에 없는 경우가 많다.
 function Test-Port($hostName, $port) {
@@ -212,11 +214,10 @@ if (-not $AppsOnly) {
 # 시작하므로, MariaDB보다 먼저 뜨면 그 두 작업이 접속 실패로 죽는다.
 Write-Host '== 앱 =='
 & (Join-Path $Root 'backend\start.bat')
-if ($LASTEXITCODE -ne 0) { warn '백엔드를 띄우지 못했다 — 위 출력 참고' }
-& (Join-Path $Root 'frontend\start.bat')
-if ($LASTEXITCODE -ne 0) { warn '프론트엔드를 띄우지 못했다 — 위 출력 참고' }
+if ($LASTEXITCODE -ne 0) { warn '앱을 띄우지 못했다 — 위 출력 참고' }
 
 Write-Host ''
-Write-Host '로그: backend\logs\backend.log · frontend\logs\frontend.log'
+Write-Host "화면: http://localhost:$AppPort  (같은 망의 다른 PC는 http://<이 PC의 IP>:$AppPort)"
+Write-Host '로그: backend\logs\backend.log'
 Write-Host '중지: stop_all.bat'
 Wait-IfDoubleClicked 'start_all.bat'

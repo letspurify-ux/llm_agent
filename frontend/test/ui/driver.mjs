@@ -296,8 +296,13 @@ export class Page {
   // 떠나는 문서에 표시를 하나 남긴다. 그것이 없으면 아래 기다림은 '아직 떠 있는 이전 화면'을 보고
   // 첫 폴링에서 참이 되어 옮겨 가기도 전에 돌아온다 — 같은 요소(.chip 등)가 두 화면에 다 있으면
   // 시간만 재던 때와 똑같이, 곧 사라질 문서를 만지게 된다.
-  async goto(url, ready = '.chat') {
-    await this.eval('window.__떠나는중 = true').catch(() => { /* 아직 아무 문서도 없다 */ });
+  //
+  // 떠나기 전에 이 탭의 sessionStorage를 비운다 — 화면은 대화를 거기 두고 같은 탭에서 다시 열면
+  // 되살리므로(chat-store.js), 비우지 않으면 앞 검사의 대화가 다음 검사의 첫 화면을 차지한다.
+  // 되살리기 자체를 재는 검사만 keepSession으로 남긴다.
+  async goto(url, ready = '.chat', { keepSession = false } = {}) {
+    await this.eval(`window.__떠나는중 = true; ${keepSession ? '' : 'try { sessionStorage.clear(); } catch {}'}`)
+      .catch(() => { /* 아직 아무 문서도 없다 */ });
     await this.send('Page.navigate', { url });
     // 선택자는 JSON.stringify로 넣는다 — 따옴표를 직접 붙이면 a[href='…'] 같은 선택자가 페이지
     // 안에서 문법 오류가 되어, 기다리는 대신 그 자리에서 낯선 SyntaxError로 죽는다.

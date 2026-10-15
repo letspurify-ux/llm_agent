@@ -176,18 +176,24 @@ docker exec -i oracle1521 sqlplus -s system/password@localhost:1521/FREEPDB1 < b
 
 ### 2. 백엔드
 
-Rust(1.88 이상, `rustup`)와 **Oracle Instant Client**가 필요하다. Instant Client는 조회 대상 Oracle이 있을 때만 쓰이고,
+실행 파일 하나(`backend/target/release/llm-agent`, Windows는 `.exe`)가 API와 화면을 함께 서빙한다 — MnemoArc처럼
+`build.rs`가 화면 빌드 결과(`frontend/dist`)를 실행 파일 안에 넣는다. 빌드에는 Rust(1.88 이상, `rustup`)와 Node.js(화면 빌드)가,
+실행에는 **Oracle Instant Client**가 필요하다. Instant Client는 조회 대상 Oracle이 있을 때만 쓰이고,
 없으면 서버는 뜨되 쿼리 실행만 실패한다(기동 로그에 `[setup] the Oracle client library could not be loaded …`가 남는다.
 설정 탭의 Oracle mock은 클라이언트 없이 동작한다).
 
 ```bash
 cd backend
-./start.sh            # 처음에는 cargo build --release (1~3분), 이후 소스가 바뀌었을 때만 다시 빌드
-# 또는 직접: cargo run --release
+./start.sh            # 화면(npm run build)과 실행 파일(cargo build --release, 처음 1~3분)을 바뀐 것만 다시 빌드해 띄운다
+# 또는 직접: (cd ../frontend && npm ci && npm run build) && cargo build --release && ./target/release/llm-agent
 ```
 
-`http://localhost:3001`에서 기동한다(설정 탭에서 포트를 바꿀 수 있다 — 프런트는 `BACKEND_PORT`로 맞춘다).
-Windows는 `start.bat`/`stop.bat`(Rust가 없으면 다른 PC에서 빌드한 `target\release\llm-agent.exe`를 복사해 둔다).
+`http://localhost:3001`이 화면이자 API다(설정 탭에서 포트를 바꿀 수 있다). Windows는 `start.bat`/`stop.bat`.
+release 빌드는 `frontend/dist`가 없으면 실패한다(빈 화면을 내보내지 않게). debug 빌드(`cargo test` 등)는 경고만 하고, 그때 `/`는 503이다.
+
+**배포** — 빌드한 PC에서 실행 파일 하나만 옮기면 된다(Rust·Node.js 불필요). 옮긴 PC에는 Instant Client와,
+실행 파일 옆(작업 폴더)의 `config.toml`·`config.credentials.json`(없으면 첫 기동에 `.env`에서 만든다)과 대상 DB 비밀번호용 `.env`만 둔다.
+Windows에서 `start.bat`으로 띄우려면 실행 파일을 `backend\target\release\llm-agent.exe` 자리에 둔다.
 
 **처음 기동할 때** `backend/config.toml`이 없으면 예전 Node 백엔드의 `backend/.env`를 읽어 만든다 —
 `MARIADB_*`, `LLM_BASE_URL`·`LLM_MODEL`·`LLM_API_KEY`(LLM_PROVIDER=openai였을 때), `EMBEDDING_*`, `EMBED_SYNC_INTERVAL`,
@@ -221,15 +227,20 @@ OS 검색 경로에 두지 않았다면 설정 탭의 **Instant Client 폴더**�
 비밀값은 화면에 돌아오지 않는다 — 등록 여부만 보이고, 새 값을 넣거나 지울 수 있다. 저장은 다른 탭과 같이 버전(If-Match)을
 대조해 다른 화면의 변경을 덮지 않는다.
 
-### 3. 프론트엔드
+### 3. 화면 개발 (Vite 개발 서버)
+
+운영에는 위 실행 파일이 화면을 내장해 서빙하므로 이 단계가 필요 없다. 화면 코드를 고칠 때만 쓴다:
 
 ```bash
 cd frontend && npm install && npm run dev
 ```
 
 `http://localhost:5173` 접속 (`/api`는 vite proxy로 백엔드(`127.0.0.1:3001`, 포트를 바꿨다면 `BACKEND_PORT`)에 전달).
+개발 서버는 브라우저와의 웹소켓(`server.ws`)을 꺼 두었다 — 켜 두면 연결이 끊길 때(절전 복귀, 사내 프록시의 유휴 연결 정리,
+서버 재시작) Vite가 페이지를 새로고침해 대화가 사라졌다. 그래서 코드를 고치면 브라우저를 직접 새로고침한다.
+화면의 대화는 그 탭의 `sessionStorage`에 저장돼, 같은 탭을 새로고침하면 말풍선·이력·대화 번호가 되살아난다(새 탭은 새 대화).
 
-인프라(MariaDB·Oracle·Ollama)와 두 앱을 한 번에 올리고 내리려면 `./start_all.sh` / `./stop_all.sh`,
+인프라(MariaDB·Oracle·Ollama)와 앱을 한 번에 올리고 내리려면 `./start_all.sh` / `./stop_all.sh`,
 Windows는 `start_all.bat` / `stop_all.bat`을 쓴다(`--apps-only`는 앱만). Windows판은 MSI가 등록한 MariaDB 서비스
 (이름이 다르면 `MARIADB_SERVICE`), Docker Desktop의 `oracle1521` 컨테이너, PATH의 `ollama`를 전제한다. 서비스 시작·중지에는
 관리자 권한이 필요해서 일반 창에서 실행하면 UAC 확인이 한 번 뜨고, Docker Desktop이 꺼져 있으면 대신 띄우지 않고 Oracle만 건너뛴다.
@@ -333,9 +344,8 @@ PUT/DELETE에는 해당 항목 GET 응답의 `ETag`를 `If-Match` 헤더로 보�
 
 #### 다른 PC에서 접속하기
 
-dev 서버는 모든 인터페이스에 바인딩되므로, 기동 로그(`logs/frontend.log`)의 `Network:` 줄에 찍힌
-주소(`http://<이 PC의 IP>:5173`)를 같은 망의 다른 PC 브라우저에 그대로 입력하면 된다.
-백엔드는 열 필요가 없다 — 브라우저가 아니라 vite가 `127.0.0.1:3001`을 대신 호출한다.
+실행 파일은 모든 인터페이스(`0.0.0.0`)에 바인딩되므로 같은 망의 다른 PC에서 `http://<이 PC의 IP>:3001`(설정 탭의 서버 포트)로 들어온다.
+아래 변수는 Vite 개발 서버(5173)로 열 때의 것이다 — 개발 서버는 모든 인터페이스에 바인딩되고, 백엔드는 vite가 `127.0.0.1:3001`로 대신 호출한다.
 
 | 변수 | 용도 |
 |---|---|
@@ -348,7 +358,7 @@ FRONTEND_ALLOWED_HOSTS=agent.corp.local npm run dev
 
 안 열린다면 방화벽부터 본다 — macOS는 첫 기동 때 수신 연결 허용 여부를 묻고, Windows는
 `제어판 > Windows Defender 방화벽`에서 해당 포트의 인바운드를 허용해야 한다.
-그리고 dev 서버에는 인증이 없다 — 신뢰하는 사내망에서만 열고, 공인 IP에 그대로 노출하지 않는다.
+그리고 화면에는 로그인이 없다(관리자 API만 인증 키를 쓴다) — 신뢰하는 사내망에서만 열고, 공인 IP에 그대로 노출하지 않는다.
 
 #### 답변 안의 수식 (LaTeX)
 

@@ -11,6 +11,7 @@ import { columnsOf, cellValue, cellText, toCsv, csvFileName, stepLabel, normaliz
 // 응답 스트림 읽기는 stream.js에, 미리보기 코드블록 표시는 preview.js에 있다.
 import { readEvents } from './stream.js';
 import { fillAnswer } from './answer-fill.js';
+import { loadChat, saveChat } from './chat-store.js';
 
 // 대화 번호. crypto.randomUUID가 없는 브라우저(구형·http 사내 주소)에서는 난수로 만든다.
 function newConversationId() {
@@ -471,7 +472,9 @@ export default function App() {
   const [adminOpen, setAdminOpen] = useState(false);
   const [adminState, setAdminState] = useState({ dirty: false, busy: false });
   const previewPlugins = useMarkdownPlugins(REHYPE_PLUGINS);
-  const [messages, setMessages] = useState([]);
+  // 이 탭에서 하던 대화 (새로 열려도 이어진다 — chat-store.js). 처음 한 번만 읽는다.
+  const [restored] = useState(() => loadChat());
+  const [messages, setMessages] = useState(() => restored?.messages ?? []);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   // 답을 기다리는 동안 서버가 흘려보낸 진행 줄 (ProgressList). 답이 오거나 요청이 끝나면 비운다.
@@ -489,7 +492,7 @@ export default function App() {
   // (접근성 트리로 확인: done 뒤 라이브 영역 0개).
   const [status, setStatus] = useState('');
   const inputRef = useRef(null);
-  const historyRef = useRef([]);      // 서버로 보낼 대화 이력 (setState 비동기와 무관하게 즉시 반영)
+  const historyRef = useRef(restored?.history ?? []); // 서버로 보낼 대화 이력 (setState 비동기와 무관하게 즉시 반영)
   const composingRef = useRef(false); // IME 조합 진행 중
   const pendingSendRef = useRef(false); // 조합 중에 눌린 Enter — 조합이 확정되면 그때 보낸다
   const sendingRef = useRef(false);   // 전송 진행 중 (loading state와 달리 같은 tick에도 즉시 보인다)
@@ -500,7 +503,11 @@ export default function App() {
   const sessionRef = useRef(0);
   // 서버가 이 대화의 맥락(앞 턴의 조회 결과·읽은 소스)을 들고 있게 하는 대화 번호. 홈으로 돌아가면 새로 만든다.
   // 서버가 재시작 등으로 이 대화를 잃었으면 함께 보내는 history로 이어 간다.
-  const conversationRef = useRef(newConversationId());
+  const conversationRef = useRef(restored?.conversationId ?? newConversationId());
+  // 말풍선이 바뀔 때마다 이 탭에 저장한다. 이력과 대화 번호는 말풍선과 같은 때 바뀐다(질문·답·홈).
+  useEffect(() => {
+    saveChat({ conversationId: conversationRef.current, messages, history: historyRef.current });
+  }, [messages]);
   const chatRef = useRef(null);
   // 화면이 대화의 바닥에 붙어 있는가. 말풍선이 뒤늦게 커질 때 따라 내려갈지를 이것으로 정한다.
   const stuckRef = useRef(true);

@@ -2295,3 +2295,21 @@ it('표 링크 경계: 참조 정의와 코드 펜스가 나뉘어 오는 스트
   await page.until(READY.tablelinks);
   await checkTableLinks(page);
 });
+
+it('같은 탭에서 다시 열면 대화가 그대로 돌아오고, 홈을 누르면 새 대화가 된다', async () => {
+  await answered();
+  const bubbles = `[...document.querySelectorAll('.chat .bubble')].map(b => b.innerText.trim().slice(0, 40))`;
+  const before = await page.eval(bubbles);
+  assert.ok(before.length >= 2, `질문과 답이 있다: ${JSON.stringify(before)}`);
+  const id = await page.eval(`JSON.parse(sessionStorage.getItem('llm-agent.chat.v1')).conversationId`);
+  // 페이지가 새로 열린다(개발 서버의 재연결 새로고침, F5와 같은 자리).
+  await page.goto(url(), '.chat .bubble', { keepSession: true });
+  assert.deepStrictEqual(await page.eval(bubbles), before);
+  assert.equal(await page.eval(`JSON.parse(sessionStorage.getItem('llm-agent.chat.v1')).conversationId`), id, '대화 번호도 이어진다');
+  await page.eval(`document.querySelector('.home-btn').click()`);
+  await page.until(`document.querySelector('.chip') && !document.querySelector('.chat .bubble')`, { what: '홈 화면' });
+  const after = await page.eval(`JSON.parse(sessionStorage.getItem('llm-agent.chat.v1'))`);
+  assert.deepStrictEqual(after.messages, []);
+  assert.notEqual(after.conversationId, id);
+});
+
