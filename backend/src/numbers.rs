@@ -38,10 +38,10 @@ fn decimal_parts(s: &str) -> Option<String> {
     if digits.is_empty() {
         return None;
     }
-    let mut exp = exponent - frac.len() as i64;
+    let mut exp = exponent.saturating_sub(frac.len() as i64);
     let digits = digits.trim_start_matches('0');
     let trimmed = digits.trim_end_matches('0');
-    exp += (digits.len() - trimmed.len()) as i64;
+    exp = exp.saturating_add((digits.len() - trimmed.len()) as i64);
     Some(if trimmed.is_empty() {
         "0".into()
     } else {
@@ -85,7 +85,7 @@ pub fn in_oracle_number_range(text: &str) -> bool {
     }
     let (digits, exp) = parts.trim_start_matches('-').split_once('e').unwrap();
     let exp: i64 = exp.parse().unwrap_or(0);
-    let magnitude = digits.len() as i64 - 1 + exp;
+    let magnitude = (digits.len() as i64 - 1).saturating_add(exp);
     (-130..126).contains(&magnitude)
 }
 
@@ -140,5 +140,11 @@ mod tests {
         assert!(valid_number_input(&json!("12")));
         assert!(valid_number_input(&json!(3.5)));
         assert!(!valid_number_input(&json!("x")));
+        // Exponents at the ends of i64 are refused, not overflowed.
+        for text in ["1.5e-9223372036854775808", "15e9223372036854775807", "1.50e9223372036854775807"] {
+            assert!(!in_oracle_number_range(text), "{text}");
+            assert!(!valid_number_input(&json!(text)), "{text}");
+            assert_eq!(number_from_text(text), json!(text));
+        }
     }
 }

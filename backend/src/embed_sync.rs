@@ -12,8 +12,10 @@ use crate::{
     search::{SEARCH_COLUMNS, hash_expr, vec_table},
 };
 use anyhow::Result;
+use futures_util::FutureExt;
 use std::{
     collections::HashMap,
+    panic::AssertUnwindSafe,
     sync::atomic::{AtomicBool, Ordering},
 };
 use tokio_util::sync::CancellationToken;
@@ -101,8 +103,14 @@ impl EmbedSync {
             let summary = sync(db, config, stop).await;
             let _ = plain_on(cfg, &mut lock, &format!("SELECT RELEASE_LOCK('{LOCK_NAME}')")).await;
             summary
-        }
-        .await;
+        };
+        // A panic would otherwise leave `running` set (every later sync
+        // skipped as busy) and end the periodic sync's loop with it. The
+        // lock's connection is reset when the pool takes it back.
+        let result = AssertUnwindSafe(result)
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("embedding sync stopped unexpectedly (panic)")));
         self.running.store(false, Ordering::Release);
         result
     }

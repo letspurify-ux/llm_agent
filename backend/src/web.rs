@@ -15,7 +15,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use serde_json::{Value, json};
 use std::sync::{Arc, atomic::Ordering};
 use tokio_util::sync::CancellationToken;
@@ -156,7 +156,7 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Result<Byte
         let _guard = cancel.clone().drop_guard();
         let task_app = app.clone();
         let run = tokio::spawn(async move {
-            let result = agent::answer(&task_app, question, Events::new(None), cancel.clone()).await;
+            let result = guarded(agent::answer(&task_app, question, Events::new(None), cancel.clone())).await;
             finish(&task_app, &message, result, &cancel)
         });
         return match run.await {
@@ -169,7 +169,7 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Result<Byte
     let task_app = app.clone();
     tokio::spawn(async move {
         let events = Events::new(Some(tx.clone()));
-        let run = agent::answer(&task_app, question, events, cancel.clone());
+        let run = guarded(agent::answer(&task_app, question, events, cancel.clone()));
         tokio::pin!(run);
         let result = tokio::select! {
             result = &mut run => result,
@@ -201,6 +201,15 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Result<Byte
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-transform"));
     headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
     response
+}
+
+/// A run that panics ends as an error: the stream then still gets its error
+/// event and the question its chat log, instead of a stream that just stops.
+async fn guarded(run: impl std::future::Future<Output = anyhow::Result<Answer>>) -> anyhow::Result<Answer> {
+    std::panic::AssertUnwindSafe(run)
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("panic: the run stopped unexpectedly")))
 }
 
 fn tokio_stream_from(mut rx: tokio::sync::mpsc::UnboundedReceiver<Value>) -> impl futures_util::Stream<Item = Value> {

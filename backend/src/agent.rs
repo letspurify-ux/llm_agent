@@ -98,7 +98,7 @@ pub async fn answer(app: &Arc<App>, question: Question, events: Events, cancel: 
         .map_err(|e| UserFacing(e.to_string()))?;
     let claim = app.sessions.open(
         &question.conversation_id,
-        Duration::from_secs(config.agent.session_idle_minutes * 60),
+        Duration::from_secs(config.agent.session_idle_minutes.saturating_mul(60)),
         config.agent.max_sessions,
         cancel.clone(),
     );

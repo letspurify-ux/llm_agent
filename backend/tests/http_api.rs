@@ -388,6 +388,64 @@ async fn conversations_are_released_when_requests_end() {
     }
 }
 
+/// A model client that panics mid-run.
+struct Panicking;
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for Panicking {
+    async fn complete(
+        &self,
+        _request: Value,
+        _config: &llm_agent::config::LlmConfig,
+        _cancel: tokio_util::sync::CancellationToken,
+        _delta: tokio::sync::mpsc::Sender<String>,
+    ) -> anyhow::Result<llm_agent::llm::Completion> {
+        panic!("model client bug");
+    }
+}
+
+/// A run that panics still answers its request with an error: the stream
+/// ends with an error event rather than just stopping, and the question is
+/// logged. Its conversation is released.
+#[tokio::test]
+async fn a_run_that_panics_ends_with_an_error() {
+    let db = TestDb::create("panic");
+    let config = db.as_ref().map(TestDb::config).unwrap_or_else(|| {
+        let mut config = llm_agent::config::Config::default();
+        config.mariadb.port = 9;
+        config.mariadb.user = "nobody".into();
+        config.llm.base_url = "http://127.0.0.1:9/v1".into();
+        config.llm.model = "gpt-4o".into();
+        config
+    });
+    let (app, _dir) = app(config, std::sync::Arc::new(Panicking));
+    let client = Client { router: web::router(app.clone()), token: None };
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/chat")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/x-ndjson")
+        .body(Body::from(json!({"conversation_id":"p1","message":"질문"}).to_string()))
+        .unwrap();
+    let response = client.router.clone().oneshot(request).await.unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let events: Vec<Value> = String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(events.last().map(|e| e["type"].clone()), Some(json!("error")), "{events:?}");
+    let plain = client.send("POST", "/api/chat", Some(json!({"message":"질문"})), None, false).await;
+    assert_eq!(plain.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(plain.body["error"], "처리 중 오류가 발생했습니다.");
+    app.sessions.sweep(std::time::Duration::ZERO);
+    assert_eq!(app.sessions.len(), 0);
+    if let Some(db) = db {
+        assert!(
+            eventually(|| db.scalar("SELECT COUNT(*) FROM chat_log WHERE JSON_VALUE(trace, '$.outcome') = 'error'") == "2").await,
+            "both panicked runs are logged"
+        );
+    }
+}
+
 /// One binary serves the screen too: `/` and the built files from the
 /// embedded frontend/dist, while unknown API paths stay JSON 404s.
 #[tokio::test]

@@ -22,6 +22,10 @@ pub const MIN_RESULT_TOKENS: usize = 200;
 pub const DEFAULT_TOOL_CALLS: usize = 32;
 /// Vector width of the `vec_*` tables (schema.sql).
 pub const EMBEDDING_DIMENSIONS: usize = 1024;
+/// Upper bound of the seconds settings (one day).
+pub const MAX_TIMEOUT_SECS: u64 = 86_400;
+/// Upper bound of the conversation idle time (one year).
+pub const MAX_IDLE_MINUTES: u64 = 525_600;
 
 mod empty_is_none {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -493,6 +497,14 @@ impl Config {
         {
             bail!("실행 한도는 0보다 커야 하고, 이력·결과 보관 용량은 64KiB 이상이어야 합니다.");
         }
+        // A deadline is the current instant plus these: past the clock's
+        // range the addition panics on every question.
+        if a.run_seconds > MAX_TIMEOUT_SECS
+            || a.tool_timeout_secs > MAX_TIMEOUT_SECS
+            || a.session_idle_minutes > MAX_IDLE_MINUTES
+        {
+            bail!("실행·도구 시간 한도는 {MAX_TIMEOUT_SECS}초, 대화 보관 시간은 {MAX_IDLE_MINUTES}분 이하여야 합니다.");
+        }
         if self.result_budget() < MIN_RESULT_TOKENS || self.batch_budget() < MIN_RESULT_TOKENS {
             bail!("도구 결과 한도는 {MIN_RESULT_TOKENS} 토큰 이상이어야 합니다.");
         }
@@ -756,6 +768,26 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(credentials_path(&path)).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn time_settings_stay_within_the_clock_range() {
+        let mut config = Config::default();
+        config.agent.run_seconds = MAX_TIMEOUT_SECS;
+        config.agent.tool_timeout_secs = MAX_TIMEOUT_SECS;
+        config.agent.session_idle_minutes = MAX_IDLE_MINUTES;
+        config.validate().unwrap();
+        // i64::MAX seconds still saves to TOML, and an instant plus that
+        // panics on every question.
+        for set in [
+            |c: &mut Config| c.agent.run_seconds = i64::MAX as u64,
+            |c: &mut Config| c.agent.tool_timeout_secs = MAX_TIMEOUT_SECS + 1,
+            |c: &mut Config| c.agent.session_idle_minutes = MAX_IDLE_MINUTES + 1,
+        ] {
+            let mut wrong = Config::default();
+            set(&mut wrong);
+            assert!(wrong.validate().unwrap_err().to_string().contains("이하여야"));
         }
     }
 

@@ -831,7 +831,8 @@ pub(super) fn execute(
             continue;
         }
         let line = symbol["name_line"].as_u64().unwrap() as usize;
-        let excerpt: String = lines[&(line - 1)].chars().take(500).collect();
+        let declaration = lines.get(&line.saturating_sub(1)).copied().unwrap_or_default();
+        let excerpt: String = declaration.chars().take(500).collect();
         let signature = symbol["signature"].as_str().unwrap().to_owned();
         let signature_start_line = symbol["signature_start_line"].as_u64().unwrap() as usize;
         let signature_end_line = symbol["signature_end_line"].as_u64().unwrap() as usize;
@@ -859,7 +860,7 @@ pub(super) fn execute(
             &excerpt,
             super::EvidenceQuality {
                 line_start_complete: true,
-                line_end_complete: excerpt.len() == lines[&(line - 1)].len(),
+                line_end_complete: excerpt.len() == declaration.len(),
                 evidence_truncated: true,
             },
         ));

@@ -36,6 +36,9 @@ pub const PREVIEW_MAX: usize = 100;
 /// Rows per result_read page: default and cap.
 pub const READ_DEFAULT: usize = 50;
 pub const READ_MAX: usize = 200;
+/// Largest offset or start_chunk taken from a call: far past any stored
+/// result or document, and small enough that `offset + limit` cannot overflow.
+const MAX_OFFSET: u64 = 1_000_000;
 
 pub fn specs() -> Vec<ToolSpec> {
     vec![
@@ -286,7 +289,7 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
         targets = vec!["knowledge".into(), "qa_method".into(), "query".into()];
     }
     let limit = limit_arg(args, "limit", SEARCH_DEFAULT, SEARCH_MAX);
-    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+    let offset = args["offset"].as_u64().unwrap_or(0).min(MAX_OFFSET) as usize;
     let config = cx.config;
     let vector = if config.embedding.enabled() {
         match cx.app.embeddings.embed(&config.embedding, &text, cx.cancel).await {
@@ -546,7 +549,7 @@ async fn knowledge_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
         .or(cursor_start)
         .or_else(|| cx.hints.get(&doc).map(|best| (best - 1).max(1)))
         .unwrap_or(1)
-        .max(1);
+        .clamp(1, MAX_OFFSET as i64);
     let cfg = &cx.config.mariadb;
     let rows = cx
         .app
@@ -858,7 +861,7 @@ fn result_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
             cx.results.keys().map(u64::to_string).collect::<Vec<_>>().join(", ")
         );
     };
-    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+    let offset = args["offset"].as_u64().unwrap_or(0).min(MAX_OFFSET) as usize;
     let limit = limit_arg(args, "limit", READ_DEFAULT, READ_MAX);
     let all_columns = columns_of(&stored.rows);
     let wanted: Vec<String> = args["cols"]
