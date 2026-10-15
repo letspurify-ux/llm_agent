@@ -82,23 +82,27 @@ fn cuts(s: &[u16], kind: usize, mut visit: impl FnMut(usize) -> bool) {
     }
 }
 
-fn last_boundary(s: &[u16], lo: usize, hi: usize) -> Option<usize> {
-    for kind in 0..3 {
-        let mut at = None;
+/// Every cut position of each boundary kind, ascending. The positions do
+/// not depend on the chunk being cut, so they are found once per document:
+/// scanning from the start again for every chunk made a long document's
+/// split quadratic (seconds of a runtime thread for a few million characters).
+fn boundaries(s: &[u16]) -> [Vec<usize>; 3] {
+    std::array::from_fn(|kind| {
+        let mut found = vec![];
         cuts(s, kind, |cut| {
-            if cut > hi {
-                return false;
-            }
-            if cut >= lo {
-                at = Some(cut);
-            }
+            found.push(cut);
             true
         });
-        if at.is_some() {
-            return at;
-        }
-    }
-    None
+        found
+    })
+}
+
+/// The last cut within `lo..=hi`, of the first kind that has one.
+fn last_boundary(boundaries: &[Vec<usize>; 3], lo: usize, hi: usize) -> Option<usize> {
+    boundaries.iter().find_map(|cuts| {
+        let below = cuts.partition_point(|&cut| cut <= hi);
+        below.checked_sub(1).map(|i| cuts[i]).filter(|&cut| cut >= lo)
+    })
 }
 
 /// The document split into chunks (JavaScript-trimmed first).
@@ -111,6 +115,7 @@ fn split_with(text: &str, target: usize, max: usize, overlap: usize) -> Vec<Stri
     if s.len() <= max {
         return vec![String::from_utf16_lossy(&s)];
     }
+    let boundaries = boundaries(&s);
     let mut out = vec![];
     let mut at = 0usize;
     while at < s.len() {
@@ -120,7 +125,7 @@ fn split_with(text: &str, target: usize, max: usize, overlap: usize) -> Vec<Stri
         }
         let lo = at + target * 6 / 10;
         let hi = at + max;
-        let end = match last_boundary(&s, lo, hi) {
+        let end = match last_boundary(&boundaries, lo, hi) {
             Some(cut) if cut > at => cut,
             _ => align_cut(&s, hi),
         };
@@ -205,6 +210,72 @@ mod tests {
             let seams: Vec<String> = chunks.windows(2).map(|w| cut_seam(&w[0], &w[1])).collect();
             assert_eq!(seams, case.seams, "case {i}");
         }
+    }
+
+    /// The split as first written: every chunk scanned the document from
+    /// its start again, quadratic in the document's length.
+    fn reference_split(text: &str) -> Vec<String> {
+        let (target, max, overlap) = (CHUNK_TARGET_LEN, CHUNK_MAX_LEN, CHUNK_OVERLAP);
+        let s: Vec<u16> = crate::text::js_trim(text).encode_utf16().collect();
+        if s.len() <= max {
+            return vec![String::from_utf16_lossy(&s)];
+        }
+        let last_boundary = |lo: usize, hi: usize| {
+            for kind in 0..3 {
+                let mut at = None;
+                cuts(&s, kind, |cut| {
+                    if cut > hi {
+                        return false;
+                    }
+                    if cut >= lo {
+                        at = Some(cut);
+                    }
+                    true
+                });
+                if at.is_some() {
+                    return at;
+                }
+            }
+            None
+        };
+        let mut out = vec![];
+        let mut at = 0usize;
+        while at < s.len() {
+            if s.len() - at <= max {
+                out.push(String::from_utf16_lossy(&s[at..]));
+                break;
+            }
+            let end = match last_boundary(at + target * 6 / 10, at + max) {
+                Some(cut) if cut > at => cut,
+                _ => align_cut(&s, at + max),
+            };
+            out.push(String::from_utf16_lossy(&s[at..end]));
+            let mut next = align_cut(&s, end.saturating_sub(overlap));
+            if next <= at {
+                next = at + if is_high(s.get(at)) && is_low(s.get(at + 1)) { 2 } else { 1 };
+            }
+            at = next;
+        }
+        out
+    }
+
+    #[test]
+    fn long_documents_split_as_before_in_linear_time() {
+        let pieces = ["배치 재시작 절차를 설명한다. ", "\n\n", "\n## 절차\n", "word ", "😀", "x", "?\n", "\n \t\n", "#"];
+        let mut seed = 7u64;
+        for size in [500, 3_000, 20_000, 120_000] {
+            let mut text = String::new();
+            while text.len() < size {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                text.push_str(pieces[(seed >> 33) as usize % pieces.len()]);
+            }
+            assert_eq!(split_content(&text), reference_split(&text), "size {size}");
+        }
+        let long = "가나다라마바사 아자차카타파하. ".repeat(100_000);
+        let started = std::time::Instant::now();
+        let chunks = split_content(&long);
+        assert!(chunks.len() > 1000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
     }
 
     #[test]

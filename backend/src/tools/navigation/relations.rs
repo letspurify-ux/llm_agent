@@ -2551,7 +2551,10 @@ pub(super) fn execute(s: &crate::tools::Workspace, args: &Value, cancel: &Cancel
     let relation = args["relation"].as_str().unwrap_or("calls");
     let (facts, sites, unsupported_calls) = collect(&workspace, cancel, deadline)?;
     let index = LinkIndex::new(&workspace, &facts, cancel, deadline)?;
-    let mut rows = Vec::new();
+    // Rows are built for the requested page only: each names up to 20
+    // candidate symbols, and the thousands of call sites of a common name,
+    // built in full, took gigabytes for a one-row page.
+    let mut kept: Vec<(&Site, Resolution)> = Vec::new();
     let mut unresolved = 0usize;
     for site in &sites {
         check_budget(cancel, deadline)?;
@@ -2597,6 +2600,9 @@ pub(super) fn execute(s: &crate::tools::Workspace, args: &Value, cancel: &Cancel
         if relation != "calls" && !resolution.targets.contains(&key) {
             continue;
         }
+        kept.push((site, resolution));
+    }
+    let row = |site: &Site, resolution: &Resolution| {
         let file = &workspace.files[site.file].syntax;
         let path = workspace.relative(&file.path);
         let candidates: Vec<_> = resolution
@@ -2607,14 +2613,14 @@ pub(super) fn execute(s: &crate::tools::Workspace, args: &Value, cancel: &Cancel
             .collect();
         let expression: String = file.source[site.span.clone()].chars().take(300).collect();
         let target_matches = resolution.targets.contains(&key);
-        rows.push(json!({"path":path,"hash":file.digest,"line":site.line,"end_line":site.end_line,"name_line":site.name_line,"name_column":site.column,
+        json!({"path":path,"hash":file.digest,"line":site.line,"end_line":site.end_line,"name_line":site.name_line,"name_column":site.column,
             "location":format!("{path}:{}-{}",site.line,site.end_line),"name":site.name.chars().take(500).collect::<String>(),"name_truncated":site.name.chars().count()>500,"qualifier":site.qualifier.as_ref().map(|q|q.chars().take(500).collect::<String>()),"qualifier_truncated":site.qualifier.as_ref().is_some_and(|q|q.chars().count()>500),
             "kind":if site.call {"call"} else {"reference"},"expression":expression,"expression_truncated":file.source[site.span.clone()].chars().count()>300,
             "enclosing_symbol":site.owner.map(|(f,i)|workspace.symbol(f,&workspace.files[f].symbols[i])),
             "enclosing_callable":site.callable.map(|(start,end)|json!({"location":format!("{path}:{start}-{end}"),"anonymous":site.owner.is_none()})),
             "resolution":resolution.status,"reason":resolution.reason,"candidates":candidates,"candidate_count":resolution.targets.len(),
-            "candidates_truncated":resolution.targets.len()>20,"selected_symbol_is_candidate":target_matches}));
-    }
+            "candidates_truncated":resolution.targets.len()>20,"selected_symbol_is_candidate":target_matches})
+    };
     let mut metadata = workspace.metadata();
     metadata["relation"] = json!(relation);
     metadata["symbol"] = workspace.symbol(file, symbol);
@@ -2631,5 +2637,7 @@ pub(super) fn execute(s: &crate::tools::Workspace, args: &Value, cancel: &Cancel
         ))?
         .as_slice(),
     );
-    page(metadata, args, &fingerprint, "relations", rows)
+    page_with(metadata, args, &fingerprint, "relations", kept.len(), |range| {
+        kept[range].iter().map(|(site, resolution)| row(site, resolution)).collect()
+    })
 }

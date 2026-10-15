@@ -937,6 +937,7 @@ async fn settings_check(State(app): State<Arc<App>>, body: Bytes) -> ApiResult<J
             if !config.embedding.enabled() {
                 anyhow::bail!("임베딩 주소가 비어 있습니다. 비우면 벡터 검색을 쓰지 않습니다.");
             }
+            config.embedding.validate()?;
             let start = std::time::Instant::now();
             crate::embedding::embed(&config.embedding, &["연결 확인".to_owned()], &Default::default())
                 .await
@@ -950,6 +951,9 @@ async fn settings_check(State(app): State<Arc<App>>, body: Bytes) -> ApiResult<J
         }
         .await,
         "mariadb" => async {
+            // The draft is not saved, so nothing has checked it yet: a pool
+            // size past the limit would be allocated as given.
+            config.mariadb.validate()?;
             let probe = crate::db::Db::default();
             let rows = probe
                 .query(

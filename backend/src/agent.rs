@@ -488,7 +488,7 @@ fn resolve_project(
     let found: Vec<&Project> = config
         .projects
         .iter()
-        .filter(|p| tools::read_path(p, path).is_ok())
+        .filter(|p| tools::path_in_project(p, path))
         .collect();
     match found.as_slice() {
         [only] => Ok((
@@ -1049,6 +1049,35 @@ mod tests {
         single.projects.truncate(1);
         let (project, note) = resolve_project(&single, "source_search", &json!({"query":"x"}), &none).unwrap();
         assert_eq!((project.name, note), ("a".into(), None));
+    }
+
+    #[test]
+    fn an_omitted_project_is_found_without_walking_the_projects() {
+        // The check runs on the async runtime: a missing path used to walk
+        // every project to suggest similar names, compiling each include and
+        // exclude glob again for every file.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        for name in ["a", "b"] {
+            for i in 0..3000 {
+                let folder = dir.path().join(name).join(format!("src/m{}", i % 30));
+                std::fs::create_dir_all(&folder).unwrap();
+                std::fs::write(folder.join(format!("f{i}.rs")), "x\n").unwrap();
+            }
+            config.projects.push(Project {
+                name: name.into(),
+                root: dir.path().join(name),
+                include: vec!["src/**".into(), "**/*.rs".into(), "**/*.md".into()],
+                exclude: vec!["**/gen/**".into(), "**/*.min.js".into()],
+                ..Default::default()
+            });
+        }
+        std::fs::write(dir.path().join("a/src/only_a.rs"), "x\n").unwrap();
+        let started = Instant::now();
+        let (project, _) = resolve_project(&config, "file_read", &json!({"path":"src/only_a.rs"}), &BTreeMap::new()).unwrap();
+        assert_eq!(project.name, "a");
+        assert!(resolve_project(&config, "file_read", &json!({"path":"src/nowhere.rs"}), &BTreeMap::new()).is_err());
+        assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
     }
 
     #[test]

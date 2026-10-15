@@ -574,9 +574,48 @@ fn folded_alias_key(value: &str) -> String {
     value.nfd().default_case_fold().nfd().collect()
 }
 
+/// A project's include/exclude globs, compiled once for a walk: compiled
+/// again for every path, they made a large project's walk take minutes.
+pub(crate) struct Rules {
+    include: Vec<Rule>,
+    exclude: Vec<Rule>,
+}
+/// A glob matched case-insensitively on the NFD path, and its case-folded
+/// form on the folded path.
+struct Rule {
+    normalized: globset::GlobMatcher,
+    folded: Option<globset::GlobMatcher>,
+}
+impl Rules {
+    pub(crate) fn new(project: &Project) -> Result<Self> {
+        use unicode_normalization::UnicodeNormalization;
+        let compile = |pattern: &String| -> Result<Rule> {
+            let normalized_pattern: String = pattern.nfd().collect();
+            Ok(Rule {
+                normalized: globset::GlobBuilder::new(&normalized_pattern)
+                    .case_insensitive(true)
+                    .build()?
+                    .compile_matcher(),
+                folded: globset::Glob::new(&folded_alias_key(pattern))
+                    .ok()
+                    .map(|glob| glob.compile_matcher()),
+            })
+        };
+        Ok(Self {
+            include: project.include.iter().map(compile).collect::<Result<_>>()?,
+            exclude: project.exclude.iter().map(compile).collect::<Result<_>>()?,
+        })
+    }
+}
+
 /// Version control, dependency and build output, and the project's
 /// include/exclude globs (case-insensitive, Unicode-normalized).
 pub(crate) fn excluded(project: &Project, relative: &Path) -> Result<bool> {
+    Ok(excluded_by(project, &Rules::new(project)?, relative))
+}
+
+/// `excluded` with the project's rules already compiled.
+pub(crate) fn excluded_by(project: &Project, rules: &Rules, relative: &Path) -> bool {
     use std::path::Component;
     use unicode_normalization::UnicodeNormalization;
     // Version-control metadata is excluded as a file too: a `.git` file
@@ -602,42 +641,15 @@ pub(crate) fn excluded(project: &Project, relative: &Path) -> Result<bool> {
         named(part, &version_control)
             || (named(part, &directories) && (index < last || project.root.join(relative).is_dir()))
     }) {
-        return Ok(true);
+        return true;
     }
     let normalized_path: String = relative.to_string_lossy().nfd().collect();
     let folded_path = folded_alias_key(&relative.to_string_lossy());
-    let matches = |pattern: &str| -> Result<bool> {
-        let normalized_pattern: String = pattern.nfd().collect();
-        if globset::GlobBuilder::new(&normalized_pattern)
-            .case_insensitive(true)
-            .build()?
-            .compile_matcher()
-            .is_match(&normalized_path)
-        {
-            return Ok(true);
-        }
-        Ok(globset::Glob::new(&folded_alias_key(pattern))
-            .ok()
-            .is_some_and(|glob| glob.compile_matcher().is_match(&folded_path)))
+    let matches = |rule: &Rule| {
+        rule.normalized.is_match(&normalized_path)
+            || rule.folded.as_ref().is_some_and(|glob| glob.is_match(&folded_path))
     };
-    if !project.include.is_empty() {
-        let mut included = false;
-        for pattern in &project.include {
-            if matches(pattern)? {
-                included = true;
-                break;
-            }
-        }
-        if !included {
-            return Ok(true);
-        }
-    }
-    for pattern in &project.exclude {
-        if matches(pattern)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    (!rules.include.is_empty() && !rules.include.iter().any(matches)) || rules.exclude.iter().any(matches)
 }
 
 /// The reference documents of a project that exist, canonicalized.
@@ -658,6 +670,17 @@ pub fn doc_paths(p: &Project) -> Vec<PathBuf> {
 }
 
 pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
+    resolve_path(p, path, true)
+}
+
+/// Whether `path` names a file or directory the project may read. Unlike
+/// `read_path` it never walks the project for similar names, so it is cheap
+/// enough for the async runtime.
+pub fn path_in_project(p: &Project, path: &str) -> bool {
+    resolve_path(p, path, false).is_ok()
+}
+
+fn resolve_path(p: &Project, path: &str, hints: bool) -> Result<PathBuf> {
     let root = p.root.canonicalize().map_err(|e| {
         anyhow::anyhow!(
             "project_root_unavailable: project {} root {} cannot be opened: {e}",
@@ -676,7 +699,7 @@ pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
             std::io::ErrorKind::PermissionDenied => "file_permission_denied",
             _ => "file_access_error",
         };
-        let hint = if e.kind() == std::io::ErrorKind::NotFound {
+        let hint = if hints && e.kind() == std::io::ErrorKind::NotFound {
             if let Some(shape) = path_shape_hint(&root, path) {
                 shape
             } else {
@@ -777,6 +800,10 @@ fn path_shape_hint(root: &Path, path: &str) -> Option<String> {
     ))
 }
 
+/// Longest walk for the names an error suggests. Such a walk has no
+/// cancellation token of its own; past this it suggests nothing.
+const HINT_WALK: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Project files whose name matches a missing path: the same file name
 /// first, then the same stem, then directories of that name.
 fn similar_paths(p: &Project, missing: &Path) -> Vec<String> {
@@ -795,7 +822,13 @@ fn similar_paths(p: &Project, missing: &Path) -> Vec<String> {
     let Ok(root) = p.root.canonicalize() else {
         return vec![];
     };
-    let Ok(paths) = candidate_paths(p, None, &tokio_util::sync::CancellationToken::new()) else {
+    let Ok(paths) = candidate_paths_scoped(
+        p,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+        None,
+        Some(std::time::Instant::now() + HINT_WALK),
+    ) else {
         return vec![];
     };
     let mut exact = vec![];
@@ -867,7 +900,7 @@ fn directory_entries(p: &Project, directory: &Path) -> (Vec<String>, usize) {
         None,
         &tokio_util::sync::CancellationToken::new(),
         Some(directory),
-        None,
+        Some(std::time::Instant::now() + HINT_WALK),
         FileScanLimits {
             max_paths: 20_000,
             max_path_bytes: 4 * 1024 * 1024,
@@ -1007,14 +1040,6 @@ pub(crate) fn read_text(path: &Path) -> Result<String> {
     })
 }
 
-fn candidate_paths(
-    p: &Project,
-    pattern: Option<&str>,
-    cancel: &tokio_util::sync::CancellationToken,
-) -> Result<Vec<PathBuf>> {
-    candidate_paths_scoped(p, pattern, cancel, None, None)
-}
-
 fn candidate_paths_scoped(
     p: &Project,
     pattern: Option<&str>,
@@ -1118,6 +1143,17 @@ fn candidate_paths_bounded(
         .map(globset::Glob::new)
         .transpose()?
         .map(|g| g.compile_matcher());
+    let rules = Rules::new(p)?;
+    // The walker reads the root's and its parents' ignore files first.
+    for dir in root.ancestors() {
+        if let Some(file) = unsafe_ignore_file(dir) {
+            bail!(
+                "unsafe_ignore_file: {} is not a regular file of at most {} bytes, so the project cannot be walked; replace it or remove it",
+                file.display(),
+                MAX_IGNORE_FILE_BYTES
+            );
+        }
+    }
     for entry in ignore::WalkBuilder::new(&root)
         .hidden(false)
         .follow_links(false)
@@ -1126,7 +1162,8 @@ fn candidate_paths_bounded(
                 || (!SKIPPED_DIRECTORIES.contains(&entry.file_name().to_string_lossy().as_ref())
                     && scope.as_ref().is_none_or(|scope| {
                         entry.path().starts_with(scope) || scope.starts_with(entry.path())
-                    }))
+                    })
+                    && unsafe_ignore_file(entry.path()).is_none())
         })
         .build()
     {
@@ -1139,7 +1176,7 @@ fn candidate_paths_bounded(
         }
         let rel = entry.path().strip_prefix(&root)?;
         if directory.is_some_and(|scope| !entry.path().starts_with(scope))
-            || excluded(p, rel)?
+            || excluded_by(p, &rules, rel)
             || filter.as_ref().is_some_and(|f| !f.is_match(rel))
         {
             continue;
@@ -1162,6 +1199,30 @@ fn candidate_paths_bounded(
     check()?;
     Ok((entries, non_utf8))
 }
+/// Largest ignore file a walk lets the walker read.
+const MAX_IGNORE_FILE_BYTES: u64 = 1024 * 1024;
+
+/// An ignore file in `dir` the walker would open but must not: anything but
+/// a regular file of at most MAX_IGNORE_FILE_BYTES (links followed, as the
+/// walker does). The walker opens these itself, before any check of ours,
+/// and reads them to the end: a pipe blocks it for good, a link to a device
+/// such as /dev/zero never ends. A directory holding one is not entered.
+fn unsafe_ignore_file(dir: &Path) -> Option<PathBuf> {
+    let safe = |path: &Path| match path.metadata() {
+        Ok(metadata) => metadata.is_file() && metadata.len() <= MAX_IGNORE_FILE_BYTES,
+        Err(_) => true,
+    };
+    let git = dir.join(".git");
+    let mut files = vec![dir.join(".ignore"), dir.join(".gitignore")];
+    match git.metadata() {
+        Ok(metadata) if metadata.is_dir() => files.push(git.join("info/exclude")),
+        // A `.git` file (worktree, submodule) is read for its gitdir line.
+        Ok(metadata) if metadata.is_file() => files.push(git),
+        _ => {}
+    }
+    files.into_iter().find(|file| !safe(file))
+}
+
 fn search_text(path: &Path) -> Result<Option<String>> {
     match read_text(path) {
         Ok(text) => Ok(Some(text)),
@@ -1981,6 +2042,73 @@ mod tests {
             list_cursor_scopes: VecDeque::new(),
             history: Default::default(),
         }
+    }
+
+    /// The walker opens every directory's ignore files itself, before any
+    /// of our checks: one that is a pipe blocked the walk forever (cancel
+    /// could not reach it), and one linked to /dev/zero was read until the
+    /// process ran out of memory.
+    #[cfg(unix)]
+    #[test]
+    fn walks_skip_ignore_files_that_are_not_small_regular_files() {
+        use std::os::unix::ffi::OsStrExt;
+        let fifo = |path: &Path| {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
+        };
+        let walk = |root: PathBuf| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let project = Project { name: "app".into(), root: root.clone(), ..Default::default() };
+                let found = candidate_paths_counted(&project, None, &tokio_util::sync::CancellationToken::new(), None, None)
+                    .map(|(paths, _)| paths.iter().map(|p| p.strip_prefix(&root.canonicalize().unwrap()).unwrap().display().to_string()).collect::<Vec<_>>());
+                let _ = tx.send(found);
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the walk blocked on an ignore file")
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("app");
+        for sub in ["src", "piped", "piped_link", "endless", "huge", "src/kept"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+            std::fs::write(root.join(sub).join("a.rs"), "fn a() {}\n").unwrap();
+        }
+        fifo(&root.join("piped/.gitignore"));
+        fifo(&dir.path().join("outside_pipe"));
+        std::os::unix::fs::symlink(dir.path().join("outside_pipe"), root.join("piped_link/.ignore")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", root.join("endless/.gitignore")).unwrap();
+        std::fs::write(root.join("huge/.gitignore"), "x\n".repeat(600_000)).unwrap();
+        // Ordinary ignore files still apply.
+        std::fs::write(root.join("src/kept/.gitignore"), "a.rs\n").unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        assert_eq!(walk(root.clone()).unwrap(), ["src/a.rs", "src/kept/.gitignore"]);
+
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("a.rs"), "fn a() {}\n").unwrap();
+        fifo(&other.join(".gitignore"));
+        let error = walk(other).unwrap_err().to_string();
+        assert!(error.starts_with("unsafe_ignore_file"), "{error}");
+    }
+
+    #[test]
+    fn relations_pages_build_only_their_rows_and_continue_with_a_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "fn x() {}\nfn a() { x(); }\nfn b() { x(); x(); }\n").unwrap();
+        let mut ws = workspace(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let found = execute(&mut ws, "symbol_search", json!({"query":"x","match":"exact"}), &cancel).unwrap();
+        let symbol = &found["symbols"][0];
+        let args = json!({"path":symbol["path"],"symbol_id":symbol["symbol_id"],"relation":"callers","limit":2});
+        let first = execute(&mut ws, "symbol_relations", args.clone(), &cancel).unwrap();
+        assert_eq!((first["total_results"].clone(), first["relations"].as_array().unwrap().len()), (json!(3), 2));
+        let lines: Vec<_> = first["relations"].as_array().unwrap().iter().map(|r| r["line"].clone()).collect();
+        assert_eq!(lines, [json!(2), json!(3)]);
+        let mut next = args;
+        next["cursor"] = first["next_cursor"].clone();
+        let second = execute(&mut ws, "symbol_relations", next, &cancel).unwrap();
+        assert_eq!(second["relations"].as_array().unwrap().len(), 1);
+        assert_eq!(second["relations"][0]["enclosing_symbol"]["name"], "b");
+        assert!(second["next_cursor"].is_null());
     }
 
     #[test]

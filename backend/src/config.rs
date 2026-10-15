@@ -215,7 +215,7 @@ impl EmbeddingConfig {
         }
         out
     }
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.enabled() {
             let url = reqwest::Url::parse(&self.url)
                 .map_err(|_| anyhow::anyhow!("임베딩 주소가 올바른 URL이 아닙니다."))?;
@@ -264,7 +264,7 @@ impl Default for MariaDbConfig {
     }
 }
 impl MariaDbConfig {
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.host.trim().is_empty() || self.database.trim().is_empty() || self.port == 0 {
             bail!("관리 DB의 호스트·포트·DB 이름을 입력해주세요.");
         }

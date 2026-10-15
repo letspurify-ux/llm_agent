@@ -100,7 +100,7 @@ async fn serve(path: PathBuf, config: Config) -> i32 {
         if config.embedding.enabled() { &config.embedding.model } else { "off" }
     );
     let shutdown = app.shutdown.clone();
-    let server = axum::serve(listener, web::router(app.clone())).with_graceful_shutdown(async move {
+    let server = web::serve(listener, app.clone(), async move {
         wait_for_signal().await;
         eprintln!("[shutdown] cleaning up and exiting");
         shutdown.cancel();

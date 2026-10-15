@@ -17,7 +17,11 @@ use axum::{
 };
 use futures_util::{FutureExt, StreamExt};
 use serde_json::{Value, json};
-use std::sync::{Arc, atomic::Ordering};
+use std::{
+    future::IntoFuture,
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
 use tokio_util::sync::CancellationToken;
 
 const NDJSON: &str = "application/x-ndjson";
@@ -25,6 +29,49 @@ const SERVER_ERROR: &str = "처리 중 오류가 발생했습니다.";
 const MAX_PENDING_LOGS: usize = 1000;
 /// Request body limit of /api/chat (the former 1mb).
 const CHAT_BODY_LIMIT: usize = 1024 * 1024;
+/// How long shutdown waits for open connections. Answers in progress are
+/// cancelled by the signal and end at once; a connection that sent only part
+/// of a request has no read timeout and would keep the process running.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// TCP keepalive of accepted connections: a client that went away without
+/// closing (sleep, network loss) is found within about two minutes, instead
+/// of its connection and task being held until the process exits.
+const KEEPALIVE: socket2::TcpKeepalive = socket2::TcpKeepalive::new()
+    .with_time(Duration::from_secs(60))
+    .with_interval(Duration::from_secs(10))
+    .with_retries(6);
+
+/// Serves the router until `signal` resolves, then shuts down: connections
+/// still open after SHUTDOWN_GRACE are dropped rather than waited for.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    app: Arc<App>,
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    use axum::serve::ListenerExt;
+    let stopping = CancellationToken::new();
+    let stopped = stopping.clone();
+    let server = axum::serve(listener.tap_io(keep_alive), router(app)).with_graceful_shutdown(async move {
+        signal.await;
+        stopped.cancel();
+    });
+    tokio::select! {
+        result = server.into_future() => result,
+        _ = async {
+            stopping.cancelled().await;
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+        } => {
+            eprintln!("[shutdown] connections still open after {}s were closed", SHUTDOWN_GRACE.as_secs());
+            Ok(())
+        }
+    }
+}
+
+fn keep_alive(stream: &mut tokio::net::TcpStream) {
+    if let Err(e) = socket2::SockRef::from(&*stream).set_tcp_keepalive(&KEEPALIVE) {
+        eprintln!("[listen] could not enable TCP keepalive on a connection: {e}");
+    }
+}
 
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
@@ -243,5 +290,20 @@ fn finish(app: &Arc<App>, message: &str, result: anyhow::Result<Answer>, cancel:
             record_chat_log(app, message, None, json!({"v":5,"outcome":"error","error":format!("{e:#}")}));
             Err((StatusCode::INTERNAL_SERVER_ERROR, shown))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn accepted_connections_probe_their_peer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut accepted, _) = listener.accept().await.unwrap();
+        assert!(!socket2::SockRef::from(&accepted).keepalive().unwrap());
+        keep_alive(&mut accepted);
+        assert!(socket2::SockRef::from(&accepted).keepalive().unwrap());
     }
 }

@@ -155,8 +155,43 @@ fn tokenizer(model: &str) -> &'static tiktoken_rs::CoreBPE {
     }
 }
 
-pub fn tokens(text: &str, model: &str) -> usize {
-    let n = tokenizer(model).encode_with_special_tokens(text).len();
+/// Bytes of text one tokenizer call sees. The tokenizer's merge step is
+/// quadratic in the length of one regex piece (a run of spaces, `=` or
+/// letters with no break: degenerate model output, a generated file line),
+/// and a piece of about a million characters makes its regex fail with a
+/// panic. A segment ends before a space where one is near, where a
+/// whole-text encoding splits too; a cut inside a long run can add a token.
+const SEGMENT_BYTES: usize = 1024;
+const SPACE_LOOKBACK: usize = 64;
+
+/// `text` in segments of at most SEGMENT_BYTES. A prefix that ends where a
+/// segment ends is cut in the same places.
+fn segments(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let mut end = rest.len();
+        if end > SEGMENT_BYTES {
+            end = SEGMENT_BYTES;
+            while !rest.is_char_boundary(end) {
+                end -= 1;
+            }
+            let from = end.saturating_sub(SPACE_LOOKBACK);
+            if let Some(space) = rest.as_bytes()[from..end].iter().rposition(|&b| b == b' ')
+                && from + space > 0
+            {
+                end = from + space;
+            }
+        }
+        let (segment, next) = rest.split_at(end);
+        rest = next;
+        Some(segment)
+    })
+}
+
+fn scaled(n: usize, model: &str) -> usize {
     if is_estimated(model) {
         // Provider tokenizers vary; the multilingual fallback keeps 25%
         // headroom.
@@ -165,25 +200,44 @@ pub fn tokens(text: &str, model: &str) -> usize {
         n
     }
 }
+
+pub fn tokens(text: &str, model: &str) -> usize {
+    let bpe = tokenizer(model);
+    scaled(segments(text).map(|s| bpe.encode_with_special_tokens(s).len()).sum(), model)
+}
 pub fn is_estimated(model: &str) -> bool {
     tiktoken_rs::tokenizer::get_tokenizer(model).is_none()
 }
 pub fn count(value: &Value, model: &str) -> usize {
     tokens(&value.to_string(), model)
 }
-/// The longest character prefix of `text` within `limit` tokens.
+/// The longest character prefix of `text` within `limit` tokens. The text is
+/// counted only up to where it crosses the limit, so a long text costs
+/// little more than the part kept.
 pub fn truncate(text: &str, limit: usize, model: &str) -> (String, bool) {
-    if tokens(text, model) <= limit {
+    let bpe = tokenizer(model);
+    let (mut counted, mut end) = (0usize, 0usize);
+    let mut over = false;
+    for segment in segments(text) {
+        counted += bpe.encode_with_special_tokens(segment).len();
+        end += segment.len();
+        if scaled(counted, model) > limit {
+            over = true;
+            break;
+        }
+    }
+    if !over {
         return (text.into(), false);
     }
+    let head = &text[..end];
     let prefix = |length: usize| {
-        let end = text
+        let end = head
             .char_indices()
             .nth(length)
-            .map_or(text.len(), |(byte, _)| byte);
-        &text[..end]
+            .map_or(head.len(), |(byte, _)| byte);
+        &head[..end]
     };
-    let (mut low, mut high) = (0, text.chars().count());
+    let (mut low, mut high) = (0, head.chars().count());
     while low < high {
         let mid = (low + high).div_ceil(2);
         if tokens(prefix(mid), model) <= limit {
@@ -289,6 +343,26 @@ pub fn evict(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_runs_without_breaks_are_counted_in_bounded_time() {
+        // One tokenizer piece of about a million characters made its regex
+        // fail with a panic, and shorter ones cost quadratic time (a run of
+        // degenerate model output, a minified or generated file line).
+        let started = std::time::Instant::now();
+        for text in [" ".repeat(1_200_000), "=".repeat(1_200_000), "가".repeat(400_000)] {
+            assert!(tokens(&text, "gpt-4o") > 0);
+            let (cut, truncated) = truncate(&text, 500, "gpt-4o");
+            assert!(truncated && !cut.is_empty() && tokens(&cut, "gpt-4o") <= 500);
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(30), "{:?}", started.elapsed());
+        // Ordinary text counts as one encoding of the whole does.
+        let prose = "The quick brown fox jumps over the lazy dog, 빠른 갈색 여우가 게으른 개를 뛰어넘는다. ".repeat(400);
+        let whole = tokenizer("gpt-4o").encode_with_special_tokens(&prose).len();
+        assert_eq!(tokens(&prose, "gpt-4o"), whole);
+        let (cut, truncated) = truncate(&prose, 1000, "gpt-4o");
+        assert!(truncated && tokens(&cut, "gpt-4o") <= 1000 && tokens(&cut, "gpt-4o") >= 990);
+    }
 
     #[test]
     fn system_prompt_sections_are_in_reading_order() {

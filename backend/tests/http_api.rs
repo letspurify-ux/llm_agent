@@ -478,3 +478,62 @@ async fn the_binary_serves_the_built_screen() {
     assert_eq!(api.status(), StatusCode::NOT_FOUND);
     assert!(api.headers()[header::CONTENT_TYPE].to_str().unwrap().starts_with("application/json"));
 }
+
+/// Shutdown does not wait on a client that sent part of a request (one that
+/// went away mid-upload): before, the process stayed up until that
+/// connection closed, and a second Ctrl+C did nothing.
+#[tokio::test]
+async fn shutdown_does_not_wait_for_a_half_sent_request() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut config = llm_agent::config::Config::default();
+    config.mariadb.port = 9;
+    let (app, _dir) = app(config, Scripted::new(vec![]));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let signal = tokio_util::sync::CancellationToken::new();
+    let trigger = signal.clone();
+    let server = tokio::spawn(web::serve(listener, app, async move { trigger.cancelled().await }));
+
+    let mut served = tokio::net::TcpStream::connect(address).await.unwrap();
+    served.write_all(b"GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+    let mut reply = [0u8; 256];
+    let n = served.read(&mut reply).await.unwrap();
+    assert!(String::from_utf8_lossy(&reply[..n]).starts_with("HTTP/1.1 200"));
+    let mut half_head = tokio::net::TcpStream::connect(address).await.unwrap();
+    half_head.write_all(b"GET /api/health HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+    let mut half_body = tokio::net::TcpStream::connect(address).await.unwrap();
+    half_body
+        .write_all(b"POST /api/chat HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"message\":")
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let started = std::time::Instant::now();
+    signal.cancel();
+    let stopped = tokio::time::timeout(web::SHUTDOWN_GRACE + std::time::Duration::from_secs(3), server).await;
+    assert!(matches!(stopped, Ok(Ok(Ok(())))), "the server is still waiting on open connections");
+    assert!(started.elapsed() >= web::SHUTDOWN_GRACE, "in-flight requests get the grace period");
+    drop((half_head, half_body));
+}
+
+/// A connection check runs on the draft settings without saving them, so
+/// they are checked first: a pool size far past the limit used to reach the
+/// pool and panic allocating it (a little smaller and the allocation failure
+/// aborted the whole process).
+#[tokio::test]
+async fn connection_checks_refuse_settings_out_of_range() {
+    let mut config = llm_agent::config::Config::default();
+    config.mariadb.port = 9;
+    let (app, _dir) = app(config, Scripted::new(vec![]));
+    let client = Client { router: web::router(app.clone()), token: None };
+    for (target, section) in [
+        ("mariadb", json!({"mariadb":{"pool_size":1u64 << 60}})),
+        ("embedding", json!({"embedding":{"url":"http://127.0.0.1:9/v1","ef_search":0}})),
+    ] {
+        let r = client.admin("POST", "settings/check", Some(json!({"target":target,"config":section})), None).await;
+        assert_eq!(r.status, StatusCode::OK, "{target}: {}", r.text);
+        assert_eq!(r.body["ok"], false, "{target}: {}", r.text);
+    }
+    let r = client.admin("POST", "settings/check", Some(json!({"target":"mariadb","config":{"mariadb":{"pool_size":1u64 << 60}}})), None).await;
+    assert!(r.body["message"].as_str().unwrap().contains("풀 크기"), "{}", r.text);
+}

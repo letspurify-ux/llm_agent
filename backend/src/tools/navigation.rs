@@ -178,24 +178,36 @@ fn request_fingerprint(workspace: &Workspace, name: &str, args: &Value) -> Strin
 }
 
 fn page(
-    mut metadata: Value,
+    metadata: Value,
     args: &Value,
     fingerprint: &str,
     field: &str,
     rows: Vec<Value>,
 ) -> Result<Value> {
+    page_with(metadata, args, fingerprint, field, rows.len(), |range| rows[range].to_vec())
+}
+
+/// `page` over `total` rows that `rows` builds for the page's range only.
+fn page_with(
+    mut metadata: Value,
+    args: &Value,
+    fingerprint: &str,
+    field: &str,
+    total: usize,
+    rows: impl FnOnce(std::ops::Range<usize>) -> Vec<Value>,
+) -> Result<Value> {
     let start = page_cursor(args, fingerprint)?;
-    if start > rows.len() {
+    if start > total {
         bail!(INVALID_CURSOR);
     }
     let end = start
         .saturating_add(n(args, "limit", 20).clamp(1, 100))
-        .min(rows.len());
+        .min(total);
     metadata["hash"] = json!(fingerprint);
-    metadata["total_results"] = json!(rows.len());
+    metadata["total_results"] = json!(total);
     metadata["page_start"] = json!(start);
-    metadata[field] = json!(&rows[start..end]);
-    metadata["next_cursor"] = json!((end < rows.len()).then(|| format!("{fingerprint}:{end}")));
+    metadata[field] = json!(rows(start..end));
+    metadata["next_cursor"] = json!((end < total).then(|| format!("{fingerprint}:{end}")));
     Ok(metadata)
 }
 
