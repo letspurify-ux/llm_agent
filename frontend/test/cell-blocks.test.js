@@ -7,7 +7,7 @@ import { REMARK_PLUGINS, REHYPE_PLUGINS, renderMathML } from '../src/math.js';
 import { PreviewPre } from '../src/preview.js';
 import { MIXED_WRAPPERS } from './mixed-content-corpus.js';
 import { CELL_CONTAINERS, CELL_CHART, CELL_MERMAID } from './cell-blocks-corpus.js';
-import { resolveChartData } from '../../backend/src/chart.js';
+import { resolveChartData } from '../src/answer-fill.js';
 
 const render = (source, preview = false) => {
   let tree;

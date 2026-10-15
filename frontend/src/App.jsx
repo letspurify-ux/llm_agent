@@ -6,10 +6,19 @@ import { REMARK_PLUGINS, REHYPE_PLUGINS } from './math.js';
 // 차트 블록의 계약(무엇을 차트로 받는가 + 이력으로 되돌릴 때의 모양)은 chart.js에 있다.
 import { parseChartBlock, splitBlock, chartTableMarkdownFrom, chartBlocksToTables, sliceSafe, clip, MAX_CHARTS_PER_MESSAGE, MAX_TITLE_LEN } from './chart.js';
 // trace 패널의 계약(열·셀 표기·CSV)은 trace.js에 있다.
-import { columnsOf, cellValue, cellText, toCsv, csvFileName, stepLabel, normalizeTrace, isSearchStep, targetsLabel, traceSummary,
+import { columnsOf, cellValue, cellText, toCsv, csvFileName, stepLabel, normalizeTrace, isSearchStep, isToolStep, targetsLabel, traceSummary,
   applyProgress, progressText } from './trace.js';
 // 응답 스트림 읽기는 stream.js에, 미리보기 코드블록 표시는 preview.js에 있다.
 import { readEvents } from './stream.js';
+import { fillAnswer } from './answer-fill.js';
+
+// 대화 번호. crypto.randomUUID가 없는 브라우저(구형·http 사내 주소)에서는 난수로 만든다.
+function newConversationId() {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  } catch { /* 아래 대비 경로로 */ }
+  return `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
+}
 import { PreviewPre } from './preview.js';
 // 답변 속 주소를 어떻게 다룰지의 판정은 markdown.js에 있다 (순수 함수라 회귀 테스트가 붙는다).
 import { linkTarget, imageTarget, mdProps, scopeMarkdownIds } from './markdown.js';
@@ -28,19 +37,19 @@ function useMarkdownPlugins(base = NO_REHYPE) {
 const Chart = lazy(() => import('./Chart.jsx'));
 const Mermaid = lazy(() => import('./Mermaid.jsx'));
 
-// 서버(agent.js normalizeChat)가 실제로 쓰는 상한과 같은 값. 서버 쪽 제한은 본문을 파싱한 뒤에
-// 적용되므로 요청 크기를 실제로 묶어두는 것은 이쪽뿐이다 — 넘기면 express의 본문 크기 제한에 걸려
+// 서버(backend/src/agent.rs MAX_CHAT_TURNS·MAX_CHAT_LEN)가 실제로 쓰는 상한과 같은 값. 서버 쪽 제한은 본문을 파싱한 뒤에
+// 적용되므로 요청 크기를 실제로 묶어두는 것은 이쪽뿐이다 — 넘기면 서버의 본문 크기 제한(1MB)에 걸려
 // 이후 모든 요청이 같은 이유로 실패한다(이력은 줄지 않으므로 대화가 복구되지 않는다).
 const HISTORY_TURNS = 6;
 const HISTORY_LEN = 1500;
 
 // 단순 slice는 경계의 서로게이트 쌍(이모지 등)을 반으로 쪼개 짝 잃은 코드유닛을 남기고,
 // 그 값은 서버를 거쳐 LLM 프롬프트로 가는 인코딩 단계에서 U+FFFD로 조용히 훼손된다.
-// 경계에 걸린 상위 서로게이트 하나를 떼어 항상 온전한 문자열만 보낸다 (서버 constants.clipText와 같은 방식).
+// 경계에 걸린 상위 서로게이트 하나를 떼어 항상 온전한 문자열만 보낸다 (서버 backend/src/text.rs clip_utf16과 같은 방식).
 const clipTurn = s => sliceSafe(String(s ?? ''), HISTORY_LEN);
 
-// 요청 상한. 서버 최악 = 루프 진입 예산 180초(agent.js MAX_LOOP_MS) + 마지막 LLM 호출 120초
-// + 강제 답변 120초 ≈ 420초이므로 그보다 뒤에 둔다. 짧게 잡으면 서버가 답을 만들어 보내는 중에
+// 요청 상한. 서버는 질문당 실행 시간(설정 agent.run_seconds, 기본 400초) 안에서 마지막 모델 호출까지
+// 끊으므로 그보다 뒤에 둔다. 짧게 잡으면 서버가 답을 만들어 보내는 중에
 // 클라이언트가 먼저 끊어 "서버와 통신하지 못했습니다"로 뭉개진다.
 // 이게 없으면 반대로 서버가 응답하지 않을 때 타이핑 표시가 영원히 돈다.
 const REQUEST_TIMEOUT_MS = 450_000;
@@ -274,7 +283,7 @@ function downloadCsv(step) {
 
 // 실행된 쿼리 한 건: 이름·대상 DB·바인드 한 줄 + 조회된 행 전부의 표.
 // 모델은 결과를 20행까지만 보고 그중 몇 행만 답변에 옮겨 적으므로, 사용자가 조회 결과 전체를 보는
-// 자리는 이 표뿐이다. 그래서 여기서는 행을 자르지 않는다(서버도 자르지 않는다 — result.js).
+// 자리는 이 표뿐이다. 그래서 여기서는 행을 자르지 않는다(서버도 자르지 않는다 — backend/src/agent.rs).
 // showGrid: 표는 패널이 한 번 펼쳐진 뒤에만 만든다(Message가 준다). 한 스텝이 1000행 × 30열이면 셀
 // 6만 개다 — 답변마다 펼치지도 않은 표를 DOM에 올리면 대화가 길어질수록 화면 전체가 무거워진다.
 function TraceStep({ step: t, showGrid }) {
@@ -282,7 +291,7 @@ function TraceStep({ step: t, showGrid }) {
   return (
     <div className="trace-step">
       <div className="trace-head">
-        {/* 번호는 서버가 준 이력의 절대 순번이다 (result.js clientTrace) — 모델이 답변에서 "3번 조회"라고 말할 때
+        {/* 번호는 서버가 준 이력의 절대 순번이다 (backend/src/agent.rs) — 모델이 답변에서 "3번 조회"라고 말할 때
             사용자가 여기서 세는 번호와 같아야 한다. 남은 것만 다시 세면 걸러진 항목만큼 어긋난다. */}
         {t.step !== undefined && <span className="trace-no">{t.step}.</span>}
         {/* 대상 DB가 여럿인 쿼리는 쿼리 이름만으로 무엇을 조회했는지 알 수 없다.
@@ -369,21 +378,35 @@ function TraceSearch({ step: t }) {
   );
 }
 
+// 지식·처리 방법·쿼리 정의 읽기와 프로젝트 소스 도구 한 건: 서버가 만든 한 줄 설명과 결과.
+function TraceTool({ step: t }) {
+  return (
+    <div className="trace-step trace-search">
+      <div className="trace-head">
+        <code>📄 {t.summary}</code>
+        <span className="trace-count">{stepLabel(t)}</span>
+      </div>
+    </div>
+  );
+}
+
 // '⚡ 검색 N회 · 실행된 쿼리 M건' 패널. 펼침 상태를 Message가 아니라 여기 두는 이유: Message가 다시 렌더되면
 // markdown을 다시 파싱하고 차트를 다시 그린다 — 패널을 여닫는 일이 그 비용을 내서는 안 된다.
-// 검색 항목과 쿼리 항목은 서버가 준 순서 그대로다(그 번호가 모델이 본 스텝 번호다 — backend result.js).
+// 검색 항목과 쿼리 항목은 서버가 준 순서 그대로다(그 번호가 모델이 본 스텝 번호다 — backend/src/agent.rs).
 function TracePanel({ trace }) {
   // 한 번이라도 펼쳤는가 — 그 뒤로는 접어도 표를 지우지 않는다(다시 펼칠 때 재생성 비용을 내지 않게).
   const [opened, setOpened] = useState(false);
   return (
     <details className="trace" onToggle={e => { if (e.currentTarget.open) setOpened(true); }}>
       <summary>⚡ {traceSummary(trace)}</summary>
-      {trace.map((t, j) => (isSearchStep(t) ? <TraceSearch key={j} step={t} /> : <TraceStep key={j} step={t} showGrid={opened} />))}
+      {trace.map((t, j) => (isSearchStep(t) ? <TraceSearch key={j} step={t} />
+        : isToolStep(t) ? <TraceTool key={j} step={t} />
+          : <TraceStep key={j} step={t} showGrid={opened} />))}
     </details>
   );
 }
 
-// 답을 기다리는 동안의 진행 줄 — 검색·조회가 시작되면 바로 서고(서버가 흘려보내는 이벤트, backend agent.js),
+// 답을 기다리는 동안의 진행 줄 — 검색·조회가 시작되면 바로 서고(서버가 흘려보내는 이벤트, backend/src/agent.rs),
 // 끝나면 같은 줄에 결과가 붙는다. 답이 오면 이 목록은 사라지고 같은 내용이 답 아래 패널(TracePanel)에 남는다.
 // 글자는 trace.js progressText가 만든다 — 패널과 같은 말을 쓰게.
 function ProgressList({ items }) {
@@ -391,7 +414,7 @@ function ProgressList({ items }) {
     <ul className="progress" aria-live="polite">
       {items.map((it, i) => (
         <li key={i} className={it.pending ? 'pending' : undefined}>
-          <span className="progress-icon" aria-hidden="true">{it.kind === 'search' ? '🔎' : '⚡'}</span>
+          <span className="progress-icon" aria-hidden="true">{it.kind === 'search' ? '🔎' : it.kind === 'tool' ? '📄' : '⚡'}</span>
           <span className="progress-text">{progressText(it)}</span>
         </li>
       ))}
@@ -475,6 +498,9 @@ export default function App() {
   // 대화의 세대 번호. 홈으로 돌아갈 때마다 올라가고, ask는 시작 시점의 값을 들고 있다가
   // 응답을 반영하기 전에 대조한다 — 끊긴 요청의 뒤늦은 응답이 새 대화에 끼어드는 것을 막는다.
   const sessionRef = useRef(0);
+  // 서버가 이 대화의 맥락(앞 턴의 조회 결과·읽은 소스)을 들고 있게 하는 대화 번호. 홈으로 돌아가면 새로 만든다.
+  // 서버가 재시작 등으로 이 대화를 잃었으면 함께 보내는 history로 이어 간다.
+  const conversationRef = useRef(newConversationId());
   const chatRef = useRef(null);
   // 화면이 대화의 바닥에 붙어 있는가. 말풍선이 뒤늦게 커질 때 따라 내려갈지를 이것으로 정한다.
   const stuckRef = useRef(true);
@@ -946,6 +972,7 @@ export default function App() {
     // 세대를 먼저 올린다. abort가 일으키는 ask의 finally가 이 값을 보고 자기 응답을 버린다
     // (아래에서 내리는 loading·sendingRef를 그쪽이 다시 건드리지 않게 하는 것도 이 대조다).
     sessionRef.current += 1;
+    conversationRef.current = newConversationId();
     abortRef.current?.abort();
     abortRef.current = null;
     stopRequestedRef.current = false;
@@ -1039,7 +1066,7 @@ export default function App() {
     const next = `${value.slice(0, start)}\n${value.slice(end)}`;
     // 이 길은 브라우저의 입력 경로를 지나지 않으므로 입력창의 maxLength가 걸리지 않는다 — 여기서
     // 직접 지킨다. 그러지 않으면 상한을 넘긴 질문이 만들어지고, 그 사실은 다 쓰고 보낸 뒤 서버가
-    // 400으로 되돌려 줄 때에야 알게 된다(backend constants.js MAX_QUESTION_LEN).
+    // 400으로 되돌려 줄 때에야 알게 된다(backend/src/agent.rs MAX_QUESTION_LEN).
     // 넘치면 아무 일도 하지 않는다 — 상한에 닿은 입력창에 글자를 더 치는 것과 같은 모습이다.
     if (el.maxLength >= 0 && next.length > el.maxLength) return;
     setInput(next);
@@ -1097,12 +1124,12 @@ export default function App() {
       setStatus('');
       const res = await fetch('/api/chat', {
         method: 'POST',
-        // 진행 상황을 흘려 받는다(NDJSON — backend server.js openStream). Accept가 없으면 서버는 예전처럼
+        // 진행 상황을 흘려 받는다(NDJSON — backend/src/web.rs chat). Accept가 없으면 서버는 예전처럼
         // JSON 하나를 주고, 그것도 같은 함수가 읽는다 (stream.js) — 검사의 가로채기가 주는 것이 그 모양이다.
         headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
         signal: ctrl.signal,
         // 서버는 상태를 저장하지 않으므로 최근 대화를 함께 보낸다 (후속 질문 해석용)
-        body: JSON.stringify({ message, history }),
+        body: JSON.stringify({ message, history, conversation_id: conversationRef.current }),
       });
       // 진행 이벤트는 답을 기다리는 말풍선에 바로 선다. 그사이 홈으로 돌아갔으면(세대가 다르면) 버린다 —
       // 비운 화면에 지난 대화의 검색 줄이 서면 안 된다. 마지막 이벤트(답·오류·예전 JSON)가 곧 응답 본문이다.
@@ -1134,6 +1161,13 @@ export default function App() {
       // (실측: 다음 질문의 이력에 assistant "서버와 통신하지 못했습니다."가 실려 갔다).
       // error는 글자가 아니어도 '서버가 오류라고 말했다'는 뜻이므로 그 자체의 참·거짓으로 본다.
       answered = res.ok && !data?.error && !!answerText;
+      // 답변의 ```table·```chart 참조(step N)를 조회 행으로 채운다. 행은 이번 턴의 trace와, 답변이 가리킨
+      // 이전 턴 스텝의 refs에 있다(서버 세션이 대화 전체에 번호를 이어 매긴다). 채우는 파서가 화면의
+      // 렌더러와 같아야 블록 판정이 어긋나지 않아 여기서 한다. 채우다 던지면 원문을 그대로 보인다.
+      if (answered) {
+        try { answer = fillAnswer(answer, data.trace, data.refs); }
+        catch (e) { console.error('[chat] 표·차트 참조를 채우지 못했습니다:', e); }
+      }
     } catch (e) {
       // answer는 통신 오류 기본값 유지. 콘솔에는 남긴다 —
       // 네트워크 실패·타임아웃·클라이언트 예외가 화면에서는 모두 같은 문구로 보이기 때문이다.
@@ -1326,7 +1360,7 @@ export default function App() {
               submitInput();
             }}
             placeholder="질문을 입력하세요 (Alt+Enter 줄바꿈)"
-            maxLength={2000}  /* 입력 단계 안내용 사본 — 실제 제한은 서버가 검증한다 (backend constants.js MAX_QUESTION_LEN) */
+            maxLength={2000}  /* 입력 단계 안내용 사본 — 실제 제한은 서버가 검증한다 (backend/src/agent.rs MAX_QUESTION_LEN) */
             autoFocus
           />
           <button

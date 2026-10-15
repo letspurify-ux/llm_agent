@@ -6,7 +6,7 @@ import Markdown from 'react-markdown';
 import { REMARK_PLUGINS, REHYPE_PLUGINS } from '../src/math.js';
 import { PreviewPre } from '../src/preview.js';
 import { MIXED_WRAPPERS } from './mixed-content-corpus.js';
-import { resolveChartData, resolveTableData } from '../../backend/src/chart.js';
+import { resolveChartData, resolveTableData } from '../src/answer-fill.js';
 
 const render = (source, preview = false) => renderToStaticMarkup(React.createElement(Markdown, {
   remarkPlugins: REMARK_PLUGINS, rehypePlugins: REHYPE_PLUGINS, components: preview ? { pre: PreviewPre } : {},

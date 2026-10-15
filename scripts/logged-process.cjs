@@ -4,7 +4,11 @@ const path = require('node:path');
 
 const log = createLog(path.resolve(process.env.APP_LOG_FILE));
 log.write(`===== ${new Date().toISOString()} start =====\n`);
-const child = spawn(process.execPath, process.argv.slice(2), {
+// `--exec <program> [args]` runs a program directly (the Rust backend binary);
+// otherwise the arguments are a Node script and its arguments (the frontend's Vite).
+const args = process.argv.slice(2);
+const [command, commandArgs] = args[0] === '--exec' ? [args[1], args.slice(2)] : [process.execPath, args];
+const child = spawn(command, commandArgs, {
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 child.stdout.on('data', chunk => log.write(chunk));

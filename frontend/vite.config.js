@@ -22,9 +22,11 @@ const server = {
   ...(allowedHosts.length ? { allowedHosts } : {}),
   // 백엔드 포트의 사본 — backend/.env의 PORT를 바꿨다면 여기가 조용히 어긋난다.
   // 그때는 BACKEND_PORT로 맞춘다: BACKEND_PORT=4001 npm run dev
-  // 프록시는 vite 프로세스가 직접 호출하므로 목적지는 외부 접속 여부와 무관하게 localhost 그대로다
+  // 프록시는 vite 프로세스가 직접 호출하므로 목적지는 외부 접속 여부와 무관하게 이 PC다
   // (브라우저가 아니라 이 PC가 백엔드를 부른다 — 그래서 백엔드는 외부에 열 필요도, CORS도 없다).
-  proxy: { '/api': `http://localhost:${process.env.BACKEND_PORT || 3001}` },
+  // localhost가 아니라 127.0.0.1로 적는다: backend(Rust)는 IPv4로 열고, localhost를 ::1로 먼저 푸는
+  // 환경에서는 프록시가 IPv6로 붙으려다 실패한다.
+  proxy: { '/api': `http://127.0.0.1:${process.env.BACKEND_PORT || 3001}` },
 };
 
 export default defineConfig({

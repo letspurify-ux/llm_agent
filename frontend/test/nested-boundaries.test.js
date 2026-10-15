@@ -6,7 +6,7 @@ import Markdown from 'react-markdown';
 import { REMARK_PLUGINS, REHYPE_PLUGINS } from '../src/math.js';
 import { PreviewPre } from '../src/preview.js';
 import { MIXED_WRAPPERS } from './mixed-content-corpus.js';
-import { resolveChartData } from '../../backend/src/chart.js';
+import { resolveChartData } from '../src/answer-fill.js';
 import { parseChartBlock } from '../src/chart.js';
 import { inlineCodeSpans } from '../../shared/inline-code.mjs';
 

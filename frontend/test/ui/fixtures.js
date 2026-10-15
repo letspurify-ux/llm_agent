@@ -24,7 +24,7 @@ export const NODE_NAMES = Array.from({ length: MAX_PIE_SLICES + 2 }, (_, i) => �
 // 애먼 앱을 탓한다. 모두 양수이면서 내림차순이라 '기타'로 모이는 것은 늘 작은 값들이다.
 export const NODE_VALUES = NODE_NAMES.map((_, i) => (NODE_NAMES.length - i) * 8);
 
-// 조회 결과의 셀 하나가 이만큼 길 수 있다. 서버의 셀 상한(backend constants.js MAX_CELL_LEN 200자)보다
+// 조회 결과의 셀 하나가 이만큼 길 수 있다. 서버의 셀 상한(backend/src/oracle.rs MAX_CELL_LEN 200자)보다
 // 넉넉히 잡는다 — 그 상한이 늘어도 이 픽스처가 먼저 걸리게. 띄어쓰기가 없어야 한다: 줄바꿈으로 접히는
 // 글자는 상자를 밀어내지 않으므로, 접히지 않는 한 덩어리라야 '화면 밖으로 나가는가'를 실제로 잰다.
 export const LONG_CELL = '노드'.repeat(120);
@@ -252,7 +252,7 @@ export const BROKEN_RESPONSES = [
 const COLS = ['node_id', 'node_name', 'region', 'status', 'cpu_pct', 'agent_version'];
 const ROWS = Array.from({ length: 30 }, (_, i) => Object.fromEntries(COLS.map(c => [c, `${c}-값-${i + 1}-조금-길게-써서-가로로-넘치게-한다`])));
 
-// 서버(backend/src/result.js clientTrace)가 실제로 주는 네 모양을 모두 담는다. 상한에 걸린 결과와
+// 서버(backend/src/agent.rs의 done.trace)가 실제로 주는 네 모양을 모두 담는다. 상한에 걸린 결과와
 // 오류 스텝을 빼 두면, 그 문구를 만드는 자리(trace.js countLabel·App.jsx TraceStep)가 화면에서는
 // 한 번도 그려지지 않아 'undefined건'이 나가도 검사가 모두 통과한다.
 export const TRACE = [
@@ -327,19 +327,19 @@ export const READY = {
 };
 
 // ===== 진행 상황 스트림 =====
-// probe.jsx가 ?stream=1이면 이 이벤트들을 한 줄씩 흘려보낸 뒤 done을 준다 (backend agent.js가 내는 모양).
+// probe.jsx가 ?stream=1이면 이 이벤트들을 한 줄씩 흘려보낸 뒤 done을 준다 (backend/src/agent.rs가 내는 모양).
 // 검색 하나와 조회 하나 — 시작 이벤트가 줄을 세우고 끝 이벤트가 결과를 붙이는 두 길을 다 밟는다.
 export const STREAM_SEARCH = { text: '가상계측 배치 재시작', targets: ['knowledge', 'qa_method'] };
 const STREAM_HITS = { knowledge: 2, qaMethods: 1, queries: null };
 export const STREAM_EVENTS = [
   { type: 'search', ...STREAM_SEARCH },
   { type: 'search_done', ...STREAM_SEARCH, hits: STREAM_HITS },
-  // id는 실제 서버가 시작·끝 이벤트에 늘 싣는 짝 번호다 (backend agent.js runBatch) — 픽스처에서 빼면
+  // id는 실제 서버가 시작·끝 이벤트에 늘 싣는 짝 번호다 (backend/src/agent.rs execute_batch) — 픽스처에서 빼면
   // 화면 검사가 이름으로 물러서는 길만 밟고, 정작 운영에서 쓰이는 길은 한 번도 지나지 않는다.
   { type: 'run_query', id: 1, query_name: 'vm_agent_health_summary', targetDb: 'space_ops', params: {} },
   { type: 'run_query_done', id: 1, query_name: 'vm_agent_health_summary', targetDb: 'space_ops', rowCount: 3 },
 ];
-// done 줄의 trace — 검색 항목이 쿼리 항목 앞에 선다 (서버 result.js clientTrace가 주는 순서)
+// done 줄의 trace — 검색 항목이 쿼리 항목 앞에 선다 (서버 done.trace가 주는 순서)
 export const STREAM_TRACE = [{ search: STREAM_SEARCH.text, targets: STREAM_SEARCH.targets, hits: STREAM_HITS }, ...TRACE];
 // 화면에 남아야 하는 문구. 만드는 자리(trace.js)에서 그대로 받아 온다 — CAPPED_LABEL과 같은 이유.
 export const STREAM_SEARCH_LABEL = searchLabel(STREAM_TRACE[0]);

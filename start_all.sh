@@ -7,10 +7,10 @@
 #
 # 인프라는 이 머신의 설치 방식(brew·docker)을 전제한다 — 다르게 설치했으면 건너뛰고
 # 알린다. 없다고 실패시키지 않는 이유: 셋 다 없어도 기능이 남기 때문이다
-#   Oracle 없음  → ORACLE_MOCK=1이면 stub 결과로 동작
+#   Oracle 없음  → 설정의 Oracle mock을 켜면 데모 데이터로 동작
 #   Ollama 없음  → 검색이 통째로 성립하지 않는다. 서버는 뜨고 답변도 나가지만 지식·처리방법·쿼리를
 #                  하나도 찾지 못하고, 그 사실이 화면과 chat_log에 '검색 불가'로 남는다
-#                  (검색은 벡터 단일 경로다 — backend/src/search.js, setup/bge-m3/README.md).
+#                  (검색은 벡터 단일 경로다 — backend/src/search.rs, setup/bge-m3/README.md).
 #   MariaDB 없음 → 이건 진짜로 못 뜬다. 유일하게 필수라 아래에서 따로 다룬다.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -30,14 +30,18 @@ done
 
 ORACLE_CONTAINER=${ORACLE_CONTAINER:-oracle1521}
 
-# 임베딩 모델 이름은 '백엔드가 읽는 곳'에서 읽는다 — 셸 환경 > backend/.env > 기본값.
-# dotenv와 같은 우선순위이고, 값을 읽는 파서도 같은 부류를 쓴다(Node의 --env-file). 셸 환경만 보던
-# 동안, 문서가 시키는 대로(README '임베딩 모델 교체', setup/bge-m3/README.md) .env에서 모델을 바꾼
-# 설치에서 아래 검사가 옛 이름을 보고 "임베딩 모델 … 준비됨"이라 알리고 새 모델은 받지 않았다.
-# 그 상태의 증상은 '모든 검색이 검색 불가'인데(벡터 단일 경로) 이 스크립트는 성공을 보고하므로,
-# 검사가 막겠다고 적어둔 바로 그 결과가 검사를 통과한 채로 난다.
-# 값을 못 읽으면(.env 없음 — 새 클론, node 없음, Node 20.6 미만) 빈 문자열이 되어 기본값으로 간다.
-env_value() { node --env-file="$1" -e 'process.stdout.write(process.env[process.argv[1]] ?? "")' "$2" 2>/dev/null; }
+# 임베딩 모델 이름은 백엔드가 읽는 곳에서 읽는다 — 셸 환경 > backend/config.toml의 [embedding] model > 기본값.
+# 설정 화면에서 모델을 바꾼 설치에서 옛 이름을 보고 "준비됨"이라 알리면, 새 모델 없이 모든 검색이
+# '검색 불가'가 되는데 이 스크립트는 성공을 보고한다. 파일이 없으면(첫 기동 전) 옛 .env 값을 본다.
+config_value() {
+  [ -f backend/config.toml ] || return 0
+  awk -v section="[$1]" -v key="$2" '
+    /^\[/ { inside = ($0 == section) }
+    inside && $1 == key { sub(/^[^=]*=[ \t]*/, ""); gsub(/^"|"$/, ""); print; exit }
+  ' backend/config.toml
+}
+env_value() { [ -f "$1" ] && sed -n "s/^$2=//p" "$1" | tail -1 | tr -d '"'; }
+EMBEDDING_MODEL=${EMBEDDING_MODEL:-$(config_value embedding model)}
 EMBEDDING_MODEL=${EMBEDDING_MODEL:-$(env_value backend/.env EMBEDDING_MODEL)}
 EMBEDDING_MODEL=${EMBEDDING_MODEL:-bge-m3}
 # Oracle은 컨테이너 안에서 인스턴스가 열릴 때까지 시간이 걸린다(콜드 스타트 1분 내외).
@@ -59,7 +63,7 @@ if [ "$APPS_ONLY" -eq 0 ]; then
     brew services start mariadb >/dev/null 2>&1
     # 기동 직후에는 소켓이 아직 안 열려 있다. 여기서 기다리지 않고 백엔드를 띄우면 기동 시
     # 임베딩 동기화와 chat_log 정리가 접속 실패로 죽고, /api/health는 계속 ok를 돌려줘
-    # 원인이 보이지 않는다 (server.js 주석 참고).
+    # 원인이 보이지 않는다.
     for _ in $(seq 1 30); do
       mysqladmin ping --silent >/dev/null 2>&1 && break
       sleep 1
@@ -72,7 +76,7 @@ if [ "$APPS_ONLY" -eq 0 ]; then
 
   # --- Oracle (조회 DB, 선택) ---
   if ! have docker; then
-    skip "Oracle 건너뜀 (docker 없음) — ORACLE_MOCK=1이면 stub으로 동작"
+    skip "Oracle 건너뜀 (docker 없음) — 설정의 Oracle mock을 켜면 데모 데이터로 동작"
   elif ! docker inspect "$ORACLE_CONTAINER" >/dev/null 2>&1; then
     skip "Oracle 건너뜀 ('$ORACLE_CONTAINER' 컨테이너 없음) — README '조회용 Oracle 테스트 DB' 참고"
   else

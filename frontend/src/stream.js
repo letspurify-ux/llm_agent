@@ -3,7 +3,7 @@
 // 회귀 테스트가 붙는다. 줄 경계에서 조각이 어긋나면 답이 통째로 사라지는데, 그 실패는 네트워크가 조각을
 // 어떻게 나눠 주느냐에 달려 있어 화면에서는 재현되지 않는다.
 //
-// 서버는 마지막 줄로 done({answer, trace})이나 error({error})를 준다(backend server.js openStream).
+// 서버는 마지막 줄로 done({answer, trace})이나 error({error})를 준다(backend/src/web.rs chat).
 // type이 없는 객체는 예전 응답(JSON 하나)이다 — 그것도 '마지막'으로 본다. 그래서 App.jsx는 스트림이든
 // 아니든 같은 값을 받는다: 마지막 객체 하나.
 
@@ -44,7 +44,7 @@ export async function readEvents(res, onEvent) {
   // 개행은 '이번 조각 안에서만' 찾고, 줄이 끝날 때까지는 조각을 이어 붙이지 않고 모아 둔다.
   // 쌓인 문자열에 indexOf를 다시 거는 방식으로는 부족하다: 이어 붙인 문자열은 V8에서 rope로 남아 있다가
   // indexOf가 불릴 때마다 평탄화되므로, 조각마다 전체를 훑는 것과 같아진다(실측: 그 방식으로도 1MB 6ms
-  // → 4MB 54ms로 아홉 배). 마지막 done 줄에는 조회된 행이 전부 실려(서버 result.js clientTrace) 한 줄이
+  // → 4MB 54ms로 아홉 배). 마지막 done 줄에는 조회된 행이 전부 실려(서버 done.trace) 한 줄이
   // 수 MB일 수 있고, 그 줄이 오는 동안에는 개행이 없다 — 답이 도착하는 바로 그 순간 화면이 그만큼 멈춘다.
   //
   // CR은 뗀다(프록시가 CRLF로 바꾸는 일이 있다). 빈 줄과 JSON이 아닌 줄은 버린다 — 프록시의 오류 페이지

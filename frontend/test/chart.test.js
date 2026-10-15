@@ -734,14 +734,14 @@ test('chartBlocksToTables는 닫히지 않은 펜스가 아무리 많아도 비�
 // 채운 칸은 markdown 표의 인라인 문맥이라 값에 든 강조·코드·링크·취소선·HTML·엔터티 표기가 그대로
 // 해석된다 — 파이프처럼 열을 밀지는 않지만 값을 조용히 바꾼다(실측: 치수 '10*20*30'이 '102030'으로,
 // '~미사용~'이 '미사용'으로, '__init__'이 'init'으로, '&amp;'가 '&'로 나갔다).
-// 서버가 짝이 있을 때만 막아 보내고(backend/src/chart.js escapeCell) 여기 splitRow가 같은 목록을
+// 서버가 짝이 있을 때만 막아 보내고(answer-fill.js escapeCell) 여기 splitRow가 같은 목록을
 // 되돌린다 — 두 규칙이 갈라지면 화면에 백슬래시가 남거나 값이 바뀐다. 그래서 실제 렌더러까지 통과시켜
 // 잰다(math.test.js와 같은 이유): 판정과 remark-gfm이 그 판정을 어떻게 읽는지가 함께 있어야 계약이다.
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { resolveTableData, resolveChartData } from '../../backend/src/chart.js';
+import { resolveTableData, resolveChartData } from '../src/answer-fill.js';
 
 const 표의_칸 = md => [...renderToStaticMarkup(React.createElement(ReactMarkdown, { remarkPlugins: [remarkGfm] }, md))
   .matchAll(/<(td|th)\b[^>]*>(.*?)<\/\1>/g)]
@@ -751,7 +751,7 @@ const 표의_칸 = md => [...renderToStaticMarkup(React.createElement(ReactMarkd
 const 값들 = ['10*20*30', '~미사용~', '__init__', '노트: `code`', '[확인](http://x)', '&amp;',
   '<b>굵게</b>', 'BATCH_JOB_STATUS', 'C:\\logs\\a|b', '재고 부족 — *긴급*', '2026-09-07 10:23:45',
   // 서버가 막는 목록이 늘면 되돌리는 쪽(splitRow)도 함께 늘어야 한다 — 한쪽만 고치면 차트 라벨에
-  // 백슬래시가 남는다. '$'·']'가 그렇게 늘어난 자리다 (backend/src/chart.js escapeCell).
+  // 백슬래시가 남는다. '$'·']'가 그렇게 늘어난 자리다 (answer-fill.js escapeCell).
   '$x$', '$$100$$', '[ERROR]', '상태[1]'];
 
 test('서버가 채운 표의 칸은 화면에서 조회 결과 원문 그대로 읽힌다', () => {

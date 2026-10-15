@@ -4,7 +4,7 @@
 # 순서가 역순이어야 하는 이유: 백엔드가 관리 DB 커넥션을 쥔 채로 MariaDB를 내리면 문장
 # 도중에 소켓이 끊겨 MariaDB 에러 로그에 'Aborted connection … Got an error reading
 # communication packets'가 쌓인다. 백엔드의 SIGTERM 경로가 풀을 정리하고 나갈 시간을 준다
-# (backend/src/server.js shutdown).
+# (the backend's graceful shutdown).
 #
 # 앱은 각 디렉터리의 stop.sh를 부른다 — PID 파일과 '우리 프로세스인가' 판정이 그쪽에 있고,
 # 여기서 다시 kill을 짜면 그 판정이 두 벌이 되어 한쪽만 고쳐질 때 엉뚱한 프로세스를 죽인다.

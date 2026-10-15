@@ -120,3 +120,35 @@
 .admin-bind-row .admin-bind-warning, .admin-bind-recovery { color: #a62537; }
 .admin-bind-recovery { font-size: 12px; line-height: 1.6; }
 @media (max-width: 480px) { .admin-bind-options { grid-template-columns: minmax(0, 1fr); } }
+
+/* 프로젝트 폴더·Instant Client 폴더 입력 옆의 '폴더 선택' 단추 */
+.admin-input-action { display: flex; gap: 8px; align-items: stretch; }
+.admin-input-action input { flex: 1; }
+/* 폴더 선택 창 */
+.admin-modal-backdrop { position: fixed; inset: 0; z-index: 50; background: #1a223366; display: grid; place-items: center; padding: 20px; }
+.admin-modal { width: min(620px, 100%); max-height: min(640px, 90vh); display: flex; flex-direction: column; gap: 12px; background: var(--surface); border-radius: 12px; padding: 20px 22px; box-shadow: 0 12px 40px #1a223333; outline: none; }
+.admin-modal h3 { margin: 0; font-size: 17px; }
+.admin-picker-path { display: flex; gap: 8px; }
+.admin-picker-path input { flex: 1; min-width: 0; border: 1px solid #dce1eb; border-radius: 7px; padding: 9px 11px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+.admin-picker-list { flex: 1; min-height: 160px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; display: flex; flex-direction: column; }
+.admin-picker-list button { text-align: left; border: 0; border-bottom: 1px solid #edf0f6; background: white; padding: 9px 12px; font-size: 13px; color: var(--text); }
+.admin-picker-list button:hover { background: #f9f8ff; }
+.admin-picker-list p { margin: 0; padding: 14px; color: var(--muted); font-size: 13px; }
+/* 설정 탭 */
+.admin-settings { display: grid; gap: 18px; margin-top: 18px; }
+.admin-settings-group { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 18px 22px 20px; margin: 0; min-width: 0; }
+.admin-settings-group legend { font-size: 15px; font-weight: 700; padding: 0 6px; }
+.admin-settings-help, .admin-settings-status { margin: 4px 0 14px; font-size: 12px; color: var(--muted); line-height: 1.6; }
+.admin-settings-status { color: var(--text); background: #f7f8fd; border-radius: 7px; padding: 8px 11px; }
+.admin-settings-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px 18px; }
+.admin-settings-grid .admin-field small, .admin-secret small { display: block; margin-top: 6px; font-size: 11px; color: var(--muted); line-height: 1.5; }
+.admin-field-check > label { font-weight: 600; gap: 8px; }
+.admin-secret { margin-top: 16px; padding-top: 14px; border-top: 1px dashed var(--border); display: grid; gap: 8px; font-size: 13px; }
+.admin-secret input { border: 1px solid #dce1eb; border-radius: 7px; padding: 9px 11px; font-size: 13px; min-width: 0; }
+.admin-badge { font-size: 11px; border-radius: 20px; padding: 2px 9px; margin-left: 6px; background: #f3f4f7; color: var(--muted); border: 1px solid var(--border); }
+.admin-badge.on { background: #edf9f2; color: #246044; border-color: #c7e6d4; }
+.admin-settings-check { margin-top: 16px; display: flex; align-items: center; gap: 12px; font-size: 12px; }
+.admin-check-ok { color: #246044; }
+.admin-check-fail { color: #a62537; overflow-wrap: anywhere; }
+.admin-settings > .admin-form-actions { position: sticky; bottom: 0; background: var(--bg); padding: 12px 0; display: flex; justify-content: space-between; align-items: center; }
+.admin-settings > .admin-form-actions > div { display: flex; gap: 8px; }

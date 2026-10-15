@@ -1,0 +1,976 @@
+//! Tools over the registered knowledge, Q&A methods and queries. They follow
+//! the MnemoArc tool rules: search returns ranked summaries and IDs, reading
+//! tools return the text, the model chooses limit, offset and cursor within
+//! runtime caps, and every result is bounded by the result budget.
+
+use crate::{
+    app::App,
+    config::Config,
+    db::{self, Row, marks, n},
+    execution::input_bind_names,
+    search,
+    session::StoredResult,
+    text::{TRUNC_MARK, clip_marked, clip_utf16, js_trim, name_key, target_db_names, utf16_len},
+    tools::{ToolSpec, number, schema, string},
+};
+use anyhow::{Result, bail};
+use serde_json::{Map, Value, json};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::Arc,
+};
+use tokio_util::sync::CancellationToken;
+
+/// Search results per target: default and cap.
+pub const SEARCH_DEFAULT: usize = 10;
+pub const SEARCH_MAX: usize = 50;
+/// Knowledge chunks per read: default and cap (a chunk is up to 1,000
+/// characters).
+pub const CHUNKS_DEFAULT: usize = 6;
+pub const CHUNKS_MAX: usize = 30;
+/// Items per method_read / query_describe call.
+pub const ITEMS_MAX: usize = 10;
+/// Query rows shown with a run: default and cap.
+pub const PREVIEW_DEFAULT: usize = 20;
+pub const PREVIEW_MAX: usize = 100;
+/// Rows per result_read page: default and cap.
+pub const READ_DEFAULT: usize = 50;
+pub const READ_MAX: usize = 200;
+
+pub fn specs() -> Vec<ToolSpec> {
+    vec![
+        ToolSpec {
+            name: "search",
+            description: "Semantic search over the registered knowledge (concepts, policies, procedures, manuals), Q&A methods (lookup procedures for kinds of questions) and registered queries. Returns ranked summaries with IDs and cosine distance (smaller is closer), not full text: read knowledge with knowledge_read, methods with method_read, and queries with query_describe. targets chooses what to search (default all three). limit is per target (default 10, max 50); offset continues the same search past results already received. An exact registered query name returns that query first. status search_unavailable means the search could not run (not that nothing exists).",
+            source: false,
+            parameters: schema(
+                json!({
+                    "query":{"type":"string","description":"2 to 6 key words, or an exact query name"},
+                    "targets":{"type":"array","items":{"type":"string","enum":["knowledge","qa_method","query"]}},
+                    "limit":{"type":"integer","minimum":1,"maximum":SEARCH_MAX},
+                    "offset":number()
+                }),
+                &["query"],
+            ),
+        },
+        ToolSpec {
+            name: "knowledge_read",
+            description: "Read a knowledge document by its ID from search (k<number>). Documents are stored in chunks of up to 1,000 characters; start_chunk (default: the best-matching chunk of the last search, else 1) and max_chunks (default 6, max 30) choose the range. Continue with next_cursor to read further; chunk_of tells how many chunks the document has.",
+            source: false,
+            parameters: schema(
+                json!({"id":string(),"start_chunk":{"type":"integer","minimum":1},"max_chunks":{"type":"integer","minimum":1,"maximum":CHUNKS_MAX},"cursor":string()}),
+                &[],
+            ),
+        },
+        ToolSpec {
+            name: "method_read",
+            description: "Read Q&A methods in full by their IDs from search (m<number>), up to 10 per call. Each result lists the registered queries the method names, with their description and inputs.",
+            source: false,
+            parameters: schema(
+                json!({"ids":{"type":"array","minItems":1,"maxItems":ITEMS_MAX,"items":{"type":"string"}}}),
+                &["ids"],
+            ),
+        },
+        ToolSpec {
+            name: "query_describe",
+            description: "Show registered queries in full by exact name, up to 10 per call: type (QUERY, PROCEDURE, FUNCTION), description, input binds with their input description, output description, target DB candidates and the SQL.",
+            source: false,
+            parameters: schema(
+                json!({"names":{"type":"array","minItems":1,"maxItems":ITEMS_MAX,"items":{"type":"string"}}}),
+                &["names"],
+            ),
+        },
+        ToolSpec {
+            name: "query_run",
+            description: "Run one registered query against its target DB and receive a step number, its columns, the row count and the first rows (preview_rows, default 20, max 100). Fill every input bind in params (keys without a colon); values must come from the question or earlier results. target_db is required when the query has more than one candidate. Independent queries can be run together as several calls in one response. Read omitted rows or columns with result_read, never by running the query again; answers refer to the rows with ```table or ```chart blocks naming the step.",
+            source: false,
+            parameters: schema(
+                json!({
+                    "query_name":string(),
+                    "params":{"type":"object","additionalProperties":{"type":["string","number"]}},
+                    "target_db":string(),
+                    "preview_rows":{"type":"integer","minimum":1,"maximum":PREVIEW_MAX}
+                }),
+                &["query_name"],
+            ),
+        },
+        ToolSpec {
+            name: "result_read",
+            description: "Read stored rows of an earlier query_run by its step without querying the DB again: offset (0-based row, default 0), limit (default 50, max 200) and cols (exact column names; default all). Cells cut at 200 characters stay cut.",
+            source: false,
+            parameters: schema(
+                json!({"step":{"type":"integer","minimum":1},"offset":number(),"limit":{"type":"integer","minimum":1,"maximum":READ_MAX},"cols":{"type":"array","items":{"type":"string"}}}),
+                &["step"],
+            ),
+        },
+    ]
+}
+
+
+/// Values the model was shown cut short: a bind value equal to one of them
+/// is a clipped copy, not the stored value.
+#[derive(Default, Clone)]
+pub struct Clipped(BTreeSet<String>);
+impl Clipped {
+    /// Cell lengths values are cut at: driver cells, answer table and chart
+    /// cells (and one less when a surrogate pair was not split).
+    const LENGTHS: [usize; 6] = [200, 199, 120, 119, 60, 59];
+
+    pub fn from_results(results: &BTreeMap<u64, StoredResult>) -> Self {
+        let mut set = BTreeSet::new();
+        for result in results.values() {
+            for row in result.rows.iter() {
+                for value in row.values() {
+                    if let Some(text) = value.as_str()
+                        && let Some(prefix) = text.strip_suffix(TRUNC_MARK)
+                    {
+                        set.insert(prefix.to_owned());
+                    }
+                }
+            }
+        }
+        Self(set)
+    }
+    /// Adds what conversation texts (answers, restored turns) show cut.
+    pub fn learn_text(&mut self, text: &str) {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let mark: Vec<u16> = TRUNC_MARK.encode_utf16().collect();
+        let mut at = 0;
+        while at + mark.len() <= units.len() {
+            if units[at..at + mark.len()] != mark[..] {
+                at += 1;
+                continue;
+            }
+            for len in Self::LENGTHS {
+                if at >= len {
+                    self.0.insert(String::from_utf16_lossy(&units[at - len..at]));
+                }
+            }
+            // The table cell the mark ends: from the previous unescaped '|'.
+            let mut start = at;
+            while start > 0 && !(units[start - 1] == b'|' as u16 && (start < 2 || units[start - 2] != b'\\' as u16)) {
+                if units[start - 1] == b'\n' as u16 {
+                    break;
+                }
+                start -= 1;
+            }
+            let shown = String::from_utf16_lossy(&units[start..at]);
+            let shown = shown.strip_prefix(' ').unwrap_or(&shown).to_owned();
+            let raw = unescape_cell(&shown);
+            if Self::LENGTHS.contains(&utf16_len(&raw)) {
+                self.0.insert(raw);
+                self.0.insert(shown);
+            }
+            at += mark.len();
+        }
+    }
+    pub fn contains(&self, value: &str) -> bool {
+        self.0.contains(value)
+    }
+}
+
+/// A Markdown table cell as the value it shows (backslash escapes removed).
+fn unescape_cell(cell: &str) -> String {
+    let mut out = String::new();
+    let mut chars = cell.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(next) = chars.peek()
+            && next.is_ascii_punctuation()
+        {
+            out.push(*next);
+            chars.next();
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// What one tool run changes in the conversation once the batch is done.
+pub enum Effect {
+    None,
+    /// Best matching chunk per document, for knowledge_read defaults.
+    Hints(Vec<(i64, i64)>),
+    /// Rows to store under a new step; `signature` identifies the call.
+    Stored { result: StoredResult, signature: String },
+    /// A failed run; it still takes a step number in the trace.
+    Failed { signature: String },
+    /// A loop-guard refusal (the same run again): told to the model only.
+    /// It is not a query failure, so it takes no step and stays out of the
+    /// chat_log `steps[].error` count of failed questions.
+    Refused,
+}
+
+/// The outcome of one knowledge/method/query tool call.
+pub struct Run {
+    pub result: Result<Value>,
+    pub effect: Effect,
+    /// search: hits per target (null when the search could not run) and
+    /// the targets that could not run.
+    pub hits: Option<(Value, Vec<String>)>,
+    /// query_run: the public message of a failure (safe for the screen).
+    pub public_error: Option<String>,
+}
+impl Run {
+    fn plain(result: Result<Value>) -> Self {
+        Self {
+            result,
+            effect: Effect::None,
+            hits: None,
+            public_error: None,
+        }
+    }
+}
+
+/// Read access to the conversation for a batch of calls.
+pub struct Context<'a> {
+    pub app: &'a Arc<App>,
+    pub config: &'a Config,
+    pub cancel: &'a CancellationToken,
+    pub results: &'a BTreeMap<u64, StoredResult>,
+    pub executed: &'a HashMap<String, u64>,
+    pub hints: &'a HashMap<i64, i64>,
+    pub clipped: &'a Clipped,
+    pub result_tokens: usize,
+}
+
+pub async fn run(cx: &Context<'_>, name: &str, args: &Value) -> Run {
+    match name {
+        "search" => search_tool(cx, args).await,
+        "knowledge_read" => Run::plain(knowledge_read(cx, args).await),
+        "method_read" => Run::plain(method_read(cx, args).await),
+        "query_describe" => Run::plain(query_describe(cx, args).await),
+        "query_run" => query_run(cx, args).await,
+        "result_read" => Run::plain(result_read(cx, args)),
+        _ => Run::plain(Err(anyhow::anyhow!("unsupported_tool: {name}"))),
+    }
+}
+
+fn limit_arg(args: &Value, key: &str, default: usize, max: usize) -> usize {
+    args[key].as_u64().map_or(default, |n| (n as usize).clamp(1, max))
+}
+
+fn excerpt(text: &str, max: usize) -> String {
+    clip_marked(js_trim(&crate::text::single_line(text)), max)
+}
+
+/// A registered query as search and method results list it.
+fn query_summary(row: &Row) -> Value {
+    let mut item = json!({
+        "name":db::text(row, "query_name"),
+        "type":db::text(row, "query_type"),
+        "description":excerpt(&db::text(row, "query_desc"), 300),
+        "inputs":input_bind_names(&db::text(row, "query_type"), &db::text(row, "query_sql"), &db::text(row, "bind_config")),
+        "target_dbs":target_db_names(&db::text(row, "target_db_name")),
+    });
+    let input_desc = db::text(row, "input_desc");
+    if !input_desc.trim().is_empty() {
+        item["input_desc"] = json!(excerpt(&input_desc, 300));
+    }
+    item
+}
+
+async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
+    let text = js_trim(args["query"].as_str().unwrap_or("")).to_owned();
+    if text.is_empty() {
+        return Run::plain(Err(anyhow::anyhow!("missing_argument: query must name what to find")));
+    }
+    let text = clip_utf16(&text, 500).to_owned();
+    let mut targets: Vec<String> = args["targets"]
+        .as_array()
+        .map(|t| t.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default();
+    targets.retain(|t| matches!(t.as_str(), "knowledge" | "qa_method" | "query"));
+    if targets.is_empty() {
+        targets = vec!["knowledge".into(), "qa_method".into(), "query".into()];
+    }
+    let limit = limit_arg(args, "limit", SEARCH_DEFAULT, SEARCH_MAX);
+    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+    let config = cx.config;
+    let vector = if config.embedding.enabled() {
+        match cx.app.embeddings.embed(&config.embedding, &text, cx.cancel).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                eprintln!("[search] embedding failed — vector search unavailable: {e}");
+                Err(format!("임베딩 서버 응답 없음: {}", clip_utf16(&e.message, 200)))
+            }
+        }
+    } else {
+        Err("임베딩 주소가 설정되지 않아 의미 검색을 쓸 수 없음".into())
+    };
+    let mut results = Map::new();
+    let mut hits = json!({});
+    let mut failed = vec![];
+    let mut hints = vec![];
+    let page_info = |more: bool, beyond: usize| {
+        json!({"next_offset":more.then_some(offset + limit),"beyond_threshold":beyond})
+    };
+    for target in &targets {
+        let outcome: std::result::Result<Value, String> = match target.as_str() {
+            "knowledge" => match &vector {
+                Err(reason) => Err(reason.clone()),
+                Ok(v) => match search::knowledge(&cx.app.db, config, v, offset, limit).await {
+                    Err(e) => Err(format!("벡터 검색 실패: {}", clip_utf16(&e.to_string(), 200))),
+                    Ok(page) => {
+                        let items: Vec<Value> = page
+                            .items
+                            .iter()
+                            .map(|d| {
+                                hints.push((d.doc_seq, d.best_chunk));
+                                json!({
+                                    "id":format!("k{}", d.doc_seq),"title":d.title,"chunk_of":d.chunk_of,
+                                    "matched_chunks":chunk_list(&d.chunks),"best_chunk":d.best_chunk,
+                                    "distance":round(d.distance),"excerpt":excerpt(&d.excerpt, 300)
+                                })
+                            })
+                            .collect();
+                        let mut out = page_info(page.more, page.beyond_threshold);
+                        out["items"] = json!(items);
+                        Ok(out)
+                    }
+                },
+            },
+            "qa_method" => match &vector {
+                Err(reason) => Err(reason.clone()),
+                Ok(v) => match search::rows(&cx.app.db, config, "qa_method", v, offset, limit).await {
+                    Err(e) => Err(format!("벡터 검색 실패: {}", clip_utf16(&e.to_string(), 200))),
+                    Ok(page) => {
+                        let items: Vec<Value> = page
+                            .items
+                            .iter()
+                            .map(|r| {
+                                json!({
+                                    "id":format!("m{}", db::int(r, "seq")),"title":db::text(r, "title"),
+                                    "distance":round(db::float(r, "_dist")),"excerpt":excerpt(&db::text(r, "method"), 300)
+                                })
+                            })
+                            .collect();
+                        let mut out = page_info(page.more, page.beyond_threshold);
+                        out["items"] = json!(items);
+                        Ok(out)
+                    }
+                },
+            },
+            _ => {
+                let mut items: Vec<Value> = vec![];
+                let mut names = BTreeSet::new();
+                let mut exact_failed = false;
+                if offset == 0 && utf16_len(&text) <= 200 {
+                    match db::queries_by_names(&cx.app.db, &config.mariadb, std::slice::from_ref(&text)).await {
+                        Ok(rows) => {
+                            for row in rows {
+                                names.insert(name_key(&db::text(&row, "query_name")));
+                                let mut item = query_summary(&row);
+                                item["exact"] = json!(true);
+                                items.push(item);
+                            }
+                        }
+                        Err(e) => {
+                            exact_failed = true;
+                            eprintln!("[search] exact query lookup failed: {e}");
+                        }
+                    }
+                }
+                match &vector {
+                    Err(reason) if items.is_empty() => Err(reason.clone()),
+                    Err(reason) => {
+                        let mut out = json!({"items":items});
+                        out["note"] = json!(format!("이름이 정확히 맞는 쿼리만 찾았다 ({reason})"));
+                        Ok(out)
+                    }
+                    Ok(v) => match search::rows(&cx.app.db, config, "query_registry", v, offset, limit).await {
+                        Err(e) if items.is_empty() || exact_failed => {
+                            Err(format!("벡터 검색 실패: {}", clip_utf16(&e.to_string(), 200)))
+                        }
+                        Err(_) => Ok(json!({"items":items})),
+                        Ok(page) => {
+                            for r in &page.items {
+                                if names.insert(name_key(&db::text(r, "query_name"))) {
+                                    let mut item = query_summary(r);
+                                    item["distance"] = json!(round(db::float(r, "_dist")));
+                                    items.push(item);
+                                }
+                            }
+                            let mut out = page_info(page.more, page.beyond_threshold);
+                            out["items"] = json!(items);
+                            Ok(out)
+                        }
+                    },
+                }
+            }
+        };
+        let hit_key = match target.as_str() {
+            "knowledge" => "knowledge",
+            "qa_method" => "qaMethods",
+            _ => "queries",
+        };
+        match outcome {
+            Ok(mut value) => {
+                let count = value["items"].as_array().map_or(0, Vec::len);
+                hits[hit_key] = json!(count);
+                value["status"] = json!("ok");
+                if count == 0 {
+                    value["note"] = json!("관련 항목이 없다. 검색어를 바꿔 볼 수 있다.");
+                }
+                results.insert(target.clone(), value);
+            }
+            Err(reason) => {
+                hits[hit_key] = Value::Null;
+                failed.push(target.clone());
+                results.insert(target.clone(), json!({"status":"search_unavailable","reason":reason}));
+            }
+        }
+    }
+    let mut data = json!({"text":text,"limit":limit,"offset":offset,"results":results});
+    fit_search(&mut data, cx.result_tokens, &config.llm.model);
+    Run {
+        result: Ok(data),
+        effect: Effect::Hints(hints),
+        hits: Some((hits, failed)),
+        public_error: None,
+    }
+}
+
+/// Fits a search result to the result budget: shorter excerpts first, then
+/// fewer items (the continuation offset follows what was kept), so the list
+/// reaches the model instead of an archive pointer.
+fn fit_search(data: &mut Value, budget: usize, model: &str) {
+    let fits = |d: &Value| crate::context::tokens(&d.to_string(), model) + 80 <= budget;
+    if fits(data) {
+        return;
+    }
+    let offset = data["offset"].as_u64().unwrap_or(0);
+    for max in [150usize, 60, 0] {
+        if let Some(targets) = data["results"].as_object_mut() {
+            for target in targets.values_mut() {
+                for item in target["items"].as_array_mut().into_iter().flatten() {
+                    let shortened = item["excerpt"].as_str().map(|e| {
+                        let e = e.strip_suffix(TRUNC_MARK).unwrap_or(e);
+                        clip_marked(e, max)
+                    });
+                    match shortened {
+                        Some(_) if max == 0 => {
+                            if let Some(fields) = item.as_object_mut() {
+                                fields.remove("excerpt");
+                            }
+                        }
+                        Some(e) => item["excerpt"] = json!(e),
+                        None => {}
+                    }
+                }
+            }
+        }
+        data["excerpts_shortened"] = json!(true);
+        if fits(data) {
+            return;
+        }
+    }
+    loop {
+        let Some(targets) = data["results"].as_object_mut() else {
+            return;
+        };
+        let longest = targets
+            .iter()
+            .filter_map(|(k, v)| v["items"].as_array().map(|items| (k.clone(), items.len())))
+            .filter(|(_, n)| *n > 1)
+            .max_by_key(|(_, n)| *n);
+        let Some((key, _)) = longest else {
+            return;
+        };
+        let target = &mut targets[&key];
+        let items = target["items"].as_array_mut().unwrap();
+        items.pop();
+        let kept = items.len() as u64;
+        target["next_offset"] = json!(offset + kept);
+        target["items_cut_for_size"] = json!(true);
+        if fits(data) {
+            return;
+        }
+    }
+}
+
+fn round(d: f64) -> f64 {
+    (d * 1000.0).round() / 1000.0
+}
+
+/// "3-5, 9" from sorted chunk numbers.
+fn chunk_list(chunks: &[i64]) -> String {
+    let mut parts: Vec<String> = vec![];
+    let mut i = 0;
+    while i < chunks.len() {
+        let start = chunks[i];
+        let mut end = start;
+        while i + 1 < chunks.len() && chunks[i + 1] == end + 1 {
+            i += 1;
+            end = chunks[i];
+        }
+        parts.push(if start == end { start.to_string() } else { format!("{start}-{end}") });
+        i += 1;
+    }
+    parts.join(", ")
+}
+
+fn item_number(id: &str, prefix: char) -> Option<i64> {
+    let id = js_trim(id);
+    let digits = id.strip_prefix(prefix).or_else(|| id.strip_prefix(prefix.to_ascii_uppercase())).unwrap_or(id);
+    digits.parse::<i64>().ok().filter(|n| *n > 0)
+}
+
+async fn knowledge_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
+    let (doc, cursor_start) = match args["cursor"].as_str() {
+        Some(cursor) => {
+            let (id, start) = cursor
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("invalid_cursor: copy next_cursor exactly"))?;
+            (
+                item_number(id, 'k').ok_or_else(|| anyhow::anyhow!("invalid_cursor: copy next_cursor exactly"))?,
+                start.parse::<i64>().ok(),
+            )
+        }
+        None => {
+            let id = args["id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing_argument: id (k<number> from search) or cursor"))?;
+            (
+                item_number(id, 'k').ok_or_else(|| {
+                    anyhow::anyhow!("unknown_item: {id:?} is not a knowledge ID; copy an id such as k12 from search results")
+                })?,
+                None,
+            )
+        }
+    };
+    let max_chunks = limit_arg(args, "max_chunks", CHUNKS_DEFAULT, CHUNKS_MAX) as i64;
+    let start = args["start_chunk"]
+        .as_i64()
+        .or(cursor_start)
+        .or_else(|| cx.hints.get(&doc).map(|best| (best - 1).max(1)))
+        .unwrap_or(1)
+        .max(1);
+    let cfg = &cx.config.mariadb;
+    let rows = cx
+        .app
+        .db
+        .query(
+            cfg,
+            "SELECT chunk_no, chunk_of, title, content FROM knowledge_chunk WHERE doc_seq = ? AND chunk_no BETWEEN ? AND ? ORDER BY chunk_no",
+            vec![n(doc), n(start), n(start + max_chunks - 1)],
+        )
+        .await?;
+    let model = cx.config.llm.model.as_str();
+    let budget = cx.result_tokens.saturating_sub(400).max(200);
+    if rows.is_empty() {
+        // Not chunked yet (the sync runs every minute): read the document.
+        let doc_rows = cx
+            .app
+            .db
+            .query(cfg, "SELECT title, content FROM knowledge WHERE seq = ?", vec![n(doc)])
+            .await?;
+        let Some(row) = doc_rows.first() else {
+            bail!("unknown_item: knowledge k{doc} does not exist; search again for current IDs");
+        };
+        let chunk_count: i64 = cx
+            .app
+            .db
+            .query(cfg, "SELECT COUNT(*) AS n FROM knowledge_chunk WHERE doc_seq = ?", vec![n(doc)])
+            .await?
+            .first()
+            .map_or(0, |r| db::int(r, "n"));
+        if chunk_count > 0 {
+            bail!("invalid_argument_value: start_chunk {start} is past the end of k{doc} ({chunk_count} chunks)");
+        }
+        let parts = crate::chunk::split_content(&db::text(row, "content"));
+        let total = parts.len() as i64;
+        if start > total {
+            bail!("invalid_argument_value: start_chunk {start} is past the end of k{doc} ({total} chunks)");
+        }
+        let chunks: Vec<(i64, String)> = parts
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| (i as i64 + 1, c))
+            .filter(|(no, _)| *no >= start && *no < start + max_chunks)
+            .collect();
+        return Ok(fit_chunks(doc, &db::text(row, "title"), total, chunks, budget, model));
+    }
+    let total = db::int(&rows[0], "chunk_of");
+    let title = db::text(&rows[0], "title");
+    let chunks: Vec<(i64, String)> = rows
+        .iter()
+        .map(|r| (db::int(r, "chunk_no"), db::text(r, "content")))
+        .collect();
+    Ok(fit_chunks(doc, &title, total, chunks, budget, model))
+}
+
+/// As many whole chunks as fit the result budget (at least one).
+fn fit_chunks(doc: i64, title: &str, total: i64, chunks: Vec<(i64, String)>, budget: usize, model: &str) -> Value {
+    let mut taken = 0;
+    let mut text = String::new();
+    for i in 0..chunks.len() {
+        let candidate = crate::chunk::join_chunks(chunks[..=i].iter().map(|(no, c)| (*no, c.as_str())));
+        if i > 0 && crate::context::tokens(&candidate, model) > budget {
+            break;
+        }
+        text = candidate;
+        taken = i + 1;
+    }
+    if taken == 1 && crate::context::tokens(&text, model) > budget {
+        text = crate::context::truncate(&text, budget, model).0 + TRUNC_MARK;
+    }
+    let first = chunks.first().map_or(1, |c| c.0);
+    let last = chunks.get(taken.saturating_sub(1)).map_or(first, |c| c.0);
+    let mut out = json!({
+        "id":format!("k{doc}"),"title":title,"chunk_of":total,
+        "chunks":if first == last { first.to_string() } else { format!("{first}-{last}") },
+        "text":text
+    });
+    if last < total {
+        out["next_cursor"] = json!(format!("k{doc}:{}", last + 1));
+    } else {
+        out["complete_to_end"] = json!(true);
+    }
+    out
+}
+
+async fn method_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
+    let ids: Vec<String> = args["ids"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default();
+    let seqs: Vec<i64> = ids.iter().filter_map(|id| item_number(id, 'm')).collect();
+    let missing: Vec<&String> = ids.iter().filter(|id| item_number(id, 'm').is_none()).collect();
+    if seqs.is_empty() {
+        bail!("unknown_item: ids must be Q&A method IDs such as m3 from search results");
+    }
+    let cfg = &cx.config.mariadb;
+    let rows = cx
+        .app
+        .db
+        .query(
+            cfg,
+            &format!("SELECT seq, title, method FROM qa_method WHERE seq IN ({})", marks(seqs.len())),
+            seqs.iter().map(|s| n(*s)).collect(),
+        )
+        .await?;
+    let mut items = vec![];
+    let mut found = BTreeSet::new();
+    for seq in &seqs {
+        let Some(row) = rows.iter().find(|r| db::int(r, "seq") == *seq) else {
+            continue;
+        };
+        found.insert(*seq);
+        let method = db::text(row, "method");
+        let queries = db::queries_mentioned_in(&cx.app.db, cfg, &method, 20).await?;
+        items.push(json!({
+            "id":format!("m{seq}"),"title":db::text(row, "title"),
+            "method":clip_marked(&method, 4000),
+            "queries":queries.iter().map(query_summary).collect::<Vec<_>>()
+        }));
+    }
+    let mut out = json!({"items":items});
+    let unknown: Vec<String> = seqs
+        .iter()
+        .filter(|s| !found.contains(*s))
+        .map(|s| format!("m{s}"))
+        .chain(missing.into_iter().cloned())
+        .collect();
+    if !unknown.is_empty() {
+        out["not_found"] = json!(unknown);
+    }
+    Ok(out)
+}
+
+async fn query_describe(cx: &Context<'_>, args: &Value) -> Result<Value> {
+    let names: Vec<String> = args["names"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default();
+    let rows = db::queries_by_names(&cx.app.db, &cx.config.mariadb, &names).await?;
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let mut item = query_summary(row);
+            item["description"] = json!(clip_marked(&db::text(row, "query_desc"), 2000));
+            item["input_desc"] = json!(clip_marked(&db::text(row, "input_desc"), 1000));
+            item["output_desc"] = json!(clip_marked(&db::text(row, "output_desc"), 2000));
+            item["sql"] = json!(clip_marked(&db::text(row, "query_sql"), 2000));
+            let bind_config = db::text(row, "bind_config");
+            if !bind_config.trim().is_empty() {
+                item["bind_config"] = json!(clip_marked(&bind_config, 1000));
+            }
+            item
+        })
+        .collect();
+    let found: BTreeSet<String> = rows.iter().map(|r| name_key(&db::text(r, "query_name"))).collect();
+    let mut out = json!({"items":items});
+    let missing: Vec<&String> = names.iter().filter(|n| !found.contains(&name_key(n))).collect();
+    if !missing.is_empty() {
+        out["not_found"] = json!(missing);
+        out["guidance"] = json!("등록되지 않은 이름이다. search(targets:[\"query\"])로 등록된 쿼리를 찾아라.");
+    }
+    Ok(out)
+}
+
+/// The params as executed: keys without a leading colon, at most 20.
+pub fn clean_params(args: &Value) -> Map<String, Value> {
+    args["params"]
+        .as_object()
+        .map(|params| {
+            params
+                .iter()
+                .map(|(k, v)| (k.trim().trim_start_matches(':').to_owned(), v.clone()))
+                .filter(|(k, _)| !k.is_empty() && k.chars().count() <= crate::sql::MAX_BIND_NAME_LEN)
+                .take(20)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Identity of a run for refusing an identical repeat.
+pub fn run_signature(query_name: &str, target: Option<&str>, params: &Map<String, Value>) -> String {
+    let sorted: BTreeMap<String, &Value> = params.iter().map(|(k, v)| (name_key(k), v)).collect();
+    json!([name_key(query_name), target.map(name_key), sorted]).to_string()
+}
+
+async fn query_run(cx: &Context<'_>, args: &Value) -> Run {
+    let name = js_trim(args["query_name"].as_str().unwrap_or("")).to_owned();
+    let params = clean_params(args);
+    let chosen = args["target_db"].as_str().map(js_trim).filter(|s| !s.is_empty()).map(str::to_owned);
+    let fail = |result: anyhow::Error, public: String, signature: Option<String>| Run {
+        result: Err(result),
+        effect: signature.map_or(Effect::None, |signature| Effect::Failed { signature }),
+        hits: None,
+        public_error: Some(public),
+    };
+    let rows = match db::queries_by_names(&cx.app.db, &cx.config.mariadb, std::slice::from_ref(&name)).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("[query_run] registry lookup failed: {e}");
+            return fail(
+                anyhow::anyhow!("database_unavailable: 관리 DB에서 쿼리를 읽지 못했다"),
+                "쿼리 정보를 읽지 못했습니다.".into(),
+                None,
+            );
+        }
+    };
+    let Some(row) = rows.into_iter().next() else {
+        return fail(
+            anyhow::anyhow!("query_not_found: 등록되지 않은 쿼리다: {}. search(targets:[\"query\"])로 등록된 이름을 찾아라", clip_utf16(&name, 100)),
+            format!("등록되지 않은 쿼리입니다: {}", clip_utf16(&name, 100)),
+            None,
+        );
+    };
+    let canonical = db::text(&row, "query_name");
+    let resolved = crate::oracle::resolve_target_db(&row, chosen.as_deref()).ok();
+    let signature = run_signature(&canonical, resolved.as_deref().or(chosen.as_deref()), &params);
+    if let Some(step) = cx.executed.get(&signature) {
+        return Run {
+            result: Err(anyhow::anyhow!(
+                "repeated_call: 같은 쿼리를 같은 값과 대상으로 이미 실행했다 (step {step}). 그 결과를 result_read로 읽어라"
+            )),
+            effect: Effect::Refused,
+            hits: None,
+            public_error: Some("같은 조회를 이미 실행했습니다.".into()),
+        };
+    }
+    let clipped = cx.clipped;
+    let is_clipped = move |v: &str| clipped.contains(v);
+    let outcome = cx
+        .app
+        .oracle
+        .run(&cx.app.db, cx.config, &row, &params, chosen.as_deref(), &is_clipped, cx.cancel)
+        .await;
+    let preview = limit_arg(args, "preview_rows", PREVIEW_DEFAULT, PREVIEW_MAX);
+    match outcome {
+        Ok(outcome) => {
+            let columns = columns_of(&outcome.rows);
+            let bytes = crate::session::serialized_bytes(&outcome.rows);
+            let shown: Vec<&Map<String, Value>> = outcome.rows.iter().take(preview).collect();
+            let mut data = json!({
+                "query_name":canonical,"target_db":outcome.target_db,"columns":columns,
+                "row_count":outcome.rows.len(),"capped":outcome.capped,"rows":shown
+            });
+            if outcome.rows.len() > shown.len() {
+                data["omitted_rows"] = json!(outcome.rows.len() - shown.len());
+                data["guidance"] = json!("나머지 행은 result_read(step, offset)로 읽어라. 답변 표·차트는 step 참조로 화면이 채운다.");
+            }
+            if outcome.capped {
+                data["capped_note"] = json!(format!("결과가 {}행을 넘어 앞 {}행만 보관했다", crate::oracle::MAX_ROWS, crate::oracle::MAX_ROWS));
+            }
+            if outcome.rows.is_empty() {
+                data["note"] = json!("조회 결과가 0건이다.");
+            }
+            let result = StoredResult {
+                step: 0,
+                query_name: canonical,
+                target_db: Some(outcome.target_db),
+                params: Value::Object(params),
+                rows: Arc::new(outcome.rows),
+                capped: outcome.capped,
+                omitted_column_key: outcome.omitted_column_key,
+                bytes,
+            };
+            Run {
+                result: Ok(data),
+                effect: Effect::Stored { result, signature },
+                hits: None,
+                public_error: None,
+            }
+        }
+        Err(e) if e.to_string() == "cancelled" => Run::plain(Err(e)),
+        Err(e) => {
+            let (public, hint, wasted) = crate::oracle::public_error(&e);
+            let driver = e.downcast_ref::<crate::sql::SafeError>().is_none();
+            if driver {
+                eprintln!("[query_run] {canonical} failed: {e:#}");
+            }
+            let code = if driver {
+                "query_failed"
+            } else if wasted {
+                "query_unrunnable"
+            } else {
+                "bind_value_problem"
+            };
+            let detail = if driver { clip_utf16(&format!("{e:#}"), 300).to_owned() } else { public.clone() };
+            let hint = hint.map(|h| format!(" 대응: {h}")).unwrap_or_default();
+            fail(anyhow::anyhow!("{code}: {detail}{hint}"), public, Some(signature))
+        }
+    }
+}
+
+/// Column names in first-seen order across rows.
+pub fn columns_of(rows: &[Map<String, Value>]) -> Vec<String> {
+    let mut columns: Vec<String> = vec![];
+    for row in rows {
+        for key in row.keys() {
+            if !columns.contains(key) {
+                columns.push(key.clone());
+            }
+        }
+    }
+    columns
+}
+
+fn result_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
+    let step = args["step"].as_u64().unwrap_or(0);
+    let Some(stored) = cx.results.get(&step) else {
+        bail!(
+            "unknown_step: step {step}의 결과가 없다 (잘못된 번호이거나 오래되어 보관에서 빠졌다). 남아 있는 step: {}",
+            cx.results.keys().map(u64::to_string).collect::<Vec<_>>().join(", ")
+        );
+    };
+    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+    let limit = limit_arg(args, "limit", READ_DEFAULT, READ_MAX);
+    let all_columns = columns_of(&stored.rows);
+    let wanted: Vec<String> = args["cols"]
+        .as_array()
+        .map(|c| c.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default();
+    let (columns, unknown): (Vec<String>, Vec<String>) = if wanted.is_empty() {
+        (all_columns.clone(), vec![])
+    } else {
+        let mut found = vec![];
+        let mut unknown = vec![];
+        for w in wanted {
+            match all_columns.iter().find(|c| **c == w).or_else(|| all_columns.iter().find(|c| name_key(c) == name_key(&w))) {
+                Some(c) if !found.contains(c) => found.push(c.clone()),
+                Some(_) => {}
+                None => unknown.push(w),
+            }
+        }
+        (found, unknown)
+    };
+    let rows: Vec<Map<String, Value>> = stored
+        .rows
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|row| {
+            columns
+                .iter()
+                .map(|c| (c.clone(), row.get(c).cloned().unwrap_or(Value::Null)))
+                .collect()
+        })
+        .collect();
+    let end = offset + rows.len();
+    let mut out = json!({
+        "step":step,"query_name":stored.query_name,"total_rows":stored.rows.len(),"capped":stored.capped,
+        "offset":offset,"columns":columns,"rows":rows,
+        "next_offset":(end < stored.rows.len()).then_some(end)
+    });
+    if !unknown.is_empty() {
+        out["unknown_columns"] = json!(unknown);
+        out["available_columns"] = json!(all_columns);
+    }
+    if offset > stored.rows.len() {
+        out["note"] = json!(format!("offset이 전체 행 수({})를 넘는다", stored.rows.len()));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_results_shrink_to_the_budget() {
+        let item = |i: usize| json!({"id":format!("k{i}"),"title":"제목","excerpt":"근거 문장 ".repeat(60)});
+        let mut data = json!({"text":"q","offset":0,"results":{
+            "knowledge":{"status":"ok","items":(0..10).map(item).collect::<Vec<_>>()},
+            "qa_method":{"status":"ok","items":(0..10).map(item).collect::<Vec<_>>()}
+        }});
+        fit_search(&mut data, 250, "gpt-4o");
+        assert!(crate::context::tokens(&data.to_string(), "gpt-4o") <= 250);
+        assert_eq!(data["excerpts_shortened"], true);
+        let k = data["results"]["knowledge"]["items"].as_array().unwrap().len();
+        assert!(k >= 1 && k < 10);
+        assert_eq!(data["results"]["knowledge"]["next_offset"], k as u64);
+        let mut small = json!({"text":"q","offset":0,"results":{"query":{"items":[item(1)]}}});
+        let before = small.clone();
+        fit_search(&mut small, 4000, "gpt-4o");
+        assert_eq!(small, before);
+    }
+
+    #[test]
+    fn chunk_lists_compress_runs() {
+        assert_eq!(chunk_list(&[1, 2, 3, 5, 7, 8]), "1-3, 5, 7-8");
+        assert_eq!(item_number("k12", 'k'), Some(12));
+        assert_eq!(item_number("K12", 'k'), Some(12));
+        assert_eq!(item_number("12", 'k'), Some(12));
+        assert_eq!(item_number("m3", 'k'), None);
+    }
+
+    #[test]
+    fn params_and_signatures_ignore_colons_case_and_order() {
+        let a = clean_params(&json!({"params":{":Job_Id":"B1","x":1}}));
+        let b = clean_params(&json!({"params":{"x":1,"job_id":"B1"}}));
+        assert_eq!(run_signature("Q", Some("DB"), &a), run_signature("q", Some("db"), &b));
+        assert_ne!(run_signature("q", Some("A"), &a), run_signature("q", Some("B"), &a));
+    }
+
+    #[test]
+    fn clipped_values_are_recognized_from_rows_and_tables() {
+        let mut results = BTreeMap::new();
+        let long = "x".repeat(200);
+        let mut row = Map::new();
+        row.insert("NOTE".into(), json!(format!("{long}{TRUNC_MARK}")));
+        results.insert(1, StoredResult {
+            step: 1, query_name: "q".into(), target_db: None, params: json!({}),
+            rows: Arc::new(vec![row]), capped: false, omitted_column_key: None, bytes: 0,
+        });
+        let mut clipped = Clipped::from_results(&results);
+        assert!(clipped.contains(&long));
+        let cell = "a\\|b".to_owned() + &"c".repeat(116);
+        clipped.learn_text(&format!("| ID | {cell}{TRUNC_MARK} |"));
+        assert!(clipped.contains(&("a|b".to_owned() + &"c".repeat(116))));
+        assert!(!clipped.contains("BATCH001"));
+    }
+
+    #[test]
+    fn chunks_fill_the_budget_and_continue() {
+        let chunks: Vec<(i64, String)> = (1..=4).map(|i| (i, format!("{i}번 ").repeat(200))).collect();
+        let out = fit_chunks(7, "제목", 9, chunks, 600, "gpt-4o");
+        assert_eq!(out["id"], "k7");
+        assert!(out["next_cursor"].as_str().unwrap().starts_with("k7:"));
+        assert!(crate::context::tokens(out["text"].as_str().unwrap(), "gpt-4o") <= 600);
+    }
+}

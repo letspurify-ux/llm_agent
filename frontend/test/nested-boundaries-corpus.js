@@ -1,4 +1,4 @@
-import { resolveChartData } from '../../backend/src/chart.js';
+import { resolveChartData } from '../src/answer-fill.js';
 
 export const NESTED_LITERAL_MATH = '\\text{`mermaid<br>literal`}';
 export const NESTED_BOUNDARY_ANSWER = resolveChartData([

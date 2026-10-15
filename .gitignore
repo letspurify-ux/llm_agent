@@ -11,3 +11,8 @@ logs/
 .frontend.pid
 *.swp
 *.swo
+
+# backend(Rust) 빌드 결과, 그리고 관리자 화면이 저장하는 설정·비밀값
+target/
+backend/config.toml
+backend/config.credentials.json

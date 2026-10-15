@@ -264,7 +264,7 @@ test('스텝 번호는 정수일 때만 화면으로 나간다', () => {
 
 test('대상 이름은 표가 담은 것만 안다 — 프로토타입의 이름이 오면 글자 그대로 보인다', () => {
   // 객체의 [] 조회는 프로토타입까지 올라간다. 'constructor'가 오면 Object 함수가 '아는 이름'으로 잡혀 화면에
-  // 'function Object() { [native code] }'가 섰다(실측). 지금 서버는 대상을 정규화해 보내지만(llm.js) 이 파일은
+  // 'function Object() { [native code] }'가 섰다(실측). 지금 서버는 대상을 정규화해 보내지만(backend/src/voc_tools.rs) 이 파일은
   // 배포가 어긋난 서버의 값도 받는 문이다.
   assert.equal(targetsLabel(['constructor', 'toString', 'knowledge']), 'constructor·toString·지식');
   assert.equal(progressText(applyProgress([], { type: 'search', text: 'x', targets: ['hasOwnProperty'] })[0]), '검색 "x" (hasOwnProperty)');
@@ -284,4 +284,40 @@ test('건수와 오류는 글자가 되는 값으로만 들어온다 — 진행 
   // 진행 줄도 같은 규칙이다
   const done = applyProgress([{ kind: 'query', id: 1, query_name: 'q', pending: true }], { type: 'run_query_done', id: 1, query_name: 'q', error: { code: 'ORA-1' } });
   assert.equal(progressText(done[0]), '조회 q → 오류: {"code":"ORA-1"}');
+});
+
+test('도구 줄: 지식·소스 읽기는 서버가 준 한 줄 설명으로 서고, 끝은 번호로 짝지어 상태를 붙인다', () => {
+  let list = [];
+  list = applyProgress(list, { type: 'tool', id: 1, name: 'file_read', summary: '[앱] 파일 읽기 src/a.rs:1-120' });
+  list = applyProgress(list, { type: 'tool', id: 2, name: 'method_read', summary: '처리 방법 읽기 m3' });
+  assert.equal(progressText(list[0]), '[앱] 파일 읽기 src/a.rs:1-120');
+  list = applyProgress(list, { type: 'tool_done', id: 2, name: 'method_read', status: 'ok' });
+  list = applyProgress(list, { type: 'tool_done', id: 1, name: 'file_read', status: 'error' });
+  assert.equal(progressText(list[1]), '처리 방법 읽기 m3 → 완료');
+  assert.equal(progressText(list[0]), '[앱] 파일 읽기 src/a.rs:1-120 → 실패');
+  // 짝 없는 끝 이벤트는 새 줄로 서되 이름으로라도 무엇인지 보인다
+  list = applyProgress(list, { type: 'tool_done', id: 9, name: 'history', status: 'ok' });
+  assert.equal(list.length, 3);
+  assert.equal(progressText(list[2]), 'history → 완료');
+  // 검색도 번호가 있으면 번호로 짝짓는다 — 같은 검색어를 두 번 보내도 줄이 뒤바뀌지 않는다
+  list = applyProgress([], { type: 'search', id: 3, text: 'x', targets: ['query'] });
+  list = applyProgress(list, { type: 'search', id: 4, text: 'x', targets: ['knowledge'] });
+  list = applyProgress(list, { type: 'search_done', id: 4, text: 'x', targets: ['knowledge'], hits: { knowledge: 2 } });
+  assert.equal(list[0].pending, true);
+  assert.equal(progressText(list[1]), '검색 "x" (지식) → 지식 2건');
+});
+
+test('trace의 도구 항목은 표 없는 한 줄이고, 머리띠 문구가 그 수를 센다', () => {
+  const trace = normalizeTrace([
+    { search: 'x', targets: ['knowledge'], hits: { knowledge: 1 } },
+    { tool: 'file_read', summary: '파일 읽기 a.rs', status: 'ok' },
+    { tool: 'source_search', summary: { bad: 1 }, status: 'error' },
+    { step: 1, query_name: 'q', rowCount: 0, rows: [] },
+  ]);
+  assert.equal(trace[1].summary, '파일 읽기 a.rs');
+  assert.equal(trace[2].summary, '{"bad":1}');
+  assert.equal(stepLabel(trace[1]), '완료');
+  assert.equal(stepLabel(trace[2]), '실패');
+  assert.equal(traceSummary(trace), '검색 1회 · 실행된 쿼리 1건 · 자료·소스 읽기 2회');
+  assert.equal(traceSummary([{ tool: 'file_read' }]), '자료·소스 읽기 1회');
 });

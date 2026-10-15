@@ -39,16 +39,18 @@ stop.bat
 
 ## 백엔드 연결
 
-`backend/.env`에 아래가 있어야 한다 (`.env.example` 기본값과 동일):
+관리자 화면 **설정 → 임베딩·검색**에 아래 값이 있어야 한다 (`backend/config.toml`의 `[embedding]` — 기본 모델이 bge-m3다).
+**연결 확인**으로 1024차원 응답이 오는지 볼 수 있다.
 
-```
-EMBEDDING_URL=http://localhost:11434/v1
-EMBEDDING_MODEL=bge-m3
+```toml
+[embedding]
+url = "http://localhost:11434/v1"
+model = "bge-m3"
 ```
 
 서버를 재시작할 필요는 없다. 임베딩 서버가 살아나면 다음 요청부터 벡터 검색이 켜지고,
 그동안 등록된 데이터는 60초 주기 동기화가 자동으로 임베딩한다. 즉시 반영하려면
-`backend`에서 `npm run embed`를 실행한다.
+`backend`에서 `./target/release/llm-agent embed-sync`(또는 `cargo run --release -- embed-sync`)를 실행한다.
 
 ## 문제 해결
 
@@ -56,7 +58,7 @@ EMBEDDING_MODEL=bge-m3
 `start.bat`은 이 경우 기존 서버를 그대로 쓰므로 정상이다.
 
 **차원이 1024가 아니라는 오류** — `vec_*` 테이블이 `VECTOR(1024)`로 정의되어 있어
-다른 차원의 모델은 쓸 수 없다. `EMBEDDING_MODEL`을 확인한다.
+다른 차원의 모델은 쓸 수 없다. 설정 탭의 임베딩 모델을 확인한다.
 
 **사내 프록시 환경에서 다운로드 실패** — `HTTPS_PROXY` 환경변수를 설정한 뒤 `ollama pull bge-m3`를
 직접 실행한다.

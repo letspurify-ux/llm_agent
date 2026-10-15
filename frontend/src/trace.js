@@ -12,24 +12,31 @@
 export const stepLabel = t => {
   if (!t) throw new TypeError('stepLabel: 스텝이 없습니다 — 부르는 쪽이 없는 스텝을 집었습니다');
   if (isSearchStep(t)) return searchLabel(t);
+  if (isToolStep(t)) return toolStatusLabel(t.status);
   return t.error ? `오류: ${t.error}` : countLabel(t);
 };
 
 // ===== 검색 항목 =====
-// 서버 trace에는 검색 기록이 쿼리 기록과 같은 배열에 섞여 온다 (backend result.js clientTrace — {search, targets,
+// 서버 trace에는 검색 기록이 쿼리 기록과 같은 배열에 섞여 온다 (backend/src/agent.rs execute_batch — {search, targets,
 // hits, failed?}). 답을 기다리는 동안 흘러오는 진행 이벤트(search·search_done)도 같은 재료다. 문구는 한 곳에서
 // 만든다 — 진행 줄과 패널이 같은 검색을 다른 말로 하면 사용자는 둘을 다른 일로 읽는다.
-// 대상 이름과 적중 수의 키는 서버가 정한다 (backend constants.js SEARCH_TARGETS, agent.js HIT_KEY).
+// 대상 이름과 적중 수의 키는 서버가 정한다 (backend/src/voc_tools.rs search_tool).
 export const TARGET_LABEL = { knowledge: '지식', qa_method: '처리방법', query: '쿼리' };
 const HIT_KEY = { knowledge: 'knowledge', qa_method: 'qaMethods', query: 'queries' };
 const TARGETS = Object.keys(TARGET_LABEL);
 
 export const isSearchStep = t => !!t && typeof t === 'object' && typeof t.search === 'string';
 
+// ===== 도구 항목 =====
+// 지식 읽기·처리 방법 읽기·쿼리 정의 보기와 프로젝트 소스 도구(파일 읽기·소스 검색 등)는 표가 없는
+// 한 줄이다 — 서버가 만든 한 줄 설명(summary, 예: '[앱] 파일 읽기 src/a.rs:1-120')과 결과 상태만 보인다.
+export const isToolStep = t => !!t && typeof t === 'object' && typeof t.tool === 'string';
+export const toolStatusLabel = status => (status === 'ok' ? '완료' : status === undefined ? '' : '실패');
+
 // 대상 목록의 표기 — '지식·처리방법'. 모르는 이름은 그대로 보인다(감추면 무엇을 찾았는지 알 수 없다).
 // 표는 자기가 담은 이름만 안다 — 객체의 [] 조회는 프로토타입까지 올라가서, 'constructor' 같은 이름이 오면
 // Object 함수가 '아는 이름'으로 잡혀 화면에 'function Object() { [native code] }'가 섰다(실측). 지금 서버는
-// 대상을 정규화해 보내지만(llm.js normalizeSearchTargets) 이 파일은 배포가 어긋난 서버의 값도 받는 문이다.
+// 대상을 정규화해 보내지만(backend/src/voc_tools.rs) 이 파일은 배포가 어긋난 서버의 값도 받는 문이다.
 const labelOf = t => (Object.prototype.hasOwnProperty.call(TARGET_LABEL, t) ? TARGET_LABEL[t] : cellText(t));
 export const targetsLabel = targets =>
   (Array.isArray(targets) ? targets : []).map(labelOf).filter(Boolean).join('·') || '전체';
@@ -51,22 +58,24 @@ export function searchLabel(t) {
 export function traceSummary(trace) {
   const list = Array.isArray(trace) ? trace : [];
   const searches = list.filter(isSearchStep).length;
-  const queries = list.length - searches;
+  const tools = list.filter(isToolStep).length;
+  const queries = list.length - searches - tools;
   const parts = [];
   if (searches > 0) parts.push(`검색 ${searches}회`);
-  if (queries > 0 || searches === 0) parts.push(`실행된 쿼리 ${queries}건`);
+  if (queries > 0 || (searches === 0 && tools === 0)) parts.push(`실행된 쿼리 ${queries}건`);
+  if (tools > 0) parts.push(`자료·소스 읽기 ${tools}회`);
   return parts.join(' · ');
 }
 
 // ===== 답을 기다리는 동안의 진행 줄 =====
-// 서버가 흘려보내는 이벤트(backend agent.js emit)를 화면의 줄 목록으로 접는다. 시작 이벤트가 줄을 세우고
+// 서버가 흘려보내는 이벤트(backend/src/agent.rs execute_batch)를 화면의 줄 목록으로 접는다. 시작 이벤트가 줄을 세우고
 // 끝 이벤트가 그 줄에 결과를 붙인다 — 같은 종류의 '아직 안 끝난' 마지막 줄을 찾아서. 순수 함수라 여기 둔다:
 // 이벤트 순서가 어긋나거나(끝이 먼저 온다) 모르는 종류가 와도 목록이 깨지지 않아야 하는데, 그 경우는 화면에서
 // 재현하기 어렵다.
 const strings = v => (Array.isArray(v) ? v.filter(x => typeof x === 'string') : []);
 
 // 끝 이벤트를 '그 줄'에 붙인다. 미완 줄이 여럿일 수 있으므로(일괄 조회는 조회 여럿이 동시에 돈다 —
-// backend agent.js runBatch) 짝을 찾아야 한다. 마지막 미완 줄에 붙이던 때에는 가운데 조회가 먼저 끝나는
+// backend/src/agent.rs execute_batch) 짝을 찾아야 한다. 마지막 미완 줄에 붙이던 때에는 가운데 조회가 먼저 끝나는
 // 순간 줄이 뒤바뀌었다: A·B·C가 도는 중에 B가 끝나면 C의 줄이 'B → 2건'이 되어 'B'가 두 줄로 보이고
 // C는 화면에서 사라졌다(실측).
 // 짝은 서버가 매기는 번호(id)로 짓는다 — 이름으로는 지을 수 없다: 같은 쿼리를 다른 값으로 두 번 부르는
@@ -90,7 +99,7 @@ const settle = (list, kind, done, same, strict = false) => {
   return list.map((x, j) => (j === i ? { ...x, ...done, id: x.id ?? done.id } : x));
 };
 
-// 이름 비교 키 — 대소문자·앞뒤 공백을 흡수한다 (backend constants.js nameKey와 같은 규칙).
+// 이름 비교 키 — 대소문자·앞뒤 공백을 흡수한다 (backend/src/text.rs name_key와 같은 규칙).
 const nameKey = v => cellText(v).trim().toLowerCase();
 
 export function applyProgress(list, e) {
@@ -98,13 +107,22 @@ export function applyProgress(list, e) {
   if (!e || typeof e !== 'object') return cur;
   switch (e.type) {
     case 'search':
-      return [...cur, { kind: 'search', text: cellText(e.text), targets: strings(e.targets), pending: true }];
+      return [...cur, { kind: 'search', ...(e.id !== undefined && { id: e.id }), text: cellText(e.text), targets: strings(e.targets), pending: true }];
     case 'search_done': {
       const done = {
-        kind: 'search', text: cellText(e.text), targets: strings(e.targets),
+        kind: 'search', ...(e.id !== undefined && { id: e.id }), text: cellText(e.text), targets: strings(e.targets),
         hits: e.hits && typeof e.hits === 'object' ? e.hits : {}, failed: strings(e.failed), pending: false,
       };
-      return settle(cur, 'search', done, x => x.text === done.text);
+      const byId = done.id !== undefined;
+      return settle(cur, 'search', done, byId ? x => x.id === done.id : x => x.text === done.text, byId);
+    }
+    case 'tool':
+      return [...cur, { kind: 'tool', id: e.id, name: cellText(e.name), summary: cellText(e.summary) || cellText(e.name), pending: true }];
+    case 'tool_done': {
+      // 설명(summary)은 시작 줄의 것을 남긴다 — 끝 이벤트는 상태만 준다.
+      const done = { kind: 'tool', id: e.id, name: cellText(e.name), status: cellText(e.status), pending: false };
+      const settled = settle(cur, 'tool', done, x => x.id === done.id, true);
+      return settled.map(x => (x.kind === 'tool' && x.summary === undefined ? { ...x, summary: x.name } : x));
     }
     case 'run_query':
       return [...cur, { kind: 'query', id: e.id, query_name: cellText(e.query_name), targetDb: cellText(e.targetDb), pending: true }];
@@ -125,7 +143,7 @@ export function applyProgress(list, e) {
   }
 }
 
-// 조회 건수의 표기 — 서버는 상한에 걸린 결과를 '1000+'처럼 준다(backend result.js). 진행 줄과 패널이
+// 조회 건수의 표기 — 서버는 상한에 걸린 결과를 '1000+'처럼 준다(backend/src/agent.rs row_count). 진행 줄과 패널이
 // 그것을 다르게 풀면 같은 조회가 몇 초 사이에 '1000+건'이었다가 '1000건 이상'이 된다 — 이 파일이
 // 문구를 한곳에서 만드는 이유가 그것이다(머리말). 진행 줄에는 아직 몇 행을 실을지가 정해지지 않았으므로
 // 패널 문구(countLabel)의 앞부분만 쓴다.
@@ -136,6 +154,9 @@ const rowCountLabel = v => {
 
 // 진행 줄 하나의 글자. 끝나지 않은 줄은 결과 없이 끝난다(기다림 표시는 CSS가 붙인다).
 export function progressText(it) {
+  if (it.kind === 'tool') {
+    return it.pending ? it.summary : `${it.summary} → ${toolStatusLabel(it.status) || '완료'}`;
+  }
   if (it.kind === 'search') {
     const head = `검색 "${it.text}" (${targetsLabel(it.targets)})`;
     return it.pending ? head : `${head} → ${searchLabel(it)}`;
@@ -146,15 +167,15 @@ export function progressText(it) {
 }
 
 // 조회 건수 문구. 조회 건수와 실린 행 수는 다를 수 있다 — 몇 건을 보고 있는지 밝히지 않으면
-// 사용자가 실린 것을 전부로 읽는다 (서버 result.js clientTrace가 omittedRows·capped를 준다).
+// 사용자가 실린 것을 전부로 읽는다 (서버 trace가 omittedRows·capped를 준다).
 export function countLabel(t) {
   const n = t.rows?.length ?? 0;
-  // rowCount는 서버가 늘 준다(result.js clientTrace). 없으면 실린 행 수로 말한다 — 'undefined건'은
+  // rowCount는 서버가 늘 준다(backend/src/agent.rs). 없으면 실린 행 수로 말한다 — 'undefined건'은
   // 화면에 나가서는 안 되는 글자이고, 이 패널의 다른 값들도 모두 없을 때를 정해 두고 있다.
   if (t.rowCount === undefined) return `${n}건`; // 몇 건 중 몇 건인지 말할 근거가 없다
-  // 상한에 걸린 것과 실린 행이 일부인 것은 함께 올 수 있다(서버 result.js) — 그때 둘 중 하나만
+  // 상한에 걸린 것과 실린 행이 일부인 것은 함께 올 수 있다(서버 trace) — 그때 둘 중 하나만
   // 말하면 '왜 이만큼뿐인가'의 절반이 사라진다.
-  // 상한에 걸린 rowCount는 서버가 '1000+'처럼 준다(result.js) — 같은 패널에서 '건 이상'과 '+건'이
+  // 상한에 걸린 rowCount는 서버가 '1000+'처럼 준다(backend/src/agent.rs) — 같은 패널에서 '건 이상'과 '+건'이
   // 섞이지 않게 여기서도 같은 말로 푼다.
   if (t.capped && t.omittedRows) return `${String(t.rowCount).replace(/\+$/, '')}건 이상 — 조회 상한에 걸렸고, 아래는 그중 ${n}건입니다`;
   if (t.omittedRows) return `${t.rowCount}건 (아래는 그중 ${n}건)`;
@@ -179,8 +200,9 @@ export function normalizeTrace(trace) {
   if (!Array.isArray(trace)) return [];
   return trace
     .filter(t => t && typeof t === 'object' && !Array.isArray(t))
-    .map(t => (isSearchStep(t) ? searchStep(t) : queryStep(t)));
+    .map(t => (isSearchStep(t) ? searchStep(t) : isToolStep(t) ? toolStep(t) : queryStep(t)));
 }
+const toolStep = t => ({ tool: t.tool, summary: cellText(t.summary) || t.tool, status: cellText(t.status) });
 const searchStep = t => ({
   ...(stepNo(t.step) !== undefined && { step: stepNo(t.step) }),
   search: t.search, targets: strings(t.targets), hits: t.hits && typeof t.hits === 'object' ? t.hits : {}, failed: strings(t.failed),
@@ -203,7 +225,7 @@ function queryStep(t) {
   };
 }
 
-// 오류 문구의 모양. 서버는 글자를 주지만(result.js clientTrace) 글자가 아닌 것이 와도 '오류였다'는 사실은
+// 오류 문구의 모양. 서버는 글자를 주지만(backend/src/agent.rs) 글자가 아닌 것이 와도 '오류였다'는 사실은
 // 남겨야 한다 — 버리면 실행되지 못한 스텝이 '0건'으로 읽혀 조회 성공처럼 보인다. 비었으면 오류가 아니다.
 // 진행 줄(applyProgress)과 패널(normalizeTrace)이 같은 함수를 쓴다 — 같은 스텝이 몇 초 사이에 다른 말을 하지 않게.
 const errorText = v => (v ? cellText(v) : undefined);
@@ -213,7 +235,7 @@ const errorText = v => (v ? cellText(v) : undefined);
 // 정수가 아니면 없는 것으로 본다: 번호가 없으면 화면이 번호를 그리지 않을 뿐이다.
 const stepNo = v => (Number.isInteger(v) && v > 0 ? v : undefined);
 
-// 행들의 열 이름 — 첫 등장 순서. 드라이버가 준 행은 열이 모두 같지만(oracle.js normalizeCells),
+// 행들의 열 이름 — 첫 등장 순서. 드라이버가 준 행은 열이 모두 같지만(backend/src/oracle.rs),
 // 다른 출처의 trace가 섞여도 한 행에만 있는 열이 빠지지 않게 합집합으로 모은다.
 export function columnsOf(rows) {
   const cols = [];

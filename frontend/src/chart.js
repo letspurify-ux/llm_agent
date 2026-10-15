@@ -1,7 +1,7 @@
 // 답변 안의 차트 블록을 다루는 계약 전체 — 무엇을 차트로 받아들이는가(parseChartBlock)와,
 // 그 블록을 대화 이력으로 되돌려 보낼 때 어떤 모양으로 줄이는가(chartBlocksToTables).
 //
-// 블록의 모양은 서버 SYSTEM_PROMPT(llm-openai.js)가 모델에게 가르치고, 서버 chart.js가 `data: step N`
+// 블록의 모양은 서버 시스템 프롬프트(backend/src/context.rs)가 모델에게 가르치고, answer-fill.js가 `data: step N`
 // 참조를 실제 표로 채워 넘긴다. 셋이 같은 줄 문법을 봐야 하므로 여기 CONFIG_RE·표 판정을 바꾸면
 // 그 둘도 함께 바꾼다.
 //
@@ -26,7 +26,7 @@
 
 // 그리기 상한. 서버는 한 조회에서 1000행(MAX_ROWS)까지 가져오지만 그리는 것은 100행까지다 — 가로 막대는
 // 행마다 22px씩 키가 자라(Chart.jsx) 1000행이면 2만 px이고, 세로 막대 1000개는 1px 조각이 된다. 서버가
-// `data: step N`으로 채우는 표도 같은 수까지만 싣는다(backend chart.js MAX_CHART_BLOCK_ROWS — 그 위는 그려지지
+// `data: step N`으로 채우는 표도 같은 수까지만 싣는다(answer-fill.js MAX_CHART_BLOCK_ROWS — 그 위는 그려지지
 // 않는 채 답변만 키우고 다른 차트의 몫을 먹는다). 넘는 행은 차트 아래에 '처음 100행만 그렸습니다'로 밝히고,
 // 조회된 행 전부는 trace 패널에 있다.
 // 시리즈 6개는 범례가 한 줄에 읽히는 한계, 라벨 30자는 축 눈금이 서로를 덮지 않는 한계.
@@ -76,7 +76,7 @@ const SEP_ROW_RE = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
 // 표 한 줄을 칸으로 쪼갠다. GFM처럼 `\|` 는 칸 안의 파이프, `\\` 는 역슬래시 하나다 — 되돌려야
 // '표로 보기'(GFM이 그린다)와 차트의 라벨이 같은 글자가 된다(서버 escapeCell이 이렇게 적는다).
 // 파이프·역슬래시만이 아니다: 값에 든 강조·코드·링크·취소선·HTML·엔터티 표기도 그대로 두면 GFM이 해석해
-// 값이 조용히 바뀌므로 서버가 짝이 있을 때만 막아 보낸다(backend/src/chart.js escapeCell). 그 목록을 여기서도
+// 값이 조용히 바뀌므로 채우는 쪽이 짝이 있을 때만 막아 넣는다(answer-fill.js escapeCell). 그 목록을 여기서도
 // 같이 되돌린다 — 한쪽만 늘리면 차트 라벨에 백슬래시가 남는다. 그 밖의 역슬래시는 글자다(`C:\dir`).
 // 양끝 파이프는 벗긴다.
 const CELL_ESCAPABLE = '\\|`*~[]<_&$';
@@ -533,7 +533,7 @@ export function chartTableMarkdownFrom(block) {
 export const chartTableMarkdown = text => chartTableMarkdownFrom(splitBlock(text));
 
 // 답변 본문에서 ```chart 펜스를 찾는다. markdown 파서(react-markdown)가 펜스로 읽는 것과 같은 범위를
-// 잡아야 한다 — 이쪽이 놓친 블록은 화면에서는 차트인데 이력에서는 설정 줄째 남고, 서버(backend chart.js)의
+// 잡아야 한다 — 이쪽이 놓친 블록은 화면에서는 차트인데 이력에서는 설정 줄째 남고, 채우는 쪽(answer-fill.js)의
 // 같은 정규식이 놓치면 `data:` 참조가 채워지지 않은 채 화면에 온다. 그래서 들여쓰기는 칸 수를 따지지 않고
 // (목록 안의 펜스는 항목 번호 폭만큼 들여 온다 — `10. `이면 4칸), 언어 뒤의 덧말(```chart 월별)과
 // 3개 넘는 백틱으로 닫는 펜스, CRLF도 받는다. 닫는 펜스가 없는 블록(토큰 한도로 잘린 응답)은 잡히지 않고 그대로 남는다.
@@ -541,7 +541,7 @@ export const chartTableMarkdown = text => chartTableMarkdownFrom(splitBlock(text
 // ~~~chart·````chart 블록이 화면에서는 차트인데 이력에는 설정 줄째 그대로 실려 갔다(실측). 닫는 펜스는 markdown과
 // 같이 여는 펜스(\2)에 그 글자(\3)가 더 붙은 것까지다 — ````chart 안의 ``` 줄은 끝이 아니라 내용이고, ```~처럼
 // 글자가 섞인 줄도 끝이 아니다. 그룹 1이 여는 펜스의 들여쓰기, 2가 펜스, 3이 펜스 글자, 본문은 그룹 4다
-// (서버 backend chart.js FENCE_RE와 같은 그룹 배치다 — 들여쓰기는 아래 chartBlocksToTables가 쓴다).
+// (answer-fill.js FENCE_RE와 같은 그룹 배치다 — 들여쓰기는 아래 chartBlocksToTables가 쓴다).
 // 본문은 없을 수도 있다(```chart 바로 아래 ```) — 그것도 markdown에게는 닫힌 블록이다. 본문 한 줄을 요구하던
 // 때에는 빈 블록의 여는 펜스가 다음 차트 블록의 닫는 펜스와 짝이 되어 그 사이의 문장까지 한 블록으로 삼켰다
 // (실측: 빈 블록 뒤의 설명 문장이 이력에서 사라졌다). 빈 본문을 먼저 시도해야(??) 그 짝짓기가 생기지 않는다.

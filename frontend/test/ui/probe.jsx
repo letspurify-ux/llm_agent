@@ -8,7 +8,7 @@ const which = new URLSearchParams(location.search).get('case') ?? 'rich';
 // ?broken=1 이면 정상 답 대신 BROKEN_RESPONSES를 한 번에 하나씩 차례로 내준다 — 한 대화 안에서
 // 모든 모양을 겪게 해야 '그중 하나에서 앱이 내려가면 그 뒤 질문도 못 한다'까지 함께 재게 된다.
 const broken = new URLSearchParams(location.search).has('broken');
-// ?stream=1 이면 서버가 진행 상황을 흘려보내는 모양(NDJSON — backend server.js openStream)으로 답한다:
+// ?stream=1 이면 서버가 진행 상황을 흘려보내는 모양(NDJSON — backend/src/web.rs chat)으로 답한다:
 // STREAM_EVENTS를 ?gap= 간격으로 한 줄씩, 마지막에 done. 답이 오기 전에 검색 줄이 서는지를 재려면
 // 이벤트 사이가 눈에 보일 만큼 벌어져야 한다.
 const stream = new URLSearchParams(location.search).has('stream');
@@ -38,7 +38,7 @@ window.fetch = async (url, opts) => {
             c.enqueue(line(e));
             await new Promise(r => setTimeout(r, gap));
           }
-          // 답변 조각 — 서버가 답변 문자열을 디코딩해 흘리는 모양 (backend agent.js answer_delta)
+          // 답변 조각 — 서버가 답변 문자열을 디코딩해 흘리는 모양 (backend/src/agent.rs answer_delta)
           const answer = CASES[which] ?? CASES.rich;
           const size = Math.ceil(answer.length / STREAM_ANSWER_CHUNKS);
           for (let i = 0; i < answer.length; i += size) {

@@ -7,8 +7,8 @@ import remarkGfm from 'remark-gfm';
 import { REMARK_PLUGINS, REHYPE_PLUGINS } from '../src/math.js';
 import { parseChartBlock } from '../src/chart.js';
 import { PreviewPre } from '../src/preview.js';
-import { resolveChartData } from '../../backend/src/chart.js';
-import { answerSyntax } from '../../backend/src/markdown-syntax.js';
+import { resolveChartData } from '../src/answer-fill.js';
+import { answerSyntax } from '../src/answer-syntax.js';
 import { MIXED_WRAPPERS } from './mixed-content-corpus.js';
 import { STRUCTURE_HEADERS, STRUCTURE_DIAGRAM, STRUCTURE_QUERY, STRUCTURE_URL,
   STRUCTURE_DEFINITION, structureTable } from './rich-table-structure-corpus.js';

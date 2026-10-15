@@ -16,7 +16,7 @@ SPACE VOC Agent의 벡터 검색에 쓰는 임베딩 모델(`qwen3-embedding:0.6
 | 크기 | 639MB (Q4_K_M) | bge-m3(1.2GB)보다 작다 |
 | 컨텍스트 | 32k 토큰 | 임베딩 원문 상한(`MAX_EMBED_TEXT_LEN` 4,000자)에 여유가 크다 |
 
-**관련도 문턱(`search.js MAX_DIST = 0.55`)은 그대로 쓸 수 있다.** 이 저장소의 실제 지식 7건(청크 전체)에
+**관련도 거리 문턱(설정 탭 '임베딩·검색')은 그대로 쓸 수 있다.** 이 저장소의 실제 지식 7건(청크 전체)에
 관련 질문 8개·무관 질문 5개를 걸어 코사인 거리를 재 보면:
 
 | | 관련 질문 ↔ 정답 문서 | 무관 질문 ↔ 모든 문서 | 놓침 | 오탐 |
@@ -93,28 +93,28 @@ ollama list
 
 ## 백엔드 연결
 
-`backend/.env`:
+관리자 화면 **설정 → 임베딩·검색** (`backend/config.toml`의 `[embedding]`):
 
-```
-EMBEDDING_URL=http://localhost:11434/v1
-EMBEDDING_MODEL=qwen3-embedding:0.6b
+```toml
+[embedding]
+url = "http://localhost:11434/v1"
+model = "qwen3-embedding:0.6b"
 ```
 
-`EMBEDDING_MODEL`을 바꾸면 **저장된 벡터가 전부 낡은 것이 된다** — 변경 감지 해시에 모델명이 들어 있어
-(`embed-sync.js`) 다음 동기화가 전 행을 자동으로 다시 임베딩한다. 등록 규모에 따라 수 분 걸리고,
-그동안 검색은 옛 벡터로 계속 동작한다. 즉시 반영하려면 `backend`에서 `npm run embed`를 실행한다.
+임베딩 모델을 바꾸면 **저장된 벡터가 전부 낡은 것이 된다** — 변경 감지 해시에 모델명이 들어 있어
+(`backend/src/embed_sync.rs`) 다음 동기화가 전 행을 자동으로 다시 임베딩한다. 등록 규모에 따라 수 분 걸리고,
+그동안 낡은 벡터는 검색에서 빠지므로 다시 임베딩된 행만 검색된다(한산한 시간에 바꿀 것). 즉시 반영하려면 `backend`에서 `./target/release/llm-agent embed-sync`를 실행한다.
 
 ### 질의 지시문 (선택)
 
 Qwen3-Embedding 계열은 **질의에만** 한 문장 지시문을 붙이도록 학습됐다(문서에는 붙이지 않는다).
-쓰려면 `backend/.env`에 아래를 둔다:
+쓰려면 설정 탭의 **검색어 앞 지시문**에 아래를 그대로 적는다(끝의 공백까지 — 이 칸은 앞뒤 공백을 지우지 않는다):
 
 ```
-EMBEDDING_QUERY_PREFIX="Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: 
 ```
 
-**반드시 큰따옴표로 감쌀 것** — dotenv는 큰따옴표일 때만 `\n`을 줄바꿈으로 풀고 값 끝의 공백을 지킨다.
-(따옴표를 잊어도 백엔드가 `\n`을 되살리지만, 끝의 공백은 dotenv 단계에서 이미 잘려 되살릴 수 없다.)
+`\n` 두 글자는 줄바꿈으로 바뀐다.
 
 설정하지 않으면 아무것도 붙지 않으며 지금까지와 동일하게 동작한다 — `bge-m3`처럼 지시문을 쓰지 않는
 모델에는 **비워 두어야 한다**(붙이면 오히려 거리가 멀어진다, 실측).
@@ -139,7 +139,7 @@ EMBEDDING_QUERY_PREFIX="Instruct: Given a web search query, retrieve relevant pa
 `start.bat`은 이 경우 기존 서버를 그대로 쓰므로 정상이다.
 
 **차원이 1024가 아니라는 오류** — `qwen3-embedding`의 다른 크기(4b·8b)는 차원이 다르다.
-`EMBEDDING_MODEL`에 태그(`:0.6b`)까지 정확히 적혔는지 확인한다.
+설정 탭의 임베딩 모델에 태그(`:0.6b`)까지 정확히 적혔는지 확인한다.
 
 **다운로드 실패** — 위 '인터넷이 안 되는 사내망' 절차를 따른다.
 

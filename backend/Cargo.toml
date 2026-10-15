@@ -1,0 +1,68 @@
+[package]
+name = "llm-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "SPACE VOC Agent backend: knowledge, Q&A methods, registered queries and project sources"
+license = "MIT"
+default-run = "llm-agent"
+
+[[bin]]
+name = "llm-agent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+futures-util = "0.3"
+globset = "0.4"
+hex = "0.4"
+hmac = "0.12"
+ignore = "0.4"
+md-5 = "0.10"
+mysql_async = { version = "0.34", default-features = false, features = ["minimal"] }
+oracle = "0.6.3"
+rand = "0.8"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+subtle = "2"
+tempfile = "3"
+tiktoken-rs = "0.9"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+toml = "0.8"
+unicode-normalization = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+caseless = "0.2"
+
+axum = "0.8"
+tower-http = { version = "0.6", features = ["limit"] }
+tree-sitter = "0.27.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-c-sharp = "0.23.5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+# Dependencies (tiktoken, serde_json, tree-sitter, regex) do the per-round work
+# of agent tests; unoptimized they make those tests several times slower. This
+# crate stays unoptimized, so incremental rebuilds keep their speed.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test]
+debug = "line-tables-only"

@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import './admin.css';
 import BindConfigEditor from './BindConfigEditor.jsx';
+import DirectoryPicker from './DirectoryPicker.jsx';
+import SettingsPanel from './SettingsPanel.jsx';
 import { readBindings, serializeBindings } from './admin-bindings.js';
 
 const SECTIONS = {
-  databases: { label: 'DB', title: '조회 대상 DB 설정', description: '에이전트가 실제로 조회할 Oracle DB의 접속 정보를 관리합니다. 관리용 MariaDB 설정은 서버 환경변수에서 관리합니다.', name: 'db_name', search: 'DB 이름, 접속 주소, 사용자명 검색',
+  databases: { label: 'DB', title: '조회 대상 DB 설정', description: '에이전트가 실제로 조회할 Oracle DB의 접속 정보를 관리합니다. 관리용 MariaDB 접속은 설정 탭에서 관리합니다.', name: 'db_name', search: 'DB 이름, 접속 주소, 사용자명 검색',
     fields: [
       ['db_name', 'DB 이름', 'text', 100, true, '예: ORDER_DB'],
       ['db_type', 'DB 유형', 'select', 20, true],
@@ -27,6 +29,16 @@ const SECTIONS = {
       ['input_desc', '입력 설명', 'textarea', 1000, false, '예: customer_id — 고객 번호 (필수, 숫자)'],
       ['output_desc', '출력 설명', 'textarea', null, false, '조회 결과의 컬럼과 의미를 설명하세요.'],
     ] },
+  projects: { label: '프로젝트', title: '프로젝트 소스', description: '질문이 프로젝트의 동작·코드에 관한 것이면 에이전트가 설명을 보고 프로젝트를 골라 소스와 참고 문서를 읽어 답합니다. 파일은 읽기만 합니다.', name: 'name', search: '프로젝트 이름, 설명, 폴더 검색',
+    fields: [
+      ['name', '프로젝트 이름', 'text', 100, true, '예: SPACE 백엔드'],
+      ['description', '설명', 'textarea', 2000, false, '무슨 프로젝트인지, 어떤 질문에 쓰는지 적으세요. 에이전트가 프로젝트를 고르는 근거입니다.'],
+      ['root', '프로젝트 폴더', 'folder', null, true, '서버 PC의 절대 경로'],
+      ['docs', '참고 문서 (md)', 'textarea', null, false, '한 줄에 하나 — 프로젝트 폴더 기준 상대 경로 또는 절대 경로 (예: docs/architecture.md)'],
+      ['include', '포함 패턴', 'textarea', null, false, '한 줄에 하나. 비우면 전체 (예: src/**)'],
+      ['exclude', '제외 패턴', 'textarea', null, false, '한 줄에 하나 (예: **/*.log). .git·node_modules·target·dist·build는 항상 제외됩니다.'],
+    ] },
+  settings: { label: '설정', title: '서버 설정', description: '모델 연결, 임베딩, 관리 DB, Oracle 클라이언트, 실행 한도를 관리합니다. 저장하면 다음 질문부터 적용됩니다.', singleton: true, fields: [] },
 };
 const blank = kind => Object.fromEntries(SECTIONS[kind].fields.map(([key]) => [key, key === 'db_type' ? 'oracle' : key === 'query_type' ? 'QUERY' : key === 'bind_config' ? readBindings('') : '']));
 const valuesOf = (kind, row) => Object.fromEntries(SECTIONS[kind].fields.map(([key]) => [key,
@@ -58,6 +70,8 @@ export default function AdminPanel({ onStateChange }) {
   const [authError, setAuthError] = useState('');
   const [authAttempted, setAuthAttempted] = useState(false);
   const [needsAuth, setNeedsAuth] = useState(false);
+  const [settingsState, setSettingsState] = useState({ dirty: false, busy: false });
+  const [picker, setPicker] = useState(null);
   const generation = useRef(0);
   const mutation = useRef(false);
   const firstField = useRef(null);
@@ -65,7 +79,9 @@ export default function AdminPanel({ onStateChange }) {
   const optionErrorRef = useRef(null);
   const fieldRefs = useRef({});
   const config = SECTIONS[kind];
-  const dirty = !!editor && JSON.stringify(draft) !== baseline;
+  const editorDirty = !!editor && JSON.stringify(draft) !== baseline;
+  const dirty = editorDirty || (config.singleton && settingsState.dirty);
+  const working = busy || (config.singleton && settingsState.busy);
 
   const api = useCallback(async (path, { signal, headers, ...init } = {}) => {
     const controller = new AbortController();
@@ -97,8 +113,8 @@ export default function AdminPanel({ onStateChange }) {
   }, [token, authAttempted]);
 
   useEffect(() => {
-    onStateChange({ dirty, busy });
-  }, [dirty, busy, onStateChange]);
+    onStateChange({ dirty, busy: working });
+  }, [dirty, working, onStateChange]);
   useEffect(() => {
     const key = Object.keys(fieldErrors)[0];
     const target = key ? fieldRefs.current[key] : needsAuth && (authError || (authAttempted && error)) ? feedbackRef.current : error ? feedbackRef.current : optionError ? optionErrorRef.current : null;
@@ -110,13 +126,14 @@ export default function AdminPanel({ onStateChange }) {
     return () => cancelAnimationFrame(frame);
   }, [error, optionError, fieldErrors, authError, authAttempted, needsAuth]);
   useEffect(() => {
-    if (!dirty && !busy) return;
+    if (!editorDirty && !busy) return;
     const warn = e => { e.preventDefault(); e.returnValue = ''; };
     window.addEventListener('beforeunload', warn);
     return () => window.removeEventListener('beforeunload', warn);
-  }, [dirty, busy]);
+  }, [editorDirty, busy]);
   useEffect(() => () => { generation.current += 1; }, []);
   useEffect(() => {
+    if (SECTIONS[kind].singleton) { setLoading(false); return undefined; }
     const controller = new AbortController();
     setLoading(true);
     setError('');
@@ -142,7 +159,7 @@ export default function AdminPanel({ onStateChange }) {
   useEffect(() => { if (editor) firstField.current?.focus(); }, [editor]);
 
   function canLeave() {
-    return !busy && !mutation.current && (!dirty || window.confirm('저장하지 않은 변경 사항을 버리시겠습니까?'));
+    return !working && !mutation.current && (!dirty || window.confirm('저장하지 않은 변경 사항을 버리시겠습니까?'));
   }
   function clearEditor() {
     generation.current += 1;
@@ -151,7 +168,7 @@ export default function AdminPanel({ onStateChange }) {
   }
   function changeSection(next) {
     if (next === kind || !canLeave()) return;
-    clearEditor(); setKind(next); setSearch(''); setPage(1); setList(null); setNotice('');
+    clearEditor(); setKind(next); setSearch(''); setPage(1); setList(null); setNotice(''); setSettingsState({ dirty: false, busy: false });
   }
   async function openEditor(item) {
     if (!canLeave()) return;
@@ -225,7 +242,7 @@ export default function AdminPanel({ onStateChange }) {
     <div className="admin-shell">
       <nav className="admin-tabs" aria-label="관리 항목">
         {Object.entries(SECTIONS).map(([key, section], index) => <button type="button" key={key}
-          aria-current={kind === key ? 'page' : undefined} disabled={busy} onClick={() => changeSection(key)}>
+          aria-current={kind === key ? 'page' : undefined} disabled={working} onClick={() => changeSection(key)}>
           <span className="admin-tab-number" aria-hidden="true">0{index + 1}</span>{section.label}
         </button>)}
       </nav>
@@ -239,8 +256,9 @@ export default function AdminPanel({ onStateChange }) {
         {(authError || (authAttempted && error)) && <p id="admin-token-error" ref={feedbackRef} role="alert" className="admin-error">{authError || error}</p>}<button className="admin-primary" type="submit">인증하기</button>
       </form> : <>
         <div className="admin-section-heading"><div><h3>{config.title}</h3><p>{config.description}</p></div>
-          <button className="admin-primary" type="button" disabled={busy || opening || loading} onClick={() => openEditor(null)}><span aria-hidden="true">＋</span> {config.label} 추가</button>
+          {!config.singleton && <button className="admin-primary" type="button" disabled={busy || opening || loading} onClick={() => openEditor(null)}><span aria-hidden="true">＋</span> {config.label} 추가</button>}
         </div>
+        {config.singleton ? <SettingsPanel api={api} onStateChange={setSettingsState} /> : <>
         <div className="admin-feedback" aria-live="polite">
           {error && <div ref={feedbackRef} role="alert" className="admin-error">{error}</div>}
           {notice && <div role="status" className="admin-success">{notice}</div>}
@@ -299,7 +317,9 @@ export default function AdminPanel({ onStateChange }) {
                         <small>{draft[key] ? '목록에 없는 기존 DB도 위에서 선택 해제할 수 있습니다.' : '선택한 DB가 없습니다.'} 여러 DB를 선택할 수 있습니다.</small>
                         {fieldError && <p id={`${id}-error`} role="alert" className="admin-field-error">{fieldError}</p>}
                       </div>
-                        : type === 'textarea' || type === 'sql' ? <textarea {...props} className={type === 'sql' ? 'admin-sql' : ''} rows={['content', 'method', 'query_sql'].includes(key) ? 12 : 3} spellCheck={type === 'sql' ? false : undefined} />
+                        : type === 'folder' ? <div className="admin-input-action"><input {...props} spellCheck={false} autoComplete="off" />
+                          <button type="button" className="admin-secondary" onClick={() => setPicker(key)}>폴더 선택</button></div>
+                        : type === 'textarea' || type === 'sql' ? <textarea {...props} className={type === 'sql' ? 'admin-sql' : ''} rows={['content', 'method', 'query_sql'].includes(key) ? 12 : 3} spellCheck={type === 'sql' || ['docs', 'include', 'exclude'].includes(key) ? false : undefined} />
                           : <input {...props} type={type} autoComplete={type === 'password' ? 'new-password' : 'off'} placeholder={keepPassword ? '변경할 때만 입력하세요' : placeholder} />}
                     {type !== 'databases' && fieldError && <p id={`${id}-error`} role="alert" className="admin-field-error">{fieldError}</p>}
                     {keepPassword && <small>현재 비밀번호: {editor.has_password ? '설정됨' : '없음'}. 비워 두면 기존 값을 유지합니다.</small>}
@@ -315,8 +335,11 @@ export default function AdminPanel({ onStateChange }) {
             </form>
           </section>}
         </div>
-        <p className="admin-footnote">DB와 쿼리 설정은 저장 후 조회에 적용됩니다. 지식·방법·쿼리의 검색 색인은 서버의 다음 임베딩 동기화 후 갱신됩니다.</p>
+        <p className="admin-footnote">{kind === 'projects' ? '프로젝트는 저장 후 다음 질문부터 쓰입니다. 에이전트는 프로젝트 폴더 안의 파일과 등록한 참고 문서만 읽습니다.'
+          : 'DB와 쿼리 설정은 저장 후 조회에 적용됩니다. 지식·방법·쿼리의 검색 색인은 서버의 다음 임베딩 동기화 후 갱신됩니다.'}</p>
+        </>}
       </>}
+      {picker && <DirectoryPicker api={api} start={draft[picker]} onClose={() => setPicker(null)} onPick={path => { updateField(picker, path); setPicker(null); }} />}
     </div>
   </main>;
 }

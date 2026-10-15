@@ -1,0 +1,221 @@
+//! HTTP: /api/health, /api/chat (NDJSON progress stream or one JSON body)
+//! and /api/admin. The chat contract is the former Node server's, with an
+//! optional `conversation_id` that keeps the conversation on the server.
+
+use crate::{
+    agent::{self, Answer, Events, MAX_QUESTION_LEN, Question, UserFacing},
+    app::App,
+    text::{js_trim, strip_lone_surrogate_escapes, utf16_len},
+};
+use axum::{
+    Json, Router,
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use futures_util::StreamExt;
+use serde_json::{Value, json};
+use std::sync::{Arc, atomic::Ordering};
+use tokio_util::sync::CancellationToken;
+
+const NDJSON: &str = "application/x-ndjson";
+const SERVER_ERROR: &str = "처리 중 오류가 발생했습니다.";
+const MAX_PENDING_LOGS: usize = 1000;
+/// Request body limit of /api/chat (the former 1mb).
+const CHAT_BODY_LIMIT: usize = 1024 * 1024;
+
+pub fn router(app: Arc<App>) -> Router {
+    Router::new()
+        .route("/api/health", get(|| async { Json(json!({"ok":true})) }))
+        .route("/api/chat", post(chat).layer(DefaultBodyLimit::max(CHAT_BODY_LIMIT)))
+        .nest("/api/admin", crate::admin::router(app.clone()))
+        .fallback(|| async {
+            (StatusCode::NOT_FOUND, Json(json!({"error":"요청한 경로를 찾을 수 없습니다."})))
+        })
+        .with_state(app)
+}
+
+fn error(status: StatusCode, message: &str) -> Response {
+    (status, Json(json!({"error":message}))).into_response()
+}
+
+/// Saves a chat_log row in the background; when the management DB falls
+/// behind, new rows are skipped rather than queued without bound.
+pub fn record_chat_log(app: &Arc<App>, question: &str, answer: Option<String>, trace: Value) {
+    if app.pending_logs.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_LOGS {
+        app.pending_logs.fetch_sub(1, Ordering::AcqRel);
+        eprintln!("[chat_log] {MAX_PENDING_LOGS} rows are still being written — skipping this one; check the management DB");
+        return;
+    }
+    let app = app.clone();
+    let question = crate::text::clip_utf16(question, MAX_QUESTION_LEN).to_owned();
+    tokio::spawn(async move {
+        let config = app.config();
+        if let Err(e) =
+            crate::db::insert_chat_log(&app.db, &config.mariadb, &question, answer.as_deref(), &trace).await
+        {
+            eprintln!("[chat_log] failed to record: {e}");
+        }
+        app.pending_logs.fetch_sub(1, Ordering::AcqRel);
+    });
+}
+
+fn rejected(app: &Arc<App>, question: &str, reason: &str, length: Option<usize>) {
+    let mut trace = json!({"v":5,"outcome":"rejected","reason":reason});
+    if let Some(length) = length {
+        trace["length"] = json!(length);
+    }
+    record_chat_log(app, question, None, trace);
+}
+
+fn conversation_id(body: &Value) -> String {
+    body["conversation_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 100
+                && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("once-{}", uuid::Uuid::new_v4()))
+}
+
+fn history(body: &Value) -> Vec<(String, String)> {
+    body["history"]
+        .as_array()
+        .map(|turns| {
+            turns
+                .iter()
+                .filter_map(|t| Some((t["role"].as_str()?.to_owned(), t["text"].as_str()?.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Result<Bytes, axum::extract::rejection::BytesRejection>) -> Response {
+    let bytes = match body {
+        Ok(bytes) => bytes,
+        Err(rejection) => {
+            let too_large = rejection.status() == StatusCode::PAYLOAD_TOO_LARGE;
+            rejected(&app, "", if too_large { "body_too_large" } else { "bad_body" }, None);
+            return if too_large {
+                error(StatusCode::PAYLOAD_TOO_LARGE, "요청이 너무 큽니다. 새 대화로 다시 시도해주세요.")
+            } else {
+                error(StatusCode::BAD_REQUEST, "잘못된 요청입니다.")
+            };
+        }
+    };
+    let parsed: Option<Value> = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| serde_json::from_str(&strip_lone_surrogate_escapes(text)).ok());
+    let Some(body) = parsed.filter(Value::is_object) else {
+        rejected(&app, "", "bad_body", None);
+        return error(StatusCode::BAD_REQUEST, "잘못된 요청입니다.");
+    };
+    let Some(raw) = body["message"].as_str() else {
+        rejected(&app, "", "no_message", None);
+        return error(StatusCode::BAD_REQUEST, "message가 필요합니다.");
+    };
+    let message = js_trim(raw).to_owned();
+    if message.is_empty() {
+        rejected(&app, raw, "empty_message", None);
+        return error(StatusCode::BAD_REQUEST, "message가 필요합니다.");
+    }
+    let length = utf16_len(&message);
+    if length > MAX_QUESTION_LEN {
+        rejected(&app, &message, "too_long", Some(length));
+        return error(StatusCode::BAD_REQUEST, "질문이 너무 깁니다 (최대 2,000자).");
+    }
+    let question = Question {
+        conversation_id: conversation_id(&body),
+        message: message.clone(),
+        history: history(&body),
+    };
+    let stream = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().contains(NDJSON));
+    let cancel = app.shutdown.child_token();
+    if !stream {
+        // A dropped request (the client went away) cancels the run.
+        let _guard = cancel.clone().drop_guard();
+        let result = agent::answer(&app, question, Events::new(None), cancel.clone()).await;
+        return match finish(&app, &message, result, &cancel) {
+            Ok(done) => Json(done).into_response(),
+            Err((status, message)) => error(status, &message),
+        };
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let task_app = app.clone();
+    tokio::spawn(async move {
+        let events = Events::new(Some(tx.clone()));
+        let run = agent::answer(&task_app, question, events, cancel.clone());
+        tokio::pin!(run);
+        let result = tokio::select! {
+            result = &mut run => result,
+            // The browser closed the stream (stop button, home, timeout).
+            _ = tx.closed() => {
+                cancel.cancel();
+                run.await
+            }
+        };
+        match finish(&task_app, &message, result, &cancel) {
+            Ok(mut done) => {
+                done["type"] = json!("done");
+                let _ = tx.send(done);
+            }
+            Err((_, message)) if !cancel.is_cancelled() => {
+                let _ = tx.send(json!({"type":"error","error":message}));
+            }
+            Err(_) => {}
+        }
+    });
+    let lines = tokio_stream_from(rx).map(|event| {
+        let mut line = event.to_string();
+        line.push('\n');
+        Ok::<_, std::convert::Infallible>(Bytes::from(line))
+    });
+    let mut response = Response::new(Body::from_stream(lines));
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/x-ndjson; charset=utf-8"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-transform"));
+    headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
+    response
+}
+
+fn tokio_stream_from(mut rx: tokio::sync::mpsc::UnboundedReceiver<Value>) -> impl futures_util::Stream<Item = Value> {
+    futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))
+}
+
+/// The response body of a finished question, or the error to show; records
+/// the chat log either way.
+fn finish(app: &Arc<App>, message: &str, result: anyhow::Result<Answer>, cancel: &CancellationToken) -> Result<Value, (StatusCode, String)> {
+    match result {
+        Ok(answer) => {
+            record_chat_log(app, message, Some(answer.answer.clone()), answer.log);
+            let mut body = json!({"answer":answer.answer,"trace":answer.trace});
+            if !answer.refs.is_empty() {
+                body["refs"] = json!(answer.refs);
+            }
+            Ok(body)
+        }
+        Err(e) if cancel.is_cancelled() || e.to_string() == "cancelled" => {
+            record_chat_log(app, message, None, json!({"v":5,"outcome":"cancelled"}));
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "cancelled".into()))
+        }
+        Err(e) => {
+            let shown = match e.downcast_ref::<UserFacing>() {
+                Some(user) => user.0.clone(),
+                None => {
+                    eprintln!("[chat error] {e:#}");
+                    SERVER_ERROR.to_owned()
+                }
+            };
+            record_chat_log(app, message, None, json!({"v":5,"outcome":"error","error":format!("{e:#}")}));
+            Err((StatusCode::INTERNAL_SERVER_ERROR, shown))
+        }
+    }
+}

@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { findChrome, launchChrome, chromePort, stopProcess, killOnExit, freePort, oneTab, Page, sleep } from '../ui/driver.mjs';
-import { resolveChartData, resolveTableData } from '../../../backend/src/chart.js';
+import { resolveChartData, resolveTableData } from '../../src/answer-fill.js';
 import { NESTED_BOUNDARY_ANSWER, NESTED_LITERAL_MATH } from '../nested-boundaries-corpus.js';
 import { CELL_BLOCKS_ANSWER, CELL_CHART, CELL_LITERAL_ANSWER } from '../cell-blocks-corpus.js';
 import { MERMAID_MATH_CASES, MERMAID_MULTILINE_MATH, MERMAID_NATIVE_MATH_CASES } from '../mermaid-math-corpus.js';

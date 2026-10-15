@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Stop the backend server (macOS/Linux). SIGTERM triggers the graceful-shutdown path
-# in server.js (connection pool cleanup, etc.).
+# Stop the backend server (macOS/Linux). SIGTERM triggers the server's graceful shutdown
+# (in-flight answers finish, chat logs are written, connections close).
 cd "$(dirname "$0")"
 
 PID_FILE=.backend.pid
@@ -17,8 +17,8 @@ PID=$(cat "$PID_FILE")
 if is_ours "$PID"; then
   kill "$PID"
   echo "[backend] sent termination signal (PID $PID)."
-  # server.js has its own 10-second force-exit timer — wait slightly longer than that
-  # before force-killing from here.
+  # The wrapper force-kills the server 11 seconds after forwarding the signal — wait a
+  # little longer than that before force-killing from here.
   for _ in $(seq 1 12); do
     is_ours "$PID" || break
     sleep 1

@@ -1,4 +1,4 @@
-import { resolveChartData } from '../../backend/src/chart.js';
+import { resolveChartData } from '../src/answer-fill.js';
 
 export const CELL_CONTAINERS = [
   body => `- 부모\n  - 자식\n    ${body}\n- 다음`,

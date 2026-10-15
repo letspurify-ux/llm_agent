@@ -12,9 +12,9 @@ if errorlevel 1 (
   exit /b 0
 )
 
-REM /T: also kills the child node.exe processes running inside the window.
+REM /T: also kills the server process running inside the window.
 REM /F: force kill - Windows has no reliable way to deliver SIGTERM to a console process,
-REM     so the graceful-shutdown path in server.js (SIGTERM handler) cannot be used here.
+REM     so the graceful shutdown (on Ctrl+C or SIGTERM) cannot be used here.
 REM     Use stop.sh on macOS/Linux for a graceful stop.
 taskkill /FI "WINDOWTITLE eq %TITLE%*" /T /F >NUL
 

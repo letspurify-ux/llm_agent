@@ -7,7 +7,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { fileURLToPath } from 'node:url';
 import { REMARK_PLUGINS, REHYPE_PLUGINS } from '../../src/math.js';
-import { resolveChartData, resolveTableData } from '../../../backend/src/chart.js';
+import { resolveChartData, resolveTableData } from '../../src/answer-fill.js';
 import { MIXED_WRAPPERS } from '../mixed-content-corpus.js';
 
 const render = md => renderToStaticMarkup(React.createElement(ReactMarkdown, {
