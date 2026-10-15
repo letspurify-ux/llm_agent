@@ -15,32 +15,15 @@ if [ -f "$PID_FILE" ] && is_ours "$(cat "$PID_FILE")"; then
   exit 0
 fi
 
-# The binary carries the screen (build.rs embeds ../frontend/dist), so the screen is built
-# first: when it is missing or older than a frontend source file. A machine without npm keeps
-# the dist it has (or a prebuilt binary).
-UI=../frontend
-UI_SOURCES=("$UI/src" "$UI/index.html" "$UI/package.json" "$UI/vite.config.js" "$UI/mermaid-math-adapter.mjs")
-if [ ! -f "$UI/dist/index.html" ] || [ -n "$(find "${UI_SOURCES[@]}" -newer "$UI/dist/index.html" -print -quit 2>/dev/null)" ]; then
-  if command -v npm >/dev/null 2>&1; then
-    echo "[backend] building the screen (npm run build in frontend)..."
-    [ -d "$UI/node_modules" ] || (cd "$UI" && npm ci)
-    (cd "$UI" && npm run build)
-  elif [ ! -f "$UI/dist/index.html" ] && [ ! -x "$BINARY" ]; then
-    echo "[backend] frontend/dist not found and npm is not installed — install Node.js or copy a prebuilt binary to $BINARY."
-    exit 1
-  fi
-fi
-
-# Build when the binary is missing or older than a source file or the built screen. A machine
-# without the Rust toolchain needs a prebuilt binary at target/release/llm-agent.
-if [ ! -x "$BINARY" ] || [ -n "$(find src Cargo.toml build.rs "$UI/dist/index.html" -newer "$BINARY" -print -quit 2>/dev/null)" ]; then
-  if command -v cargo >/dev/null 2>&1; then
-    echo "[backend] building the release binary (cargo build --release)..."
-    cargo build --release
-  elif [ ! -x "$BINARY" ]; then
-    echo "[backend] $BINARY not found and cargo is not installed — install Rust (https://rustup.rs) or copy a prebuilt binary there."
-    exit 1
-  fi
+# The binary carries the screen: `cargo build --release` builds it too when frontend sources
+# changed (build.rs runs npm run build), and is quick when nothing changed. A machine without
+# the Rust toolchain needs a prebuilt binary at target/release/llm-agent.
+if command -v cargo >/dev/null 2>&1; then
+  echo "[backend] cargo build --release (builds the screen and the binary when they changed)..."
+  cargo build --release
+elif [ ! -x "$BINARY" ]; then
+  echo "[backend] $BINARY not found and cargo is not installed — install Rust (https://rustup.rs) or copy a prebuilt binary there."
+  exit 1
 fi
 
 FRESH=0

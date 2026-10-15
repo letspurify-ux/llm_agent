@@ -137,6 +137,6 @@ echo "== 앱 =="
 PORT=$(config_value server port)
 PORT=${PORT:-$(env_value backend/.env PORT)}
 echo
-echo "화면: http://localhost:${PORT:-3001}  (같은 망의 다른 PC는 http://<이 PC의 IP>:${PORT:-3001})"
+echo "화면: http://localhost:${PORT:-5173}  (같은 망의 다른 PC는 http://<이 PC의 IP>:${PORT:-5173})"
 echo "로그: backend/logs/backend.log"
 echo "중지: ./stop_all.sh"

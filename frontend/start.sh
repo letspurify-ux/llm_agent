@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the frontend dev server (macOS/Linux). If the default port (5173) is taken,
+# Start the frontend dev server (macOS/Linux). If the default port (5174) is taken,
 # vite automatically picks the next one — check the log for the actual assigned port.
 set -euo pipefail
 cd "$(dirname "$0")"

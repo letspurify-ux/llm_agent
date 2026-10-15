@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react';
 import { mermaidMathAdapter } from './mermaid-math-adapter.mjs';
 
 // 외부(다른 PC) 접속 허용. vite는 기본적으로 localhost에만 바인딩해서 같은 PC에서만 열린다 —
-// true면 모든 인터페이스(0.0.0.0)에 붙어 사내망의 다른 PC가 `http://<이 PC의 IP>:5173`으로 들어온다.
+// true면 모든 인터페이스(0.0.0.0)에 붙어 사내망의 다른 PC가 `http://<이 PC의 IP>:5174`로 들어온다.
 // 기동 로그의 Network: 줄에 그 주소가 찍히니 거기서 확인한다.
 // 다시 내 PC만으로 닫으려면 FRONTEND_HOST=localhost 로 띄운다.
 const host = process.env.FRONTEND_HOST || true;
@@ -19,6 +19,9 @@ const allowedHosts = (process.env.FRONTEND_ALLOWED_HOSTS || '')
 
 const server = {
   host,
+  // 5173은 화면을 내장한 백엔드 실행 파일의 기본 포트다(예전 화면 주소를 그대로 쓰게). 개발 서버는 그 옆에
+  // 띄운다 — 같이 떠도 부딪히지 않는다. 비어 있지 않으면 vite가 다음 번호로 옮겨 간다(기동 로그 참고).
+  port: Number(process.env.FRONTEND_PORT) || 5174,
   // 브라우저와의 웹소켓을 끈다. 켜 두면 그 연결이 끊길 때(절전 복귀, 사내 프록시의 유휴 연결 정리,
   // 개발 서버 재시작) Vite 클라이언트가 서버를 기다렸다가 페이지를 새로고침해, 화면의 대화가 통째로 사라졌다.
   // hmr: false만으로는 막히지 않는다(연결은 그대로 열리고 끊기면 새로고침한다 — 헤드리스 Chrome으로 확인).
@@ -31,7 +34,7 @@ const server = {
   // (브라우저가 아니라 이 PC가 백엔드를 부른다 — 그래서 백엔드는 외부에 열 필요도, CORS도 없다).
   // localhost가 아니라 127.0.0.1로 적는다: backend(Rust)는 IPv4로 열고, localhost를 ::1로 먼저 푸는
   // 환경에서는 프록시가 IPv6로 붙으려다 실패한다.
-  proxy: { '/api': `http://127.0.0.1:${process.env.BACKEND_PORT || 3001}` },
+  proxy: { '/api': `http://127.0.0.1:${process.env.BACKEND_PORT || 5173}` },
 };
 
 export default defineConfig({

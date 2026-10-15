@@ -376,7 +376,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            port: 3001,
+            port: 5173,
             chat_log_retention_days: 3,
         }
     }

@@ -74,7 +74,7 @@ function Get-Setting($section, $key, $envKey, $default) {
 $EmbeddingModel = Get-Setting 'embedding' 'model' 'EMBEDDING_MODEL' 'qwen3-embedding:0.6b'
 $DbHost = Get-Setting 'mariadb' 'host' 'MARIADB_HOST' 'localhost'
 $DbPort = [int](Get-Setting 'mariadb' 'port' 'MARIADB_PORT' 3306)
-$AppPort = Get-Setting 'server' 'port' 'PORT' 3001
+$AppPort = Get-Setting 'server' 'port' 'PORT' 5173
 
 # 관리 DB가 접속을 받는지는 포트로 본다 — mysqladmin은 MSI 설치에서 PATH에 없는 경우가 많다.
 function Test-Port($hostName, $port) {

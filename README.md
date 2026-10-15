@@ -184,12 +184,17 @@ docker exec -i oracle1521 sqlplus -s system/password@localhost:1521/FREEPDB1 < b
 
 ```bash
 cd backend
-./start.sh            # 화면(npm run build)과 실행 파일(cargo build --release, 처음 1~3분)을 바뀐 것만 다시 빌드해 띄운다
-# 또는 직접: (cd ../frontend && npm ci && npm run build) && cargo build --release && ./target/release/llm-agent
+./start.sh            # cargo build --release(바뀐 것만, 처음 1~3분) 뒤 실행
+# 또는 직접: cargo build --release && ./target/release/llm-agent
 ```
 
-`http://localhost:3001`이 화면이자 API다(설정 탭에서 포트를 바꿀 수 있다). Windows는 `start.bat`/`stop.bat`.
-release 빌드는 `frontend/dist`가 없으면 실패한다(빈 화면을 내보내지 않게). debug 빌드(`cargo test` 등)는 경고만 하고, 그때 `/`는 503이다.
+`cargo build --release` 하나로 화면까지 빌드된다 — `build.rs`가 화면 소스(`frontend/src`·`index.html`·`package.json`·`vite.config.js` 등)가
+`frontend/dist`보다 새것이면 `npm run build`를(처음이면 `npm ci`도) 먼저 부르고 그 결과를 넣는다. 그래서 예전 화면이 들어갈 일이 없다.
+npm이 없는 PC에서는 있는 `dist`를 그대로 쓰고, `dist`도 없으면 release 빌드가 실패한다(빈 화면을 내보내지 않게).
+debug 빌드(`cargo build`·`cargo test`)는 화면을 빌드하지 않고 있는 것만 넣는다(없으면 `/`가 503).
+화면을 고친 직후의 release 빌드는 다음 번에 한 번 더 컴파일한다(빌드 도중 바뀐 `dist`를 cargo가 본다) — 그 뒤로는 즉시 끝난다.
+
+`http://localhost:5173`이 화면이자 API다(예전 화면 주소 그대로, 설정 탭에서 포트를 바꿀 수 있다). Windows는 `start.bat`/`stop.bat`.
 
 **배포** — 빌드한 PC에서 실행 파일 하나만 옮기면 된다(Rust·Node.js 불필요). 옮긴 PC에는 Instant Client와,
 실행 파일 옆(작업 폴더)의 `config.toml`·`config.credentials.json`(없으면 첫 기동에 `.env`에서 만든다)과 대상 DB 비밀번호용 `.env`만 둔다.
@@ -235,7 +240,7 @@ OS 검색 경로에 두지 않았다면 설정 탭의 **Instant Client 폴더**�
 cd frontend && npm install && npm run dev
 ```
 
-`http://localhost:5173` 접속 (`/api`는 vite proxy로 백엔드(`127.0.0.1:3001`, 포트를 바꿨다면 `BACKEND_PORT`)에 전달).
+`http://localhost:5174` 접속(`FRONTEND_PORT`로 바꾼다. `/api`는 vite proxy로 백엔드(`127.0.0.1:5173`, 포트를 바꿨다면 `BACKEND_PORT`)에 전달).
 개발 서버는 브라우저와의 웹소켓(`server.ws`)을 꺼 두었다 — 켜 두면 연결이 끊길 때(절전 복귀, 사내 프록시의 유휴 연결 정리,
 서버 재시작) Vite가 페이지를 새로고침해 대화가 사라졌다. 그래서 코드를 고치면 브라우저를 직접 새로고침한다.
 화면의 대화는 그 탭의 `sessionStorage`에 저장돼, 같은 탭을 새로고침하면 말풍선·이력·대화 번호가 되살아난다(새 탭은 새 대화).
@@ -344,8 +349,8 @@ PUT/DELETE에는 해당 항목 GET 응답의 `ETag`를 `If-Match` 헤더로 보�
 
 #### 다른 PC에서 접속하기
 
-실행 파일은 모든 인터페이스(`0.0.0.0`)에 바인딩되므로 같은 망의 다른 PC에서 `http://<이 PC의 IP>:3001`(설정 탭의 서버 포트)로 들어온다.
-아래 변수는 Vite 개발 서버(5173)로 열 때의 것이다 — 개발 서버는 모든 인터페이스에 바인딩되고, 백엔드는 vite가 `127.0.0.1:3001`로 대신 호출한다.
+실행 파일은 모든 인터페이스(`0.0.0.0`)에 바인딩되므로 같은 망의 다른 PC에서 `http://<이 PC의 IP>:5173`(설정 탭의 서버 포트)로 들어온다.
+아래 변수는 Vite 개발 서버(5174)로 열 때의 것이다 — 개발 서버는 모든 인터페이스에 바인딩되고, 백엔드는 vite가 `127.0.0.1:5173`으로 대신 호출한다.
 
 | 변수 | 용도 |
 |---|---|
@@ -527,7 +532,7 @@ Oracle은 설정 탭의 mock을 켜면 데모 쿼리 5개가 고정된 행을 �
 앞부분이 라운드 사이에 같은 토큰열로 남게(vLLM·OpenRouter prefix caching) 하고, 시스템 프롬프트에는 요청마다 달라지는 값을 싣지 않는다.
 
 ```bash
-curl -s localhost:3001/api/chat -H 'Content-Type: application/json' -d '{"message":"홍길동 고객 주문 상태 알려줘"}'
+curl -s localhost:5173/api/chat -H 'Content-Type: application/json' -d '{"message":"홍길동 고객 주문 상태 알려줘"}'
 ```
 
 ### 답변 안의 표 — 참조로 적고 화면이 채운다
@@ -561,7 +566,7 @@ limit: 20
 그 JSON과 같다.
 
 ```bash
-curl -sN localhost:3001/api/chat -H 'Content-Type: application/json' -H 'Accept: application/x-ndjson' \
+curl -sN localhost:5173/api/chat -H 'Content-Type: application/json' -H 'Accept: application/x-ndjson' \
   -d '{"message":"BATCH001 작업 상태 알려줘","conversation_id":"demo-1"}'
 # {"type":"search","id":1,"text":"BATCH001 배치 상태","targets":["qa_method","query"]}
 # {"type":"search_done","id":1,"text":"…","targets":[…],"hits":{"qaMethods":1,"queries":3}}
