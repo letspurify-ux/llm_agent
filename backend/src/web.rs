@@ -3,7 +3,7 @@
 //! optional `conversation_id` that keeps the conversation on the server.
 
 use crate::{
-    agent::{self, Answer, Events, MAX_QUESTION_LEN, Question, UserFacing},
+    agent::{self, Answer, Events, MAX_QUESTION_LEN, ONE_SHOT_PREFIX, Question, UserFacing},
     app::App,
     text::{js_trim, strip_lone_surrogate_escapes, utf16_len},
 };
@@ -80,7 +80,7 @@ fn conversation_id(body: &Value) -> String {
                 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         })
         .map(str::to_owned)
-        .unwrap_or_else(|| format!("once-{}", uuid::Uuid::new_v4()))
+        .unwrap_or_else(|| format!("{ONE_SHOT_PREFIX}{}", uuid::Uuid::new_v4()))
 }
 
 fn history(body: &Value) -> Vec<(String, String)> {
@@ -140,12 +140,22 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Result<Byte
         .is_some_and(|v| v.to_ascii_lowercase().contains(NDJSON));
     let cancel = app.shutdown.child_token();
     if !stream {
-        // A dropped request (the client went away) cancels the run.
+        // The run has a task of its own, as in the stream below: a request
+        // the client drops cancels it (the guard), and it then stops at its
+        // next checkpoint and records the chat log. Dropped with the request
+        // instead, it would stop mid-await — with a tool batch holding the
+        // conversation's history on its thread, the conversation would keep
+        // an empty one.
         let _guard = cancel.clone().drop_guard();
-        let result = agent::answer(&app, question, Events::new(None), cancel.clone()).await;
-        return match finish(&app, &message, result, &cancel) {
-            Ok(done) => Json(done).into_response(),
-            Err((status, message)) => error(status, &message),
+        let task_app = app.clone();
+        let run = tokio::spawn(async move {
+            let result = agent::answer(&task_app, question, Events::new(None), cancel.clone()).await;
+            finish(&task_app, &message, result, &cancel)
+        });
+        return match run.await {
+            Ok(Ok(done)) => Json(done).into_response(),
+            Ok(Err((status, message))) => error(status, &message),
+            Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, SERVER_ERROR),
         };
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Value>();

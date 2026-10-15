@@ -30,6 +30,11 @@ pub const MAX_CHAT_TURNS: usize = 6;
 pub const MAX_CHAT_LEN: usize = 1500;
 /// Characters (UTF-16) of a question.
 pub const MAX_QUESTION_LEN: usize = 2000;
+/// Prefix of the conversation a request without `conversation_id` gets
+/// (web.rs). Client ids cannot contain ':', so none is taken for one. Nothing
+/// can continue it, so it is dropped when its run ends rather than kept for
+/// the idle time, where it would also push real conversations out.
+pub const ONE_SHOT_PREFIX: &str = "once:";
 /// Seconds kept for the final answer when time runs short.
 const FINAL_RESERVE_SECS: u64 = 45;
 const PROVIDER_WAITS: [u64; 2] = [5, 15];
@@ -97,20 +102,21 @@ pub async fn answer(app: &Arc<App>, question: Question, events: Events, cancel: 
         config.agent.max_sessions,
         cancel.clone(),
     );
-    let result = async {
-        let mut conversation = tokio::select! {
-            guard = claim.conversation.lock() => guard,
-            _ = cancel.cancelled() => bail!("cancelled"),
-        };
-        conversation.last_used = Instant::now();
-        if !claim.existed {
-            restore(&mut conversation, &question.history);
-        }
-        run(app, &config, &mut conversation, &question.message, &events, &cancel).await
+    // Dropped last (after the conversation's lock), on every way out.
+    let _release = app.sessions.release_on_drop(
+        &question.conversation_id,
+        claim.run,
+        question.conversation_id.starts_with(ONE_SHOT_PREFIX),
+    );
+    let mut conversation = tokio::select! {
+        guard = claim.conversation.lock() => guard,
+        _ = cancel.cancelled() => bail!("cancelled"),
+    };
+    conversation.last_used = Instant::now();
+    if !claim.existed {
+        restore(&mut conversation, &question.history);
     }
-    .await;
-    app.sessions.finish(&question.conversation_id, claim.run);
-    result
+    run(app, &config, &mut conversation, &question.message, &events, &cancel).await
 }
 
 /// A conversation the server lost (restart, expiry) continues from the
@@ -585,6 +591,10 @@ async fn execute_batch(
         }
         clipped
     };
+    // Restored if the source thread dies (a panic past the tool's own guard):
+    // the copies it holds die with it, and the conversation would go on with
+    // an empty history. Bundles share their messages, so this copy is cheap.
+    let backup = (c.file_cursors.clone(), c.list_cursor_scopes.clone(), c.history.clone());
     let mut cursors = std::mem::take(&mut c.file_cursors);
     let mut scopes = std::mem::take(&mut c.list_cursor_scopes);
     let mut history = std::mem::take(&mut c.history);
@@ -706,7 +716,7 @@ async fn execute_batch(
     }
     let (outputs, cursors, scopes, history) = match source_task.await {
         Ok(done) => done,
-        Err(_) => (vec![], BTreeMap::new(), VecDeque::new(), Default::default()),
+        Err(_) => (vec![], backup.0, backup.1, backup.2),
     };
     c.file_cursors = cursors;
     c.list_cursor_scopes = scopes;

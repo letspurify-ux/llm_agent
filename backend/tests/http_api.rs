@@ -311,3 +311,79 @@ async fn chat_streams_ndjson_and_logs_each_outcome() {
     assert_eq!(db.scalar("SELECT COUNT(*) FROM chat_log WHERE JSON_VALUE(trace, '$.outcome') = 'rejected'"), "3");
     assert_eq!(db.scalar("SELECT JSON_VALUE(trace, '$.v') FROM chat_log ORDER BY seq DESC LIMIT 1"), "5");
 }
+
+async fn eventually(mut check: impl FnMut() -> bool) -> bool {
+    for _ in 0..100 {
+        if check() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// A run lets go of its conversation however its request ends, and a
+/// conversation nothing can continue is not kept. Runs without MariaDB (the
+/// chat log is checked when one is configured).
+#[tokio::test]
+async fn conversations_are_released_when_requests_end() {
+    let db = TestDb::create("release");
+    let config = db.as_ref().map(TestDb::config).unwrap_or_else(|| {
+        let mut config = llm_agent::config::Config::default();
+        config.mariadb.port = 9;
+        config.mariadb.user = "nobody".into();
+        config.llm.base_url = "http://127.0.0.1:9/v1".into();
+        config.llm.model = "gpt-4o".into();
+        config
+    });
+    let llm = Scripted::new(vec![]);
+    llm.hang.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (app, _dir) = app(config, llm.clone());
+    let router = web::router(app.clone());
+    let chat = |body: Value, stream: bool| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/chat")
+            .header(header::CONTENT_TYPE, "application/json");
+        if stream {
+            request = request.header(header::ACCEPT, "application/x-ndjson");
+        }
+        request.body(Body::from(body.to_string())).unwrap()
+    };
+    let idle = std::time::Duration::ZERO;
+
+    // The client goes away while the model is answering: the plain request's
+    // handler is dropped, the stream's body is dropped.
+    let pending = tokio::spawn(router.clone().oneshot(chat(json!({"conversation_id":"plain","message":"질문"}), false)));
+    assert!(eventually(|| llm.requests().len() == 1).await);
+    pending.abort();
+    let response = router.clone().oneshot(chat(json!({"conversation_id":"stream","message":"질문"}), true)).await.unwrap();
+    assert!(eventually(|| llm.requests().len() == 2).await);
+    drop(response);
+    assert!(
+        eventually(|| {
+            app.sessions.sweep(idle);
+            app.sessions.len() == 0
+        })
+        .await,
+        "a run whose client left still holds its conversation"
+    );
+
+    // A request without conversation_id leaves nothing behind; one with an
+    // id is kept for its next question.
+    llm.hang.store(false, std::sync::atomic::Ordering::Relaxed);
+    llm.push(vec![text("답 하나"), text("답 둘")]);
+    let once = router.clone().oneshot(chat(json!({"message":"질문"}), false)).await.unwrap();
+    assert_eq!(once.status(), StatusCode::OK);
+    assert_eq!(app.sessions.len(), 0);
+    let kept = router.clone().oneshot(chat(json!({"conversation_id":"kept","message":"질문"}), false)).await.unwrap();
+    assert_eq!(kept.status(), StatusCode::OK);
+    assert_eq!(app.sessions.len(), 1);
+
+    if let Some(db) = db {
+        assert!(
+            eventually(|| db.scalar("SELECT COUNT(*) FROM chat_log WHERE JSON_VALUE(trace, '$.outcome') = 'cancelled'") == "2").await,
+            "both dropped requests are logged as cancelled"
+        );
+    }
+}

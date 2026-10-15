@@ -139,9 +139,22 @@ async fn wait_for_signal() {
     }
 }
 
-/// Embedding warm-up, the embedding sync (at start and every interval) and
-/// the chat log retention cleanup (at start and hourly).
+/// Embedding warm-up, the embedding sync (at start and every interval), the
+/// chat log retention cleanup (at start and hourly), and every minute the
+/// release of idle conversations and Oracle pools.
 fn background_jobs(app: &Arc<App>) {
+    let housekeeping = app.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = housekeeping.shutdown.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+            }
+            let idle = housekeeping.config().agent.session_idle_minutes.saturating_mul(60);
+            housekeeping.sessions.sweep(Duration::from_secs(idle));
+            housekeeping.oracle.close_idle(llm_agent::oracle::POOL_IDLE);
+        }
+    });
     let warm = app.clone();
     tokio::spawn(async move {
         let config = warm.config();

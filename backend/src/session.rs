@@ -196,6 +196,10 @@ impl Conversation {
             }
             total -= self.results.remove(&oldest).map_or(0, |r| r.bytes);
         }
+        // A repeat is refused in favour of result_read on the earlier step;
+        // once that step's rows are gone the query must be allowed to run
+        // again (and the map stays as small as the results it points to).
+        self.executed.retain(|_, kept| self.results.contains_key(kept));
         step
     }
     /// Reserves a step number for a query that failed, so step numbers in the
@@ -215,12 +219,37 @@ struct Entry {
     last_used: Instant,
 }
 
-/// A run's claim on a conversation, released with `SessionStore::finish`.
+/// A run's claim on a conversation, released with `SessionStore::finish`
+/// (or `SessionStore::release_on_drop`).
 pub struct Claim {
     pub conversation: Arc<tokio::sync::Mutex<Conversation>>,
     /// Whether the conversation already existed (its history is current).
     pub existed: bool,
     pub run: u64,
+}
+
+/// Releases a run's claim when dropped, however the run ends: returned,
+/// failed, dropped mid-await or panicked. A claim left behind keeps its
+/// conversation "running", which neither expiry nor the count limit removes.
+/// A one-shot conversation (nothing can continue it) is removed instead.
+pub struct Release<'a> {
+    store: &'a SessionStore,
+    id: String,
+    run: u64,
+    one_shot: bool,
+}
+impl Drop for Release<'_> {
+    fn drop(&mut self) {
+        if self.one_shot {
+            self.store.close(&self.id, self.run);
+        } else {
+            self.store.finish(&self.id, self.run);
+        }
+    }
+}
+
+fn expired(entry: &Entry, now: Instant, idle: std::time::Duration) -> bool {
+    entry.running.is_none() && now.duration_since(entry.last_used) >= idle
 }
 
 /// Conversations by the id the browser sends. Idle conversations expire and
@@ -245,9 +274,7 @@ impl SessionStore {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
-        entries.retain(|key, entry| {
-            key == id || entry.running.is_some() || now.duration_since(entry.last_used) < idle
-        });
+        entries.retain(|key, entry| key == id || !expired(entry, now, idle));
         let existed = entries.contains_key(id);
         if !existed {
             while entries.len() >= max.max(1) {
@@ -287,6 +314,38 @@ impl SessionStore {
             }
             entry.last_used = Instant::now();
         }
+    }
+
+    /// Removes the conversation unless a newer run took it.
+    pub fn close(&self, id: &str, run: u64) {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if entries
+            .get(id)
+            .is_some_and(|entry| entry.running.as_ref().is_none_or(|(owner, _)| *owner == run))
+        {
+            entries.remove(id);
+        }
+    }
+
+    /// A guard that releases the claim when dropped (see `Release`).
+    pub fn release_on_drop(&self, id: &str, run: u64, one_shot: bool) -> Release<'_> {
+        Release {
+            store: self,
+            id: id.to_owned(),
+            run,
+            one_shot,
+        }
+    }
+
+    /// Drops the conversations idle for `idle`. `open` does the same when a
+    /// question arrives; this runs on a timer so a quiet server does not keep
+    /// every conversation's history and rows past the retention time.
+    pub fn sweep(&self, idle: std::time::Duration) -> usize {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let before = entries.len();
+        let now = Instant::now();
+        entries.retain(|_, entry| !expired(entry, now, idle));
+        before - entries.len()
     }
 
     pub fn len(&self) -> usize {
@@ -345,9 +404,39 @@ mod tests {
             bytes,
         };
         assert_eq!(c.store_result(result(60), 100), 1);
+        c.executed.insert("q-a".into(), 1);
         assert_eq!(c.reserve_step(), 2);
         assert_eq!(c.store_result(result(60), 100), 3);
+        c.executed.insert("q-b".into(), 3);
         assert!(!c.results.contains_key(&1));
         assert!(c.results.contains_key(&3));
+        // The dropped step's call may run again; the kept one is still refused.
+        assert_eq!(c.executed.keys().collect::<Vec<_>>(), ["q-b"]);
+    }
+
+    #[test]
+    fn claims_are_released_however_the_run_ends() {
+        let store = SessionStore::default();
+        let hour = std::time::Duration::from_secs(3600);
+        // A run dropped mid-way (its guard dropped, finish never called)
+        // no longer pins its conversation as running.
+        let claim = store.open("c1", hour, 10, CancellationToken::new());
+        drop(store.release_on_drop("c1", claim.run, false));
+        assert_eq!(store.sweep(std::time::Duration::ZERO), 1);
+        // A run still in progress keeps its conversation through a sweep.
+        let running = store.open("c2", hour, 10, CancellationToken::new());
+        assert_eq!(store.sweep(std::time::Duration::ZERO), 0);
+        // A newer run's claim survives the older run's release.
+        let newer = store.open("c2", hour, 10, CancellationToken::new());
+        drop(store.release_on_drop("c2", running.run, false));
+        assert_eq!(store.sweep(std::time::Duration::ZERO), 0);
+        drop(store.release_on_drop("c2", newer.run, false));
+        assert_eq!(store.sweep(hour), 0, "kept until idle");
+        assert_eq!(store.len(), 1);
+        // A one-shot conversation goes as soon as its run ends.
+        let once = store.open("once:1", hour, 10, CancellationToken::new());
+        assert_eq!(store.len(), 2);
+        drop(store.release_on_drop("once:1", once.run, true));
+        assert_eq!(store.len(), 1);
     }
 }

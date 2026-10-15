@@ -88,4 +88,14 @@ async fn queries_routines_types_and_cancellation() {
     // The pool still works after a break.
     let out = run(registry("today_date").await, json!({}), CancellationToken::new()).await.unwrap();
     assert!(out.rows[0]["TODAY"].is_string());
+
+    // A pool in use is kept; an idle one is closed, and the next run opens
+    // a new one.
+    assert_eq!(app.oracle.pool_count(), 1);
+    assert_eq!(app.oracle.close_idle(llm_agent::oracle::POOL_IDLE), 0);
+    assert_eq!(app.oracle.close_idle(std::time::Duration::ZERO), 1);
+    assert_eq!(app.oracle.pool_count(), 0);
+    let out = run(registry("today_date").await, json!({}), CancellationToken::new()).await.unwrap();
+    assert!(out.rows[0]["TODAY"].is_string());
+    assert_eq!(app.oracle.pool_count(), 1);
 }

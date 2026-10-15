@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -29,6 +29,9 @@ pub const MAX_CELL_LEN: usize = 200;
 const MAX_TARGET_DB_NAME_LEN: usize = 200;
 const MAX_DB_LIST_LEN: usize = 200;
 const POOL_MAX: u32 = 8;
+/// A pool no run has used this long is closed (`Oracle::close_idle`), the
+/// same 5 minutes its idle sessions are kept for.
+pub const POOL_IDLE: Duration = Duration::from_secs(300);
 
 const NLS_SESSION_FORMATS: &str = "ALTER SESSION SET NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS' NLS_NUMERIC_CHARACTERS='.,' NLS_TIMESTAMP_FORMAT='YYYY-MM-DD HH24:MI:SS.FF3' NLS_TIMESTAMP_TZ_FORMAT='YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM'";
 const PREPARE_DBMS_OUTPUT: &str = "BEGIN DBMS_OUTPUT.DISABLE; DBMS_OUTPUT.ENABLE(NULL); END;";
@@ -52,6 +55,7 @@ pub struct Outcome {
 struct PoolEntry {
     fingerprint: String,
     pool: Arc<oracle::pool::Pool>,
+    last_used: Instant,
 }
 
 #[derive(Default)]
@@ -247,9 +251,10 @@ impl Oracle {
         }
         let fingerprint = hex::encode(hash.finalize());
         let mut pools = self.pools.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(entry) = pools.get(&name)
+        if let Some(entry) = pools.get_mut(&name)
             && entry.fingerprint == fingerprint
         {
+            entry.last_used = Instant::now();
             return Ok(entry.pool.clone());
         }
         let pool = oracle::pool::PoolBuilder::new(
@@ -265,16 +270,58 @@ impl Oracle {
         .get_mode(oracle::pool::GetMode::TimedWait(Duration::from_millis(cfg.timeout_ms)))
         .build()?;
         let pool = Arc::new(pool);
-        if let Some(old) = pools.insert(name, PoolEntry { fingerprint, pool: pool.clone() }) {
-            // Requests still holding the old pool finish on their connections.
-            std::thread::spawn(move || {
-                if let Ok(old) = Arc::try_unwrap(old.pool) {
-                    let _ = old.close(&oracle::pool::CloseMode::Default);
-                }
-            });
+        let entry = PoolEntry {
+            fingerprint,
+            pool: pool.clone(),
+            last_used: Instant::now(),
+        };
+        if let Some(old) = pools.insert(name, entry) {
+            close_later(vec![old.pool]);
         }
         Ok(pool)
     }
+
+    /// Closes the pools no run has used for `idle`. Closing frees their
+    /// sessions on the target DB whatever the client library does with idle
+    /// sessions, and drops the pools of renamed or deleted registrations,
+    /// which nothing would use again.
+    pub fn close_idle(&self, idle: Duration) -> usize {
+        let now = Instant::now();
+        let mut stale = vec![];
+        self.pools
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|_, entry| {
+                let keep = now.duration_since(entry.last_used) < idle;
+                if !keep {
+                    stale.push(entry.pool.clone());
+                }
+                keep
+            });
+        let closed = stale.len();
+        if closed > 0 {
+            close_later(stale);
+        }
+        closed
+    }
+
+    /// Pools currently kept (one per target registration in use).
+    pub fn pool_count(&self) -> usize {
+        self.pools.lock().map_or(0, |pools| pools.len())
+    }
+}
+
+/// Closes pools on a thread of their own (closing waits on the network). A
+/// pool a run still holds closes when the run lets go of it: the client
+/// library destroys a pool when its last reference goes.
+fn close_later(pools: Vec<Arc<oracle::pool::Pool>>) {
+    std::thread::spawn(move || {
+        for pool in pools {
+            if let Ok(pool) = Arc::try_unwrap(pool) {
+                let _ = pool.close(&oracle::pool::CloseMode::Default);
+            }
+        }
+    });
 }
 
 /// A bind value by exact key, then by Oracle's case-insensitive name.
