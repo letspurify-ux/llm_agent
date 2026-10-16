@@ -65,6 +65,9 @@ const EMPTY_REPLIES: &str = "모델이 빈 응답을 반복해 답변을 만들�
 /// a larger limit or less reasoning does.
 const OUTPUT_SPENT: &str = "모델이 출력 한도에 닿을 때까지 답변을 시작하지 못했습니다. 추론 모델이면 설정에서 출력 한도를 늘리거나 추론 강도를 낮춰주세요.";
 const LENGTH_CONTINUATIONS: usize = 2;
+/// Responses in a row whose tool calls could not be used.
+const UNUSABLE_RETRIES: usize = 2;
+const UNUSABLE_CALLS: &str = "모델이 쓸 수 없는 도구 호출을 거듭해 답변을 마무리하지 못했습니다. 잠시 후 다시 시도하거나 다른 모델을 써 보세요.";
 
 pub struct Question {
     pub conversation_id: String,
@@ -195,6 +198,7 @@ async fn run(
     let mut withheld = 0usize;
     let mut empty = 0usize;
     let mut outages = 0usize;
+    let mut unusable = 0usize;
     let mut partial: Vec<String> = vec![];
     let mut notice: Option<String> = None;
     let mut event_id = 0u64;
@@ -447,6 +451,33 @@ async fn run(
                     }
                     bail!(too_long(true, !only_question));
                 }
+                // Tool calls that cannot be used (arguments that are not one
+                // JSON object, an empty or repeated call ID, too many calls):
+                // nothing ran. The client asks again only while none of the
+                // response's text has gone out, so one that wrote first (a
+                // sentence before its calls) ended the question; it is asked
+                // again here, told what was wrong.
+                let message = error.to_string();
+                if crate::llm::unusable_tool_calls(&message) {
+                    if unusable < UNUSABLE_RETRIES {
+                        unusable += 1;
+                        discard();
+                        let detail = clip_utf16(&message, 300);
+                        notice = Some(if continuing {
+                            format!("이전 응답은 쓸 수 없는 도구 호출로 끝났다({detail}). 답변을 이어 쓰는 중이라 도구를 쓸 수 없다. 끊긴 곳에서 바로 이어 써라.")
+                        } else if withheld_tools {
+                            format!("이전 응답은 쓸 수 없는 도구 호출로 끝났다({detail}). 도구를 더 쓸 수 없다. 지금까지 확보한 근거로 최종 답변만 써라.")
+                        } else {
+                            format!("이전 응답의 도구 호출은 쓸 수 없어 하나도 실행되지 않았다({detail}). 필요한 호출을 올바른 인수로 다시 하라.")
+                        });
+                        continue;
+                    }
+                    if continuing {
+                        break written;
+                    }
+                    discard();
+                    bail!(UserFacing(UNUSABLE_CALLS.into()));
+                }
                 // The provider or the connection failed: asked again after a
                 // wait, what this response showed taken back. A stream cut
                 // while it wrote is no reason to end the question, though
@@ -483,6 +514,7 @@ async fn run(
             }
         };
         outages = 0;
+        unusable = 0;
         let usage = completion.usage.clone();
         if let Some(usage) = &usage {
             // The provider counted the request as it was sent: without the

@@ -2409,3 +2409,47 @@ async fn a_stream_cut_while_it_writes_is_asked_again() {
     let kept: Vec<Value> = claim.conversation.lock().await.history.active();
     assert_eq!(kept.iter().filter(|m| m["role"] == "assistant").map(|m| m["content"].clone()).collect::<Vec<_>>(), [json!("다시 쓴 답")]);
 }
+
+/// A model that writes a sentence, then sends tool calls the client cannot
+/// use, `broken` times, then answers.
+struct WritesThenBreaksItsCalls {
+    broken: usize,
+    requests: std::sync::Mutex<Vec<Value>>,
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for WritesThenBreaksItsCalls {
+    async fn complete(&self, request: Value, _config: &llm_agent::config::LlmConfig, _c: CancellationToken, delta: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        let n = {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request);
+            requests.len() - 1
+        };
+        if n < self.broken {
+            let _ = delta.send("찾아보겠습니다. ".into()).await;
+            anyhow::bail!("invalid_tool_arguments: search arguments are not one complete JSON object (EOF while parsing an object at line 1 column 12); use double-quoted property names and close every string, array and object");
+        }
+        let answer = "고친 답";
+        let _ = delta.send(answer.into()).await;
+        Ok(text(answer))
+    }
+}
+
+/// AB: tool calls the client could not use after the response had written
+/// a sentence ended the question with "처리 중 오류가 발생했습니다": the
+/// client asks again only while none of the text has gone out.
+#[tokio::test]
+async fn unusable_calls_after_a_sentence_are_asked_for_again() {
+    let llm = std::sync::Arc::new(WritesThenBreaksItsCalls { broken: 1, requests: Default::default() });
+    let (fixed, _dir) = app(no_db("gpt-4o"), llm.clone());
+    let (result, events) = ask(&fixed, "ab1", "질문", vec![]).await;
+    assert_eq!(result.map(|a| a.answer).map_err(|e| e.to_string()), Ok("고친 답".to_owned()));
+    assert_eq!(preview(&events), "고친 답", "the sentence was taken back: {events:?}");
+    let notice = state_of(&llm.requests.lock().unwrap()[1])["run_guidance"]["notice"].as_str().unwrap().to_owned();
+    assert!(notice.contains("실행되지 않았다") && notice.contains("not one complete JSON object"), "{notice}");
+    // Again and again: the question ends with a message for the user.
+    let llm = std::sync::Arc::new(WritesThenBreaksItsCalls { broken: 9, requests: Default::default() });
+    let (broken, _broken_dir) = app(no_db("gpt-4o"), llm.clone());
+    let error = ask(&broken, "ab2", "질문", vec![]).await.0.err().unwrap();
+    assert!(error.downcast_ref::<agent::UserFacing>().is_some_and(|e| e.0.contains("도구 호출")), "{error}");
+    assert_eq!(llm.requests.lock().unwrap().len(), 3, "two more requests");
+}

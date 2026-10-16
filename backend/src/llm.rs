@@ -69,6 +69,8 @@ pub enum AttemptAction {
     /// Withheld tools sent again without their definitions, for a provider
     /// that refuses tool_choice "none".
     ToolChoiceFallback,
+    /// Sent again without an optional parameter the provider refused by name.
+    ParameterFallback,
     Stop,
 }
 
@@ -321,6 +323,73 @@ fn apply_thinking_settings(request: &mut Value, c: &Config) {
     }
 }
 
+/// Request parameters a server may not know. They are left out for a server
+/// that refuses one by name, which `apply_optional_parameters` remembers.
+const OPTIONAL_PARAMETERS: [&str; 2] = ["reasoning_effort", "stream_options"];
+
+/// Endpoints (base URL and model) with a parameter they refused by name and
+/// then answered without.
+static OPTIONAL_PARAMETER_REJECTED: std::sync::Mutex<SchemaCache> =
+    std::sync::Mutex::new(SchemaCache(VecDeque::new()));
+
+fn optional_parameter_key(c: &Config, parameter: &str) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    for part in [c.base_url.as_str(), c.model.as_str(), parameter] {
+        hash.update(part.len().to_le_bytes());
+        hash.update(part.as_bytes());
+    }
+    hash.finalize().into()
+}
+
+/// The thinking settings and usage request on `request`, without what the
+/// endpoint refused before.
+fn apply_optional_parameters(request: &mut Value, c: &Config, stream: bool) {
+    if stream && c.stream_usage {
+        request["stream_options"] = json!({"include_usage":true});
+    }
+    apply_thinking_settings(request, c);
+    if let (Some(fields), Ok(mut rejected)) = (request.as_object_mut(), OPTIONAL_PARAMETER_REJECTED.lock()) {
+        for parameter in OPTIONAL_PARAMETERS {
+            if fields.contains_key(parameter) && rejected.contains(&optional_parameter_key(c, parameter)) {
+                fields.remove(parameter);
+            }
+        }
+    }
+}
+
+/// The optional parameter of `request` a refusal names: an HTTP 400 or 422
+/// such as "Unrecognized request argument supplied: reasoning_effort" or
+/// "Unsupported parameter: 'reasoning_effort' is not supported with this
+/// model". The request is sent again without it.
+fn rejected_parameter(error: &str, request: &Value) -> Option<&'static str> {
+    if !(error.starts_with("http_400:") || error.starts_with("http_422:")) || context_overflow(error) {
+        return None;
+    }
+    let error = error.to_ascii_lowercase();
+    OPTIONAL_PARAMETERS
+        .into_iter()
+        .find(|parameter| request.get(parameter).is_some() && error.contains(parameter))
+}
+
+/// Remembers the parameters a request had to leave out to be answered.
+fn remember_rejected_parameters(c: &Config, parameters: &[&str]) {
+    if let Ok(mut rejected) = OPTIONAL_PARAMETER_REJECTED.lock() {
+        for parameter in parameters {
+            rejected.insert(optional_parameter_key(c, parameter));
+        }
+    }
+}
+
+/// A response whose tool calls cannot be used (arguments that are not one
+/// JSON object, an empty or repeated call ID or name, too many calls):
+/// nothing of it runs. The client sends the request again only while none
+/// of its text has gone out; the caller may take the text back and ask again.
+pub fn unusable_tool_calls(error: &str) -> bool {
+    ["invalid_tool_arguments:", "malformed_tool_call:", "tool_call_batch_limit:"]
+        .iter()
+        .any(|code| error.starts_with(code))
+}
+
 fn response_format_rejected(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     // OpenAI-compatible servers do not agree on the error body: some name
@@ -565,10 +634,6 @@ impl OpenAiClient {
         } else {
             "max_completion_tokens"
         }] = json!(c.output_tokens);
-        if c.stream_usage {
-            request["stream_options"] = json!({"include_usage":true});
-        }
-        apply_thinking_settings(&mut request, c);
         let mut req = Self::client(c)?.post(c.completion_url()?).json(&request);
         if let Some(key) = Self::key(c) {
             req = req.bearer_auth(key)
@@ -840,16 +905,35 @@ impl OpenAiClient {
         } else {
             "max_completion_tokens"
         }] = json!(c.output_tokens);
-        apply_thinking_settings(&mut body, c);
-        let mut req = Self::client(c)?.post(c.completion_url()?).json(&body);
-        if let Some(k) = Self::key(c) {
-            req = req.bearer_auth(k)
-        }
-        let plain =
-            tokio::time::timeout(Duration::from_secs(c.request_timeout_secs), req.send()).await??;
-        if !plain.status().is_success() {
-            bail!("plain response probe failed: {}", plain.status());
-        }
+        apply_optional_parameters(&mut body, c, false);
+        let mut left_out: Vec<&str> = vec![];
+        let plain = loop {
+            let mut req = Self::client(c)?.post(c.completion_url()?).json(&body);
+            if let Some(k) = Self::key(c) {
+                req = req.bearer_auth(k)
+            }
+            let plain =
+                tokio::time::timeout(Duration::from_secs(c.request_timeout_secs), req.send()).await??;
+            if plain.status().is_success() {
+                break plain;
+            }
+            let status = plain.status();
+            let detail = tokio::time::timeout(Duration::from_secs(c.request_timeout_secs), plain.bytes())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .map(|bytes| String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_ERROR_BODY_BYTES)]).chars().take(1000).collect::<String>())
+                .unwrap_or_default();
+            // As a chat request does: an optional parameter refused by name
+            // is left out.
+            if let Some(parameter) = rejected_parameter(&format!("http_{}: {detail}", status.as_u16()), &body) {
+                body.as_object_mut().unwrap().remove(parameter);
+                left_out.push(parameter);
+                continue;
+            }
+            bail!("plain response probe failed: {status} {}", detail.chars().take(300).collect::<String>());
+        };
+        remember_rejected_parameters(c, &left_out);
         // HTTP 200 alone can be an HTML proxy page or a provider error. Read
         // and validate the plain answer before testing streaming/tool support.
         let mut stream = plain.bytes_stream();
@@ -953,6 +1037,8 @@ impl LlmClient for OpenAiClient {
         if format_rejected && let Some(fields) = request.as_object_mut() {
             fields.remove("response_format");
         }
+        apply_optional_parameters(&mut request, c, true);
+        let mut parameters_left_out: Vec<&str> = vec![];
         let withheld = withholds_tools(&request);
         if withheld
             && TOOL_CHOICE_NONE_UNSUPPORTED
@@ -1009,6 +1095,7 @@ impl LlmClient for OpenAiClient {
                     {
                         unsupported.insert(schema_endpoint(c));
                     }
+                    remember_rejected_parameters(c, &parameters_left_out);
                     r.tools_dropped = withheld && request.get("tools").is_none();
                     r.attempts = attempt.saturating_add(1);
                     r.attempt_diagnostics = attempt_diagnostics;
@@ -1016,6 +1103,25 @@ impl LlmClient for OpenAiClient {
                 }
                 Err(e) => {
                     let text = e.to_string();
+                    // An optional parameter the server does not know, named
+                    // in its refusal: sent again without it, and left out for
+                    // this endpoint once that is answered.
+                    if let Some(parameter) = rejected_parameter(&text, &request) {
+                        if let Some(fields) = request.as_object_mut() {
+                            fields.remove(parameter);
+                        }
+                        parameters_left_out.push(parameter);
+                        record_attempt_failure(
+                            &mut attempt_diagnostics,
+                            &request_id,
+                            attempt.saturating_add(1),
+                            &text,
+                            AttemptAction::ParameterFallback,
+                            c,
+                        );
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
                     // Not every provider takes tool_choice "none" (some accept
                     // only "auto"): a refused request is sent once more
                     // without the withheld tools, and the endpoint is
@@ -1238,6 +1344,9 @@ mod tool_choice_tests {
         TooLong,
         /// The stream drops after its first words.
         Drops,
+        /// Refuses reasoning_effort by name, as OpenAI does for a model
+        /// without reasoning.
+        RefusesEffort,
     }
 
     /// An OpenAI-compatible server on a fresh port (so the endpoint caches
@@ -1271,6 +1380,7 @@ mod tool_choice_tests {
                         }
                     };
                     let withheld = body["tool_choice"] == "none";
+                    let effort = body.get("reasoning_effort").is_some();
                     record.lock().unwrap().push(body);
                     let event = |v: Value| format!("data: {v}\n\n");
                     let reply = match provider {
@@ -1280,6 +1390,10 @@ mod tool_choice_tests {
                         }
                         Provider::TooLong => {
                             let error = r#"{"error":{"message":"This model's maximum context length is 8192 tokens.","code":"context_length_exceeded"}}"#;
+                            format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}", error.len())
+                        }
+                        Provider::RefusesEffort if effort => {
+                            let error = r#"{"error":{"message":"Unrecognized request argument supplied: reasoning_effort","type":"invalid_request_error"}}"#;
                             format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}", error.len())
                         }
                         Provider::Drops => format!(
@@ -1383,5 +1497,27 @@ mod tool_choice_tests {
         let failure = error.downcast_ref::<CompletionError>().expect("a completion error");
         assert!(failure.transient(), "{error}");
         assert_eq!(seen.lock().unwrap().len(), 1, "not retried by the client");
+    }
+
+    #[tokio::test]
+    async fn an_optional_parameter_refused_by_name_is_left_out() {
+        // README: a server that does not know reasoning_effort gets the
+        // request again without it, and later requests leave it out.
+        let (config, seen) = serve(Provider::RefusesEffort).await;
+        for _ in 0..2 {
+            let reply = complete(&config, withheld()).await.unwrap();
+            assert_eq!(reply.text, "답");
+        }
+        let sent: Vec<(bool, bool, bool)> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| (r.get("reasoning_effort").is_some(), r.get("stream_options").is_some(), r.get("tools").is_some()))
+            .collect();
+        assert_eq!(sent, [(true, true, true), (false, true, true), (false, true, true)], "only the parameter named goes, and stays gone");
+        // A refusal that names no optional parameter is no reason to drop one.
+        let (config, seen) = serve(Provider::Refuses).await;
+        complete(&config, withheld()).await.unwrap();
+        assert!(seen.lock().unwrap().iter().all(|r| r.get("reasoning_effort").is_some()));
     }
 }
