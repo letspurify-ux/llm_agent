@@ -1563,7 +1563,7 @@ mod tests {
         let mut cursors = BTreeMap::new();
         cursors.insert(
             "k1".to_owned(),
-            FileCursor { project: "b".into(), path: "README.md".into(), hash: String::new(), start_line: 1, max_lines: 10, offset: 0 },
+            FileCursor { project: "b".into(), path: "README.md".into(), hash: String::new(), start_line: 1, max_lines: 10, offset: 0, handed_out: 0 },
         );
         let (project, note) = resolve("file_read", json!({"project":"a","cursor":"k1"}), &cursors).unwrap();
         assert_eq!(project, "b");

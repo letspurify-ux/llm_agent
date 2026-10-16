@@ -95,7 +95,7 @@ impl ToolConfig {
 
 /// Where a truncated file read continues. The project is kept so a cursor
 /// sent alone still reads from the right root.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileCursor {
     pub project: String,
     pub path: String,
@@ -103,7 +103,19 @@ pub struct FileCursor {
     pub start_line: usize,
     pub max_lines: usize,
     pub offset: usize,
+    /// When the cursor was last handed to the model (issued, or issued
+    /// again for the same range): a full table drops the one handed out
+    /// longest ago. Not part of where the cursor reads.
+    #[serde(skip)]
+    pub handed_out: u64,
 }
+impl PartialEq for FileCursor {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.project, &self.path, &self.hash, self.start_line, self.max_lines, self.offset)
+            == (&other.project, &other.path, &other.hash, other.start_line, other.max_lines, other.offset)
+    }
+}
+impl Eq for FileCursor {}
 
 /// What a source tool call works on: the selected project and the
 /// conversation's cursors and history (for repeated-read suppression,
@@ -1773,23 +1785,31 @@ fn file_cursor(project: &str, result: &Value) -> FileCursor {
         start_line: data["read_start"].as_u64().unwrap_or(1) as usize,
         max_lines: data["read_max_lines"].as_u64().unwrap_or(1) as usize,
         offset: data["next_offset"].as_u64().unwrap_or(0) as usize,
+        handed_out: 0,
     }
 }
 fn register_file_cursor(s: &mut Workspace, id: String, result: &Value) -> String {
-    let cursor = file_cursor(&s.project.name, result);
-    if let Some((existing, _)) = s.file_cursors.iter().find(|(_, known)| **known == cursor) {
+    static HANDED_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let now = HANDED_OUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut cursor = file_cursor(&s.project.name, result);
+    // The same range read again keeps its cursor ID (results already given
+    // name it) and counts as handed out now.
+    if let Some((existing, known)) = s.file_cursors.iter_mut().find(|(_, known)| **known == cursor) {
+        known.handed_out = now;
         return existing.clone();
     }
-    // Issued in number order: "R10000" sorts before "R9999" as text.
+    // The cursor handed out longest ago goes; IDs count up in issue order
+    // ("R10000" sorts before "R9999" as text) and break a tie.
     if s.file_cursors.len() >= Workspace::FILE_CURSORS
         && let Some(oldest) = s
             .file_cursors
-            .keys()
-            .min_by_key(|id| id.trim_start_matches('R').parse::<u64>().unwrap_or(0))
-            .cloned()
+            .iter()
+            .min_by_key(|(id, known)| (known.handed_out, id.trim_start_matches('R').parse::<u64>().unwrap_or(0)))
+            .map(|(id, _)| id.clone())
     {
         s.file_cursors.remove(&oldest);
     }
+    cursor.handed_out = now;
     s.file_cursors.insert(id.clone(), cursor);
     id
 }
@@ -2390,6 +2410,27 @@ mod tests {
         register_file_cursor(&mut ws, "R10001".into(), &next);
         assert!(ws.file_cursors.contains_key(&newest), "the cursor issued last call is kept");
         assert!(!ws.file_cursors.contains_key("R9000") && !ws.file_cursors.contains_key("R9001"));
+    }
+
+    /// Context management review, thirteenth pass: a read whose cursor was
+    /// issued before (the same range read again) is handed the earlier ID,
+    /// and the full table dropped the lowest ID first — the cursor the model
+    /// had just received, while hundreds issued after it stayed.
+    #[test]
+    fn a_cursor_handed_out_again_is_kept_as_a_recent_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = workspace(dir.path());
+        let at = |offset: usize| json!({"data":{"path":"a.rs","hash":"h","read_start":1,"read_max_lines":10,"next_offset":offset}});
+        let again = register_file_cursor(&mut ws, "R1".into(), &at(1));
+        for n in 2..=Workspace::FILE_CURSORS {
+            register_file_cursor(&mut ws, format!("R{n}"), &at(n));
+        }
+        // The first range read again: its cursor is handed out once more.
+        assert_eq!(register_file_cursor(&mut ws, "R9999".into(), &at(1)), again);
+        register_file_cursor(&mut ws, "R10000".into(), &at(10_000));
+        assert!(ws.file_cursors.contains_key(&again), "the cursor just handed out again stays");
+        assert!(!ws.file_cursors.contains_key("R2"), "the one least recently handed out goes");
+        assert_eq!(ws.file_cursors.len(), Workspace::FILE_CURSORS);
     }
 
     #[test]
