@@ -66,6 +66,9 @@ pub enum AttemptAction {
     Retry,
     JsonModeFallback,
     UnstructuredFallback,
+    /// Withheld tools sent again without their definitions, for a provider
+    /// that refuses tool_choice "none".
+    ToolChoiceFallback,
     Stop,
 }
 
@@ -347,6 +350,25 @@ static JSON_SCHEMA_STREAM_SUSPECTED: std::sync::Mutex<SchemaCache> =
 /// JSON mode. A live run otherwise paid a failed attempt on every structured call.
 static RESPONSE_FORMAT_REJECTED: std::sync::Mutex<SchemaCache> =
     std::sync::Mutex::new(SchemaCache(VecDeque::new()));
+
+/// Endpoints where tool_choice "none" does not withhold tools: a request with
+/// it was refused and then succeeded without the tools, or the model still
+/// called tools. Their withheld requests leave the tools out instead (the
+/// prompt then loses the prefix the provider cached with them).
+static TOOL_CHOICE_NONE_UNSUPPORTED: std::sync::Mutex<SchemaCache> =
+    std::sync::Mutex::new(SchemaCache(VecDeque::new()));
+
+/// A request that withholds its tools with tool_choice "none".
+fn withholds_tools(request: &Value) -> bool {
+    request["tool_choice"] == "none"
+}
+
+fn drop_withheld_tools(request: &mut Value) {
+    if let Some(fields) = request.as_object_mut() {
+        fields.remove("tools");
+        fields.remove("tool_choice");
+    }
+}
 
 struct SchemaCache(VecDeque<[u8; 32]>);
 impl SchemaCache {
@@ -922,6 +944,14 @@ impl LlmClient for OpenAiClient {
         if format_rejected && let Some(fields) = request.as_object_mut() {
             fields.remove("response_format");
         }
+        if withholds_tools(&request)
+            && TOOL_CHOICE_NONE_UNSUPPORTED
+                .lock()
+                .is_ok_and(|mut unsupported| unsupported.contains(&schema_endpoint(c)))
+        {
+            drop_withheld_tools(&mut request);
+        }
+        let mut tool_choice_fallback = false;
         let emitted_text = Arc::new(AtomicBool::new(false));
         let mut attempt = 0usize;
         // The optional response-format fallback is a compatibility attempt,
@@ -961,12 +991,43 @@ impl LlmClient for OpenAiClient {
                     {
                         rejected.insert(schema_endpoint(c));
                     }
+                    // Recovered without the tools it refused to withhold, or
+                    // called tools it was told not to call.
+                    let ignored = withholds_tools(&request) && (!r.calls.is_empty() || r.discarded_tool_calls);
+                    if (tool_choice_fallback || ignored)
+                        && let Ok(mut unsupported) = TOOL_CHOICE_NONE_UNSUPPORTED.lock()
+                    {
+                        unsupported.insert(schema_endpoint(c));
+                    }
                     r.attempts = attempt.saturating_add(1);
                     r.attempt_diagnostics = attempt_diagnostics;
                     return Ok(r);
                 }
                 Err(e) => {
                     let text = e.to_string();
+                    // Not every provider takes tool_choice "none" (some accept
+                    // only "auto"): a refused request is sent once more
+                    // without the withheld tools, and the endpoint is
+                    // remembered only if that succeeds. A refusal for its size
+                    // stays the caller's to handle.
+                    if !tool_choice_fallback
+                        && withholds_tools(&request)
+                        && (text.starts_with("http_400:") || text.starts_with("http_422:"))
+                        && !context_overflow(&text)
+                    {
+                        drop_withheld_tools(&mut request);
+                        tool_choice_fallback = true;
+                        record_attempt_failure(
+                            &mut attempt_diagnostics,
+                            &request_id,
+                            attempt.saturating_add(1),
+                            &text,
+                            AttemptAction::ToolChoiceFallback,
+                            c,
+                        );
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
                     // OpenAI-compatible local servers are not uniform about
                     // JSON mode. Retry once without the optional structured
                     // output hint when the server explicitly rejects it;
@@ -1145,5 +1206,143 @@ mod diagnostic_tests {
         ] {
             assert!(!context_overflow(other), "{other}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_choice_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// How the fake provider treats a request with tool_choice "none".
+    #[derive(Clone, Copy)]
+    enum Provider {
+        Honors,
+        Refuses,
+        Ignores,
+        TooLong,
+    }
+
+    /// An OpenAI-compatible server on a fresh port (so the endpoint caches
+    /// start empty), recording every request body.
+    async fn serve(provider: Provider) -> (Config, Arc<Mutex<Vec<Value>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(vec![]));
+        let record = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let record = record.clone();
+                tokio::spawn(async move {
+                    let mut bytes = vec![];
+                    let mut buffer = [0u8; 8192];
+                    let body = loop {
+                        let n = socket.read(&mut buffer).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&buffer[..n]);
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                            let length = head
+                                .lines()
+                                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                                .unwrap_or(0);
+                            if body.len() >= length {
+                                break serde_json::from_str::<Value>(body).unwrap();
+                            }
+                        }
+                    };
+                    let withheld = body["tool_choice"] == "none";
+                    record.lock().unwrap().push(body);
+                    let event = |v: Value| format!("data: {v}\n\n");
+                    let reply = match provider {
+                        Provider::Refuses if withheld => {
+                            let error = r#"{"error":{"code":"1210","message":"Invalid API parameter"}}"#;
+                            format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}", error.len())
+                        }
+                        Provider::TooLong => {
+                            let error = r#"{"error":{"message":"This model's maximum context length is 8192 tokens.","code":"context_length_exceeded"}}"#;
+                            format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}", error.len())
+                        }
+                        Provider::Ignores if withheld => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}{}data: [DONE]\n\n",
+                            event(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"search","arguments":"{}"}}]},"finish_reason":null}]})),
+                            event(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}))
+                        ),
+                        _ => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}{}data: [DONE]\n\n",
+                            event(json!({"choices":[{"delta":{"content":"답"},"finish_reason":null}]})),
+                            event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]}))
+                        ),
+                    };
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        let config = Config {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "tool-choice-test".into(),
+            disable_proxy: true,
+            retries: 0,
+            ..Config::default()
+        };
+        (config, seen)
+    }
+
+    fn withheld() -> Value {
+        json!({"model":"tool-choice-test","messages":[{"role":"user","content":"질문"}],
+            "tools":[{"type":"function","function":{"name":"search","description":"찾기","parameters":{"type":"object","properties":{}}}}],
+            "tool_choice":"none"})
+    }
+
+    async fn complete(config: &Config, request: Value) -> Result<Completion> {
+        let (tx, mut rx) = mpsc::channel(64);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        OpenAiClient.complete(request, config, CancellationToken::new(), tx).await
+    }
+
+    fn shapes(seen: &Arc<Mutex<Vec<Value>>>) -> Vec<(bool, bool)> {
+        seen.lock().unwrap().iter().map(|r| (r.get("tools").is_some(), r.get("tool_choice").is_some())).collect()
+    }
+
+    #[tokio::test]
+    async fn withheld_tools_stay_defined_where_tool_choice_none_works() {
+        let (config, seen) = serve(Provider::Honors).await;
+        for _ in 0..2 {
+            assert_eq!(complete(&config, withheld()).await.unwrap().text, "답");
+        }
+        assert_eq!(shapes(&seen), [(true, true), (true, true)], "the tools keep the prompt's prefix");
+    }
+
+    #[tokio::test]
+    async fn a_provider_refusing_tool_choice_none_gets_the_request_without_tools() {
+        // Z.ai documents tool_choice "auto" only.
+        let (config, seen) = serve(Provider::Refuses).await;
+        assert_eq!(complete(&config, withheld()).await.unwrap().text, "답");
+        assert_eq!(shapes(&seen), [(true, true), (false, false)]);
+        // Remembered: the next withheld request leaves the tools out at once.
+        assert_eq!(complete(&config, withheld()).await.unwrap().text, "답");
+        assert_eq!(shapes(&seen)[2], (false, false));
+    }
+
+    #[tokio::test]
+    async fn a_provider_ignoring_tool_choice_none_is_remembered() {
+        // Ollama's OpenAI API does not read tool_choice: the model may call tools.
+        let (config, seen) = serve(Provider::Ignores).await;
+        let first = complete(&config, withheld()).await.unwrap();
+        assert_eq!(first.calls.len(), 1, "the caller handles calls it withheld");
+        assert_eq!(complete(&config, withheld()).await.unwrap().text, "답");
+        assert_eq!(shapes(&seen), [(true, true), (false, false)]);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_for_size_is_not_taken_for_tool_choice() {
+        let (config, seen) = serve(Provider::TooLong).await;
+        let error = complete(&config, withheld()).await.unwrap_err().to_string();
+        assert!(context_overflow(&error), "{error}");
+        assert_eq!(shapes(&seen), [(true, true)], "the caller evicts and asks again");
     }
 }

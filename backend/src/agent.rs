@@ -41,8 +41,14 @@ const WITHHELD_RETRIES: usize = 2;
 /// can continue it, so it is dropped when its run ends rather than kept for
 /// the idle time, where it would also push real conversations out.
 pub const ONE_SHOT_PREFIX: &str = "once:";
-/// Seconds kept for the final answer when time runs short.
+/// Seconds kept for the final answer when time runs short. Work started
+/// before them stops at them: a request that has not begun its answer, and
+/// tool calls.
 const FINAL_RESERVE_SECS: u64 = 45;
+const TIME_OVER: &str = "답변 시간이 다 되어 마무리하지 못했습니다. 질문을 좁혀 다시 시도해주세요.";
+/// What the model is told when the work before the final reserve stopped.
+const RESERVE_REACHED: &str = "남은 시간이 모자라 이전 요청을 멈췄다.";
+const TOOLS_STOPPED: &str = "남은 시간이 모자라 이전 응답의 도구 실행 일부를 멈췄다(status cancelled).";
 const PROVIDER_WAITS: [u64; 2] = [5, 15];
 const EMPTY_RETRIES: usize = 2;
 const LENGTH_CONTINUATIONS: usize = 2;
@@ -181,52 +187,76 @@ async fn run(
         // A question runs until it answers; near its time the model is asked
         // to answer with what it has.
         let final_round = remaining.as_secs() <= FINAL_RESERVE_SECS;
-        if remaining.is_zero() {
-            bail!(UserFacing("답변 시간이 다 되어 마무리하지 못했습니다. 질문을 좁혀 다시 시도해주세요.".into()));
-        }
         // An answer cut at the output limit is continued without tools.
         let continuing = !partial.is_empty();
+        if remaining.is_zero() {
+            // A cut answer whose time ran out stands as written.
+            if continuing {
+                break partial.concat();
+            }
+            bail!(UserFacing(TIME_OVER.into()));
+        }
         let withheld_tools = final_round || continuing;
         let round_notice = notice.take();
+        // Withheld tools stay defined, refused with tool_choice "none": the
+        // tool definitions open the prompt, and dropping them would leave
+        // nothing of the provider's prefix cache for the final answer or a
+        // continuation. (The client drops them for a provider that refuses or
+        // ignores tool_choice.)
         let frame = |c: &Conversation| {
-            let offered = offered_tools(config, c, withheld_tools);
-            let state = runtime_state(config, message, remaining, final_round, &offered, partial.is_empty(), round_notice.clone());
+            let offered = offered_tools(config, c);
+            let usable: &[String] = if withheld_tools { &[] } else { &offered };
+            let state = runtime_state(config, message, remaining, final_round, usable, partial.is_empty(), round_notice.clone());
             let mut definitions = ToolRegistry::definitions(&offered.iter().map(String::as_str).collect());
             tools::require_project(&mut definitions, &config.projects);
             (offered, state, definitions)
         };
+        let build = |c: &Conversation, state: &Value, definitions: &[Value]| {
+            let mut request = context::request(&c.history, state, &model, definitions.to_vec());
+            if withheld_tools && !definitions.is_empty() {
+                request["tool_choice"] = json!("none");
+            }
+            request
+        };
         let (mut offered, mut state, mut definitions) = frame(c);
-        let mut request = context::request(&c.history, &state, &model, definitions.clone());
+        let mut request = build(c, &state, &definitions);
         let mut estimate = context::count(&request, &model);
         let evicted = context::evict(c, config, estimate, &[question_bundle]);
         if !evicted.is_empty() {
             // What left is readable through the history tool from this
             // request on.
             (offered, state, definitions) = frame(c);
-            request = context::request(&c.history, &state, &model, definitions.clone());
+            request = build(c, &state, &definitions);
             estimate = context::count(&request, &model);
             eprintln!("[context] evicted {} old bundles; request now ~{estimate} tokens", evicted.len());
         }
         // What eviction cannot remove: the frame and the question.
-        let kept = context::count(&context::request(&Default::default(), &state, &model, definitions), &model)
-            + context::bundle_tokens(&c.history, question_bundle, &model)
-            + 512;
-        let calibrated = (estimate as f64 * context::token_ratio(c, &model)).ceil() as usize;
-        if calibrated + config.llm.output_tokens + 512 > config.llm.context_tokens {
+        let alone = context::count(&context::request(&Default::default(), &state, &model, definitions.clone()), &model)
+            + context::bundle_tokens(&c.history, question_bundle, &model);
+        let kept = alone + 512;
+        let ratio = context::token_ratio(c, &model);
+        let fits = |tokens: usize| (tokens as f64 * ratio).ceil() as usize + config.llm.output_tokens + 512 <= config.llm.context_tokens;
+        if !fits(estimate) {
             // A cut answer that can no longer be continued stands as written.
             if continuing {
                 break partial.concat();
             }
-            bail!(UserFacing("대화가 너무 길어 이어서 답할 수 없습니다. 새 대화로 다시 질문해주세요.".into()));
+            let usable: &[String] = if withheld_tools { &[] } else { &offered };
+            let bare = runtime_state(config, "", remaining, final_round, usable, true, None);
+            let frame_tokens = context::count(&context::request(&Default::default(), &bare, &model, definitions), &model);
+            bail!(too_long(fits(frame_tokens), fits(alone)));
         }
         rounds += 1;
         let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(64);
         let relay_events = events.clone();
+        let writing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let relay_writing = writing.clone();
         // The text shown while the response streams, kept for a stop.
         let relay = tokio::spawn(async move {
             let mut shown = String::new();
             while let Some(text) = delta_rx.recv().await {
                 if !text.is_empty() {
+                    relay_writing.store(true, std::sync::atomic::Ordering::Relaxed);
                     shown.push_str(&text);
                     relay_events.send(json!({"type":"answer_delta","text":text}));
                 }
@@ -236,13 +266,30 @@ async fn run(
         let started = Instant::now();
         let mut llm_config = config.llm.clone();
         llm_config.retry_timeouts = true;
-        let response = tokio::select! {
-            _ = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
-            result = tokio::time::timeout(remaining, app.llm.complete(request, &llm_config, cancel.clone(), delta_tx)) => match result {
-                Ok(result) => result,
-                Err(_) => Err(anyhow::anyhow!("run_timeout")),
-            },
+        let mut call = Box::pin(tokio::time::timeout(remaining, app.llm.complete(request, &llm_config, cancel.clone(), delta_tx)));
+        // Before the final reserve, a request that has not begun writing by
+        // then stops, so the final answer keeps its time; one writing its
+        // answer goes on.
+        let mut reserve = (!final_round).then(|| {
+            Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(deadline - Duration::from_secs(FINAL_RESERVE_SECS))))
+        });
+        let response = loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break Err(anyhow::anyhow!("cancelled")),
+                result = &mut call => break match result {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow::anyhow!("run_timeout")),
+                },
+                _ = async { reserve.as_mut().unwrap().await }, if reserve.is_some() => {
+                    reserve = None;
+                    if !writing.load(std::sync::atomic::Ordering::Relaxed) {
+                        break Err(anyhow::anyhow!("reserve_reached"));
+                    }
+                }
+            }
         };
+        // A request left unfinished goes now, with its stream, so the relay ends.
+        drop(call);
         let shown = relay.await.unwrap_or_default();
         let emitted = !shown.is_empty();
         let ms = started.elapsed().as_millis() as u64;
@@ -250,14 +297,13 @@ async fn run(
             Ok(completion) => completion,
             Err(error) => {
                 timing.llm.push(json!({"ms":ms,"error":true}));
-                if emitted {
-                    events.send(json!({"type":"answer_reset"}));
-                }
+                // What the answer has written: the pieces kept so far and
+                // what this response showed before it ended.
+                let written = partial.concat() + &shown;
                 if error.to_string() == "cancelled" {
                     // What a stopped answer has written stays in the
                     // conversation, as the browser keeps what it showed for
                     // the next question.
-                    let written = partial.concat() + &shown;
                     if !written.trim().is_empty() {
                         if last_is_partial(c) {
                             c.history.bundles.pop_back();
@@ -265,6 +311,16 @@ async fn run(
                         c.history.push(vec![json!({"role":"assistant","content":written})], true);
                     }
                     bail!("cancelled");
+                }
+                if emitted {
+                    retract(events, &partial);
+                }
+                // Stopped at the final reserve: the next request is the final
+                // one, with the whole reserve.
+                if error.to_string() == "reserve_reached" {
+                    eprintln!("[agent] the request had not begun its answer at the final reserve; asking for the final answer");
+                    notice = Some(RESERVE_REACHED.into());
+                    continue;
                 }
                 // A provider that counts more than the estimate, or serves
                 // less context than configured, refuses the request: every
@@ -279,9 +335,10 @@ async fn run(
                         continue;
                     }
                     if continuing {
-                        break partial.concat();
+                        break written;
                     }
-                    bail!(UserFacing("대화가 너무 길어 이어서 답할 수 없습니다. 새 대화로 다시 질문해주세요.".into()));
+                    let only_question = c.history.bundles.iter().rev().find(|b| b.active).map(|b| b.id) == Some(question_bundle);
+                    bail!(too_long(true, !only_question));
                 }
                 let unavailable = error
                     .downcast_ref::<crate::llm::CompletionError>()
@@ -300,6 +357,15 @@ async fn run(
                         continue;
                     }
                 }
+                // A cut answer whose continuation failed (its time ran out,
+                // the provider failed) stands as written.
+                if continuing {
+                    eprintln!("[agent] continuing a cut answer failed; it stands as written: {error:#}");
+                    break written;
+                }
+                if error.to_string() == "run_timeout" {
+                    bail!(UserFacing(TIME_OVER.into()));
+                }
                 return Err(error);
             }
         };
@@ -315,8 +381,12 @@ async fn run(
             );
         }
         timing.llm.push(json!({"ms":ms,"prompt":usage.as_ref().map(|u| u.input),"completion":usage.as_ref().map(|u| u.output),"cached":usage.as_ref().and_then(|u| u.cached),"estimate":estimate}));
-        if emitted && (!completion.calls.is_empty() || completion.length_limited) {
-            events.send(json!({"type":"answer_reset"}));
+        // Text streamed for a response that is not part of the answer (it
+        // called tools, its calls were cut, it was blank) is taken back. A
+        // cut answer's piece stays shown: its continuation follows it.
+        let answers = completion.calls.is_empty() && !completion.discarded_tool_calls && !completion.text.trim().is_empty();
+        if emitted && !answers {
+            retract(events, &partial);
         }
         if completion.length_limited {
             if completion.discarded_tool_calls {
@@ -391,6 +461,20 @@ async fn run(
         // own usage has just updated: the next request is checked with it.
         let room = ((config.input_budget() as f64 / context::token_ratio(c, &model)) as usize).saturating_sub(kept);
         let tool_started = Instant::now();
+        // The calls stop at the final reserve too, which the final answer keeps.
+        let tools_cancel = cancel.child_token();
+        let stop_at = deadline - Duration::from_secs(FINAL_RESERVE_SECS);
+        if Instant::now() >= stop_at {
+            // Already there (the response was written into the reserve).
+            tools_cancel.cancel();
+        }
+        let stopper = {
+            let stop = tools_cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(stop_at)).await;
+                stop.cancel();
+            })
+        };
         let messages = execute_batch(
             app,
             config,
@@ -398,16 +482,23 @@ async fn run(
             &completion,
             &offered,
             events,
-            cancel,
+            &tools_cancel,
             &mut tracker,
             &mut trace,
             &mut event_id,
             room,
         )
         .await;
+        stopper.abort();
         timing.tools.push(json!({"ms":tool_started.elapsed().as_millis() as u64,"calls":completion.calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()}));
         if cancel.is_cancelled() {
             bail!("cancelled");
+        }
+        let stopped = tools_cancel.is_cancelled()
+            && messages.iter().any(|m| m["role"] == "tool" && m["content"].as_str().is_some_and(|c| c.contains("\"status\":\"cancelled\"")));
+        if stopped {
+            eprintln!("[agent] tool calls stopped at the final reserve");
+            notice = Some(TOOLS_STOPPED.into());
         }
         c.history.push(messages, true);
     };
@@ -440,6 +531,30 @@ async fn run(
     })
 }
 
+/// Takes back the text streamed for a response that is not part of the
+/// answer. The pieces of a cut answer being continued are shown again, as the
+/// answer goes on from them.
+fn retract(events: &Events, partial: &[String]) {
+    events.send(json!({"type":"answer_reset"}));
+    if !partial.is_empty() {
+        events.send(json!({"type":"answer_delta","text":partial.concat()}));
+    }
+}
+
+/// A request that does not fit with every old bundle evicted, told by what
+/// fills it: the frame alone (no question fits the configured context), the
+/// question (a new conversation would fail the same way), or the
+/// conversation.
+fn too_long(frame_fits: bool, question_fits: bool) -> UserFacing {
+    UserFacing(if !frame_fits {
+        "모델 컨텍스트 설정이 너무 작아 답할 수 없습니다. 설정에서 컨텍스트와 출력 한도를 확인해주세요.".into()
+    } else if !question_fits {
+        "질문이 너무 길어 답할 수 없습니다. 질문을 줄여 다시 시도해주세요.".into()
+    } else {
+        "대화가 너무 길어 이어서 답할 수 없습니다. 새 대화로 다시 질문해주세요.".into()
+    })
+}
+
 /// Whether the newest bundle holds the pieces of an answer being continued.
 fn last_is_partial(c: &Conversation) -> bool {
     c.history
@@ -449,13 +564,10 @@ fn last_is_partial(c: &Conversation) -> bool {
         .is_some_and(|m| m["partial"] == true)
 }
 
-/// Tools offered this round: the knowledge and query tools always, the
+/// Tools defined this round: the knowledge and query tools always, the
 /// source tools when projects exist, the history tool once something left
-/// the context. None in the final round.
-fn offered_tools(config: &Config, c: &Conversation, final_round: bool) -> Vec<String> {
-    if final_round {
-        return vec![];
-    }
+/// the context. A round that withholds them still defines them.
+fn offered_tools(config: &Config, c: &Conversation) -> Vec<String> {
     let mut names: Vec<String> = voc_tools::specs().iter().map(|s| s.name.to_owned()).collect();
     if !config.projects.is_empty() {
         names.extend(

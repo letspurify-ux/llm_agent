@@ -589,7 +589,9 @@ async fn a_cut_answer_is_continued_without_tools_as_one_message() {
     assert!(ev(&events, "tool").is_empty(), "no tool runs while an answer is continued");
     let requests = llm.requests();
     for request in &requests[1..4] {
-        assert!(request.get("tools").is_none(), "continuing requests offer no tools");
+        // Withheld, not dropped: the same definitions keep the prompt's prefix.
+        assert_eq!(request["tool_choice"], "none", "continuing requests let no tool run");
+        assert_eq!(request["tools"], requests[0]["tools"]);
         let roles: Vec<&str> = request["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
         assert!(!roles.windows(2).any(|pair| pair == ["assistant", "assistant"]), "{roles:?}");
     }
@@ -1178,4 +1180,312 @@ async fn random_conversations_keep_every_request_in_shape() {
             }
         }
     }
+}
+
+// Context management review, third pass (2026-10-16): each failed before its
+// fix. Needs no MariaDB.
+
+/// The preview the browser shows from the events it got: `answer_delta`
+/// appends, `answer_reset` clears (frontend/src/App.jsx).
+fn preview(events: &[Value]) -> String {
+    let mut shown = String::new();
+    for event in events {
+        match event["type"].as_str() {
+            Some("answer_delta") => shown.push_str(event["text"].as_str().unwrap()),
+            Some("answer_reset") => shown.clear(),
+            _ => {}
+        }
+    }
+    shown
+}
+
+/// L: the piece of an answer cut at the output limit was taken back from the
+/// preview when its continuation began, so the screen showed the answer from
+/// mid-sentence on, and a stop kept only the last piece.
+#[tokio::test]
+async fn a_continued_answer_keeps_its_pieces_in_the_preview() {
+    let mut calls_and_text = calls(vec![call("w", "file_list", json!({}))]);
+    calls_and_text.text = "도구를 쓰겠다 ".into();
+    let llm = Scripted::new(vec![cut_text("첫 조각 "), calls_and_text, text("이어진 끝.")]);
+    let (app, _dir) = app(no_db("gpt-4o"), llm.clone());
+    let (r, events) = ask(&app, "l", "길게 설명해줘", vec![]).await;
+    assert_eq!(r.unwrap().answer, "첫 조각 이어진 끝.");
+    // The withheld response's own text is taken back, the piece shown again.
+    assert_eq!(preview(&events), "첫 조각 이어진 끝.", "{events:?}");
+}
+
+/// A model whose second request (continuing a cut answer) fails: it outlives
+/// the question's time, or the provider refuses it.
+struct FailingContinuation {
+    calls: std::sync::atomic::AtomicUsize,
+    slow: bool,
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for FailingContinuation {
+    async fn complete(&self, _request: Value, _config: &llm_agent::config::LlmConfig, _c: CancellationToken, _d: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        match self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
+            0 => Ok(cut_text("쓴 앞부분 ")),
+            1 if self.slow => {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Ok(text("늦은 끝"))
+            }
+            1 => anyhow::bail!("http_400: {}", json!({"error":{"message":"Invalid request"}})),
+            _ => Ok(text("다음 답")),
+        }
+    }
+}
+
+/// M: an answer cut at the output limit whose continuation ran out of time
+/// or failed at the provider ended the question with an error, though its
+/// first piece was written (and stayed in the conversation as an answer the
+/// user never got).
+#[tokio::test]
+async fn a_cut_answer_whose_continuation_fails_stands_as_written() {
+    for slow in [true, false] {
+        let mut config = no_db("gpt-4o");
+        config.agent.run_seconds = 2;
+        let llm = std::sync::Arc::new(FailingContinuation { calls: Default::default(), slow });
+        let (app, _dir) = app(config, llm.clone());
+        let (r, _) = ask(&app, "m", "길게 설명해줘", vec![]).await;
+        assert_eq!(r.map(|a| a.answer).map_err(|e| e.to_string()), Ok("쓴 앞부분 ".to_owned()), "slow {slow}");
+    }
+}
+
+/// N: a question too long by itself was told to start a new conversation,
+/// where it fails the same way.
+#[tokio::test]
+async fn a_question_too_long_by_itself_is_told_so() {
+    let question = "자료 ".repeat(6_000);
+    let mut config = no_db("gpt-4o");
+    config.llm.context_tokens = 12_000;
+    config.llm.output_tokens = 4_000;
+    let (small, _small_dir) = app(config, Scripted::new(vec![text("답")]));
+    let (r, _) = ask(&small, "n", &question, vec![]).await;
+    let error = r.err().expect("too long").to_string();
+    assert!(error.contains("질문이 너무 길어"), "{error}");
+    // A provider serving less context than configured refuses it as well.
+    let mut config = no_db("gpt-4o");
+    config.llm.context_tokens = 64_000;
+    config.llm.output_tokens = 2_000;
+    let llm = std::sync::Arc::new(Refusing { limit: 9_000, replies: Default::default(), refused: Default::default() });
+    let (refusing, _refusing_dir) = app(config, llm.clone());
+    let (r, _) = ask(&refusing, "n2", &question, vec![]).await;
+    let error = r.err().expect("refused").to_string();
+    assert!(error.contains("질문이 너무 길어"), "{error}");
+    // Long turns before a short question leave the context instead.
+    let (r, _) = ask(&refusing, "n3", "짧은 질문", vec![("user".into(), question.clone()), ("assistant".into(), question.clone())]).await;
+    assert_eq!(r.unwrap().answer, "끝");
+    // A context too small for the system prompt and tools fits no question.
+    let mut config = no_db("unknown-tokenizer");
+    config.llm.context_tokens = 6_000;
+    config.llm.output_tokens = 500;
+    let (tiny, _tiny_dir) = app(config, Scripted::new(vec![text("답")]));
+    let (r, _) = ask(&tiny, "n4", "안녕", vec![]).await;
+    let error = r.err().expect("nothing fits").to_string();
+    assert!(error.contains("컨텍스트 설정이 너무 작아"), "{error}");
+}
+
+/// A model answering at random until the user stops it mid-stream: cut
+/// answer pieces, tool calls with text before them, cut tool calls, empty
+/// replies.
+struct StoppedAtRandom {
+    seed: std::sync::Mutex<u64>,
+    stop_at: usize,
+    calls: std::sync::atomic::AtomicUsize,
+    stop: CancellationToken,
+}
+impl StoppedAtRandom {
+    fn next(&self, n: usize) -> usize {
+        let mut seed = self.seed.lock().unwrap();
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 33) as usize) % n.max(1)
+    }
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for StoppedAtRandom {
+    async fn complete(&self, _request: Value, _config: &llm_agent::config::LlmConfig, cancel: CancellationToken, delta: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n > self.stop_at {
+            return Ok(text("다음 답"));
+        }
+        let mut out = text("");
+        out.text = match self.next(5) {
+            0 => format!("조각{n} "),
+            1 | 2 => format!("도구 전 글{n} "),
+            3 => " ".into(),
+            _ => String::new(),
+        };
+        if n == self.stop_at {
+            // Part of the response streams, then the user stops.
+            let shown: String = out.text.chars().take(self.next(out.text.chars().count() + 1)).collect();
+            if !shown.is_empty() {
+                let _ = delta.send(shown).await;
+            }
+            self.stop.cancel();
+            cancel.cancelled().await;
+            anyhow::bail!("cancelled");
+        }
+        if !out.text.is_empty() {
+            let _ = delta.send(out.text.clone()).await;
+        }
+        match self.next(4) {
+            0 => out.length_limited = true,
+            1 => out.calls.push(call(&format!("c{n}"), "nope", json!({}))),
+            2 => {
+                out.length_limited = true;
+                out.discarded_tool_calls = true;
+            }
+            _ => out.text = if out.text.starts_with("조각") { out.text } else { String::new() },
+        }
+        if !out.length_limited && out.calls.is_empty() && !out.text.trim().is_empty() {
+            // An answer piece not cut is the answer: keep the question going.
+            out.length_limited = true;
+        }
+        Ok(out)
+    }
+}
+
+/// O: what a stopped answer leaves in the conversation is what the browser
+/// showed and keeps for the next question (fix 8 of the second pass held only
+/// while no answer piece had been cut). STOP_FUZZ sets the number of stops.
+#[tokio::test]
+async fn a_stop_leaves_in_the_conversation_what_the_browser_showed() {
+    let runs: usize = std::env::var("STOP_FUZZ").ok().and_then(|n| n.parse().ok()).unwrap_or(200);
+    let mut checked = 0;
+    for run in 0..runs {
+        let stop = CancellationToken::new();
+        let llm = std::sync::Arc::new(StoppedAtRandom {
+            seed: std::sync::Mutex::new(run as u64 * 7919 + 1),
+            stop_at: run % 6,
+            calls: Default::default(),
+            stop: stop.clone(),
+        });
+        let (app, _dir) = app(no_db("gpt-4o"), llm.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let question = Question { conversation_id: "o".into(), message: "질문".into(), history: vec![] };
+        let stopped = agent::answer(&app, question, Events::new(Some(tx)), stop).await;
+        let mut events = vec![];
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        if stopped.is_ok() || llm.calls.load(std::sync::atomic::Ordering::Relaxed) <= llm.stop_at {
+            continue; // answered or failed before the stop
+        }
+        checked += 1;
+        let shown = preview(&events);
+        let (r, _) = ask(&app, "o", "다음", vec![]).await;
+        assert_eq!(r.unwrap().answer, "다음 답");
+        // The conversation now ends: what the stop left, the next question, its answer.
+        let claim = app.sessions.open("o", std::time::Duration::from_secs(60), 10, CancellationToken::new());
+        let active = claim.conversation.lock().await.history.active();
+        let before = &active[active.len() - 3];
+        if shown.trim().is_empty() {
+            assert!(before["role"] != "assistant" || before["tool_calls"].is_array(), "run {run}: nothing was shown, yet {before} stayed; events {events:?}");
+        } else {
+            assert_eq!(before["content"].as_str(), Some(shown.as_str()), "run {run}: events {events:?}");
+        }
+    }
+    assert!(checked > runs / 4, "only {checked} runs reached their stop");
+}
+
+// Follow-ups to the third pass (2026-10-16): the provider's prefix cache and
+// the question's time. Each failed before its fix. Needs no MariaDB.
+
+/// One scripted response: text streamed before waiting (or none), how long
+/// the response takes, and the response.
+type Step = (&'static str, u64, llm_agent::llm::Completion);
+
+/// A model that takes its time, recording every request.
+struct Timed {
+    steps: std::sync::Mutex<std::collections::VecDeque<Step>>,
+    requests: std::sync::Mutex<Vec<Value>>,
+}
+impl Timed {
+    fn new(steps: Vec<Step>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { steps: std::sync::Mutex::new(steps.into()), requests: Default::default() })
+    }
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for Timed {
+    async fn complete(&self, request: Value, _config: &llm_agent::config::LlmConfig, _c: CancellationToken, delta: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        self.requests.lock().unwrap().push(request);
+        let (first, ms, reply) = self.steps.lock().unwrap().pop_front().unwrap_or(("", 0, text("(script exhausted)")));
+        if !first.is_empty() {
+            let _ = delta.send(first.to_owned()).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        Ok(reply)
+    }
+}
+
+/// P: the final answer's request (and a continuation's) dropped the tool
+/// definitions, which open the prompt, so nothing of the provider's prefix
+/// cache was left for it.
+#[tokio::test]
+async fn the_final_request_keeps_the_tools_and_withholds_them() {
+    let mut config = no_db("gpt-4o");
+    config.agent.run_seconds = 47;
+    // The first request is stopped at the reserve, two seconds in.
+    let llm = Timed::new(vec![("", 10_000, text("늦은 답")), ("", 0, text("마지막 답"))]);
+    let (app, _dir) = app(config, llm.clone());
+    let (r, _) = ask(&app, "p", "질문", vec![]).await;
+    assert_eq!(r.unwrap().answer, "마지막 답");
+    let requests = llm.requests.lock().unwrap().clone();
+    assert!(requests[0].get("tool_choice").is_none());
+    assert_eq!(requests[1]["tools"], requests[0]["tools"], "the same definitions");
+    assert_eq!(requests[1]["tool_choice"], "none");
+    let state = state_of(&requests[1]);
+    assert!(state["run_guidance"]["instruction"].as_str().unwrap().contains("도구를 더 쓸 수 없다"), "{state}");
+    assert!(state.get("projects").is_none());
+}
+
+/// Q: a request that had not begun its answer when the final reserve came
+/// ran on into it, so the question could end with no final answer; one
+/// writing its answer goes on.
+#[tokio::test]
+async fn work_before_the_final_reserve_stops_at_it() {
+    let mut config = no_db("gpt-4o");
+    config.agent.run_seconds = 47;
+    let started = std::time::Instant::now();
+    let llm = Timed::new(vec![("", 10_000, text("늦은 답")), ("", 0, text("마지막 답"))]);
+    let (silent, _silent_dir) = app(config.clone(), llm.clone());
+    let (r, _) = ask(&silent, "q", "질문", vec![]).await;
+    assert_eq!(r.unwrap().answer, "마지막 답");
+    assert!(started.elapsed() < std::time::Duration::from_secs(8), "{:?}", started.elapsed());
+    let notice = state_of(&llm.requests.lock().unwrap()[1])["run_guidance"]["notice"].clone();
+    assert!(notice.as_str().unwrap().contains("남은 시간이 모자라"), "{notice}");
+    // An answer being written when the reserve comes is not stopped.
+    let llm = Timed::new(vec![("이미 쓰는 ", 3_000, text("이미 쓰는 답"))]);
+    let (writing, _writing_dir) = app(config.clone(), llm.clone());
+    let (r, _) = ask(&writing, "q2", "질문", vec![]).await;
+    assert_eq!(r.unwrap().answer, "이미 쓰는 답");
+    assert_eq!(llm.requests.lock().unwrap().len(), 1);
+    // Tool calls stop at the reserve too, and the final request says so.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+    config.projects.push(llm_agent::config::Project { name: "app".into(), root: dir.path().into(), ..Default::default() });
+    let mut late_calls = calls(vec![call("t1", "file_list", json!({}))]);
+    late_calls.text = "찾아보겠다 ".into();
+    let llm = Timed::new(vec![("찾아보겠다 ", 3_000, late_calls), ("", 0, text("확인하지 못했다"))]);
+    let (tools, _tools_dir) = app(config, llm.clone());
+    let (r, _) = ask(&tools, "q3", "질문", vec![]).await;
+    assert_eq!(r.unwrap().answer, "확인하지 못했다");
+    let requests = llm.requests.lock().unwrap().clone();
+    assert_eq!(tool_result(&requests[1], "t1")["status"], "cancelled");
+    let notice = state_of(&requests[1])["run_guidance"]["notice"].clone();
+    assert!(notice.as_str().unwrap().contains("도구 실행 일부를 멈췄다"), "{notice}");
+}
+
+/// R: a model request that outlived the question's time ended with the
+/// generic server error instead of the time-over message.
+#[tokio::test]
+async fn a_request_past_the_questions_time_says_the_time_ran_out() {
+    let mut config = no_db("gpt-4o");
+    config.agent.run_seconds = 2;
+    let llm = Timed::new(vec![("", 5_000, text("늦은 답"))]);
+    let (app, _dir) = app(config, llm.clone());
+    let (r, _) = ask(&app, "r", "질문", vec![]).await;
+    let error = r.err().expect("time ran out");
+    assert!(error.downcast_ref::<agent::UserFacing>().is_some(), "{error:#}");
+    assert!(error.to_string().contains("답변 시간이 다 되어"), "{error}");
 }

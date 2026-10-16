@@ -80,28 +80,45 @@ impl SessionHistory {
             .collect()
     }
     /// Drops the oldest evicted bundles until they fit `limit` bytes. Active
-    /// bundles neither count nor go (the input budget bounds them), and an
-    /// archive whose result is still in the context stays readable.
+    /// bundles neither count nor go (the input budget bounds them), and what
+    /// a result still in the context continues stays readable: the archive of
+    /// a cut result, the bundle a cut history read goes on reading.
     pub fn prune(&mut self, limit: usize) {
-        let in_context: std::collections::BTreeSet<String> = self
-            .bundles
-            .iter()
-            .filter(|b| b.active)
-            .flat_map(|b| b.messages.iter())
-            .filter(|m| m["role"] == "tool")
-            .filter_map(|m| m["tool_call_id"].as_str().map(str::to_owned))
-            .collect();
-        let droppable = |b: &Bundle| {
-            !b.active
-                && !b.messages.first().is_some_and(|m| {
-                    m["role"] == "tool_archive" && m["call_id"].as_str().is_some_and(|id| in_context.contains(id))
-                })
-        };
         let mut bytes = self
             .bundles
             .iter()
             .filter(|b| !b.active)
             .fold(0usize, |total, bundle| total.saturating_add(bundle.bytes()));
+        if bytes <= limit {
+            return;
+        }
+        let mut calls = std::collections::BTreeSet::new();
+        let mut continued = std::collections::BTreeSet::new();
+        for message in self
+            .bundles
+            .iter()
+            .filter(|b| b.active)
+            .flat_map(|b| b.messages.iter())
+            .filter(|m| m["role"] == "tool")
+        {
+            if let Some(id) = message["tool_call_id"].as_str() {
+                calls.insert(id.to_owned());
+            }
+            let Some(result) = message["content"].as_str().and_then(|text| serde_json::from_str::<Value>(text).ok()) else {
+                continue;
+            };
+            continued.extend(result["archive_id"].as_u64());
+            if result["next_cursor"]["tool"] == "history" {
+                continued.extend(result["next_cursor"]["id"].as_u64());
+            }
+        }
+        let droppable = |b: &Bundle| {
+            !b.active
+                && !continued.contains(&b.id)
+                && !b.messages.first().is_some_and(|m| {
+                    m["role"] == "tool_archive" && m["call_id"].as_str().is_some_and(|id| calls.contains(id))
+                })
+        };
         while bytes > limit {
             let Some(index) = self.bundles.iter().position(&droppable) else {
                 break;
@@ -442,6 +459,32 @@ mod tests {
         h.bundles[1].active = false;
         h.prune(100);
         assert!(h.bundles.iter().all(|b| b.messages[0]["role"] != "tool_archive"), "dropped once its result left");
+    }
+
+    #[test]
+    fn prune_keeps_what_a_history_read_in_the_context_goes_on_reading() {
+        // A cut history read continues its bundle by id: an evicted bundle,
+        // or an archive made for an earlier call that has left the context.
+        let mut h = SessionHistory::default();
+        let evicted = h.push(vec![json!({"role":"user","content":"x".repeat(5000)})], true);
+        h.bundles[0].active = false;
+        let archive = h.push(vec![json!({"role":"tool_archive","call_id":"c1","result":{"status":"ok","data":{"text":"y".repeat(5000)}}})], true);
+        h.bundles[1].active = false;
+        let read = |call: &str, id: u64| {
+            vec![
+                json!({"role":"assistant","content":null,"tool_calls":[{"id":call,"type":"function","function":{"name":"history","arguments":json!({"action":"read","id":id}).to_string()}}]}),
+                json!({"role":"tool","tool_call_id":call,"content":json!({"status":"ok","data":{"text":"…","truncated":true,"next_offset":100},"truncated":true,"next_cursor":{"tool":"history","action":"read","id":id,"offset":100}}).to_string()}),
+            ]
+        };
+        h.push(read("c2", evicted), true);
+        h.push(read("c3", archive), true);
+        h.prune(100);
+        assert!(h.read(evicted).is_ok() && h.read(archive).is_ok());
+        // Once the reads leave the context, the bundles they read may go.
+        h.bundles[2].active = false;
+        h.bundles[3].active = false;
+        h.prune(100);
+        assert!(h.read(evicted).is_err() && h.read(archive).is_err());
     }
 
     #[test]

@@ -1769,8 +1769,13 @@ fn register_file_cursor(s: &mut Workspace, id: String, result: &Value) -> String
     if let Some((existing, _)) = s.file_cursors.iter().find(|(_, known)| **known == cursor) {
         return existing.clone();
     }
+    // Issued in number order: "R10000" sorts before "R9999" as text.
     if s.file_cursors.len() >= Workspace::FILE_CURSORS
-        && let Some(oldest) = s.file_cursors.keys().next().cloned()
+        && let Some(oldest) = s
+            .file_cursors
+            .keys()
+            .min_by_key(|id| id.trim_start_matches('R').parse::<u64>().unwrap_or(0))
+            .cloned()
     {
         s.file_cursors.remove(&oldest);
     }
@@ -2253,6 +2258,26 @@ mod tests {
         let next = envelope(execute(&mut ws, "file_read", json!({"cursor":cursor}), &Default::default()));
         assert_eq!(next["status"], "ok", "{next}");
         assert!(next["data"]["content"]["line_start"].as_u64().unwrap() > 1);
+    }
+
+    #[test]
+    fn a_full_cursor_table_drops_the_oldest_cursor_not_the_first_by_name() {
+        // Cursor IDs count up across the process: "R10000" sorts before
+        // "R9999" as text, so the newest cursor was dropped first.
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = workspace(dir.path());
+        for n in 9_000..9_000 + Workspace::FILE_CURSORS as u64 {
+            let mut cursor = file_cursor("p", &json!({"data":{"path":"a.rs","hash":"h","read_start":1,"read_max_lines":10}}));
+            cursor.offset = n as usize;
+            ws.file_cursors.insert(format!("R{n}"), cursor);
+        }
+        let result = json!({"data":{"path":"a.rs","hash":"h","read_start":1,"read_max_lines":10,"next_offset":1}});
+        let newest = register_file_cursor(&mut ws, "R10000".into(), &result);
+        let mut next = result.clone();
+        next["data"]["next_offset"] = json!(2);
+        register_file_cursor(&mut ws, "R10001".into(), &next);
+        assert!(ws.file_cursors.contains_key(&newest), "the cursor issued last call is kept");
+        assert!(!ws.file_cursors.contains_key("R9000") && !ws.file_cursors.contains_key("R9001"));
     }
 
     #[test]
