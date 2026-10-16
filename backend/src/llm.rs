@@ -144,6 +144,7 @@ pub struct CompletionError {
     attempts: usize,
     transient: bool,
     attempt_diagnostics: Vec<AttemptDiagnostic>,
+    tools_dropped: bool,
 }
 impl CompletionError {
     pub(crate) fn new(source: anyhow::Error, attempts: usize, transient: bool) -> Self {
@@ -152,7 +153,15 @@ impl CompletionError {
             attempts,
             transient,
             attempt_diagnostics: Vec::new(),
+            tools_dropped: false,
         }
+    }
+
+    /// The failed request withheld its tools and was sent without their
+    /// definitions, as `Completion::tools_dropped`: a size the provider
+    /// states in its refusal counts none of them.
+    pub fn tools_dropped(&self) -> bool {
+        self.tools_dropped
     }
 
     pub fn attempts(&self) -> usize {
@@ -231,6 +240,40 @@ pub fn context_overflow(error: &str) -> bool {
     ]
     .iter()
     .any(|phrase| text.contains(phrase))
+}
+
+/// The prompt tokens a provider counted for a request it refused as longer
+/// than its context, as its refusal states them (OpenAI, vLLM, llama.cpp,
+/// LM Studio, OpenRouter, Anthropic, Gemini, Text Generation Inference) —
+/// the input alone, without the output it would have reserved. No usage
+/// comes back with a refusal: this is the request's only measure.
+pub fn overflow_prompt_tokens(error: &str) -> Option<usize> {
+    static PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> = std::sync::LazyLock::new(|| {
+        [
+            // OpenAI and older vLLM: "(29012 in the messages, 4000 in the
+            // completion)", with the tools apart when they are counted apart.
+            r"(?i)\(([\d,]+) in the messages(?:, ([\d,]+) in the functions)?",
+            r"(?i)your messages resulted in ([\d,]+) tokens",
+            r"(?i)you requested ([\d,]+) tokens in the messages",
+            r"(?i)your request has ([\d,]+) input tokens",
+            // OpenRouter: "(136000 of text input, 900 of tool input, …)".
+            r"(?i)\(([\d,]+) of text input(?:, ([\d,]+) of tool input)?",
+            r#""n_prompt_tokens"\s*:\s*(\d+)"#,
+            r"(?i)keep the first ([\d,]+) tokens",
+            r"(?i)prompt is too long: ([\d,]+) tokens",
+            r"(?i)input token count \(([\d,]+)\)",
+            r"(?i)given: ([\d,]+) `inputs` tokens",
+            r"(?i)`inputs` must have less than [\d,]+ tokens\. given: ([\d,]+)",
+        ]
+        .iter()
+        .map(|pattern| regex::Regex::new(pattern).unwrap())
+        .collect()
+    });
+    PATTERNS.iter().find_map(|pattern| {
+        let found = pattern.captures(error)?;
+        let number = |group: usize| found.get(group).and_then(|m| m.as_str().replace(',', "").parse::<usize>().ok());
+        Some(number(1)? + number(2).unwrap_or(0))
+    })
 }
 
 /// Failures of the provider or the connection, not of the request itself.
@@ -1237,13 +1280,14 @@ impl LlmClient for OpenAiClient {
                             AttemptAction::Stop,
                             c,
                         );
-                        return Err(CompletionError::new(
+                        let mut failure = CompletionError::new(
                             e,
                             attempt.saturating_add(1),
                             transient,
                         )
-                        .with_diagnostics(attempt_diagnostics)
-                        .into());
+                        .with_diagnostics(attempt_diagnostics);
+                        failure.tools_dropped = withheld && request.get("tools").is_none();
+                        return Err(failure.into());
                     }
                     record_attempt_failure(
                         &mut attempt_diagnostics,
@@ -1327,6 +1371,34 @@ mod diagnostic_tests {
             assert!(!context_overflow(other), "{other}");
         }
     }
+
+    /// Context management review, thirteenth pass: a refusal for size was
+    /// told only by its words, so a request the provider counted past the
+    /// context never calibrated the estimate (no usage comes back with it).
+    #[test]
+    fn refusals_say_what_the_provider_counted() {
+        for (refused, counted) in [
+            (r#"http_400: {"error":{"message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 140213 tokens.","code":"context_length_exceeded"}}"#, Some(140_213)),
+            (r#"http_400: {"error":{"message":"This model's maximum context length is 8192 tokens. However, you requested 9500 tokens (7200 in the messages, 300 in the functions, and 2000 in the completion).","code":"context_length_exceeded"}}"#, Some(7_500)),
+            (r#"http_400: {"object":"error","message":"This model's maximum context length is 32768 tokens. However, you requested 33012 tokens (29012 in the messages, 4000 in the completion).","code":400}"#, Some(29_012)),
+            (r#"http_400: {"object":"error","message":"This model's maximum context length is 32768 tokens. However, you requested 40100 tokens in the messages, Please reduce the length of the messages.","code":400}"#, Some(40_100)),
+            (r#"http_400: {"object":"error","message":"'max_tokens' or 'max_completion_tokens' is too large: 4000. This model's maximum context length is 32768 tokens and your request has 29012 input tokens (4000 > 32768 - 29012).","code":400}"#, Some(29_012)),
+            (r#"http_400: {"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size_error","n_prompt_tokens":17001,"n_ctx":16384}}"#, Some(17_001)),
+            (r#"http_400: {"error":"Trying to keep the first 17001 tokens when context the overflows. However, the model is loaded with context length of only 16384 tokens, which is not enough."}"#, Some(17_001)),
+            (r#"http_400: {"error":{"message":"This endpoint's maximum context length is 131072 tokens. However, you requested about 140000 tokens (135100 of text input, 900 of tool input, 4000 in the output). Please reduce the length of either one.","code":400}}"#, Some(136_000)),
+            (r#"http_400: {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210,012 tokens > 200,000 maximum"}}"#, Some(210_012)),
+            (r#"http_400: [{"error":{"code":400,"message":"The input token count (1100000) exceeds the maximum number of tokens allowed (1048576).","status":"INVALID_ARGUMENT"}}]"#, Some(1_100_000)),
+            (r#"http_422: {"error":"Input validation error: `inputs` tokens + `max_new_tokens` must be <= 32768. Given: 31000 `inputs` tokens and 4000 `max_new_tokens`","error_type":"validation"}"#, Some(31_000)),
+            (r#"http_422: {"error":"Input validation error: `inputs` must have less than 8192 tokens. Given: 9000","error_type":"validation"}"#, Some(9_000)),
+            // Words without a count.
+            (r#"http_400: {"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size_error"}}"#, None),
+            (r#"http_400: {"error":{"code":"1261","message":"Prompt exceeds max length"}}"#, None),
+            ("http_413: Request Entity Too Large", None),
+        ] {
+            assert!(context_overflow(refused), "{refused}");
+            assert_eq!(overflow_prompt_tokens(refused), counted, "{refused}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1347,6 +1419,9 @@ mod tool_choice_tests {
         /// Refuses reasoning_effort by name, as OpenAI does for a model
         /// without reasoning.
         RefusesEffort,
+        /// Refuses tool_choice "none", then the request without its tools
+        /// as too long, saying what it counted.
+        RefusesThenTooLong,
     }
 
     /// An OpenAI-compatible server on a fresh port (so the endpoint caches
@@ -1384,8 +1459,12 @@ mod tool_choice_tests {
                     record.lock().unwrap().push(body);
                     let event = |v: Value| format!("data: {v}\n\n");
                     let reply = match provider {
-                        Provider::Refuses if withheld => {
+                        Provider::Refuses | Provider::RefusesThenTooLong if withheld => {
                             let error = r#"{"error":{"code":"1210","message":"Invalid API parameter"}}"#;
+                            format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}", error.len())
+                        }
+                        Provider::RefusesThenTooLong => {
+                            let error = r#"{"error":{"message":"This model's maximum context length is 8192 tokens. However, your messages resulted in 9100 tokens.","code":"context_length_exceeded"}}"#;
                             format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}", error.len())
                         }
                         Provider::TooLong => {
@@ -1480,9 +1559,22 @@ mod tool_choice_tests {
     #[tokio::test]
     async fn a_refusal_for_size_is_not_taken_for_tool_choice() {
         let (config, seen) = serve(Provider::TooLong).await;
-        let error = complete(&config, withheld()).await.unwrap_err().to_string();
-        assert!(context_overflow(&error), "{error}");
+        let error = complete(&config, withheld()).await.unwrap_err();
+        assert!(context_overflow(&error.to_string()), "{error}");
         assert_eq!(shapes(&seen), [(true, true)], "the caller evicts and asks again");
+        assert!(!error.downcast_ref::<CompletionError>().unwrap().tools_dropped(), "sent with its tools");
+    }
+
+    /// Context management review, thirteenth pass: the count in a refusal
+    /// is of the request as sent — without the tools, here — and the caller
+    /// calibrates against that request.
+    #[tokio::test]
+    async fn a_refusal_says_whether_the_tools_were_sent() {
+        let (config, seen) = serve(Provider::RefusesThenTooLong).await;
+        let error = complete(&config, withheld()).await.unwrap_err();
+        assert_eq!(shapes(&seen), [(true, true), (false, false)]);
+        assert_eq!(overflow_prompt_tokens(&error.to_string()), Some(9_100));
+        assert!(error.downcast_ref::<CompletionError>().unwrap().tools_dropped(), "{error}");
     }
 
     #[tokio::test]

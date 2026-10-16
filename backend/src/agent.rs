@@ -426,10 +426,42 @@ async fn run(
                     continue;
                 }
                 // A provider that counts more than the estimate, or serves
-                // less context than configured, refuses the request: every
-                // bundle that may leave leaves, and the request is made again.
-                // Nothing left to leave, the question ends as one too long.
-                if crate::llm::context_overflow(&error.to_string()) {
+                // less context than configured, refuses the request. Most
+                // refusals say what it counted, the only measure of a request
+                // no usage comes back for: it calibrates the estimate.
+                // Counted past the configured context, the request was
+                // estimated short (the server serves what is configured):
+                // calibrated, it is made again as any other — only what must
+                // leave leaves, and one that cannot fit is told by what fills
+                // it. Otherwise every bundle that may leave leaves and the
+                // request is made again; nothing left to leave, the question
+                // ends as one too long. Without the count a new
+                // conversation's first request (nothing calibrated yet) lost
+                // every old bundle, and a question alone was sent to the
+                // settings as if the server served less than configured.
+                let refusal = error.to_string();
+                if crate::llm::context_overflow(&refusal) {
+                    let counted = crate::llm::overflow_prompt_tokens(&refusal);
+                    let undercounted = counted.is_some_and(|n| n + config.llm.output_tokens + 512 > config.llm.context_tokens);
+                    if let Some(counted) = counted {
+                        let dropped = error
+                            .downcast_ref::<crate::llm::CompletionError>()
+                            .is_some_and(|e| e.tools_dropped());
+                        let sent = if dropped {
+                            context::count(&context::request(&c.history, &state, &model, vec![]), &model)
+                        } else {
+                            estimate
+                        };
+                        context::record_usage(c, &model, sent, counted);
+                    }
+                    let calibrated = (estimate as f64 * context::token_ratio(c, &model)).ceil() as usize;
+                    if undercounted && calibrated + config.llm.output_tokens + 512 > config.llm.context_tokens {
+                        eprintln!("[context] the provider counted {} tokens for ~{estimate}; asking again calibrated", counted.unwrap_or_default());
+                        discard();
+                        rounds -= 1;
+                        notice = round_notice;
+                        continue;
+                    }
                     let evicted = context::evict_all(c, config, &[question_bundle]);
                     if !evicted.is_empty() {
                         eprintln!("[context] the provider refused ~{estimate} tokens as too long; evicted {} old bundles", evicted.len());
@@ -446,8 +478,10 @@ async fn run(
                     // Refused with the question alone, which is not most of
                     // the request: the system prompt and tools pass what the
                     // server serves, and a shorter question would not help.
+                    // Counted past the configured context, the server serves
+                    // it: the settings hold too little for what it counts.
                     if only_question && context::bundle_tokens(&c.history, question_bundle, &model) * 2 < estimate {
-                        bail!(UserFacing(SERVED_SMALLER.into()));
+                        bail!(if undercounted { too_long(false, true) } else { UserFacing(SERVED_SMALLER.into()) });
                     }
                     bail!(too_long(true, !only_question));
                 }

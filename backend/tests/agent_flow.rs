@@ -2453,3 +2453,80 @@ async fn unusable_calls_after_a_sentence_are_asked_for_again() {
     assert!(error.downcast_ref::<agent::UserFacing>().is_some_and(|e| e.0.contains("도구 호출")), "{error}");
     assert_eq!(llm.requests.lock().unwrap().len(), 3, "two more requests");
 }
+
+// Context management review, thirteenth pass (2026-10-17): each failed
+// before its fix. Needs no MariaDB.
+
+/// A provider serving the configured context that counts `factor` times the
+/// estimate (a tokenizer and chat template unlike the fallback's): a longer
+/// request is refused with the count, as OpenAI-compatible servers word it.
+/// Each request is kept with its estimate and whether it was answered.
+struct Overcounting {
+    factor: f64,
+    requests: std::sync::Mutex<Vec<(Value, usize, bool)>>,
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for Overcounting {
+    async fn complete(&self, request: Value, config: &llm_agent::config::LlmConfig, _c: CancellationToken, _d: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        let estimate = llm_agent::context::count(&request, &config.model);
+        let counted = (estimate as f64 * self.factor) as usize;
+        let accepted = counted + config.output_tokens <= config.context_tokens;
+        self.requests.lock().unwrap().push((request, estimate, accepted));
+        if !accepted {
+            anyhow::bail!(
+                "http_400: {}",
+                json!({"error":{"message":format!("This model's maximum context length is {} tokens. However, your messages resulted in {counted} tokens.", config.context_tokens),"code":"context_length_exceeded"}})
+            );
+        }
+        let mut answer = text("답");
+        answer.usage = Some(llm_agent::llm::Usage { input: counted, output: 10, cached: None });
+        Ok(answer)
+    }
+}
+
+/// AC: a server that counts a new conversation's first request past the
+/// configured context (no usage has calibrated the estimate yet) refused a
+/// question too long for it, and the user was told the server serves less
+/// context than configured — it serves just that. Its refusal says what it
+/// counted: calibrated, the question is told it is too long.
+#[tokio::test]
+async fn a_refusal_that_counts_the_request_calibrates_it() {
+    let mut config = no_db("unknown-tokenizer");
+    config.llm.context_tokens = 16_000;
+    config.llm.output_tokens = 2_000;
+    let llm = std::sync::Arc::new(Overcounting { factor: 1.4, requests: Default::default() });
+    let (app, _dir) = app(config.clone(), llm.clone());
+    let (r, _) = ask(&app, "ac", &format!("이 내용을 정리해줘 {}", "자료 ".repeat(1_200)), vec![]).await;
+    let error = r.err().expect("too long for this server").to_string();
+    let (_, estimate, accepted) = llm.requests.lock().unwrap()[0].clone();
+    assert!(!accepted && estimate + config.llm.output_tokens + 512 <= config.llm.context_tokens, "sent uncalibrated, then refused: {estimate}");
+    assert!(error.contains("질문이 너무 길어"), "{error}");
+    // A short question is answered once calibrated, in the same conversation.
+    let (r, _) = ask(&app, "ac", "짧게 물어볼게", vec![]).await;
+    assert_eq!(r.map(|a| a.answer).map_err(|e| e.to_string()), Ok("답".to_owned()));
+}
+
+/// AD: the same server refused a restored conversation's first request, and
+/// every restored turn left the context at once: what had to leave was
+/// unknown without a count. Calibrated by the refusal, only the oldest turns
+/// leave and the latest exchange stays for the follow-up question.
+#[tokio::test]
+async fn a_counted_refusal_evicts_only_what_the_count_requires() {
+    let mut config = no_db("unknown-tokenizer");
+    config.llm.context_tokens = 32_000;
+    config.llm.output_tokens = 2_000;
+    config.agent.high_water = 0.95;
+    config.agent.low_water = 0.9;
+    let llm = std::sync::Arc::new(Overcounting { factor: 1.4, requests: Default::default() });
+    let (app, _dir) = app(config, llm.clone());
+    let turns: Vec<(String, String)> = (0..6)
+        .map(|i| (["user", "assistant"][i % 2].to_owned(), format!("턴{i} {}", "이전 대화 내용 ".repeat(420))))
+        .collect();
+    let (r, _) = ask(&app, "ad", "그럼 마지막 건은?", turns).await;
+    assert_eq!(r.map(|a| a.answer).map_err(|e| e.to_string()), Ok("답".to_owned()));
+    let requests = llm.requests.lock().unwrap().clone();
+    assert!(!requests[0].2, "the first request was refused: {}", requests[0].1);
+    let (answered, _, _) = requests.iter().find(|(_, _, accepted)| *accepted).unwrap();
+    let kept: Vec<String> = answered["messages"].as_array().unwrap().iter().filter_map(|m| m["content"].as_str()).filter_map(|t| t.strip_prefix("턴").map(|t| t[..1].to_owned())).collect();
+    assert!(kept.ends_with(&["4".to_owned(), "5".to_owned()]), "the latest exchange stays: {kept:?}");
+}
