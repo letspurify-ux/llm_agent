@@ -441,7 +441,7 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
 /// fewer items (the continuation offset follows what was kept), so the list
 /// reaches the model instead of an archive pointer. The tool message is
 /// measured as the model receives it, as `bound_result` measures it.
-fn fit_search(data: &mut Value, budget: usize, model: &str) {
+pub(crate) fn fit_search(data: &mut Value, budget: usize, model: &str) {
     let size = |d: &Value| crate::tools::message_tokens(&crate::tools::envelope(Ok(d.clone())), model);
     let fits = |d: &Value| size(d) <= budget;
     if fits(data) {
@@ -619,13 +619,19 @@ async fn knowledge_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
 /// message the model receives (at least one, cut when it alone is larger).
 fn fit_chunks(doc: i64, title: &str, total: i64, chunks: Vec<(i64, String)>, budget: usize, model: &str) -> Value {
     let first = chunks.first().map_or(1, |c| c.0);
-    let build = |taken: usize, text: String| {
+    // `ends`: where each chunk taken ends in `text`, so a cut beside other
+    // results keeps whole chunks (`tools::bound_result`); the model does not
+    // see them (`tools::model_result`).
+    let build = |taken: usize, (text, ends): (String, Vec<usize>)| {
         let last = chunks.get(taken.saturating_sub(1)).map_or(first, |c| c.0);
         let mut out = json!({
             "id":format!("k{doc}"),"title":title,"chunk_of":total,
             "chunks":if first == last { first.to_string() } else { format!("{first}-{last}") },
             "text":text
         });
+        if !ends.is_empty() {
+            out["chunk_ends"] = json!(chunks.iter().zip(ends).map(|((no, _), end)| json!([no, end])).collect::<Vec<_>>());
+        }
         if last < total {
             out["next_cursor"] = json!(format!("k{doc}:{}", last + 1));
         } else {
@@ -634,16 +640,16 @@ fn fit_chunks(doc: i64, title: &str, total: i64, chunks: Vec<(i64, String)>, bud
         out
     };
     let size = |out: &Value| crate::tools::message_tokens(&crate::tools::envelope(Ok(out.clone())), model);
-    let join = |taken: usize| crate::chunk::join_chunks(chunks[..taken].iter().map(|(no, c)| (*no, c.as_str())));
+    let join = |taken: usize| crate::chunk::join_chunks_with_ends(chunks[..taken].iter().map(|(no, c)| (*no, c.as_str())));
     // Each chunk counted once, without the overlap the join removes, to
     // choose how many; the joined message is then measured, and chunks leave
     // from the end until it fits.
     if chunks.is_empty() {
-        return build(0, String::new());
+        return build(0, Default::default());
     }
     // Chunks past the budget are not counted: a long document fetches many.
     let mut sizes: Vec<usize> = vec![];
-    let mut sum = size(&build(0, String::new()));
+    let mut sum = size(&build(0, Default::default()));
     for (i, (no, content)) in chunks.iter().enumerate() {
         let added = match i.checked_sub(1).map(|p| &chunks[p]) {
             Some((before, previous)) if *before == no - 1 => {
@@ -686,11 +692,13 @@ fn fit_chunks(doc: i64, title: &str, total: i64, chunks: Vec<(i64, String)>, bud
         return out;
     }
     // One chunk larger than the budget: its start.
-    let whole = join(1);
-    let mut room = budget.saturating_sub(size(&build(1, String::new())));
+    let (whole, _) = join(1);
+    let mut room = budget.saturating_sub(size(&build(1, Default::default())));
     loop {
         let (head, _) = crate::context::truncate(&whole, room, model);
-        let out = build(1, head + TRUNC_MARK);
+        let text = head + TRUNC_MARK;
+        let end = text.chars().count();
+        let out = build(1, (text, vec![end]));
         if room == 0 || size(&out) <= budget {
             return out;
         }
@@ -1158,5 +1166,89 @@ mod tests {
         assert_eq!(cut["chunks"], "1");
         assert!(cut["text"].as_str().unwrap().ends_with(TRUNC_MARK));
         assert!(message(&cut) <= 400, "{}", message(&cut));
+    }
+
+    // Context management review, sixth pass (2026-10-16): results cut beside
+    // the other results of their response (`fit_batch`) kept their own
+    // shape and continuation. Each failed before its fix.
+
+    fn workspace() -> crate::tools::Workspace {
+        crate::tools::Workspace {
+            project: Default::default(),
+            config: crate::tools::ToolConfig { model: "gpt-4o".into(), result_tokens: 25_000, tool_timeout_secs: 30 },
+            file_cursors: Default::default(),
+            list_cursor_scopes: Default::default(),
+            history: Default::default(),
+        }
+    }
+    fn tool_call(name: &str) -> crate::llm::ToolCall {
+        crate::llm::ToolCall { id: "c1".into(), name: name.into(), arguments: "{}".into() }
+    }
+
+    /// A document cut beside other results was cut inside its text: it still
+    /// said it held all its chunks ("1-9") and had no next_cursor, so a
+    /// continuation by chunk number skipped what was cut.
+    #[test]
+    fn a_document_cut_beside_other_results_keeps_whole_chunks_and_its_cursor() {
+        let chunks: Vec<(i64, String)> = (1..=9).map(|i| (i, format!("{i}번 문단 ").repeat(120))).collect();
+        let read = crate::tools::envelope(Ok(fit_chunks(7, "제목", 9, chunks.clone(), 25_000, "gpt-4o")));
+        assert_eq!(read["data"]["complete_to_end"], true);
+        let call = tool_call("knowledge_read");
+        let args = json!({"id":"k7"});
+        let full = crate::tools::result_tokens(&call, &read, "gpt-4o");
+        let mut ws = workspace();
+        for limit in [full / 2, full / 4] {
+            let cut = crate::tools::bound_result(&mut ws, &call, &args, read.clone(), limit);
+            assert!(crate::tools::result_tokens(&call, &cut, "gpt-4o") <= limit, "{cut}");
+            let data = &cut["data"];
+            let last: usize = data["chunks"].as_str().unwrap().rsplit('-').next().unwrap().parse().unwrap();
+            assert!((1..9).contains(&last), "{cut}");
+            assert_eq!(data["chunks"], format!("1-{last}"));
+            let joined = crate::chunk::join_chunks(chunks[..last].iter().map(|(no, c)| (*no, c.as_str())));
+            assert_eq!(data["text"], joined);
+            assert_eq!(data["next_cursor"], format!("k7:{}", last + 1));
+            assert!(data.get("complete_to_end").is_none(), "{cut}");
+        }
+        // Too small for one chunk: nothing of it, read again from its start.
+        let none = crate::tools::bound_result(&mut ws, &call, &args, read.clone(), 200);
+        assert_eq!((none["data"]["text"].clone(), none["data"]["next_cursor"].clone()), (json!(""), json!("k7:1")), "{none}");
+        // The knowledge itself holds the rest: nothing was archived, and the
+        // chunk bookkeeping stays off the model's view.
+        assert!(ws.history.bundles.is_empty() && none.get("archive_id").is_none());
+        assert!(crate::tools::model_result(&read)["data"].get("chunk_ends").is_none());
+    }
+
+    /// A search cut beside other results was archived whole, its list shown
+    /// as the start of its JSON text, though a search fits itself.
+    #[test]
+    fn a_search_cut_beside_other_results_still_fits_itself() {
+        let item = |i: usize| json!({"id":format!("k{i}"),"title":"제목","excerpt":"근거 문장 ".repeat(60)});
+        let data = json!({"text":"q","limit":10,"offset":0,"results":{"knowledge":{"status":"ok","items":(0..10).map(item).collect::<Vec<_>>()}}});
+        let result = crate::tools::envelope(Ok(data));
+        let call = tool_call("search");
+        let limit = crate::tools::result_tokens(&call, &result, "gpt-4o") / 3;
+        let mut ws = workspace();
+        let cut = crate::tools::bound_result(&mut ws, &call, &json!({"query":"q"}), result, limit);
+        assert!(crate::tools::result_tokens(&call, &cut, "gpt-4o") <= limit, "{cut}");
+        let items = cut["data"]["results"]["knowledge"]["items"].as_array().expect("still a list");
+        assert!(!items.is_empty(), "{cut}");
+        assert!(ws.history.bundles.is_empty() && cut.get("archive_id").is_none(), "{cut}");
+    }
+
+    /// Query rows cut for size kept the count of rows past the preview, so
+    /// the rows cut from the preview itself were nowhere to be read from.
+    #[test]
+    fn cut_query_rows_say_where_the_unseen_rows_start() {
+        let rows: Vec<Value> = (0..20).map(|i| json!({"ID":i,"NOTE":"가나다 ".repeat(40)})).collect();
+        let data = json!({"step":3,"query_name":"q","target_db":"DB","columns":["ID","NOTE"],"row_count":100,"capped":false,"rows":rows,
+            "omitted_rows":80,"guidance":"나머지 행은 result_read(step, offset)로 읽어라."});
+        let result = crate::tools::envelope(Ok(data));
+        let call = tool_call("query_run");
+        let limit = crate::tools::result_tokens(&call, &result, "gpt-4o") / 3;
+        let cut = crate::tools::bound_result(&mut workspace(), &call, &json!({"query_name":"q"}), result, limit);
+        let shown = cut["data"]["rows"].as_array().unwrap().len();
+        assert!((1..20).contains(&shown), "{cut}");
+        assert_eq!(cut["data"]["omitted_rows"], 100 - shown, "{cut}");
+        assert!(cut["data"]["guidance"].as_str().unwrap().contains(&format!("offset {shown}")), "{cut}");
     }
 }

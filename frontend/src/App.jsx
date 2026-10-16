@@ -11,7 +11,7 @@ import { columnsOf, cellValue, cellText, toCsv, csvFileName, stepLabel, normaliz
 // 응답 스트림 읽기는 stream.js에, 미리보기 코드블록 표시는 preview.js에 있다.
 import { readEvents } from './stream.js';
 import { fillAnswer } from './answer-fill.js';
-import { loadChat, saveChat } from './chat-store.js';
+import { openChat, closeChat, markChatOpen, saveChat } from './chat-store.js';
 
 // 대화 번호. crypto.randomUUID가 없는 브라우저(구형·http 사내 주소)에서는 난수로 만든다.
 function newConversationId() {
@@ -473,7 +473,8 @@ export default function App() {
   const [adminState, setAdminState] = useState({ dirty: false, busy: false });
   const previewPlugins = useMarkdownPlugins(REHYPE_PLUGINS);
   // 이 탭에서 하던 대화 (새로 열려도 이어진다 — chat-store.js). 처음 한 번만 읽는다.
-  const [restored] = useState(() => loadChat());
+  // 복제된 탭이면 대화 번호가 비어 온다(아래에서 새로 만든다).
+  const [restored] = useState(() => openChat());
   const [messages, setMessages] = useState(() => restored?.messages ?? []);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
@@ -508,6 +509,18 @@ export default function App() {
   useEffect(() => {
     saveChat({ conversationId: conversationRef.current, messages, history: historyRef.current });
   }, [messages]);
+  // 이 탭이 대화를 보여 주는 동안 '열림' 표시를 둔다 — 떠날 때 지우고, 뒤로 가기 캐시에서 돌아오면 다시 단다.
+  // 표시가 남은 채 열리는 페이지는 복제된 탭이다(openChat).
+  useEffect(() => {
+    const leave = () => closeChat();
+    const back = e => { if (e.persisted) markChatOpen(); };
+    window.addEventListener('pagehide', leave);
+    window.addEventListener('pageshow', back);
+    return () => {
+      window.removeEventListener('pagehide', leave);
+      window.removeEventListener('pageshow', back);
+    };
+  }, []);
   const chatRef = useRef(null);
   // 화면이 대화의 바닥에 붙어 있는가. 말풍선이 뒤늦게 커질 때 따라 내려갈지를 이것으로 정한다.
   const stuckRef = useRef(true);

@@ -46,6 +46,8 @@ pub const ONE_SHOT_PREFIX: &str = "once:";
 /// tool calls.
 const FINAL_RESERVE_SECS: u64 = 45;
 const TIME_OVER: &str = "답변 시간이 다 되어 마무리하지 못했습니다. 질문을 좁혀 다시 시도해주세요.";
+/// A short question the model server refused as longer than its context.
+const SERVED_SMALLER: &str = "모델 서버가 받을 수 있는 컨텍스트가 설정보다 작아 답할 수 없습니다. 설정의 컨텍스트와 출력 한도를 모델 서버에 맞춰주세요.";
 /// What the model is told when the work before the final reserve stopped.
 const RESERVE_REACHED: &str = "남은 시간이 모자라 이전 요청을 멈췄다.";
 const TOOLS_STOPPED: &str = "남은 시간이 모자라 이전 응답의 도구 실행 일부를 멈췄다(status cancelled).";
@@ -425,6 +427,12 @@ async fn run(
                     }
                     discard();
                     let only_question = c.history.bundles.iter().rev().find(|b| b.active).map(|b| b.id) == Some(question_bundle);
+                    // Refused with the question alone, which is not most of
+                    // the request: the system prompt and tools pass what the
+                    // server serves, and a shorter question would not help.
+                    if only_question && context::bundle_tokens(&c.history, question_bundle, &model) * 2 < estimate {
+                        bail!(UserFacing(SERVED_SMALLER.into()));
+                    }
                     bail!(too_long(true, !only_question));
                 }
                 let unavailable = error

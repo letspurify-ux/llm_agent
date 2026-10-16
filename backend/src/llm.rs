@@ -199,8 +199,9 @@ fn overload_error(text: &str) -> bool {
 }
 
 /// A provider's refusal of a request longer than the context it serves, as
-/// OpenAI, vLLM, llama.cpp, LM Studio, OpenRouter, Anthropic, Gemini and
-/// Z.ai word it (or a proxy refusing the body's size).
+/// OpenAI, vLLM, llama.cpp, LM Studio, OpenRouter, Anthropic, Gemini, Z.ai
+/// and Text Generation Inference word it (or a proxy refusing the body's
+/// size).
 pub fn context_overflow(error: &str) -> bool {
     if error.starts_with("http_413") {
         return true;
@@ -221,6 +222,8 @@ pub fn context_overflow(error: &str) -> bool {
         "reduce the length of the messages",
         "maximum prompt length",
         "exceeds max length",
+        "`inputs` tokens + `max_new_tokens`",
+        "`inputs` must have less than",
     ]
     .iter()
     .any(|phrase| text.contains(phrase))
@@ -1200,6 +1203,9 @@ mod diagnostic_tests {
             r#"http_400: {"error":{"code":"1261","message":"Prompt exceeds max length"}}"#,
             "http_413: Request Entity Too Large",
             r#"provider_error: {"code":400,"message":"This endpoint's maximum context length is 65536 tokens."}"#,
+            // Text Generation Inference (and providers serving with it).
+            r#"http_422: {"error":"Input validation error: `inputs` tokens + `max_new_tokens` must be <= 32768. Given: 31000 `inputs` tokens and 4000 `max_new_tokens`","error_type":"validation"}"#,
+            r#"http_422: {"error":"Input validation error: `inputs` must have less than 8192 tokens. Given: 9000","error_type":"validation"}"#,
         ] {
             assert!(context_overflow(refused), "{refused}");
         }

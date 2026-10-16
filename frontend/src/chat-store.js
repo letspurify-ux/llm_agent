@@ -2,7 +2,13 @@
 // 새로 열리면(개발 서버의 재연결 새로고침, 실수로 누른 F5, 브라우저의 탭 복원) 통째로 사라졌다.
 // 같은 탭에서 다시 열면 말풍선·서버로 보낼 이력·대화 번호를 그대로 되살린다 — 대화 번호가 같으니
 // 서버가 아직 들고 있는 맥락(앞 턴의 조회 결과)도 이어진다. 새 탭은 sessionStorage가 따로라 새 대화다.
+// 단 '탭 복제'는 sessionStorage를 통째로 복사한다 — 대화 번호까지 같아지면 두 탭의 질문이 서버의
+// 한 대화에 섞이고(한 탭의 답이 다른 탭 질문의 맥락이 된다), 한 탭의 질문이 다른 탭에서 진행 중인 답을
+// 취소한다. 그래서 대화를 보여 주는 동안 '열림' 표시를 두고 떠날 때(새로고침·닫기·이동, pagehide) 지운다.
+// 열 때 표시가 이미 있으면 그 대화를 아직 보여 주는 탭의 복제본이다 — 말풍선과 이력은 그대로 두고
+// 대화 번호만 새로 받는다(서버는 보낸 이력으로 맥락을 되살린다).
 const KEY = 'llm-agent.chat.v1';
+const OPEN = 'llm-agent.chat.open';
 
 function storageOf(storage) {
   if (storage !== undefined) return storage;
@@ -47,4 +53,26 @@ export function saveChat({ conversationId, messages, history }, storage) {
   }
   try { store.removeItem(KEY); } catch { /* 지울 수도 없으면 그대로 둔다 */ }
   return false;
+}
+
+// 이 탭이 대화를 연다: 저장해 둔 대화(없으면 null)를 돌려주고 '열림' 표시를 세운다. 표시가 이미 있으면
+// 복제된 탭이므로 대화 번호를 비워(null) 돌려준다 — 부르는 쪽이 새 번호를 만든다.
+export function openChat(storage) {
+  const store = storageOf(storage);
+  const chat = loadChat(store);
+  let duplicate = false;
+  try {
+    duplicate = store?.getItem(OPEN) === '1';
+    store?.setItem(OPEN, '1');
+  } catch { /* 표시를 못 다는 저장소면 예전처럼 이어 간다 */ }
+  return chat && duplicate ? { ...chat, conversationId: null } : chat;
+}
+
+// 탭이 대화를 떠난다(pagehide) — 같은 탭에서 다시 열면 같은 대화로 이어지게 표시를 지운다.
+// 뒤로 가기 캐시에서 되살아나면(pageshow persisted) markChatOpen으로 다시 세운다.
+export function closeChat(storage) {
+  try { storageOf(storage)?.removeItem(OPEN); } catch { /* 지울 수 없으면 그대로 둔다 */ }
+}
+export function markChatOpen(storage) {
+  try { storageOf(storage)?.setItem(OPEN, '1'); } catch { /* 위와 같다 */ }
 }

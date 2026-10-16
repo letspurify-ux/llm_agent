@@ -1790,3 +1790,268 @@ async fn too_much_material_for_one_question_is_not_sent_to_a_new_conversation() 
     let error = r.err().expect("too much material").to_string();
     assert!(error.contains("질문을 나누거나") && !error.contains("새 대화"), "{error}");
 }
+
+// Context management review, sixth pass (2026-10-16): each failed before its
+// fix. Needs no MariaDB.
+
+/// AA: a provider serving less context than configured refused even a short
+/// first question (the system prompt and tools alone did not fit), and the
+/// question was told it was too long: shortening it never helps.
+#[tokio::test]
+async fn a_short_question_the_provider_refuses_points_to_the_settings() {
+    let mut config = no_db("gpt-4o");
+    config.llm.context_tokens = 64_000;
+    config.llm.output_tokens = 2_000;
+    let llm = std::sync::Arc::new(Refusing { limit: 3_000, replies: Default::default(), refused: Default::default() });
+    let (app, _dir) = app(config, llm.clone());
+    let (r, _) = ask(&app, "aa", "안녕하세요", vec![]).await;
+    let error = r.err().expect("refused").to_string();
+    assert!(error.contains("설정") && !error.contains("질문이 너무 길어"), "{error}");
+}
+
+/// AB: with the knowledge and query tools, random batches (many documents at
+/// once, so a response's results are cut together), eviction, a small
+/// history and a provider serving less context than configured: every
+/// request keeps its shape and fits, a document's text is exactly the
+/// chunks it names with the right continuation, cut query rows say what is
+/// unseen, the chunk bookkeeping never reaches the model, and every
+/// continuation followed (a document's next_cursor, a history next_cursor, a
+/// search item's offset, result_read's next_offset) reads. DB_FUZZ sets the
+/// number of conversations (DB_FUZZ_STATS prints what was exercised). Needs
+/// MariaDB.
+/// A model that reads at random with the knowledge and query tools, then
+/// follows every continuation its latest results name, then answers.
+struct DbFollower {
+    seed: std::sync::Mutex<u64>,
+    docs: Vec<String>,
+    ratio: f64,
+    real_limit: usize,
+    round: std::sync::Mutex<usize>,
+    next_id: std::sync::Mutex<usize>,
+    requests: std::sync::Mutex<Vec<(Value, bool)>>,
+    /// Calls made by following a continuation: id → what was followed.
+    followed: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+}
+impl DbFollower {
+    fn next(&self, n: usize) -> usize {
+        let mut seed = self.seed.lock().unwrap();
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 33) as usize) % n.max(1)
+    }
+    fn id(&self) -> String {
+        let mut n = self.next_id.lock().unwrap();
+        *n += 1;
+        format!("d{n}")
+    }
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for DbFollower {
+    async fn complete(&self, request: Value, config: &llm_agent::config::LlmConfig, _c: CancellationToken, _d: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        let input = (llm_agent::context::count(&request, &config.model) as f64 * self.ratio) as usize;
+        let accepted = input + config.output_tokens <= self.real_limit;
+        self.requests.lock().unwrap().push((request.clone(), accepted));
+        if !accepted {
+            anyhow::bail!("http_400: {}", json!({"error":{"message":format!("This model's maximum context length is {} tokens.", self.real_limit),"code":"context_length_exceeded"}}));
+        }
+        let round = {
+            let mut round = self.round.lock().unwrap();
+            *round += 1;
+            *round
+        };
+        let mut out = text("");
+        out.usage = Some(llm_agent::llm::Usage { input, output: 50, cached: None });
+        let withheld = request["tool_choice"] == "none";
+        if withheld || round > 6 {
+            out.text = "답".into();
+            *self.round.lock().unwrap() = 0;
+            return Ok(out);
+        }
+        if round == 1 {
+            for _ in 0..1 + self.next(24) {
+                let id = self.id();
+                let doc = &self.docs[self.next(self.docs.len())];
+                out.calls.push(match self.next(10) {
+                    0..=4 => {
+                        let mut args = json!({"id":doc});
+                        if self.next(3) == 0 {
+                            args["start_chunk"] = json!(1 + self.next(30));
+                        }
+                        if self.next(4) == 0 {
+                            args["max_chunks"] = json!(1 + self.next(20));
+                        }
+                        call(&id, "knowledge_read", args)
+                    }
+                    5 => call(&id, "query_run", {
+                        let customer = ["C-1001", "C-1002", "C-1003"][self.next(3)];
+                        json!({"query_name":"order_status_by_customer","params":{"customer_id":customer},"preview_rows":1 + self.next(3)})
+                    }),
+                    6 => call(&id, "result_read", json!({"step":1 + self.next(4),"offset":self.next(3),"limit":1 + self.next(2)})),
+                    7 => call(&id, "method_read", json!({"ids":["m1","m2","m3","m4"]})),
+                    _ => call(&id, "history", {
+                        let query = ["끝", "문단", "배치"][self.next(3)];
+                        json!({"action":"search","query":query})
+                    }),
+                });
+            }
+            return Ok(out);
+        }
+        // Follow what the newest results say goes on.
+        let messages = request["messages"].as_array().unwrap();
+        let last_assistant = messages.iter().rposition(|m| m["role"] == "assistant" && m["tool_calls"].as_array().is_some_and(|c| !c.is_empty()));
+        let Some(at) = last_assistant else {
+            out.text = "답".into();
+            return Ok(out);
+        };
+        let calls_made = messages[at]["tool_calls"].as_array().unwrap().clone();
+        for message in &messages[at + 1..] {
+            if message["role"] != "tool" {
+                continue;
+            }
+            let Ok(result) = serde_json::from_str::<Value>(message["content"].as_str().unwrap()) else { continue };
+            let name = calls_made.iter().find(|c| c["id"] == message["tool_call_id"]).map(|c| c["function"]["name"].as_str().unwrap().to_owned()).unwrap_or_default();
+            let id = self.id();
+            let follow = if result["next_cursor"]["tool"] == "history" {
+                let mut args = result["next_cursor"].clone();
+                args.as_object_mut().unwrap().remove("tool");
+                Some((call(&id, "history", args), "history next_cursor"))
+            } else if name == "knowledge_read" && result["data"]["next_cursor"].is_string() {
+                Some((call(&id, "knowledge_read", json!({"cursor":result["data"]["next_cursor"]})), "knowledge next_cursor"))
+            } else if name == "result_read" && result["data"]["next_offset"].is_u64() {
+                Some((call(&id, "result_read", json!({"step":result["data"]["step"],"offset":result["data"]["next_offset"],"limit":2})), "result_read next_offset"))
+            } else if name == "history" && result["data"]["items"].as_array().is_some_and(|i| !i.is_empty()) {
+                let item = &result["data"]["items"][0];
+                item["offset"].as_u64().map(|offset| (call(&id, "history", json!({"action":"read","id":item["id"],"offset":offset})), "history search offset"))
+            } else {
+                None
+            };
+            if let Some((c, what)) = follow {
+                self.followed.lock().unwrap().insert(id.clone(), what.to_owned());
+                out.calls.push(c);
+            }
+        }
+        if out.calls.is_empty() {
+            out.text = "답".into();
+            *self.round.lock().unwrap() = 0;
+        }
+        Ok(out)
+    }
+}
+
+#[tokio::test]
+async fn random_knowledge_and_query_reads_keep_their_shape_and_continuations() {
+    let Some(db) = TestDb::create("fuzz6") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let runs: usize = std::env::var("DB_FUZZ").ok().and_then(|n| n.parse().ok()).unwrap_or(10);
+    let mut seed: u64 = 0xdb6;
+    let mut next = |n: usize| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as usize) % n.max(1)
+    };
+    let mut contents = std::collections::BTreeMap::new();
+    for d in 0..12 {
+        let paragraphs = [2, 5, 20, 40, 60][d % 5];
+        let body: String = (0..paragraphs).map(|p| format!("문서{d} 문단{p}: {} 끝{d}-{p}.\n", "점검 절차와 \"따옴표\" 설명 ".repeat(5 + (p % 7)))).collect();
+        db.sql_in(&format!("INSERT INTO knowledge (title, content) VALUES ('퍼저 문서 {d}', '{}')", body.replace('\'', "''")));
+        let seq = db.scalar(&format!("SELECT seq FROM knowledge WHERE title = '퍼저 문서 {d}'"));
+        contents.insert(format!("k{seq}"), body);
+    }
+    let docs: Vec<String> = contents.keys().cloned().collect();
+    let parts: std::collections::BTreeMap<String, Vec<String>> = contents.iter().map(|(k, v)| (k.clone(), llm_agent::chunk::split_content(v))).collect();
+    let mut stats: std::collections::BTreeMap<String, usize> = Default::default();
+    for run in 0..runs {
+        let mut config = db.config();
+        config.llm.model = ["gpt-4o", "unknown-tokenizer"][next(2)].into();
+        let context = [24_000, 32_000, 64_000][next(3)];
+        config.llm.context_tokens = context;
+        config.llm.output_tokens = [2_000, 4_000][next(2)];
+        if next(2) == 0 {
+            config.agent.history_bytes = 64 * 1024;
+        }
+        if next(3) == 0 {
+            config.agent.result_tokens = Some(200 + next(3000));
+        }
+        let ratio = if config.llm.model == "gpt-4o" { 1.0 } else { 0.8 + next(40) as f64 / 100.0 };
+        let real_limit = if next(3) == 0 { context * (60 + next(40)) / 100 } else { context * 2 };
+        let llm = std::sync::Arc::new(DbFollower {
+            seed: std::sync::Mutex::new(next(1 << 30) as u64 + 1),
+            docs: docs.clone(),
+            ratio,
+            real_limit,
+            round: Default::default(),
+            next_id: Default::default(),
+            requests: Default::default(),
+            followed: Default::default(),
+        });
+        let (fuzz_app, _fuzz_dir) = app(config.clone(), llm.clone());
+        for q in 0..3 {
+            let before = llm.requests.lock().unwrap().len();
+            let (result, _) = ask(&fuzz_app, &format!("db{run}"), &format!("질문 {q}"), vec![]).await;
+            if let Err(error) = &result {
+                assert!(error.downcast_ref::<agent::UserFacing>().is_some(), "run {run} question {q}: {error:#}");
+            }
+            let requests = llm.requests.lock().unwrap().clone();
+            let followed = llm.followed.lock().unwrap().clone();
+            for (i, (request, accepted)) in requests.iter().enumerate().skip(before) {
+                if let Err(broken) = request_shape(request) {
+                    panic!("run {run} question {q} request {i}: {broken}");
+                }
+                let raw = request.to_string();
+                assert!(!raw.contains("chunk_ends"), "run {run} request {i}: chunk bookkeeping reached the model");
+                let input = (llm_agent::context::count(request, &config.llm.model) as f64 * ratio) as usize;
+                assert!(!accepted || i == 0 || input + config.llm.output_tokens <= context, "run {run} request {i}: {input} past {context}");
+                let messages = request["messages"].as_array().unwrap();
+                for (at, message) in messages.iter().enumerate().filter(|(_, m)| m["role"] == "tool") {
+                    let call_id = message["tool_call_id"].as_str().unwrap();
+                    let call = messages[..at].iter().rev().filter_map(|m| m["tool_calls"].as_array()).flatten().find(|c| c["id"] == call_id).unwrap();
+                    let name = call["function"]["name"].as_str().unwrap();
+                    let result: Value = serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+                    if let Some(what) = followed.get(call_id) {
+                        *stats.entry(format!("followed {what} {}", result["status"])).or_default() += 1;
+                    }
+                    if name == "knowledge_read" && result["truncated"] == true {
+                        *stats.entry(format!("knowledge cut {}", if result["data"]["not_delivered"].is_string() { "to nothing" } else { "to whole chunks" })).or_default() += 1;
+                    }
+                    if result["archive_id"].is_u64() {
+                        *stats.entry(format!("archived {name}")).or_default() += 1;
+                    }
+                    if let Some(what) = followed.get(call_id) {
+                        assert_eq!(result["status"], "ok", "run {run} request {i}: following {what} failed: {result}");
+                    }
+                    if name == "knowledge_read" && result["status"] == "ok" {
+                        let data = &result["data"];
+                        let doc = data["id"].as_str().unwrap();
+                        let total = parts[doc].len();
+                        let text = data["text"].as_str().unwrap();
+                        if text.is_empty() {
+                            assert!(data["next_cursor"].is_string() && data["not_delivered"].is_string(), "run {run} request {i}: {result}");
+                            continue;
+                        }
+                        let chunks = data["chunks"].as_str().unwrap();
+                        let (a, b) = chunks.split_once('-').map_or((chunks, chunks), |(a, b)| (a, b));
+                        let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+                        let joined = llm_agent::chunk::join_chunks((a..=b).map(|n| (n as i64, parts[doc][n - 1].as_str())));
+                        let mark = llm_agent::text::TRUNC_MARK;
+                        assert!(text == joined || (a == b && text.ends_with(mark) && joined.starts_with(text.strip_suffix(mark).unwrap())), "run {run} request {i}: {doc} {chunks} text is not those chunks: {result}");
+                        if b < total {
+                            assert_eq!(data["next_cursor"], format!("{doc}:{}", b + 1), "run {run} request {i}: {result}");
+                        } else {
+                            assert_eq!(data["complete_to_end"], true, "run {run} request {i}: {result}");
+                        }
+                    }
+                    if name == "query_run" && result["status"] == "ok" && result["data"]["rows_omitted"].is_u64() {
+                        let shown = result["data"]["rows"].as_array().unwrap().len() as u64;
+                        assert_eq!(result["data"]["omitted_rows"], result["data"]["row_count"].as_u64().unwrap() - shown, "run {run}: {result}");
+                    }
+                }
+            }
+            if let Err(error) = &result {
+                let refused = llm.requests.lock().unwrap().iter().skip(before).any(|(_, accepted)| !accepted);
+                *stats.entry(format!("error {} (provider refused: {refused})", error.to_string().chars().take(20).collect::<String>())).or_default() += 1;
+            }
+        }
+    }
+    if std::env::var("DB_FUZZ_STATS").is_ok() {
+        eprintln!("stats: {stats:#?}");
+    }
+}

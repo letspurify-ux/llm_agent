@@ -222,7 +222,7 @@ impl ToolRegistry {
         }
         specs.push(ToolSpec {
             name: "history",
-            description: "Search earlier tool results of this conversation that left the active context (continue a search with after: next_cursor), or read one by ID and character offset (read requires id). A result archived because it was too large is read here with the id its next_cursor names.",
+            description: "Search earlier tool results of this conversation that left the active context (continue a search with after: next_cursor), or read one by ID and character offset (read requires id; a search item's offset reads from its match). A result archived because it was too large is read here with the id its next_cursor names.",
             source: false,
             parameters: schema(
                 json!({"action":action(&["search","read"]),"query":string(),"id":number(),"offset":number(),"after":number(),"limit":{"type":"integer","minimum":1,"maximum":50}}),
@@ -1703,6 +1703,7 @@ pub fn model_result(result: &Value) -> Value {
     }
     if let Some(data) = shown.get_mut("data").and_then(Value::as_object_mut) {
         data.remove("source");
+        data.remove("chunk_ends");
         for rows in ["matches", "symbols"] {
             if let Some(rows) = data.get_mut(rows).and_then(Value::as_array_mut) {
                 for row in rows {
@@ -1857,6 +1858,23 @@ pub fn bound_result(
     {
         return page;
     }
+    // A document goes on from the knowledge by chunk number (no archive): it
+    // is cut at whole chunks, with the cursor to the first one left out.
+    if call.name == "knowledge_read"
+        && result["status"] == "ok"
+        && let Some(page) = knowledge_page(call, &output, limit, &model)
+    {
+        return page;
+    }
+    // A search fits itself, as it does to the result budget (shorter
+    // excerpts, then fewer items with their next_offset).
+    if call.name == "search" && result["status"] == "ok" && output["data"]["results"].is_object() {
+        let mut fitted = output.clone();
+        crate::voc_tools::fit_search(&mut fitted["data"], limit, &model);
+        if result_tokens(call, &fitted, &model) <= limit {
+            return fitted;
+        }
+    }
     // A file read continues from the file with its cursor: it is archived
     // only when its text cannot be narrowed to the limit.
     let reads_file = matches!(call.name.as_str(), "file_read" | "symbol_read")
@@ -1976,6 +1994,17 @@ pub fn bound_result(
             if call.name == "history" && field == "items" {
                 output["data"]["next_cursor"] = items[low - 1]["id"].clone();
             }
+            // Query rows not shown, the preview's cut ones too, are read
+            // with result_read from the first of them.
+            if call.name == "query_run"
+                && field == "rows"
+                && let Some(total) = output["data"]["row_count"].as_u64()
+            {
+                output["data"]["omitted_rows"] = json!(total.saturating_sub(low as u64));
+                output["data"]["guidance"] = json!(format!(
+                    "나머지 행은 result_read(step, offset {low})로 읽어라. 답변 표·차트는 step 참조로 화면이 채운다."
+                ));
+            }
             let start = args["cursor"]
                 .as_str()
                 .and_then(|cursor| cursor.rsplit_once(':'))
@@ -2029,6 +2058,54 @@ pub fn bound_result(
         compact["data"] = Value::Null;
     }
     compact
+}
+
+/// A knowledge read cut to the whole chunks that fit `limit`, by the chunk
+/// ends it carries: the text of those chunks and the cursor to the next one,
+/// or none of it (the cursor reads it again) when not one chunk fits.
+fn knowledge_page(call: &crate::llm::ToolCall, result: &Value, limit: usize, model: &str) -> Option<Value> {
+    let data = &result["data"];
+    let ends: Vec<(i64, usize)> = data["chunk_ends"]
+        .as_array()?
+        .iter()
+        .map(|end| Some((end[0].as_i64()?, end[1].as_u64()? as usize)))
+        .collect::<Option<_>>()?;
+    let (text, doc) = (data["text"].as_str()?, data["id"].as_str()?);
+    let first = ends.first()?.0;
+    let page = |taken: usize| {
+        let mut page = result.clone();
+        let fields = page["data"].as_object_mut().unwrap();
+        fields.remove("complete_to_end");
+        if taken == 0 {
+            fields.remove("chunks");
+            fields.remove("chunk_ends");
+            fields.insert("text".into(), json!(""));
+            fields.insert("next_cursor".into(), json!(format!("{doc}:{first}")));
+            fields.insert(
+                "not_delivered".into(),
+                json!("Not one chunk fitted beside the other results of this response; read it with next_cursor."),
+            );
+        } else {
+            let (last, end) = ends[taken - 1];
+            fields.insert("text".into(), json!(text.chars().take(end).collect::<String>()));
+            fields.insert("chunks".into(), json!(if first == last { first.to_string() } else { format!("{first}-{last}") }));
+            fields.insert("chunk_ends".into(), json!(ends[..taken].iter().map(|(no, end)| json!([no, end])).collect::<Vec<_>>()));
+            fields.insert("next_cursor".into(), json!(format!("{doc}:{}", last + 1)));
+        }
+        page["truncated"] = json!(true);
+        page
+    };
+    // Fewer chunks than all of them: those did not fit.
+    let (mut low, mut high) = (0, ends.len() - 1);
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if result_tokens(call, &page(mid), model) <= limit {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Some(page(low))
 }
 
 /// The longest length up to `n` whose `size` stays within `limit`, for a size

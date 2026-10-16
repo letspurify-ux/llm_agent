@@ -160,7 +160,15 @@ pub fn cut_seam(text: &str, next: &str) -> String {
 /// (number, content) in ascending order; a missing number starts a new
 /// paragraph.
 pub fn join_chunks<'a>(chunks: impl IntoIterator<Item = (i64, &'a str)>) -> String {
+    join_chunks_with_ends(chunks).0
+}
+
+/// `join_chunks`, with the character where each chunk ends in the text: the
+/// first n chunks joined are the text up to the n-th end.
+pub fn join_chunks_with_ends<'a>(chunks: impl IntoIterator<Item = (i64, &'a str)>) -> (String, Vec<usize>) {
     let mut text = String::new();
+    let mut chars = 0;
+    let mut ends = vec![];
     let mut prev: Option<i64> = None;
     for (no, content) in chunks {
         let add = if prev == Some(no - 1) {
@@ -170,19 +178,24 @@ pub fn join_chunks<'a>(chunks: impl IntoIterator<Item = (i64, &'a str)>) -> Stri
         };
         if prev.is_some() && add.is_empty() {
             prev = Some(no);
+            ends.push(chars);
             continue;
         }
         if prev.is_none() {
             text = content.to_owned();
+            chars = text.chars().count();
         } else {
             if add == content {
                 text.push('\n');
+                chars += 1;
             }
             text.push_str(&add);
+            chars += add.chars().count();
         }
         prev = Some(no);
+        ends.push(chars);
     }
-    text
+    (text, ends)
 }
 
 #[cfg(test)]

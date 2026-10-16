@@ -82,7 +82,10 @@ impl SessionHistory {
     /// Drops the oldest evicted bundles until they fit `limit` bytes. Active
     /// bundles neither count nor go (the input budget bounds them), and what
     /// a result still in the context continues stays readable: the archive of
-    /// a cut result, the bundle a cut history read goes on reading.
+    /// a cut result, the bundle a cut history read goes on reading, and the
+    /// bundles a history search in the newest bundle found, which the next
+    /// response reads (a search's items are many: kept for longer, one small
+    /// result could hold many large bundles past the limit).
     pub fn prune(&mut self, limit: usize) {
         let mut bytes = self
             .bundles
@@ -94,22 +97,31 @@ impl SessionHistory {
         }
         let mut calls = std::collections::BTreeSet::new();
         let mut continued = std::collections::BTreeSet::new();
-        for message in self
-            .bundles
-            .iter()
-            .filter(|b| b.active)
-            .flat_map(|b| b.messages.iter())
-            .filter(|m| m["role"] == "tool")
-        {
-            if let Some(id) = message["tool_call_id"].as_str() {
-                calls.insert(id.to_owned());
-            }
-            let Some(result) = message["content"].as_str().and_then(|text| serde_json::from_str::<Value>(text).ok()) else {
-                continue;
-            };
-            continued.extend(result["archive_id"].as_u64());
-            if result["next_cursor"]["tool"] == "history" {
-                continued.extend(result["next_cursor"]["id"].as_u64());
+        let newest = self.bundles.iter().rev().find(|b| b.active).map(|b| b.id);
+        for bundle in self.bundles.iter().filter(|b| b.active) {
+            let searches: std::collections::BTreeSet<&str> = bundle
+                .messages
+                .iter()
+                .filter(|_| Some(bundle.id) == newest)
+                .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
+                .filter(|call| call["function"]["name"] == "history")
+                .filter_map(|call| call["id"].as_str())
+                .collect();
+            for message in bundle.messages.iter().filter(|m| m["role"] == "tool") {
+                let call = message["tool_call_id"].as_str();
+                if let Some(id) = call {
+                    calls.insert(id.to_owned());
+                }
+                let Some(result) = message["content"].as_str().and_then(|text| serde_json::from_str::<Value>(text).ok()) else {
+                    continue;
+                };
+                continued.extend(result["archive_id"].as_u64());
+                if result["next_cursor"]["tool"] == "history" {
+                    continued.extend(result["next_cursor"]["id"].as_u64());
+                }
+                if call.is_some_and(|id| searches.contains(id)) {
+                    continued.extend(result["data"]["items"].as_array().into_iter().flatten().filter_map(|item| item["id"].as_u64()));
+                }
             }
         }
         let droppable = |b: &Bundle| {
@@ -154,31 +166,42 @@ impl SessionHistory {
         // or as sent (copied from a history read).
         let escaped = serde_json::to_string(&q).map_or_else(|_| q.clone(), |s| s[1..s.len() - 1].to_owned());
         let needles: Vec<&str> = if escaped == q { vec![&q] } else { vec![&escaped, &q] };
-        let rows: Vec<(&Bundle, String, &str)> = self
+        let rows: Vec<(&Bundle, String, &str, bool)> = self
             .bundles
             .iter()
             .filter(|b| b.id > after)
             .filter_map(|b| {
-                let text = serde_json::to_string(&crate::context::shown_messages(&without_history_calls(&b.messages[..]))).unwrap_or_default();
+                let (messages, whole) = without_history_calls(&b.messages[..]);
+                let text = serde_json::to_string(&crate::context::shown_messages(&messages)).unwrap_or_default();
                 let lowered = text.to_lowercase();
                 let needle = needles.iter().copied().find(|needle| lowered.contains(needle))?;
-                Some((b, text, needle))
+                Some((b, text, needle, whole))
             })
             .collect();
         let items: Vec<_> = rows
             .iter()
             .take(limit.clamp(1, 50))
-            .map(|(b, text, needle)| json!({"id":b.id,"active":b.active,"excerpt":excerpt_around(text, needle)}))
+            .map(|(b, text, needle, whole)| {
+                let (excerpt, start) = excerpt_around(text, needle);
+                let mut item = json!({"id":b.id,"active":b.active,"excerpt":excerpt});
+                // Where a read of the bundle shows the excerpt: its text is
+                // the one searched unless history calls were left out.
+                if *whole {
+                    item["offset"] = json!(start);
+                }
+                item
+            })
             .collect();
         json!({"next_cursor":if rows.len()>items.len(){items.last().and_then(|x|x["id"].as_u64())}else{None},"items":items,"pruned_through":self.pruned_through})
     }
 }
 
-/// A bundle's messages without its history tool calls and their results.
-/// What a search or read showed is found where it came from: searched as
-/// well, an earlier search for the same words (its query, its excerpts) and
-/// every read copy would come back as matches of their own.
-fn without_history_calls(messages: &[Value]) -> Vec<Value> {
+/// A bundle's messages without its history tool calls and their results,
+/// and whether that is all of them. What a search or read showed is found
+/// where it came from: searched as well, an earlier search for the same
+/// words (its query, its excerpts) and every read copy would come back as
+/// matches of their own.
+fn without_history_calls(messages: &[Value]) -> (Vec<Value>, bool) {
     let calls: std::collections::BTreeSet<String> = messages
         .iter()
         .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
@@ -186,9 +209,9 @@ fn without_history_calls(messages: &[Value]) -> Vec<Value> {
         .filter_map(|call| call["id"].as_str().map(str::to_owned))
         .collect();
     if calls.is_empty() {
-        return messages.to_vec();
+        return (messages.to_vec(), true);
     }
-    messages
+    let kept = messages
         .iter()
         .filter(|m| !(m["role"] == "tool" && m["tool_call_id"].as_str().is_some_and(|id| calls.contains(id))))
         .map(|m| {
@@ -198,13 +221,15 @@ fn without_history_calls(messages: &[Value]) -> Vec<Value> {
             }
             m
         })
-        .collect()
+        .collect();
+    (kept, false)
 }
 
 /// About 240 characters of `text` around the first match of `query` (in
 /// lower case), so a search shows where a bundle matched rather than its
-/// opening tool call; the start when the match cannot be placed.
-fn excerpt_around(text: &str, query: &str) -> String {
+/// opening tool call (the start when the match cannot be placed), and the
+/// character of `text` it starts at.
+fn excerpt_around(text: &str, query: &str) -> (String, usize) {
     const BEFORE: usize = 80;
     const LENGTH: usize = 240;
     let chars: Vec<char> = text.chars().collect();
@@ -230,7 +255,7 @@ fn excerpt_around(text: &str, query: &str) -> String {
     if end < chars.len() {
         out.push('…');
     }
-    out
+    (out, start)
 }
 
 /// Rows of one executed query, kept for result_read and the answer's
@@ -544,6 +569,51 @@ mod tests {
         assert_eq!(ids, [found, 2], "{both}");
         let excerpt = h.search("needle", found, 10)["items"][0]["excerpt"].as_str().unwrap().to_owned();
         assert!(excerpt.contains("needle.txt") && !excerpt.contains("\"query\""), "{excerpt}");
+    }
+
+    /// Context management review, sixth pass: past the history size, the
+    /// bundles a search in the context had just found were dropped at the
+    /// next request, before the model could read them.
+    #[test]
+    fn prune_keeps_what_a_history_search_in_the_context_found() {
+        let mut h = SessionHistory::default();
+        let found = h.push(vec![json!({"role":"user","content":format!("needle {}", "x".repeat(5000))})], true);
+        h.bundles[0].active = false;
+        let search = h.search("needle", 0, 10);
+        h.push(
+            vec![
+                json!({"role":"assistant","content":null,"tool_calls":[{"id":"s","type":"function","function":{"name":"history","arguments":json!({"action":"search","query":"needle"}).to_string()}}]}),
+                json!({"role":"tool","tool_call_id":"s","content":json!({"status":"ok","data":search,"truncated":false,"next_cursor":null}).to_string()}),
+            ],
+            true,
+        );
+        h.prune(100);
+        assert!(h.read(found).is_ok(), "what the search the model just made found stays readable");
+        // Once a later response follows the search, what it found may go:
+        // the response after the search reads it.
+        h.push(vec![json!({"role":"assistant","content":"답"})], true);
+        h.prune(100);
+        assert!(h.read(found).is_err());
+    }
+
+    /// Context management review, sixth pass: a search named the bundle and
+    /// showed an excerpt, but not where in the bundle the match is, so a
+    /// large archive was read page by page from its start to reach it (as
+    /// the archive told the model to "find a part with history search").
+    #[test]
+    fn a_history_search_says_where_to_read_its_match_from() {
+        let mut h = SessionHistory::default();
+        let text = format!("{}찾을 말 바로 여기{}", "앞 문장. ".repeat(20_000), "뒤 문장. ".repeat(100));
+        h.push(vec![json!({"role":"tool_archive","call_id":"c","result":{"status":"ok","data":{"text":text}}})], true);
+        let item = h.search("찾을 말", 0, 10)["items"][0].clone();
+        let offset = item["offset"].as_u64().expect("an offset") as usize;
+        // Read as the history tool reads: the bundle's shown messages from
+        // that character on.
+        let read = serde_json::to_string(&crate::context::shown_messages(&h.bundles[0].messages[..])).unwrap();
+        let from: String = read.chars().skip(offset).take(200).collect();
+        assert!(from.contains("찾을 말 바로 여기"), "{from}");
+        let excerpt = item["excerpt"].as_str().unwrap().trim_start_matches('…');
+        assert!(from.starts_with(&excerpt.chars().take(40).collect::<String>()), "{from} / {excerpt}");
     }
 
     #[test]

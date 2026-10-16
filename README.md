@@ -245,6 +245,8 @@ cd frontend && npm install && npm run dev
 개발 서버는 브라우저와의 웹소켓(`server.ws`)을 꺼 두었다 — 켜 두면 연결이 끊길 때(절전 복귀, 사내 프록시의 유휴 연결 정리,
 서버 재시작) Vite가 페이지를 새로고침해 대화가 사라졌다. 그래서 코드를 고치면 브라우저를 직접 새로고침한다.
 화면의 대화는 그 탭의 `sessionStorage`에 저장돼, 같은 탭을 새로고침하면 말풍선·이력·대화 번호가 되살아난다(새 탭은 새 대화).
+탭 복제는 `sessionStorage`를 복사하므로, 복제된 탭은 말풍선·이력을 이어 받되 대화 번호는 새로 받는다 — 두 탭의 질문이 서버의 한 대화에
+섞이거나 서로의 진행 중인 답을 취소하지 않는다(`chat-store.js`의 '열림' 표시, 떠날 때 `pagehide`로 지운다).
 
 인프라(MariaDB·Oracle·Ollama)와 앱을 한 번에 올리고 내리려면 `./start_all.sh` / `./stop_all.sh`,
 Windows는 `start_all.bat` / `stop_all.bat`을 쓴다(`--apps-only`는 앱만). Windows판은 MSI가 등록한 MariaDB 서비스

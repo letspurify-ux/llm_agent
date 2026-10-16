@@ -2314,3 +2314,17 @@ it('같은 탭에서 다시 열면 대화가 그대로 돌아오고, 홈을 누�
   assert.notEqual(after.conversationId, id);
 });
 
+it('복제한 탭은 같은 말풍선으로 이어 가되 대화 번호는 새로 받는다', async () => {
+  await answered();
+  const bubbles = `[...document.querySelectorAll('.chat .bubble')].map(b => b.innerText.trim().slice(0, 40))`;
+  const before = await page.eval(bubbles);
+  const id = await page.eval(`JSON.parse(sessionStorage.getItem('llm-agent.chat.v1')).conversationId`);
+  // 탭 복제는 sessionStorage를 대화를 보여 주는 탭의 '열림' 표시까지 복사한다. 떠날 때 지운 표시를
+  // 다시 세워 두고 열면 복제된 탭과 같은 자리다 — 같은 번호로 이어 가면 두 탭의 질문이 서버의 한 대화에
+  // 섞이고, 한 탭의 질문이 다른 탭의 진행 중인 답을 취소한다.
+  await page.eval(`addEventListener('pagehide', () => sessionStorage.setItem('llm-agent.chat.open', '1'))`);
+  await page.goto(url(), '.chat .bubble', { keepSession: true });
+  assert.deepStrictEqual(await page.eval(bubbles), before);
+  assert.notEqual(await page.eval(`JSON.parse(sessionStorage.getItem('llm-agent.chat.v1')).conversationId`), id, '새 대화 번호');
+});
+
