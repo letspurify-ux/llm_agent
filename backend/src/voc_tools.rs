@@ -536,15 +536,7 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
                 value["status"] = json!("ok");
                 if title_total > 0 {
                     value["title_matches"] = json!(title_total);
-                    let shown = value["items"].as_array().map_or(0, |i| i.iter().filter(|i| i["title_match"] == true).count());
-                    if title_total > shown {
-                        let place = if target == "query" { "이름·설명" } else { "제목" };
-                        let narrow = format!("{place}에 낱말이 맞는 항목 {title_total}건 중 {shown}건만 실었다. 낱말을 더 붙이면 좁혀진다.");
-                        value["note"] = json!(match value["note"].as_str() {
-                            Some(note) => format!("{note} {narrow}"),
-                            None => narrow,
-                        });
-                    }
+                    note_titles_shown(target, &mut value);
                 }
                 if count == 0 {
                     value["note"] = json!("관련 항목이 없다. 검색어를 바꿔 볼 수 있다.");
@@ -565,6 +557,54 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
         effect: Effect::None,
         hits: Some((hits, failed)),
         public_error: None,
+    }
+}
+
+/// Says in a target's note how many of its `title_matches` the list shows
+/// when it shows fewer, in place of what an earlier count said there.
+fn note_titles_shown(target: &str, value: &mut Value) {
+    let total = value["title_matches"].as_u64().unwrap_or(0);
+    let shown = value["items"].as_array().map_or(0, |i| i.iter().filter(|i| i["title_match"] == true).count()) as u64;
+    let place = if target == "query" { "이름·설명" } else { "제목" };
+    let lead = format!("{place}에 낱말이 맞는 항목 ");
+    let before = value["note"]
+        .as_str()
+        .map(|note| note.split(&lead).next().unwrap_or_default().trim_end().to_owned())
+        .filter(|before| !before.is_empty());
+    let narrow = (total > shown).then(|| format!("{lead}{total}건 중 {shown}건만 실었다. 낱말을 더 붙이면 좁혀진다."));
+    let note = match (before, narrow) {
+        (Some(before), Some(narrow)) => format!("{before} {narrow}"),
+        (Some(note), None) | (None, Some(note)) => note,
+        (None, None) => {
+            if let Some(fields) = value.as_object_mut() {
+                fields.remove("note");
+            }
+            return;
+        }
+    };
+    value["note"] = json!(note);
+}
+
+/// An item a later page goes on to: a vector result not shown first as a
+/// title match or an exact query name (those come before the page's places
+/// and no offset pages through them).
+fn paged(item: &Value) -> bool {
+    item["exact"] != true && item["title_match"] != true
+}
+
+/// The item a cut list gives up first: its last vector result while another
+/// stays (the page goes on to it), then from the end what no page repeats —
+/// keeping one vector result, so the list's next_offset still goes on past
+/// this call. None when one item is left.
+fn cut_item(items: &[Value]) -> Option<usize> {
+    if items.len() < 2 {
+        return None;
+    }
+    let paged_items = items.iter().filter(|item| paged(item)).count();
+    if paged_items > 1 {
+        items.iter().rposition(paged)
+    } else {
+        items.iter().rposition(|item| !paged(item))
     }
 }
 
@@ -618,22 +658,27 @@ pub(crate) fn fit_search(data: &mut Value, budget: usize, model: &str) {
             };
             let longest = targets
                 .iter()
-                .filter_map(|(k, v)| v["items"].as_array().map(|items| (k.clone(), items.len())))
-                .filter(|(_, n)| *n > 1)
-                .max_by_key(|(_, n)| *n);
-            let Some((key, _)) = longest else {
+                .filter_map(|(k, v)| v["items"].as_array().map(|items| (k.clone(), items.len(), cut_item(items))))
+                .filter_map(|(k, n, at)| at.map(|at| (k, n, at)))
+                .max_by_key(|(_, n, _)| *n);
+            let Some((key, _, at)) = longest else {
                 return;
             };
             let target = &mut targets[&key];
             let items = target["items"].as_array_mut().unwrap();
-            if let Some(item) = items.pop() {
-                freed += crate::context::tokens(&item.to_string(), model).max(1);
+            let item = items.remove(at);
+            freed += crate::context::tokens(&item.to_string(), model).max(1);
+            if paged(&item) {
+                // An exact query name or a title match comes before the page
+                // and is none of its positions: counted, the page would go
+                // on past a result unseen.
+                let kept = items.iter().filter(|item| paged(item)).count() as u64;
+                target["next_offset"] = json!(offset + kept);
+            } else {
+                // No page repeats it: the page goes on where it did (or
+                // nowhere), and the note says how many title matches are left.
+                note_titles_shown(&key, target);
             }
-            // An exact query name or a title match comes before the page and
-            // is none of its positions: counted, the page would go on past a
-            // result unseen.
-            let kept = items.iter().filter(|item| item["exact"] != true && item["title_match"] != true).count() as u64;
-            target["next_offset"] = json!(offset + kept);
             target["items_cut_for_size"] = json!(true);
         }
     }
@@ -1338,6 +1383,57 @@ mod tests {
         let vector_shown = shown.iter().filter(|i| i["title_match"] != true).count();
         assert!(vector_shown > 0 && shown.len() - vector_shown == 3, "{target}");
         assert_eq!(target["next_offset"], vector_shown as u64, "{target}");
+    }
+
+    /// Context management review, ninth pass: a list cut for size gave up
+    /// what no later page repeats (title matches, an exact name) as readily
+    /// as the vector results a page goes on to, and its next_offset could
+    /// name the same call (offset 0) or an empty page past the last.
+    #[test]
+    fn a_cut_list_keeps_what_no_page_repeats_and_goes_on_somewhere_new() {
+        // Heavy in what fitting does not shorten, so items must leave.
+        let long = |mut item: Value| {
+            item["title"] = json!(format!("{} {}", item["title"].as_str().unwrap(), "제목 ".repeat(100)));
+            item
+        };
+        let message = |d: &Value| crate::tools::message_tokens(&crate::tools::envelope(Ok(d.clone())), "gpt-4o");
+        let cut = |target: Value, offset: u64, budget: usize| {
+            let mut data = json!({"text":"낱말","limit":10,"offset":offset,"results":{"knowledge":target}});
+            fit_search(&mut data, budget, "gpt-4o");
+            data["results"]["knowledge"].clone()
+        };
+        // The vector search did not run (the embedding server is down): only
+        // title matches, which no offset pages through.
+        let titles: Vec<Value> = (0..5).map(|i| long(title_hit(&format!("t{i}")))).collect();
+        let down = json!({"status":"ok","title_matches":5,"note":"제목에 낱말이 든 항목만 찾았다 (임베딩 서버 응답 없음)","items":titles});
+        let target = cut(down.clone(), 0, message(&json!({"results":{"knowledge":down}})) / 2);
+        let shown = target["items"].as_array().unwrap().len();
+        assert!(target["items_cut_for_size"] == true && shown < 5, "{target}");
+        assert!(target.get("next_offset").is_none(), "no page goes on from it: {target}");
+        let note = target["note"].as_str().unwrap();
+        assert!(note.starts_with("제목에 낱말이 든 항목만 찾았다") && note.contains(&format!("5건 중 {shown}건만")), "{note}");
+        // A last page with a title match held back after the vector results:
+        // the vector results leave first, and the page goes on to them.
+        let mut items: Vec<Value> = vec![long(title_hit("t0"))];
+        items.extend((0..6).map(|i| long(doc(&format!("k{i}")))));
+        items.push(long(title_hit("t9")));
+        let last = json!({"status":"ok","next_offset":null,"title_matches":2,"items":items});
+        let target = cut(last.clone(), 0, message(&json!({"results":{"knowledge":last}})) / 2);
+        let ids: Vec<&str> = target["items"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"t0") && ids.contains(&"t9"), "{ids:?}");
+        let vectors = ids.iter().filter(|id| id.starts_with('k')).count();
+        assert!(vectors < 6 && target["next_offset"] == vectors as u64, "{target}");
+        // A first page cut hard keeps one vector result, so its next_offset
+        // never names this same call again.
+        let mut items: Vec<Value> = (0..4).map(|i| long(title_hit(&format!("t{i}")))).collect();
+        items.extend((0..6).map(|i| long(doc(&format!("k{i}")))));
+        let first = json!({"status":"ok","next_offset":6,"title_matches":4,"items":items});
+        let target = cut(first, 0, 400);
+        let ids: Vec<&str> = target["items"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap()).collect();
+        assert_eq!(ids.iter().filter(|id| id.starts_with('k')).count(), 1, "{ids:?}");
+        assert_eq!(target["next_offset"], 1, "{target}");
+        let shown_titles = ids.iter().filter(|id| id.starts_with('t')).count();
+        assert!(target["note"].as_str().unwrap().contains(&format!("4건 중 {shown_titles}건만")), "{target}");
     }
 
     #[test]
