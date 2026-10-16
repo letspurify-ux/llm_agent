@@ -2300,3 +2300,112 @@ async fn a_history_search_says_what_the_request_delivering_it_holds() {
     }
     assert!(evicted_seen, "setup: a request delivering a search evicted the answer");
 }
+
+// Context management review, tenth pass (2026-10-16): failed before its fix.
+// Needs no MariaDB.
+
+/// A thinking model that spends the whole output limit reasoning: the
+/// response ends at the limit with no text and no call.
+fn reasoned_out() -> llm_agent::llm::Completion {
+    let mut completion = cut_text("");
+    completion.reasoning_chars = 40_000;
+    completion
+}
+
+/// Z: a response cut at the output limit before any text was taken for a
+/// blank reply: the model was told its reply was empty, nothing about the
+/// limit its reasoning had used up, and the user to try again later, which
+/// fails the same way.
+#[tokio::test]
+async fn a_reply_cut_before_any_text_is_told_from_a_blank_one() {
+    let llm = Scripted::new(vec![reasoned_out(), reasoned_out(), reasoned_out()]);
+    let (spent, _spent_dir) = app(no_db("gpt-4o"), llm.clone());
+    let error = ask(&spent, "z1", "질문", vec![]).await.0.err().unwrap();
+    let shown = error.downcast_ref::<agent::UserFacing>().expect("a message for the user").to_string();
+    assert!(shown.contains("출력 한도") && !shown.contains("잠시 후"), "{shown}");
+    for request in &llm.requests()[1..] {
+        let notice = state_of(request)["run_guidance"]["notice"].as_str().unwrap().to_owned();
+        assert!(notice.contains("출력 한도") && notice.contains("도구를 부르거나"), "{notice}");
+    }
+    // While a cut answer is continued, it is asked to go on, and stands.
+    let llm = Scripted::new(vec![cut_text("첫 조각 "), reasoned_out(), text("끝.")]);
+    let (continued, _continued_dir) = app(no_db("gpt-4o"), llm.clone());
+    assert_eq!(ask(&continued, "z2", "질문", vec![]).await.0.unwrap().answer, "첫 조각 끝.");
+    let notice = state_of(&llm.requests()[2])["run_guidance"]["notice"].as_str().unwrap().to_owned();
+    assert!(notice.contains("출력 한도") && notice.contains("이어 써라"), "{notice}");
+    // A blank reply stays a blank reply.
+    let llm = Scripted::new(vec![text(""), text(""), text("")]);
+    let (blank, _blank_dir) = app(no_db("gpt-4o"), llm.clone());
+    let shown = ask(&blank, "z3", "질문", vec![]).await.0.err().unwrap().to_string();
+    assert!(shown.contains("빈 응답"), "{shown}");
+    let notice = state_of(&llm.requests()[1])["run_guidance"]["notice"].as_str().unwrap().to_owned();
+    assert!(notice.contains("비어 있었다"), "{notice}");
+}
+
+// Context management review, eleventh pass (2026-10-16): failed before its
+// fix. Needs no MariaDB.
+
+/// An OpenAI-compatible server whose first stream drops while it writes the
+/// answer; the requests after it are answered whole.
+async fn drops_its_first_stream() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://127.0.0.1:{}/v1", listener.local_addr().unwrap().port());
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = served.clone();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let count = count.clone();
+            tokio::spawn(async move {
+                let mut bytes = vec![];
+                let mut buffer = [0u8; 65536];
+                loop {
+                    let n = socket.read(&mut buffer).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&buffer[..n]);
+                    let Some(split) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                    let head = String::from_utf8_lossy(&bytes[..split]).to_ascii_lowercase();
+                    let length = head.lines().find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap())).unwrap_or(0);
+                    if bytes.len() - split - 4 >= length {
+                        break;
+                    }
+                }
+                let event = |text: &str, finish: Value| format!("data: {}\n\n", json!({"choices":[{"delta":{"content":text},"finish_reason":finish}]}));
+                let mut reply = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n".to_owned();
+                if count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    // The connection drops partway through the answer.
+                    reply.push_str(&event("쓰던 답 ", Value::Null));
+                } else {
+                    reply.push_str(&event("다시 쓴 답", Value::Null));
+                    reply.push_str(&event("", json!("stop")));
+                    reply.push_str("data: [DONE]\n\n");
+                }
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (url, served)
+}
+
+/// AA: a stream that dropped while the answer was being written ended the
+/// question with "처리 중 오류가 발생했습니다": the client cannot retry a
+/// stream whose text has gone out, and the answer loop asked again only when
+/// none had. It can take the text back from the screen and ask again.
+#[tokio::test]
+async fn a_stream_cut_while_it_writes_is_asked_again() {
+    let (url, served) = drops_its_first_stream().await;
+    let mut config = no_db("stream-cut-test");
+    config.llm.base_url = url;
+    config.llm.disable_proxy = true;
+    let (cut_app, _dir) = app(config, std::sync::Arc::new(llm_agent::llm::OpenAiClient));
+    let (result, events) = ask(&cut_app, "aa", "질문", vec![]).await;
+    assert_eq!(result.map(|a| a.answer).map_err(|e| e.to_string()), Ok("다시 쓴 답".to_owned()));
+    assert_eq!(served.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert_eq!(preview(&events), "다시 쓴 답", "the cut text was taken back: {events:?}");
+    let claim = cut_app.sessions.open("aa", std::time::Duration::from_secs(60), 10, CancellationToken::new());
+    let kept: Vec<Value> = claim.conversation.lock().await.history.active();
+    assert_eq!(kept.iter().filter(|m| m["role"] == "assistant").map(|m| m["content"].clone()).collect::<Vec<_>>(), [json!("다시 쓴 답")]);
+}

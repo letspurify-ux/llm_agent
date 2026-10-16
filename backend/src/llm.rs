@@ -140,15 +140,15 @@ impl Completion {
 pub struct CompletionError {
     source: anyhow::Error,
     attempts: usize,
-    provider_unavailable: bool,
+    transient: bool,
     attempt_diagnostics: Vec<AttemptDiagnostic>,
 }
 impl CompletionError {
-    pub(crate) fn new(source: anyhow::Error, attempts: usize, provider_unavailable: bool) -> Self {
+    pub(crate) fn new(source: anyhow::Error, attempts: usize, transient: bool) -> Self {
         Self {
             source,
             attempts,
-            provider_unavailable,
+            transient,
             attempt_diagnostics: Vec::new(),
         }
     }
@@ -173,11 +173,13 @@ impl CompletionError {
         self
     }
 
-    /// The provider stayed unavailable (overload, 5xx, dropped stream) through
-    /// every quick retry and no text reached the user, so the same request
-    /// may be sent again after a longer wait.
-    pub(crate) fn provider_unavailable(&self) -> bool {
-        self.provider_unavailable
+    /// The provider or the connection failed (overload, 5xx, timeout, a
+    /// dropped stream), not the request: it may be sent again after a longer
+    /// wait. A stream that failed after its text reached the user was not
+    /// retried here (the text cannot be taken back from the stream); the
+    /// caller takes it back from the screen and asks again.
+    pub(crate) fn transient(&self) -> bool {
+        self.transient
     }
 }
 
@@ -1132,7 +1134,7 @@ impl LlmClient for OpenAiClient {
                         return Err(CompletionError::new(
                             e,
                             attempt.saturating_add(1),
-                            silent && transient,
+                            transient,
                         )
                         .with_diagnostics(attempt_diagnostics)
                         .into());
@@ -1234,6 +1236,8 @@ mod tool_choice_tests {
         Refuses,
         Ignores,
         TooLong,
+        /// The stream drops after its first words.
+        Drops,
     }
 
     /// An OpenAI-compatible server on a fresh port (so the endpoint caches
@@ -1278,6 +1282,10 @@ mod tool_choice_tests {
                             let error = r#"{"error":{"message":"This model's maximum context length is 8192 tokens.","code":"context_length_exceeded"}}"#;
                             format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}", error.len())
                         }
+                        Provider::Drops => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}",
+                            event(json!({"choices":[{"delta":{"content":"쓰던 "},"finish_reason":null}]}))
+                        ),
                         Provider::Ignores if withheld => format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}{}data: [DONE]\n\n",
                             event(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"search","arguments":"{}"}}]},"finish_reason":null}]})),
@@ -1361,5 +1369,19 @@ mod tool_choice_tests {
         let error = complete(&config, withheld()).await.unwrap_err().to_string();
         assert!(context_overflow(&error), "{error}");
         assert_eq!(shapes(&seen), [(true, true)], "the caller evicts and asks again");
+    }
+
+    #[tokio::test]
+    async fn a_stream_cut_after_its_text_is_a_transient_failure_left_to_the_caller() {
+        // Its text has gone out: the client does not send the request again
+        // (the stream would repeat it), but the caller may, taking it back.
+        let (config, seen) = serve(Provider::Drops).await;
+        let config = Config { retries: 2, ..config };
+        let (tx, mut rx) = mpsc::channel(64);
+        let error = OpenAiClient.complete(withheld(), &config, CancellationToken::new(), tx).await.unwrap_err();
+        assert_eq!(rx.recv().await.as_deref(), Some("쓰던 "));
+        let failure = error.downcast_ref::<CompletionError>().expect("a completion error");
+        assert!(failure.transient(), "{error}");
+        assert_eq!(seen.lock().unwrap().len(), 1, "not retried by the client");
     }
 }

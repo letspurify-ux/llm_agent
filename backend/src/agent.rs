@@ -60,6 +60,10 @@ const SEARCH_FIRST: &str = "이전 응답은 search 없이 '등록된 지식에 
 const UNREGISTERED_LEAD: &str = "등록된 지식에 없는 내용";
 const PROVIDER_WAITS: [u64; 2] = [5, 15];
 const EMPTY_RETRIES: usize = 2;
+const EMPTY_REPLIES: &str = "모델이 빈 응답을 반복해 답변을 만들지 못했습니다. 잠시 후 다시 시도해주세요.";
+/// Replies cut at the output limit before any text: waiting does not help,
+/// a larger limit or less reasoning does.
+const OUTPUT_SPENT: &str = "모델이 출력 한도에 닿을 때까지 답변을 시작하지 못했습니다. 추론 모델이면 설정에서 출력 한도를 늘리거나 추론 강도를 낮춰주세요.";
 const LENGTH_CONTINUATIONS: usize = 2;
 
 pub struct Question {
@@ -443,9 +447,13 @@ async fn run(
                     }
                     bail!(too_long(true, !only_question));
                 }
+                // The provider or the connection failed: asked again after a
+                // wait, what this response showed taken back. A stream cut
+                // while it wrote is no reason to end the question, though
+                // the client could not retry it (its text had gone out).
                 let unavailable = error
                     .downcast_ref::<crate::llm::CompletionError>()
-                    .is_some_and(|e| e.provider_unavailable());
+                    .is_some_and(|e| e.transient());
                 if unavailable && outages < PROVIDER_WAITS.len() {
                     let wait = Duration::from_secs(PROVIDER_WAITS[outages]);
                     if Instant::now() + wait + Duration::from_secs(FINAL_RESERVE_SECS) < deadline {
@@ -551,19 +559,24 @@ async fn run(
             let text = completion.text.trim();
             if text.is_empty() {
                 empty += 1;
+                // Cut at the output limit with nothing written: the limit
+                // went on what the model does not show (a thinking model's
+                // reasoning). Neither a blank reply nor a passing failure.
+                let spent = completion.length_limited;
                 if empty > EMPTY_RETRIES {
                     if !partial.is_empty() {
                         break partial.concat();
                     }
-                    bail!(UserFacing("모델이 빈 응답을 반복해 답변을 만들지 못했습니다. 잠시 후 다시 시도해주세요.".into()));
+                    bail!(UserFacing(if spent { OUTPUT_SPENT } else { EMPTY_REPLIES }.into()));
                 }
                 notice = Some(
-                    if continuing {
-                        "이전 응답이 비어 있었다. 끊긴 곳에서 바로 이어 써라."
-                    } else if final_round {
-                        "이전 응답이 비어 있었다. 지금까지 확보한 근거로 최종 답변을 써라."
-                    } else {
-                        "이전 응답이 비어 있었다(글도 도구 호출도 없었다). 도구를 부르거나 답변을 써라."
+                    match (spent, continuing, final_round) {
+                        (false, true, _) => "이전 응답이 비어 있었다. 끊긴 곳에서 바로 이어 써라.",
+                        (false, false, true) => "이전 응답이 비어 있었다. 지금까지 확보한 근거로 최종 답변을 써라.",
+                        (false, false, false) => "이전 응답이 비어 있었다(글도 도구 호출도 없었다). 도구를 부르거나 답변을 써라.",
+                        (true, true, _) => "이전 응답은 출력 한도에 닿을 때까지 글을 쓰지 못했다. 생각을 짧게 하고 끊긴 곳에서 바로 이어 써라.",
+                        (true, false, true) => "이전 응답은 출력 한도에 닿을 때까지 글을 쓰지 못했다. 생각을 짧게 하고 지금까지 확보한 근거로 바로 최종 답변을 써라.",
+                        (true, false, false) => "이전 응답은 출력 한도에 닿을 때까지 글도 도구 호출도 내지 못했다. 생각을 짧게 하고 바로 도구를 부르거나 답변을 써라.",
                     }
                     .into(),
                 );
