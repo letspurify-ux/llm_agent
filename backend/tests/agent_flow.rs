@@ -553,6 +553,203 @@ async fn random_responses_never_outgrow_the_context() {
     }
 }
 
+/// An answer cut at the output limit is continued without tools, and its
+/// pieces stay one assistant message, replaced by the whole answer at the
+/// end. Needs no MariaDB.
+#[tokio::test]
+async fn a_cut_answer_is_continued_without_tools_as_one_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "a\n").unwrap();
+    let mut config = llm_agent::config::Config::default();
+    config.mariadb.port = 9;
+    config.llm.base_url = "http://127.0.0.1:9/v1".into();
+    config.llm.model = "gpt-4o".into();
+    config.projects.push(llm_agent::config::Project {
+        name: "app".into(),
+        root: root.clone(),
+        ..Default::default()
+    });
+    let cut = |piece: &str| {
+        let mut completion = text(piece);
+        completion.length_limited = true;
+        completion
+    };
+    let llm = Scripted::new(vec![
+        cut("첫 조각 "),
+        cut("둘째 조각 "),
+        calls(vec![call("x", "file_list", json!({}))]),
+        text("끝."),
+        text("다음 답"),
+    ]);
+    let (cut_app, _cut_dir) = app(config, llm.clone());
+    let (result, events) = ask(&cut_app, "cut", "길게 설명해줘", vec![]).await;
+    assert_eq!(result.unwrap().answer, "첫 조각 둘째 조각 끝.");
+    assert!(ev(&events, "tool").is_empty(), "no tool runs while an answer is continued");
+    let requests = llm.requests();
+    for request in &requests[1..4] {
+        assert!(request.get("tools").is_none(), "continuing requests offer no tools");
+        let roles: Vec<&str> = request["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert!(!roles.windows(2).any(|pair| pair == ["assistant", "assistant"]), "{roles:?}");
+    }
+    // The next question sees the whole answer once, not its pieces.
+    let (result, _) = ask(&cut_app, "cut", "다음 질문", vec![]).await;
+    assert_eq!(result.unwrap().answer, "다음 답");
+    let next = llm.requests().last().unwrap().clone();
+    let replies: Vec<String> = messages(&next, "assistant").iter().map(|m| m["content"].as_str().unwrap_or("").to_owned()).collect();
+    assert_eq!(replies, vec!["첫 조각 둘째 조각 끝.".to_owned()]);
+}
+
+// Context management review (2026-10-16): each failed before its fix.
+
+fn no_db(model: &str) -> llm_agent::config::Config {
+    let mut config = llm_agent::config::Config::default();
+    config.mariadb.port = 9;
+    config.llm.base_url = "http://127.0.0.1:9/v1".into();
+    config.llm.model = model.into();
+    config
+}
+
+/// A: a length-limited piece followed by empty responses ends with the
+/// piece as the answer, but the partial bundle stays too.
+#[tokio::test]
+async fn a_cut_answer_followed_by_empty_replies_is_kept_once() {
+    let mut cut = text("첫 부분입니다.");
+    cut.length_limited = true;
+    let llm = Scripted::new(vec![cut, text(""), text(""), text(""), text("두 번째 답")]);
+    let (app, _dir) = app(no_db("gpt-4o"), llm.clone());
+    let (r, _) = ask(&app, "a", "질문1", vec![]).await;
+    assert_eq!(r.unwrap().answer, "첫 부분입니다.");
+    let (r, _) = ask(&app, "a", "질문2", vec![]).await;
+    r.unwrap();
+    let request = llm.requests().last().unwrap().clone();
+    assert_eq!(messages(&request, "assistant").len(), 1, "one answer for the first question");
+}
+
+/// B: an archive the newest result points to is dropped by the byte prune
+/// because active bundles count toward history_bytes.
+#[tokio::test]
+async fn an_archive_an_active_result_points_to_stays_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let body: String = (1..=3000).map(|i| format!("line {i} {}\n", "word ".repeat(12))).collect();
+    std::fs::write(root.join("big.txt"), &body).unwrap();
+    for i in 0..600 {
+        std::fs::write(root.join(format!("src/module_with_a_long_name_{i:04}.rs")), "fn x() {}\n").unwrap();
+    }
+    let mut config = no_db("gpt-4o");
+    config.agent.result_tokens = Some(3_000);
+    config.agent.history_bytes = 64 * 1024;
+    config.projects.push(llm_agent::config::Project { name: "app".into(), root: root.clone(), ..Default::default() });
+    let mut batch: Vec<_> = (0..6).map(|i| call(&format!("r{i}"), "file_read", json!({"path":"big.txt","start_line":1 + i * 400}))).collect();
+    batch.push(call("l", "file_list", json!({"path_glob":"src/**","mode":"paths","limit":500})));
+    let llm = Scripted::new(vec![
+        calls(batch),
+        calls(vec![call("h", "history", json!({"action":"read","id":2}))]),
+        text("끝"),
+    ]);
+    let (app, _dir) = app(config, llm.clone());
+    let (r, _) = ask(&app, "b", "파일 봐줘", vec![]).await;
+    assert_eq!(r.unwrap().answer, "끝");
+    let requests = llm.requests();
+    let listed = tool_result(&requests[1], "l");
+    assert_eq!(listed["archive_id"], 2);
+    let read = tool_result(&requests[2], "h");
+    assert_eq!(read["status"], "ok", "the archive the active result names is readable");
+}
+
+/// A provider whose count per model is `ratio` times the local estimate and
+/// which rejects a request that does not fit its context.
+struct PerModel {
+    replies: std::sync::Mutex<std::collections::VecDeque<llm_agent::llm::Completion>>,
+    seen: std::sync::Mutex<Vec<(String, usize, usize)>>,
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for PerModel {
+    async fn complete(&self, request: Value, config: &llm_agent::config::LlmConfig, _c: CancellationToken, _d: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        let estimate = llm_agent::context::count(&request, &config.model);
+        let ratio = if config.model == "model-a" { 0.6 } else { 1.0 };
+        let input = (estimate as f64 * ratio) as usize;
+        self.seen.lock().unwrap().push((config.model.clone(), estimate, input));
+        if input + config.output_tokens > config.context_tokens {
+            anyhow::bail!("context_length_exceeded: {input} + {} > {}", config.output_tokens, config.context_tokens);
+        }
+        let mut reply = self.replies.lock().unwrap().pop_front().unwrap_or_else(|| text("끝"));
+        reply.usage = Some(llm_agent::llm::Usage { input, output: 50, cached: None });
+        Ok(reply)
+    }
+}
+
+/// C: the calibration of one model is applied to the next one.
+#[tokio::test]
+async fn a_model_change_starts_its_calibration_afresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    let body: String = (1..=20000).map(|i| format!("line {i} {}\n", "word ".repeat(12))).collect();
+    std::fs::write(root.join("big.txt"), &body).unwrap();
+    let mut config = no_db("model-a");
+    config.llm.context_tokens = 32_000;
+    config.llm.output_tokens = 2_000;
+    config.agent.result_tokens = Some(4_000);
+    config.projects.push(llm_agent::config::Project { name: "app".into(), root: root.clone(), ..Default::default() });
+    let mut script: Vec<_> = (0..7).map(|i| calls(vec![call(&format!("r{i}"), "file_read", json!({"path":"big.txt","start_line":1 + i * 1000}))])).collect();
+    script.push(text("첫 답"));
+    let llm = std::sync::Arc::new(PerModel { replies: std::sync::Mutex::new(script.into()), seen: Default::default() });
+    let (app, _dir) = app(config, llm.clone());
+    let (r, _) = ask(&app, "c", "큰 파일 봐줘", vec![]).await;
+    assert_eq!(r.unwrap().answer, "첫 답");
+    // The administrator switches the model.
+    let mut next = (*app.config()).clone();
+    next.llm.model = "model-b".into();
+    app.store_config(next).unwrap();
+    let mut failed = 0;
+    for question in ["다음 질문", "다시 질문", "세 번째"] {
+        let (r, _) = ask(&app, "c", question, vec![]).await;
+        failed += usize::from(r.is_err());
+    }
+    assert_eq!(failed, 0, "the conversation keeps working after the model change");
+}
+
+/// D: the history tool gives the model the stored messages, not what
+/// `model_message` shows: absolute root, offsets, internal flags.
+#[tokio::test]
+async fn history_reads_show_what_the_model_was_shown() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
+    std::fs::write(root.join("big.txt"), "긴 줄입니다 ".repeat(3000)).unwrap();
+    let mut config = no_db("gpt-4o");
+    config.llm.context_tokens = 16_000;
+    config.llm.output_tokens = 2_000;
+    config.agent.result_tokens = Some(3_000);
+    config.projects.push(llm_agent::config::Project { name: "app".into(), root: root.clone(), ..Default::default() });
+    let mut script = vec![calls(vec![call("s1", "file_read", json!({"path":"src/a.rs"}))])];
+    for i in 0..4 {
+        script.push(calls(vec![call(&format!("b{i}"), "file_read", json!({"path":"big.txt","start_line":1,"max_lines":1,"force_read":true}))]));
+    }
+    // ids: 1-2 restored turns, 3 question, 4 the first read.
+    script.push(calls(vec![call("h", "history", json!({"action":"read","id":4})), call("h2", "history", json!({"action":"read","id":1}))]));
+    script.push(text("끝"));
+    let llm = Scripted::new(script);
+    let (app, _dir) = app(config, llm.clone());
+    let restored = vec![("user".to_owned(), "이전 질문".to_owned()), ("assistant".to_owned(), "이전 답".to_owned())];
+    let (r, _) = ask(&app, "d", "a.rs 봐줘", restored).await;
+    assert_eq!(r.unwrap().answer, "끝");
+    let requests = llm.requests();
+    let first = tool_result(&requests[1], "s1");
+    assert_eq!(first["data"]["path"], "src/a.rs", "the first read showed a relative path");
+    let read = tool_result(requests.last().unwrap(), "h");
+    let text = read["data"]["text"].as_str().unwrap_or_default().to_owned();
+    let read1 = tool_result(requests.last().unwrap(), "h2");
+    let root_text = root.canonicalize().unwrap().display().to_string();
+    assert!(!text.contains(&root_text), "the project root reaches the model through history read");
+    assert!(!read1["data"]["text"].as_str().unwrap_or_default().contains("restored"), "internal flags reach the model");
+}
+
 /// With two projects the model is told to name one; a call that omits it
 /// still runs when its path exists in only one project. Needs no MariaDB.
 #[tokio::test]

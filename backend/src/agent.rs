@@ -128,11 +128,16 @@ pub async fn answer(app: &Arc<App>, question: Question, events: Events, cancel: 
 /// A conversation the server lost (restart, expiry) continues from the
 /// turns the browser kept.
 fn restore(c: &mut Conversation, history: &[(String, String)]) {
-    for (role, text) in history.iter().rev().take(MAX_CHAT_TURNS).rev() {
-        let text = clip_utf16(js_trim(text), MAX_CHAT_LEN);
-        if text.is_empty() || !matches!(role.as_str(), "user" | "assistant") {
-            continue;
-        }
+    let turns = history
+        .iter()
+        .rev()
+        .take(MAX_CHAT_TURNS)
+        .rev()
+        .map(|(role, text)| (role.as_str(), clip_utf16(js_trim(text), MAX_CHAT_LEN)))
+        .filter(|(role, text)| !text.is_empty() && matches!(*role, "user" | "assistant"))
+        // The conversation opens with a question, as eviction keeps it.
+        .skip_while(|(role, _)| *role != "user");
+    for (role, text) in turns {
         c.history
             .push(vec![json!({"role":role,"content":text,"restored":true})], true);
     }
@@ -176,7 +181,9 @@ async fn run(
         if remaining.is_zero() {
             bail!(UserFacing("답변 시간이 다 되어 마무리하지 못했습니다. 질문을 좁혀 다시 시도해주세요.".into()));
         }
-        let offered = offered_tools(config, c, final_round);
+        // An answer cut at the output limit is continued without tools.
+        let continuing = !partial.is_empty();
+        let offered = offered_tools(config, c, final_round || continuing);
         let state = runtime_state(config, message, remaining, final_round, &offered, partial.is_empty(), notice.take());
         let mut definitions = ToolRegistry::definitions(&offered.iter().map(String::as_str).collect());
         tools::require_project(&mut definitions, &config.projects);
@@ -272,8 +279,13 @@ async fn run(
             }
             if !completion.text.trim().is_empty() && partial.len() < LENGTH_CONTINUATIONS {
                 partial.push(completion.text.clone());
+                // The pieces so far stay one assistant message, which the
+                // next piece continues.
+                if last_is_partial(c) {
+                    c.history.bundles.pop_back();
+                }
                 c.history.push(
-                    vec![json!({"role":"assistant","content":completion.text,"partial":true})],
+                    vec![json!({"role":"assistant","content":partial.concat(),"partial":true})],
                     true,
                 );
                 continue;
@@ -300,12 +312,20 @@ async fn run(
             break partial.concat();
         }
         empty = 0;
-        if final_round {
+        if final_round || continuing {
             // Tools were withheld; a provider that still sends calls gets
-            // one more request.
-            notice = Some("도구를 더 쓸 수 없다. 지금까지 확보한 근거로 최종 답변만 써라.".into());
+            // another request.
+            notice = Some(if final_round {
+                "도구를 더 쓸 수 없다. 지금까지 확보한 근거로 최종 답변만 써라.".into()
+            } else {
+                "답변을 이어 쓰는 중이라 도구를 쓸 수 없다. 끊긴 곳에서 바로 이어 써라.".into()
+            });
             withheld += 1;
             if withheld > WITHHELD_RETRIES {
+                // A cut answer is kept as far as it was written.
+                if continuing {
+                    break partial.concat();
+                }
                 bail!(UserFacing("모델이 답변 대신 도구 호출을 반복해 답변을 마무리하지 못했습니다.".into()));
             }
             continue;
@@ -336,12 +356,8 @@ async fn run(
     };
     // The answer is kept in history as written (table and chart references,
     // not filled rows): the context stays small and refers to steps.
-    for _ in 0..partial.len().saturating_sub(1) {
-        if let Some(last) = c.history.bundles.back()
-            && last.messages.first().is_some_and(|m| m["partial"] == true)
-        {
-            c.history.bundles.pop_back();
-        }
+    if last_is_partial(c) {
+        c.history.bundles.pop_back();
     }
     c.history
         .push(vec![json!({"role":"assistant","content":answer_text})], true);
@@ -365,6 +381,15 @@ async fn run(
         refs,
         log,
     })
+}
+
+/// Whether the newest bundle holds the pieces of an answer being continued.
+fn last_is_partial(c: &Conversation) -> bool {
+    c.history
+        .bundles
+        .back()
+        .and_then(|b| b.messages.first())
+        .is_some_and(|m| m["partial"] == true)
 }
 
 /// Tools offered this round: the knowledge and query tools always, the
@@ -677,8 +702,13 @@ async fn execute_batch(
             {
                 result["data"]["adjusted_arguments"] = adjusted;
             }
-            let mut result = tools::limit_result(&mut workspace, &call, &clean, result, share);
+            // The root before bounding: an archived result is shown with
+            // paths relative to it, as the model receives the result.
             if call.name != "history" {
+                result["root"] = json!(root_text.display().to_string());
+            }
+            let mut result = tools::limit_result(&mut workspace, &call, &clean, result, share);
+            if call.name != "history" && result.get("root").is_none() {
                 result["root"] = json!(root_text.display().to_string());
             }
             source_events.send(json!({"type":"tool_done","id":source_ids[index],"name":call.name,"status":result["status"],"ms":started.elapsed().as_millis() as u64}));
@@ -1142,6 +1172,18 @@ mod tests {
         assert_eq!(project.name, "a");
         assert!(resolve_project(&config, "file_read", &json!({"path":"src/nowhere.rs"}), &BTreeMap::new()).is_err());
         assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_restored_conversation_starts_with_a_question() {
+        let mut c = Conversation::new("r".into());
+        let turns: Vec<(String, String)> = [("assistant", "앞 답"), ("user", "질문"), ("assistant", "답")]
+            .into_iter()
+            .map(|(role, text)| (role.to_owned(), text.to_owned()))
+            .collect();
+        restore(&mut c, &turns);
+        let roles: Vec<String> = c.history.active().iter().map(|m| m["role"].as_str().unwrap().to_owned()).collect();
+        assert_eq!(roles, ["user", "assistant"]);
     }
 
     #[test]

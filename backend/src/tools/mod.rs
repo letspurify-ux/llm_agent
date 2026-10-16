@@ -1367,7 +1367,7 @@ fn execute_validated(
             )),
             "read" => {
                 let b = s.history.read(n(&args, "id", 0) as u64)?;
-                let text = serde_json::to_string(&*b.messages)?;
+                let text = serde_json::to_string(&context::shown_messages(&b.messages[..]))?;
                 Ok(bounded_text(s, &text, n(&args, "offset", 0)))
             }
             _ => unreachable!(),
@@ -2390,6 +2390,25 @@ mod tests {
         let whole = envelope(execute(&mut ws, "file_read", json!({"path":"e.rs"}), &Default::default()));
         assert_eq!(whole["data"]["content"]["line_end"], 4);
         assert_eq!(model_result(&whole)["data"]["content"]["numbered_text"], "1|fn a() {\n2|}\n3|\n4|fn b() {}");
+    }
+
+    #[test]
+    fn a_history_search_shows_where_it_matched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = workspace(dir.path());
+        let content = format!("{}배치 BATCH007 재시작 절차{}", "앞 내용 ".repeat(300), " 뒤 내용".repeat(300));
+        ws.history.push(
+            vec![
+                json!({"role":"assistant","content":null,"tool_calls":[{"id":"a","type":"function","function":{"name":"knowledge_read","arguments":"{\"id\":\"k1\"}"}}]}),
+                json!({"role":"tool","tool_call_id":"a","content":content}),
+            ],
+            true,
+        );
+        ws.history.bundles[0].active = false;
+        let found = envelope(execute(&mut ws, "history", json!({"action":"search","query":"batch007"}), &Default::default()));
+        let excerpt = found["data"]["items"][0]["excerpt"].as_str().unwrap();
+        assert!(excerpt.contains("BATCH007"), "{excerpt}");
+        assert!(excerpt.chars().count() <= 260, "{}", excerpt.chars().count());
     }
 
     #[test]

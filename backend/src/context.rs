@@ -265,6 +265,23 @@ pub fn model_message(mut message: Value) -> Value {
     message
 }
 
+/// History messages as the model received them, for the history tool:
+/// tool results (archived ones too) through `tools::model_result`, internal
+/// flags removed.
+pub fn shown_messages(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .cloned()
+        .map(|message| {
+            if message["role"] == "tool_archive" {
+                json!({"role":"tool_archive","call_id":message["call_id"],"result":crate::tools::model_result(&message["result"])})
+            } else {
+                model_message(message)
+            }
+        })
+        .collect()
+}
+
 /// The request for one model call. `state` is the runtime-state message.
 pub fn request(history: &SessionHistory, state: &Value, model: &str, tools: Vec<Value>) -> Value {
     let mut messages = vec![json!({"role":"system","content":SYSTEM.as_str()})];
@@ -294,6 +311,11 @@ pub fn record_usage(c: &mut Conversation, model: &str, estimated: usize, actual:
         return;
     }
     let ratio = (actual as f64 / estimated as f64).clamp(0.5, 1.5);
+    // Another model counts its own way: its ratios start afresh.
+    if c.token_ratio_model != model {
+        c.token_ratios.clear();
+        c.token_ratio_model = model.to_owned();
+    }
     c.token_ratios.push_back(ratio);
     while c.token_ratios.len() > CALIBRATION_SAMPLES {
         c.token_ratios.pop_front();
@@ -302,7 +324,7 @@ pub fn record_usage(c: &mut Conversation, model: &str, estimated: usize, actual:
 /// Provider tokens per estimated token: the highest recent ratio, so a
 /// calibrated size never undercounts what the provider recently measured.
 pub fn token_ratio(c: &Conversation, model: &str) -> f64 {
-    if !is_estimated(model) {
+    if !is_estimated(model) || c.token_ratio_model != model {
         return 1.0;
     }
     c.token_ratios.iter().copied().reduce(f64::max).unwrap_or(1.0)
@@ -341,6 +363,18 @@ pub fn evict(
             remaining = remaining.saturating_sub(count(&json!(delivered), model));
             bundle.active = false;
             evicted.push(bundle.id);
+        }
+        // The context opens with a user message, as chat templates and some
+        // providers require: a reply whose question left goes with it.
+        if !evicted.is_empty() {
+            while let Some(first) = c.history.bundles.iter_mut().find(|b| b.active) {
+                let opens_with_user = first.messages.first().is_some_and(|m| m["role"] == "user");
+                if opens_with_user || !first.complete || Some(first.id) == newest || protected.contains(&first.id) {
+                    break;
+                }
+                first.active = false;
+                evicted.push(first.id);
+            }
         }
     }
     c.history.prune(config.agent.history_bytes);
@@ -444,6 +478,25 @@ mod tests {
         let mut fresh = Conversation::new("y".into());
         fresh.history.push(vec![json!({"role":"user","content":"hi"})], true);
         assert!(evict(&mut fresh, &config, 10, &[]).is_empty());
+    }
+
+    #[test]
+    fn eviction_leaves_the_context_starting_with_a_user_message() {
+        // Some chat templates and providers refuse a conversation that opens
+        // with the model's message: a reply whose question left goes too.
+        let mut config = Config::default();
+        config.llm.model = "gpt-4o".into();
+        config.llm.context_tokens = 16_000;
+        config.llm.output_tokens = 2_000;
+        let mut c = Conversation::new("x".into());
+        let old_question = c.history.push(vec![json!({"role":"user","content":"자료 ".repeat(12_000)})], true);
+        let old_answer = c.history.push(vec![json!({"role":"assistant","content":"짧은 답"})], true);
+        let question = c.history.push(vec![json!({"role":"user","content":"지금 질문"})], true);
+        c.history.push(vec![json!({"role":"assistant","content":"y".repeat(400)})], true);
+        let tokens = count(&request(&c.history, &json!({}), "gpt-4o", vec![]), "gpt-4o");
+        let evicted = evict(&mut c, &config, tokens, &[question]);
+        assert_eq!(evicted, vec![old_question, old_answer]);
+        assert_eq!(c.history.active()[0]["role"], "user");
     }
 
     #[test]

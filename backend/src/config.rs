@@ -333,7 +333,8 @@ pub struct AgentConfig {
     pub high_water: f64,
     /// Share eviction brings the estimate down to.
     pub low_water: f64,
-    /// Bytes of history (active and evicted) one conversation keeps.
+    /// Bytes of evicted history (bundles out of the context and archived
+    /// results) one conversation keeps for the history tool.
     pub history_bytes: usize,
     /// Tokens of one tool result. Empty: see `Config::result_budget`.
     pub result_tokens: Option<usize>,

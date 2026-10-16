@@ -79,13 +79,31 @@ impl SessionHistory {
             .flat_map(|b| b.messages.iter().cloned())
             .collect()
     }
-    /// Drops the oldest evicted bundles until the history fits `limit`
-    /// bytes. Active bundles are never dropped here: eviction retires them
-    /// first.
+    /// Drops the oldest evicted bundles until they fit `limit` bytes. Active
+    /// bundles neither count nor go (the input budget bounds them), and an
+    /// archive whose result is still in the context stays readable.
     pub fn prune(&mut self, limit: usize) {
-        let mut bytes = self.bytes();
+        let in_context: std::collections::BTreeSet<String> = self
+            .bundles
+            .iter()
+            .filter(|b| b.active)
+            .flat_map(|b| b.messages.iter())
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["tool_call_id"].as_str().map(str::to_owned))
+            .collect();
+        let droppable = |b: &Bundle| {
+            !b.active
+                && !b.messages.first().is_some_and(|m| {
+                    m["role"] == "tool_archive" && m["call_id"].as_str().is_some_and(|id| in_context.contains(id))
+                })
+        };
+        let mut bytes = self
+            .bundles
+            .iter()
+            .filter(|b| !b.active)
+            .fold(0usize, |total, bundle| total.saturating_add(bundle.bytes()));
         while bytes > limit {
-            let Some(index) = self.bundles.iter().position(|b| !b.active) else {
+            let Some(index) = self.bundles.iter().position(&droppable) else {
                 break;
             };
             let removed = self.bundles.remove(index).unwrap();
@@ -99,36 +117,67 @@ impl SessionHistory {
                 (Some(first), Some(last)) => format!("retained ids are {} to {}", first.id, last.id),
                 _ => "no history is retained".into(),
             };
-            let pruned = self.pruned_through.map_or(String::new(), |id| {
-                format!("; ids up to {id} were dropped and cannot be restored")
-            });
+            // Ids are given in order, so one at or below the last was given
+            // and has been dropped (older history beyond its size, or the
+            // pieces of an answer once it was whole).
+            let state = if (1..=self.next_id).contains(&id) {
+                "was dropped and cannot be restored"
+            } else {
+                "does not exist"
+            };
             anyhow::anyhow!(
-                "history_unavailable: history id {id} does not exist; {available}{pruned}. Copy an id from history action=search, or repeat the original call"
+                "history_unavailable: history id {id} {state}; {available}. Copy an id from history action=search, or repeat the original call"
             )
         })
     }
     pub fn search(&self, query: &str, after: u64, limit: usize) -> Value {
         let q = query.to_lowercase();
-        let rows: Vec<_> = self
+        let rows: Vec<(&Bundle, String)> = self
             .bundles
             .iter()
             .filter(|b| b.id > after)
-            .filter(|b| {
-                serde_json::to_string(&*b.messages)
-                    .unwrap_or_default()
-                    .to_lowercase()
-                    .contains(&q)
-            })
+            .map(|b| (b, serde_json::to_string(&crate::context::shown_messages(&b.messages[..])).unwrap_or_default()))
+            .filter(|(_, text)| text.to_lowercase().contains(&q))
             .collect();
         let items: Vec<_> = rows
             .iter()
             .take(limit.clamp(1, 50))
-            .map(|b| {
-                json!({"id":b.id,"active":b.active,"excerpt":serde_json::to_string(&*b.messages).unwrap_or_default().chars().take(240).collect::<String>()})
-            })
+            .map(|(b, text)| json!({"id":b.id,"active":b.active,"excerpt":excerpt_around(text, &q)}))
             .collect();
         json!({"next_cursor":if rows.len()>items.len(){items.last().and_then(|x|x["id"].as_u64())}else{None},"items":items,"pruned_through":self.pruned_through})
     }
+}
+
+/// About 240 characters of `text` around the first match of `query` (in
+/// lower case), so a search shows where a bundle matched rather than its
+/// opening tool call; the start when the match cannot be placed.
+fn excerpt_around(text: &str, query: &str) -> String {
+    const BEFORE: usize = 80;
+    const LENGTH: usize = 240;
+    let chars: Vec<char> = text.chars().collect();
+    // Lower-cased character by character, so a byte of the match maps back
+    // to the character it came from.
+    let mut lowered = String::new();
+    let mut origin = vec![];
+    for (index, ch) in chars.iter().enumerate() {
+        let start = lowered.len();
+        lowered.extend(ch.to_lowercase());
+        origin.extend(std::iter::repeat_n(index, lowered.len() - start));
+    }
+    let at = (!query.is_empty())
+        .then(|| lowered.find(query))
+        .flatten()
+        .map_or(0, |byte| origin[byte]);
+    let start = at.saturating_sub(BEFORE);
+    let end = (start + LENGTH).min(chars.len());
+    let mut out: String = chars[start..end].iter().collect();
+    if start > 0 {
+        out.insert(0, '…');
+    }
+    if end < chars.len() {
+        out.push('…');
+    }
+    out
 }
 
 /// Rows of one executed query, kept for result_read and the answer's
@@ -159,8 +208,10 @@ pub struct Conversation {
     /// Executed query calls (name, target, params) → step, to refuse an
     /// identical repeat.
     pub executed: HashMap<String, u64>,
-    /// Provider/estimate token ratios for calibration (MnemoArc).
+    /// Provider/estimate token ratios for calibration (MnemoArc), measured
+    /// with `token_ratio_model`.
     pub token_ratios: VecDeque<f64>,
+    pub token_ratio_model: String,
     pub last_used: Instant,
 }
 impl Conversation {
@@ -174,6 +225,7 @@ impl Conversation {
             next_step: 1,
             executed: HashMap::new(),
             token_ratios: VecDeque::new(),
+            token_ratio_model: String::new(),
             last_used: Instant::now(),
         }
     }
@@ -364,10 +416,23 @@ mod tests {
         assert_eq!(h.bundles.len(), 3, "active bundles stay");
         h.bundles[0].active = false;
         h.bundles[1].active = false;
-        h.prune(2500);
+        // Only the evicted bundles count toward the limit.
+        h.prune(1500);
         assert_eq!(h.bundles.len(), 2);
         assert_eq!(h.pruned_through, Some(a));
-        assert!(h.read(a).unwrap_err().to_string().starts_with("history_unavailable"));
+        let gone = h.read(a).unwrap_err().to_string();
+        assert!(gone.starts_with(&format!("history_unavailable: history id {a} was dropped")), "{gone}");
+        assert!(h.read(99).unwrap_err().to_string().contains("does not exist"));
+        // An archive whose result is still in the context is kept.
+        let mut h = SessionHistory::default();
+        h.push(vec![json!({"role":"tool_archive","call_id":"c1","result":{"data":"x".repeat(2000)}})], true);
+        h.bundles[0].active = false;
+        h.push(vec![json!({"role":"assistant","tool_calls":[]}), json!({"role":"tool","tool_call_id":"c1","content":"cut"})], true);
+        h.prune(100);
+        assert_eq!(h.bundles.len(), 2, "the archive the active result names stays");
+        h.bundles[1].active = false;
+        h.prune(100);
+        assert!(h.bundles.iter().all(|b| b.messages[0]["role"] != "tool_archive"), "dropped once its result left");
     }
 
     #[test]
