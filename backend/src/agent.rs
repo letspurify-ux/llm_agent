@@ -119,7 +119,10 @@ pub async fn answer(app: &Arc<App>, question: Question, events: Events, cancel: 
         _ = cancel.cancelled() => bail!("cancelled"),
     };
     conversation.last_used = Instant::now();
-    if !claim.existed {
+    // A conversation with no question yet continues from the turns the
+    // browser kept: a new one, or one whose first run was cancelled while
+    // it waited for the conversation.
+    if conversation.history.next_id == 0 {
         restore(&mut conversation, &question.history);
     }
     run(app, &config, &mut conversation, &question.message, &events, &cancel).await
@@ -183,38 +186,52 @@ async fn run(
         }
         // An answer cut at the output limit is continued without tools.
         let continuing = !partial.is_empty();
-        let offered = offered_tools(config, c, final_round || continuing);
-        let state = runtime_state(config, message, remaining, final_round, &offered, partial.is_empty(), notice.take());
-        let mut definitions = ToolRegistry::definitions(&offered.iter().map(String::as_str).collect());
-        tools::require_project(&mut definitions, &config.projects);
-        // What eviction cannot remove: the frame and the question.
-        let kept = context::count(&context::request(&Default::default(), &state, &model, definitions.clone()), &model)
-            + context::bundle_tokens(&c.history, question_bundle, &model)
-            + 512;
+        let withheld_tools = final_round || continuing;
+        let round_notice = notice.take();
+        let frame = |c: &Conversation| {
+            let offered = offered_tools(config, c, withheld_tools);
+            let state = runtime_state(config, message, remaining, final_round, &offered, partial.is_empty(), round_notice.clone());
+            let mut definitions = ToolRegistry::definitions(&offered.iter().map(String::as_str).collect());
+            tools::require_project(&mut definitions, &config.projects);
+            (offered, state, definitions)
+        };
+        let (mut offered, mut state, mut definitions) = frame(c);
         let mut request = context::request(&c.history, &state, &model, definitions.clone());
         let mut estimate = context::count(&request, &model);
         let evicted = context::evict(c, config, estimate, &[question_bundle]);
         if !evicted.is_empty() {
-            request = context::request(&c.history, &state, &model, definitions);
+            // What left is readable through the history tool from this
+            // request on.
+            (offered, state, definitions) = frame(c);
+            request = context::request(&c.history, &state, &model, definitions.clone());
             estimate = context::count(&request, &model);
             eprintln!("[context] evicted {} old bundles; request now ~{estimate} tokens", evicted.len());
         }
+        // What eviction cannot remove: the frame and the question.
+        let kept = context::count(&context::request(&Default::default(), &state, &model, definitions), &model)
+            + context::bundle_tokens(&c.history, question_bundle, &model)
+            + 512;
         let calibrated = (estimate as f64 * context::token_ratio(c, &model)).ceil() as usize;
         if calibrated + config.llm.output_tokens + 512 > config.llm.context_tokens {
+            // A cut answer that can no longer be continued stands as written.
+            if continuing {
+                break partial.concat();
+            }
             bail!(UserFacing("대화가 너무 길어 이어서 답할 수 없습니다. 새 대화로 다시 질문해주세요.".into()));
         }
         rounds += 1;
         let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(64);
         let relay_events = events.clone();
+        // The text shown while the response streams, kept for a stop.
         let relay = tokio::spawn(async move {
-            let mut emitted = false;
+            let mut shown = String::new();
             while let Some(text) = delta_rx.recv().await {
                 if !text.is_empty() {
-                    emitted = true;
+                    shown.push_str(&text);
                     relay_events.send(json!({"type":"answer_delta","text":text}));
                 }
             }
-            emitted
+            shown
         });
         let started = Instant::now();
         let mut llm_config = config.llm.clone();
@@ -226,7 +243,8 @@ async fn run(
                 Err(_) => Err(anyhow::anyhow!("run_timeout")),
             },
         };
-        let emitted = relay.await.unwrap_or(false);
+        let shown = relay.await.unwrap_or_default();
+        let emitted = !shown.is_empty();
         let ms = started.elapsed().as_millis() as u64;
         let completion: Completion = match response {
             Ok(completion) => completion,
@@ -236,7 +254,34 @@ async fn run(
                     events.send(json!({"type":"answer_reset"}));
                 }
                 if error.to_string() == "cancelled" {
+                    // What a stopped answer has written stays in the
+                    // conversation, as the browser keeps what it showed for
+                    // the next question.
+                    let written = partial.concat() + &shown;
+                    if !written.trim().is_empty() {
+                        if last_is_partial(c) {
+                            c.history.bundles.pop_back();
+                        }
+                        c.history.push(vec![json!({"role":"assistant","content":written})], true);
+                    }
                     bail!("cancelled");
+                }
+                // A provider that counts more than the estimate, or serves
+                // less context than configured, refuses the request: every
+                // bundle that may leave leaves, and the request is made again.
+                // Nothing left to leave, the question ends as one too long.
+                if crate::llm::context_overflow(&error.to_string()) {
+                    let evicted = context::evict_all(c, config, &[question_bundle]);
+                    if !evicted.is_empty() {
+                        eprintln!("[context] the provider refused ~{estimate} tokens as too long; evicted {} old bundles", evicted.len());
+                        rounds -= 1;
+                        notice = round_notice;
+                        continue;
+                    }
+                    if continuing {
+                        break partial.concat();
+                    }
+                    bail!(UserFacing("대화가 너무 길어 이어서 답할 수 없습니다. 새 대화로 다시 질문해주세요.".into()));
                 }
                 let unavailable = error
                     .downcast_ref::<crate::llm::CompletionError>()
@@ -251,6 +296,7 @@ async fn run(
                             _ = cancel.cancelled() => bail!("cancelled"),
                             _ = tokio::time::sleep(wait) => {}
                         }
+                        notice = round_notice;
                         continue;
                     }
                 }
@@ -274,10 +320,13 @@ async fn run(
         }
         if completion.length_limited {
             if completion.discarded_tool_calls {
-                notice = Some("이전 응답이 출력 한도에 걸려 그 도구 호출은 하나도 실행되지 않았다. 필요한 호출을 더 짧은 인수로 다시 하라.".into());
-                continue;
-            }
-            if !completion.text.trim().is_empty() && partial.len() < LENGTH_CONTINUATIONS {
+                // Calls cut at the output limit never run. Withheld, they
+                // count below as calls the model was told not to make.
+                if !withheld_tools {
+                    notice = Some("이전 응답이 출력 한도에 걸려 그 도구 호출은 하나도 실행되지 않았다. 필요한 호출을 더 짧은 인수로 다시 하라.".into());
+                    continue;
+                }
+            } else if !completion.text.trim().is_empty() && partial.len() < LENGTH_CONTINUATIONS {
                 partial.push(completion.text.clone());
                 // The pieces so far stay one assistant message, which the
                 // next piece continues.
@@ -289,13 +338,12 @@ async fn run(
                     true,
                 );
                 continue;
-            }
-            if !completion.text.trim().is_empty() {
+            } else if !completion.text.trim().is_empty() {
                 partial.push(completion.text.clone());
                 break partial.concat();
             }
         }
-        if completion.calls.is_empty() {
+        if completion.calls.is_empty() && !completion.discarded_tool_calls {
             let text = completion.text.trim();
             if text.is_empty() {
                 empty += 1;
@@ -305,20 +353,29 @@ async fn run(
                     }
                     bail!(UserFacing("모델이 빈 응답을 반복해 답변을 만들지 못했습니다. 잠시 후 다시 시도해주세요.".into()));
                 }
-                notice = Some("이전 응답이 비어 있었다(글도 도구 호출도 없었다). 도구를 부르거나 답변을 써라.".into());
+                notice = Some(
+                    if continuing {
+                        "이전 응답이 비어 있었다. 끊긴 곳에서 바로 이어 써라."
+                    } else if final_round {
+                        "이전 응답이 비어 있었다. 지금까지 확보한 근거로 최종 답변을 써라."
+                    } else {
+                        "이전 응답이 비어 있었다(글도 도구 호출도 없었다). 도구를 부르거나 답변을 써라."
+                    }
+                    .into(),
+                );
                 continue;
             }
             partial.push(completion.text.clone());
             break partial.concat();
         }
         empty = 0;
-        if final_round || continuing {
+        if withheld_tools {
             // Tools were withheld; a provider that still sends calls gets
             // another request.
-            notice = Some(if final_round {
-                "도구를 더 쓸 수 없다. 지금까지 확보한 근거로 최종 답변만 써라.".into()
-            } else {
+            notice = Some(if continuing {
                 "답변을 이어 쓰는 중이라 도구를 쓸 수 없다. 끊긴 곳에서 바로 이어 써라.".into()
+            } else {
+                "도구를 더 쓸 수 없다. 지금까지 확보한 근거로 최종 답변만 써라.".into()
             });
             withheld += 1;
             if withheld > WITHHELD_RETRIES {
@@ -430,10 +487,12 @@ fn runtime_state(
 ) -> Value {
     use chrono::Datelike;
     let now = chrono::Utc::now() + chrono::Duration::hours(9);
-    let instruction = if final_round {
-        "도구를 더 쓸 수 없다. 지금까지 확보한 근거로 최종 답변을 써라. 확인하지 못한 부분은 그렇다고 밝혀라."
-    } else if !first_part {
+    // A cut answer is continued, in the final round too: a new final answer
+    // would be joined to the pieces already written.
+    let instruction = if !first_part {
         "이전 응답이 출력 한도에서 끊겼다. 끊긴 곳에서 바로 이어 써라. 앞부분을 반복하거나 머리말을 붙이지 말고, 이미 연 코드블록을 다시 열지 마라."
+    } else if final_round {
+        "도구를 더 쓸 수 없다. 지금까지 확보한 근거로 최종 답변을 써라. 확인하지 못한 부분은 그렇다고 밝혀라."
     } else {
         "질문에 필요한 근거를 도구로 확보하고, 충분하면 도구 없이 최종 답변을 써라."
     };

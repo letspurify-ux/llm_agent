@@ -802,3 +802,380 @@ async fn an_omitted_project_is_taken_from_a_path_found_in_one_project() {
     let search = tool_result(&requests[1], "r3");
     assert!(search["error"].as_str().unwrap().starts_with("project_required"), "{search}");
 }
+
+// Context management review, second pass (2026-10-16): each failed before
+// its fix. Needs no MariaDB.
+
+/// The runtime state a recorded request ends with.
+fn state_of(request: &Value) -> Value {
+    let users = messages(request, "user");
+    let text = users.last().unwrap()["content"].as_str().unwrap();
+    serde_json::from_str(text.split_once('\n').unwrap().1).unwrap()
+}
+
+fn cut_text(piece: &str) -> llm_agent::llm::Completion {
+    let mut completion = text(piece);
+    completion.length_limited = true;
+    completion
+}
+
+/// A response cut at the output limit inside its tool calls.
+fn cut_calls() -> llm_agent::llm::Completion {
+    let mut completion = cut_text("");
+    completion.discarded_tool_calls = true;
+    completion
+}
+
+/// E: an answer cut in the final round was asked for a final answer instead
+/// of its continuation, so the answer repeated its start.
+#[tokio::test]
+async fn a_cut_answer_in_the_final_round_is_continued() {
+    let mut config = no_db("gpt-4o");
+    // Every request is within the final reserve.
+    config.agent.run_seconds = 45;
+    let llm = Scripted::new(vec![cut_text("첫 조각 "), calls(vec![call("x", "file_list", json!({}))]), text("이어진 끝.")]);
+    let (app, _dir) = app(config, llm.clone());
+    let (r, _) = ask(&app, "e", "길게 설명해줘", vec![]).await;
+    assert_eq!(r.unwrap().answer, "첫 조각 이어진 끝.");
+    let requests = llm.requests();
+    let continued = state_of(&requests[1]);
+    assert!(continued["run_guidance"]["instruction"].as_str().unwrap().contains("끊긴 곳에서 바로 이어 써라"), "{continued}");
+    let withheld = state_of(&requests[2]);
+    assert!(withheld["run_guidance"]["notice"].as_str().unwrap().contains("이어 쓰는 중"), "{withheld}");
+}
+
+/// F: a response cut inside tool calls while tools were withheld was told to
+/// make the calls again, and was never counted as a withheld response.
+#[tokio::test]
+async fn cut_tool_calls_while_tools_are_withheld_count_as_withheld() {
+    let llm = Scripted::new(vec![cut_text("첫 조각 "), cut_calls(), cut_calls(), cut_calls(), text("쓰이지 않는 답")]);
+    let (cut_app, _cut_dir) = app(no_db("gpt-4o"), llm.clone());
+    let (r, _) = ask(&cut_app, "f", "길게 설명해줘", vec![]).await;
+    assert_eq!(r.unwrap().answer, "첫 조각 ");
+    let notice = state_of(&llm.requests()[2])["run_guidance"]["notice"].clone();
+    assert!(notice.as_str().unwrap().contains("이어 쓰는 중"), "{notice}");
+    // In the final round they end the question as other withheld calls do.
+    let mut config = no_db("gpt-4o");
+    config.agent.run_seconds = 45;
+    let llm = Scripted::new(vec![cut_calls(), cut_calls(), cut_calls(), text("쓰이지 않는 답")]);
+    let (final_app, _final_dir) = app(config, llm.clone());
+    let (r, _) = ask(&final_app, "f2", "질문", vec![]).await;
+    let error = r.err().expect("withheld calls end the question").to_string();
+    assert!(error.contains("도구 호출을 반복"), "{error}");
+    let notice = state_of(&llm.requests()[1])["run_guidance"]["notice"].clone();
+    assert!(notice.as_str().unwrap().contains("도구를 더 쓸 수 없다"), "{notice}");
+}
+
+/// G: an answer cut at the output limit whose continuation no longer fits
+/// the context failed the question, and what was written was lost.
+#[tokio::test]
+async fn a_cut_answer_that_cannot_be_continued_stands_as_written() {
+    let mut config = no_db("gpt-4o");
+    config.llm.context_tokens = 12_000;
+    config.llm.output_tokens = 4_000;
+    let piece = "가나다 ".repeat(3_900);
+    let llm = Scripted::new(vec![cut_text(&piece), text("이어진 끝")]);
+    let (app, _dir) = app(config, llm.clone());
+    let (r, _) = ask(&app, "g", &"자료 ".repeat(1_500), vec![]).await;
+    assert_eq!(r.unwrap().answer, piece);
+    assert_eq!(llm.requests().len(), 1);
+}
+
+/// H: a conversation the store already held with no question in it (its
+/// first run was cancelled while it waited) ignored the browser's history.
+#[tokio::test]
+async fn a_conversation_held_without_a_question_is_restored() {
+    let llm = Scripted::new(vec![text("답")]);
+    let (app, _dir) = app(no_db("gpt-4o"), llm.clone());
+    let claim = app.sessions.open("h", std::time::Duration::from_secs(60), 10, CancellationToken::new());
+    app.sessions.finish("h", claim.run);
+    let history = vec![("user".to_owned(), "이전 질문".to_owned()), ("assistant".to_owned(), "이전 답".to_owned())];
+    let (r, _) = ask(&app, "h", "이어서", history).await;
+    r.unwrap();
+    assert_eq!(messages(&llm.requests()[0], "user")[0]["content"], "이전 질문");
+}
+
+/// I: the request that evicted bundles did not offer the history tool, so
+/// the model could not read back what had just left its context.
+#[tokio::test]
+async fn the_request_that_evicts_offers_the_history_tool() {
+    let mut config = no_db("gpt-4o");
+    config.llm.context_tokens = 16_000;
+    config.llm.output_tokens = 2_000;
+    let llm = Scripted::new(vec![text("답")]);
+    let (app, _dir) = app(config, llm.clone());
+    let big = "자료 ".repeat(3_000);
+    let history: Vec<(String, String)> = [("user", big.as_str()), ("assistant", &big), ("user", &big), ("assistant", &big), ("user", "짧은 질문"), ("assistant", "짧은 답")]
+        .into_iter()
+        .map(|(role, text)| (role.to_owned(), text.to_owned()))
+        .collect();
+    let (r, _) = ask(&app, "i", "이어서", history).await;
+    r.unwrap();
+    let request = &llm.requests()[0];
+    assert_eq!(messages(request, "user")[0]["content"], "짧은 질문", "the large turns left");
+    let tools: Vec<&str> = request["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+    assert!(tools.contains(&"history"), "{tools:?}");
+}
+
+/// A provider whose real context is `limit` tokens: a longer request is
+/// refused as OpenAI-compatible servers refuse it.
+struct Refusing {
+    limit: usize,
+    replies: std::sync::Mutex<std::collections::VecDeque<llm_agent::llm::Completion>>,
+    refused: std::sync::atomic::AtomicUsize,
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for Refusing {
+    async fn complete(&self, request: Value, config: &llm_agent::config::LlmConfig, _c: CancellationToken, _d: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        let input = llm_agent::context::count(&request, &config.model);
+        if input + config.output_tokens > self.limit {
+            self.refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            anyhow::bail!(
+                "http_400: {}",
+                json!({"error":{"message":format!("This model's maximum context length is {} tokens. However, your messages resulted in {input} tokens.", self.limit),"code":"context_length_exceeded"}})
+            );
+        }
+        Ok(self.replies.lock().unwrap().pop_front().unwrap_or_else(|| text("끝")))
+    }
+}
+
+/// J: a provider that refused a request as longer than its context (a model
+/// served with less context than configured) failed the question, and as
+/// nothing then left the context, every later question the same way.
+#[tokio::test]
+async fn a_request_the_provider_finds_too_long_runs_again_with_old_bundles_evicted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    let body: String = (1..=8000).map(|i| format!("line {i} {}\n", "word ".repeat(12))).collect();
+    std::fs::write(root.join("big.txt"), &body).unwrap();
+    let mut config = no_db("gpt-4o");
+    config.llm.context_tokens = 64_000;
+    config.llm.output_tokens = 2_000;
+    config.agent.result_tokens = Some(6_000);
+    config.projects.push(llm_agent::config::Project { name: "app".into(), root: root.clone(), ..Default::default() });
+    let mut script: Vec<_> = (0..4).map(|i| calls(vec![call(&format!("r{i}"), "file_read", json!({"path":"big.txt","start_line":1 + i * 1000}))])).collect();
+    script.push(text("첫 답"));
+    script.push(text("둘째 답"));
+    let llm = std::sync::Arc::new(Refusing { limit: 26_000, replies: std::sync::Mutex::new(script.into()), refused: Default::default() });
+    let (app, _dir) = app(config, llm.clone());
+    let (r, _) = ask(&app, "j", "큰 파일 봐줘", vec![]).await;
+    assert_eq!(r.unwrap().answer, "첫 답");
+    assert!(llm.refused.load(std::sync::atomic::Ordering::Relaxed) > 0, "the provider refused a request");
+    let (r, _) = ask(&app, "j", "다음 질문", vec![]).await;
+    assert_eq!(r.unwrap().answer, "둘째 답");
+}
+
+/// Streams the start of an answer, then the user stops it.
+struct StoppedMidAnswer {
+    stop: CancellationToken,
+    requests: std::sync::Mutex<Vec<Value>>,
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for StoppedMidAnswer {
+    async fn complete(&self, request: Value, _config: &llm_agent::config::LlmConfig, cancel: CancellationToken, delta: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        let first = {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request);
+            requests.len() == 1
+        };
+        if !first {
+            return Ok(text("이어서 답합니다."));
+        }
+        for part in ["배치 상태는 ", "다음 표와 같습니다."] {
+            let _ = delta.send(part.to_owned()).await;
+        }
+        self.stop.cancel();
+        cancel.cancelled().await;
+        anyhow::bail!("cancelled")
+    }
+}
+
+/// K: an answer the user stopped mid-way was dropped from the conversation,
+/// while the browser keeps what it showed for the next question.
+#[tokio::test]
+async fn what_a_stopped_answer_showed_stays_in_the_conversation() {
+    let stop = CancellationToken::new();
+    let llm = std::sync::Arc::new(StoppedMidAnswer { stop: stop.clone(), requests: Default::default() });
+    let (app, _dir) = app(no_db("gpt-4o"), llm.clone());
+    let question = |message: &str| Question { conversation_id: "k".into(), message: message.into(), history: vec![] };
+    let stopped = agent::answer(&app, question("배치 상태 알려줘"), Events::new(None), stop).await;
+    assert!(stopped.is_err());
+    let answered = agent::answer(&app, question("계속해줘"), Events::new(None), CancellationToken::new()).await;
+    assert_eq!(answered.map(|a| a.answer).map_err(|e| e.to_string()), Ok("이어서 답합니다.".to_owned()));
+    let next = llm.requests.lock().unwrap()[1].clone();
+    let replies: Vec<Value> = messages(&next, "assistant").iter().map(|m| m["content"].clone()).collect();
+    assert_eq!(replies, vec![json!("배치 상태는 다음 표와 같습니다.")]);
+}
+
+/// A model answering at random: tool calls (history ones too), answers cut
+/// at the output limit, cut tool calls, empty replies and answers, against
+/// a provider whose real context may be smaller than the configured one.
+struct RandomModel {
+    seed: std::sync::Mutex<u64>,
+    real_limit: usize,
+    ratio: f64,
+    rounds: std::sync::Mutex<usize>,
+    next_call: std::sync::Mutex<usize>,
+    requests: std::sync::Mutex<Vec<(Value, bool)>>,
+}
+impl RandomModel {
+    fn next(&self, n: usize) -> usize {
+        let mut seed = self.seed.lock().unwrap();
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 33) as usize) % n.max(1)
+    }
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for RandomModel {
+    async fn complete(&self, request: Value, config: &llm_agent::config::LlmConfig, _c: CancellationToken, _d: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        let input = (llm_agent::context::count(&request, &config.model) as f64 * self.ratio) as usize;
+        let accepted = input + config.output_tokens <= self.real_limit;
+        self.requests.lock().unwrap().push((request, accepted));
+        if !accepted {
+            anyhow::bail!("http_400: {}", json!({"error":{"message":format!("This model's maximum context length is {} tokens.", self.real_limit),"code":"context_length_exceeded"}}));
+        }
+        let rounds = {
+            let mut rounds = self.rounds.lock().unwrap();
+            *rounds += 1;
+            *rounds
+        };
+        let mut out = text("");
+        out.usage = Some(llm_agent::llm::Usage { input, output: 50, cached: None });
+        match if rounds > 8 { 99 } else { self.next(100) } {
+            0..=39 => {
+                for _ in 0..1 + self.next(4) {
+                    let id = {
+                        let mut next = self.next_call.lock().unwrap();
+                        *next += 1;
+                        format!("c{next}")
+                    };
+                    out.calls.push(match self.next(5) {
+                        0 => call(&id, "file_read", json!({"path":"big.txt","start_line":1 + self.next(7000)})),
+                        1 => call(&id, "source_search", json!({"query":"needle","limit":100})),
+                        2 => call(&id, "file_list", json!({"path_glob":"**/*","mode":"paths","limit":500})),
+                        3 => {
+                            let query = ["needle", "word", "\"q\""][self.next(3)];
+                            call(&id, "history", json!({"action":"search","query":query}))
+                        }
+                        _ => call(&id, "history", json!({"action":"read","id":1 + self.next(40)})),
+                    });
+                }
+            }
+            40..=54 => {
+                out.text = format!("조각{} {}", self.next(1000), "가나다 ".repeat(self.next(config.output_tokens.min(3000))));
+                out.length_limited = true;
+            }
+            55..=64 => {
+                out.length_limited = true;
+                out.discarded_tool_calls = true;
+            }
+            65..=69 => {}
+            _ => {
+                out.text = format!("답{}", self.next(1000));
+                *self.rounds.lock().unwrap() = 0;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// The shape every request must keep: the context opens with a user
+/// message, no reply follows a reply, every tool call has its result right
+/// after it, one answer per question, no internal flags.
+fn request_shape(request: &Value) -> Result<(), String> {
+    let messages = request["messages"].as_array().unwrap();
+    if messages[0]["role"] != "system" || messages[1]["role"] != "user" || messages.last().unwrap()["role"] != "user" {
+        return Err("not system, user …, state".into());
+    }
+    let mut pending: Vec<&str> = vec![];
+    let mut answers = 0;
+    let mut previous = "";
+    for message in &messages[1..] {
+        let role = message["role"].as_str().unwrap();
+        if role == "assistant" && previous == "assistant" {
+            return Err("a reply after a reply".into());
+        }
+        if role != "tool" && !pending.is_empty() {
+            return Err(format!("no result for {pending:?}"));
+        }
+        if message.get("partial").is_some() || message.get("restored").is_some() {
+            return Err("internal flag".into());
+        }
+        match role {
+            "assistant" => match message["tool_calls"].as_array() {
+                Some(calls) if !calls.is_empty() => pending = calls.iter().map(|c| c["id"].as_str().unwrap()).collect(),
+                _ => answers += 1,
+            },
+            "tool" => {
+                let id = message["tool_call_id"].as_str().unwrap();
+                let at = pending.iter().position(|p| *p == id).ok_or(format!("result without its call {id}"))?;
+                pending.remove(at);
+            }
+            _ => answers = 0,
+        }
+        if answers > 1 {
+            return Err("two answers to one question".into());
+        }
+        previous = role;
+    }
+    Ok(())
+}
+
+/// Random conversations of three questions keep every request in shape and
+/// within the context, and end every question with an answer or a message
+/// the user may see. CTX_FUZZ sets the number of conversations. Needs no
+/// MariaDB.
+#[tokio::test]
+async fn random_conversations_keep_every_request_in_shape() {
+    let runs: usize = std::env::var("CTX_FUZZ").ok().and_then(|n| n.parse().ok()).unwrap_or(12);
+    let mut seed: u64 = 0x5eed;
+    let mut next = |n: usize| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as usize) % n.max(1)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let body: String = (1..=8000).map(|i| format!("line {i} {}\n", "word \"q\" ".repeat(8))).collect();
+    std::fs::write(root.join("big.txt"), &body).unwrap();
+    for i in 0..40 {
+        std::fs::write(root.join(format!("src/m{i}.rs")), format!("fn f{i}() {{ let needle = {i}; }}\n").repeat(100)).unwrap();
+    }
+    for run in 0..runs {
+        let mut config = no_db(["gpt-4o", "unknown-tokenizer"][next(2)]);
+        let context = [24_000, 32_000, 64_000, 128_000][next(4)];
+        config.llm.context_tokens = context;
+        config.llm.output_tokens = [2_000, 4_000][next(2)];
+        config.projects.push(llm_agent::config::Project { name: "app".into(), root: root.clone(), ..Default::default() });
+        let real_limit = if next(3) == 0 { context * (60 + next(40)) / 100 } else { context * 2 };
+        let ratio = if config.llm.model == "gpt-4o" { 1.0 } else { 0.8 + next(40) as f64 / 100.0 };
+        let llm = std::sync::Arc::new(RandomModel {
+            seed: std::sync::Mutex::new(next(1 << 30) as u64 + 1),
+            real_limit,
+            ratio,
+            rounds: Default::default(),
+            next_call: Default::default(),
+            requests: Default::default(),
+        });
+        let (fuzz_app, _fuzz_dir) = app(config.clone(), llm.clone());
+        let turns: Vec<(String, String)> = (0..next(7)).map(|i| (["user", "assistant"][i % 2].to_owned(), "이전 대화 ".repeat(next(3000)))).collect();
+        for q in 0..3 {
+            let before = llm.requests.lock().unwrap().len();
+            let message = format!("질문 {q} {}", "자료 ".repeat(next(800)));
+            let (result, _) = ask(&fuzz_app, &format!("shape{run}"), &message, turns.clone()).await;
+            let requests = llm.requests.lock().unwrap().clone();
+            for (i, (request, accepted)) in requests.iter().enumerate().skip(before) {
+                if let Err(broken) = request_shape(request) {
+                    panic!("run {run} question {q} request {i}: {broken}");
+                }
+                // What the provider counts, once a usage sample calibrated the estimate.
+                let input = (llm_agent::context::count(request, &config.llm.model) as f64 * ratio) as usize;
+                assert!(!accepted || i == 0 || input + config.llm.output_tokens <= context, "run {run} request {i}: {input} tokens past the context {context}");
+            }
+            if let Err(error) = result {
+                assert!(error.downcast_ref::<agent::UserFacing>().is_some(), "run {run} question {q}: {error:#}");
+            }
+        }
+    }
+}

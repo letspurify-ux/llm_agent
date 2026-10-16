@@ -267,17 +267,36 @@ pub fn model_message(mut message: Value) -> Value {
 
 /// History messages as the model received them, for the history tool:
 /// tool results (archived ones too) through `tools::model_result`, internal
-/// flags removed.
+/// flags removed. JSON a message carries as text (a tool result, call
+/// arguments) is shown as that JSON, not as a string escaped once more: its
+/// quotes and backslashes read, and are found, as the model was given them.
 pub fn shown_messages(messages: &[Value]) -> Vec<Value> {
+    fn unwrap_json(value: &mut Value) {
+        if let Some(parsed) = value
+            .as_str()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .filter(|parsed| parsed.is_object() || parsed.is_array())
+        {
+            *value = parsed;
+        }
+    }
     messages
         .iter()
         .cloned()
         .map(|message| {
             if message["role"] == "tool_archive" {
-                json!({"role":"tool_archive","call_id":message["call_id"],"result":crate::tools::model_result(&message["result"])})
-            } else {
-                model_message(message)
+                return json!({"role":"tool_archive","call_id":message["call_id"],"result":crate::tools::model_result(&message["result"])});
             }
+            let mut shown = model_message(message);
+            if shown["role"] == "tool" {
+                unwrap_json(&mut shown["content"]);
+            }
+            if let Some(calls) = shown["tool_calls"].as_array_mut() {
+                for call in calls {
+                    unwrap_json(&mut call["function"]["arguments"]);
+                }
+            }
+            shown
         })
         .collect()
 }
@@ -344,40 +363,67 @@ pub fn evict(
     let budget = (config.input_budget() as f64 / token_ratio(c, model)) as usize;
     let high = (budget as f64 * config.agent.high_water) as usize;
     let low = (budget as f64 * config.agent.low_water) as usize;
+    let evicted = if request_tokens >= high {
+        evict_down_to(c, model, request_tokens, Some(low), protected)
+    } else {
+        vec![]
+    };
+    c.history.prune(config.agent.history_bytes);
+    evicted
+}
+
+/// Evicts every bundle `evict` may remove, for a request the provider
+/// refused as longer than its context (it counts more than the estimate, or
+/// serves less context than configured). Returns the evicted bundle IDs.
+pub fn evict_all(c: &mut Conversation, config: &Config, protected: &[u64]) -> Vec<u64> {
+    let evicted = evict_down_to(c, &config.llm.model, 0, None, protected);
+    c.history.prune(config.agent.history_bytes);
+    evicted
+}
+
+/// Evicts the oldest bundles until `request_tokens` less theirs is at most
+/// `low` (all of them without one), but never the newest bundle or one in
+/// `protected`.
+fn evict_down_to(
+    c: &mut Conversation,
+    model: &str,
+    request_tokens: usize,
+    low: Option<usize>,
+    protected: &[u64],
+) -> Vec<u64> {
+    let newest = c.history.bundles.iter().rev().find(|b| b.active).map(|b| b.id);
+    let mut remaining = request_tokens;
     let mut evicted = vec![];
-    if request_tokens >= high {
-        let newest = c.history.bundles.iter().rev().find(|b| b.active).map(|b| b.id);
-        let mut remaining = request_tokens;
-        for bundle in c.history.bundles.iter_mut() {
-            if remaining <= low {
-                break;
-            }
-            if !bundle.active
-                || !bundle.complete
-                || Some(bundle.id) == newest
-                || protected.contains(&bundle.id)
-            {
-                continue;
-            }
+    for bundle in c.history.bundles.iter_mut() {
+        if low.is_some_and(|low| remaining <= low) {
+            break;
+        }
+        if !bundle.active
+            || !bundle.complete
+            || Some(bundle.id) == newest
+            || protected.contains(&bundle.id)
+        {
+            continue;
+        }
+        if low.is_some() {
             let delivered: Vec<Value> = bundle.messages.iter().cloned().map(model_message).collect();
             remaining = remaining.saturating_sub(count(&json!(delivered), model));
-            bundle.active = false;
-            evicted.push(bundle.id);
         }
-        // The context opens with a user message, as chat templates and some
-        // providers require: a reply whose question left goes with it.
-        if !evicted.is_empty() {
-            while let Some(first) = c.history.bundles.iter_mut().find(|b| b.active) {
-                let opens_with_user = first.messages.first().is_some_and(|m| m["role"] == "user");
-                if opens_with_user || !first.complete || Some(first.id) == newest || protected.contains(&first.id) {
-                    break;
-                }
-                first.active = false;
-                evicted.push(first.id);
+        bundle.active = false;
+        evicted.push(bundle.id);
+    }
+    // The context opens with a user message, as chat templates and some
+    // providers require: a reply whose question left goes with it.
+    if !evicted.is_empty() {
+        while let Some(first) = c.history.bundles.iter_mut().find(|b| b.active) {
+            let opens_with_user = first.messages.first().is_some_and(|m| m["role"] == "user");
+            if opens_with_user || !first.complete || Some(first.id) == newest || protected.contains(&first.id) {
+                break;
             }
+            first.active = false;
+            evicted.push(first.id);
         }
     }
-    c.history.prune(config.agent.history_bytes);
     evicted
 }
 

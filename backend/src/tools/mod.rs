@@ -2412,6 +2412,33 @@ mod tests {
     }
 
     #[test]
+    fn history_finds_and_shows_quoted_text_as_written() {
+        // A tool result is JSON inside a message: searched and read as a
+        // string escaped once more, quotes and backslashes never matched.
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = workspace(dir.path());
+        let result = envelope(Ok(json!({"text":"let model = config[\"llm\"][\"model\"];\nlet home = \"C:\\app\";"})));
+        ws.history.push(
+            vec![
+                json!({"role":"assistant","content":null,"tool_calls":[{"id":"a","type":"function","function":{"name":"search","arguments":json!({"query":"모델 \"설정\""}).to_string()}}]}),
+                json!({"role":"tool","tool_call_id":"a","content":result.to_string()}),
+            ],
+            true,
+        );
+        ws.history.bundles[0].active = false;
+        for query in ["config[\"llm\"]", "C:\\app", "모델 \"설정\"", r#"config[\"llm\"]"#] {
+            let found = envelope(execute(&mut ws, "history", json!({"action":"search","query":query}), &Default::default()));
+            assert_eq!(found["data"]["items"].as_array().unwrap().len(), 1, "{query}: {found}");
+            let excerpt = found["data"]["items"][0]["excerpt"].as_str().unwrap();
+            assert!(excerpt.contains("config") || excerpt.contains("설정"), "{query}: {excerpt}");
+        }
+        // A read shows the result as the JSON the model was given.
+        let read = envelope(execute(&mut ws, "history", json!({"action":"read","id":1}), &Default::default()));
+        let text = read["data"]["text"].as_str().unwrap();
+        assert!(text.contains(r#"config[\"llm\"]"#) && !text.contains(r#"\\\"llm"#), "{text}");
+    }
+
+    #[test]
     fn an_archived_result_shows_its_start() {
         let dir = tempfile::tempdir().unwrap();
         let mut ws = workspace(dir.path());

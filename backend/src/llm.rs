@@ -191,6 +191,34 @@ fn overload_error(text: &str) -> bool {
         || text.contains("\"error_type\":\"provider_overloaded\"")
 }
 
+/// A provider's refusal of a request longer than the context it serves, as
+/// OpenAI, vLLM, llama.cpp, LM Studio, OpenRouter, Anthropic, Gemini and
+/// Z.ai word it (or a proxy refusing the body's size).
+pub fn context_overflow(error: &str) -> bool {
+    if error.starts_with("http_413") {
+        return true;
+    }
+    if !(error.starts_with("http_4") || error.starts_with("provider_error")) {
+        return false;
+    }
+    let text = error.to_ascii_lowercase();
+    [
+        "context_length_exceeded",
+        "context length",
+        "context window",
+        "context size",
+        "prompt is too long",
+        "input is too long",
+        "too many tokens",
+        "exceeds the maximum number of tokens",
+        "reduce the length of the messages",
+        "maximum prompt length",
+        "exceeds max length",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+}
+
 /// Failures of the provider or the connection, not of the request itself.
 fn transient_error(text: &str) -> bool {
     text.starts_with("provider_stream_error:")
@@ -1091,5 +1119,31 @@ mod diagnostic_tests {
         assert_eq!(diagnostics[0].reason.chars().count(), MAX_DIAGNOSTIC_CHARS);
         assert_eq!(diagnostics[1].code, "request_error");
         assert_eq!(diagnostics[1].reason, "[redacted]");
+    }
+
+    #[test]
+    fn context_overflow_refusals_are_told_from_other_errors() {
+        for refused in [
+            r#"http_400: {"error":{"message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 140213 tokens.","code":"context_length_exceeded"}}"#,
+            r#"http_400: {"object":"error","message":"This model's maximum context length is 32768 tokens. However, you requested 33012 tokens (29012 in the messages, 4000 in the completion).","code":400}"#,
+            r#"http_400: {"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size_error"}}"#,
+            r#"http_400: {"error":{"message":"This endpoint's maximum context length is 131072 tokens. However, you requested about 150000 tokens","code":400}}"#,
+            r#"http_400: {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#,
+            r#"http_400: [{"error":{"code":400,"message":"The input token count (1100000) exceeds the maximum number of tokens allowed (1048576).","status":"INVALID_ARGUMENT"}}]"#,
+            r#"http_400: {"error":{"code":"1261","message":"Prompt exceeds max length"}}"#,
+            "http_413: Request Entity Too Large",
+            r#"provider_error: {"code":400,"message":"This endpoint's maximum context length is 65536 tokens."}"#,
+        ] {
+            assert!(context_overflow(refused), "{refused}");
+        }
+        for other in [
+            r#"http_401: {"error":{"message":"Incorrect API key provided"}}"#,
+            r#"http_400: {"error":{"message":"Invalid schema for function 'search'","code":"invalid_function_parameters"}}"#,
+            r#"http_429: {"error":{"message":"Rate limit reached"}}"#,
+            r#"http_500: {"error":{"message":"maximum context length exceeded while loading"}}"#,
+            "stream_interrupted: missing completion terminator",
+        ] {
+            assert!(!context_overflow(other), "{other}");
+        }
     }
 }

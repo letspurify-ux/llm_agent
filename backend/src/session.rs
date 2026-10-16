@@ -132,17 +132,26 @@ impl SessionHistory {
     }
     pub fn search(&self, query: &str, after: u64, limit: usize) -> Value {
         let q = query.to_lowercase();
-        let rows: Vec<(&Bundle, String)> = self
+        // The messages are searched as JSON text, where quotes, backslashes
+        // and line breaks are escaped: the query is found as JSON writes it,
+        // or as sent (copied from a history read).
+        let escaped = serde_json::to_string(&q).map_or_else(|_| q.clone(), |s| s[1..s.len() - 1].to_owned());
+        let needles: Vec<&str> = if escaped == q { vec![&q] } else { vec![&escaped, &q] };
+        let rows: Vec<(&Bundle, String, &str)> = self
             .bundles
             .iter()
             .filter(|b| b.id > after)
-            .map(|b| (b, serde_json::to_string(&crate::context::shown_messages(&b.messages[..])).unwrap_or_default()))
-            .filter(|(_, text)| text.to_lowercase().contains(&q))
+            .filter_map(|b| {
+                let text = serde_json::to_string(&crate::context::shown_messages(&b.messages[..])).unwrap_or_default();
+                let lowered = text.to_lowercase();
+                let needle = needles.iter().copied().find(|needle| lowered.contains(needle))?;
+                Some((b, text, needle))
+            })
             .collect();
         let items: Vec<_> = rows
             .iter()
             .take(limit.clamp(1, 50))
-            .map(|(b, text)| json!({"id":b.id,"active":b.active,"excerpt":excerpt_around(text, &q)}))
+            .map(|(b, text, needle)| json!({"id":b.id,"active":b.active,"excerpt":excerpt_around(text, needle)}))
             .collect();
         json!({"next_cursor":if rows.len()>items.len(){items.last().and_then(|x|x["id"].as_u64())}else{None},"items":items,"pruned_through":self.pruned_through})
     }
