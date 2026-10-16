@@ -288,6 +288,9 @@ async fn run(
         let writing = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let relay_writing = writing.clone();
         let (claim_tx, mut claim_rx) = tokio::sync::oneshot::channel::<()>();
+        // The run is cancelled when the browser closes the stream (a stop):
+        // what is sent after that never reaches it.
+        let stopped = cancel.clone();
         // The text shown while the response streams, kept for a stop.
         let relay = tokio::spawn(async move {
             let mut shown = String::new();
@@ -297,7 +300,7 @@ async fn run(
             let mut held = search_first.then(String::new);
             let mut claim = Some(claim_tx);
             while let Some(text) = delta_rx.recv().await {
-                if text.is_empty() {
+                if text.is_empty() || stopped.is_cancelled() {
                     continue;
                 }
                 relay_writing.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -320,10 +323,12 @@ async fn run(
                 shown.push_str(&text);
                 relay_events.send(json!({"type":"answer_delta","text":text}));
             }
-            // A response that ended while undecided shows its start.
+            // A response that ended while undecided shows its start (not
+            // after a stop: the stream ended because the browser closed it).
             if let Some(start) = held
                 && claim.is_some()
                 && !start.is_empty()
+                && !stopped.is_cancelled()
             {
                 shown.push_str(&start);
                 relay_events.send(json!({"type":"answer_delta","text":start}));

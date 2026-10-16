@@ -987,6 +987,9 @@ impl llm_agent::llm::LlmClient for StoppedMidAnswer {
         for part in ["배치 상태는 ", "다음 표와 같습니다."] {
             let _ = delta.send(part.to_owned()).await;
         }
+        // The user stops once it is on the screen (nothing sent after a stop
+        // reaches the browser).
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         self.stop.cancel();
         cancel.cancelled().await;
         anyhow::bail!("cancelled")
@@ -1325,6 +1328,35 @@ async fn a_question_too_long_by_itself_is_told_so() {
     assert!(error.contains("컨텍스트 설정이 너무 작아"), "{error}");
 }
 
+/// The browser's end of a stream the user stops: it reads events until the
+/// stop, then closes the stream (web.rs cancels the run when it sees that),
+/// so what is sent after the stop never reaches it.
+#[derive(Default)]
+struct Browser {
+    stream: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Value>>>,
+    seen: std::sync::Mutex<Vec<Value>>,
+}
+impl Browser {
+    fn events(&self) -> Events {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self.stream.lock().unwrap() = Some(rx);
+        Events::new(Some(tx))
+    }
+    /// What arrived so far; the stream is closed from here on.
+    fn close(&self) {
+        if let Some(mut stream) = self.stream.lock().unwrap().take() {
+            let mut seen = self.seen.lock().unwrap();
+            while let Ok(event) = stream.try_recv() {
+                seen.push(event);
+            }
+        }
+    }
+    fn seen(&self) -> Vec<Value> {
+        self.close();
+        self.seen.lock().unwrap().clone()
+    }
+}
+
 /// A model answering at random until the user stops it mid-stream: cut
 /// answer pieces, tool calls with text before them, cut tool calls, empty
 /// replies.
@@ -1333,6 +1365,7 @@ struct StoppedAtRandom {
     stop_at: usize,
     calls: std::sync::atomic::AtomicUsize,
     stop: CancellationToken,
+    browser: std::sync::Arc<Browser>,
 }
 impl StoppedAtRandom {
     fn next(&self, n: usize) -> usize {
@@ -1363,6 +1396,9 @@ impl llm_agent::llm::LlmClient for StoppedAtRandom {
             if !shown.is_empty() {
                 let _ = delta.send(shown).await;
             }
+            // The user stops once it is on the screen.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            self.browser.close();
             self.stop.cancel();
             cancel.cancelled().await;
             anyhow::bail!("cancelled");
@@ -1396,20 +1432,18 @@ async fn a_stop_leaves_in_the_conversation_what_the_browser_showed() {
     let mut checked = 0;
     for run in 0..runs {
         let stop = CancellationToken::new();
+        let browser = std::sync::Arc::new(Browser::default());
         let llm = std::sync::Arc::new(StoppedAtRandom {
             seed: std::sync::Mutex::new(run as u64 * 7919 + 1),
             stop_at: run % 6,
             calls: Default::default(),
             stop: stop.clone(),
+            browser: browser.clone(),
         });
         let (app, _dir) = app(no_db("gpt-4o"), llm.clone());
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let question = Question { conversation_id: "o".into(), message: "질문".into(), history: vec![] };
-        let stopped = agent::answer(&app, question, Events::new(Some(tx)), stop).await;
-        let mut events = vec![];
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
-        }
+        let stopped = agent::answer(&app, question, browser.events(), stop).await;
+        let events = browser.seen();
         if stopped.is_ok() || llm.calls.load(std::sync::atomic::Ordering::Relaxed) <= llm.stop_at {
             continue; // answered or failed before the stop
         }
@@ -1678,6 +1712,55 @@ async fn a_refused_line_stops_its_request_at_its_start() {
     assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
     assert_eq!(preview(&events), "찾아보니 기업가입니다.");
     assert!(ev(&events, "answer_reset").is_empty(), "{events:?}");
+}
+
+/// A model whose first answer opens with `start` and is stopped there by the
+/// user; then it answers from `replies`.
+struct StoppedAtStart {
+    start: &'static str,
+    stop: CancellationToken,
+    browser: std::sync::Arc<Browser>,
+    replies: std::sync::Arc<Scripted>,
+    stopped: std::sync::atomic::AtomicBool,
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for StoppedAtStart {
+    async fn complete(&self, request: Value, config: &llm_agent::config::LlmConfig, cancel: CancellationToken, delta: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        if self.stopped.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return self.replies.complete(request, config, cancel, delta).await;
+        }
+        let _ = delta.send(self.start.to_owned()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        self.browser.close();
+        self.stop.cancel();
+        cancel.cancelled().await;
+        anyhow::bail!("cancelled")
+    }
+}
+
+/// Context management review, ninth pass: a stop while the start of an answer
+/// was held (it could still be the general-knowledge line) sent that start
+/// after the stop, to a browser that had closed the stream, and kept it in
+/// the conversation: the next question's context held a reply the user never
+/// saw, and when it was the start of the line, the guard took it for the
+/// previous answer saying the line and let the next line stand unsearched.
+#[tokio::test]
+async fn a_stop_keeps_nothing_the_browser_was_not_shown() {
+    for (n, start) in ["**", "*등록된 지식에 없는 내"].into_iter().enumerate() {
+        let stop = CancellationToken::new();
+        let browser = std::sync::Arc::new(Browser::default());
+        let replies = Scripted::new(vec![text(GENERAL_LINE), text("찾아보니 기업가입니다.")]);
+        let llm = std::sync::Arc::new(StoppedAtStart { start, stop: stop.clone(), browser: browser.clone(), replies: replies.clone(), stopped: Default::default() });
+        let (app, _dir) = app(no_db("gpt-4o"), llm);
+        let conversation = format!("held{n}");
+        let question = Question { conversation_id: conversation.clone(), message: "일론 머스크가 누구야?".into(), history: vec![] };
+        assert!(agent::answer(&app, question, browser.events(), stop).await.is_err());
+        assert_eq!(preview(&browser.seen()), "", "{start:?} was held, not shown");
+        let (r, _) = ask(&app, &conversation, "일론 머스크가 누구야?", vec![]).await;
+        assert_eq!(r.unwrap().answer, "찾아보니 기업가입니다.", "{start:?}: the line is still refused before a search");
+        let first = &replies.requests()[0];
+        assert!(messages(first, "assistant").is_empty(), "{start:?}: the conversation kept {:?}", messages(first, "assistant"));
+    }
 }
 
 // Context management review, fifth pass (2026-10-16): each failed before its
