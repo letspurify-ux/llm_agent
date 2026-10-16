@@ -21,7 +21,7 @@ export const SETTING_GROUPS = [
       ['llm.legacy_max_tokens', 'max_tokens 이름으로 보내기 (구형 서버)', 'boolean'],
     ] },
   { id: 'embedding', title: '임베딩·검색', check: 'embedding',
-    description: '지식·처리 방법·쿼리의 의미 검색에 쓰는 임베딩 서버(Ollama 등)입니다. 주소를 비우면 의미 검색 없이 정확한 쿼리 이름 조회만 됩니다.',
+    description: '지식·처리 방법·쿼리의 의미 검색에 쓰는 임베딩 서버(Ollama 등)입니다. 주소를 비우면 의미 검색 없이 제목·쿼리 이름·설명의 낱말 일치만 됩니다.',
     fields: [
       ['embedding.url', '주소', 'optionalText', '예: http://localhost:11434/v1'],
       ['embedding.model', '모델', 'text', '1024차원 모델이어야 합니다 (bge-m3, qwen3-embedding:0.6b).'],

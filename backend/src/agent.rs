@@ -782,7 +782,7 @@ fn runtime_state(
         "current_question":crate::text::clip_marked(message, STATE_QUESTION_LEN),
     });
     if !config.embedding.enabled() {
-        state["search"] = json!("unavailable: 임베딩이 설정되지 않아 의미 검색을 쓸 수 없다. 정확한 쿼리 이름 조회만 된다.");
+        state["search"] = json!("unavailable: 임베딩이 설정되지 않아 의미 검색을 쓸 수 없다. 제목·쿼리 이름·설명의 낱말 일치만 된다.");
     }
     if !config.projects.is_empty() && offered.iter().any(|t| t == "file_read") {
         state["projects"] = json!(config

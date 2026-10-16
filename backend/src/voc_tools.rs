@@ -44,7 +44,7 @@ pub fn specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "search",
-            description: "Semantic search over the registered knowledge (concepts, policies, procedures, manuals), Q&A methods (lookup procedures for kinds of questions) and registered queries. Returns ranked summaries with IDs and cosine distance (smaller is closer), not full text: read knowledge with knowledge_read, methods with method_read, and queries with query_describe. targets chooses what to search (default all three). limit is per target (default 10, max 50); offset continues the same search past results already received. An exact registered query name returns that query first. status search_unavailable means the search could not run (not that nothing exists).",
+            description: "Semantic search over the registered knowledge (concepts, policies, procedures, manuals), Q&A methods (lookup procedures for kinds of questions) and registered queries. Returns ranked summaries with IDs and cosine distance (smaller is closer), not full text: read knowledge with knowledge_read, methods with method_read, and queries with query_describe. targets chooses what to search (default all three). limit is per target (default 10, max 50); offset continues the same search past results already received. An exact registered query name returns that query first. The first page also puts up to 5 items whose title (queries: name or description) contains the search words first, marked title_match; title_matches counts all such items. status search_unavailable means the search could not run (not that nothing exists).",
             source: false,
             parameters: schema(
                 json!({
@@ -278,6 +278,157 @@ fn query_summary(row: &Row) -> Value {
     item
 }
 
+/// One target's vector results as listed, with each one's seq and distance.
+struct VectorList {
+    items: Vec<Value>,
+    near: Vec<(i64, f64)>,
+    more: bool,
+    beyond: usize,
+}
+
+async fn vector_list(cx: &Context<'_>, target: &str, vector: &[f32], offset: usize, limit: usize) -> Result<VectorList> {
+    let config = cx.config;
+    if target == "knowledge" {
+        let page = search::knowledge(&cx.app.db, config, vector, offset, limit).await?;
+        return Ok(VectorList {
+            items: page
+                .items
+                .iter()
+                .map(|d| {
+                    json!({
+                        "id":format!("k{}", d.doc_seq),"title":d.title,"chunk_of":d.chunk_of,
+                        "matched_chunks":chunk_list(&d.chunks),"best_chunk":d.best_chunk,
+                        "distance":round(d.distance),"excerpt":excerpt(&d.excerpt, 300)
+                    })
+                })
+                .collect(),
+            near: page.items.iter().map(|d| (d.doc_seq, d.distance)).collect(),
+            more: page.more,
+            beyond: page.beyond_threshold,
+        });
+    }
+    let table = if target == "qa_method" { "qa_method" } else { "query_registry" };
+    let page = search::rows(&cx.app.db, config, table, vector, offset, limit).await?;
+    Ok(VectorList {
+        items: page
+            .items
+            .iter()
+            .map(|r| {
+                let distance = round(db::float(r, "_dist"));
+                if target == "qa_method" {
+                    json!({
+                        "id":format!("m{}", db::int(r, "seq")),"title":db::text(r, "title"),
+                        "distance":distance,"excerpt":excerpt(&db::text(r, "method"), 300)
+                    })
+                } else {
+                    let mut item = query_summary(r);
+                    item["distance"] = json!(distance);
+                    item
+                }
+            })
+            .collect(),
+        near: page.items.iter().map(|r| (db::int(r, "seq"), db::float(r, "_dist"))).collect(),
+        more: page.more,
+        beyond: page.beyond_threshold,
+    })
+}
+
+/// A title match as search lists it.
+fn title_item(target: &str, row: &Row) -> Value {
+    let matched = row.get("_matched").cloned().unwrap_or_else(|| json!([]));
+    let head = excerpt(&db::text(row, "_head"), 300);
+    match target {
+        "knowledge" => {
+            let chunk_of = match row.get("chunk_of") {
+                Some(Value::Number(_)) => db::int(row, "chunk_of"),
+                _ => crate::chunk::split_content(&db::text(row, "_whole")).len() as i64,
+            };
+            json!({
+                "id":format!("k{}", db::int(row, "seq")),"title":db::text(row, "title"),"chunk_of":chunk_of,
+                "title_match":true,"matched_words":matched,"excerpt":head
+            })
+        }
+        "qa_method" => json!({
+            "id":format!("m{}", db::int(row, "seq")),"title":db::text(row, "title"),
+            "title_match":true,"matched_words":matched,"excerpt":head
+        }),
+        _ => {
+            let mut item = query_summary(row);
+            item["title_match"] = json!(true);
+            item["matched_words"] = matched;
+            item
+        }
+    }
+}
+
+/// What identifies an item of a target: the ID, or the query name as
+/// `name_key` compares it.
+fn item_key(item: &Value) -> String {
+    match item["id"].as_str() {
+        Some(id) => id.to_owned(),
+        None => name_key(item["name"].as_str().unwrap_or("")),
+    }
+}
+
+/// Title matches a first page holds: fewer than `limit` while the vector
+/// search runs, so a vector result keeps a place and `next_offset` never
+/// names this same call again.
+fn title_slots(offset: usize, limit: usize, vector_runs: bool) -> usize {
+    match (offset, vector_runs) {
+        (0, true) => search::TITLE_MAX.min(limit - 1),
+        (0, false) => search::TITLE_MAX.min(limit),
+        _ => 0,
+    }
+}
+
+/// A page of one target: the first `slots` title matches (with the vector
+/// result's fields when the vector search found them too), then the vector
+/// results not among them in the places left. `next_offset` goes on after
+/// the last vector result looked at; one shown as a title match counts as
+/// looked at. A last page has no place to keep for the vector results: the
+/// title matches held back fill it.
+fn merge_page(mut titles: Vec<Value>, slots: usize, vector: &[Value], offset: usize, limit: usize, more: bool) -> (Vec<Value>, Option<usize>) {
+    let as_title = |title: Value| match vector.iter().find(|v| item_key(v) == item_key(&title)) {
+        Some(found) => {
+            let mut item = found.clone();
+            item["title_match"] = json!(true);
+            item["matched_words"] = title["matched_words"].clone();
+            item
+        }
+        None => title,
+    };
+    let held = titles.split_off(slots.min(titles.len()));
+    let mut items: Vec<Value> = titles.into_iter().map(as_title).collect();
+    let shown: BTreeSet<String> = items.iter().map(item_key).collect();
+    let room = limit.saturating_sub(items.len());
+    let (mut looked, mut taken) = (0, 0);
+    while let Some(item) = vector.get(looked) {
+        let already = shown.contains(&item_key(item));
+        if !already && taken == room {
+            break;
+        }
+        looked += 1;
+        if !already {
+            items.push(item.clone());
+            taken += 1;
+        }
+    }
+    let next = if looked < vector.len() { Some(offset + looked) } else { more.then_some(offset + limit) };
+    if next.is_none() {
+        for title in held {
+            match items.iter().position(|i| item_key(i) == item_key(&title)) {
+                Some(at) => {
+                    items[at]["title_match"] = json!(true);
+                    items[at]["matched_words"] = title["matched_words"].clone();
+                }
+                None if items.len() < limit => items.push(as_title(title)),
+                None => {}
+            }
+        }
+    }
+    (items, next)
+}
+
 async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
     let text = js_trim(args["query"].as_str().unwrap_or("")).to_owned();
     if text.is_empty() {
@@ -309,100 +460,68 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
     let mut results = Map::new();
     let mut hits = json!({});
     let mut failed = vec![];
-    let page_info = |more: bool, beyond: usize| {
-        json!({"next_offset":more.then_some(offset + limit),"beyond_threshold":beyond})
-    };
     for target in &targets {
-        let outcome: std::result::Result<Value, String> = match target.as_str() {
-            "knowledge" => match &vector {
-                Err(reason) => Err(reason.clone()),
-                Ok(v) => match search::knowledge(&cx.app.db, config, v, offset, limit).await {
-                    Err(e) => Err(format!("벡터 검색 실패: {}", clip_utf16(&e.to_string(), 200))),
-                    Ok(page) => {
-                        let items: Vec<Value> = page
-                            .items
-                            .iter()
-                            .map(|d| {
-                                json!({
-                                    "id":format!("k{}", d.doc_seq),"title":d.title,"chunk_of":d.chunk_of,
-                                    "matched_chunks":chunk_list(&d.chunks),"best_chunk":d.best_chunk,
-                                    "distance":round(d.distance),"excerpt":excerpt(&d.excerpt, 300)
-                                })
-                            })
-                            .collect();
-                        let mut out = page_info(page.more, page.beyond_threshold);
-                        out["items"] = json!(items);
-                        Ok(out)
-                    }
-                },
-            },
-            "qa_method" => match &vector {
-                Err(reason) => Err(reason.clone()),
-                Ok(v) => match search::rows(&cx.app.db, config, "qa_method", v, offset, limit).await {
-                    Err(e) => Err(format!("벡터 검색 실패: {}", clip_utf16(&e.to_string(), 200))),
-                    Ok(page) => {
-                        let items: Vec<Value> = page
-                            .items
-                            .iter()
-                            .map(|r| {
-                                json!({
-                                    "id":format!("m{}", db::int(r, "seq")),"title":db::text(r, "title"),
-                                    "distance":round(db::float(r, "_dist")),"excerpt":excerpt(&db::text(r, "method"), 300)
-                                })
-                            })
-                            .collect();
-                        let mut out = page_info(page.more, page.beyond_threshold);
-                        out["items"] = json!(items);
-                        Ok(out)
-                    }
-                },
-            },
-            _ => {
-                let mut items: Vec<Value> = vec![];
-                let mut names = BTreeSet::new();
-                let mut exact_failed = false;
-                if offset == 0 && utf16_len(&text) <= 200 {
-                    match db::queries_by_names(&cx.app.db, &config.mariadb, std::slice::from_ref(&text)).await {
-                        Ok(rows) => {
-                            for row in rows {
-                                names.insert(name_key(&db::text(&row, "query_name")));
-                                let mut item = query_summary(&row);
-                                item["exact"] = json!(true);
-                                items.push(item);
-                            }
-                        }
-                        Err(e) => {
-                            exact_failed = true;
-                            eprintln!("[search] exact query lookup failed: {e}");
-                        }
+        // An exact query name comes before the page, outside its places.
+        let mut exact: Vec<Value> = vec![];
+        if target == "query" && offset == 0 && utf16_len(&text) <= 200 {
+            match db::queries_by_names(&cx.app.db, &config.mariadb, std::slice::from_ref(&text)).await {
+                Ok(rows) => {
+                    for row in rows {
+                        let mut item = query_summary(&row);
+                        item["exact"] = json!(true);
+                        exact.push(item);
                     }
                 }
-                match &vector {
-                    Err(reason) if items.is_empty() => Err(reason.clone()),
-                    Err(reason) => {
-                        let mut out = json!({"items":items});
-                        out["note"] = json!(format!("이름이 정확히 맞는 쿼리만 찾았다 ({reason})"));
-                        Ok(out)
-                    }
-                    Ok(v) => match search::rows(&cx.app.db, config, "query_registry", v, offset, limit).await {
-                        Err(e) if items.is_empty() || exact_failed => {
-                            Err(format!("벡터 검색 실패: {}", clip_utf16(&e.to_string(), 200)))
-                        }
-                        Err(_) => Ok(json!({"items":items})),
-                        Ok(page) => {
-                            for r in &page.items {
-                                if names.insert(name_key(&db::text(r, "query_name"))) {
-                                    let mut item = query_summary(r);
-                                    item["distance"] = json!(round(db::float(r, "_dist")));
-                                    items.push(item);
-                                }
-                            }
-                            let mut out = page_info(page.more, page.beyond_threshold);
-                            out["items"] = json!(items);
-                            Ok(out)
-                        }
-                    },
+                Err(e) => eprintln!("[search] exact query lookup failed: {e}"),
+            }
+        }
+        let listed: std::result::Result<VectorList, String> = match &vector {
+            Err(reason) => Err(reason.clone()),
+            Ok(v) => vector_list(cx, target, v, offset, limit)
+                .await
+                .map_err(|e| format!("벡터 검색 실패: {}", clip_utf16(&e.to_string(), 200))),
+        };
+        let slots = title_slots(offset, limit, listed.is_ok());
+        let source = match target.as_str() {
+            "knowledge" => &search::KNOWLEDGE_TITLES,
+            "qa_method" => &search::METHOD_TITLES,
+            _ => &search::QUERY_TEXTS,
+        };
+        let near = listed.as_ref().map(|l| l.near.clone()).unwrap_or_default();
+        let titles = if slots == 0 {
+            search::TitleMatches::default()
+        } else {
+            let wanted = title_slots(offset, limit, false) + exact.len();
+            match search::title_matches(&cx.app.db, &config.mariadb, source, &text, &near, wanted).await {
+                Ok(found) => found,
+                Err(e) => {
+                    eprintln!("[search] title match failed on {target}: {e}");
+                    search::TitleMatches::default()
                 }
+            }
+        };
+        let exact_keys: BTreeSet<String> = exact.iter().map(item_key).collect();
+        let mut title_items: Vec<Value> = titles.rows.iter().map(|r| title_item(target, r)).collect();
+        let found_titles = title_items.len();
+        title_items.retain(|i| !exact_keys.contains(&item_key(i)));
+        let title_total = titles.total.saturating_sub(found_titles - title_items.len());
+        title_items.truncate(title_slots(offset, limit, false));
+        let outcome: std::result::Result<Value, String> = match listed {
+            Ok(list) => {
+                let vector_items: Vec<Value> = list.items.into_iter().filter(|i| !exact_keys.contains(&item_key(i))).collect();
+                let (page, next) = merge_page(title_items, slots, &vector_items, offset, limit, list.more);
+                let mut items = exact;
+                items.extend(page);
+                let mut out = json!({"next_offset":next,"beyond_threshold":list.beyond});
+                out["items"] = json!(items);
+                Ok(out)
+            }
+            Err(reason) if exact.is_empty() && title_items.is_empty() => Err(reason),
+            Err(reason) => {
+                let found = if target == "query" { "이름이 정확히 맞거나 이름·설명에 낱말이 든 쿼리만" } else { "제목에 낱말이 든 항목만" };
+                let mut items = exact;
+                items.extend(title_items);
+                Ok(json!({"items":items,"note":format!("{found} 찾았다 ({reason})")}))
             }
         };
         let hit_key = match target.as_str() {
@@ -415,6 +534,18 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
                 let count = value["items"].as_array().map_or(0, Vec::len);
                 hits[hit_key] = json!(count);
                 value["status"] = json!("ok");
+                if title_total > 0 {
+                    value["title_matches"] = json!(title_total);
+                    let shown = value["items"].as_array().map_or(0, |i| i.iter().filter(|i| i["title_match"] == true).count());
+                    if title_total > shown {
+                        let place = if target == "query" { "이름·설명" } else { "제목" };
+                        let narrow = format!("{place}에 낱말이 맞는 항목 {title_total}건 중 {shown}건만 실었다. 낱말을 더 붙이면 좁혀진다.");
+                        value["note"] = json!(match value["note"].as_str() {
+                            Some(note) => format!("{note} {narrow}"),
+                            None => narrow,
+                        });
+                    }
+                }
                 if count == 0 {
                     value["note"] = json!("관련 항목이 없다. 검색어를 바꿔 볼 수 있다.");
                 }
@@ -498,9 +629,10 @@ pub(crate) fn fit_search(data: &mut Value, budget: usize, model: &str) {
             if let Some(item) = items.pop() {
                 freed += crate::context::tokens(&item.to_string(), model).max(1);
             }
-            // An exact query name comes before the page and is none of its
-            // positions: counted, the page would go on past a query unseen.
-            let kept = items.iter().filter(|item| item["exact"] != true).count() as u64;
+            // An exact query name or a title match comes before the page and
+            // is none of its positions: counted, the page would go on past a
+            // result unseen.
+            let kept = items.iter().filter(|item| item["exact"] != true && item["title_match"] != true).count() as u64;
             target["next_offset"] = json!(offset + kept);
             target["items_cut_for_size"] = json!(true);
         }
@@ -1131,6 +1263,81 @@ mod tests {
         // The page from next_offset starts at the first near query not shown.
         let near_shown = shown.iter().filter(|name| name.starts_with("near_")).count();
         assert_eq!(target["next_offset"], near_shown as u64, "{shown:?}");
+    }
+
+    fn doc(id: &str) -> Value {
+        json!({"id":id,"title":id,"distance":0.3,"excerpt":"본문"})
+    }
+    fn title_hit(id: &str) -> Value {
+        json!({"id":id,"title":id,"title_match":true,"matched_words":["낱말"],"excerpt":"제목"})
+    }
+    fn ids(items: &[Value]) -> Vec<&str> {
+        items.iter().map(|i| i["id"].as_str().unwrap()).collect()
+    }
+
+    /// Title matches share the places of a page with the vector results,
+    /// and the page goes on from the first vector result not looked at.
+    #[test]
+    fn title_matches_come_first_within_the_limit() {
+        let vector: Vec<Value> = ["k1", "k2", "k3", "k4", "k5"].map(doc).to_vec();
+        // k3 was found both ways: shown once, first, with its distance; the
+        // page goes on past it.
+        let (items, next) = merge_page(vec![title_hit("k3"), title_hit("k9")], 3, &vector, 0, 4, true);
+        assert_eq!(ids(&items), ["k3", "k9", "k1", "k2"]);
+        assert_eq!((items[0]["distance"].clone(), items[0]["title_match"].clone()), (json!(0.3), json!(true)));
+        assert_eq!(next, Some(3));
+        // One further down the vector list is not reached yet.
+        let (items, next) = merge_page(vec![title_hit("k5")], 2, &vector, 0, 3, true);
+        assert_eq!(ids(&items), ["k5", "k1", "k2"]);
+        assert_eq!(next, Some(2));
+        let (items, next) = merge_page(vec![title_hit("k2")], 1, &vector[..2], 0, 2, false);
+        assert_eq!(ids(&items), ["k2", "k1"]);
+        assert_eq!(next, None);
+        // Without title matches the page is the vector page.
+        let (items, next) = merge_page(vec![], 0, &vector, 10, 5, true);
+        assert_eq!((ids(&items).len(), next), (5, Some(15)));
+        // On a last page the matches held back fill the places left, and
+        // mark the vector results they repeat.
+        let titles: Vec<Value> = ["k1", "k2", "k3", "k4", "k8"].map(title_hit).to_vec();
+        let (items, next) = merge_page(titles.clone(), 4, &vector[..3], 0, 5, false);
+        assert_eq!((ids(&items), next), (vec!["k1", "k2", "k3", "k4", "k8"], None));
+        let (items, _) = merge_page(titles[3..].to_vec(), 1, &vector[..3], 0, 5, false);
+        assert_eq!(ids(&items), ["k4", "k1", "k2", "k3", "k8"]);
+        let (items, next) = merge_page(titles, 4, &vector, 0, 5, true);
+        assert_eq!((ids(&items), next), (vec!["k1", "k2", "k3", "k4", "k5"], Some(5)));
+    }
+
+    #[test]
+    fn title_matches_leave_a_vector_place_on_first_pages_only() {
+        assert_eq!(title_slots(0, 10, true), 5);
+        assert_eq!(title_slots(0, 3, true), 2);
+        assert_eq!(title_slots(0, 1, true), 0);
+        assert_eq!(title_slots(0, 1, false), 1);
+        assert_eq!(title_slots(0, 50, false), 5);
+        assert_eq!(title_slots(10, 10, true), 0);
+        // With a title match in every place it may take, the page still
+        // goes on past the current call.
+        for limit in 1..=8 {
+            let titles: Vec<Value> = (0..title_slots(0, limit, true)).map(|i| title_hit(&format!("t{i}"))).collect();
+            let vector: Vec<Value> = (0..limit).map(|i| doc(&format!("k{i}"))).collect();
+            let slots = titles.len();
+            let (_, next) = merge_page(titles, slots, &vector, 0, limit, true);
+            assert!(next.is_some_and(|n| n > 0), "limit {limit}: {next:?}");
+        }
+    }
+
+    #[test]
+    fn a_cut_page_does_not_count_title_matches_as_vector_places() {
+        let mut items: Vec<Value> = (0..3).map(|i| title_hit(&format!("t{i}"))).collect();
+        items.extend((0..7).map(|i| json!({"id":format!("k{i}"),"title":"문서","distance":0.3,"excerpt":"본문 ".repeat(100)})));
+        let mut data = json!({"text":"낱말","limit":10,"offset":0,"results":{"knowledge":{"status":"ok","next_offset":7,"beyond_threshold":0,"items":items}}});
+        fit_search(&mut data, 300, "gpt-4o");
+        let target = &data["results"]["knowledge"];
+        let shown = target["items"].as_array().unwrap();
+        assert!(target["items_cut_for_size"] == true && shown.len() < 10, "{target}");
+        let vector_shown = shown.iter().filter(|i| i["title_match"] != true).count();
+        assert!(vector_shown > 0 && shown.len() - vector_shown == 3, "{target}");
+        assert_eq!(target["next_offset"], vector_shown as u64, "{target}");
     }
 
     #[test]
