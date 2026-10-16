@@ -222,7 +222,7 @@ impl ToolRegistry {
         }
         specs.push(ToolSpec {
             name: "history",
-            description: "Search earlier tool results of this conversation that left the active context (continue a search with after: next_cursor), or read one by ID and character offset (read requires id; a search item's offset reads from its match). A result archived because it was too large is read here with the id its next_cursor names.",
+            description: "Search this conversation's earlier questions, answers, tool calls and tool results, including those that left the active context (this tool is offered once part of the conversation has left it); continue a search with after: next_cursor. Read one by ID and character offset (read requires id; a search item's offset reads from its match). A result archived because it was too large is read here with the id its next_cursor names.",
             source: false,
             parameters: schema(
                 json!({"action":action(&["search","read"]),"query":string(),"id":number(),"offset":number(),"after":number(),"limit":{"type":"integer","minimum":1,"maximum":50}}),
@@ -1366,9 +1366,19 @@ fn execute_validated(
                 n(&args, "limit", 10),
             )),
             "read" => {
-                let b = s.history.read(n(&args, "id", 0) as u64)?;
+                let id = n(&args, "id", 0) as u64;
+                let b = s.history.read(id)?;
                 let text = serde_json::to_string(&context::shown_messages(&b.messages[..]))?;
-                Ok(bounded_text(s, &text, n(&args, "offset", 0)))
+                // Past the end, the read would be an empty text with nothing
+                // after it: the same as a bundle with nothing in it.
+                let offset = n(&args, "offset", 0);
+                let length = text.chars().count();
+                if offset > length {
+                    bail!(
+                        "invalid_offset: offset {offset} is past the end of history id {id} ({length} characters); read from 0, from a search item's offset or from next_cursor"
+                    );
+                }
+                Ok(bounded_text(s, &text, offset))
             }
             _ => unreachable!(),
         },
@@ -1985,7 +1995,14 @@ pub fn bound_result(
         }
         output["data"][field] = Value::Array(items[..low].to_vec());
         if low > 0 {
-            output["data"][format!("{field}_omitted")] = json!(items.len() - low);
+            // A result cut again (beside the other results of its response)
+            // left out what its first cut did too. Query rows tell all their
+            // unseen rows once, as omitted_rows below.
+            if !(call.name == "query_run" && field == "rows") {
+                let omitted = format!("{field}_omitted");
+                let before = output["data"][&omitted].as_u64().unwrap_or(0);
+                output["data"][omitted] = json!(before + (items.len() - low) as u64);
+            }
             // Rows read from an offset continue right after those shown, and
             // a history search after the last match shown.
             if let (Some(offset), true) = (output["data"]["offset"].as_u64(), output["data"].get("next_offset").is_some()) {
@@ -2494,6 +2511,23 @@ mod tests {
         }
     }
 
+    /// Context management review, seventh pass: a history read from past
+    /// the end of its bundle (an offset worked out by the model, or copied
+    /// from another bundle's search item) was an empty text with nothing
+    /// after it, read as a bundle that holds nothing.
+    #[test]
+    fn a_history_read_past_the_end_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = workspace(dir.path());
+        let id = ws.history.push(vec![json!({"role":"user","content":"BATCH007 상태"})], true);
+        let length = serde_json::to_string(&context::shown_messages(&ws.history.bundles[0].messages[..])).unwrap().chars().count();
+        let at_end = envelope(execute(&mut ws, "history", json!({"action":"read","id":id,"offset":length}), &Default::default()));
+        assert_eq!((at_end["status"].clone(), at_end["data"]["text"].clone()), (json!("ok"), json!("")), "{at_end}");
+        let past = envelope(execute(&mut ws, "history", json!({"action":"read","id":id,"offset":length + 5_000}), &Default::default()));
+        assert_eq!(past["status"], "error", "{past}");
+        assert!(past["error"].as_str().unwrap().starts_with("invalid_offset") && past["error"].as_str().unwrap().contains(&format!("{length} characters")), "{past}");
+    }
+
     /// Random files read at random ranges and limits, cut again at a smaller
     /// limit now and then (as a response that does not fit the context is):
     /// following the cursors gives back the requested range exactly, and
@@ -2593,6 +2627,28 @@ mod tests {
         let excerpt = found["data"]["items"][0]["excerpt"].as_str().unwrap();
         assert!(excerpt.contains("BATCH007"), "{excerpt}");
         assert!(excerpt.chars().count() <= 260, "{}", excerpt.chars().count());
+    }
+
+    /// Context management review, seventh pass: the history tool said it
+    /// searched "earlier tool results", but the oldest bundles, which leave
+    /// the context first, are earlier questions and answers, and it finds
+    /// them too: a follow-up whose antecedent had left had no reason to look
+    /// for it there.
+    #[test]
+    fn the_history_tool_says_it_finds_earlier_questions_and_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = workspace(dir.path());
+        ws.history.push(vec![json!({"role":"user","content":"BATCH007 상태 알려줘"})], true);
+        ws.history.push(vec![json!({"role":"assistant","content":"BATCH007은 실패 상태입니다."})], true);
+        for bundle in ws.history.bundles.iter_mut() {
+            bundle.active = false;
+        }
+        let found = envelope(execute(&mut ws, "history", json!({"action":"search","query":"batch007"}), &Default::default()));
+        assert_eq!(found["data"]["items"].as_array().unwrap().len(), 2, "{found}");
+        let spec = ToolRegistry::source_specs().into_iter().find(|s| s.name == "history").unwrap();
+        for what in ["questions", "answers", "tool results", "left"] {
+            assert!(spec.description.contains(what), "{what}: {}", spec.description);
+        }
     }
 
     #[test]

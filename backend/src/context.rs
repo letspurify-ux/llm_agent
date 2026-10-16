@@ -352,17 +352,28 @@ pub fn token_ratio(c: &Conversation, model: &str) -> f64 {
 /// Evicts the oldest whole bundles once `request_tokens` (a local estimate)
 /// crosses the high-water share of the input budget, until the estimate is
 /// under the low-water share. The bundles named in `protected` (the current
-/// question) and the newest bundle stay. Returns the evicted bundle IDs.
+/// question) and the newest bundle stay. A request that cannot read back
+/// what leaves (`readable` false: it withholds the history tool with the
+/// others — the final answer, a continuation) keeps what fits: bundles leave
+/// only past the whole budget, and only as many as it needs, since the
+/// answer it writes has nothing else to go on. Returns the evicted IDs.
 pub fn evict(
     c: &mut Conversation,
     config: &Config,
     request_tokens: usize,
     protected: &[u64],
+    readable: bool,
 ) -> Vec<u64> {
     let model = config.llm.model.as_str();
     let budget = (config.input_budget() as f64 / token_ratio(c, model)) as usize;
-    let high = (budget as f64 * config.agent.high_water) as usize;
-    let low = (budget as f64 * config.agent.low_water) as usize;
+    let (high, low) = if readable {
+        (
+            (budget as f64 * config.agent.high_water) as usize,
+            (budget as f64 * config.agent.low_water) as usize,
+        )
+    } else {
+        (budget.saturating_add(1), budget)
+    };
     let evicted = if request_tokens >= high {
         evict_down_to(c, model, request_tokens, Some(low), protected)
     } else {
@@ -516,14 +527,14 @@ mod tests {
         let question = c.history.push(vec![json!({"role":"user","content":"지금 질문"})], true);
         let newest = c.history.push(vec![json!({"role":"assistant","content":"y".repeat(4000)})], true);
         let tokens = count(&request(&c.history, &json!({}), "gpt-4o", vec![]), "gpt-4o");
-        let evicted = evict(&mut c, &config, tokens, &[question]);
+        let evicted = evict(&mut c, &config, tokens, &[question], true);
         assert_eq!(evicted, vec![old, call]);
         let active: Vec<u64> = c.history.bundles.iter().filter(|b| b.active).map(|b| b.id).collect();
         assert_eq!(active, vec![question, newest]);
         // Below the high-water mark nothing leaves.
         let mut fresh = Conversation::new("y".into());
         fresh.history.push(vec![json!({"role":"user","content":"hi"})], true);
-        assert!(evict(&mut fresh, &config, 10, &[]).is_empty());
+        assert!(evict(&mut fresh, &config, 10, &[], true).is_empty());
     }
 
     #[test]
@@ -540,9 +551,42 @@ mod tests {
         let question = c.history.push(vec![json!({"role":"user","content":"지금 질문"})], true);
         c.history.push(vec![json!({"role":"assistant","content":"y".repeat(400)})], true);
         let tokens = count(&request(&c.history, &json!({}), "gpt-4o", vec![]), "gpt-4o");
-        let evicted = evict(&mut c, &config, tokens, &[question]);
+        let evicted = evict(&mut c, &config, tokens, &[question], true);
         assert_eq!(evicted, vec![old_question, old_answer]);
         assert_eq!(c.history.active()[0]["role"], "user");
+    }
+
+    #[test]
+    fn a_request_that_cannot_read_back_keeps_what_fits() {
+        // Without the history tool what leaves is gone for the answer: past
+        // the high-water share nothing leaves while the request fits, and
+        // past the budget only the oldest bundles it needs to.
+        let mut config = Config::default();
+        config.llm.model = "gpt-4o".into();
+        config.llm.context_tokens = 16_000;
+        config.llm.output_tokens = 2_000;
+        let budget = config.input_budget();
+        let conversation = || {
+            let mut c = Conversation::new("x".into());
+            let mut ids = vec![];
+            for i in 0..4 {
+                ids.push(c.history.push(vec![json!({"role":"user","content":format!("질문{i} {}", "자료 ".repeat(1_200))})], true));
+                ids.push(c.history.push(vec![json!({"role":"assistant","content":format!("답{i}")})], true));
+            }
+            ids.push(c.history.push(vec![json!({"role":"user","content":"지금 질문"})], true));
+            (c, ids)
+        };
+        let (mut c, ids) = conversation();
+        let question = *ids.last().unwrap();
+        let fitting = budget * 95 / 100;
+        assert!(fitting as f64 >= budget as f64 * config.agent.high_water);
+        assert!(evict(&mut c, &config, fitting, &[question], false).is_empty(), "it fits: nothing leaves");
+        assert!(!evict(&mut c, &config, fitting, &[question], true).is_empty(), "a request that can read back leaves at high water");
+        // Past the budget, the oldest pairs leave until it fits, not to low water.
+        let (mut c, ids) = conversation();
+        let pair = count(&json!(c.history.bundles[0].messages.iter().chain(c.history.bundles[1].messages.iter()).cloned().collect::<Vec<_>>()), "gpt-4o");
+        let evicted = evict(&mut c, &config, budget + pair / 2, &[question], false);
+        assert_eq!(evicted, ids[..2].to_vec(), "only the oldest question and its answer");
     }
 
     #[test]

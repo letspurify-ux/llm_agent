@@ -250,7 +250,9 @@ async fn run(
         let (mut offered, mut state, mut definitions) = frame(c);
         let mut request = build(c, &state, &definitions);
         let mut estimate = context::count(&request, &model);
-        let evicted = context::evict(c, config, estimate, &[question_bundle]);
+        // A request that withholds the tools cannot read back what leaves:
+        // it keeps what fits (the results its answer is written from).
+        let evicted = context::evict(c, config, estimate, &[question_bundle], !withheld_tools);
         if !evicted.is_empty() {
             // What left is readable through the history tool from this
             // request on.

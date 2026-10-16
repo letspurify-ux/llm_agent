@@ -498,7 +498,9 @@ pub(crate) fn fit_search(data: &mut Value, budget: usize, model: &str) {
             if let Some(item) = items.pop() {
                 freed += crate::context::tokens(&item.to_string(), model).max(1);
             }
-            let kept = items.len() as u64;
+            // An exact query name comes before the page and is none of its
+            // positions: counted, the page would go on past a query unseen.
+            let kept = items.iter().filter(|item| item["exact"] != true).count() as u64;
             target["next_offset"] = json!(offset + kept);
             target["items_cut_for_size"] = json!(true);
         }
@@ -1112,6 +1114,25 @@ mod tests {
         }
     }
 
+    /// Context management review, seventh pass: an exact query name comes
+    /// before the page of nearest queries and is not one of its positions,
+    /// but a list cut for size counted it in its next_offset, so the search
+    /// continued past one query the model was never shown.
+    #[test]
+    fn a_cut_query_list_goes_on_after_the_last_query_it_shows() {
+        let item = |name: &str| json!({"name":name,"type":"QUERY","description":"설명 ".repeat(100),"inputs":[],"target_dbs":[],"distance":0.2});
+        let mut items = vec![json!({"name":"exact_q","type":"QUERY","description":"설명","inputs":[],"target_dbs":[],"exact":true})];
+        items.extend((0..10).map(|i| item(&format!("near_{i}"))));
+        let mut data = json!({"text":"exact_q","limit":10,"offset":0,"results":{"query":{"status":"ok","next_offset":10,"beyond_threshold":0,"items":items}}});
+        fit_search(&mut data, 1_500, "gpt-4o");
+        let target = &data["results"]["query"];
+        let shown: Vec<&str> = target["items"].as_array().unwrap().iter().map(|i| i["name"].as_str().unwrap()).collect();
+        assert!(target["items_cut_for_size"] == true && shown.len() > 1 && shown.len() < 11, "{shown:?}");
+        // The page from next_offset starts at the first near query not shown.
+        let near_shown = shown.iter().filter(|name| name.starts_with("near_")).count();
+        assert_eq!(target["next_offset"], near_shown as u64, "{shown:?}");
+    }
+
     #[test]
     fn chunk_lists_compress_runs() {
         assert_eq!(chunk_list(&[1, 2, 3, 5, 7, 8]), "1-3, 5, 7-8");
@@ -1250,5 +1271,39 @@ mod tests {
         assert!((1..20).contains(&shown), "{cut}");
         assert_eq!(cut["data"]["omitted_rows"], 100 - shown, "{cut}");
         assert!(cut["data"]["guidance"].as_str().unwrap().contains(&format!("offset {shown}")), "{cut}");
+    }
+
+    /// Context management review, seventh pass: a result cut at the result
+    /// limit and cut again beside the other results of its response said
+    /// only what the second cut left out (`paths_omitted` 166 of 406), and
+    /// cut query rows said two different counts of unseen rows
+    /// (`rows_omitted` 55 beside `omitted_rows` 955).
+    #[test]
+    fn a_result_cut_twice_counts_what_both_cuts_left_out() {
+        let mut ws = workspace();
+        let call = tool_call("file_list");
+        let paths: Vec<Value> = (0..500).map(|i| json!(format!("src/module_{i}/very/long/path/name/file_{i}.rs"))).collect();
+        let list = crate::tools::envelope(Ok(json!({"hash":"h","mode":"paths","total_files":2000,"paths":paths,"next_cursor":"h:500"})));
+        let once = crate::tools::bound_result(&mut ws, &call, &json!({}), list, 4000);
+        let twice = crate::tools::bound_result(&mut ws, &call, &json!({}), once.clone(), 1500);
+        for cut in [&once, &twice] {
+            let shown = cut["data"]["paths"].as_array().unwrap().len();
+            assert!((1..500).contains(&shown), "{cut}");
+            assert_eq!(cut["data"]["paths_omitted"], 500 - shown, "{cut}");
+            assert_eq!(cut["data"]["next_cursor"], format!("h:{shown}"), "{cut}");
+        }
+        let call = tool_call("query_run");
+        let rows: Vec<Value> = (0..100).map(|i| json!({"ID":i,"NOTE":"가나다라마바사 ".repeat(20)})).collect();
+        let run = crate::tools::envelope(Ok(json!({"step":1,"query_name":"q","target_db":"DB","columns":["ID","NOTE"],"row_count":1000,"capped":false,"rows":rows,
+            "omitted_rows":900,"guidance":"나머지 행은 result_read(step, offset)로 읽어라."})));
+        let limit = crate::tools::result_tokens(&call, &run, "gpt-4o");
+        let once = crate::tools::bound_result(&mut ws, &call, &json!({}), run, limit / 2);
+        let twice = crate::tools::bound_result(&mut ws, &call, &json!({}), once.clone(), limit / 5);
+        for cut in [&once, &twice] {
+            let shown = cut["data"]["rows"].as_array().unwrap().len();
+            assert!((1..100).contains(&shown), "{cut}");
+            assert_eq!(cut["data"]["omitted_rows"], 1000 - shown, "{cut}");
+            assert!(cut["data"].get("rows_omitted").is_none(), "one count of unseen rows: {cut}");
+        }
     }
 }

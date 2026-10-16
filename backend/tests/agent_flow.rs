@@ -2039,9 +2039,11 @@ async fn random_knowledge_and_query_reads_keep_their_shape_and_continuations() {
                             assert_eq!(data["complete_to_end"], true, "run {run} request {i}: {result}");
                         }
                     }
-                    if name == "query_run" && result["status"] == "ok" && result["data"]["rows_omitted"].is_u64() {
+                    if name == "query_run" && result["status"] == "ok" && result["truncated"] == true && result["data"]["rows"].is_array() {
+                        *stats.entry("query rows cut".into()).or_default() += 1;
                         let shown = result["data"]["rows"].as_array().unwrap().len() as u64;
                         assert_eq!(result["data"]["omitted_rows"], result["data"]["row_count"].as_u64().unwrap() - shown, "run {run}: {result}");
+                        assert!(result["data"].get("rows_omitted").is_none(), "run {run}: two counts of unseen rows: {result}");
                     }
                 }
             }
@@ -2054,4 +2056,92 @@ async fn random_knowledge_and_query_reads_keep_their_shape_and_continuations() {
     if std::env::var("DB_FUZZ_STATS").is_ok() {
         eprintln!("stats: {stats:#?}");
     }
+}
+
+// Context management review, seventh pass (2026-10-16): each failed before
+// its fix. Needs no MariaDB.
+
+/// Reads one range of a large file a round until the request nears the
+/// high-water share of the input budget, then writes an answer cut at the
+/// output limit, sized so its continuation lands between the high-water
+/// share and the whole budget: it fits without anything leaving.
+struct FillsThenCuts {
+    high: usize,
+    budget: usize,
+    reads: std::sync::Mutex<usize>,
+    requests: std::sync::Mutex<Vec<Value>>,
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for FillsThenCuts {
+    async fn complete(&self, request: Value, config: &llm_agent::config::LlmConfig, _c: CancellationToken, _d: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        let size = llm_agent::context::count(&request, &config.model);
+        self.requests.lock().unwrap().push(request.clone());
+        if request["tool_choice"] == "none" {
+            return Ok(text("끝."));
+        }
+        let target = (self.high + self.budget) / 2;
+        if size + config.output_tokens < target {
+            let mut reads = self.reads.lock().unwrap();
+            *reads += 1;
+            return Ok(calls(vec![call(&format!("r{reads}"), "file_read", json!({"path":"big.txt","start_line":1 + 2000 * (*reads - 1)}))]));
+        }
+        let piece_tokens = target.saturating_sub(size);
+        assert!(piece_tokens > 200 && piece_tokens < config.output_tokens, "setup: {size} tokens, a piece of {piece_tokens}");
+        let piece = " word".repeat(piece_tokens);
+        Ok(cut_text(&piece))
+    }
+}
+
+/// S: a request that cannot use tools (an answer's continuation, the final
+/// answer) evicted old bundles at the high-water share although it fit the
+/// context, so the answer went on without the results it was written from,
+/// which that request could not read back with the history tool.
+#[tokio::test]
+async fn a_request_that_cannot_use_tools_keeps_what_fits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    let body: String = (1..=20_000).map(|i| format!("line {i} {}\n", "word ".repeat(12))).collect();
+    std::fs::write(root.join("big.txt"), &body).unwrap();
+    let mut config = no_db("gpt-4o");
+    config.llm.context_tokens = 24_000;
+    config.llm.output_tokens = 4_000;
+    config.projects.push(llm_agent::config::Project { name: "app".into(), root, ..Default::default() });
+    let budget = config.input_budget();
+    let high = (budget as f64 * config.agent.high_water) as usize;
+    let llm = std::sync::Arc::new(FillsThenCuts { high, budget, reads: Default::default(), requests: Default::default() });
+    let (fill_app, _dir) = app(config.clone(), llm.clone());
+    let (r, _) = ask(&fill_app, "s", "파일을 길게 설명해줘", vec![]).await;
+    assert!(r.unwrap().answer.ends_with("끝."));
+    let requests = llm.requests.lock().unwrap().clone();
+    let continuation = requests.last().unwrap();
+    assert_eq!(continuation["tool_choice"], "none");
+    let reads = *llm.reads.lock().unwrap();
+    assert_eq!(messages(continuation, "tool").len(), reads, "the results the answer is written from stay");
+    let size = llm_agent::context::count(continuation, &config.llm.model);
+    assert!(size >= high && size <= budget, "setup: the continuation is {size}, between {high} and {budget}");
+
+    // The final answer (every request is within the final reserve) keeps
+    // the earlier conversation that fits as well.
+    let mut config = no_db("gpt-4o");
+    config.llm.context_tokens = 16_000;
+    config.llm.output_tokens = 2_000;
+    config.agent.run_seconds = 45;
+    let budget = config.input_budget();
+    let high = (budget as f64 * config.agent.high_water) as usize;
+    let probe = Scripted::new(vec![text("답")]);
+    let (probe_app, _probe_dir) = app(config.clone(), probe.clone());
+    ask(&probe_app, "probe", "이어서", vec![]).await.0.unwrap();
+    let frame = llm_agent::context::count(&probe.requests()[0], &config.llm.model);
+    let turn = |tokens: usize| " 자료".repeat(tokens / llm_agent::context::tokens(" 자료", "gpt-4o"));
+    let each = ((high + budget) / 2 - frame) / 4;
+    let history: Vec<(String, String)> = (0..4).map(|i| (["user", "assistant"][i % 2].to_owned(), turn(each))).collect();
+    let llm = Scripted::new(vec![text("답")]);
+    let (final_app, _final_dir) = app(config.clone(), llm.clone());
+    ask(&final_app, "s2", "이어서", history).await.0.unwrap();
+    let request = &llm.requests()[0];
+    assert_eq!(request["tool_choice"], "none");
+    assert_eq!(messages(request, "assistant").len(), 2, "the earlier turns stay");
+    let size = llm_agent::context::count(request, &config.llm.model);
+    assert!(size >= high && size <= budget, "setup: the final request is {size}, between {high} and {budget}");
 }
