@@ -118,6 +118,10 @@ pub struct Completion {
     pub reasoning_tokens: Option<usize>,
     /// Characters of streamed reasoning text, for providers that send it.
     pub reasoning_chars: usize,
+    /// The request withheld its tools and was answered without their
+    /// definitions (the provider refuses or ignores tool_choice "none"): its
+    /// usage counts none of them.
+    pub tools_dropped: bool,
 }
 
 impl Completion {
@@ -944,7 +948,8 @@ impl LlmClient for OpenAiClient {
         if format_rejected && let Some(fields) = request.as_object_mut() {
             fields.remove("response_format");
         }
-        if withholds_tools(&request)
+        let withheld = withholds_tools(&request);
+        if withheld
             && TOOL_CHOICE_NONE_UNSUPPORTED
                 .lock()
                 .is_ok_and(|mut unsupported| unsupported.contains(&schema_endpoint(c)))
@@ -999,6 +1004,7 @@ impl LlmClient for OpenAiClient {
                     {
                         unsupported.insert(schema_endpoint(c));
                     }
+                    r.tools_dropped = withheld && request.get("tools").is_none();
                     r.attempts = attempt.saturating_add(1);
                     r.attempt_diagnostics = attempt_diagnostics;
                     return Ok(r);
@@ -1312,7 +1318,8 @@ mod tool_choice_tests {
     async fn withheld_tools_stay_defined_where_tool_choice_none_works() {
         let (config, seen) = serve(Provider::Honors).await;
         for _ in 0..2 {
-            assert_eq!(complete(&config, withheld()).await.unwrap().text, "답");
+            let reply = complete(&config, withheld()).await.unwrap();
+            assert_eq!((reply.text.as_str(), reply.tools_dropped), ("답", false));
         }
         assert_eq!(shapes(&seen), [(true, true), (true, true)], "the tools keep the prompt's prefix");
     }
@@ -1321,10 +1328,12 @@ mod tool_choice_tests {
     async fn a_provider_refusing_tool_choice_none_gets_the_request_without_tools() {
         // Z.ai documents tool_choice "auto" only.
         let (config, seen) = serve(Provider::Refuses).await;
-        assert_eq!(complete(&config, withheld()).await.unwrap().text, "답");
+        let reply = complete(&config, withheld()).await.unwrap();
+        assert_eq!((reply.text.as_str(), reply.tools_dropped), ("답", true), "its usage counts no tools");
         assert_eq!(shapes(&seen), [(true, true), (false, false)]);
         // Remembered: the next withheld request leaves the tools out at once.
-        assert_eq!(complete(&config, withheld()).await.unwrap().text, "답");
+        let reply = complete(&config, withheld()).await.unwrap();
+        assert_eq!((reply.text.as_str(), reply.tools_dropped), ("답", true));
         assert_eq!(shapes(&seen)[2], (false, false));
     }
 
@@ -1334,7 +1343,9 @@ mod tool_choice_tests {
         let (config, seen) = serve(Provider::Ignores).await;
         let first = complete(&config, withheld()).await.unwrap();
         assert_eq!(first.calls.len(), 1, "the caller handles calls it withheld");
-        assert_eq!(complete(&config, withheld()).await.unwrap().text, "답");
+        assert!(!first.tools_dropped);
+        let reply = complete(&config, withheld()).await.unwrap();
+        assert_eq!((reply.text.as_str(), reply.tools_dropped), ("답", true));
         assert_eq!(shapes(&seen), [(true, true), (false, false)]);
     }
 

@@ -521,7 +521,7 @@ Oracle은 설정 탭의 mock을 켜면 데모 쿼리 5개가 고정된 행을 �
 | 홍길동 주문 합계를 함수로 계산해줘 | `get_customer_order_total_fn` 1회 — `GET_CUSTOMER_ORDER_TOTAL`의 NUMBER 반환값 |
 | 오늘 며칠이야 | 쿼리 0회. 매 요청 끝에 실린 현재 시각(KST, 요일 포함)으로 바로 답한다. "어제", "이번 주" 같은 상대 날짜도 같은 값을 기준으로 절대 날짜로 바꾼다 (`today_date`는 DB 서버 시각 자체를 확인할 때만 실행된다) |
 | 실패한 배치 다 보여줘 | `batch_list_by_status` 1회. `qa_method` 없이 쿼리 설명(`query_desc`)만으로 선택되는 경로B 데모 |
-| 쿠버네티스가 뭐야 (등록되지 않은 질문) | LLM의 일반 지식으로 답변 — "*등록된 지식에 없는 내용이라 일반 지식으로 답변합니다.*" 표시가 붙음 |
+| 쿠버네티스가 뭐야 (등록되지 않은 질문) | `search`로 찾아본 뒤 LLM의 일반 지식으로 답변 — "*등록된 지식에 없는 내용이라 일반 지식으로 답변합니다.*" 표시가 붙음. 찾아보지 않고 이 문구로 답하려 하면 서버가 멈추고 먼저 찾게 한다(context.md 7절) |
 | (위 질문에 이어) 그럼 BATCH002는? | 후속 질문 — 서버가 들고 있는 대화에서 "배치 상태 조회"였음을 보고 BATCH002로 재조회 |
 | (위 질문에 이어) 재시작은 어떻게 해? | 후속 질문 — 이미 읽은 지식과 조회 결과로 답한다(다시 찾지 않는다) |
 | 검색 문턱은 어디서 정해? (이 저장소를 프로젝트로 등록했을 때) | 프로젝트의 참고 문서 → `source_search` → `file_read`로 `backend/src/config.rs`의 `max_distance`를 찾아 `경로:줄` 근거로 답한다 |
@@ -585,7 +585,7 @@ curl -sN localhost:5173/api/chat -H 'Content-Type: application/json' -H 'Accept:
 | `search` / `search_done` | 검색 시작 / 끝 | 짝 번호(`id`), 검색어, 대상, 대상별 적중 수(`hits`), 검색이 성립하지 않은 대상(`failed`) |
 | `run_query` / `run_query_done` | 조회 시작 / 끝 | 짝 번호, 쿼리 이름, 바인드, 대상 DB, 건수 또는 화면용 오류 문구 (한 응답의 여러 조회는 병렬, 항목마다) |
 | `tool` / `tool_done` | 그 밖의 도구(지식·처리 방법·쿼리 정의·결과 읽기·소스) 시작 / 끝 | 짝 번호, 도구 이름, 한 줄 요약(시작), `status`(`ok`/`error`)와 소요 ms(끝) |
-| `answer_delta` / `answer_reset` | 모델이 글을 쓰는 동안 | 답변 조각. reset은 앞선 조각을 버리라는 뜻이다 — 모델이 글을 쓰다 도구를 부르기로 했거나, 빈 응답이었거나, 재시도했을 때. 출력 한도에서 끊긴 답의 조각은 버리지 않고 이어 쓴 글이 뒤에 붙는다. 이어 쓰던 중에 reset하면 그때까지의 조각을 delta 하나로 다시 보낸다 |
+| `answer_delta` / `answer_reset` | 모델이 글을 쓰는 동안 | 답변 조각. reset은 앞선 조각을 버리라는 뜻이다 — 모델이 글을 쓰다 도구를 부르기로 했거나, 빈 응답이었거나, 재시도했을 때. 출력 한도에서 끊긴 답의 조각은 버리지 않고 이어 쓴 글이 뒤에 붙는다(이어 쓰다 실패해 쓴 데까지가 답이 될 때 그 응답이 보인 글도). 이어 쓰던 중에 reset하면 그때까지의 조각을 delta 하나로 다시 보낸다. 질문에서 아직 검색하지 않았으면 답의 첫머리가 일반 지식 문구일 수 있는 동안 보내지 않고 모아 두었다가 갈라지는 순간 한꺼번에 보낸다 |
 | `done` | 마지막 | `{answer, trace, refs?}` — JSON 응답과 같다. `answer`는 참조를 채우기 전 원문이고 화면이 채운다. `refs`는 답변이 가리킨 이전 턴 조회의 행 |
 | `error` | 헤더가 나간 뒤 실패 | `{error}` |
 
@@ -934,6 +934,7 @@ ORDER BY created_at DESC;
 `{step, query_name, params, targetDb, rowCount, rows(≤20), totalRows, capped?}` 또는 `{step, query_name, params, error}`, 그 밖의 도구
 `{tool, summary, status}`. `search`는 요약 `{searches, targets, knowledge, qaMethods, queries, searchFailed?}`이고(적중 수는 검색마다의 합, 그 대상을
 찾아본 적 없으면 null), `timing`은 `{total, llm[{ms, prompt, completion, cached, estimate}], tools[{ms, calls}]}`(ms)이다.
+검색 전에 일반 지식 문구로 답하려 해서 되돌린 질문은 `searchFirst: true`가 붙고, 되돌린 요청의 `timing.llm` 항목에도 `searchFirst: true`가 있다.
 v4(Node 백엔드)의 `timing.search`·`timing.oracle`은 v5에서 `timing.tools`(한 응답의 도구 일괄 실행 경과)로 합쳐졌다.
 
 `trace.outcome`은 그 요청이 무엇으로 끝났는지다. 답변까지 간 요청만이 아니라
@@ -978,6 +979,16 @@ ORDER BY created_at DESC;
 ```sql
 SELECT question, LEFT(answer, 80) AS answer, created_at FROM chat_log
 WHERE JSON_VALUE(trace, '$.outcome') = 'answered' AND JSON_VALUE(trace, '$.search.searches') = 0
+ORDER BY created_at DESC;
+```
+
+검색 없이 일반 지식 문구로 답하려다 되돌려진 질문 (`searchFirst`) — 건수가 많으면 시스템 프롬프트의 검색 규칙을 다시 볼 것.
+문구가 그대로 남은 답(가드가 질문당 한 번만 걸리므로, 되돌린 뒤에도 모델이 검색 없이 같은 답을 낸 경우)도 함께 본다:
+
+```sql
+SELECT question, JSON_VALUE(trace, '$.search.searches') AS searches, LEFT(answer, 80) AS answer, created_at FROM chat_log
+WHERE JSON_VALUE(trace, '$.searchFirst') IS NOT NULL   -- 되돌리지 않은 질문에는 없다
+   OR (answer LIKE '%등록된 지식에 없는 내용이라%' AND JSON_VALUE(trace, '$.search.searches') = 0)
 ORDER BY created_at DESC;
 ```
 

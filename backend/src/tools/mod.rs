@@ -1817,6 +1817,18 @@ pub fn limit_result(
         result["truncated"] = json!(true);
         result["next_cursor"] = json!({"tool":"file_read","cursor":id});
     }
+    // A history read cut at its own budget goes on from its next offset, as
+    // a cut file read does from its cursor (and prune keeps what it reads).
+    if call.name == "history"
+        && args["action"] == "read"
+        && result["status"] == "ok"
+        && result["data"]["truncated"] == true
+        && !result["next_cursor"].is_object()
+    {
+        result["truncated"] = json!(true);
+        result["next_cursor"] =
+            json!({"tool":"history","action":"read","id":args["id"],"offset":result["data"]["next_offset"]});
+    }
     bound_result(s, call, args, result, limit)
 }
 
@@ -1850,10 +1862,12 @@ pub fn bound_result(
     let reads_file = matches!(call.name.as_str(), "file_read" | "symbol_read")
         && output["data"]["content"]["text"].is_string();
     output["truncated"] = json!(true);
+    // A history read goes on where it started; other archives from the start.
+    let from = if call.name == "history" && args["action"] == "read" { args["offset"].as_u64().unwrap_or(0) } else { 0 };
     if !reads_file {
         let archive = archive_for(s, call, args, &result);
         output["archive_id"] = json!(archive);
-        output["next_cursor"] = json!({"tool":"history","action":"read","id":archive,"offset":0});
+        output["next_cursor"] = json!({"tool":"history","action":"read","id":archive,"offset":from});
     }
     for pointer in ["/data/content/text", "/data/text"] {
         let Some(text) = output
@@ -1930,7 +1944,7 @@ pub fn bound_result(
         None => {
             let id = archive_for(s, call, args, &result);
             output["archive_id"] = json!(id);
-            output["next_cursor"] = json!({"tool":"history","action":"read","id":id,"offset":0});
+            output["next_cursor"] = json!({"tool":"history","action":"read","id":id,"offset":from});
             id
         }
     };
@@ -1980,7 +1994,7 @@ pub fn bound_result(
             return output;
         }
     }
-    let mut compact = json!({"status":result["status"],"truncated":true,"data":{"message":"Result retained in history; preview is its start. Read the rest with next_cursor (history read, offset) or find a part with history search."},"next_cursor":{"tool":"history","action":"read","id":archive,"offset":0}});
+    let mut compact = json!({"status":result["status"],"truncated":true,"data":{"message":"Result retained in history; preview is its start. Read the rest with next_cursor (history read, offset) or find a part with history search."},"next_cursor":{"tool":"history","action":"read","id":archive,"offset":from}});
     if let Some(data) = arguments::compact_data(&result["data"]) {
         compact["data"] = data;
     } else if result["status"] == "ok" {
@@ -2333,6 +2347,66 @@ mod tests {
         let items = cut["data"]["items"].as_array().unwrap();
         assert!(!items.is_empty() && items.len() < 10, "{cut}");
         assert_eq!(cut["data"]["next_cursor"], items.last().unwrap()["id"], "{cut}");
+    }
+
+    #[test]
+    fn a_cut_history_read_says_where_it_goes_on() {
+        // A read cut by its own budget, whose text has few characters to
+        // escape, fit the result limit as cut: it said truncated:false with
+        // no next_cursor, and prune did not keep the bundle it goes on in.
+        let dir = tempfile::tempdir().unwrap();
+        let call = crate::llm::ToolCall { id: "h".into(), name: "history".into(), arguments: "{}".into() };
+        let mut seed: u64 = 0x415;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n.max(1)
+        };
+        for run in 0..12 {
+            let mut ws = workspace(dir.path());
+            ws.config.result_tokens = 1_000 + next(4_000);
+            let text = if run % 2 == 0 { "가나다라 마바사 ".repeat(3_000) } else { "line \"q\"\n".repeat(2_000) };
+            let id = ws.history.push(vec![json!({"role":"user","content":text})], true);
+            ws.history.bundles[0].active = false;
+            let whole = serde_json::to_string(&context::shown_messages(&ws.history.bundles[0].messages[..])).unwrap();
+            let mut args = json!({"action":"read","id":id});
+            let mut shown = String::new();
+            let mut reads = 0;
+            loop {
+                reads += 1;
+                assert!(reads < 1_000, "run {run}: the reads do not end");
+                let budget = ws.config.result_tokens;
+                let result = envelope(execute(&mut ws, "history", args.clone(), &Default::default()));
+                let mut result = limit_result(&mut ws, &call, &args, result, budget);
+                let mut limit = budget;
+                if next(3) == 0 {
+                    limit = 300 + next(budget);
+                    result = bound_result(&mut ws, &call, &args, result, limit);
+                }
+                assert!(result_tokens(&call, &result, "gpt-4o") <= limit, "run {run}");
+                shown.push_str(result["data"]["text"].as_str().unwrap());
+                if result["data"]["truncated"] != true {
+                    assert!(result["next_cursor"].is_null(), "run {run}: {}", result["next_cursor"]);
+                    break;
+                }
+                assert_eq!(result["truncated"], true, "run {run}: {}", result["next_cursor"]);
+                assert_eq!(result["next_cursor"]["tool"], "history", "run {run}: {}", result["next_cursor"]);
+                assert_eq!(result["next_cursor"]["offset"], result["data"]["next_offset"], "run {run}");
+                // While the cut read is in the context, prune keeps what it reads.
+                let mut kept = ws.history.clone();
+                kept.push(
+                    vec![
+                        json!({"role":"assistant","content":null,"tool_calls":[{"id":"h","type":"function","function":{"name":"history","arguments":args.to_string()}}]}),
+                        json!({"role":"tool","tool_call_id":"h","content":result.to_string()}),
+                    ],
+                    true,
+                );
+                kept.prune(0);
+                assert!(kept.read(id).is_ok(), "run {run}: the bundle being read was pruned");
+                args = json!({"action":"read","id":result["next_cursor"]["id"],"offset":result["next_cursor"]["offset"]});
+            }
+            assert!(reads > 1, "run {run}: the read was not cut");
+            assert!(shown == whole, "run {run}: shown {} of {} chars", shown.chars().count(), whole.chars().count());
+        }
     }
 
     /// Random files read at random ranges and limits, cut again at a smaller

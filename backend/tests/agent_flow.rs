@@ -1150,6 +1150,10 @@ async fn random_conversations_keep_every_request_in_shape() {
         config.llm.context_tokens = context;
         config.llm.output_tokens = [2_000, 4_000][next(2)];
         config.projects.push(llm_agent::config::Project { name: "app".into(), root: root.clone(), ..Default::default() });
+        // Now and then a history small enough for prune to drop bundles.
+        if next(2) == 0 {
+            config.agent.history_bytes = 64 * 1024;
+        }
         let real_limit = if next(3) == 0 { context * (60 + next(40)) / 100 } else { context * 2 };
         let ratio = if config.llm.model == "gpt-4o" { 1.0 } else { 0.8 + next(40) as f64 / 100.0 };
         let llm = std::sync::Arc::new(RandomModel {
@@ -1178,8 +1182,44 @@ async fn random_conversations_keep_every_request_in_shape() {
             if let Err(error) = result {
                 assert!(error.downcast_ref::<agent::UserFacing>().is_some(), "run {run} question {q}: {error:#}");
             }
+            let id = format!("shape{run}");
+            let claim = fuzz_app.sessions.open(&id, std::time::Duration::from_secs(60), 10, CancellationToken::new());
+            let kept = continuations_kept(&claim.conversation.lock().await.history);
+            fuzz_app.sessions.finish(&id, claim.run);
+            if let Err(lost) = kept {
+                panic!("run {run} question {q}: {lost}");
+            }
         }
     }
+}
+
+/// What a result in the context goes on in is still held: the archive of a
+/// cut result, the bundle a cut history read reads.
+fn continuations_kept(history: &llm_agent::session::SessionHistory) -> Result<(), String> {
+    for bundle in history.bundles.iter().filter(|b| b.active) {
+        for message in bundle.messages.iter().filter(|m| m["role"] == "tool") {
+            let Ok(result) = serde_json::from_str::<Value>(message["content"].as_str().unwrap_or("")) else {
+                continue;
+            };
+            let mut ids: Vec<u64> = result["archive_id"].as_u64().into_iter().collect();
+            if result["next_cursor"]["tool"] == "history" {
+                ids.extend(result["next_cursor"]["id"].as_u64());
+            }
+            if result["data"]["truncated"] == true && result["next_cursor"]["tool"] != "history" && message["tool_call_id"].as_str().is_some() {
+                // A cut history read without a continuation the prune can see.
+                let call = bundle.messages[0]["tool_calls"].as_array().and_then(|calls| calls.iter().find(|c| c["id"] == message["tool_call_id"]));
+                if call.is_some_and(|c| c["function"]["name"] == "history") {
+                    return Err(format!("bundle {}: a cut history read names no next_cursor", bundle.id));
+                }
+            }
+            for id in ids {
+                if history.read(id).is_err() {
+                    return Err(format!("bundle {}: {id}, which a result in the context goes on in, was dropped", bundle.id));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // Context management review, third pass (2026-10-16): each failed before its
@@ -1309,10 +1349,12 @@ impl llm_agent::llm::LlmClient for StoppedAtRandom {
             return Ok(text("다음 답"));
         }
         let mut out = text("");
-        out.text = match self.next(5) {
+        out.text = match self.next(6) {
             0 => format!("조각{n} "),
             1 | 2 => format!("도구 전 글{n} "),
             3 => " ".into(),
+            // Held unseen before a search (the general-knowledge line).
+            4 => format!("*등록된 지식에 없는 내용이라 조각{n} "),
             _ => String::new(),
         };
         if n == self.stop_at {
@@ -1335,7 +1377,7 @@ impl llm_agent::llm::LlmClient for StoppedAtRandom {
                 out.length_limited = true;
                 out.discarded_tool_calls = true;
             }
-            _ => out.text = if out.text.starts_with("조각") { out.text } else { String::new() },
+            _ => out.text = if out.text.starts_with("조각") || out.text.starts_with('*') { out.text } else { String::new() },
         }
         if !out.length_limited && out.calls.is_empty() && !out.text.trim().is_empty() {
             // An answer piece not cut is the answer: keep the question going.
@@ -1488,4 +1530,152 @@ async fn a_request_past_the_questions_time_says_the_time_ran_out() {
     let error = r.err().expect("time ran out");
     assert!(error.downcast_ref::<agent::UserFacing>().is_some(), "{error:#}");
     assert!(error.to_string().contains("답변 시간이 다 되어"), "{error}");
+}
+
+// Context management review, fourth pass (2026-10-16): each failed before its
+// fix. Needs no MariaDB.
+
+/// A provider that leaves withheld tools out of the request (as the client
+/// does for one that refuses or ignores tool_choice "none") and reports the
+/// size of what it was sent.
+struct DropsWithheldTools {
+    replies: std::sync::Mutex<std::collections::VecDeque<llm_agent::llm::Completion>>,
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for DropsWithheldTools {
+    async fn complete(&self, request: Value, config: &llm_agent::config::LlmConfig, _c: CancellationToken, _d: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        let mut sent = request.clone();
+        let dropped = sent["tool_choice"] == "none";
+        if dropped {
+            let fields = sent.as_object_mut().unwrap();
+            fields.remove("tools");
+            fields.remove("tool_choice");
+        }
+        let input = llm_agent::context::count(&sent, &config.model);
+        let mut reply = self.replies.lock().unwrap().pop_front().unwrap_or_else(|| text("끝"));
+        reply.usage = Some(llm_agent::llm::Usage { input, output: 50, cached: None });
+        reply.tools_dropped = dropped;
+        Ok(reply)
+    }
+}
+
+/// S: a request whose withheld tools the provider was sent without was
+/// calibrated against the estimate with them: the provider seemed to count
+/// less than the estimate by the size of the tool definitions.
+#[tokio::test]
+async fn a_request_sent_without_its_withheld_tools_is_calibrated_as_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+    let mut config = no_db("unknown-tokenizer");
+    config.projects.push(llm_agent::config::Project { name: "app".into(), root: dir.path().into(), ..Default::default() });
+    let replies = vec![cut_text(&"첫 조각 ".repeat(200)), text("이어진 끝.")];
+    let llm = std::sync::Arc::new(DropsWithheldTools { replies: std::sync::Mutex::new(replies.into()) });
+    let (app, _dir) = app(config, llm);
+    let (r, _) = ask(&app, "s", "길게 설명해줘", vec![]).await;
+    assert!(r.unwrap().answer.ends_with("이어진 끝."));
+    let claim = app.sessions.open("s", std::time::Duration::from_secs(60), 10, CancellationToken::new());
+    let ratios: Vec<f64> = claim.conversation.lock().await.token_ratios.iter().copied().collect();
+    assert_eq!(ratios.len(), 2, "{ratios:?}");
+    assert!(ratios.iter().all(|r| (r - 1.0).abs() < 0.01), "the provider counted what it was sent: {ratios:?}");
+}
+
+/// T: a continuation that had shown text when it failed (its time ran out)
+/// stands as written, that text included, but the preview took the text
+/// back first: answer_reset for text the answer keeps.
+#[tokio::test]
+async fn a_failed_continuation_keeps_in_the_preview_what_the_answer_keeps() {
+    let mut config = no_db("gpt-4o");
+    config.agent.run_seconds = 2;
+    let llm = Timed::new(vec![("쓴 앞부분 ", 0, cut_text("쓴 앞부분 ")), ("이어 쓰던 ", 5_000, text("늦은 끝"))]);
+    let (app, _dir) = app(config, llm.clone());
+    let (r, events) = ask(&app, "t", "길게 설명해줘", vec![]).await;
+    let answer = r.map(|a| a.answer).map_err(|e| e.to_string());
+    assert_eq!(answer, Ok("쓴 앞부분 이어 쓰던 ".to_owned()));
+    assert_eq!(preview(&events), "쓴 앞부분 이어 쓰던 ", "{events:?}");
+    assert!(ev(&events, "answer_reset").is_empty(), "{events:?}");
+}
+
+// The general-knowledge line before any search (2026-10-16): the model took a
+// registered subject for general knowledge and said it was not registered
+// without searching. Needs no MariaDB.
+
+const GENERAL_LINE: &str = "*등록된 지식에 없는 내용이라 일반 지식으로 답변합니다.*\n일론 머스크는 기업가입니다.";
+
+/// U: the line before any search is stopped unseen and the model asked to
+/// search; a follow-up on the same subject keeps the line without searching.
+#[tokio::test]
+async fn the_general_knowledge_line_before_any_search_asks_for_a_search() {
+    let llm = Scripted::new(vec![
+        text(GENERAL_LINE),
+        calls(vec![call("s1", "search", json!({"query":"일론 머스크"}))]),
+        text(GENERAL_LINE),
+        text("*등록된 지식에 없는 내용이라 일반 지식으로 답변합니다.*\n쉽게 말하면 사업가입니다."),
+    ]);
+    let (app, _dir) = app(no_db("gpt-4o"), llm.clone());
+    let (r, events) = ask(&app, "u", "일론 머스크가 누구야?", vec![]).await;
+    let answer = r.unwrap();
+    assert_eq!(answer.answer, GENERAL_LINE);
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 3);
+    let notice = state_of(&requests[1])["run_guidance"]["notice"].clone();
+    assert!(notice.as_str().unwrap().contains("먼저 search로 찾아라"), "{notice}");
+    // The refused line was never shown, nor kept in the conversation.
+    assert!(ev(&events, "answer_reset").is_empty(), "{events:?}");
+    assert_eq!(preview(&events), GENERAL_LINE);
+    assert!(messages(&requests[1], "assistant").is_empty());
+    assert_eq!(answer.log["searchFirst"], true);
+    assert_eq!(answer.log["search"]["searches"], 1);
+    let (r, _) = ask(&app, "u", "더 쉽게 설명해줘", vec![]).await;
+    assert!(r.unwrap().answer.contains("사업가"));
+    assert_eq!(llm.requests().len(), 4, "the follow-up was not asked to search");
+}
+
+/// V: the line is refused once per question, found in the whole answer when
+/// it did not open it, and left alone where no search can follow (the final
+/// request) or no line is said.
+#[tokio::test]
+async fn the_search_first_guard_asks_once_and_spares_other_answers() {
+    // After a heading it streams before it is found: taken back, asked once,
+    // and the second time it stands.
+    let late = "### 답변\n\n등록된 자료에서 찾을 수 없어 일반 지식으로 답합니다. 쿠버네티스는 컨테이너 오케스트레이션입니다.";
+    let llm = Scripted::new(vec![text(late), text(late)]);
+    let (late_app, _late_dir) = app(no_db("gpt-4o"), llm.clone());
+    let (r, events) = ask(&late_app, "v", "쿠버네티스가 뭐야?", vec![]).await;
+    assert_eq!(r.unwrap().answer, late);
+    assert_eq!(llm.requests().len(), 2);
+    assert_eq!(ev(&events, "answer_reset").len(), 1);
+    assert_eq!(preview(&events), late);
+    // Ordinary answers, held for their first characters only, stream whole.
+    for (n, ordinary) in ["**요약**\n배치는 정상입니다.", "등록된 쿼리로 확인한 결과 정상입니다.", "안녕하세요!"].into_iter().enumerate() {
+        let llm = Scripted::new(vec![text(ordinary)]);
+        let (ordinary_app, _ordinary_dir) = app(no_db("gpt-4o"), llm.clone());
+        let (r, events) = ask(&ordinary_app, &format!("v{n}"), "질문", vec![]).await;
+        assert_eq!(r.unwrap().answer, ordinary);
+        assert_eq!((llm.requests().len(), preview(&events)), (1, ordinary.to_owned()));
+        assert!(ev(&events, "answer_reset").is_empty(), "{events:?}");
+    }
+    // In the final request no search can follow: the line stands.
+    let mut config = no_db("gpt-4o");
+    config.agent.run_seconds = 45;
+    let llm = Scripted::new(vec![text(GENERAL_LINE)]);
+    let (final_app, _final_dir) = app(config, llm.clone());
+    let (r, events) = ask(&final_app, "v-final", "일론 머스크가 누구야?", vec![]).await;
+    let answer = r.unwrap();
+    assert_eq!((answer.answer.as_str(), llm.requests().len()), (GENERAL_LINE, 1));
+    assert_eq!(preview(&events), GENERAL_LINE);
+    assert!(answer.log.get("searchFirst").is_none());
+}
+
+/// W: the rest of a refused line is not generated: the request stops as soon
+/// as its held start is the line, with nothing shown.
+#[tokio::test]
+async fn a_refused_line_stops_its_request_at_its_start() {
+    let llm = Timed::new(vec![("*등록된 지식에 없는 내용이라 ", 10_000, text(GENERAL_LINE)), ("찾아보니 기업가입니다.", 0, text("찾아보니 기업가입니다."))]);
+    let (app, _dir) = app(no_db("gpt-4o"), llm.clone());
+    let started = std::time::Instant::now();
+    let (r, events) = ask(&app, "w", "일론 머스크가 누구야?", vec![]).await;
+    assert_eq!(r.unwrap().answer, "찾아보니 기업가입니다.");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    assert_eq!(preview(&events), "찾아보니 기업가입니다.");
+    assert!(ev(&events, "answer_reset").is_empty(), "{events:?}");
 }

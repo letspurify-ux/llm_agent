@@ -49,6 +49,12 @@ const TIME_OVER: &str = "답변 시간이 다 되어 마무리하지 못했습�
 /// What the model is told when the work before the final reserve stopped.
 const RESERVE_REACHED: &str = "남은 시간이 모자라 이전 요청을 멈췄다.";
 const TOOLS_STOPPED: &str = "남은 시간이 모자라 이전 응답의 도구 실행 일부를 멈췄다(status cancelled).";
+/// What the model is told when it answered that the registered material
+/// lacks the subject before searching for it.
+const SEARCH_FIRST: &str = "이전 응답은 search 없이 '등록된 지식에 없다'고 답하려 해서 멈췄다. 일반 지식처럼 보여도 등록 자료에 있을 수 있으니 먼저 search로 찾아라. 찾아도 없을 때만 그 문구를 써라.";
+/// The start of the general-knowledge line of the system prompt, which a
+/// streamed answer is held against before any search.
+const UNREGISTERED_LEAD: &str = "등록된 지식에 없는 내용";
 const PROVIDER_WAITS: [u64; 2] = [5, 15];
 const EMPTY_RETRIES: usize = 2;
 const LENGTH_CONTINUATIONS: usize = 2;
@@ -143,10 +149,16 @@ fn restore(c: &mut Conversation, history: &[(String, String)]) {
         .take(MAX_CHAT_TURNS)
         .rev()
         .map(|(role, text)| (role.as_str(), clip_utf16(js_trim(text), MAX_CHAT_LEN)))
-        .filter(|(role, text)| !text.is_empty() && matches!(*role, "user" | "assistant"))
-        // The conversation opens with a question, as eviction keeps it.
-        .skip_while(|(role, _)| *role != "user");
+        .filter(|(role, text)| !text.is_empty() && matches!(*role, "user" | "assistant"));
+    // A reply follows its question: the conversation opens with a question,
+    // as eviction keeps it, and a reply whose question was left out (blank)
+    // goes too rather than follow another reply.
+    let mut previous = "";
     for (role, text) in turns {
+        if role == "assistant" && previous != "user" {
+            continue;
+        }
+        previous = role;
         c.history
             .push(vec![json!({"role":role,"content":text,"restored":true})], true);
     }
@@ -179,6 +191,21 @@ async fn run(
     let mut partial: Vec<String> = vec![];
     let mut notice: Option<String> = None;
     let mut event_id = 0u64;
+    // The general-knowledge line says the registered material was searched
+    // and lacks the subject. Said before any search in this question, it is
+    // refused once and the model asked to search, unless the previous answer
+    // said it too (a follow-up on the same unregistered subject).
+    let previous_claimed = c
+        .history
+        .bundles
+        .iter()
+        .rev()
+        .filter(|b| b.id != question_bundle)
+        .flat_map(|b| b.messages.iter().rev())
+        .find(|m| m["role"] == "assistant" && !m["tool_calls"].as_array().is_some_and(|calls| !calls.is_empty()))
+        .and_then(|m| m["content"].as_str())
+        .is_some_and(claims_unregistered);
+    let mut search_first_asked = false;
     let answer_text = loop {
         if cancel.is_cancelled() {
             bail!("cancelled");
@@ -247,19 +274,54 @@ async fn run(
             bail!(too_long(fits(frame_tokens), fits(alone)));
         }
         rounds += 1;
+        let search_first = !withheld_tools
+            && !search_first_asked
+            && !previous_claimed
+            && !trace.iter().any(|step| step.get("search").is_some());
         let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(64);
         let relay_events = events.clone();
         let writing = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let relay_writing = writing.clone();
+        let (claim_tx, mut claim_rx) = tokio::sync::oneshot::channel::<()>();
         // The text shown while the response streams, kept for a stop.
         let relay = tokio::spawn(async move {
             let mut shown = String::new();
+            // Before a search, the start is held while it may still be the
+            // general-knowledge line, which is then refused unseen. An
+            // ordinary answer parts from it at its first characters.
+            let mut held = search_first.then(String::new);
+            let mut claim = Some(claim_tx);
             while let Some(text) = delta_rx.recv().await {
-                if !text.is_empty() {
-                    relay_writing.store(true, std::sync::atomic::Ordering::Relaxed);
-                    shown.push_str(&text);
-                    relay_events.send(json!({"type":"answer_delta","text":text}));
+                if text.is_empty() {
+                    continue;
                 }
+                relay_writing.store(true, std::sync::atomic::Ordering::Relaxed);
+                let text = match held.as_mut() {
+                    Some(start) => {
+                        start.push_str(&text);
+                        match lead(start) {
+                            Lead::Undecided => continue,
+                            Lead::Claims => {
+                                if let Some(claim) = claim.take() {
+                                    let _ = claim.send(());
+                                }
+                                continue;
+                            }
+                            Lead::Other => held.take().unwrap_or_default(),
+                        }
+                    }
+                    None => text,
+                };
+                shown.push_str(&text);
+                relay_events.send(json!({"type":"answer_delta","text":text}));
+            }
+            // A response that ended while undecided shows its start.
+            if let Some(start) = held
+                && claim.is_some()
+                && !start.is_empty()
+            {
+                shown.push_str(&start);
+                relay_events.send(json!({"type":"answer_delta","text":start}));
             }
             shown
         });
@@ -273,6 +335,7 @@ async fn run(
         let mut reserve = (!final_round).then(|| {
             Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(deadline - Duration::from_secs(FINAL_RESERVE_SECS))))
         });
+        let mut watching = search_first;
         let response = loop {
             tokio::select! {
                 _ = cancel.cancelled() => break Err(anyhow::anyhow!("cancelled")),
@@ -286,6 +349,14 @@ async fn run(
                         break Err(anyhow::anyhow!("reserve_reached"));
                     }
                 }
+                // The held start became the general-knowledge line: the rest
+                // of that answer is not worth generating.
+                claimed = &mut claim_rx, if watching => {
+                    watching = false;
+                    if claimed.is_ok() {
+                        break Err(anyhow::anyhow!("search_first"));
+                    }
+                }
             }
         };
         // A request left unfinished goes now, with its stream, so the relay ends.
@@ -296,7 +367,8 @@ async fn run(
         let completion: Completion = match response {
             Ok(completion) => completion,
             Err(error) => {
-                timing.llm.push(json!({"ms":ms,"error":true}));
+                let stopped_for_search = error.to_string() == "search_first";
+                timing.llm.push(if stopped_for_search { json!({"ms":ms,"searchFirst":true}) } else { json!({"ms":ms,"error":true}) });
                 // What the answer has written: the pieces kept so far and
                 // what this response showed before it ended.
                 let written = partial.concat() + &shown;
@@ -312,13 +384,26 @@ async fn run(
                     }
                     bail!("cancelled");
                 }
-                if emitted {
-                    retract(events, &partial);
+                // What this response showed is taken back where it is not
+                // part of the answer: the request is made again, or the
+                // question ends. A cut answer standing as written keeps it.
+                let discard = || {
+                    if emitted {
+                        retract(events, &partial);
+                    }
+                };
+                if stopped_for_search {
+                    eprintln!("[agent] the answer said the registered material lacks it before any search; asking for a search");
+                    discard();
+                    search_first_asked = true;
+                    notice = Some(SEARCH_FIRST.into());
+                    continue;
                 }
                 // Stopped at the final reserve: the next request is the final
                 // one, with the whole reserve.
                 if error.to_string() == "reserve_reached" {
                     eprintln!("[agent] the request had not begun its answer at the final reserve; asking for the final answer");
+                    discard();
                     notice = Some(RESERVE_REACHED.into());
                     continue;
                 }
@@ -330,6 +415,7 @@ async fn run(
                     let evicted = context::evict_all(c, config, &[question_bundle]);
                     if !evicted.is_empty() {
                         eprintln!("[context] the provider refused ~{estimate} tokens as too long; evicted {} old bundles", evicted.len());
+                        discard();
                         rounds -= 1;
                         notice = round_notice;
                         continue;
@@ -337,6 +423,7 @@ async fn run(
                     if continuing {
                         break written;
                     }
+                    discard();
                     let only_question = c.history.bundles.iter().rev().find(|b| b.active).map(|b| b.id) == Some(question_bundle);
                     bail!(too_long(true, !only_question));
                 }
@@ -348,6 +435,7 @@ async fn run(
                     if Instant::now() + wait + Duration::from_secs(FINAL_RESERVE_SECS) < deadline {
                         outages += 1;
                         rounds -= 1;
+                        discard();
                         eprintln!("[llm] provider unavailable; retrying in {}s: {error}", wait.as_secs());
                         tokio::select! {
                             _ = cancel.cancelled() => bail!("cancelled"),
@@ -363,6 +451,7 @@ async fn run(
                     eprintln!("[agent] continuing a cut answer failed; it stands as written: {error:#}");
                     break written;
                 }
+                discard();
                 if error.to_string() == "run_timeout" {
                     bail!(UserFacing(TIME_OVER.into()));
                 }
@@ -372,7 +461,14 @@ async fn run(
         outages = 0;
         let usage = completion.usage.clone();
         if let Some(usage) = &usage {
-            context::record_usage(c, &model, estimate, usage.input);
+            // The provider counted the request as it was sent: without the
+            // withheld tools when it was answered without them.
+            let sent = if completion.tools_dropped {
+                context::count(&context::request(&c.history, &state, &model, vec![]), &model)
+            } else {
+                estimate
+            };
+            context::record_usage(c, &model, sent, usage.input);
             eprintln!(
                 "[llm] usage prompt={} completion={} cached={} ms={ms}",
                 usage.input,
@@ -381,6 +477,24 @@ async fn run(
             );
         }
         timing.llm.push(json!({"ms":ms,"prompt":usage.as_ref().map(|u| u.input),"completion":usage.as_ref().map(|u| u.output),"cached":usage.as_ref().and_then(|u| u.cached),"estimate":estimate}));
+        // The general-knowledge line before any search, found in the whole
+        // answer (one that did not open with it streamed in full).
+        if search_first
+            && completion.calls.is_empty()
+            && !completion.discarded_tool_calls
+            && claims_unregistered(&completion.text)
+        {
+            eprintln!("[agent] the answer said the registered material lacks it before any search; asking for a search");
+            if emitted {
+                retract(events, &partial);
+            }
+            if let Some(last) = timing.llm.last_mut() {
+                last["searchFirst"] = json!(true);
+            }
+            search_first_asked = true;
+            notice = Some(SEARCH_FIRST.into());
+            continue;
+        }
         // Text streamed for a response that is not part of the answer (it
         // called tools, its calls were cut, it was blank) is taken back. A
         // cut answer's piece stays shown: its continuation follows it.
@@ -517,12 +631,15 @@ async fn run(
         json!(timing.llm.iter().map(|l| l["ms"].clone()).collect::<Vec<_>>()),
         json!(timing.tools.iter().map(|t| t["ms"].clone()).collect::<Vec<_>>())
     );
-    let log = json!({
+    let mut log = json!({
         "v":5,"outcome":"answered","conversation_id":c.id,"rounds":rounds,
         "search":search_summary(&trace),
         "timing":{"total":total,"llm":timing.llm,"tools":timing.tools},
         "steps":trace.iter().map(log_step).collect::<Vec<_>>()
     });
+    if search_first_asked {
+        log["searchFirst"] = json!(true);
+    }
     Ok(Answer {
         answer: answer_text,
         trace,
@@ -553,6 +670,34 @@ fn too_long(frame_fits: bool, question_fits: bool) -> UserFacing {
     } else {
         "대화가 너무 길어 이어서 답할 수 없습니다. 새 대화로 다시 질문해주세요.".into()
     })
+}
+
+/// Whether an answer says the registered material lacks what was asked: the
+/// general-knowledge line of the system prompt, or words to that effect.
+fn claims_unregistered(text: &str) -> bool {
+    static PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"등록(?:된|되어\s*있는)\s*(?:지식|자료)[^\n.]{0,10}없").unwrap()
+    });
+    PATTERN.is_match(text)
+}
+
+/// How far the start of a streamed answer decides whether it opens with the
+/// general-knowledge line.
+#[derive(Debug, PartialEq)]
+enum Lead {
+    Undecided,
+    Claims,
+    Other,
+}
+fn lead(text: &str) -> Lead {
+    let start = text.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '*' | '_' | '>' | '#'));
+    if start.starts_with(UNREGISTERED_LEAD) {
+        Lead::Claims
+    } else if UNREGISTERED_LEAD.starts_with(start) {
+        Lead::Undecided
+    } else {
+        Lead::Other
+    }
 }
 
 /// Whether the newest bundle holds the pieces of an answer being continued.
@@ -1355,6 +1500,43 @@ mod tests {
         restore(&mut c, &turns);
         let roles: Vec<String> = c.history.active().iter().map(|m| m["role"].as_str().unwrap().to_owned()).collect();
         assert_eq!(roles, ["user", "assistant"]);
+        // A question left out (blank) left its answer after the answer
+        // before it: a reply after a reply, which strict chat templates refuse.
+        let mut c = Conversation::new("r2".into());
+        let turns: Vec<(String, String)> = [("user", "질문"), ("assistant", "답"), ("user", "  "), ("assistant", "빈 질문의 답"), ("user", "다음"), ("assistant", "다음 답")]
+            .into_iter()
+            .map(|(role, text)| (role.to_owned(), text.to_owned()))
+            .collect();
+        restore(&mut c, &turns);
+        let kept: Vec<String> = c.history.active().iter().map(|m| m["content"].as_str().unwrap().to_owned()).collect();
+        assert_eq!(kept, ["질문", "답", "다음", "다음 답"]);
+    }
+
+    #[test]
+    fn the_general_knowledge_line_is_told_from_other_answers() {
+        let line = "*등록된 지식에 없는 내용이라 일반 지식으로 답변합니다.*\n일론 머스크는";
+        assert!(claims_unregistered(line));
+        for said in ["### 답변\n\n등록된 자료에서 찾을 수 없어 일반 지식으로 답합니다.", "등록되어 있는 지식에는 없지만", "> **등록된 지식에 없는 질문이라**"] {
+            assert!(claims_unregistered(said), "{said}");
+        }
+        for other in ["배치 재시작은 등록된 지식의 절차를 따릅니다.", "등록된 쿼리로 조회했습니다. 결과가 없습니다.", "안녕하세요!"] {
+            assert!(!claims_unregistered(other), "{other}");
+        }
+        // Held while the start may still be the line, decided at its first
+        // other character.
+        for (start, expected) in [
+            ("", Lead::Undecided),
+            ("*", Lead::Undecided),
+            ("**등록된 지식", Lead::Undecided),
+            ("\n> *등록된 지식에 없는 내", Lead::Undecided),
+            ("*등록된 지식에 없는 내용이라", Lead::Claims),
+            ("등록된 쿼리", Lead::Other),
+            ("등록된 지식에 없는지 찾아보겠다", Lead::Other),
+            ("**요약**", Lead::Other),
+            ("# 배치", Lead::Other),
+        ] {
+            assert_eq!(lead(start), expected, "{start:?}");
+        }
     }
 
     #[test]
