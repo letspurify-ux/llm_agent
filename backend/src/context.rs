@@ -434,8 +434,49 @@ fn evict_down_to(
             first.active = false;
             evicted.push(first.id);
         }
+        mark_left(c, &evicted);
     }
     evicted
+}
+
+/// A history search in the newest bundle has not reached the model yet: the
+/// request that first delivers it is the one evicting now. What it found
+/// among the evicted bundles says it is no longer active, as that request
+/// holds it (searches the model has already read stay as they were shown).
+fn mark_left(c: &mut Conversation, evicted: &[u64]) {
+    let Some(newest) = c.history.bundles.iter_mut().rev().find(|b| b.active) else {
+        return;
+    };
+    let searches: Vec<String> = newest
+        .messages
+        .iter()
+        .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
+        .filter(|call| call["function"]["name"] == "history")
+        .filter_map(|call| call["id"].as_str().map(str::to_owned))
+        .collect();
+    if searches.is_empty() {
+        return;
+    }
+    let updated: Vec<(usize, String)> = newest
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m["role"] == "tool" && m["tool_call_id"].as_str().is_some_and(|id| searches.iter().any(|s| s == id)))
+        .filter_map(|(index, m)| {
+            let mut result: Value = serde_json::from_str(m["content"].as_str()?).ok()?;
+            let mut changed = false;
+            for item in result["data"]["items"].as_array_mut().into_iter().flatten() {
+                if item["active"] == true && item["id"].as_u64().is_some_and(|id| evicted.contains(&id)) {
+                    item["active"] = json!(false);
+                    changed = true;
+                }
+            }
+            changed.then(|| (index, result.to_string()))
+        })
+        .collect();
+    for (index, content) in updated {
+        newest.messages[index]["content"] = json!(content);
+    }
 }
 
 #[cfg(test)]

@@ -25,7 +25,8 @@ use std::{
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-/// Turns of the browser's history used to restore a lost conversation.
+/// Turns of the browser's history used to restore a lost conversation (the
+/// browser keeps and sends as many: frontend/src/chat-store.js HISTORY_TURNS).
 pub const MAX_CHAT_TURNS: usize = 6;
 pub const MAX_CHAT_LEN: usize = 10_000;
 /// Characters (UTF-16) of a question: a pasted log or SQL fits, and its

@@ -2145,3 +2145,75 @@ async fn a_request_that_cannot_use_tools_keeps_what_fits() {
     let size = llm_agent::context::count(request, &config.llm.model);
     assert!(size >= high && size <= budget, "setup: the final request is {size}, between {high} and {budget}");
 }
+
+// Context management review, eighth pass (2026-10-16): each failed before
+// its fix. Needs no MariaDB.
+
+/// Answers the first question with a marker, then searches the history for
+/// it beside a read of a large file, a round, so the requests grow until one
+/// evicts the bundles the searches found.
+struct SearchesWhileFilling {
+    reads: std::sync::Mutex<usize>,
+    requests: std::sync::Mutex<Vec<Value>>,
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for SearchesWhileFilling {
+    async fn complete(&self, request: Value, _config: &llm_agent::config::LlmConfig, _c: CancellationToken, _d: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        self.requests.lock().unwrap().push(request.clone());
+        if state_of(&request)["current_question"] == "첫 질문" {
+            // A cut search leaves an archive, so the history tool is offered.
+            if messages(&request, "tool").is_empty() {
+                return Ok(calls(vec![call("s0", "source_search", json!({"query":"needle","limit":100}))]));
+            }
+            return Ok(text("MARKER-Q1 답: needle은 여러 파일에 있다."));
+        }
+        let mut reads = self.reads.lock().unwrap();
+        if *reads >= 8 {
+            return Ok(text("끝."));
+        }
+        *reads += 1;
+        Ok(calls(vec![
+            call(&format!("h{reads}"), "history", json!({"action":"search","query":"marker-q1"})),
+            call(&format!("f{reads}"), "file_read", json!({"path":"big.txt","start_line":1 + 400 * *reads,"max_lines":400})),
+        ]))
+    }
+}
+
+/// U: a history search reported whether each bundle it found was in the
+/// active context as it was when the search ran, but the request that first
+/// delivered the search could evict those bundles: the model was told an
+/// earlier answer was still in its context in the request that had just
+/// taken it out.
+#[tokio::test]
+async fn a_history_search_says_what_the_request_delivering_it_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let body: String = (1..=6000).map(|i| format!("line {i} {}\n", "word \"q\" 가나다 ".repeat(6))).collect();
+    std::fs::write(root.join("big.txt"), &body).unwrap();
+    for i in 0..40 {
+        std::fs::write(root.join(format!("src/m{i}.rs")), format!("fn f{i}() {{ let needle = {i}; }}\n").repeat(60)).unwrap();
+    }
+    let mut config = no_db("gpt-4o");
+    config.llm.context_tokens = 24_000;
+    config.llm.output_tokens = 2_000;
+    config.projects.push(llm_agent::config::Project { name: "app".into(), root, ..Default::default() });
+    let llm = std::sync::Arc::new(SearchesWhileFilling { reads: Default::default(), requests: Default::default() });
+    let (search_app, _dir) = app(config, llm.clone());
+    ask(&search_app, "u", "첫 질문", vec![]).await.0.unwrap();
+    let first = llm.requests.lock().unwrap().len();
+    assert_eq!(ask(&search_app, "u", "다음 질문", vec![]).await.0.unwrap().answer, "끝.");
+    let requests = llm.requests.lock().unwrap().clone();
+    let mut evicted_seen = false;
+    for (i, request) in requests.iter().enumerate().skip(first + 1) {
+        // The search the previous response made, delivered here first.
+        let call = messages(request, "assistant").last().unwrap()["tool_calls"][0]["id"].as_str().unwrap().to_owned();
+        let found = tool_result(request, &call);
+        let items = found["data"]["items"].as_array().unwrap();
+        let answer = items.iter().find(|item| item["excerpt"].as_str().unwrap().contains("MARKER-Q1")).unwrap_or_else(|| panic!("request {i}: {found}"));
+        let held = messages(request, "assistant").iter().any(|m| m["content"].as_str().is_some_and(|c| c.contains("MARKER-Q1")));
+        evicted_seen |= !held;
+        assert_eq!(answer["active"], held, "request {i}: the answer's bundle is {}in this request: {answer}", if held { "" } else { "not " });
+    }
+    assert!(evicted_seen, "setup: a request delivering a search evicted the answer");
+}

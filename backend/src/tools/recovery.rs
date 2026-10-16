@@ -145,7 +145,8 @@ pub fn attach(offered: &[String], result: &mut Value) {
             &["code_outline", "symbol_search"]
         }
         "query_not_found" | "unknown_item" => &["search"],
-        "history_unavailable" => &["file_read"],
+        // A dropped bundle held any tool's result, or a question and its
+        // answer: its message says to search the history or repeat the call.
         _ => &[],
     };
     let tools: Vec<&str> = hints
@@ -199,6 +200,18 @@ mod tests {
         assert_eq!(describe("file_not_found: x")["action"], "resolve_path");
         assert_eq!(describe("cursor_expired: x")["class"], "stale_state");
         assert_eq!(describe("Something odd")["code"], "tool_error");
+    }
+
+    /// Context management review, eighth pass: a history id that was
+    /// dropped pointed to file_read (MnemoArc archived only source results),
+    /// whatever the bundle held — a knowledge or query result, a question.
+    #[test]
+    fn a_dropped_history_id_names_no_other_tool() {
+        let offered: Vec<String> = ["file_read", "knowledge_read", "result_read", "history"].map(String::from).to_vec();
+        let mut result = json!({"status":"error","error":"history_unavailable: history id 3 was dropped","recovery":describe("history_unavailable: history id 3 was dropped")});
+        attach(&offered, &mut result);
+        assert_eq!(result["recovery"]["action"], "repeat_the_original_call");
+        assert!(result["recovery"].get("tools").is_none(), "{result}");
     }
 
     #[test]

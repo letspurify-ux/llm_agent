@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loadChat, saveChat, openChat, closeChat, markChatOpen } from '../src/chat-store.js';
+import { loadChat, saveChat, openChat, closeChat, markChatOpen, rememberTurn, HISTORY_TURNS } from '../src/chat-store.js';
 
 function memory(limit = Infinity) {
   const items = new Map();
@@ -70,6 +70,25 @@ test('용량을 넘으면 앞 답변의 실행 결과부터, 그다음 오래된
   const tight = memory(JSON.stringify({ ...big, messages: big.messages.slice(2) }).length);
   assert.equal(saveChat(big, tight), true);
   assert.deepEqual(loadChat(tight).messages.map(m => m.text), ['둘째 질문', '둘째 답']);
+});
+
+// 컨텍스트 관리 검토 8차: 서버로 보내는 이력은 최근 HISTORY_TURNS턴뿐인데 화면은 대화의 모든 턴을 이력으로
+// 들고 통째로 저장했다 — 긴 대화에서는 보내지도 않을 옛 답변이 저장 용량을 차지해, 용량을 넘으면 말풍선부터
+// 덜어 내고 끝내 이력만으로 넘으면 저장본을 지워 새로고침에 대화(대화 번호까지)를 잃었다.
+test('이력은 서버가 쓰는 최근 턴만 저장하고, 그 때문에 말풍선을 덜어 내지 않는다', () => {
+  const turns = Array.from({ length: 40 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', text: `${i}번째 턴 `.repeat(400) }));
+  const big = { conversationId: 'c1', messages: turns.map(t => ({ ...t })), history: turns };
+  const needed = JSON.stringify({ ...big, history: turns.slice(-HISTORY_TURNS) }).length;
+  const store = memory(needed);
+  assert.equal(saveChat(big, store), true);
+  const kept = loadChat(store);
+  assert.equal(kept.messages.length, 40, '말풍선은 모두 남는다');
+  assert.deepEqual(kept.history, turns.slice(-HISTORY_TURNS));
+  // 예전 저장본(모든 턴)을 읽어도 최근 턴만 이력으로 쓴다.
+  const old = memory();
+  old.setItem('llm-agent.chat.v1', JSON.stringify(big));
+  assert.deepEqual(loadChat(old).history, turns.slice(-HISTORY_TURNS));
+  assert.deepEqual(rememberTurn(turns.slice(-HISTORY_TURNS), { role: 'user', text: '다음' }), [...turns.slice(-HISTORY_TURNS + 1), { role: 'user', text: '다음' }]);
 });
 
 test('끝내 못 넣으면 지난 저장본을 지워 옛 대화가 되살아나지 않게 한다', () => {

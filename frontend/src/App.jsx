@@ -11,7 +11,7 @@ import { columnsOf, cellValue, cellText, toCsv, csvFileName, stepLabel, normaliz
 // 응답 스트림 읽기는 stream.js에, 미리보기 코드블록 표시는 preview.js에 있다.
 import { readEvents } from './stream.js';
 import { fillAnswer } from './answer-fill.js';
-import { openChat, closeChat, markChatOpen, saveChat } from './chat-store.js';
+import { openChat, closeChat, markChatOpen, saveChat, rememberTurn, HISTORY_TURNS } from './chat-store.js';
 
 // 대화 번호. crypto.randomUUID가 없는 브라우저(구형·http 사내 주소)에서는 난수로 만든다.
 function newConversationId() {
@@ -38,10 +38,9 @@ function useMarkdownPlugins(base = NO_REHYPE) {
 const Chart = lazy(() => import('./Chart.jsx'));
 const Mermaid = lazy(() => import('./Mermaid.jsx'));
 
-// 서버(backend/src/agent.rs MAX_CHAT_TURNS·MAX_CHAT_LEN)가 실제로 쓰는 상한과 같은 값. 서버 쪽 제한은 본문을 파싱한 뒤에
-// 적용되므로 요청 크기를 실제로 묶어두는 것은 이쪽뿐이다 — 넘기면 서버의 본문 크기 제한(1MB)에 걸려
-// 이후 모든 요청이 같은 이유로 실패한다(이력은 줄지 않으므로 대화가 복구되지 않는다).
-const HISTORY_TURNS = 6;
+// 서버(backend/src/agent.rs MAX_CHAT_TURNS·MAX_CHAT_LEN)가 실제로 쓰는 상한과 같은 값(턴 수 HISTORY_TURNS는 chat-store.js).
+// 서버 쪽 제한은 본문을 파싱한 뒤에 적용되므로 요청 크기를 실제로 묶어두는 것은 이쪽뿐이다 — 넘기면 서버의 본문 크기
+// 제한(1MB)에 걸려 이후 모든 요청이 같은 이유로 실패한다(이력은 줄지 않으므로 대화가 복구되지 않는다).
 const HISTORY_LEN = 10000;
 
 // 단순 slice는 경계의 서로게이트 쌍(이모지 등)을 반으로 쪼개 짝 잃은 코드유닛을 남기고,
@@ -493,7 +492,7 @@ export default function App() {
   // (접근성 트리로 확인: done 뒤 라이브 영역 0개).
   const [status, setStatus] = useState('');
   const inputRef = useRef(null);
-  const historyRef = useRef(restored?.history ?? []); // 서버로 보낼 대화 이력 (setState 비동기와 무관하게 즉시 반영)
+  const historyRef = useRef(restored?.history ?? []); // 서버로 보낼 최근 대화 이력 (setState 비동기와 무관하게 즉시 반영)
   const composingRef = useRef(false); // IME 조합 진행 중
   const pendingSendRef = useRef(false); // 조합 중에 눌린 Enter — 조합이 확정되면 그때 보낸다
   const sendingRef = useRef(false);   // 전송 진행 중 (loading state와 달리 같은 tick에도 즉시 보인다)
@@ -1135,7 +1134,7 @@ export default function App() {
       const history = historyRef.current
         .slice(-HISTORY_TURNS)
         .map(m => ({ role: m.role, text: clipTurn(m.role === 'assistant' ? chartBlocksToTables(m.text) : m.text) }));
-      historyRef.current = [...historyRef.current, { role: 'user', text: message }];
+      historyRef.current = rememberTurn(historyRef.current, { role: 'user', text: message });
       setMessages(m => [...m, { role: 'user', text: message }]);
       setLoading(true);
       setProgress([]);
@@ -1220,7 +1219,7 @@ export default function App() {
           // 보인 조각이 있으면 다음 질문의 맥락에도 남긴다. 빈 중지 안내만 모델의 과거 답변으로
           // 보내지는 않는다 — 실제로 생성된 답이 아니기 때문이다.
           if (answered || (stopped && stoppedPartial.trim())) {
-            historyRef.current = [...historyRef.current, { role: 'assistant', text: answer }];
+            historyRef.current = rememberTurn(historyRef.current, { role: 'assistant', text: answer });
           }
           setMessages(m => [...m, { role: 'assistant', text: answer, trace, stopped }]);
           // 도착했다는 사실만 알린다 — 답변 본문은 길고(상한 70,000자) 표·차트가 섞여 있어 읽어 주면

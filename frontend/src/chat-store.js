@@ -17,6 +17,14 @@ function storageOf(storage) {
 
 const isTurn = t => t && typeof t === 'object' && (t.role === 'user' || t.role === 'assistant') && typeof t.text === 'string';
 
+// 서버로 보내는 이력의 턴 수 — 서버(backend/src/agent.rs MAX_CHAT_TURNS)가 실제로 쓰는 상한과 같은 값.
+// 이력은 이만큼만 들고 저장한다: 더 앞의 턴은 보내지 않으므로, 모두 들고 있으면 긴 대화에서 저장 용량만
+// 차지해 말풍선이 먼저 덜리고 끝내 저장본째 지워졌다.
+export const HISTORY_TURNS = 6;
+
+// 이력에 한 턴을 더한다(가장 오래된 턴부터 HISTORY_TURNS 밖으로 밀려난다).
+export const rememberTurn = (history, turn) => [...history, turn].slice(-HISTORY_TURNS);
+
 // 저장해 둔 대화. 없거나 읽을 수 없으면(형식이 다르거나 깨졌으면) null — 그때는 새 대화로 시작한다.
 export function loadChat(storage) {
   const store = storageOf(storage);
@@ -25,18 +33,19 @@ export function loadChat(storage) {
     if (!data || typeof data.conversationId !== 'string' || !data.conversationId
       || !Array.isArray(data.messages) || !data.messages.every(isTurn)
       || !Array.isArray(data.history) || !data.history.every(isTurn)) return null;
-    return { conversationId: data.conversationId, messages: data.messages, history: data.history };
+    return { conversationId: data.conversationId, messages: data.messages, history: data.history.slice(-HISTORY_TURNS) };
   } catch {
     return null;
   }
 }
 
 // 대화를 저장한다. 용량(브라우저마다 5MB 안팎)을 넘으면 앞 답변의 실행 결과(trace — 조회 행이 대부분)부터
-// 덜어 내고, 그래도 넘으면 오래된 말풍선부터 덜어 낸다. 서버로 보낼 이력은 짧아서(최근 몇 턴의 글) 그대로 둔다.
+// 덜어 내고, 그래도 넘으면 오래된 말풍선부터 덜어 낸다. 서버로 보낼 이력은 최근 HISTORY_TURNS턴만 둔다.
 // 끝내 못 넣으면 지난 저장본을 지운다 — 옛 대화가 되살아나 지금 대화인 척하면 안 된다.
 export function saveChat({ conversationId, messages, history }, storage) {
   const store = storageOf(storage);
   if (!store) return false;
+  history = history.slice(-HISTORY_TURNS);
   const attempt = list => {
     try {
       store.setItem(KEY, JSON.stringify({ conversationId, messages: list, history }));

@@ -160,7 +160,7 @@ impl SessionHistory {
         })
     }
     pub fn search(&self, query: &str, after: u64, limit: usize) -> Value {
-        let q = query.to_lowercase();
+        let q: String = query.chars().flat_map(fold).collect();
         // The messages are searched as JSON text, where quotes, backslashes
         // and line breaks are escaped: the query is found as JSON writes it,
         // or as sent (copied from a history read).
@@ -173,7 +173,7 @@ impl SessionHistory {
             .filter_map(|b| {
                 let (messages, whole) = without_history_calls(&b.messages[..]);
                 let text = serde_json::to_string(&crate::context::shown_messages(&messages)).unwrap_or_default();
-                let lowered = text.to_lowercase();
+                let lowered: String = text.chars().flat_map(fold).collect();
                 let needle = needles.iter().copied().find(|needle| lowered.contains(needle))?;
                 Some((b, text, needle, whole))
             })
@@ -225,21 +225,29 @@ fn without_history_calls(messages: &[Value]) -> (Vec<Value>, bool) {
     (kept, false)
 }
 
-/// About 240 characters of `text` around the first match of `query` (in
-/// lower case), so a search shows where a bundle matched rather than its
+/// A character as history search compares it: lower case, letter by letter
+/// (a match in the folded text maps back to the letters it came from), with
+/// the word-final sigma as σ — lower-casing a whole text gives ς at the end
+/// of a word, so a word and its folded query could otherwise differ.
+fn fold(ch: char) -> impl Iterator<Item = char> {
+    ch.to_lowercase().map(|c| if c == 'ς' { 'σ' } else { c })
+}
+
+/// About 240 characters of `text` around the first match of `query` (folded
+/// as `fold` does), so a search shows where a bundle matched rather than its
 /// opening tool call (the start when the match cannot be placed), and the
 /// character of `text` it starts at.
 fn excerpt_around(text: &str, query: &str) -> (String, usize) {
     const BEFORE: usize = 80;
     const LENGTH: usize = 240;
     let chars: Vec<char> = text.chars().collect();
-    // Lower-cased character by character, so a byte of the match maps back
-    // to the character it came from.
+    // Folded character by character, as the search matched it, so a byte
+    // of the match maps back to the character it came from.
     let mut lowered = String::new();
     let mut origin = vec![];
     for (index, ch) in chars.iter().enumerate() {
         let start = lowered.len();
-        lowered.extend(ch.to_lowercase());
+        lowered.extend(fold(*ch));
         origin.extend(std::iter::repeat_n(index, lowered.len() - start));
     }
     let at = (!query.is_empty())
@@ -614,6 +622,25 @@ mod tests {
         assert!(from.contains("찾을 말 바로 여기"), "{from}");
         let excerpt = item["excerpt"].as_str().unwrap().trim_start_matches('…');
         assert!(from.starts_with(&excerpt.chars().take(40).collect::<String>()), "{from} / {excerpt}");
+    }
+
+    /// Context management review, eighth pass: a bundle was matched in text
+    /// lower-cased as a whole, where a word-final capital sigma becomes ς,
+    /// but its excerpt and offset were placed in text lower-cased letter by
+    /// letter (σ): the match was not found there, and the item pointed to the
+    /// start of the bundle.
+    #[test]
+    fn a_match_is_placed_where_it_was_found() {
+        let mut h = SessionHistory::default();
+        let text = format!("{} ΟΔΟΣ 7 마감", "앞 문장. ".repeat(200));
+        h.push(vec![json!({"role":"user","content":text})], true);
+        let read = serde_json::to_string(&crate::context::shown_messages(&h.bundles[0].messages[..])).unwrap();
+        for query in ["ΟΔΟΣ 7", "οδος 7", "οδοσ 7"] {
+            let item = h.search(query, 0, 10)["items"][0].clone();
+            let offset = item["offset"].as_u64().expect("an offset") as usize;
+            let from: String = read.chars().skip(offset).collect();
+            assert!(offset > 0 && from.contains("ΟΔΟΣ 7"), "{query}: {item}");
+        }
     }
 
     #[test]
