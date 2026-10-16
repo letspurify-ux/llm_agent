@@ -1679,3 +1679,114 @@ async fn a_refused_line_stops_its_request_at_its_start() {
     assert_eq!(preview(&events), "찾아보니 기업가입니다.");
     assert!(ev(&events, "answer_reset").is_empty(), "{events:?}");
 }
+
+// Context management review, fifth pass (2026-10-16): each failed before its
+// fix. Needs no MariaDB.
+
+/// X: the retries for blank replies and for calls while tools are withheld
+/// counted over the whole question: after two blank replies (or a withheld
+/// call) earlier, a cut answer's continuation got none and the answer ended
+/// at the cut.
+#[tokio::test]
+async fn a_cut_answer_gets_its_own_retries() {
+    let llm = Scripted::new(vec![text(""), text(""), cut_text("첫 조각 "), text(""), text("끝.")]);
+    let (blank, _blank_dir) = app(no_db("gpt-4o"), llm.clone());
+    let (r, _) = ask(&blank, "x1", "질문", vec![]).await;
+    assert_eq!(r.unwrap().answer, "첫 조각 끝.");
+    let listing = |id: &str| calls(vec![call(id, "file_list", json!({}))]);
+    let llm = Scripted::new(vec![cut_text("첫 조각 "), listing("w1"), cut_text("둘째 조각 "), listing("w2"), listing("w3"), text("끝.")]);
+    let (withheld, _withheld_dir) = app(no_db("gpt-4o"), llm.clone());
+    let (r, _) = ask(&withheld, "x2", "질문", vec![]).await;
+    assert_eq!(r.unwrap().answer, "첫 조각 둘째 조각 끝.");
+}
+
+/// A model that calls `first`, then every continuation (`next_cursor`) its
+/// results name, exactly as given, then answers.
+struct Following {
+    first: Vec<llm_agent::llm::ToolCall>,
+    requests: std::sync::Mutex<Vec<Value>>,
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for Following {
+    async fn complete(&self, request: Value, _config: &llm_agent::config::LlmConfig, _c: CancellationToken, _d: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        let round = {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request.clone());
+            requests.len()
+        };
+        Ok(match round {
+            1 => calls(self.first.clone()),
+            2 => calls(
+                messages(&request, "tool")
+                    .iter()
+                    .filter_map(|m| serde_json::from_str::<Value>(m["content"].as_str()?).ok())
+                    .filter(|result| result["next_cursor"]["tool"].is_string())
+                    .enumerate()
+                    .map(|(i, result)| {
+                        let mut args = result["next_cursor"].clone();
+                        let name = args["tool"].as_str().unwrap().to_owned();
+                        args.as_object_mut().unwrap().remove("tool");
+                        call(&format!("next{i}"), &name, args)
+                    })
+                    .collect(),
+            ),
+            _ => text("답"),
+        })
+    }
+}
+
+/// Y: a cut page of code_outline, symbol_search or symbol_relations repeats
+/// its call's arguments as next_cursor, but without the project (it is taken
+/// off before the call runs): copied as given where several projects are,
+/// the continuation was refused with project_required.
+#[tokio::test]
+async fn a_cut_page_continues_in_its_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = no_db("gpt-4o");
+    for name in ["app", "lib"] {
+        let root = dir.path().join(name);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let code: String = (0..200).map(|f| format!("pub fn {name}_handler_{f}(x: i32) -> i32 {{\n    x + {f}\n}}\n")).collect();
+        std::fs::write(root.join("src/m.rs"), code).unwrap();
+        config.projects.push(llm_agent::config::Project { name: name.into(), root, ..Default::default() });
+    }
+    let llm = std::sync::Arc::new(Following {
+        first: vec![
+            call("o", "code_outline", json!({"project":"lib","path":"src/m.rs","limit":20})),
+            call("s", "symbol_search", json!({"project":"lib","query":"handler","limit":20})),
+        ],
+        requests: Default::default(),
+    });
+    let (app, _dir) = app(config, llm.clone());
+    let (r, _) = ask(&app, "y", "핸들러 목록", vec![]).await;
+    assert_eq!(r.unwrap().answer, "답");
+    let last = llm.requests.lock().unwrap().last().unwrap().clone();
+    for id in ["next0", "next1"] {
+        let result = tool_result(&last, id);
+        assert_eq!(result["status"], "ok", "{result}");
+        assert!(result.to_string().contains("lib_handler_") && !result.to_string().contains("app_handler_"), "{result}");
+    }
+}
+
+/// Z: a question whose own results do not fit was told the conversation was
+/// too long and to ask again in a new conversation, where the same question
+/// fails the same way (earlier questions have all left the context by then).
+#[tokio::test]
+async fn too_much_material_for_one_question_is_not_sent_to_a_new_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    for i in 0..80 {
+        let body: String = (1..=400).map(|l| format!("file {i} line {l} {}\n", "word ".repeat(10))).collect();
+        std::fs::write(root.join(format!("f{i}.txt")), body).unwrap();
+    }
+    let mut config = no_db("gpt-4o");
+    config.llm.context_tokens = 24_000;
+    config.llm.output_tokens = 2_000;
+    config.projects.push(llm_agent::config::Project { name: "app".into(), root, ..Default::default() });
+    let every_file = calls((0..80).map(|i| call(&format!("r{i}"), "file_read", json!({"path":format!("f{i}.txt")}))).collect());
+    let (app, _dir) = app(config, Scripted::new(vec![every_file, text("답")]));
+    let (r, _) = ask(&app, "z", "모든 파일을 요약해줘", vec![]).await;
+    let error = r.err().expect("too much material").to_string();
+    assert!(error.contains("질문을 나누거나") && !error.contains("새 대화"), "{error}");
+}

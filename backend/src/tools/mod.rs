@@ -1861,10 +1861,14 @@ pub fn bound_result(
     // only when its text cannot be narrowed to the limit.
     let reads_file = matches!(call.name.as_str(), "file_read" | "symbol_read")
         && output["data"]["content"]["text"].is_string();
+    // A history search pages by itself (after: next_cursor): it is archived
+    // only when not one match fits. An archive would also hold the search's
+    // own words for the searches after it to find.
+    let pages = call.name == "history" && args["action"] == "search";
     output["truncated"] = json!(true);
     // A history read goes on where it started; other archives from the start.
     let from = if call.name == "history" && args["action"] == "read" { args["offset"].as_u64().unwrap_or(0) } else { 0 };
-    if !reads_file {
+    if !reads_file && !pages {
         let archive = archive_for(s, call, args, &result);
         output["archive_id"] = json!(archive);
         output["next_cursor"] = json!({"tool":"history","action":"read","id":archive,"offset":from});
@@ -1939,15 +1943,6 @@ pub fn bound_result(
             return output;
         }
     }
-    let archive = match output["archive_id"].as_u64() {
-        Some(id) => id,
-        None => {
-            let id = archive_for(s, call, args, &result);
-            output["archive_id"] = json!(id);
-            output["next_cursor"] = json!({"tool":"history","action":"read","id":id,"offset":from});
-            id
-        }
-    };
     // Collections stay structured: a shortened native page resumes at the
     // first omitted item, other collections continue in the archive.
     for field in ["paths", "matches", "items", "rows", "hits", "outline", "files", "counts"] {
@@ -1994,6 +1989,15 @@ pub fn bound_result(
             return output;
         }
     }
+    let archive = match output["archive_id"].as_u64() {
+        Some(id) => id,
+        None => {
+            let id = archive_for(s, call, args, &result);
+            output["archive_id"] = json!(id);
+            output["next_cursor"] = json!({"tool":"history","action":"read","id":id,"offset":from});
+            id
+        }
+    };
     let mut compact = json!({"status":result["status"],"truncated":true,"data":{"message":"Result retained in history; preview is its start. Read the rest with next_cursor (history read, offset) or find a part with history search."},"next_cursor":{"tool":"history","action":"read","id":archive,"offset":from}});
     if let Some(data) = arguments::compact_data(&result["data"]) {
         compact["data"] = data;
@@ -2347,6 +2351,10 @@ mod tests {
         let items = cut["data"]["items"].as_array().unwrap();
         assert!(!items.is_empty() && items.len() < 10, "{cut}");
         assert_eq!(cut["data"]["next_cursor"], items.last().unwrap()["id"], "{cut}");
+        // It pages by itself: no archive, which would hold the matches for
+        // the next search to find again.
+        assert_eq!(ws.history.bundles.len(), 30, "{cut}");
+        assert!(cut.get("archive_id").is_none() && cut["next_cursor"].is_null(), "{cut}");
     }
 
     #[test]

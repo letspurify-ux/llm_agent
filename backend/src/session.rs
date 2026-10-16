@@ -159,7 +159,7 @@ impl SessionHistory {
             .iter()
             .filter(|b| b.id > after)
             .filter_map(|b| {
-                let text = serde_json::to_string(&crate::context::shown_messages(&b.messages[..])).unwrap_or_default();
+                let text = serde_json::to_string(&crate::context::shown_messages(&without_history_calls(&b.messages[..]))).unwrap_or_default();
                 let lowered = text.to_lowercase();
                 let needle = needles.iter().copied().find(|needle| lowered.contains(needle))?;
                 Some((b, text, needle))
@@ -172,6 +172,33 @@ impl SessionHistory {
             .collect();
         json!({"next_cursor":if rows.len()>items.len(){items.last().and_then(|x|x["id"].as_u64())}else{None},"items":items,"pruned_through":self.pruned_through})
     }
+}
+
+/// A bundle's messages without its history tool calls and their results.
+/// What a search or read showed is found where it came from: searched as
+/// well, an earlier search for the same words (its query, its excerpts) and
+/// every read copy would come back as matches of their own.
+fn without_history_calls(messages: &[Value]) -> Vec<Value> {
+    let calls: std::collections::BTreeSet<String> = messages
+        .iter()
+        .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
+        .filter(|call| call["function"]["name"] == "history")
+        .filter_map(|call| call["id"].as_str().map(str::to_owned))
+        .collect();
+    if calls.is_empty() {
+        return messages.to_vec();
+    }
+    messages
+        .iter()
+        .filter(|m| !(m["role"] == "tool" && m["tool_call_id"].as_str().is_some_and(|id| calls.contains(id))))
+        .map(|m| {
+            let mut m = m.clone();
+            if let Some(tool_calls) = m["tool_calls"].as_array_mut() {
+                tool_calls.retain(|call| call["function"]["name"] != "history");
+            }
+            m
+        })
+        .collect()
 }
 
 /// About 240 characters of `text` around the first match of `query` (in
@@ -485,6 +512,38 @@ mod tests {
         h.bundles[3].active = false;
         h.prune(100);
         assert!(h.read(evicted).is_err() && h.read(archive).is_err());
+    }
+
+    #[test]
+    fn a_history_search_does_not_find_the_history_tool_again() {
+        // An earlier search for the same words (its query and excerpts), and
+        // a read copy of a bundle, came back as matches of their own.
+        let mut h = SessionHistory::default();
+        let found = h.push(vec![json!({"role":"user","content":"the needle is here"})], true);
+        let history_call = |id: &str, args: Value| json!({"id":id,"type":"function","function":{"name":"history","arguments":args.to_string()}});
+        let search = h.search("needle", 0, 10);
+        let read = json!({"status":"ok","data":{"text":serde_json::to_string(&crate::context::shown_messages(&h.bundles[0].messages[..])).unwrap()}});
+        h.push(
+            vec![
+                json!({"role":"assistant","content":null,"tool_calls":[history_call("s", json!({"action":"search","query":"needle"})), history_call("r", json!({"action":"read","id":found})), {"id":"f","type":"function","function":{"name":"file_read","arguments":"{\"path\":\"needle.txt\"}"}}]}),
+                json!({"role":"tool","tool_call_id":"s","content":json!({"status":"ok","data":search}).to_string()}),
+                json!({"role":"tool","tool_call_id":"r","content":read.to_string()}),
+                json!({"role":"tool","tool_call_id":"f","content":json!({"status":"ok","data":{"text":"no match"}}).to_string()}),
+            ],
+            true,
+        );
+        let both = h.push(
+            vec![
+                json!({"role":"assistant","content":null,"tool_calls":[history_call("s2", json!({"action":"search","query":"haystack"}))]}),
+                json!({"role":"tool","tool_call_id":"s2","content":json!({"status":"ok","data":{"items":[{"id":1,"excerpt":"needle"}]}}).to_string()}),
+            ],
+            true,
+        );
+        let ids: Vec<u64> = h.search("needle", 0, 10)["items"].as_array().unwrap().iter().map(|i| i["id"].as_u64().unwrap()).collect();
+        // The bundle with the history calls is still found by its other call.
+        assert_eq!(ids, [found, 2], "{both}");
+        let excerpt = h.search("needle", found, 10)["items"][0]["excerpt"].as_str().unwrap().to_owned();
+        assert!(excerpt.contains("needle.txt") && !excerpt.contains("\"query\""), "{excerpt}");
     }
 
     #[test]

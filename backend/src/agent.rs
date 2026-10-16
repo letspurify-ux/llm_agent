@@ -512,6 +512,10 @@ async fn run(
                 }
             } else if !completion.text.trim().is_empty() && partial.len() < LENGTH_CONTINUATIONS {
                 partial.push(completion.text.clone());
+                // A piece is progress: its continuation gets its own retries
+                // for blank replies and for calls while tools are withheld.
+                empty = 0;
+                withheld = 0;
                 // The pieces so far stay one assistant message, which the
                 // next piece continues.
                 if last_is_partial(c) {
@@ -660,15 +664,16 @@ fn retract(events: &Events, partial: &[String]) {
 
 /// A request that does not fit with every old bundle evicted, told by what
 /// fills it: the frame alone (no question fits the configured context), the
-/// question (a new conversation would fail the same way), or the
-/// conversation.
+/// question, or what this question gathered (its newest results or answer
+/// pieces). Earlier questions have all left the context by then, so a new
+/// conversation would fail the same way: only a narrower question helps.
 fn too_long(frame_fits: bool, question_fits: bool) -> UserFacing {
     UserFacing(if !frame_fits {
         "모델 컨텍스트 설정이 너무 작아 답할 수 없습니다. 설정에서 컨텍스트와 출력 한도를 확인해주세요.".into()
     } else if !question_fits {
         "질문이 너무 길어 답할 수 없습니다. 질문을 줄여 다시 시도해주세요.".into()
     } else {
-        "대화가 너무 길어 이어서 답할 수 없습니다. 새 대화로 다시 질문해주세요.".into()
+        "이번 질문에 필요한 자료가 한 번에 담기지 않아 답할 수 없습니다. 질문을 나누거나 범위를 좁혀 다시 시도해주세요.".into()
     })
 }
 
@@ -1023,7 +1028,8 @@ async fn execute_batch(
             if call.name != "history" {
                 result["root"] = json!(root_text.display().to_string());
             }
-            let mut result = tools::limit_result(&mut workspace, &call, &clean, result, share);
+            let continued = continuation_args(&call.name, &clean, &workspace.project);
+            let mut result = tools::limit_result(&mut workspace, &call, &continued, result, share);
             if call.name != "history" && result.get("root").is_none() {
                 result["root"] = json!(root_text.display().to_string());
             }
@@ -1303,6 +1309,9 @@ fn fit_batch(ws: &mut Workspace, calls: &[ToolCall], prepared: &[Prepared], resu
             fields.remove("project");
             fields.remove("__adjusted");
         }
+        if let Prepared::Source { project, .. } = &prepared[index] {
+            args = continuation_args(&calls[index].name, &args, project);
+        }
         let limit = size.saturating_sub(total - room).max(crate::config::MIN_RESULT_TOKENS);
         let result = std::mem::take(&mut results[index]);
         let cut = tools::bound_result(ws, &calls[index], &args, result, limit);
@@ -1311,6 +1320,19 @@ fn fit_batch(ws: &mut Workspace, calls: &[ToolCall], prepared: &[Prepared], resu
         sizes[index] = cut_size;
         results[index] = cut;
     }
+}
+
+/// The arguments a cut result's continuation repeats (a page of
+/// code_outline, symbol_search or symbol_relations): with the project the
+/// call ran in, which the call may have left out (a path found in one
+/// project, the only project). Copied as given, a continuation without it is
+/// refused where several projects are.
+fn continuation_args(name: &str, args: &Value, project: &Project) -> Value {
+    let mut args = args.clone();
+    if name != "history" && args.is_object() {
+        args["project"] = json!(project.name);
+    }
+    args
 }
 
 fn search_targets(args: &Value) -> Value {
