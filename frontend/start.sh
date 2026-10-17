@@ -32,7 +32,7 @@ echo $! > "$PID_FILE"
 sleep 1
 if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   PID=$(cat "$PID_FILE")
-  START_TIME=$(ps -p "$PID" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//') || START_TIME=''
+  START_TIME=$(process_start "$PID") || START_TIME=''
   printf '%s %s\n' "$PID" "$START_TIME" > "$OWNER_FILE"
   echo "[frontend] started (PID $(cat "$PID_FILE")) — see the log for the URL: $LOG_FILE"
 else

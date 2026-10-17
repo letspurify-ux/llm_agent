@@ -3,8 +3,14 @@
 frontend_dir=$(pwd -P)
 OWNER_FILE=.frontend.owner
 
+# Both ends are trimmed: macOS pads lstart to a fixed width, and the owner
+# marker is read back with `read`, which drops trailing blanks. Trimming only
+# the leading ones left the written and the probed value unequal, so a server
+# never recognised itself (start.sh started a second one, stop.sh reported it
+# already gone). Internal spacing is kept — `read` keeps it too, and a
+# single-digit day has two spaces before it.
 process_start() {
-  ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//'
+  ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 
 is_ours() {
