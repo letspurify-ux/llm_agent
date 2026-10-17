@@ -4,7 +4,16 @@ import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.j
 // Both sizes share the same character; the small brand mark uses a portrait crop.
 export function mountRobot(host, { variant = 'portrait' } = {}) {
   const standing = variant === 'standing';
-  const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, powerPreference: 'low-power' });
+  // three.js needs WebGL2, asked for here first: where the browser cannot make
+  // one (no GPU, WebGL turned off) the robot is left out quietly, while
+  // three.js would report it with console.error on every page.
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('webgl2', {
+    alpha: true, depth: true, stencil: false, antialias: true, premultipliedAlpha: true,
+    preserveDrawingBuffer: false, powerPreference: 'low-power',
+  });
+  if (!context) return undefined;
+  const renderer = new THREE.WebGLRenderer({ canvas, context, alpha: true, antialias: true, powerPreference: 'low-power' });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.setClearColor(0, 0);
   renderer.outputColorSpace = THREE.SRGBColorSpace;

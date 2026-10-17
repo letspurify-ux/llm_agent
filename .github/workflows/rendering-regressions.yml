@@ -7,7 +7,9 @@ permissions:
 jobs:
   rendering:
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    # 전체 묶음(unit·ui·admin·production·inline-math)이 로컬 Mac에서 10.5분, 러너에서는 그 두 배 남짓이다 —
+    # 20분 한도에서는 통과하는 실행도 끝나기 전에 취소됐다.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

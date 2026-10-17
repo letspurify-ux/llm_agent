@@ -723,7 +723,7 @@ export default function App() {
       const d = summary?.parentElement;
       if (d && !d.open) {
         unstick();
-        openingAnchor = { d, summary, top: summary.getBoundingClientRect().top };
+        openingAnchor = { d, summary, top: summary.getBoundingClientRect().top, at: performance.now() };
       }
     };
     const onToggle = e => {
@@ -732,14 +732,24 @@ export default function App() {
       if (openingAnchor?.d !== e.target) return;
       // 따라가기를 멈춰도 브라우저의 스크롤 앵커 보정이 펼친 패널의 머리를
       // 옮길 수 있다. 기본 펼침과 React 렌더 뒤에 클릭 당시의 화면 좌표를 복원한다.
+      // 패널의 내용은 한 번에 서지 않는다 — 실행 과정의 표는 toggle을 받은 React가 다음 렌더에서야
+      // 그린다(TracePanel opened). 그 렌더가 한 번뿐이던 보정 프레임보다 늦으면 두 번째 이동이 남았다
+      // (실측: 170px, 30ms 뒤 971px 두 번 자라 머리가 19px 내려갔다). 그래서 패널의 높이가 두 프레임
+      // 그대로일 때까지(길어야 1초) 프레임마다 되돌린다. 그사이 사용자가 움직이면(휠·키·손가락) 그 뜻을 따른다.
       const anchor = openingAnchor;
       openingAnchor = null;
       cancelAnimationFrame(anchorFrame);
-      anchorFrame = requestAnimationFrame(() => {
-        if (anchor.d.open && el.contains(anchor.summary)) {
-          el.scrollTop += anchor.summary.getBoundingClientRect().top - anchor.top;
-        }
-      });
+      let height = -1;
+      let still = 0;
+      const hold = () => {
+        if (!anchor.d.open || !el.contains(anchor.summary) || inputAtRef.current > anchor.at) return;
+        el.scrollTop += anchor.summary.getBoundingClientRect().top - anchor.top;
+        const now = anchor.d.offsetHeight;
+        still = now === height ? still + 1 : 0;
+        height = now;
+        if (still < 2 && performance.now() - anchor.at < 1000) anchorFrame = requestAnimationFrame(hold);
+      };
+      anchorFrame = requestAnimationFrame(hold);
     };
     el?.addEventListener('click', onSummaryClick, true);
     el?.addEventListener('toggle', onToggle, true);
