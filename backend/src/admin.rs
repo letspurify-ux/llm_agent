@@ -5,7 +5,7 @@
 
 use crate::{
     app::App,
-    config::{Config, Project, Secret},
+    config::{Config, McpServer, Project, Secret},
     db::{self, Param, exec_on, marks, n, p, plain_on, query_on},
     text::{js_trim, name_index_of, name_key, password_env_reference, target_db_names, utf16_len},
 };
@@ -81,6 +81,10 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
         .route("/directories", get(directories))
         .route("/settings", get(settings_get).put(settings_put))
         .route("/settings/check", post(settings_check))
+        .route("/mcp", get(mcp_list).post(mcp_create))
+        .route("/mcp/{name}", get(mcp_read).put(mcp_update).delete(mcp_remove))
+        .route("/mcp/{name}/restart", post(mcp_restart))
+        .route("/mcp-check", post(mcp_check))
         .route("/{resource}", get(list).post(create))
         .route("/{resource}/{id}", get(read).put(update).delete(remove))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024 * 1024 - 1))
@@ -823,6 +827,7 @@ fn settings_view(app: &App, config: &Config) -> Value {
     let mut sections = serde_json::to_value(config).unwrap_or_default();
     if let Some(fields) = sections.as_object_mut() {
         fields.remove("projects");
+        fields.remove("mcp_servers");
     }
     let started = &app.started;
     let mut restart = vec![];
@@ -864,7 +869,8 @@ fn draft(current: &Config, body: &Value) -> ApiResult<Config> {
     let mut merged = serde_json::to_value(current).unwrap_or_default();
     if let Some(sections) = body["config"].as_object() {
         for (key, value) in sections {
-            if key == "projects" {
+            // Projects and MCP servers have their own editors.
+            if key == "projects" || key == "mcp_servers" {
                 continue;
             }
             let Some(section) = merged.get_mut(key) else {
@@ -883,6 +889,7 @@ fn draft(current: &Config, body: &Value) -> ApiResult<Config> {
     let mut config: Config = serde_json::from_value(merged)
         .map_err(|e| ApiError::new(400, format!("설정 형식이 올바르지 않습니다: {e}")))?;
     config.projects = current.projects.clone();
+    config.mcp_servers = current.mcp_servers.clone();
     config.llm.api_key = current.llm.api_key.clone();
     config.mariadb.password = current.mariadb.password.clone();
     config.admin_token = current.admin_token.clone();
@@ -985,6 +992,314 @@ async fn settings_check(State(app): State<Arc<App>>, body: Bytes) -> ApiResult<J
         Ok(message) => json!({"ok":true,"message":message}),
         Err(e) => json!({"ok":false,"message":format!("{e:#}")}),
     }))
+}
+
+// ===== MCP servers (config.toml, docs/mcp-design.md) =====
+
+/// Why the screen may not change MCP servers, if it may not. A server runs
+/// a command on the server PC, so it takes an admin key — one the backend
+/// started with: while no key is set the admin API is open, and whoever set
+/// a key first could otherwise add a command at once. A key set since the
+/// start counts after a restart, which needs the server PC. Editing
+/// config.toml always works.
+fn mcp_lock(app: &App) -> Option<&'static str> {
+    if app.config().admin_token.is_none() {
+        Some("MCP 서버는 서버 PC에서 명령을 실행하는 설정이라 관리자 인증 키를 등록한 뒤에만 화면에서 바꿀 수 있습니다. 설정 탭에서 관리자 인증 키를 먼저 등록하고 backend를 다시 시작하거나, config.toml을 직접 고쳐주세요.")
+    } else if app.started.admin_token.is_none() {
+        Some("관리자 인증 키가 backend가 시작된 뒤에 등록되었습니다. 키 없이 열려 있던 동안 다른 사람이 먼저 키를 등록했을 수도 있어, MCP 서버(명령 실행)는 backend를 다시 시작한 뒤부터 화면에서 바꿀 수 있습니다. config.toml 직접 편집은 지금도 됩니다.")
+    } else {
+        None
+    }
+}
+
+fn require_admin_key(app: &App) -> ApiResult<()> {
+    match mcp_lock(app) {
+        Some(reason) => Err(ApiError::new(403, reason)),
+        None => Ok(()),
+    }
+}
+
+fn mcp_revision(app: &App, server: &McpServer) -> String {
+    let mut hash = Sha256::new();
+    hash.update(serde_json::to_vec(server).unwrap_or_default());
+    for (kind, values) in [("env", &server.secret_env), ("headers", &server.secret_headers)] {
+        for (key, value) in values {
+            for part in [kind, key.as_str(), value.0.as_str()] {
+                hash.update(part.len().to_le_bytes());
+                hash.update(part.as_bytes());
+            }
+        }
+    }
+    hmac_revision(app, "mcp", &hex::encode(hash.finalize()))
+}
+
+/// A server as the screen edits it: secrets by name only, with its live
+/// state.
+fn mcp_view(app: &App, server: &McpServer) -> Value {
+    let config = app.config();
+    json!({
+        "name":server.name,"description":server.description,"enabled":server.enabled,
+        "transport":if server.url.trim().is_empty() { "stdio" } else { "http" },
+        "command":server.command,"args":server.args,"cwd":server.cwd,"url":server.url,
+        "tools":server.tools,"timeout_secs":server.timeout_secs,"env":server.env,"headers":server.headers,
+        "secrets":{"env":server.secret_env.keys().collect::<Vec<_>>(),"headers":server.secret_headers.keys().collect::<Vec<_>>()},
+        "revision":mcp_revision(app, server),
+        "status":app.mcp.server_status(&server.name, &config.llm.model)
+    })
+}
+
+fn find_mcp(app: &App, name: &str) -> ApiResult<McpServer> {
+    app.config()
+        .mcp_servers
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case(name))
+        .cloned()
+        .ok_or_else(|| ApiError::new(404, "MCP 서버가 없거나 이미 삭제되었습니다. 목록을 새로고침해주세요."))
+}
+
+async fn mcp_list(State(app): State<Arc<App>>) -> Json<Value> {
+    let config = app.config();
+    Json(json!({
+        "servers":config.mcp_servers.iter().map(|s| mcp_view(&app, s)).collect::<Vec<_>>(),
+        "default_timeout_secs":config.agent.tool_timeout_secs,
+        "editable":mcp_lock(&app).is_none(),
+        "locked_reason":mcp_lock(&app)
+    }))
+}
+
+async fn mcp_read(State(app): State<Arc<App>>, Path(name): Path<String>) -> ApiResult<Response> {
+    let server = find_mcp(&app, &name)?;
+    Ok(record(mcp_view(&app, &server), StatusCode::OK))
+}
+
+/// The server `body` describes over `server`: fields present replace it,
+/// secrets are set (text), removed (null) or kept (absent). The fields of
+/// the other connection kind are dropped.
+fn mcp_draft(body: &Value, mut server: McpServer) -> ApiResult<McpServer> {
+    let object = body.as_object().ok_or_else(|| ApiError::new(400, "입력 내용을 확인해주세요."))?;
+    let (before_url, before_secrets): (String, Vec<String>) = (server.url.clone(), server.secret_headers.keys().cloned().collect());
+    let bad = |key: &str| ApiError::new(400, format!("MCP 서버 설정의 {key} 값 형식이 올바르지 않습니다."));
+    let text = |key: &str| -> ApiResult<Option<String>> {
+        match object.get(key) {
+            None => Ok(None),
+            Some(Value::String(v)) => Ok(Some(v.clone())),
+            Some(Value::Null) => Ok(Some(String::new())),
+            Some(_) => Err(bad(key)),
+        }
+    };
+    let list = |key: &str| -> ApiResult<Option<Vec<String>>> {
+        match object.get(key) {
+            None => Ok(None),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| v.as_str().map(str::to_owned).ok_or_else(|| bad(key)))
+                .collect::<ApiResult<Vec<_>>>()
+                .map(Some),
+            Some(Value::String(lines)) => Ok(Some(lines.lines().map(|l| l.trim_end_matches('\r').to_owned()).filter(|l| !l.trim().is_empty()).collect())),
+            Some(_) => Err(bad(key)),
+        }
+    };
+    let map = |key: &str| -> ApiResult<Option<std::collections::BTreeMap<String, String>>> {
+        match object.get(key) {
+            None => Ok(None),
+            Some(Value::Object(fields)) => fields
+                .iter()
+                .map(|(k, v)| v.as_str().map(|v| (js_trim(k).to_owned(), v.to_owned())).ok_or_else(|| bad(key)))
+                .collect::<ApiResult<_>>()
+                .map(Some),
+            Some(_) => Err(bad(key)),
+        }
+    };
+    if let Some(v) = text("name")? {
+        server.name = js_trim(&v).to_owned();
+    }
+    if let Some(v) = text("description")? {
+        server.description = js_trim(&v).to_owned();
+    }
+    match object.get("enabled") {
+        None => {}
+        Some(Value::Bool(v)) => server.enabled = *v,
+        Some(_) => return Err(bad("enabled")),
+    }
+    if let Some(v) = text("command")? {
+        server.command = js_trim(&v).to_owned();
+    }
+    if let Some(v) = text("cwd")? {
+        server.cwd = js_trim(&v).to_owned();
+    }
+    if let Some(v) = text("url")? {
+        server.url = js_trim(&v).to_owned();
+    }
+    if let Some(v) = list("args")? {
+        server.args = v;
+    }
+    if let Some(v) = list("tools")? {
+        let mut tools: Vec<String> = vec![];
+        for tool in v.iter().map(|t| js_trim(t).to_owned()).filter(|t| !t.is_empty()) {
+            if !tools.contains(&tool) {
+                tools.push(tool);
+            }
+        }
+        server.tools = tools;
+    }
+    match object.get("timeout_secs") {
+        None => {}
+        Some(Value::Null) => server.timeout_secs = None,
+        Some(Value::String(v)) if v.trim().is_empty() => server.timeout_secs = None,
+        Some(v) => server.timeout_secs = Some(v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())).ok_or_else(|| bad("timeout_secs"))?),
+    }
+    if let Some(v) = map("env")? {
+        server.env = v;
+    }
+    if let Some(v) = map("headers")? {
+        server.headers = v;
+    }
+    if let Some(secrets) = object.get("secrets") {
+        let secrets = secrets.as_object().ok_or_else(|| bad("secrets"))?;
+        for (kind, values) in secrets {
+            let target = match kind.as_str() {
+                "env" => &mut server.secret_env,
+                "headers" => &mut server.secret_headers,
+                _ => return Err(bad("secrets")),
+            };
+            for (key, value) in values.as_object().ok_or_else(|| bad("secrets"))? {
+                let key = js_trim(key).to_owned();
+                match value {
+                    Value::Null => {
+                        target.remove(&key);
+                    }
+                    Value::String(v) if !v.is_empty() => {
+                        target.insert(key, Secret(v.clone()));
+                    }
+                    Value::String(_) => {}
+                    _ => return Err(bad("secrets")),
+                }
+            }
+        }
+    }
+    // Stored secret headers (a token) are not sent to another host than the
+    // one they were entered for — a mistyped address would receive them.
+    // Each must be entered again or removed in the same request.
+    let origin = |url: &str| reqwest::Url::parse(url).ok().map(|u| (u.scheme().to_owned(), u.host_str().map(str::to_owned), u.port_or_known_default()));
+    if !before_secrets.is_empty() && !server.url.is_empty() && origin(&before_url) != origin(&server.url) {
+        let answered = |key: &str| {
+            object
+                .get("secrets")
+                .and_then(|s| s.get("headers"))
+                .and_then(Value::as_object)
+                .is_some_and(|h| h.keys().any(|k| js_trim(k).eq_ignore_ascii_case(key)))
+        };
+        let unanswered: Vec<&str> = before_secrets.iter().map(String::as_str).filter(|key| !answered(key)).collect();
+        if !unanswered.is_empty() {
+            return Err(ApiError::new(
+                400,
+                format!(
+                    "서버 주소의 호스트가 바뀌어 저장된 비밀 헤더({})를 새 주소로 보내지 않습니다. 비밀 헤더를 다시 넣거나 지운 뒤 저장해주세요.",
+                    unanswered.join(", ")
+                ),
+            ));
+        }
+    }
+    if server.url.is_empty() {
+        server.headers.clear();
+        server.secret_headers.clear();
+    } else if server.command.is_empty() {
+        server.args.clear();
+        server.cwd.clear();
+        server.env.clear();
+        server.secret_env.clear();
+    }
+    crate::mcp::validate_server(&server).map_err(|e| ApiError::new(400, e.to_string()))?;
+    Ok(server)
+}
+
+fn store_mcp(app: &App, config: Config) -> ApiResult<()> {
+    let stored = app
+        .store_config(config)
+        .map_err(|e| ApiError::new(500, format!("설정을 저장하지 못했습니다: {e}")))?;
+    app.mcp.apply(&stored.mcp_servers);
+    Ok(())
+}
+
+async fn mcp_create(State(app): State<Arc<App>>, body: Bytes) -> ApiResult<Response> {
+    require_admin_key(&app)?;
+    let body = body_json(&body)?;
+    let server = mcp_draft(&body, McpServer::default())?;
+    let _guard = app.config_write.lock().await;
+    let mut config = (*app.config()).clone();
+    if config.mcp_servers.iter().any(|s| s.name.eq_ignore_ascii_case(&server.name)) {
+        return Err(ApiError::new(409, "같은 이름의 MCP 서버가 이미 있습니다."));
+    }
+    config.mcp_servers.push(server.clone());
+    store_mcp(&app, config)?;
+    Ok(record(mcp_view(&app, &server), StatusCode::CREATED))
+}
+
+const MCP_CHANGED: &str = "이 MCP 서버는 다른 화면에서 변경되었습니다. 입력 내용을 보관한 뒤 다시 열어 확인해주세요.";
+
+async fn mcp_update(State(app): State<Arc<App>>, Path(name): Path<String>, headers: HeaderMap, body: Bytes) -> ApiResult<Response> {
+    require_admin_key(&app)?;
+    let body = body_json(&body)?;
+    let revision = require_revision(&if_match(&headers))?;
+    let _guard = app.config_write.lock().await;
+    let existing = find_mcp(&app, &name)?;
+    if mcp_revision(&app, &existing) != revision {
+        return Err(ApiError::new(409, MCP_CHANGED));
+    }
+    let server = mcp_draft(&body, existing.clone())?;
+    let mut config = (*app.config()).clone();
+    if config
+        .mcp_servers
+        .iter()
+        .any(|s| !s.name.eq_ignore_ascii_case(&existing.name) && s.name.eq_ignore_ascii_case(&server.name))
+    {
+        return Err(ApiError::new(409, "같은 이름의 MCP 서버가 이미 있습니다."));
+    }
+    for slot in &mut config.mcp_servers {
+        if slot.name.eq_ignore_ascii_case(&existing.name) {
+            *slot = server.clone();
+        }
+    }
+    store_mcp(&app, config)?;
+    Ok(record(mcp_view(&app, &server), StatusCode::OK))
+}
+
+async fn mcp_remove(State(app): State<Arc<App>>, Path(name): Path<String>, headers: HeaderMap) -> ApiResult<StatusCode> {
+    require_admin_key(&app)?;
+    let revision = require_revision(&if_match(&headers))?;
+    let _guard = app.config_write.lock().await;
+    let existing = find_mcp(&app, &name)?;
+    if mcp_revision(&app, &existing) != revision {
+        return Err(ApiError::new(409, MCP_CHANGED));
+    }
+    let mut config = (*app.config()).clone();
+    config.mcp_servers.retain(|s| !s.name.eq_ignore_ascii_case(&existing.name));
+    store_mcp(&app, config)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn mcp_restart(State(app): State<Arc<App>>, Path(name): Path<String>) -> ApiResult<Response> {
+    require_admin_key(&app)?;
+    let server = find_mcp(&app, &name)?;
+    if !app.mcp.restart(&server.name) {
+        return Err(ApiError::new(409, "꺼진 서버는 다시 연결할 수 없습니다. 먼저 사용으로 바꿔 저장해주세요."));
+    }
+    Ok(record(mcp_view(&app, &server), StatusCode::OK))
+}
+
+/// Connects with the draft settings (over the stored ones of `original`,
+/// its secrets included), lists the tools and disconnects.
+async fn mcp_check(State(app): State<Arc<App>>, body: Bytes) -> ApiResult<Json<Value>> {
+    require_admin_key(&app)?;
+    let body = body_json(&body)?;
+    let base = match body["original"].as_str().filter(|n| !n.is_empty()) {
+        Some(name) => find_mcp(&app, name)?,
+        None => McpServer::default(),
+    };
+    let server = mcp_draft(&body, base)?;
+    let model = app.config().llm.model.clone();
+    let result = crate::mcp::probe(&server, &model).await.map_err(|e| ApiError::new(400, e.to_string()))?;
+    Ok(Json(result))
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ use crate::{
     embed_sync::EmbedSync,
     embedding::QueryCache,
     llm::LlmClient,
+    mcp::McpHub,
     oracle::Oracle,
     session::SessionStore,
 };
@@ -29,6 +30,8 @@ pub struct App {
     pub llm: Arc<dyn LlmClient>,
     pub embeddings: QueryCache,
     pub sync: EmbedSync,
+    /// MCP tool servers; `serve` starts them from the settings.
+    pub mcp: McpHub,
     /// Key of admin record revisions; a restart invalidates open editors.
     pub revision_key: [u8; 32],
     pub shutdown: CancellationToken,
@@ -49,6 +52,7 @@ impl App {
             llm,
             embeddings: QueryCache::default(),
             sync: EmbedSync::default(),
+            mcp: McpHub::default(),
             revision_key: rand::random(),
             shutdown: CancellationToken::new(),
             pending_logs: AtomicUsize::new(0),

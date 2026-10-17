@@ -28,8 +28,14 @@ jobs:
   backend:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    env:
+      # MCP 검사는 가짜 MCP 서버를 Node로 띄운다 — 없으면 건너뛰지 말고 실패한다.
+      REQUIRE_NODE: '1'
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
@@ -41,3 +47,26 @@ jobs:
       # DB·LLM·Oracle 없이 도는 검사만 실행한다. MariaDB·Oracle 통합 검사는 환경변수
       # (LLM_AGENT_TEST_MARIADB·LLM_AGENT_TEST_ORACLE)가 있을 때만 돈다 — README '검사' 참고.
       - run: cargo test --manifest-path backend/Cargo.toml
+
+  # MCP 도구 서버는 Windows에서 Job Object로 프로세스를 묶고 npx.cmd 같은 배치 파일을 실행한다 —
+  # macOS·Linux에서는 그 경로를 잴 수 없어 Windows에서 따로 돌린다(가짜 MCP 서버는 Node로 뜬다).
+  backend-windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      REQUIRE_NODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            backend/target
+          key: cargo-windows-${{ hashFiles('backend/Cargo.lock') }}
+      - run: cargo test --manifest-path backend/Cargo.toml --test mcp
+      - run: "cargo test --manifest-path backend/Cargo.toml --lib mcp::"

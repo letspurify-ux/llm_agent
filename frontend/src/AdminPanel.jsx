@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import './admin.css';
 import BindConfigEditor from './BindConfigEditor.jsx';
 import DirectoryPicker from './DirectoryPicker.jsx';
+import McpPanel from './McpPanel.jsx';
 import SettingsPanel from './SettingsPanel.jsx';
 import { readBindings, serializeBindings } from './admin-bindings.js';
 
@@ -38,6 +39,7 @@ const SECTIONS = {
       ['include', '포함 패턴', 'textarea', null, false, '한 줄에 하나. 비우면 전체 (예: src/**)'],
       ['exclude', '제외 패턴', 'textarea', null, false, '한 줄에 하나 (예: **/*.log). .git·node_modules·target·dist·build는 항상 제외됩니다.'],
     ] },
+  mcp: { label: 'MCP', title: 'MCP 도구 서버', description: '외부 시스템의 도구를 MCP 서버로 연결해 에이전트가 쓰게 합니다. 서버마다 허용한 도구만 모델에 보이며, 저장하면 다음 질문부터 적용됩니다.', singleton: true, fields: [] },
   settings: { label: '설정', title: '서버 설정', description: '모델 연결, 임베딩, 관리 DB, Oracle 클라이언트, 실행 한도를 관리합니다. 저장하면 다음 질문부터 적용됩니다.', singleton: true, fields: [] },
 };
 const blank = kind => Object.fromEntries(SECTIONS[kind].fields.map(([key]) => [key, key === 'db_type' ? 'oracle' : key === 'query_type' ? 'QUERY' : key === 'bind_config' ? readBindings('') : '']));
@@ -98,9 +100,11 @@ export default function AdminPanel({ onStateChange }) {
       if (response.status === 401) {
         setNeedsAuth(true); setList(null);
         if (authAttempted) setAuthError('인증에 실패했습니다. 관리자 인증 키를 확인한 후 다시 입력해주세요.');
+        throw new Error(data.error || '요청을 처리하지 못했습니다.');
       }
-      if (!response.ok) throw new Error(data.error || '요청을 처리하지 못했습니다.');
+      // 401이 아니면 키는 통과했다: 관리 DB가 꺼져 목록이 500이어도 DB가 필요 없는 탭(MCP·설정)은 열린다.
       setNeedsAuth(false); setAuthError(''); setAuthAttempted(false);
+      if (!response.ok) throw new Error(data.error || '요청을 처리하지 못했습니다.');
       return data;
     } catch (e) {
       if (controller.signal.aborted && !signal?.aborted) throw new Error('서버 응답이 늦어지고 있습니다. 목록을 새로고침해 저장 여부를 확인해주세요.');
@@ -258,7 +262,7 @@ export default function AdminPanel({ onStateChange }) {
         <div className="admin-section-heading"><div><h3>{config.title}</h3><p>{config.description}</p></div>
           {!config.singleton && <button className="admin-primary" type="button" disabled={busy || opening || loading} onClick={() => openEditor(null)}><span aria-hidden="true">＋</span> {config.label} 추가</button>}
         </div>
-        {config.singleton ? <SettingsPanel api={api} onStateChange={setSettingsState} /> : <>
+        {config.singleton ? kind === 'mcp' ? <McpPanel api={api} onStateChange={setSettingsState} /> : <SettingsPanel api={api} onStateChange={setSettingsState} /> : <>
         <div className="admin-feedback" aria-live="polite">
           {error && <div ref={feedbackRef} role="alert" className="admin-error">{error}</div>}
           {notice && <div role="status" className="admin-success">{notice}</div>}

@@ -23,6 +23,7 @@ backend는 Rust(axum)다 — MnemoArc의 질문 모드(일반 작업) 런타임�
 - **LLM**: OpenRouter / vLLM / Ollama 등 OpenAI 호환 `/chat/completions` (tool calling을 지원하는 모델)
 - **임베딩**: Ollama 등 OpenAI 호환 `/embeddings` (1024차원 — bge-m3, qwen3-embedding:0.6b)
 - **설정**: 모두 관리자 화면의 **설정** 탭에서 바꾼다 — `backend/config.toml`과 비밀값 파일 `backend/config.credentials.json`에 저장된다
+- **도구 확장**: MCP(Model Context Protocol) 서버의 도구를 코드 수정 없이 붙인다 — 관리자 화면 **MCP** 탭 또는 `config.toml`의 `[[mcp_servers]]` (아래 'MCP 도구 서버로 도구 붙이기')
 
 ## 대화 맥락
 
@@ -58,6 +59,8 @@ backend/                     # Rust (cargo) — 실행 파일 target/release/llm
   src/llm.rs                 # OpenAI 호환 SSE 클라이언트 (MnemoArc)
   src/voc_tools.rs           # search·knowledge_read·method_read·query_describe·query_run·result_read
   src/tools/                 # 프로젝트 소스 도구 (MnemoArc: 검색·tree-sitter 구조·심볼 탐색·결과 한도)
+  src/mcp/                   # MCP 도구 서버 연결·재연결·호출·결과 변환 (docs/mcp-design.md)
+  tests/fixtures/fake_mcp_server.mjs  # 시험용 가짜 MCP 서버 (stdio·HTTP, Node)
   src/search.rs, embed_sync.rs, embedding.rs, chunk.rs   # 벡터 검색·동기화
   src/oracle.rs, sql.rs, execution.rs, numbers.rs        # Oracle 실행·조회 전용 가드·루틴·NUMBER
   tests/                     # 통합 검사 (MariaDB·Oracle은 환경변수가 있을 때만)
@@ -269,8 +272,11 @@ Windows의 `start.bat`(`start_all.bat`도 이것을 부른다)은 같은 파일�
 #### 회귀 검증
 
 ```bash
-cd backend && cargo test   # 청커·SQL 가드·바인드·NUMBER·설정·도구 한도·맥락 비우기·관리 API·답변 루프 — DB 없이 1~2분
+cd backend && cargo test   # 청커·SQL 가드·바인드·NUMBER·설정·도구 한도·맥락 비우기·관리 API·답변 루프·MCP — DB 없이 1~2분
 ```
+
+MCP 검사(`tests/mcp.rs`)는 `node`로 가짜 MCP 서버(`tests/fixtures/fake_mcp_server.mjs`)를 stdio·HTTP로 띄워 연결·호출·시간 초과와 취소·
+호출 중 프로세스 죽음과 재연결·stdout 오염·stderr 폭주·도구 목록 변경·손자 프로세스 정리·환경 격리·관리 API를 잰다(node가 없으면 건너뛴다).
 
 MariaDB·Oracle·임베딩이 필요한 통합 검사는 환경변수가 있을 때만 돈다(없으면 건너뛰었다고 찍는다).
 검사마다 `llm_agent_rs_test_*` DB를 새로 만들어 `schema.sql`·`seed.sql`을 싣고 끝나면 지운다 — 운영 DB는 건드리지 않는다.
@@ -285,7 +291,7 @@ MariaDB·Oracle·임베딩이 필요한 통합 검사는 환경변수가 있을 
 cd frontend
 npm test          # 순수 함수의 계약(수식 판정·차트 파싱·표 채우기·trace/CSV·설정 변환·주소 규칙)과 띄운 것을 내리는 규칙 — 몇 초
 npm run test:ui   # 화면 동작의 계약 — 진짜 Chrome을 headless로 띄운다 (약 2분)
-npm run test:admin # 관리자 검색·페이지 이동·저장·인증·작은 화면 검증
+npm run test:admin # 관리자 검색·페이지 이동·저장·인증·작은 화면, MCP 탭(상태·허용 도구·비밀값·연결 확인·보기 전용) 검증
 npm run test:production # 현재 소스를 빌드하고 preview 서버에서 핵심 화면 동작을 검증
 npm run test:all  # 위 넷과 수식 화면 검사를 차례로
 npm run test:regression # 필수 전체 회귀 (Chrome 누락도 실패)
@@ -302,12 +308,12 @@ npm run test:regression # 필수 전체 회귀 (Chrome 누락도 실패)
 
 수식·Markdown·차트 관련 버그별 정식 테스트는 [회귀 검사 목록](docs/rendering-regressions.md)에 정리했다.
 GitHub Actions는 모든 push/PR에서 프런트의 `test:regression`(Node 22 이상과 Chrome, `npm ci`)과
-백엔드의 `cargo test`를 실행한다. 실제 DB나 LLM 서버는 사용하지 않는다.
+백엔드의 `cargo test`를 실행하고, Windows에서 MCP 검사(`cargo test --test mcp`)를 따로 돌린다. 실제 DB나 LLM 서버는 사용하지 않는다.
 
 #### 관리자 화면
 
 상단 **관리자**를 누르면 기존 대화와 입력 중인 질문을 유지하면서 설정 화면을 연다.
-**채팅으로**를 누르면 대화로 돌아간다. 다섯 탭에서 목록 검색과 항목 추가·수정·삭제를, **설정** 탭에서 서버 설정을 한다.
+**채팅으로**를 누르면 대화로 돌아간다. 다섯 탭에서 목록 검색과 항목 추가·수정·삭제를, **MCP** 탭에서 도구 서버를, **설정** 탭에서 서버 설정을 한다.
 
 | 탭 | 관리 내용 | 검색 대상 |
 | --- | --- | --- |
@@ -316,6 +322,7 @@ GitHub Actions는 모든 push/PR에서 프런트의 `test:regression`(Node 22 �
 | 방법 | 제목·Q&A 처리 절차 | 제목·처리 방법 본문 |
 | 쿼리 | 이름·SQL·입력/출력 설명·대상 DB | 이름·SQL·모든 설명·대상 DB |
 | 프로젝트 | 이름·설명·소스 폴더·참고 문서·포함/제외 패턴 (아래 '프로젝트 소스로 답하기') | 이름·설명·폴더 |
+| MCP | 도구 서버의 연결(명령·HTTP)·허용 도구·비밀값과 연결 상태·도구별 호출 현황·최근 기록 (아래 'MCP 도구 서버로 도구 붙이기') | — |
 | 설정 | 모델 연결·임베딩·관리 DB·Oracle·실행/컨텍스트·서버 (위 '설정 탭') | — |
 
 검색은 서버에서 전체 데이터를 대상으로 부분 일치로 수행하며, 결과는 최근 등록순으로
@@ -588,7 +595,7 @@ curl -sN localhost:5173/api/chat -H 'Content-Type: application/json' -H 'Accept:
 |---|---|---|
 | `search` / `search_done` | 검색 시작 / 끝 | 짝 번호(`id`), 검색어, 대상, 대상별 적중 수(`hits`), 검색이 성립하지 않은 대상(`failed`) |
 | `run_query` / `run_query_done` | 조회 시작 / 끝 | 짝 번호, 쿼리 이름, 바인드, 대상 DB, 건수 또는 화면용 오류 문구 (한 응답의 여러 조회는 병렬, 항목마다) |
-| `tool` / `tool_done` | 그 밖의 도구(지식·처리 방법·쿼리 정의·결과 읽기·소스) 시작 / 끝 | 짝 번호, 도구 이름, 한 줄 요약(시작), `status`(`ok`/`error`)와 소요 ms(끝) |
+| `tool` / `tool_done` | 그 밖의 도구(지식·처리 방법·쿼리 정의·결과 읽기·소스·MCP) 시작 / 끝 | 짝 번호, 도구 이름, 한 줄 요약(시작 — MCP 도구는 `서버 · 도구 "첫 문자열 인수"`), `status`(`ok`/`error`/`cancelled`)와 소요 ms(끝) |
 | `answer_delta` / `answer_reset` | 모델이 글을 쓰는 동안 | 답변 조각. reset은 앞선 조각을 버리라는 뜻이다 — 모델이 글을 쓰다 도구를 부르기로 했거나, 빈 응답이었거나, 재시도했을 때. 출력 한도에서 끊긴 답의 조각은 버리지 않고 이어 쓴 글이 뒤에 붙는다(이어 쓰다 실패해 쓴 데까지가 답이 될 때 그 응답이 보인 글도). 이어 쓰던 중에 reset하면 그때까지의 조각을 delta 하나로 다시 보낸다. 질문에서 아직 검색하지 않았으면 답의 첫머리가 일반 지식 문구일 수 있는 동안 보내지 않고 모아 두었다가 갈라지는 순간 한꺼번에 보낸다(그 사이 멈추면 보내지 않고, 멈춘 답으로 남기지도 않는다) |
 | `done` | 마지막 | `{answer, trace, refs?}` — JSON 응답과 같다. `answer`는 참조를 채우기 전 원문이고 화면이 채운다. `refs`는 답변이 가리킨 이전 턴 조회의 행 |
 | `error` | 헤더가 나간 뒤 실패 | `{error}` |
@@ -619,6 +626,7 @@ Claude Code·opencode처럼 결과마다 따로 받고 호출 수로 나누지 �
 | `result_read` | 보관된 조회 결과의 다른 행·열을 읽는다(DB 재실행 없음) | 50 / 200행 |
 | `file_list`·`source_search`·`code_outline`·`symbol_search`·`symbol_relations`·`symbol_read`·`file_read` | 프로젝트 소스 읽기(아래) | MnemoArc 기본값, `file_read`는 2,000줄 |
 | `history` | 지난 질문·답·도구 결과(맥락에서 빠진 것 포함)를 찾고 다시 읽기. 무언가 맥락에서 빠진 뒤에 생긴다 | — |
+| `서버__도구` | 연결된 MCP 서버의 도구 중 허용한 것(아래 'MCP 도구 서버로 도구 붙이기') | 서버가 정한다, 결과는 같은 한도 |
 
 보호 장치는 예전 것을 이어받았다 — 한 질문 안에서 같은 쿼리·대상 DB·바인드의 반복 실행 거절(다음 질문에서는 다시
 실행해 지금 값을 받는다), 화면에서 잘린 값(`…(생략)`)을 바인드로 옮겨 적으면 거절, 대상 DB 후보가 여럿인데 고르지 않으면
@@ -643,6 +651,65 @@ Claude Code·opencode처럼 결과마다 따로 받고 호출 수로 나누지 �
 도구는 전부 읽기 전용이다 — 파일 쓰기·명령 실행·DB 쓰기 도구는 없다. 경로는 정규화한 뒤 소스 폴더 안이어야 하고
 (심볼릭 링크·`..`로 밖에 나가면 거절), 예외는 그 프로젝트의 참고 문서로 적은 정확한 파일뿐이다. 서버 프로세스가 읽을 수 있는
 폴더만 등록할 수 있으므로, 비밀이 든 폴더(`.env`·키 파일)는 제외 패턴에 적거나 등록하지 않는다.
+
+## MCP 도구 서버로 도구 붙이기
+
+에이전트가 쓰는 도구를 코드 수정 없이 늘린다. MCP(Model Context Protocol) 서버를 등록하면 그 서버가 내놓는 도구 중
+**허용한 것만** `서버__도구` 이름으로 모델에 보인다. 설계와 결정 근거는 [MCP 설계](docs/mcp-design.md)에 있다.
+
+```toml
+# backend/config.toml — 직접 고치면 재시작해야 반영된다(관리자 화면 MCP 탭은 저장 즉시 반영)
+[[mcp_servers]]
+name = "jira"                       # 영문자로 시작, 영문·숫자·-·_ 24자 이하("__" 금지, "_"로 끝나지 않음) — 도구 이름 앞부분
+description = "사내 Jira 이슈 조회"  # 모델이 서버를 고르는 근거(시스템 프롬프트에 실린다)
+command = "npx"                     # 명령 실행(stdio, 상대 경로는 cwd 기준) — 또는 url = "http://…/mcp" (Streamable HTTP)
+args = ["-y", "jira-mcp-server"]
+tools = ["search_issues", "get_issue"]  # 허용 도구(서버의 이름 또는 jira__search_issues). ["*"]는 전부, 비우면 하나도 안 보인다
+timeout_secs = 30                   # 호출 한도. 비우면 설정의 도구 시간 한도
+
+[mcp_servers.env]
+JIRA_URL = "https://jira.example.com"
+JIRA_TOKEN = "ENV:JIRA_TOKEN"       # ENV:이름 = backend 환경변수(.env 포함)에서 읽는다
+```
+
+- **연결 방식**: 명령 실행(stdio)과 Streamable HTTP(`url` + `headers`). 공식 Rust SDK(`rmcp`)를 쓴다. 서버가 보내는 sampling 요청은
+  지원하지 않는다고, 사용자 입력 요청(elicitation)은 거절로 답한다 — 이 화면에는 도중에 사용자에게 묻는 창이 없다.
+- **비밀값**: 토큰처럼 숨길 환경변수·헤더는 MCP 탭의 비밀값에 넣는다.
+  - `config.credentials.json`의 `mcp.<서버>`에 저장되고 화면에 다시 보이지 않는다.
+  - 같은 이름의 일반 값보다 우선한다(헤더는 대소문자를 가리지 않는다). 파일로 관리할 때는 `ENV:이름` 참조를 쓴다.
+  - HTTP 주소의 호스트를 바꾸면 저장된 비밀 헤더는 새 주소로 가지 않는다. 다시 넣거나 지워야 저장된다(주소 오타로 토큰이 새는 것을 막는다).
+- **명령의 환경**: backend의 환경변수를 통째로 넘기지 않는다(`.env`의 DB 비밀번호가 따라간다). PATH·HOME·USERPROFILE·TEMP·
+  SYSTEMROOT·프록시·CA 인증서 변수처럼 실행에 필요한 것만 상속하고 설정한 `env`를 더한다.
+- **질문 하나 동안 같은 도구**: 질문이 시작될 때 연결된 서버의 허용 도구를 정해, 그 질문의 모든 요청에 같은 정의를 보낸다(제공자 프롬프트 캐시가 유지된다).
+  - 도구 설명은 1,024자까지 싣는다. OpenAI는 이보다 긴 함수 설명이 하나라도 있으면 요청 전체를 거절한다.
+  - 호출은 그 순간의 설정과 연결로 간다. 질문 도중 다시 연결되거나 설정이 바뀐 서버도 쓰이고, 허용에서 뺀 도구는 거절된다.
+- **결과**: 텍스트·텍스트 리소스·링크는 `data.text`로 이어 붙이고, 이미지·오디오·바이너리는 싣지 못해 `omitted_content`에 종류만 적는다.
+  구조화 결과는 텍스트가 없을 때만 JSON으로 싣는다. 텍스트는 200,000자에서 자르고, 그 결과도 다른 도구처럼 결과 한도로 줄여
+  나머지는 `history`에서 읽게 한다. 도구가 실패를 알리면(`isError`) `mcp_tool_error`, 시간 초과는 `mcp_timeout`(서버에 취소를 보낸다),
+  연결이 없으면 `mcp_server_unavailable`, 서버가 인수를 거절하면 `invalid_tool_arguments`로 모델에게 알린다.
+- **장애 격리**: 서버가 뜨지 않거나 죽어도 backend 시작과 다른 도구는 영향받지 않는다.
+  - 끊긴 서버는 1초부터 두 배씩 최대 60초 간격으로 다시 연결하고, 그동안 새 질문에는 그 서버의 도구를 내놓지 않는다.
+  - HTTP 서버는 호출이 연결 오류(서버 없음·토큰 거절)를 만나면 그때 다시 연결해, 실패하면 '실패'로 바뀐다.
+  - 호출 한도와 정지는 입력을 읽지 않는 서버에도 걸린다.
+  - 연결 실패에는 원인 안내가 앞에 붙는다: 인증서 불신(HTTPS는 서버 PC 운영체제의 신뢰 저장소로 검증하므로, 사설 인증 기관은 거기에 등록한다), 연결 거부, 호스트 이름 조회 실패, 인증 거절, 시간 초과.
+  - 스키마가 틀린 도구가 섞인 서버도 연결된다. 그 도구만 인수 없이 받고, 이유를 기록에 남긴다.
+  - stdio 서버의 출력은 한 줄 16 MiB까지 읽는다. 넘는 줄을 보내면 연결을 끊고 다시 연결한다(HTTP도 SDK가 이벤트 하나를 16 MiB로 막는다).
+  - 서버가 보내는 것에도 상한이 있다: 도구 1,000개, 도구당 입력 스키마 64 KiB(넘는 도구는 받지 않는다), 이름·제목 200자, 안내문 8,000자. 목록 변경 알림이 몰려도 1초에 한 번만 다시 읽는다. stderr는 계속 읽어 비우고(최근 200줄 보관),
+  stdout에 섞인 JSON 아닌 줄은 건너뛴다. 명령은 Unix에서는 프로세스 그룹, Windows에서는 Job Object로 띄워 멈출 때(종료·재연결·삭제)
+  손자 프로세스까지 정리한다.
+- **MCP 탭**: 서버 목록과 상태(준비됨·연결 중·실패·꺼짐), 편집기(연결 방식·명령/주소·인수·작업 폴더·환경변수/헤더·비밀값·
+  호출 한도·허용 도구), **연결 확인**(저장 전 설정으로 잠깐 연결해 도구 목록을 받아 온다 — 허용할 도구를 체크박스로 고른다),
+  **다시 연결**, 그리고 연결 상태·서버 정보·서버가 준 안내문·도구별 호출/실패/취소/평균 시간/최근 오류·최근 기록을 보여 준다.
+  허용한 도구 정의가 요청마다 차지하는 토큰 수도 보인다 — 도구 정의는 매 요청에 실리므로 꼭 필요한 도구만 허용한다.
+  호출 수는 메모리에만 있어 backend를 다시 시작하면 처음부터 센다.
+- **화면 편집은 관리자 인증 키가 있을 때만**: MCP 서버는 서버 PC에서 명령을 실행하는 설정이라, backend가 시작될 때 관리자 인증 키가 이미 등록되어 있어야
+  MCP 탭에서 추가·수정·삭제·연결 확인·다시 연결을 할 수 있다(아니면 403, 화면은 보기 전용과 그 이유).
+  - 실행 중에 키를 처음 등록했다면 backend를 다시 시작한 뒤부터 열린다. 키 없이 관리 API가 열려 있는 동안 다른 사람이 키를 먼저 등록하고 명령을 추가하는 것을 막기 위해서다.
+  - `config.toml` 직접 편집은 언제나 된다.
+  설정 탭의 저장은 `mcp_servers`를 건드리지 않는다.
+- **지원하지 않는 것**: 사용자별 로그인(OAuth) 서버 — 모든 사용자가 등록한 공용 계정 권한으로 쓴다, 실행 전 사용자 승인,
+  대화마다 따로 띄우는 서버(상태를 가진 서버는 대화끼리 상태를 나눠 쓴다), MCP의 resources·prompts.
+  Windows 경로(Job Object 정리, `npx.cmd` 같은 배치 파일 실행)는 GitHub Actions의 Windows 작업이 MCP 검사로 잰다.
 
 ## 실제 LLM 연결 (vLLM / OpenRouter / Ollama)
 
@@ -824,7 +891,14 @@ INSERT INTO query_registry (query_name, query_desc, input_desc, query_sql, outpu
   위 가드와 같은 규칙이 계정 차원에서도 강제된다 (`sql/oracle-init.sql`이 그렇게 부여한다)
 - `db_password`는 `ENV:변수명` 형식으로 환경변수 참조 권장. 평문 저장은 개발용만
 - **프로젝트 소스 도구는 읽기 전용**이고 등록한 폴더 밖(심볼릭 링크·`..` 포함)은 읽지 않는다. 파일 쓰기·명령 실행 도구는 아예 없다
-- **설정의 비밀값**(LLM API 키·관리 DB 비밀번호·관리자 인증 키)은 `backend/config.credentials.json`(소유자만 읽기)에만 저장되고 화면·API 응답으로 돌아오지 않는다
+- **MCP 도구는 등록한 서버가 하는 일을 그대로 한다** — 쓰기·삭제를 하는 도구도 있고, 모델은 사람 승인 없이 부른다. 허용 목록(`tools`)이
+  유일한 통제다. 서버가 붙인 '읽기 전용' 힌트는 믿지 말고 도구가 실제로 하는 일을 보고 허용한다. 도구 결과에 섞인 지시문은 근거 자료로만
+  다루라고 시스템 프롬프트가 일러 두지만, 신뢰하지 않는 내용을 돌려주는 서버는 등록하지 않는다
+- **MCP 서버 명령은 backend 계정 권한으로 돈다** — 그래서 화면에서의 추가·변경은 관리자 인증 키가 있을 때만 되고, 명령에는 backend의
+  환경변수(비밀번호 등)를 넘기지 않는다
+- **MCP 연결 오류 문구는 서버 주소의 쿼리 값과 사용자 정보를 가린다**(`https://host/mcp?…`). 이 문구는 콘솔 로그와 상태 화면에 남고,
+  호출 오류로 LLM 제공자에게도 가기 때문이다. 키는 주소보다 비밀 헤더에 두는 것이 낫다
+- **설정의 비밀값**(LLM API 키·관리 DB 비밀번호·관리자 인증 키·MCP 서버의 비밀 환경변수/헤더)은 `backend/config.credentials.json`(소유자만 읽기)에만 저장되고 화면·API 응답으로 돌아오지 않는다
 - 관리 DB 조회 한도(설정 '관리 DB → 쿼리 한도', 기본 30초) — 검색은 답변 루프의 시간 검사보다 앞에서 돌기 때문에, 여기가 매달리면 요청 상한이 통째로 성립하지 않는다
 - 조회 쿼리 한도(설정 'Oracle → 조회 한도', 기본 30초) — 느린 쿼리가 요청을 무한 대기시키지 않는다. 한도·정지·연결 끊김에는 실행 중인 문장을 `break`로 끊는다
 - 조회 결과는 1,000행(`MAX_ROWS`) 제한. 셀당 4,000자 절단은 드라이버 경계(`oracle.rs`)에서, 모델에게 보이는 행 수는 `query_run`의 미리보기와 `result_read`가 정한다.
@@ -958,7 +1032,7 @@ ORDER BY created_at DESC;
 `trace.v`는 스키마 버전이다 (현재 5 — `{v, outcome, conversation_id, rounds, search, timing, steps}`. 이 필드가 없는 행은 trace가 steps 배열
 자체였던 옛 형식). `steps`에는 이번 질문의 기록이 순서대로 섞인다 — 검색 `{search, targets, hits, failed?}`, 조회
 `{step, query_name, params, targetDb, rowCount, rows(≤20), totalRows, capped?}` 또는 `{step, query_name, params, error}`, 그 밖의 도구
-`{tool, summary, status}`. `search`는 요약 `{searches, targets, knowledge, qaMethods, queries, searchFailed?}`이고(적중 수는 검색마다의 합, 그 대상을
+`{tool, summary, status}`(MCP 도구는 `tool`이 `서버__도구`, `summary`가 `서버 · 도구 "첫 인수"`). `search`는 요약 `{searches, targets, knowledge, qaMethods, queries, searchFailed?}`이고(적중 수는 검색마다의 합, 그 대상을
 찾아본 적 없으면 null), `timing`은 `{total, llm[{ms, prompt, completion, cached, estimate}], tools[{ms, calls}]}`(ms)이다.
 검색 전에 일반 지식 문구로 답하려 해서 되돌린 질문은 `searchFirst: true`가 붙고, 되돌린 요청의 `timing.llm` 항목에도 `searchFirst: true`가 있다.
 v4(Node 백엔드)의 `timing.search`·`timing.oracle`은 v5에서 `timing.tools`(한 응답의 도구 일괄 실행 경과)로 합쳐졌다.
@@ -1062,5 +1136,9 @@ FROM chat_log WHERE JSON_VALUE(trace, '$.v') >= 5 AND JSON_VALUE(trace, '$.outco
   지시문을 학습한 모델(Qwen3-Embedding·Harrier 계열)은 **검색어 앞 지시문**으로 **질의에만** 접두를 붙인다
   (문서에는 붙지 않는다 — 그 비대칭이 모델의 학습 형식이다). 바꾸면 전 행이 자동으로 다시 임베딩되고,
   관련도 거리 문턱(기본 0.4)이 그 모델에서도 성립하는지는 등록 지식으로 직접 잴 것
-- **새 도구**: `backend/src/voc_tools.rs`(지식·쿼리 쪽) 또는 `backend/src/tools/`(소스 쪽)에 정의와 실행을 더하고, 시스템 프롬프트
-  (`backend/src/context.rs`)에 언제 쓰는지 적는다. 쓰기 도구는 더하지 않는다
+- **새 도구**: 먼저 MCP 서버로 붙일 수 있는지 본다(위 'MCP 도구 서버로 도구 붙이기' — 코드 수정 없음). 결과 나눠 읽기·표 참조처럼
+  대화 상태에 붙은 전용 처리가 필요한 도구만 `backend/src/voc_tools.rs`(지식·쿼리 쪽) 또는 `backend/src/tools/`(소스 쪽)에 정의와
+  실행을 더하고, 시스템 프롬프트(`backend/src/context.rs`)에 언제 쓰는지 적는다. 내장 도구에는 쓰기 도구를 더하지 않는다
+- **MCP 다음 단계**(설계만, [MCP 설계](docs/mcp-design.md)): 도구가 수십 개를 넘으면 '도구 찾기' 도구로 정의를 필요할 때만 싣기,
+  상태를 가진 서버를 위한 대화별 서버 프로세스, 쓰기 도구를 위한 실행 전 승인 창(서버의 elicitation도 이 창이 필요하다),
+  사용자 로그인과 사용자별 OAuth

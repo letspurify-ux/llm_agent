@@ -425,6 +425,66 @@ impl Default for Project {
     }
 }
 
+/// An MCP tool server (docs/mcp-design.md): a command spoken to over stdio,
+/// or a Streamable HTTP endpoint. Its tools join the agent's as
+/// `name__tool`, those in `tools` only.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpServer {
+    /// Letters, digits, '-' and '_' (no "__"), at most 24: the start of its
+    /// tool names.
+    pub name: String,
+    /// What the server is for; the model picks its tools by it.
+    pub description: String,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub command: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Working folder of the command; empty is the backend's.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub cwd: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// Tools offered to the model: their names, or "*" for every tool.
+    pub tools: Vec<String>,
+    /// Seconds one call may take; unset is `agent.tool_timeout_secs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// Environment of the command beyond the safe inherited set. A value
+    /// `ENV:NAME` reads the backend's environment (and `.env`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// HTTP headers of every request; values as `env`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// Environment values and headers kept in the secrets file; they win
+    /// over the visible ones of the same name.
+    #[serde(skip)]
+    pub secret_env: BTreeMap<String, Secret>,
+    #[serde(skip)]
+    pub secret_headers: BTreeMap<String, Secret>,
+}
+impl Default for McpServer {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            enabled: true,
+            command: String::new(),
+            args: vec![],
+            cwd: String::new(),
+            url: String::new(),
+            tools: vec![],
+            timeout_secs: None,
+            env: BTreeMap::new(),
+            headers: BTreeMap::new(),
+            secret_env: BTreeMap::new(),
+            secret_headers: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -435,6 +495,7 @@ pub struct Config {
     pub agent: AgentConfig,
     pub server: ServerConfig,
     pub projects: Vec<Project>,
+    pub mcp_servers: Vec<McpServer>,
     /// Shared admin key; empty leaves the admin API open to the local
     /// network (as the former ADMIN_TOKEN did).
     #[serde(skip)]
@@ -452,6 +513,18 @@ struct Credentials {
     mariadb_password: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     admin_token: Option<String>,
+    /// MCP server secrets by server name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    mcp: BTreeMap<String, McpCredentials>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct McpCredentials {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    env: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    headers: BTreeMap<String, String>,
 }
 
 pub fn credentials_path(config: &Path) -> PathBuf {
@@ -532,6 +605,13 @@ impl Config {
                 bail!("프로젝트 번호가 중복되었습니다.");
             }
         }
+        let mut servers = std::collections::BTreeSet::new();
+        for server in &self.mcp_servers {
+            crate::mcp::validate_server(server)?;
+            if !servers.insert(server.name.to_ascii_lowercase()) {
+                bail!("같은 이름의 MCP 서버가 이미 있습니다: {}", server.name);
+            }
+        }
         Ok(())
     }
 
@@ -586,6 +666,19 @@ impl Config {
         self.llm.api_key = secret(c.llm_api_key);
         self.mariadb.password = secret(c.mariadb_password);
         self.admin_token = secret(c.admin_token);
+        // Secrets kept for a server name config.toml no longer has (renamed
+        // by hand) do not reach it, and the next save drops them.
+        for name in c.mcp.keys().filter(|name| !self.mcp_servers.iter().any(|s| &s.name == *name)) {
+            eprintln!("[config] the secrets file holds MCP secrets for {name:?}, which config.toml has no server for — enter them again on the server they belong to; the next save drops them");
+        }
+        for server in &mut self.mcp_servers {
+            let stored = c.mcp.get(&server.name).cloned().unwrap_or_default();
+            let secrets = |values: BTreeMap<String, String>| {
+                values.into_iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| (k, Secret(v))).collect()
+            };
+            server.secret_env = secrets(stored.env);
+            server.secret_headers = secrets(stored.headers);
+        }
     }
 
     fn credentials(&self) -> Credentials {
@@ -593,6 +686,17 @@ impl Config {
             llm_api_key: self.llm.api_key.as_ref().map(|s| s.0.clone()),
             mariadb_password: self.mariadb.password.as_ref().map(|s| s.0.clone()),
             admin_token: self.admin_token.as_ref().map(|s| s.0.clone()),
+            mcp: self
+                .mcp_servers
+                .iter()
+                .filter(|s| !s.secret_env.is_empty() || !s.secret_headers.is_empty())
+                .map(|s| {
+                    let plain = |values: &BTreeMap<String, Secret>| {
+                        values.iter().map(|(k, v)| (k.clone(), v.0.clone())).collect()
+                    };
+                    (s.name.clone(), McpCredentials { env: plain(&s.secret_env), headers: plain(&s.secret_headers) })
+                })
+                .collect(),
         }
     }
 
@@ -708,6 +812,14 @@ impl Config {
             hash.update(secret.map_or(&[0u8][..], |s| s.0.as_bytes()));
             hash.update([0xff]);
         }
+        for server in &self.mcp_servers {
+            for (key, value) in server.secret_env.iter().chain(&server.secret_headers) {
+                for part in [server.name.as_str(), key, value.0.as_str()] {
+                    hash.update(part.len().to_le_bytes());
+                    hash.update(part.as_bytes());
+                }
+            }
+        }
         hex::encode(hash.finalize())
     }
 }
@@ -747,6 +859,46 @@ fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_servers_keep_their_secrets_in_the_secrets_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        let mut server = McpServer {
+            name: "wiki".into(),
+            url: "https://wiki.example.com/mcp".into(),
+            tools: vec!["*".into()],
+            ..Default::default()
+        };
+        server.headers.insert("X-Team".into(), "voc".into());
+        server.secret_headers.insert("Authorization".into(), Secret("Bearer s3cret".into()));
+        config.mcp_servers.push(server);
+        let mut local = McpServer { name: "jira".into(), command: "npx".into(), args: vec!["-y".into(), "jira-mcp".into()], ..Default::default() };
+        local.env.insert("JIRA_TOKEN".into(), "ENV:JIRA_TOKEN".into());
+        local.timeout_secs = Some(20);
+        config.mcp_servers.push(local);
+        config.save(&path).unwrap();
+        let toml = std::fs::read_to_string(&path).unwrap();
+        assert!(toml.contains("[[mcp_servers]]") && toml.contains("X-Team") && toml.contains("ENV:JIRA_TOKEN"), "{toml}");
+        assert!(!toml.contains("s3cret"), "{toml}");
+        let secrets = std::fs::read_to_string(credentials_path(&path)).unwrap();
+        assert!(secrets.contains("Bearer s3cret"), "{secrets}");
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.mcp_servers, config.mcp_servers);
+        assert_eq!(loaded.revision(), config.revision());
+        let mut changed = loaded.clone();
+        changed.mcp_servers[0].secret_headers.insert("Authorization".into(), Secret("Bearer other".into()));
+        assert_ne!(changed.revision(), loaded.revision(), "a changed secret changes the revision");
+        // A server written by hand: the defaults fill in what it leaves out.
+        std::fs::write(&path, "[[mcp_servers]]\nname = \"x\"\ncommand = \"node\"\n").unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded.mcp_servers[0].enabled && loaded.mcp_servers[0].tools.is_empty());
+        std::fs::write(&path, "[[mcp_servers]]\nname = \"x\"\ncommand = \"node\"\ntool = [\"*\"]\n").unwrap();
+        assert!(Config::load(&path).is_err(), "a misspelt key is refused, not ignored");
+        std::fs::write(&path, "[[mcp_servers]]\nname = \"x\"\ncommand = \"node\"\n[[mcp_servers]]\nname = \"X\"\nurl = \"http://h/mcp\"\n").unwrap();
+        assert!(Config::load(&path).is_err(), "names are unique ignoring case");
+    }
 
     #[test]
     fn defaults_validate_and_round_trip() {

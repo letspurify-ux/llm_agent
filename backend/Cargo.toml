@@ -27,6 +27,12 @@ oracle = "0.6.3"
 rand = "0.8"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# MCP client: stdio servers and Streamable HTTP. Its HTTP client (reqwest 0.13)
+# uses the ring provider installed at start (mcp::install_tls), not aws-lc.
+rmcp = { version = "3.5", default-features = false, features = ["client", "transport-child-process", "which-command", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+process-wrap = { version = "10", features = ["tokio1"] }
+which = "8"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"

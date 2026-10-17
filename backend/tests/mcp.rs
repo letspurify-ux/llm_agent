@@ -1,0 +1,1338 @@
+//! MCP tool servers against a fake server (tests/fixtures/fake_mcp_server.mjs,
+//! run with Node): connection, tools, calls, failures and recovery, process
+//! cleanup, HTTP, and the answer loop with a scripted model.
+
+mod support;
+
+use llm_agent::{
+    agent::{self, Events, Question},
+    config::{Config, McpServer, Secret},
+    mcp::{McpHub, probe},
+};
+use serde_json::{Value, json};
+use std::{
+    io::{BufRead, BufReader},
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+    time::{Duration, Instant},
+};
+use support::*;
+use tokio_util::sync::CancellationToken;
+
+const MODEL: &str = "gpt-4o";
+
+fn fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_mcp_server.mjs")
+}
+
+/// Whether the fake server cannot run. CI sets REQUIRE_NODE=1, where a
+/// missing node fails instead of passing these tests unseen.
+fn node_missing() -> bool {
+    let missing = Command::new("node").arg("--version").output().is_err();
+    if missing {
+        assert!(std::env::var("REQUIRE_NODE").as_deref() != Ok("1"), "node is required (REQUIRE_NODE=1)");
+        skip("node is not installed");
+    }
+    missing
+}
+
+fn fake(name: &str, tools: &[&str], env: &[(&str, &str)]) -> McpServer {
+    McpServer {
+        name: name.into(),
+        description: format!("가짜 MCP 서버 {name}"),
+        command: "node".into(),
+        args: vec![fixture().display().to_string()],
+        tools: tools.iter().map(|t| (*t).to_owned()).collect(),
+        env: env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
+        ..Default::default()
+    }
+}
+
+fn config(servers: Vec<McpServer>) -> Config {
+    let mut config = Config::default();
+    config.mariadb.port = 9;
+    config.llm.base_url = "http://127.0.0.1:9/v1".into();
+    config.llm.model = MODEL.into();
+    config.mcp_servers = servers;
+    config
+}
+
+/// The server's status once `done` holds, within ten seconds.
+async fn wait_for(hub: &McpHub, name: &str, done: impl Fn(&Value) -> bool) -> Value {
+    let started = Instant::now();
+    loop {
+        let status = hub.server_status(name, MODEL).expect("server is configured");
+        if done(&status) {
+            return status;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "timed out waiting for {name}: {status:#}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn ready(hub: &McpHub, name: &str) -> Value {
+    wait_for(hub, name, |s| s["state"] == "ready").await
+}
+
+fn log_text(status: &Value) -> String {
+    status["log"].as_array().unwrap().iter().map(|l| l["text"].as_str().unwrap_or("").to_owned()).collect::<Vec<_>>().join("\n")
+}
+
+async fn call(hub: &McpHub, config: &Config, name: &str, args: Value) -> anyhow::Result<Value> {
+    let snapshot = hub.snapshot(config);
+    let tool = snapshot.find(name).unwrap_or_else(|| panic!("{name} is not offered: {:?}", snapshot.names().collect::<Vec<_>>()));
+    tool.check(&args)?;
+    tool.call(args, &CancellationToken::new()).await
+}
+
+#[tokio::test]
+async fn tools_are_listed_offered_and_called() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("fake", &["echo", "add", "structured_only", "mixed", "weird.name"], &[])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    let status = ready(&hub, "fake").await;
+    // Listed across pages (three tools a page), every tool, allowed or not.
+    assert_eq!(status["tools"].as_array().unwrap().len(), 21, "{status:#}");
+    assert_eq!(status["server_info"]["name"], "fake-mcp");
+    assert_eq!(status["server_info"]["version"], "1.2.3");
+    let echo = status["tools"].as_array().unwrap().iter().find(|t| t["name"] == "echo").unwrap();
+    assert_eq!(echo["allowed"], true);
+    assert_eq!(echo["annotations"]["readOnlyHint"], true);
+    assert!(echo["tokens"].as_u64().unwrap() > 10);
+    let crash = status["tools"].as_array().unwrap().iter().find(|t| t["name"] == "crash").unwrap();
+    assert_eq!(crash["allowed"], false);
+
+    let snapshot = hub.snapshot(&config);
+    let names: Vec<&str> = snapshot.names().collect();
+    assert_eq!(names, ["fake__echo", "fake__add", "fake__structured_only", "fake__mixed", "fake__weird_name"]);
+    let definitions = snapshot.definitions();
+    let weird = definitions.iter().find(|d| d["function"]["name"] == "fake__weird_name").unwrap();
+    let parameters = &weird["function"]["parameters"];
+    assert!(parameters.get("anyOf").is_none() && parameters.get("$defs").is_none(), "{parameters}");
+    assert_eq!(parameters["properties"]["item"]["properties"]["id"]["type"], "integer");
+    assert!(snapshot.prompt().contains("- fake: 가짜 MCP 서버 fake"), "{}", snapshot.prompt());
+
+    assert_eq!(call(&hub, &config, "fake__echo", json!({"text":"안녕"})).await.unwrap(), json!({"text":"echo: 안녕"}));
+    assert_eq!(call(&hub, &config, "fake__add", json!({"a":2,"b":3})).await.unwrap(), json!({"text":"{\"sum\":5}"}));
+    assert_eq!(call(&hub, &config, "fake__structured_only", json!({})).await.unwrap()["text"], "{\"ok\":true,\"items\":[1,2]}");
+    let mixed = call(&hub, &config, "fake__mixed", json!({})).await.unwrap();
+    assert!(mixed["text"].as_str().unwrap().contains("resource body"), "{mixed}");
+    assert_eq!(mixed["omitted_content"].as_array().unwrap().len(), 3);
+    let missing = call(&hub, &config, "fake__add", json!({"a":2})).await.unwrap_err();
+    assert!(missing.to_string().starts_with("missing_argument: b"), "{missing}");
+    // A call's statistics.
+    let status = hub.server_status("fake", MODEL).unwrap();
+    let echo = status["tools"].as_array().unwrap().iter().find(|t| t["name"] == "echo").unwrap();
+    assert_eq!(echo["calls"], 1);
+    assert_eq!(echo["failures"], 0);
+    assert!(log_text(&status).contains("fake server ready"), "the server's log notification is kept");
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_empty_allow_list_offers_nothing() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("quiet", &[], &[])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "quiet").await;
+    let snapshot = hub.snapshot(&config);
+    assert!(snapshot.is_empty());
+    assert_eq!(snapshot.prompt(), "");
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn tool_errors_bad_arguments_and_large_results() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("fake", &["*"], &[])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "fake").await;
+    let failed = call(&hub, &config, "fake__fail", json!({})).await.unwrap_err();
+    assert_eq!(failed.to_string(), "mcp_tool_error: boom: the tool failed");
+    let refused = call(&hub, &config, "fake__strict", json!({})).await.unwrap_err();
+    assert!(refused.to_string().starts_with("invalid_tool_arguments:"), "{refused}");
+    let big = call(&hub, &config, "fake__big", json!({"chars":250_000})).await.unwrap();
+    assert_eq!(big["text"].as_str().unwrap().len(), llm_agent::mcp::MAX_RESULT_CHARS);
+    assert_eq!(big["text_cut_chars"], 50_000);
+    let status = hub.server_status("fake", MODEL).unwrap();
+    let fail = status["tools"].as_array().unwrap().iter().find(|t| t["name"] == "fail").unwrap();
+    assert_eq!(fail["failures"], 1);
+    assert!(fail["last_error"].as_str().unwrap().contains("boom"));
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_slow_call_times_out_or_is_cancelled_and_the_server_is_told() {
+    if node_missing() {
+        return;
+    }
+    let mut server = fake("slow", &["slow", "echo"], &[]);
+    server.timeout_secs = Some(1);
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "slow").await;
+    let started = Instant::now();
+    let timed_out = call(&hub, &config, "slow__slow", json!({"ms":5000})).await.unwrap_err();
+    assert!(timed_out.to_string().starts_with("mcp_timeout:"), "{timed_out}");
+    assert!(started.elapsed() < Duration::from_secs(3));
+    wait_for(&hub, "slow", |s| log_text(s).contains("cancelled")).await;
+
+    let snapshot = hub.snapshot(&config);
+    let tool = snapshot.find("slow__slow").unwrap();
+    let cancel = CancellationToken::new();
+    let stopper = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stopper.cancel();
+    });
+    let stopped = tool.call(json!({"ms":5000}), &cancel).await.unwrap_err();
+    assert_eq!(stopped.to_string(), "cancelled");
+    wait_for(&hub, "slow", |s| log_text(s).matches("cancelled").count() >= 2).await;
+    // The connection still serves.
+    assert_eq!(call(&hub, &config, "slow__echo", json!({"text":"x"})).await.unwrap()["text"], "echo: x");
+    let status = hub.server_status("slow", MODEL).unwrap();
+    let slow = status["tools"].as_array().unwrap().iter().find(|t| t["name"] == "slow").unwrap();
+    assert_eq!((slow["calls"].as_u64(), slow["failures"].as_u64(), slow["cancelled"].as_u64()), (Some(2), Some(1), Some(1)));
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn calls_to_a_server_that_stopped_reading_end_at_their_timeout() {
+    if node_missing() {
+        return;
+    }
+    let mut server = fake("stuck", &["stall_input", "echo"], &[]);
+    server.timeout_secs = Some(1);
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "stuck").await;
+    call(&hub, &config, "stuck__stall_input", json!({})).await.unwrap();
+    // More than the pipe and the SDK's queue hold: later calls wait to be
+    // sent, and every one still ends at its timeout.
+    let snapshot = hub.snapshot(&config);
+    let tool = snapshot.find("stuck__echo").unwrap();
+    let started = Instant::now();
+    let calls = (0..1_200).map(|_| {
+        let tool = tool.clone();
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let outcome = tool.call(json!({"text":"x".repeat(1_000)}), &CancellationToken::new()).await;
+            (outcome, started.elapsed())
+        })
+    });
+    let outcomes = futures_util::future::join_all(calls).await;
+    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    for outcome in outcomes {
+        let (outcome, took) = outcome.unwrap();
+        let error = outcome.unwrap_err().to_string();
+        assert!(error.starts_with("mcp_timeout:"), "{error}");
+        // The timeout, and the second given to a notice stuck behind it.
+        assert!(took < Duration::from_millis(2_600), "one call took {took:?}");
+    }
+    // A stop does not wait on it either.
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let started = Instant::now();
+    assert_eq!(tool.call(json!({"text":"x"}), &cancel).await.unwrap_err().to_string(), "cancelled");
+    let stopper = CancellationToken::new();
+    let stop = stopper.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop.cancel();
+    });
+    assert_eq!(tool.call(json!({"text":"x"}), &stopper).await.unwrap_err().to_string(), "cancelled");
+    assert!(started.elapsed() < Duration::from_millis(900));
+    // Closing it does not wait on the input it no longer reads: a second
+    // for the input, the grace to exit, then the kill (on Windows the only
+    // thing that ends it before the backend exits).
+    let closing = Instant::now();
+    hub.shutdown().await;
+    assert!(closing.elapsed() < Duration::from_millis(4_800), "closed in {:?}", closing.elapsed());
+}
+
+#[tokio::test]
+async fn calls_in_flight_end_promptly_when_the_backend_stops() {
+    if node_missing() {
+        return;
+    }
+    let mut server = fake("busy", &["slow"], &[]);
+    server.timeout_secs = Some(60);
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "busy").await;
+    let snapshot = hub.snapshot(&config);
+    let tool = snapshot.find("busy__slow").unwrap();
+    let calls: Vec<_> = (0..5)
+        .map(|_| {
+            let tool = tool.clone();
+            tokio::spawn(async move { tool.call(json!({"ms":30_000}), &CancellationToken::new()).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = Instant::now();
+    hub.shutdown().await;
+    for call in calls {
+        let outcome = tokio::time::timeout(Duration::from_secs(5), call).await.expect("the call ended").unwrap();
+        let error = outcome.unwrap_err().to_string();
+        assert!(error.starts_with("mcp_server_unavailable:"), "{error}");
+    }
+    assert!(started.elapsed() < Duration::from_secs(7), "{:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn calls_racing_edits_and_restarts_neither_hang_nor_panic() {
+    if node_missing() {
+        return;
+    }
+    let mut server = fake("churn", &["echo", "slow"], &[]);
+    server.timeout_secs = Some(3);
+    let mut config = config(vec![server.clone()]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "churn").await;
+    let snapshot = hub.snapshot(&config);
+    let started = Instant::now();
+    let callers: Vec<_> = (0..8)
+        .map(|i| {
+            let echo = snapshot.find("churn__echo").unwrap();
+            let slow = snapshot.find("churn__slow").unwrap();
+            tokio::spawn(async move {
+                let mut outcomes = (0, 0);
+                for n in 0..40 {
+                    let outcome = if (i + n) % 5 == 0 {
+                        slow.call(json!({"ms":200}), &CancellationToken::new()).await
+                    } else {
+                        echo.call(json!({"text":format!("{i}-{n}")}), &CancellationToken::new()).await
+                    };
+                    match outcome {
+                        Ok(_) => outcomes.0 += 1,
+                        Err(error) => {
+                            let text = error.to_string();
+                            assert!(text.starts_with("mcp_server_unavailable:") || text.starts_with("unsupported_tool:") || text.starts_with("mcp_timeout:"), "{text}");
+                            outcomes.1 += 1;
+                        }
+                    }
+                }
+                outcomes
+            })
+        })
+        .collect();
+    // Meanwhile: allowed tools change in place, the connection changes,
+    // restarts are asked for, the server is turned off and on.
+    for round in 0..6 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        match round % 3 {
+            0 => server.tools = if server.tools.len() == 2 { vec!["echo".into()] } else { vec!["echo".into(), "slow".into()] },
+            1 => {
+                server.env.insert("ROUND".into(), round.to_string());
+            }
+            _ => {
+                hub.restart("churn");
+            }
+        }
+        config.mcp_servers = vec![server.clone()];
+        hub.apply(&config.mcp_servers);
+    }
+    server.enabled = false;
+    hub.apply(std::slice::from_ref(&server));
+    server.enabled = true;
+    hub.apply(std::slice::from_ref(&server));
+    let mut total = (0, 0);
+    for caller in callers {
+        let (ok, failed) = tokio::time::timeout(Duration::from_secs(60), caller).await.expect("no caller hangs").expect("no caller panics");
+        total = (total.0 + ok, total.1 + failed);
+    }
+    assert_eq!(total.0 + total.1, 320);
+    assert!(total.0 > 0, "some calls went through: {total:?}");
+    // The server settles connected, and serves.
+    let settled = ready(&hub, "churn").await;
+    assert_eq!(settled["state"], "ready");
+    let config = config_after(&server);
+    assert_eq!(call(&hub, &config, "churn__echo", json!({"text":"끝"})).await.unwrap()["text"], "echo: 끝");
+    eprintln!("churn: {total:?} in {:?}", started.elapsed());
+    hub.shutdown().await;
+}
+
+fn config_after(server: &McpServer) -> Config {
+    config(vec![server.clone()])
+}
+
+#[tokio::test]
+async fn a_line_without_end_cuts_the_connection_instead_of_filling_memory() {
+    if node_missing() {
+        return;
+    }
+    let mut server = fake("flood", &["flood_line", "echo"], &[]);
+    server.timeout_secs = Some(30);
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    let first = ready(&hub, "flood").await;
+    let started = Instant::now();
+    let error = call(&hub, &config, "flood__flood_line", json!({})).await.unwrap_err().to_string();
+    assert!(error.starts_with("mcp_server_unavailable:"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(10), "cut when the line passed the limit, not at the timeout: {:?}", started.elapsed());
+    let failed = wait_for(&hub, "flood", |s| log_text(s).contains("16 MiB를 넘는 한 줄")).await;
+    assert_ne!(failed["state"], "ready");
+    let again = wait_for(&hub, "flood", |s| s["state"] == "ready" && s["pid"] != first["pid"]).await;
+    assert!(again["restarts"].as_u64().unwrap() >= 1);
+    assert_eq!(call(&hub, &config, "flood__echo", json!({"text":"다시"})).await.unwrap()["text"], "echo: 다시");
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_save_during_shutdown_starts_nothing() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("late", &["echo"], &[])]);
+    let hub = McpHub::default();
+    hub.shutdown().await;
+    // The admin API still answers during the connections' grace.
+    hub.apply(&config.mcp_servers);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let status = hub.server_status("late", MODEL);
+    assert!(status.is_none() || status.as_ref().unwrap()["pid"].is_null(), "no process after shutdown: {status:?}");
+    assert!(!hub.restart("late"));
+    assert!(hub.snapshot(&config).is_empty());
+}
+
+#[tokio::test]
+async fn a_server_that_exits_mid_call_is_reconnected() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("crashy", &["crash", "echo"], &[])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    let first = ready(&hub, "crashy").await;
+    let error = call(&hub, &config, "crashy__crash", json!({})).await.unwrap_err();
+    assert!(error.to_string().starts_with("mcp_server_unavailable:"), "{error}");
+    let failed = wait_for(&hub, "crashy", |s| s["state"] == "failed").await;
+    assert!(failed["error"].as_str().unwrap().contains("crashing on purpose"), "the last output explains it: {failed:#}");
+    assert!(failed["retry_at"].is_string());
+    // While it is down, a new question is not offered its tools.
+    assert!(hub.snapshot(&config).find("crashy__echo").is_none());
+    let again = wait_for(&hub, "crashy", |s| s["state"] == "ready" && s["restarts"].as_u64() >= Some(1)).await;
+    assert_ne!(first["pid"], again["pid"]);
+    assert_eq!(call(&hub, &config, "crashy__echo", json!({"text":"x"})).await.unwrap()["text"], "echo: x");
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn noisy_output_and_failing_servers_stay_apart() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![
+        fake("noisy", &["echo"], &[("FAKE_MCP_GARBAGE", "1"), ("FAKE_MCP_STDERR", "500")]),
+        fake("broken", &["*"], &[("FAKE_MCP_EXIT_BEFORE_INIT", "1")]),
+        McpServer { name: "missing".into(), command: "llm-agent-no-such-command".into(), tools: vec!["*".into()], ..Default::default() },
+    ]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    let noisy = ready(&hub, "noisy").await;
+    // Non-JSON lines on stdout are skipped; stderr is drained and its last
+    // lines kept.
+    assert_eq!(call(&hub, &config, "noisy__echo", json!({"text":"ok"})).await.unwrap()["text"], "echo: ok");
+    let log = noisy["log"].as_array().unwrap();
+    assert!(log.len() <= 200);
+    assert!(log_text(&noisy).contains("stderr line 499"));
+    let broken = wait_for(&hub, "broken", |s| s["state"] == "failed").await;
+    assert!(broken["error"].as_str().unwrap().contains("fatal: missing configuration"), "{broken:#}");
+    let missing = wait_for(&hub, "missing", |s| s["state"] == "failed").await;
+    assert!(missing["error"].as_str().unwrap().contains("PATH에서 찾지 못했습니다"), "{missing:#}");
+    let snapshot = hub.snapshot(&config);
+    assert_eq!(snapshot.names().collect::<Vec<_>>(), ["noisy__echo"]);
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_reconnect_asked_while_connecting_reconnects_once() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("slowstart", &["echo"], &[("FAKE_MCP_SLOW_INIT_MS", "3000")])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(hub.server_status("slowstart", MODEL).unwrap()["state"], "connecting");
+    let asked = Instant::now();
+    assert!(hub.restart("slowstart"));
+    let first = ready(&hub, "slowstart").await;
+    assert_eq!(first["restarts"], 1);
+    // The slow start under way was dropped for the new one, not waited out
+    // and then done again (about 3.2 s against 6 s; wide margins for a busy
+    // machine).
+    assert!(asked.elapsed() < Duration::from_millis(4_800), "took {:?}", asked.elapsed());
+    // No second reconnection follows the one asked for.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let later = hub.server_status("slowstart", MODEL).unwrap();
+    assert_eq!((later["state"].clone(), later["pid"].clone(), later["restarts"].clone()), (json!("ready"), first["pid"].clone(), json!(1)));
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_server_stuck_listing_its_tools_still_stops_at_once() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("stuck", &["*"], &[("FAKE_MCP_HANG_LIST", "1")])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    let listing = wait_for(&hub, "stuck", |s| s["pid"].is_number() && log_text(s).contains("fake server ready")).await;
+    let pid = listing["pid"].as_i64().unwrap() as i32;
+    let started = Instant::now();
+    hub.shutdown().await;
+    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    let gone = Instant::now();
+    while alive(pid) && gone.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!alive(pid));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_is_found_in_the_path_its_own_env_sets() {
+    use std::os::unix::fs::PermissionsExt;
+    if node_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("llm-agent-fake-mcp");
+    std::fs::write(&script, format!("#!/bin/sh\nexec node {}\n", fixture().display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut server = McpServer { name: "pathed".into(), command: "llm-agent-fake-mcp".into(), tools: vec!["echo".into()], ..Default::default() };
+    let path = format!("{}:{}", dir.path().display(), std::env::var("PATH").unwrap());
+    server.env.insert("PATH".into(), path);
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "pathed").await;
+    assert_eq!(call(&hub, &config, "pathed__echo", json!({"text":"찾음"})).await.unwrap()["text"], "echo: 찾음");
+    hub.shutdown().await;
+}
+
+/// A batch file found in PATH, as npx.cmd is: found with PATHEXT, run
+/// through cmd.exe, and the whole tree (cmd, node, its child) ended by the
+/// Job Object.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_batch_file_in_the_path_runs_like_npx_and_its_tree_ends_with_it() {
+    if node_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("llm-agent-fake-mcp.cmd"), format!("@echo off\r\nnode \"{}\" %*\r\n", fixture().display())).unwrap();
+    let mut server = McpServer { name: "batch".into(), command: "llm-agent-fake-mcp".into(), tools: vec!["echo".into(), "spawn_child".into()], ..Default::default() };
+    server.env.insert("PATH".into(), format!("{};{}", dir.path().display(), std::env::var("PATH").unwrap()));
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "batch").await;
+    assert_eq!(call(&hub, &config, "batch__echo", json!({"text":"배치"})).await.unwrap()["text"], "echo: 배치");
+    let child: i32 = call(&hub, &config, "batch__spawn_child", json!({})).await.unwrap()["text"].as_str().unwrap().parse().unwrap();
+    assert!(alive(child));
+    hub.shutdown().await;
+    let gone = Instant::now();
+    while alive(child) && gone.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!alive(child), "the server's child ended with the job");
+}
+
+/// A relative command is the working folder's, on every system.
+#[tokio::test]
+async fn a_relative_command_runs_from_the_working_folder() {
+    if node_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let tools = dir.path().join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    #[cfg(unix)]
+    let command = {
+        use std::os::unix::fs::PermissionsExt;
+        let script = tools.join("server.sh");
+        std::fs::write(&script, format!("#!/bin/sh\nexec node {}\n", fixture().display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        "tools/server.sh"
+    };
+    #[cfg(windows)]
+    let command = {
+        std::fs::write(tools.join("server.cmd"), format!("@echo off\r\nnode \"{}\" %*\r\n", fixture().display())).unwrap();
+        "tools\\server.cmd"
+    };
+    let server = McpServer { name: "relative".into(), command: command.into(), cwd: dir.path().display().to_string(), tools: vec!["echo".into()], ..Default::default() };
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "relative").await;
+    assert_eq!(call(&hub, &config, "relative__echo", json!({"text":"상대"})).await.unwrap()["text"], "echo: 상대");
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_missing_working_folder_is_named() {
+    if node_missing() {
+        return;
+    }
+    let mut server = fake("nowhere", &["*"], &[]);
+    server.cwd = "/llm-agent-no-such-folder".into();
+    let hub = McpHub::default();
+    hub.apply(&[server]);
+    let failed = wait_for(&hub, "nowhere", |s| s["state"] == "failed").await;
+    assert!(failed["error"].as_str().unwrap().contains("작업 폴더"), "{failed:#}");
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn results_and_server_requests_outside_the_types_are_read_leniently() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("edge", &["*"], &[])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "edge").await;
+    // A block of an unknown type or a text block without text does not lose
+    // the whole result.
+    assert_eq!(call(&hub, &config, "edge__bad_content", json!({})).await.unwrap(), json!({"text":"","omitted_content":["weird"]}));
+    assert_eq!(call(&hub, &config, "edge__bad_text", json!({})).await.unwrap(), json!({"text":""}));
+    // What the server asks the client mid-call is answered (not supported,
+    // no roots, declined), and the call completes.
+    let asked = call(&hub, &config, "edge__ask_client", json!({})).await.unwrap();
+    assert_eq!(asked["text"], "sampling: error -32601; roots: {\"roots\":[]}; elicitation: {\"action\":\"decline\"}");
+    assert_eq!(call(&hub, &config, "edge__progress", json!({})).await.unwrap()["text"], "progressed");
+    assert_eq!(call(&hub, &config, "edge__stray_reply", json!({})).await.unwrap()["text"], "real");
+    assert_eq!(call(&hub, &config, "edge__echo", json!({"text":"after"})).await.unwrap()["text"], "echo: after");
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_sloppy_tool_list_still_connects() {
+    if node_missing() {
+        return;
+    }
+    let servers = vec![
+        fake("sloppy", &["*"], &[("FAKE_MCP_BAD_LIST", "1"), ("FAKE_MCP_DUPLICATE", "1")]),
+        fake("looping", &["echo"], &[("FAKE_MCP_CURSOR_LOOP", "1")]),
+    ];
+    let config = config(servers);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    // One tool without a schema does not fail the server: it takes no
+    // arguments; a repeated name keeps the first.
+    let sloppy = ready(&hub, "sloppy").await;
+    let names: Vec<&str> = sloppy["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names.iter().filter(|n| **n == "echo").count(), 1);
+    assert!(names.contains(&"no_schema") && names.contains(&"string_schema"), "{names:?}");
+    let log = log_text(&sloppy);
+    assert!(log.contains("no_schema의 입력 스키마") && log.contains("echo이(가) 두 번"), "{log}");
+    let definitions = hub.snapshot(&config).definitions();
+    let no_schema = definitions.iter().find(|d| d["function"]["name"] == "sloppy__no_schema").unwrap();
+    assert_eq!(no_schema["function"]["parameters"], json!({"type":"object","properties":{}}));
+    assert_eq!(call(&hub, &config, "sloppy__echo", json!({"text":"first"})).await.unwrap()["text"], "echo: first");
+    let mut misspelt = fake("misspelt", &["ech0"], &[]);
+    misspelt.description.clear();
+    hub.apply(&[config.mcp_servers[0].clone(), config.mcp_servers[1].clone(), misspelt]);
+    let warned = wait_for(&hub, "misspelt", |s| log_text(s).contains("허용 목록의 ech0")).await;
+    assert_eq!(warned["state"], "ready");
+    // A server repeating its cursor is listed once, not until the timeout.
+    let looping = ready(&hub, "looping").await;
+    assert!(log_text(&looping).contains("같은 커서 반복"), "{looping:#}");
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn what_a_server_sends_is_bounded() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![
+        fake("huge", &["*"], &[("FAKE_MCP_HUGE_META", "1")]),
+        fake("many", &["*"], &[("FAKE_MCP_MANY", "1500"), ("FAKE_MCP_PAGE", "5000")]),
+        fake("storm", &["echo"], &[("FAKE_MCP_LIST_STORM", "1"), ("FAKE_MCP_PAGE", "1000")]),
+    ]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    for name in ["huge", "many", "storm"] {
+        ready(&hub, name).await;
+    }
+    // A server announcing a changed list after every listing is listed
+    // about once a second, not in a loop.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let storm = hub.server_status("storm", MODEL).unwrap();
+    let lists = log_text(&storm).lines().filter(|l| l.starts_with("listed")).count();
+    assert!(lists <= 5, "listed {lists} times in 3 s");
+    // What it says about itself is cut; a schema too large leaves its tool out.
+    let huge = hub.server_status("huge", MODEL).unwrap();
+    assert!(huge["server_info"]["instructions"].as_str().unwrap().chars().count() <= 8_001);
+    assert!(huge["server_info"]["name"].as_str().unwrap().chars().count() <= 201);
+    let tools = huge["tools"].as_array().unwrap();
+    let meta = tools.iter().find(|t| t["name"] == "huge_meta").unwrap();
+    assert_eq!(meta["annotations"], json!({"readOnlyHint":true}));
+    assert!(meta["title"].as_str().unwrap().chars().count() <= 201);
+    assert!(!tools.iter().any(|t| t["name"] == "huge_schema"));
+    assert!(log_text(&huge).contains("huge_schema의 입력 스키마가"), "{}", log_text(&huge));
+    let many = hub.server_status("many", MODEL).unwrap();
+    assert_eq!(many["tools"].as_array().unwrap().len(), 1_000);
+    assert!(log_text(&many).contains("앞의 1000개만"));
+    // The admin screen's status stays small however much they send.
+    let status = hub.status(MODEL).to_string().len();
+    assert!(status < 1_500_000, "status {status} bytes");
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_changed_tool_list_is_read_again() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("grow", &["*"], &[])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "grow").await;
+    assert!(hub.snapshot(&config).find("grow__extra").is_none());
+    call(&hub, &config, "grow__add_tool", json!({})).await.unwrap();
+    wait_for(&hub, "grow", |s| s["tools"].as_array().unwrap().iter().any(|t| t["name"] == "extra")).await;
+    assert_eq!(call(&hub, &config, "grow__extra", json!({})).await.unwrap()["text"], "extra ran");
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn commands_get_their_environment_but_not_the_backends_secrets() {
+    if node_missing() {
+        return;
+    }
+    // SAFETY: no other test reads these variables.
+    unsafe {
+        std::env::set_var("LLM_AGENT_MCP_FLOW_SECRET", "from-backend");
+        std::env::set_var("MARIADB_PASSWORD_MCP_FLOW", "db-secret");
+    }
+    let mut server = fake("envy", &["env"], &[("PLAIN", "visible"), ("REF", "ENV:LLM_AGENT_MCP_FLOW_SECRET")]);
+    server.secret_env.insert("HIDDEN".into(), Secret("kept-secret".into()));
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "envy").await;
+    for (name, expected) in [
+        ("PLAIN", "visible"),
+        ("REF", "from-backend"),
+        ("HIDDEN", "kept-secret"),
+        ("MARIADB_PASSWORD_MCP_FLOW", "<unset>"),
+        ("LLM_AGENT_MCP_FLOW_SECRET", "<unset>"),
+    ] {
+        assert_eq!(call(&hub, &config, "envy__env", json!({"name":name})).await.unwrap()["text"], expected, "{name}");
+    }
+    assert_ne!(call(&hub, &config, "envy__env", json!({"name":"PATH"})).await.unwrap()["text"], "<unset>");
+    hub.shutdown().await;
+}
+
+#[cfg(unix)]
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn alive(pid: i32) -> bool {
+    let listed = Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]).output().unwrap();
+    String::from_utf8_lossy(&listed.stdout).contains(&format!("\"{pid}\""))
+}
+
+#[tokio::test]
+async fn stopping_kills_the_children_a_server_started() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("parent", &["spawn_child"], &[])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    let status = ready(&hub, "parent").await;
+    let server = status["pid"].as_i64().unwrap() as i32;
+    let child: i32 = call(&hub, &config, "parent__spawn_child", json!({})).await.unwrap()["text"].as_str().unwrap().parse().unwrap();
+    assert!(alive(child));
+    hub.shutdown().await;
+    let started = Instant::now();
+    while (alive(child) || alive(server)) && started.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!alive(server), "the server process is gone");
+    assert!(!alive(child), "the server's own child is gone too");
+}
+
+#[tokio::test]
+async fn settings_apply_in_place_or_reconnect() {
+    if node_missing() {
+        return;
+    }
+    let mut server = fake("live", &["echo"], &[]);
+    let mut config = config(vec![server.clone()]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    let first = ready(&hub, "live").await;
+    // Description, allowed tools and timeout change without a new connection.
+    server.description = "바뀐 설명".into();
+    server.tools = vec!["echo".into(), "add".into()];
+    config.mcp_servers = vec![server.clone()];
+    hub.apply(&config.mcp_servers);
+    let same = hub.server_status("live", MODEL).unwrap();
+    assert_eq!(same["pid"], first["pid"]);
+    assert_eq!(hub.snapshot(&config).names().collect::<Vec<_>>(), ["live__echo", "live__add"]);
+    assert!(hub.snapshot(&config).prompt().contains("바뀐 설명"));
+    // An entry may name the tool as the model sees it; one naming no tool
+    // is reported when the tools are listed.
+    server.tools = vec!["live__echo".into(), "add".into(), "ech0".into()];
+    config.mcp_servers = vec![server.clone()];
+    hub.apply(&config.mcp_servers);
+    assert_eq!(hub.snapshot(&config).names().collect::<Vec<_>>(), ["live__echo", "live__add"]);
+    let listed = probe(&server, MODEL).await.unwrap();
+    assert_eq!(listed["tools"].as_array().unwrap().iter().filter(|t| t["allowed"] == true).count(), 2);
+    // A question's tools follow the edits made while it runs: a tool no
+    // longer allowed is refused, a new connection serves the old snapshot.
+    let question = hub.snapshot(&config);
+    server.tools = vec!["add".into()];
+    config.mcp_servers = vec![server.clone()];
+    hub.apply(&config.mcp_servers);
+    let refused = question.find("live__echo").unwrap().call(json!({"text":"x"}), &CancellationToken::new()).await.unwrap_err();
+    assert!(refused.to_string().starts_with("unsupported_tool:"), "{refused}");
+    // The environment is the connection: a new process.
+    server.env.insert("X".into(), "1".into());
+    config.mcp_servers = vec![server.clone()];
+    hub.apply(&config.mcp_servers);
+    let renewed = wait_for(&hub, "live", |s| s["state"] == "ready" && s["pid"] != first["pid"]).await;
+    assert!(renewed["pid"].is_number());
+    let added = question.find("live__add").unwrap().call(json!({"a":1,"b":2}), &CancellationToken::new()).await.unwrap();
+    assert_eq!(added["text"], "{\"sum\":3}", "the old snapshot calls through the new connection");
+    server.tools = vec!["echo".into(), "add".into()];
+    config.mcp_servers = vec![server.clone()];
+    hub.apply(&config.mcp_servers);
+    // A restart request reconnects at once.
+    assert!(hub.restart("live"));
+    wait_for(&hub, "live", |s| s["state"] == "ready" && s["pid"] != renewed["pid"]).await;
+    // Disabled: no process, no tools.
+    server.enabled = false;
+    config.mcp_servers = vec![server.clone()];
+    hub.apply(&config.mcp_servers);
+    let off = hub.server_status("live", MODEL).unwrap();
+    assert_eq!(off["state"], "disabled");
+    assert!(!hub.restart("live"));
+    assert!(hub.snapshot(&config).is_empty());
+    // Removed.
+    config.mcp_servers.clear();
+    hub.apply(&config.mcp_servers);
+    assert!(hub.server_status("live", MODEL).is_none());
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_probe_lists_the_tools_or_says_why_not() {
+    if node_missing() {
+        return;
+    }
+    let result = probe(&fake("try", &["echo"], &[]), MODEL).await.unwrap();
+    assert_eq!(result["ok"], true, "{result:#}");
+    assert_eq!(result["tools"].as_array().unwrap().len(), 21);
+    assert!(result["message"].as_str().unwrap().contains("fake-mcp 1.2.3"));
+    let failed = probe(&fake("try", &[], &[("FAKE_MCP_EXIT_BEFORE_INIT", "1")]), MODEL).await.unwrap();
+    assert_eq!(failed["ok"], false);
+    assert!(failed["message"].as_str().unwrap().contains("fatal: missing configuration"), "{failed:#}");
+    let invalid = probe(&McpServer { name: "a__b".into(), command: "node".into(), ..Default::default() }, MODEL).await;
+    assert!(invalid.is_err());
+}
+
+/// A fake server over Streamable HTTP; killed when dropped.
+struct HttpServer {
+    child: Child,
+    url: String,
+}
+impl HttpServer {
+    fn start(env: &[(&str, &str)]) -> Self {
+        Self::start_on(env, 0)
+    }
+    fn start_on(env: &[(&str, &str)], port: u16) -> Self {
+        let mut command = Command::new("node");
+        command.arg(fixture()).arg("--http").arg("--port").arg(port.to_string()).stdout(Stdio::piped()).stderr(Stdio::null());
+        for (k, v) in env {
+            command.env(k, v);
+        }
+        let mut child = command.spawn().unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let port = line.trim().strip_prefix("listening ").unwrap().to_owned();
+        Self { child, url: format!("http://127.0.0.1:{port}/mcp") }
+    }
+}
+impl Drop for HttpServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[tokio::test]
+async fn http_servers_connect_with_their_headers() {
+    if node_missing() {
+        return;
+    }
+    // JSON or SSE answers; with a session, or without one (a stateless
+    // server: the session ID is the server's choice).
+    for (sse, stateless) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut env = vec![("FAKE_MCP_AUTH", "Bearer t0k")];
+        if sse {
+            env.push(("FAKE_MCP_SSE", "1"));
+        }
+        if stateless {
+            env.push(("FAKE_MCP_STATELESS", "1"));
+        }
+        let remote = HttpServer::start(&env);
+        let mut server = McpServer { name: "web".into(), url: remote.url.clone(), tools: vec!["echo".into(), "headers".into()], ..Default::default() };
+        server.secret_headers.insert("Authorization".into(), Secret("Bearer t0k".into()));
+        let mut refused = McpServer { name: "nokey".into(), url: remote.url.clone(), tools: vec!["*".into()], ..Default::default() };
+        refused.headers.insert("Authorization".into(), "Bearer wrong".into());
+        let config = config(vec![server, refused]);
+        let hub = McpHub::default();
+        hub.apply(&config.mcp_servers);
+        let status = ready(&hub, "web").await;
+        assert_eq!(status["transport"], "http");
+        assert_eq!(call(&hub, &config, "web__echo", json!({"text":"원격"})).await.unwrap()["text"], "echo: 원격", "sse {sse}, stateless {stateless}");
+        assert_eq!(call(&hub, &config, "web__headers", json!({})).await.unwrap()["text"], "Bearer t0k");
+        if !sse && !stateless {
+            // Addresses that are not the endpoint say what to fix.
+            let base = remote.url.trim_end_matches("/mcp").to_owned();
+            let wrong: Vec<McpServer> = [("moved", "/moved"), ("page", "/page"), ("nope", "/nope")]
+                .iter()
+                .map(|(name, path)| McpServer { name: (*name).into(), url: format!("{base}{path}"), tools: vec!["*".into()], ..Default::default() })
+                .collect();
+            let probes = McpHub::default();
+            probes.apply(&wrong);
+            for (name, hint) in [("moved", "리디렉션"), ("page", "MCP 서버가 아닌 응답"), ("nope", "MCP 엔드포인트가 없습니다")] {
+                let failed = wait_for(&probes, name, |s| s["state"] == "failed").await;
+                assert!(failed["error"].as_str().unwrap().contains(hint), "{name}: {failed:#}");
+            }
+            probes.shutdown().await;
+        }
+        let nokey = wait_for(&hub, "nokey", |s| s["state"] == "failed").await;
+        let error = nokey["error"].as_str().unwrap();
+        assert!(error.starts_with("초기화하지 못했습니다: 서버가 인증을 거절했습니다") && error.contains("HTTP 401"), "{error}");
+        assert!(!error.contains("rmcp::transport"), "no SDK type names: {error}");
+        hub.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn an_http_server_that_goes_away_is_marked_failed_and_reconnected() {
+    if node_missing() {
+        return;
+    }
+    let remote = HttpServer::start(&[]);
+    let port: u16 = remote.url.rsplit(':').next().unwrap().trim_end_matches("/mcp").parse().unwrap();
+    let server = McpServer { name: "web".into(), url: remote.url.clone(), tools: vec!["echo".into()], ..Default::default() };
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "web").await;
+    drop(remote);
+    // The call says why, and the server stops being shown (and offered) as
+    // connected instead of failing every call while it looks ready.
+    let error = call(&hub, &config, "web__echo", json!({"text":"x"})).await.unwrap_err().to_string();
+    assert!(error.starts_with("mcp_server_unavailable:"), "{error}");
+    assert!(error.len() > "mcp_server_unavailable: the connection to MCP server web closed during the call".len(), "the cause is kept: {error}");
+    let failed = wait_for(&hub, "web", |s| s["state"] == "failed").await;
+    assert!(failed["error"].as_str().unwrap().contains("연결이 거부되었습니다"), "{failed:#}");
+    assert!(error.contains("연결이 거부되었습니다"), "{error}");
+    assert!(hub.snapshot(&config).is_empty());
+    let back = HttpServer::start_on(&[], port);
+    wait_for(&hub, "web", |s| s["state"] == "ready").await;
+    assert_eq!(call(&hub, &config, "web__echo", json!({"text":"돌아옴"})).await.unwrap()["text"], "echo: 돌아옴");
+    drop(back);
+    hub.shutdown().await;
+}
+
+async fn ask(app: &std::sync::Arc<llm_agent::app::App>, message: &str) -> (anyhow::Result<agent::Answer>, Vec<Value>) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let result = agent::answer(
+        app,
+        Question { conversation_id: "mcp".into(), message: message.into(), history: vec![] },
+        Events::new(Some(tx)),
+        CancellationToken::new(),
+    )
+    .await;
+    let mut events = vec![];
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    (result, events)
+}
+
+#[tokio::test]
+async fn the_model_calls_mcp_tools_like_its_own() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("fake", &["echo", "fail", "big"], &[])]);
+    let llm = Scripted::new(vec![
+        calls(vec![
+            support::call("m1", "fake__echo", json!({"text":"이슈 123"})),
+            support::call("m2", "fake__fail", json!({})),
+            support::call("m3", "fake__big", json!({"chars":180_000})),
+            support::call("m4", "fake__echo", json!({})),
+        ]),
+        text("끝"),
+    ]);
+    let (app, _dir) = app(config.clone(), llm.clone());
+    app.mcp.apply(&config.mcp_servers);
+    ready(&app.mcp, "fake").await;
+    let (result, events) = ask(&app, "이슈 123 상태 알려줘").await;
+    let answer = result.unwrap();
+    assert_eq!(answer.answer, "끝");
+    let requests = llm.requests();
+    let first = &requests[0];
+    let tools: Vec<&str> = first["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+    for name in ["fake__echo", "fake__fail", "fake__big", "search"] {
+        assert!(tools.contains(&name), "{name} in {tools:?}");
+    }
+    let system = first["messages"][0]["content"].as_str().unwrap();
+    assert!(system.ends_with("- fake: 가짜 MCP 서버 fake"), "{system}");
+    let second = &requests[1];
+    assert_eq!(tool_result(second, "m1")["data"]["text"], "echo: 이슈 123");
+    let failed = tool_result(second, "m2");
+    assert_eq!(failed["status"], "error");
+    assert_eq!(failed["error"], "mcp_tool_error: boom: the tool failed");
+    // A result past the budget is cut to its start, the rest archived.
+    let big = tool_result(second, "m3");
+    assert_eq!(big["truncated"], true);
+    assert_eq!(big["next_cursor"]["tool"], "history");
+    assert!(big["data"]["text"].as_str().unwrap().len() < 180_000);
+    let refused = tool_result(second, "m4");
+    assert!(refused["error"].as_str().unwrap().starts_with("missing_argument: text"), "{refused}");
+    // Progress lines and the trace name the server and tool.
+    let started = ev(&events, "tool");
+    assert_eq!(started[0]["summary"], "fake · echo \"이슈 123\"");
+    let done = ev(&events, "tool_done");
+    assert_eq!(done.len(), 4);
+    assert_eq!(answer.trace[0]["tool"], "fake__echo");
+    assert_eq!(answer.trace[0]["summary"], "fake · echo \"이슈 123\"");
+    assert_eq!(answer.trace[1]["status"], "error");
+    app.mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn many_large_mcp_results_are_cut_to_fit_and_read_back_from_history() {
+    if node_missing() {
+        return;
+    }
+    let mut config = config(vec![fake("fake", &["big"], &[])]);
+    config.llm.context_tokens = 40_000;
+    config.llm.output_tokens = 4_000;
+    let calls_made: Vec<_> = (0..8).map(|i| support::call(&format!("b{i}"), "fake__big", json!({"chars":60_000}))).collect();
+    let llm = Scripted::new(vec![calls(calls_made), text("끝")]);
+    let (app, _dir) = app(config.clone(), llm.clone());
+    app.mcp.apply(&config.mcp_servers);
+    ready(&app.mcp, "fake").await;
+    let (result, _) = ask(&app, "크게 여러 번").await;
+    assert_eq!(result.unwrap().answer, "끝");
+    let second = &llm.requests()[1];
+    let budget = config.result_budget();
+    let mut archives = vec![];
+    for i in 0..8 {
+        let shown = tool_result(second, &format!("b{i}"));
+        assert_eq!(shown["status"], "ok");
+        assert_eq!(shown["truncated"], true, "{i}");
+        assert_eq!(shown["next_cursor"]["tool"], "history");
+        archives.push(shown["next_cursor"]["id"].as_u64().unwrap());
+    }
+    let messages: Vec<_> = messages(second, "tool");
+    let total: usize = messages.iter().map(|m| llm_agent::context::count(m, MODEL)).sum();
+    assert!(total <= 8 * (budget + 200), "each result within its budget: {total}");
+    assert!(llm_agent::context::count(second, MODEL) < config.llm.context_tokens - config.llm.output_tokens, "the request fits the context");
+    assert_eq!(archives.iter().collect::<std::collections::BTreeSet<_>>().len(), 8, "one archive per result");
+    // The rest of a cut result is read from the history where it was
+    // archived, the next question in the same conversation too.
+    llm.push(vec![
+        calls(vec![
+            support::call("h1", "history", json!({"action":"read","id":archives[3],"offset":0})),
+            support::call("h2", "history", json!({"action":"read","id":archives[3],"offset":50_000})),
+        ]),
+        text("다 읽음"),
+    ]);
+    let (result, _) = ask(&app, "잘린 결과 이어 읽어").await;
+    assert_eq!(result.unwrap().answer, "다 읽음");
+    let requests = llm.requests();
+    let tools: Vec<&str> = requests[2]["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+    assert!(tools.contains(&"history") && tools.contains(&"fake__big"), "{tools:?}");
+    for id in ["h1", "h2"] {
+        let read = tool_result(&requests[3], id);
+        assert_eq!(read["status"], "ok", "{read}");
+        assert!(read["data"]["text"].as_str().unwrap().contains("0123456789"), "{id}: {read}");
+    }
+    app.mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn too_many_allowed_mcp_tools_are_named_as_what_does_not_fit() {
+    if node_missing() {
+        return;
+    }
+    // Long descriptions over the minimum context: the frame fits without the
+    // MCP tools and not with them.
+    let mut config = config(vec![fake("wide", &["*"], &[("FAKE_MCP_WIDE", "40")])]);
+    config.llm.context_tokens = 12_000;
+    config.llm.output_tokens = 2_000;
+    let llm = Scripted::new(vec![text("끝")]);
+    let (app, _dir) = app(config.clone(), llm.clone());
+    app.mcp.apply(&config.mcp_servers);
+    ready(&app.mcp, "wide").await;
+    let tokens: u64 = app.mcp.server_status("wide", MODEL).unwrap()["tools"].as_array().unwrap().iter().map(|t| t["tokens"].as_u64().unwrap()).sum();
+    assert!(tokens > 12_000, "the fixture is wide enough: {tokens}");
+    let (result, _) = ask(&app, "안녕").await;
+    let Err(error) = result else { panic!("the question was answered") };
+    let shown = error.downcast_ref::<agent::UserFacing>().map(|e| e.0.clone()).unwrap_or_else(|| error.to_string());
+    assert!(shown.contains("MCP 탭에서 허용 도구를 줄여주세요"), "{shown}");
+    assert!(llm.requests().is_empty(), "nothing was sent");
+    app.mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_calls_stop_at_the_final_reserve() {
+    if node_missing() {
+        return;
+    }
+    let mut server = fake("fake", &["slow"], &[]);
+    server.timeout_secs = Some(120);
+    let mut config = config(vec![server]);
+    config.agent.run_seconds = 49;
+    let llm = Scripted::new(vec![calls(vec![support::call("s1", "fake__slow", json!({"ms":30_000}))]), text("끝")]);
+    let (app, _dir) = app(config.clone(), llm.clone());
+    app.mcp.apply(&config.mcp_servers);
+    ready(&app.mcp, "fake").await;
+    let started = Instant::now();
+    let (result, events) = ask(&app, "느린 도구").await;
+    assert_eq!(result.unwrap().answer, "끝");
+    assert!(started.elapsed() < Duration::from_secs(10), "stopped at the reserve, not after 30 s: {:?}", started.elapsed());
+    let second = &llm.requests()[1];
+    assert_eq!(tool_result(second, "s1")["status"], "cancelled");
+    assert_eq!(second["tool_choice"], "none", "the final answer is asked without tools");
+    assert_eq!(ev(&events, "tool_done")[0]["status"], "cancelled");
+    let status = wait_for(&app.mcp, "fake", |s| log_text(s).contains("cancelled")).await;
+    assert_eq!(status["tools"].as_array().unwrap().iter().find(|t| t["name"] == "slow").unwrap()["cancelled"], 1);
+    app.mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_question_keeps_its_tools_while_the_server_reconnects() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("flaky", &["echo", "crash"], &[])]);
+    let llm = Scripted::new(vec![
+        calls(vec![support::call("c1", "flaky__crash", json!({}))]),
+        calls(vec![support::call("c2", "flaky__echo", json!({"text":"다시"}))]),
+        text("끝"),
+    ]);
+    let (app, _dir) = app(config.clone(), llm.clone());
+    app.mcp.apply(&config.mcp_servers);
+    ready(&app.mcp, "flaky").await;
+    let (result, _) = ask(&app, "두 번 불러줘").await;
+    assert_eq!(result.unwrap().answer, "끝");
+    let requests = llm.requests();
+    let crashed = tool_result(&requests[1], "c1");
+    assert_eq!(crashed["recovery"]["code"], "mcp_server_unavailable");
+    // The same tool definitions in every request of the question.
+    assert_eq!(requests[0]["tools"], requests[2]["tools"]);
+    let echo = tool_result(&requests[2], "c2");
+    assert!(echo["status"] == "ok" || echo["recovery"]["code"] == "mcp_server_unavailable", "{echo}");
+    app.mcp.shutdown().await;
+}
+
+/// The admin API over the router, as the screen calls it.
+struct Admin {
+    router: axum::Router,
+    token: Option<String>,
+}
+
+impl Admin {
+    async fn send(&self, method: &str, path: &str, body: Option<Value>, revision: Option<&str>) -> (u16, Value, String) {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let mut request = Request::builder().method(method).uri(format!("/api/admin/{path}")).header("x-admin-request", "1");
+        if let Some(token) = &self.token {
+            request = request.header("x-admin-token", token);
+        }
+        if let Some(revision) = revision {
+            request = request.header("if-match", format!("\"{revision}\""));
+        }
+        let request = match body {
+            Some(body) => request.header("content-type", "application/json").body(Body::from(body.to_string())).unwrap(),
+            None => request.body(Body::empty()).unwrap(),
+        };
+        let response = self.router.clone().oneshot(request).await.unwrap();
+        let status = response.status().as_u16();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        (status, serde_json::from_str(&text).unwrap_or(Value::Null), text)
+    }
+}
+
+#[tokio::test]
+async fn the_admin_screen_edits_servers_only_behind_a_key() {
+    if node_missing() {
+        return;
+    }
+    let (open_app, _open_dir) = app(config(vec![]), Scripted::new(vec![]));
+    let open = Admin { router: llm_agent::web::router(open_app.clone()), token: None };
+    let (status, body, _) = open.send("GET", "mcp", None, None).await;
+    assert_eq!((status, body["editable"].clone()), (200, json!(false)));
+    let draft = json!({"name":"fake","command":"node","args":[fixture().display().to_string()],"tools":["echo"]});
+    for (method, path) in [("POST", "mcp"), ("POST", "mcp-check")] {
+        let (status, body, _) = open.send(method, path, Some(draft.clone()), None).await;
+        assert_eq!(status, 403, "{path}: {body}");
+        assert!(body["error"].as_str().unwrap().contains("관리자 인증 키"));
+    }
+
+    // A key set while the admin API was open does not open MCP editing
+    // until the backend restarts with it.
+    let (status, settings, _) = open.send("GET", "settings", None, None).await;
+    assert_eq!(status, 200);
+    let (status, _, text) = open
+        .send("PUT", "settings", Some(json!({"secrets":{"admin_token":"late-key"}})), Some(settings["revision"].as_str().unwrap()))
+        .await;
+    assert_eq!(status, 200, "{text}");
+    let late = Admin { router: llm_agent::web::router(open_app.clone()), token: Some("late-key".into()) };
+    let (status, listed, _) = late.send("GET", "mcp", None, None).await;
+    assert_eq!((status, listed["editable"].clone()), (200, json!(false)));
+    assert!(listed["locked_reason"].as_str().unwrap().contains("다시 시작"));
+    let (status, body, _) = late.send("POST", "mcp", Some(draft.clone()), None).await;
+    assert_eq!(status, 403, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("backend를 다시 시작한 뒤"), "{body}");
+
+    let mut keyed = config(vec![]);
+    keyed.admin_token = Some(Secret("key".into()));
+    let (app, dir) = app(keyed, Scripted::new(vec![]));
+    let admin = Admin { router: llm_agent::web::router(app.clone()), token: Some("key".into()) };
+    let mut created = draft.clone();
+    created["description"] = json!("가짜 서버");
+    created["env"] = json!({"PLAIN":"visible"});
+    created["secrets"] = json!({"env":{"HIDDEN":"kept-secret"}});
+    let (status, server, text) = admin.send("POST", "mcp", Some(created.clone()), None).await;
+    assert_eq!(status, 201, "{text}");
+    assert_eq!(server["secrets"]["env"], json!(["HIDDEN"]));
+    assert!(!text.contains("kept-secret"), "a secret is never sent back");
+    let toml = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(toml.contains("[[mcp_servers]]") && !toml.contains("kept-secret"), "{toml}");
+    assert!(std::fs::read_to_string(dir.path().join("config.credentials.json")).unwrap().contains("kept-secret"));
+    let first = ready(&app.mcp, "fake").await;
+    let config_now = app.config();
+    assert_eq!(call(&app.mcp, &config_now, "fake__echo", json!({"text":"화면"})).await.unwrap()["text"], "echo: 화면");
+    let (status, _, _) = admin.send("POST", "mcp", Some(created.clone()), None).await;
+    assert_eq!(status, 409, "the name is taken");
+    let mut both = created.clone();
+    both["name"] = json!("both");
+    both["url"] = json!("http://127.0.0.1:9/mcp");
+    let (status, body, _) = admin.send("POST", "mcp", Some(both), None).await;
+    assert_eq!(status, 400, "{body}");
+
+    // A stale revision is refused; allowed tools change on the live connection.
+    let (status, _, _) = admin.send("PUT", "mcp/fake", Some(json!({"tools":["echo","add"]})), Some(&"0".repeat(64))).await;
+    assert_eq!(status, 409);
+    let (status, listed, _) = admin.send("GET", "mcp", None, None).await;
+    assert_eq!(status, 200);
+    let revision = listed["servers"][0]["revision"].as_str().unwrap().to_owned();
+    assert_eq!(listed["servers"][0]["status"]["state"], "ready");
+    let (status, updated, text) = admin.send("PUT", "mcp/fake", Some(json!({"tools":["echo","add"]})), Some(&revision)).await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(updated["secrets"]["env"], json!(["HIDDEN"]), "secrets absent from the body are kept");
+    assert_eq!(updated["status"]["pid"], first["pid"], "no new connection for a changed allow list");
+    assert_eq!(app.mcp.snapshot(&app.config()).names().collect::<Vec<_>>(), ["fake__echo", "fake__add"]);
+    let revision = updated["revision"].as_str().unwrap().to_owned();
+    let (status, updated, _) = admin.send("PUT", "mcp/fake", Some(json!({"secrets":{"env":{"HIDDEN":null}}})), Some(&revision)).await;
+    assert_eq!(status, 200);
+    assert_eq!(updated["secrets"]["env"], json!([]));
+    ready(&app.mcp, "fake").await;
+
+    // The settings tab neither shows nor drops the servers.
+    let (status, settings, _) = admin.send("GET", "settings", None, None).await;
+    assert_eq!(status, 200);
+    assert!(settings["config"].get("mcp_servers").is_none());
+    let (status, saved, text) = admin
+        .send("PUT", "settings", Some(json!({"config":{"agent":{"tool_timeout_secs":31},"mcp_servers":[]}})), Some(settings["revision"].as_str().unwrap()))
+        .await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(saved["config"]["agent"]["tool_timeout_secs"], 31);
+    assert_eq!(app.config().mcp_servers.len(), 1);
+
+    // A restart reconnects; a check connects with the draft and lists tools.
+    let before = ready(&app.mcp, "fake").await;
+    let (status, _, _) = admin.send("POST", "mcp/fake/restart", None, None).await;
+    assert_eq!(status, 200);
+    wait_for(&app.mcp, "fake", |s| s["state"] == "ready" && s["pid"] != before["pid"]).await;
+    let (status, checked, text) = admin.send("POST", "mcp-check", Some(json!({"original":"fake","tools":["*"]})), None).await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(checked["ok"], true, "{checked:#}");
+    assert_eq!(checked["tools"].as_array().unwrap().len(), 21);
+    assert!(checked["tools"][0]["tokens"].as_u64().unwrap() > 10);
+    let (status, _, _) = admin.send("POST", "mcp-check", Some(json!({"name":"a__b","command":"node"})), None).await;
+    assert_eq!(status, 400);
+
+    // A token is not sent to another host unless it is entered again.
+    let mut web = json!({"name":"web","url":"http://127.0.0.1:9/mcp","tools":["*"],"secrets":{"headers":{"Authorization":"Bearer t0k"}}});
+    let (status, created, text) = admin.send("POST", "mcp", Some(web.clone()), None).await;
+    assert_eq!(status, 201, "{text}");
+    let moved = json!({"url":"http://127.0.0.2:9/mcp"});
+    let (status, body, _) = admin.send("PUT", "mcp/web", Some(moved.clone()), Some(created["revision"].as_str().unwrap())).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("Authorization"), "{body}");
+    let (status, _, _) = admin.send("POST", "mcp-check", Some(json!({"original":"web","url":"http://127.0.0.2:9/mcp"})), None).await;
+    assert_eq!(status, 400, "the check does not send it either");
+    let (status, same_host, text) = admin.send("PUT", "mcp/web", Some(json!({"url":"http://127.0.0.1:9/other"})), Some(created["revision"].as_str().unwrap())).await;
+    assert_eq!(status, 200, "same host, another path: {text}");
+    assert_eq!(same_host["secrets"]["headers"], json!(["Authorization"]));
+    web["url"] = json!("http://127.0.0.2:9/mcp");
+    web["secrets"] = json!({"headers":{"Authorization":"Bearer new"}});
+    let (status, _, text) = admin.send("PUT", "mcp/web", Some(web), Some(same_host["revision"].as_str().unwrap())).await;
+    assert_eq!(status, 200, "entered again: {text}");
+    let (_, listed, _) = admin.send("GET", "mcp", None, None).await;
+    let revision = listed["servers"][1]["revision"].as_str().unwrap().to_owned();
+    let (status, _, _) = admin.send("DELETE", "mcp/web", None, Some(&revision)).await;
+    assert_eq!(status, 204);
+
+    // Removal needs the revision and stops the server.
+    let (_, listed, _) = admin.send("GET", "mcp", None, None).await;
+    let revision = listed["servers"][0]["revision"].as_str().unwrap().to_owned();
+    let (status, _, _) = admin.send("DELETE", "mcp/fake", None, None).await;
+    assert_eq!(status, 428);
+    let (status, _, _) = admin.send("DELETE", "mcp/fake", None, Some(&revision)).await;
+    assert_eq!(status, 204);
+    assert!(app.mcp.server_status("fake", MODEL).is_none());
+    assert!(app.config().mcp_servers.is_empty());
+    app.mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_key_in_the_server_address_stays_out_of_errors_and_logs() {
+    let server = McpServer { name: "leak".into(), url: "http://user:hunter2@127.0.0.1:9/mcp?api_key=s3cret".into(), tools: vec!["*".into()], ..Default::default() };
+    let hub = McpHub::default();
+    hub.apply(&[server]);
+    let failed = wait_for(&hub, "leak", |s| s["state"] == "failed").await;
+    let shown = format!("{} {}", failed["error"], log_text(&failed));
+    assert!(shown.contains("127.0.0.1:9/mcp?…"), "{shown}");
+    for secret in ["s3cret", "hunter2", "api_key"] {
+        assert!(!shown.contains(secret), "{secret} in {shown}");
+    }
+    hub.shutdown().await;
+}

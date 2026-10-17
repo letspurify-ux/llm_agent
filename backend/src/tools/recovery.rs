@@ -94,7 +94,7 @@ pub fn describe(message: &str) -> Value {
         (Class::Capacity, "narrow_the_scope")
     } else if matches!(
         code,
-        "search_unavailable" | "database_unavailable" | "embedding_unavailable"
+        "search_unavailable" | "database_unavailable" | "embedding_unavailable" | "mcp_server_unavailable"
     ) {
         (Class::Unavailable, "answer_with_gathered_evidence")
     } else if matches!(code, "query_not_found" | "unknown_item") {

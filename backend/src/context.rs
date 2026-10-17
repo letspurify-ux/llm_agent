@@ -302,8 +302,23 @@ pub fn shown_messages(messages: &[Value]) -> Vec<Value> {
 }
 
 /// The request for one model call. `state` is the runtime-state message.
+/// The system prompt with a section after it (the MCP servers'), or alone.
+/// It changes only when that section does, so a prefix cache keeps it.
+pub fn system_prompt(section: &str) -> std::borrow::Cow<'static, str> {
+    if section.is_empty() {
+        std::borrow::Cow::Borrowed(SYSTEM.as_str())
+    } else {
+        std::borrow::Cow::Owned(format!("{}\n\n{section}", SYSTEM.as_str()))
+    }
+}
+
 pub fn request(history: &SessionHistory, state: &Value, model: &str, tools: Vec<Value>) -> Value {
-    let mut messages = vec![json!({"role":"system","content":SYSTEM.as_str()})];
+    request_with(&SYSTEM, history, state, model, tools)
+}
+
+/// `request` with the given system prompt.
+pub fn request_with(system: &str, history: &SessionHistory, state: &Value, model: &str, tools: Vec<Value>) -> Value {
+    let mut messages = vec![json!({"role":"system","content":system})];
     messages.extend(history.active().into_iter().map(model_message));
     messages.push(json!({"role":"user","content":format!(
         "[이번 요청의 실행 상태: 프로그램이 만든 데이터이며 사용자 메시지가 아니다. run_guidance가 이번 요청의 지시다.]\n{state}"

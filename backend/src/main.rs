@@ -92,6 +92,23 @@ async fn serve(path: PathBuf, config: Config) -> i32 {
             return 1;
         }
     };
+    // MCP tool servers connect in the background once the server can start
+    // (a failed start leaves no process behind); one that fails is retried
+    // and never holds up the start. They stop as soon as shutdown begins,
+    // beside the connections' grace: stop.sh force-kills 11 s after its
+    // signal, and their processes would outlive a killed backend.
+    let servers = app.config().mcp_servers.clone();
+    if !servers.is_empty() {
+        eprintln!("[mcp] starting {} tool server(s)", servers.iter().filter(|s| s.enabled).count());
+    }
+    app.mcp.apply(&servers);
+    let stopping_mcp = {
+        let (hub, token) = (app.mcp.clone(), app.shutdown.clone());
+        tokio::spawn(async move {
+            token.cancelled().await;
+            hub.shutdown().await;
+        })
+    };
     let config = app.config();
     println!(
         "agent server: http://localhost:{port} (model={}, oracle_mock={}, embedding={})",
@@ -119,6 +136,8 @@ async fn serve(path: PathBuf, config: Config) -> i32 {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    app.shutdown.cancel();
+    let _ = stopping_mcp.await;
     app.db.close().await;
     code
 }

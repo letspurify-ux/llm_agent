@@ -152,3 +152,46 @@
 .admin-check-fail { color: #a62537; overflow-wrap: anywhere; }
 .admin-settings > .admin-form-actions { position: sticky; bottom: 0; background: var(--bg); padding: 12px 0; display: flex; justify-content: space-between; align-items: center; }
 .admin-settings > .admin-form-actions > div { display: flex; gap: 8px; }
+/* MCP 탭 */
+.admin-mcp { margin-top: 18px; }
+.admin-mcp-readonly { padding: 12px 15px; border-radius: 8px; font-size: 13px; line-height: 1.6; margin: 0 0 14px; background: #fff8e8; color: #7a5208; border: 1px solid #f1dfb0; }
+.admin-mcp-caption { padding-top: 14px; align-items: center; }
+.admin-mcp-caption > span:last-child { display: flex; gap: 6px; }
+.admin-mcp-caption .admin-secondary, .admin-mcp-caption .admin-primary { padding: 6px 11px; }
+.admin-record-copy strong small { font-weight: 500; color: var(--muted); font-size: 11px; margin-left: 4px; }
+.admin-mcp-state { flex-shrink: 0; font-size: 11px; font-weight: 650; border-radius: 20px; padding: 3px 9px; border: 1px solid var(--border); background: #f3f4f7; color: var(--muted); white-space: nowrap; }
+.admin-mcp-state.ready { background: #edf9f2; color: #246044; border-color: #c7e6d4; }
+.admin-mcp-state.connecting { background: #eef4ff; color: #2d4f8f; border-color: #cbd9f5; }
+.admin-mcp-state.failed { background: #fff1f2; color: #a62537; border-color: #f4cbd1; }
+.admin-mcp-choice { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 13px; }
+.admin-mcp-choice label { display: inline-flex; align-items: center; gap: 6px; }
+.admin-field .admin-mcp-choice input[type=radio] { display: inline-block; width: auto; margin: 0; accent-color: var(--accent); }
+.admin-mcp-secrets { display: grid; gap: 8px; font-size: 13px; }
+.admin-mcp-secrets code { font-size: 12px; background: #f3f4f7; border-radius: 4px; padding: 1px 5px; }
+.admin-mcp-secrets .admin-input-action input { border: 1px solid #dce1eb; border-radius: 7px; padding: 9px 11px; font-size: 13px; min-width: 0; }
+.admin-mcp-tools { display: grid; gap: 2px; max-height: 340px; overflow: auto; border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; font-size: 12px; }
+.admin-mcp-tools > p { margin: 6px 0; color: var(--muted); }
+.admin-mcp-tools label { display: flex; align-items: flex-start; gap: 8px; padding: 6px 2px; border-bottom: 1px solid #f0f2f7; overflow-wrap: anywhere; }
+.admin-mcp-tools label:last-child { border-bottom: 0; }
+.admin-mcp-tools input { margin-top: 2px; accent-color: var(--accent); }
+.admin-mcp-tools label.missing { color: var(--muted); }
+.admin-mcp-tools em { font-style: normal; font-size: 10px; color: #a62537; margin-left: 6px; }
+.admin-mcp-tools em.safe { color: #246044; }
+.admin-mcp-tools small { display: inline; color: var(--muted); }
+.admin-mcp-all { font-weight: 650; }
+.admin-mcp-tool-description { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; color: var(--muted); margin-top: 2px; }
+.admin-mcp-check { margin: 0; padding: 0 23px 16px; }
+.admin-mcp-status { border-top: 1px solid var(--border); padding: 18px 23px 22px; font-size: 13px; }
+.admin-mcp-status h4 { margin: 0 0 10px; font-size: 14px; }
+.admin-mcp-status h4 + * { margin-top: 0; }
+.admin-mcp-status dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 14px; margin: 0 0 14px; }
+.admin-mcp-status dt { color: var(--muted); }
+.admin-mcp-status dd { margin: 0; overflow-wrap: anywhere; }
+.admin-mcp-status details { margin: 0 0 14px; }
+.admin-mcp-instructions { white-space: pre-wrap; background: #f7f8fd; border-radius: 7px; padding: 8px 11px; font-size: 12px; }
+.admin-mcp-table { overflow: auto; margin: 0 0 16px; }
+.admin-mcp-table table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.admin-mcp-table th, .admin-mcp-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #edf0f6; white-space: nowrap; }
+.admin-mcp-table th { color: var(--muted); font-weight: 600; }
+.admin-mcp-table .admin-mcp-error { white-space: normal; color: #a62537; min-width: 160px; overflow-wrap: anywhere; }
+.admin-mcp-log { max-height: 240px; overflow: auto; margin: 0; background: #1d2230; color: #e3e7f1; border-radius: 8px; padding: 10px 12px; font-size: 11px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }

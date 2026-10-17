@@ -7,6 +7,7 @@ pub mod session;
 pub mod shared;
 pub mod text;
 pub mod tools;
+pub mod mcp;
 pub mod voc_tools;
 mod worker;
 pub mod chunk;

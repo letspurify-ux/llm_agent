@@ -9,6 +9,7 @@ use crate::{
     config::{Config, Project},
     context,
     llm::{Completion, ToolCall},
+    mcp,
     session::Conversation,
     text::{clip_utf16, js_trim, name_key},
     tools::{self, FileCursor, ToolConfig, ToolRegistry, Workspace, recovery::FailureTracker},
@@ -57,6 +58,8 @@ const SERVED_CUT: &str = "모델 서버가 요청을 다 받지 못하고 일부
 const CUT_GROWTH: usize = 1_000;
 /// What the model is told when the work before the final reserve stopped.
 const RESERVE_REACHED: &str = "남은 시간이 모자라 이전 요청을 멈췄다.";
+/// The allowed MCP tools' definitions alone fill the context.
+const MCP_TOO_LARGE: &str = "허용한 MCP 도구의 정의가 모델 컨텍스트를 너무 많이 차지해 답할 수 없습니다. 관리자 화면 MCP 탭에서 허용 도구를 줄여주세요.";
 const TOOLS_STOPPED: &str = "남은 시간이 모자라 이전 응답의 도구 실행 일부를 멈췄다(status cancelled).";
 /// What the model is told when it answered that the registered material
 /// lacks the subject before searching for it.
@@ -197,6 +200,10 @@ async fn run(
         .history
         .push(vec![json!({"role":"user","content":message})], true);
     let model = config.llm.model.clone();
+    // The MCP tools of this question: the same definitions and system prompt
+    // in every request, so a provider's prefix cache keeps them.
+    let mcp = app.mcp.snapshot(config);
+    let system = context::system_prompt(&mcp.prompt());
     let deadline = timing.started + Duration::from_secs(config.agent.run_seconds);
     let mut trace: Vec<Value> = vec![];
     let mut tracker = FailureTracker::default();
@@ -256,15 +263,17 @@ async fn run(
         // continuation. (The client drops them for a provider that refuses or
         // ignores tool_choice.)
         let frame = |c: &Conversation| {
-            let offered = offered_tools(config, c);
+            let offered = offered_tools(config, c, &mcp);
             let usable: &[String] = if withheld_tools { &[] } else { &offered };
             let state = runtime_state(config, message, remaining, final_round, usable, partial.is_empty(), round_notice.clone());
             let mut definitions = ToolRegistry::definitions(&offered.iter().map(String::as_str).collect());
             tools::require_project(&mut definitions, &config.projects);
+            // After require_project: an MCP tool's own `project` field is its own.
+            definitions.extend(mcp.definitions());
             (offered, state, definitions)
         };
         let build = |c: &Conversation, state: &Value, definitions: &[Value]| {
-            let mut request = context::request(&c.history, state, &model, definitions.to_vec());
+            let mut request = context::request_with(&system, &c.history, state, &model, definitions.to_vec());
             if withheld_tools && !definitions.is_empty() {
                 request["tool_choice"] = json!("none");
             }
@@ -286,7 +295,7 @@ async fn run(
             eprintln!("[context] evicted {} old bundles; request now ~{estimate} tokens", evicted.len());
         }
         // What eviction cannot remove: the frame and the question.
-        let alone = context::count(&context::request(&Default::default(), &state, &model, definitions.clone()), &model)
+        let alone = context::count(&context::request_with(&system, &Default::default(), &state, &model, definitions.clone()), &model)
             + context::bundle_tokens(&c.history, question_bundle, &model);
         let kept = alone + 512;
         let ratio = context::token_ratio(c, &model);
@@ -298,7 +307,15 @@ async fn run(
             }
             let usable: &[String] = if withheld_tools { &[] } else { &offered };
             let bare = runtime_state(config, "", remaining, final_round, usable, true, None);
-            let frame_tokens = context::count(&context::request(&Default::default(), &bare, &model, definitions), &model);
+            let mcp_count = mcp.definitions().len();
+            let own = definitions[..definitions.len() - mcp_count].to_vec();
+            let frame_tokens = context::count(&context::request_with(&system, &Default::default(), &bare, &model, definitions), &model);
+            // The MCP tools' definitions and section are what does not fit:
+            // the settings are not too small, the allowed tools too many.
+            if !fits(frame_tokens) && mcp_count > 0 && fits(context::count(&context::request(&Default::default(), &bare, &model, own), &model)) {
+                eprintln!("[mcp] the allowed MCP tools' definitions (~{frame_tokens} tokens with the frame) do not fit the context");
+                bail!(UserFacing(MCP_TOO_LARGE.into()));
+            }
             bail!(too_long(fits(frame_tokens), fits(alone)));
         }
         rounds += 1;
@@ -463,7 +480,7 @@ async fn run(
                             .downcast_ref::<crate::llm::CompletionError>()
                             .is_some_and(|e| e.tools_dropped());
                         let sent = if dropped {
-                            context::count(&context::request(&c.history, &state, &model, vec![]), &model)
+                            context::count(&context::request_with(&system, &c.history, &state, &model, vec![]), &model)
                         } else {
                             estimate
                         };
@@ -570,7 +587,7 @@ async fn run(
             // The provider counted the request as it was sent: without the
             // withheld tools when it was answered without them.
             let sent = if completion.tools_dropped {
-                context::count(&context::request(&c.history, &state, &model, vec![]), &model)
+                context::count(&context::request_with(&system, &c.history, &state, &model, vec![]), &model)
             } else {
                 estimate
             };
@@ -740,6 +757,7 @@ async fn run(
             c,
             &completion,
             &offered,
+            &mcp,
             events,
             &tools_cancel,
             &mut tracker,
@@ -858,8 +876,9 @@ fn last_is_partial(c: &Conversation) -> bool {
 
 /// Tools defined this round: the knowledge and query tools always, the
 /// source tools when projects exist, the history tool once something left
-/// the context. A round that withholds them still defines them.
-fn offered_tools(config: &Config, c: &Conversation) -> Vec<String> {
+/// the context, then the question's MCP tools. A round that withholds them
+/// still defines them.
+fn offered_tools(config: &Config, c: &Conversation, mcp: &mcp::Snapshot) -> Vec<String> {
     let mut names: Vec<String> = voc_tools::specs().iter().map(|s| s.name.to_owned()).collect();
     if !config.projects.is_empty() {
         names.extend(
@@ -872,6 +891,7 @@ fn offered_tools(config: &Config, c: &Conversation) -> Vec<String> {
     if c.history.bundles.iter().any(|b| !b.active) {
         names.push("history".into());
     }
+    names.extend(mcp.names().map(str::to_owned));
     names
 }
 
@@ -929,6 +949,7 @@ fn runtime_state(
 enum Prepared {
     Voc { args: Value },
     Source { args: Value, project: Project },
+    Mcp { args: Value, tool: Arc<mcp::Offered> },
     /// Refused before running (its result is the refusal).
     Done(Value),
 }
@@ -1012,6 +1033,7 @@ async fn execute_batch(
     c: &mut Conversation,
     completion: &Completion,
     offered: &[String],
+    mcp: &mcp::Snapshot,
     events: &Events,
     cancel: &CancellationToken,
     tracker: &mut FailureTracker,
@@ -1046,6 +1068,10 @@ async fn execute_batch(
                 });
             }
             let mut args = parsed.clone()?;
+            if let Some(tool) = mcp.find(&call.name) {
+                tool.check(&args).map_err(|e| format!("{e:#}"))?;
+                return Ok(Prepared::Mcp { args, tool });
+            }
             let adjusted = tools::normalize_arguments(&call.name, &mut args);
             ToolRegistry::validate(&call.name, &args).map_err(|e| format!("{e:#}"))?;
             if !adjusted.is_empty() {
@@ -1081,13 +1107,25 @@ async fn execute_batch(
             Err(message) => Prepared::Done(tools::envelope(Err(anyhow::anyhow!(message)))),
         });
     }
+    // The progress line of an MCP call names its server and tool.
+    let summaries: Vec<Option<String>> = prepared
+        .iter()
+        .map(|p| match p {
+            Prepared::Mcp { args, tool } => Some(tool.summary(args)),
+            _ => None,
+        })
+        .collect();
     // Start events, in call order.
     for (index, call) in calls.iter().enumerate() {
         let id = ids[index];
         let args = match &prepared[index] {
-            Prepared::Voc { args } | Prepared::Source { args, .. } => args.clone(),
+            Prepared::Voc { args } | Prepared::Source { args, .. } | Prepared::Mcp { args, .. } => args.clone(),
             Prepared::Done(_) => serde_json::from_str(&call.arguments).unwrap_or(Value::Null),
         };
+        if let Some(summary) = &summaries[index] {
+            events.send(json!({"type":"tool","id":id,"name":call.name,"summary":summary}));
+            continue;
+        }
         match call.name.as_str() {
             "search" => events.send(json!({"type":"search","id":id,"text":args["query"],"targets":search_targets(&args)})),
             "query_run" => {
@@ -1105,6 +1143,36 @@ async fn execute_batch(
     }
     let mut results: Vec<Option<Value>> = vec![None; calls.len()];
     let mut runs: Vec<Option<voc_tools::Run>> = (0..calls.len()).map(|_| None).collect();
+    // MCP calls run as tasks of their own beside the source and knowledge
+    // calls; each closes its progress line when it ends.
+    let mcp_tasks: Vec<(usize, tokio::task::JoinHandle<Result<Value>>)> = prepared
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| match p {
+            Prepared::Mcp { args, tool } => {
+                let tool = tool.clone();
+                let args = args.clone();
+                let cancel = cancel.clone();
+                let events = events.clone();
+                let (id, name) = (ids[i], calls[i].name.clone());
+                Some((
+                    i,
+                    tokio::spawn(async move {
+                        let started = Instant::now();
+                        let outcome = tool.call(args, &cancel).await;
+                        let status = match &outcome {
+                            Ok(_) => "ok",
+                            Err(e) if e.to_string() == "cancelled" => "cancelled",
+                            Err(_) => "error",
+                        };
+                        events.send(json!({"type":"tool_done","id":id,"name":name,"status":status,"ms":started.elapsed().as_millis() as u64}));
+                        outcome
+                    }),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
     // Source calls run on a blocking thread with the conversation's cursors
     // and history; knowledge and query calls run concurrently meanwhile.
     let source_calls: Vec<(usize, ToolCall, Value, Project)> = prepared
@@ -1356,6 +1424,19 @@ async fn execute_batch(
         let bounded = tools::bound_result(&mut workspace, call, &args, result, share);
         results[index] = Some(bounded);
     }
+    for (index, task) in mcp_tasks {
+        // A task that panicked never closed its progress line.
+        let outcome = task.await.unwrap_or_else(|_| {
+            events.send(json!({"type":"tool_done","id":ids[index],"name":calls[index].name,"status":"error"}));
+            Err(anyhow::anyhow!("tool_worker_panic: the tool stopped unexpectedly"))
+        });
+        let args = match &prepared[index] {
+            Prepared::Mcp { args, .. } => args.clone(),
+            _ => Value::Null,
+        };
+        let result = tools::envelope(outcome);
+        results[index] = Some(tools::bound_result(&mut workspace, &calls[index], &args, result, share));
+    }
     // Every result as the model receives it (repeat warnings and recovery
     // hints attached), fitted beside the response's own calls.
     let mut finals: Vec<Value> = Vec::with_capacity(calls.len());
@@ -1378,7 +1459,8 @@ async fn execute_batch(
     for (index, (call, result)) in calls.iter().zip(finals).enumerate() {
         if !matches!(call.name.as_str(), "search" | "query_run") {
             let root = result["root"].as_str().map(std::path::PathBuf::from).unwrap_or_default();
-            trace.push(json!({"tool":call.name,"summary":tools::call_summary(&root, &call.name, &call.arguments),"status":result["status"]}));
+            let summary = summaries[index].clone().unwrap_or_else(|| tools::call_summary(&root, &call.name, &call.arguments));
+            trace.push(json!({"tool":call.name,"summary":summary,"status":result["status"]}));
             if let Prepared::Done(_) = &prepared[index] {
                 events.send(json!({"type":"tool_done","id":ids[index],"name":call.name,"status":result["status"]}));
             }
@@ -1424,7 +1506,7 @@ fn fit_batch(ws: &mut Workspace, calls: &[ToolCall], prepared: &[Prepared], resu
     // Refusals are small and kept as they are.
     let mut settled: Vec<bool> = prepared
         .iter()
-        .map(|p| !matches!(p, Prepared::Voc { .. } | Prepared::Source { .. }))
+        .map(|p| !matches!(p, Prepared::Voc { .. } | Prepared::Source { .. } | Prepared::Mcp { .. }))
         .collect();
     loop {
         let total = sizes.iter().sum::<usize>();
@@ -1441,7 +1523,7 @@ fn fit_batch(ws: &mut Workspace, calls: &[ToolCall], prepared: &[Prepared], resu
             return;
         };
         let mut args = match &prepared[index] {
-            Prepared::Voc { args } => args.clone(),
+            Prepared::Voc { args } | Prepared::Mcp { args, .. } => args.clone(),
             Prepared::Source { args, project } => {
                 ws.project = project.clone();
                 args.clone()

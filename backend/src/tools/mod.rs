@@ -47,6 +47,12 @@ fn legacy_pattern(instead: &str) -> Value {
 pub(crate) fn number() -> Value {
     json!({"type":"integer","minimum":0})
 }
+/// A field schema with a description: guidance that would push a tool's
+/// own description past OpenAI's 1,024 characters goes on its fields.
+fn described(mut field: Value, description: &str) -> Value {
+    field["description"] = json!(description);
+    field
+}
 pub(crate) fn action(values: &[&str]) -> Value {
     json!({"type":"string","enum":values})
 }
@@ -183,10 +189,10 @@ impl ToolRegistry {
             },
             ToolSpec {
                 name: "code_outline",
-                description: "Explore one Rust, JS/JSX, TS/TSX, Python, Java or C# file. For a function list use {path,view:\"compact\",max_depth:0,kind:\"function\"}; use kind:\"method\" with container and without max_depth:0 for class methods. Omit kind only for a mixed overview. Find a name with {path,query:\"handleQuestion\",match:\"exact\",kind:\"function\"}. query defaults to case-insensitive substring matching. kind filters normalized symbol_kind; for container copy the parent class qualified_name, e.g. Store or Outer::Inner, never converting :: to Java or C# member dots. qualified_name is navigation, not a unique ID for overloaded methods. Defaults: all kinds/depths, view=detailed. Compact returns names, kinds, containers, positions, a ready-to-copy location and symbol IDs. For parameters, defaults and declared return types use view=detailed with query and match=exact; an untruncated signature often answers without a body read. Detailed includes signature_source and signature_truncated; if truncated, read only the missing signature lines. When signature_context_start_line is present, shared declaration modifiers were omitted; use file_read there for the common prefix. Edits expire cursors/IDs.",
+                description: "Explore one Rust, JS/JSX, TS/TSX, Python, Java or C# file. For a function list use {path,view:\"compact\",max_depth:0,kind:\"function\"}; use kind:\"method\" with container and without max_depth:0 for class methods. Omit kind only for a mixed overview. Find a name with {path,query:\"handleQuestion\",match:\"exact\",kind:\"function\"}. query defaults to case-insensitive substring matching. qualified_name is navigation, not a unique ID for overloaded methods. Defaults: all kinds/depths, view=detailed. Compact returns names, kinds, containers, positions, a ready-to-copy location and symbol IDs. For parameters, defaults and declared return types use view=detailed with query and match=exact; an untruncated signature often answers without a body read. When signature_context_start_line is present, shared declaration modifiers were omitted; use file_read there for the common prefix. Edits expire cursors/IDs.",
                 source: true,
                 parameters: schema(
-                    json!({"project":project_field(),"path":string(),"query":string(),"match":action(&["contains","exact"]),"case_sensitive":{"type":"boolean"},"kind":action(&["function","method","constructor","class","struct","interface","trait","impl","enum","enum_member","record","annotation","field","variable","constant","type","module","macro","property","accessor","event","delegate","operator","destructor"]),"container":{"type":"string","description":"Exact enclosing symbol path, case-sensitive. Empty string selects top-level symbols."},"max_depth":{"type":"integer","minimum":0,"description":"Maximum symbol nesting depth: 0 top level, 1 direct members (not AST depth)."},"view":action(&["compact","detailed"]),"cursor":string(),"limit":{"type":"integer","minimum":1,"maximum":100}}),
+                    json!({"project":project_field(),"path":string(),"query":string(),"match":action(&["contains","exact"]),"case_sensitive":{"type":"boolean"},"kind":described(action(&["function","method","constructor","class","struct","interface","trait","impl","enum","enum_member","record","annotation","field","variable","constant","type","module","macro","property","accessor","event","delegate","operator","destructor"]), "Filters normalized symbol_kind."),"container":{"type":"string","description":"Exact enclosing symbol path, case-sensitive: copy the parent class qualified_name, e.g. Store or Outer::Inner, never converting :: to Java or C# member dots. Empty string selects top-level symbols."},"max_depth":{"type":"integer","minimum":0,"description":"Maximum symbol nesting depth: 0 top level, 1 direct members (not AST depth)."},"view":described(action(&["compact","detailed"]), "Detailed includes signature_source and signature_truncated; if truncated, read only the missing signature lines."),"cursor":string(),"limit":{"type":"integer","minimum":1,"maximum":100}}),
                     &["path"],
                 ),
             },
@@ -2234,6 +2240,19 @@ pub fn relativize_paths(value: &mut Value, root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OpenAI refuses a whole request whose function descriptions run past
+    /// 1,024 characters ("string too long"); MCP tool descriptions are cut
+    /// there too (`mcp::schema::MAX_DESCRIPTION`).
+    #[test]
+    fn every_tool_description_fits_openais_limit() {
+        let all: BTreeSet<&str> = ToolRegistry::specs().iter().map(|s| s.name).collect();
+        for definition in ToolRegistry::definitions(&all) {
+            let description = definition["function"]["description"].as_str().unwrap();
+            let length = description.chars().count();
+            assert!(length <= 1_024, "{} has {length} characters", definition["function"]["name"]);
+        }
+    }
 
     #[test]
     fn two_projects_make_the_project_required_and_listed() {
