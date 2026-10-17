@@ -1057,14 +1057,20 @@ fn find_mcp(app: &App, name: &str) -> ApiResult<McpServer> {
         .ok_or_else(|| ApiError::new(404, "MCP 서버가 없거나 이미 삭제되었습니다. 목록을 새로고침해주세요."))
 }
 
-async fn mcp_list(State(app): State<Arc<App>>) -> Json<Value> {
-    let config = app.config();
-    Json(json!({
-        "servers":config.mcp_servers.iter().map(|s| mcp_view(&app, s)).collect::<Vec<_>>(),
-        "default_timeout_secs":config.agent.tool_timeout_secs,
-        "editable":mcp_lock(&app).is_none(),
-        "locked_reason":mcp_lock(&app)
-    }))
+async fn mcp_list(State(app): State<Arc<App>>) -> ApiResult<Json<Value>> {
+    // The first status after a listing counts every definition's tokens:
+    // work for a blocking thread, not for the one serving requests.
+    tokio::task::spawn_blocking(move || {
+        let config = app.config();
+        Json(json!({
+            "servers":config.mcp_servers.iter().map(|s| mcp_view(&app, s)).collect::<Vec<_>>(),
+            "default_timeout_secs":config.agent.tool_timeout_secs,
+            "editable":mcp_lock(&app).is_none(),
+            "locked_reason":mcp_lock(&app)
+        }))
+    })
+    .await
+    .map_err(|_| ApiError::new(500, "MCP 서버 상태를 만들지 못했습니다."))
 }
 
 async fn mcp_read(State(app): State<Arc<App>>, Path(name): Path<String>) -> ApiResult<Response> {
@@ -1162,13 +1168,16 @@ fn mcp_draft(body: &Value, mut server: McpServer) -> ApiResult<McpServer> {
                 "headers" => &mut server.secret_headers,
                 _ => return Err(bad("secrets")),
             };
+            // A header is one whatever the case of its name: a token entered
+            // again as "Authorization" replaces the "authorization" stored.
+            let folded = kind == "headers";
             for (key, value) in values.as_object().ok_or_else(|| bad("secrets"))? {
                 let key = js_trim(key).to_owned();
+                let other = |known: &String| if folded { !known.eq_ignore_ascii_case(&key) } else { *known != key };
                 match value {
-                    Value::Null => {
-                        target.remove(&key);
-                    }
+                    Value::Null => target.retain(|known, _| other(known)),
                     Value::String(v) if !v.is_empty() => {
+                        target.retain(|known, _| other(known));
                         target.insert(key, Secret(v.clone()));
                     }
                     Value::String(_) => {}
@@ -1182,12 +1191,15 @@ fn mcp_draft(body: &Value, mut server: McpServer) -> ApiResult<McpServer> {
     // Each must be entered again or removed in the same request.
     let origin = |url: &str| reqwest::Url::parse(url).ok().map(|u| (u.scheme().to_owned(), u.host_str().map(str::to_owned), u.port_or_known_default()));
     if !before_secrets.is_empty() && !server.url.is_empty() && origin(&before_url) != origin(&server.url) {
+        // Answered: entered again or removed (an empty value keeps it).
         let answered = |key: &str| {
             object
                 .get("secrets")
                 .and_then(|s| s.get("headers"))
                 .and_then(Value::as_object)
-                .is_some_and(|h| h.keys().any(|k| js_trim(k).eq_ignore_ascii_case(key)))
+                .is_some_and(|h| {
+                    h.iter().any(|(k, v)| js_trim(k).eq_ignore_ascii_case(key) && (v.is_null() || v.as_str().is_some_and(|v| !v.is_empty())))
+                })
         };
         let unanswered: Vec<&str> = before_secrets.iter().map(String::as_str).filter(|key| !answered(key)).collect();
         if !unanswered.is_empty() {

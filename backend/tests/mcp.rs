@@ -109,6 +109,9 @@ async fn tools_are_listed_offered_and_called() {
     let names: Vec<&str> = snapshot.names().collect();
     assert_eq!(names, ["fake__echo", "fake__add", "fake__structured_only", "fake__mixed", "fake__weird_name"]);
     let definitions = snapshot.definitions();
+    // Another tool named in a description is named as the model sees it.
+    let structured = definitions.iter().find(|d| d["function"]["name"] == "fake__structured_only").unwrap();
+    assert_eq!(structured["function"]["description"], "Structured content without text; for text use fake__add_tool or fake__weird_name, or call echo.");
     let weird = definitions.iter().find(|d| d["function"]["name"] == "fake__weird_name").unwrap();
     let parameters = &weird["function"]["parameters"];
     assert!(parameters.get("anyOf").is_none() && parameters.get("$defs").is_none(), "{parameters}");
@@ -963,6 +966,37 @@ async fn an_http_server_that_goes_away_is_marked_failed_and_reconnected() {
     hub.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_rate_limit_or_a_proxy_error_is_not_a_lost_connection() {
+    if node_missing() {
+        return;
+    }
+    for (status, code) in [("429", "mcp_rate_limited:"), ("502", "mcp_request_failed:")] {
+        let remote = HttpServer::start(&[("FAKE_MCP_CALL_STATUS", status)]);
+        let server = McpServer { name: "limited".into(), url: remote.url.clone(), tools: vec!["echo".into()], ..Default::default() };
+        let config = config(vec![server]);
+        let hub = McpHub::default();
+        hub.apply(&config.mcp_servers);
+        ready(&hub, "limited").await;
+        let error = call(&hub, &config, "limited__echo", json!({"text":"x"})).await.unwrap_err().to_string();
+        assert!(error.starts_with(code), "{status}: {error}");
+        assert!(error.contains(if status == "429" { "요청 수를 제한" } else { "서버 쪽 오류" }), "{error}");
+        if status == "429" {
+            assert_eq!(llm_agent::tools::recovery::describe(&error)["class"], "transient");
+        }
+        // The session stays: no reconnection, the tools stay offered, and
+        // the next call goes through it.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let status_now = hub.server_status("limited", MODEL).unwrap();
+        assert_eq!((status_now["state"].clone(), status_now["restarts"].clone()), (json!("ready"), json!(0)), "{status}: {status_now:#}");
+        assert!(!hub.snapshot(&config).is_empty());
+        let again = call(&hub, &config, "limited__echo", json!({"text":"다시"})).await;
+        assert_eq!(again.unwrap()["text"], "echo: 다시", "{status}");
+        assert_eq!(hub.server_status("limited", MODEL).unwrap()["restarts"], 0);
+        hub.shutdown().await;
+    }
+}
+
 async fn ask(app: &std::sync::Arc<llm_agent::app::App>, message: &str) -> (anyhow::Result<agent::Answer>, Vec<Value>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let result = agent::answer(
@@ -991,6 +1025,9 @@ async fn the_model_calls_mcp_tools_like_its_own() {
             support::call("m2", "fake__fail", json!({})),
             support::call("m3", "fake__big", json!({"chars":180_000})),
             support::call("m4", "fake__echo", json!({})),
+            // The server's own name for the tool, as its descriptions say.
+            support::call("m5", "echo", json!({"text":"원래 이름"})),
+            support::call("m6", "echo", json!({})),
         ]),
         text("끝"),
     ]);
@@ -1018,15 +1055,21 @@ async fn the_model_calls_mcp_tools_like_its_own() {
     assert_eq!(big["truncated"], true);
     assert_eq!(big["next_cursor"]["tool"], "history");
     assert!(big["data"]["text"].as_str().unwrap().len() < 180_000);
+    let renamed = tool_result(second, "m5");
+    assert_eq!(renamed["data"]["text"], "echo: 원래 이름");
+    assert_eq!(renamed["data"]["adjusted_arguments"], json!(["tool name echo was taken as fake__echo; call it fake__echo"]));
     let refused = tool_result(second, "m4");
     assert!(refused["error"].as_str().unwrap().starts_with("missing_argument: text"), "{refused}");
+    let refused = tool_result(second, "m6");
+    assert_eq!(refused["error"], "missing_argument: text is required by fake__echo", "the refusal names the tool to call");
     // Progress lines and the trace name the server and tool.
     let started = ev(&events, "tool");
     assert_eq!(started[0]["summary"], "fake · echo \"이슈 123\"");
     assert_eq!(started[3]["summary"], "fake · echo", "a call refused before it ran is named alike");
     assert_eq!(answer.trace[3]["summary"], "fake · echo");
+    assert_eq!(started[5]["summary"], "fake · echo", "by the server's name for it too");
     let done = ev(&events, "tool_done");
-    assert_eq!(done.len(), 4);
+    assert_eq!(done.len(), 6);
     assert_eq!(answer.trace[0]["tool"], "fake__echo");
     assert_eq!(answer.trace[0]["summary"], "fake · echo \"이슈 123\"");
     assert_eq!(answer.trace[1]["status"], "error");
@@ -1091,22 +1134,25 @@ async fn too_many_allowed_mcp_tools_are_named_as_what_does_not_fit() {
         return;
     }
     // Long descriptions over the minimum context: the frame fits without the
-    // MCP tools and not with them.
-    let mut config = config(vec![fake("wide", &["*"], &[("FAKE_MCP_WIDE", "40")])]);
-    config.llm.context_tokens = 12_000;
-    config.llm.output_tokens = 2_000;
-    let llm = Scripted::new(vec![text("끝")]);
-    let (app, _dir) = app(config.clone(), llm.clone());
-    app.mcp.apply(&config.mcp_servers);
-    ready(&app.mcp, "wide").await;
-    let tokens: u64 = app.mcp.server_status("wide", MODEL).unwrap()["tools"].as_array().unwrap().iter().map(|t| t["tokens"].as_u64().unwrap()).sum();
-    assert!(tokens > 12_000, "the fixture is wide enough: {tokens}");
-    let (result, _) = ask(&app, "안녕").await;
-    let Err(error) = result else { panic!("the question was answered") };
-    let shown = error.downcast_ref::<agent::UserFacing>().map(|e| e.0.clone()).unwrap_or_else(|| error.to_string());
-    assert!(shown.contains("MCP 탭에서 허용 도구를 줄여주세요"), "{shown}");
-    assert!(llm.requests().is_empty(), "nothing was sent");
-    app.mcp.shutdown().await;
+    // MCP tools and not with them — past the context (counted with the
+    // request) and past twice the context (refused before that).
+    for (wide, range) in [("20", 12_000..24_000), ("40", 24_000..60_000)] {
+        let mut config = config(vec![fake("wide", &["*"], &[("FAKE_MCP_WIDE", wide)])]);
+        config.llm.context_tokens = 12_000;
+        config.llm.output_tokens = 2_000;
+        let llm = Scripted::new(vec![text("끝")]);
+        let (app, _dir) = app(config.clone(), llm.clone());
+        app.mcp.apply(&config.mcp_servers);
+        ready(&app.mcp, "wide").await;
+        let tokens: u64 = app.mcp.server_status("wide", MODEL).unwrap()["tools"].as_array().unwrap().iter().map(|t| t["tokens"].as_u64().unwrap()).sum();
+        assert!(range.contains(&tokens), "the fixture is as wide as meant: {tokens}");
+        let (result, _) = ask(&app, "안녕").await;
+        let Err(error) = result else { panic!("the question was answered") };
+        let shown = error.downcast_ref::<agent::UserFacing>().map(|e| e.0.clone()).unwrap_or_else(|| error.to_string());
+        assert!(shown.contains("MCP 탭에서 허용 도구를 줄여주세요"), "{wide}: {shown}");
+        assert!(llm.requests().is_empty(), "nothing was sent");
+        app.mcp.shutdown().await;
+    }
 }
 
 #[tokio::test]
@@ -1132,6 +1178,44 @@ async fn mcp_calls_stop_at_the_final_reserve() {
     assert_eq!(ev(&events, "tool_done")[0]["status"], "cancelled");
     let status = wait_for(&app.mcp, "fake", |s| log_text(s).contains("cancelled")).await;
     assert_eq!(status["tools"].as_array().unwrap().iter().find(|t| t["name"] == "slow").unwrap()["cancelled"], 1);
+    app.mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_server_name_for_a_tool_two_servers_have_is_not_guessed() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("alpha", &["echo"], &[]), fake("beta", &["echo"], &[])]);
+    let llm = Scripted::new(vec![calls(vec![support::call("e1", "echo", json!({"text":"어느 쪽"}))]), text("끝")]);
+    let (app, _dir) = app(config.clone(), llm.clone());
+    app.mcp.apply(&config.mcp_servers);
+    ready(&app.mcp, "alpha").await;
+    ready(&app.mcp, "beta").await;
+    let (result, _) = ask(&app, "에코").await;
+    assert_eq!(result.unwrap().answer, "끝");
+    let refused = tool_result(&llm.requests()[1], "e1");
+    assert_eq!(refused["status"], "unsupported");
+    assert_eq!(refused["error"], "unsupported_tool: echo is a tool of several MCP servers; call one of alpha__echo, beta__echo");
+    app.mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_agent_tool_name_is_not_taken_for_a_server_tool() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("srv", &["history"], &[("FAKE_MCP_BUILTIN_NAME", "1")])]);
+    let llm = Scripted::new(vec![calls(vec![support::call("h1", "history", json!({"action":"search","query":"x"}))]), text("끝")]);
+    let (app, _dir) = app(config.clone(), llm.clone());
+    app.mcp.apply(&config.mcp_servers);
+    ready(&app.mcp, "srv").await;
+    let (result, _) = ask(&app, "이력").await;
+    assert_eq!(result.unwrap().answer, "끝");
+    // The agent's own history tool is not offered yet (nothing left the
+    // context): the call is told so, not run on the server's tool.
+    let refused = tool_result(&llm.requests()[1], "h1");
+    assert_eq!(refused["error"], "unsupported_tool: history is not offered now; use the offered tools", "{refused}");
     app.mcp.shutdown().await;
 }
 
@@ -1301,6 +1385,9 @@ async fn the_admin_screen_edits_servers_only_behind_a_key() {
     assert!(body["error"].as_str().unwrap().contains("Authorization"), "{body}");
     let (status, _, _) = admin.send("POST", "mcp-check", Some(json!({"original":"web","url":"http://127.0.0.2:9/mcp"})), None).await;
     assert_eq!(status, 400, "the check does not send it either");
+    let empty = json!({"url":"http://127.0.0.2:9/mcp","secrets":{"headers":{"Authorization":""}}});
+    let (status, _, _) = admin.send("PUT", "mcp/web", Some(empty), Some(created["revision"].as_str().unwrap())).await;
+    assert_eq!(status, 400, "an empty value keeps the token: it is not an answer");
     let (status, same_host, text) = admin.send("PUT", "mcp/web", Some(json!({"url":"http://127.0.0.1:9/other"})), Some(created["revision"].as_str().unwrap())).await;
     assert_eq!(status, 200, "same host, another path: {text}");
     assert_eq!(same_host["secrets"]["headers"], json!(["Authorization"]));
@@ -1308,6 +1395,15 @@ async fn the_admin_screen_edits_servers_only_behind_a_key() {
     web["secrets"] = json!({"headers":{"Authorization":"Bearer new"}});
     let (status, _, text) = admin.send("PUT", "mcp/web", Some(web), Some(same_host["revision"].as_str().unwrap())).await;
     assert_eq!(status, 200, "entered again: {text}");
+    // A header entered again in another case replaces the stored one.
+    let (_, listed, _) = admin.send("GET", "mcp", None, None).await;
+    let web_revision = listed["servers"][1]["revision"].as_str().unwrap().to_owned();
+    let lower = json!({"secrets":{"headers":{"authorization":"Bearer newer"}}});
+    let (status, updated, text) = admin.send("PUT", "mcp/web", Some(lower), Some(&web_revision)).await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(updated["secrets"]["headers"], json!(["authorization"]));
+    let stored = app.config().mcp_servers.iter().find(|s| s.name == "web").cloned().unwrap();
+    assert_eq!(stored.secret_headers.values().map(|s| s.0.as_str()).collect::<Vec<_>>(), ["Bearer newer"]);
     let (_, listed, _) = admin.send("GET", "mcp", None, None).await;
     let revision = listed["servers"][1]["revision"].as_str().unwrap().to_owned();
     let (status, _, _) = admin.send("DELETE", "mcp/web", None, Some(&revision)).await;
@@ -1337,4 +1433,140 @@ async fn a_key_in_the_server_address_stays_out_of_errors_and_logs() {
         assert!(!shown.contains(secret), "{secret} in {shown}");
     }
     hub.shutdown().await;
+}
+
+/// The admin screen's status counts the tokens of every tool definition;
+/// a question starting meanwhile does not wait for it, and a count is made
+/// once per model.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_status_counts_tokens_without_holding_up_questions() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("fat", &["*"], &[("FAKE_MCP_FAT", "300"), ("FAKE_MCP_PAGE", "100")])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "fat").await;
+    // Another model: every definition is counted again.
+    let counting = hub.clone();
+    let status = tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        let status = counting.status("another-model");
+        (started.elapsed(), status)
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let started = Instant::now();
+    let snapshot = hub.snapshot(&config);
+    let waited = started.elapsed();
+    let (counted, status) = status.await.unwrap();
+    assert_eq!(snapshot.names().count(), 321);
+    assert!(counted > Duration::from_millis(400), "the count takes a while: {counted:?}");
+    assert!(waited < counted / 4, "the snapshot waited {waited:?} for a count of {counted:?}");
+    let fat = status[0]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "fat_0").unwrap();
+    assert!(fat["tokens"].as_u64().unwrap() > 1_000, "{}", fat["tokens"]);
+    let started = Instant::now();
+    hub.status("another-model");
+    assert!(started.elapsed() < counted / 4, "counted once: {:?}", started.elapsed());
+    hub.shutdown().await;
+}
+
+/// Text a JavaScript server cut inside an emoji holds half a surrogate pair
+/// (a `\ud83d` escape), which JSON parsers refuse: the result comes with
+/// U+FFFD in its place, over stdio and SSE (so does a byte that is not
+/// UTF-8 over stdio). A plain JSON response is parsed inside the SDK: that
+/// call fails, the session stays.
+#[tokio::test]
+async fn text_cut_inside_an_emoji_does_not_hang_or_end_the_session() {
+    if node_missing() {
+        return;
+    }
+    for mode in ["stdio", "sse", "json"] {
+        let remote;
+        let server = if mode == "stdio" {
+            fake("cut", &["echo"], &[])
+        } else {
+            remote = HttpServer::start(if mode == "sse" { &[("FAKE_MCP_SSE", "1")] } else { &[] });
+            McpServer { name: "cut".into(), url: remote.url.clone(), tools: vec!["echo".into()], ..Default::default() }
+        };
+        let config = config(vec![server]);
+        let hub = McpHub::default();
+        hub.apply(&config.mcp_servers);
+        ready(&hub, "cut").await;
+        let started = Instant::now();
+        let outcome = call(&hub, &config, "cut__echo", json!({"text":"cut emoji"})).await;
+        assert!(started.elapsed() < Duration::from_secs(5), "{mode}: answered at once, not at the timeout");
+        if mode == "json" {
+            let error = outcome.unwrap_err().to_string();
+            assert!(error.starts_with("mcp_request_failed:") && error.contains("JSON-RPC 메시지로 읽지 못했습니다"), "{error}");
+        } else {
+            assert_eq!(outcome.unwrap()["text"], "잘림 \u{fffd}", "{mode}");
+        }
+        if mode == "stdio" {
+            let bytes = call(&hub, &config, "cut__echo", json!({"text":"bad bytes"})).await;
+            assert_eq!(bytes.unwrap()["text"], "raw \u{fffd} byte", "a byte that is not UTF-8");
+        }
+        let after = call(&hub, &config, "cut__echo", json!({"text":"after"})).await;
+        assert_eq!(after.unwrap()["text"], "echo: after", "{mode}");
+        let status = hub.server_status("cut", MODEL).unwrap();
+        assert_eq!((status["state"].clone(), status["restarts"].clone()), (json!("ready"), json!(0)), "{mode}");
+        hub.shutdown().await;
+    }
+}
+
+/// Output as some Windows programs write it: a byte order mark before the
+/// first line (the answer to initialize), CRLF line ends — read through the
+/// line reader in front of the SDK's (which drops both).
+#[tokio::test]
+async fn windows_style_output_is_read() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("win", &["echo"], &[("FAKE_MCP_WINDOWS", "1")])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "win").await;
+    assert_eq!(call(&hub, &config, "win__echo", json!({"text":"crlf"})).await.unwrap()["text"], "echo: crlf");
+    hub.shutdown().await;
+}
+
+/// Answers that slip on JSON-RPC (no "jsonrpc":"2.0", an error without a
+/// numeric code) were dropped by the SDK over stdio — the call waited out
+/// its timeout — and ended the session over SSE. They are put right.
+#[tokio::test]
+async fn slips_of_the_protocol_neither_hang_nor_end_the_session() {
+    if node_missing() {
+        return;
+    }
+    let shapes = [
+        (r#"{"result":{"content":[{"type":"text","text":"no version"}]}}"#, Ok("no version")),
+        (r#"{"jsonrpc":"1.0","result":{"content":[{"type":"text","text":"old"}]}}"#, Ok("old")),
+        (r#"{"jsonrpc":"2.0","error":{"message":"no code"}}"#, Err("mcp_request_failed: no code (code -32603)")),
+        (r#"{"jsonrpc":"2.0","error":{"code":"E1","message":"text code"}}"#, Err("mcp_request_failed: text code (code -32603)")),
+        (r#"{"jsonrpc":"2.0","error":"just text"}"#, Err("mcp_request_failed: just text (code -32603)")),
+    ];
+    for mode in ["stdio", "sse"] {
+        let remote;
+        let server = if mode == "stdio" {
+            fake("shape", &["echo"], &[])
+        } else {
+            remote = HttpServer::start(&[("FAKE_MCP_SSE", "1")]);
+            McpServer { name: "shape".into(), url: remote.url.clone(), tools: vec!["echo".into()], ..Default::default() }
+        };
+        let config = config(vec![McpServer { timeout_secs: Some(5), ..server }]);
+        let hub = McpHub::default();
+        hub.apply(&config.mcp_servers);
+        ready(&hub, "shape").await;
+        for (shape, expected) in shapes {
+            let started = Instant::now();
+            let outcome = call(&hub, &config, "shape__echo", json!({"text":format!("shape:{shape}")})).await;
+            assert!(started.elapsed() < Duration::from_secs(3), "{mode} {shape}: answered at once");
+            match expected {
+                Ok(text) => assert_eq!(outcome.unwrap()["text"], text, "{mode} {shape}"),
+                Err(error) => assert_eq!(outcome.unwrap_err().to_string(), error, "{mode} {shape}"),
+            }
+        }
+        assert_eq!(call(&hub, &config, "shape__echo", json!({"text":"after"})).await.unwrap()["text"], "echo: after");
+        assert_eq!(hub.server_status("shape", MODEL).unwrap()["restarts"], 0, "{mode}");
+        hub.shutdown().await;
+    }
 }

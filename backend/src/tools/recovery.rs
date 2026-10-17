@@ -103,6 +103,8 @@ pub fn describe(message: &str) -> Value {
         (Class::Prerequisite, "choose_another_query_or_answer")
     } else if code == "bind_value_problem" || code == "target_db_required" {
         (Class::InvalidInput, "correct_arguments")
+    } else if code == "mcp_rate_limited" {
+        (Class::Transient, "answer_with_gathered_evidence")
     } else if code == "repeated_call" {
         (Class::InvalidInput, "use_previous_result")
     } else if code.contains("conflict")

@@ -6,6 +6,7 @@
 
 mod convert;
 mod schema;
+mod wire;
 
 pub use convert::MAX_RESULT_CHARS;
 
@@ -192,7 +193,7 @@ impl Phase {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct RemoteTool {
     name: String,
     exposed: String,
@@ -200,6 +201,33 @@ struct RemoteTool {
     description: String,
     parameters: Value,
     annotations: Value,
+    /// The function definition the model gets, built once per listing.
+    definition: Value,
+    /// Its tokens for a model, counted once: the admin screen asks every
+    /// few seconds, and a server may list a thousand tools.
+    tokens: Mutex<Option<(String, usize)>>,
+}
+
+impl RemoteTool {
+    fn new(name: String, exposed: String, title: Option<String>, description: String, parameters: Value, annotations: Value) -> Self {
+        let definition = schema::definition(&exposed, &description, &parameters);
+        Self { name, exposed, title, description, parameters, annotations, definition, tokens: Mutex::new(None) }
+    }
+
+    fn same(&self, other: &RemoteTool) -> bool {
+        self.name == other.name && self.title == other.title && self.definition == other.definition && self.annotations == other.annotations
+    }
+
+    fn tokens(&self, model: &str) -> usize {
+        if let Some((counted, tokens)) = &*self.tokens.lock().unwrap_or_else(|p| p.into_inner())
+            && counted == model
+        {
+            return *tokens;
+        }
+        let tokens = crate::context::count(&self.definition, model);
+        *self.tokens.lock().unwrap_or_else(|p| p.into_inner()) = Some((model.to_owned(), tokens));
+        tokens
+    }
 }
 
 #[derive(Clone, Default)]
@@ -227,7 +255,9 @@ struct State {
     transport_error: Option<String>,
     pid: Option<u32>,
     info: Value,
-    tools: Vec<RemoteTool>,
+    /// Shared with the questions' snapshots and the status: taken out of
+    /// the lock, not copied in it.
+    tools: Vec<Arc<RemoteTool>>,
     log: VecDeque<Value>,
     stats: BTreeMap<String, ToolStats>,
 }
@@ -329,6 +359,23 @@ impl Slot {
         }
     }
 
+    /// The listed tools; statistics of tools no longer listed go with them
+    /// (a server renaming its tools would grow them without end).
+    fn set_tools(&self, tools: Vec<Arc<RemoteTool>>) {
+        // A tool listed again unchanged stays as it was, its tokens counted.
+        let old: HashMap<String, Arc<RemoteTool>> = self.state().tools.iter().map(|t| (t.exposed.clone(), t.clone())).collect();
+        let tools: Vec<Arc<RemoteTool>> = tools
+            .into_iter()
+            .map(|tool| match old.get(&tool.exposed) {
+                Some(known) if known.same(&tool) => known.clone(),
+                _ => tool,
+            })
+            .collect();
+        let mut state = self.state();
+        state.stats.retain(|name, _| tools.iter().any(|t| &t.name == name));
+        state.tools = tools;
+    }
+
     fn record(&self, tool: &str, ms: u64, outcome: &Result<Value>) {
         let mut state = self.state();
         let stats = state.stats.entry(tool.to_owned()).or_default();
@@ -369,8 +416,7 @@ pub struct Offered {
     pub exposed: String,
     pub server: String,
     pub tool: String,
-    definition: Value,
-    parameters: Value,
+    remote: Arc<RemoteTool>,
     timeout: Duration,
     /// The servers as they are when the call is made: a server edited on the
     /// admin screen during the question serves it from its new connection,
@@ -387,10 +433,24 @@ impl Snapshot {
     }
     /// OpenAI function definitions, in server and tool order.
     pub fn definitions(&self) -> Vec<Value> {
-        self.tools.iter().map(|t| t.definition.clone()).collect()
+        self.tools.iter().map(|t| t.remote.definition.clone()).collect()
+    }
+    /// The definitions' tokens for `model`, as counted one by one.
+    pub fn tokens(&self, model: &str) -> usize {
+        self.tools.iter().map(|t| t.remote.tokens(model)).sum()
     }
     pub fn find(&self, name: &str) -> Option<Arc<Offered>> {
         self.tools.iter().find(|t| t.exposed == name).cloned()
+    }
+    /// The one offered tool a server calls `name` (its own name, not the
+    /// model's `server__tool`), or the model's names of several.
+    pub fn find_raw(&self, name: &str) -> std::result::Result<Option<Arc<Offered>>, Vec<String>> {
+        let found: Vec<&Arc<Offered>> = self.tools.iter().filter(|t| t.tool == name).collect();
+        match found.as_slice() {
+            [] => Ok(None),
+            [one] => Ok(Some((*one).clone())),
+            several => Err(several.iter().map(|t| t.exposed.clone()).collect()),
+        }
     }
     /// The system prompt section naming the servers whose tools are offered
     /// (empty when none is).
@@ -416,7 +476,7 @@ impl Offered {
         let Some(object) = args.as_object() else {
             bail!("invalid_tool_arguments: the arguments of {} must be a JSON object", self.exposed);
         };
-        let missing = schema::missing_required(&self.parameters, object);
+        let missing = schema::missing_required(&self.remote.parameters, object);
         if !missing.is_empty() {
             bail!("missing_argument: {} is required by {}", missing.join(", "), self.exposed);
         }
@@ -537,12 +597,31 @@ impl Offered {
             ),
             ServiceError::TransportClosed | ServiceError::TransportSend(_) => {
                 let detail = explain(&error);
-                slot.state().transport_error = Some(detail.clone());
-                broken.notify_one();
-                anyhow!(
-                    "mcp_server_unavailable: the connection to MCP server {} failed during the call ({detail}); it is being reconnected",
-                    self.server
-                )
+                // An answer to this one request that cannot be read leaves the
+                // session as it is (the SDK serves the next call on it).
+                if unreadable(&error) {
+                    return anyhow!("mcp_request_failed: MCP server {} sent an answer that is not readable JSON-RPC ({detail})", self.server);
+                }
+                // An HTTP answer about this one request (a rate limit, a proxy
+                // or server error) leaves the session as it is: only a lost
+                // connection makes a new one.
+                match http_status(&error) {
+                    Some(429) => anyhow!(
+                        "mcp_rate_limited: MCP server {} is limiting requests (HTTP 429); answer with what is known or call it again later ({detail})",
+                        self.server
+                    ),
+                    Some(status) if (500..600).contains(&status) => {
+                        anyhow!("mcp_request_failed: MCP server {} answered HTTP {status} ({detail})", self.server)
+                    }
+                    _ => {
+                        slot.state().transport_error = Some(detail.clone());
+                        broken.notify_one();
+                        anyhow!(
+                            "mcp_server_unavailable: the connection to MCP server {} failed during the call ({detail}); it is being reconnected",
+                            self.server
+                        )
+                    }
+                }
             }
             other => anyhow!("mcp_request_failed: {}", redact(&other.to_string())),
         }
@@ -659,13 +738,16 @@ impl McpHub {
         let mut names = std::collections::BTreeSet::new();
         for slot in self.slots() {
             let server = slot.server();
-            let state = slot.state();
-            if state.phase != Phase::Ready || !server.enabled {
-                continue;
-            }
+            let listed = {
+                let state = slot.state();
+                if state.phase != Phase::Ready || !server.enabled {
+                    continue;
+                }
+                state.tools.clone()
+            };
             let timeout = Duration::from_secs(server.timeout_secs.unwrap_or(config.agent.tool_timeout_secs));
             let before = tools.len();
-            for tool in state.tools.iter().filter(|t| allows(&server.tools, &t.name, &t.exposed)) {
+            for tool in listed.iter().filter(|t| allows(&server.tools, &t.name, &t.exposed)) {
                 // Names are unique by construction; a request with one twice
                 // is refused by providers, so a twin is left out regardless.
                 if !names.insert(tool.exposed.to_ascii_lowercase()) {
@@ -675,8 +757,7 @@ impl McpHub {
                     exposed: tool.exposed.clone(),
                     server: server.name.clone(),
                     tool: tool.name.clone(),
-                    definition: schema::definition(&tool.exposed, &tool.description, &tool.parameters),
-                    parameters: tool.parameters.clone(),
+                    remote: tool.clone(),
                     timeout,
                     hub: self.clone(),
                 }));
@@ -710,7 +791,7 @@ fn allows(allowed: &[String], tool: &str, exposed: &str) -> bool {
 }
 
 /// Allow-list entries no listed tool answers to (a misspelling).
-fn unmatched(server: &McpServer, tools: &[RemoteTool]) -> Vec<String> {
+fn unmatched(server: &McpServer, tools: &[Arc<RemoteTool>]) -> Vec<String> {
     server
         .tools
         .iter()
@@ -721,29 +802,34 @@ fn unmatched(server: &McpServer, tools: &[RemoteTool]) -> Vec<String> {
 
 fn slot_status(slot: &Arc<Slot>, model: &str) -> Value {
     let server = slot.server();
-    let state = slot.state();
-    let tools: Vec<Value> = state
-        .tools
+    // Out of the lock before the tokens are counted: a question's snapshot
+    // and the calls take it too.
+    let (listed, stats, mut status) = {
+        let state = slot.state();
+        let status = json!({
+            "name":server.name,"enabled":server.enabled,"transport":if server.url.is_empty() { "stdio" } else { "http" },
+            "state":state.phase.label(),"since":state.since,"error":state.error,"restarts":state.restarts,
+            "retry_at":state.retry_at,"pid":state.pid,"server_info":state.info,
+            "log":state.log.iter().collect::<Vec<_>>()
+        });
+        (state.tools.clone(), state.stats.clone(), status)
+    };
+    let tools: Vec<Value> = listed
         .iter()
         .map(|tool| {
-            let stats = state.stats.get(&tool.name).cloned().unwrap_or_default();
-            let definition = schema::definition(&tool.exposed, &tool.description, &tool.parameters);
+            let stats = stats.get(&tool.name).cloned().unwrap_or_default();
             json!({
                 "name":tool.name,"exposed":tool.exposed,"title":tool.title,"description":tool.description,
                 "annotations":tool.annotations,"allowed":allows(&server.tools, &tool.name, &tool.exposed),
-                "tokens":crate::context::count(&definition, model),
+                "tokens":tool.tokens(model),
                 "calls":stats.calls,"failures":stats.failures,"cancelled":stats.cancelled,
                 "avg_ms":stats.total_ms.checked_div(stats.calls),"last_ms":(stats.calls > 0).then_some(stats.last_ms),
                 "last_error":stats.last_error,"last_at":stats.last_at
             })
         })
         .collect();
-    json!({
-        "name":server.name,"enabled":server.enabled,"transport":if server.url.is_empty() { "stdio" } else { "http" },
-        "state":state.phase.label(),"since":state.since,"error":state.error,"restarts":state.restarts,
-        "retry_at":state.retry_at,"pid":state.pid,"server_info":state.info,"tools":tools,
-        "log":state.log.iter().collect::<Vec<_>>()
-    })
+    status["tools"] = json!(tools);
+    status
 }
 
 fn start(server: McpServer) -> Arc<Slot> {
@@ -896,6 +982,7 @@ async fn serve(slot: &Arc<Slot>, server: &McpServer, connection: &mut Connection
             {
                 let mut state = slot.state();
                 state.info = server_info(&info);
+                state.stats.retain(|name, _| tools.iter().any(|t| &t.name == name));
                 state.tools = tools;
                 state.peer = Some(connection.peer.clone());
                 state.broken = Some(connection.broken.clone());
@@ -931,7 +1018,7 @@ async fn serve(slot: &Arc<Slot>, server: &McpServer, connection: &mut Connection
                 };
                 match listed {
                     Ok(Ok(Listed { tools, notes })) => {
-                        let names = |tools: &[RemoteTool]| tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+                        let names = |tools: &[Arc<RemoteTool>]| tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
                         let changed = names(&slot.state().tools) != names(&tools);
                         // A server that only says so, again and again, is not
                         // logged each time.
@@ -941,7 +1028,7 @@ async fn serve(slot: &Arc<Slot>, server: &McpServer, connection: &mut Connection
                             }
                             slot.log("event", &format!("도구 목록이 바뀌었습니다: {}개", tools.len()));
                         }
-                        slot.state().tools = tools;
+                        slot.set_tools(tools);
                     }
                     Ok(Err(error)) => slot.log("event", &format!("바뀐 도구 목록을 받지 못했습니다: {error:#}")),
                     Err(_) => slot.log("event", "바뀐 도구 목록을 제때 받지 못했습니다"),
@@ -973,7 +1060,11 @@ fn causes(error: &dyn std::error::Error) -> String {
 fn explain<E: std::error::Error + std::fmt::Debug>(error: &E) -> String {
     let shown = regex::Regex::new(r"Transport \[[^\]]*\] error: ").unwrap().replace_all(&causes(error), "").into_owned();
     let debug = format!("{error:?}");
-    let cause = if debug.contains("InvalidCertificate") || debug.contains("certificate is not trusted") || debug.contains("UnknownIssuer") {
+    // First: the preview of the body it quotes is the server's text, which
+    // may say anything ("HTTP 404" in a fetched page).
+    let cause = if unreadable(error) {
+        Some("서버 응답을 JSON-RPC 메시지로 읽지 못했습니다(서버의 응답 형식을 확인하세요)".to_owned())
+    } else if debug.contains("InvalidCertificate") || debug.contains("certificate is not trusted") || debug.contains("UnknownIssuer") {
         let detail = regex::Regex::new(r#"InvalidCertificate\((?:[^"()]*\()*"?([^"()]+)"?"#)
             .unwrap()
             .captures(&debug)
@@ -984,6 +1075,10 @@ fn explain<E: std::error::Error + std::fmt::Debug>(error: &E) -> String {
         Some("연결이 거부되었습니다(서버가 꺼져 있거나 주소·포트가 틀렸습니다)".to_owned())
     } else if debug.contains("dns error") || debug.contains("failed to lookup address") || debug.contains("nodename nor servname") {
         Some("주소의 호스트 이름을 찾지 못했습니다".to_owned())
+    } else if debug.contains("HTTP 429") {
+        Some("서버가 요청 수를 제한하고 있습니다(잠시 뒤 다시 시도하거나, 호스팅 서비스라면 API 키를 비밀 헤더에 넣으세요)".to_owned())
+    } else if regex::Regex::new(r"HTTP 5\d\d").unwrap().is_match(&debug) {
+        Some("서버 쪽 오류입니다(HTTP 5xx — 서버나 사이의 프록시 상태를 확인하세요)".to_owned())
     } else if debug.contains("HTTP 401") || debug.contains("HTTP 403") || debug.contains("AuthRequired") {
         Some("서버가 인증을 거절했습니다(인증 헤더의 토큰을 확인하세요)".to_owned())
     } else if debug.contains("TimedOut") || debug.contains("timed out") {
@@ -1020,6 +1115,20 @@ fn redact(text: &str) -> String {
         format!("{}{}{}{query}", &c[1], &c[3], &c[4])
     })
     .into_owned()
+}
+
+/// The HTTP status an HTTP transport error carries, from its debug form (the
+/// SDK keeps it only as text there).
+/// A response the SDK could not parse as a JSON-RPC message.
+fn unreadable<E: std::fmt::Debug>(error: &E) -> bool {
+    format!("{error:?}").contains("could not parse JSON response")
+}
+
+fn http_status<E: std::fmt::Debug>(error: &E) -> Option<u16> {
+    regex::Regex::new(r"HTTP (\d{3})")
+        .unwrap()
+        .captures(&format!("{error:?}"))
+        .and_then(|c| c[1].parse().ok())
 }
 
 /// A server's text, cut to `limit` characters (null stays null).
@@ -1074,7 +1183,7 @@ fn describe_server(info: &Value) -> String {
 
 /// A server's tools, and notes on what was left out or read leniently.
 struct Listed {
-    tools: Vec<RemoteTool>,
+    tools: Vec<Arc<RemoteTool>>,
     notes: Vec<String>,
 }
 
@@ -1132,17 +1241,20 @@ async fn list_tools(peer: &Peer<RoleClient>, server: &str) -> Result<Listed> {
     }
     let names: Vec<String> = kept.iter().map(|t| t["name"].as_str().unwrap_or_default().to_owned()).collect();
     let exposed = schema::exposed_names(server, &names);
+    let renamer = schema::Renamer::new(&names.iter().cloned().zip(exposed.iter().cloned()).collect::<Vec<_>>());
     let tools = kept
         .iter()
         .zip(names)
         .zip(exposed)
-        .map(|((tool, name), exposed)| RemoteTool {
-            name,
-            exposed,
-            title: clipped(&tool["title"], MAX_LABEL_CHARS).as_str().map(str::to_owned),
-            description: schema::description(tool),
-            parameters: schema::parameters(&tool["inputSchema"]),
-            annotations: hints(&tool["annotations"]),
+        .map(|((tool, name), exposed)| {
+            Arc::new(RemoteTool::new(
+                name,
+                exposed,
+                clipped(&tool["title"], MAX_LABEL_CHARS).as_str().map(str::to_owned),
+                renamer.apply(&schema::description(tool)),
+                schema::parameters(&tool["inputSchema"]),
+                hints(&tool["annotations"]),
+            ))
         })
         .collect();
     Ok(Listed { tools, notes })
@@ -1191,7 +1303,7 @@ async fn connect(slot: &Arc<Slot>, server: &McpServer) -> Result<Connection> {
     } else {
         install_tls();
         handler
-            .serve_with_ct(StreamableHttpClientTransport::from_config(http_config(server)?), close.clone())
+            .serve_with_ct(StreamableHttpClientTransport::with_client(wire::Lenient::new(), http_config(server)?), close.clone())
             .await
     }
     .map_err(|e| anyhow!("초기화하지 못했습니다: {}", explain(&e)))?;
@@ -1321,7 +1433,7 @@ fn spawn(slot: &Arc<Slot>, server: &McpServer) -> Result<ChildTransport> {
     if let Some(stderr) = child.stderr().take() {
         tokio::spawn(read_output(Arc::downgrade(slot), stderr));
     }
-    let output = LineLimit { inner: stdout, run: 0, slot: Arc::downgrade(slot) };
+    let output = LineLimit { inner: stdout, line: vec![], out: vec![], out_at: 0, ended: false, slot: Arc::downgrade(slot) };
     Ok(ChildTransport { inner: AsyncRwTransport::new_client(output, stdin), child: Some(child) })
 }
 
@@ -1370,12 +1482,35 @@ impl Drop for ChildTransport {
     }
 }
 
-/// A server's output that ends in an error once a line runs past
-/// `MAX_LINE_BYTES` without a newline.
+/// A server's output, passed on a whole line at a time: mended (see
+/// `wire`), and ending in an error once a line runs past `MAX_LINE_BYTES`
+/// (the SDK's reader would buffer it without end).
 struct LineLimit<R> {
     inner: R,
-    run: usize,
+    /// The line being read, up to its newline.
+    line: Vec<u8>,
+    /// Whole lines not yet passed on, `out_at` bytes of them passed.
+    out: Vec<u8>,
+    out_at: usize,
+    ended: bool,
     slot: Weak<Slot>,
+}
+
+impl<R> LineLimit<R> {
+    fn pass(&mut self, mut line: Vec<u8>) {
+        // Mended without its line end, which a message written anew lacks.
+        let body = line.len() - line.iter().rev().take_while(|&&b| b == b'\n' || b == b'\r').count();
+        if let Some(mended) = wire::mend(&line[..body]) {
+            let end = line.split_off(body);
+            line = mended;
+            line.extend_from_slice(&end);
+        }
+        if self.out.is_empty() {
+            self.out = line;
+        } else {
+            self.out.extend_from_slice(&line);
+        }
+    }
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LineLimit<R> {
@@ -1384,21 +1519,46 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LineLimit<R> {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        let before = buf.filled().len();
-        std::task::ready!(Pin::new(&mut self.inner).poll_read(cx, buf))?;
-        let read = &buf.filled()[before..];
-        let run = match read.iter().rposition(|&b| b == b'\n') {
-            Some(at) => read.len() - at - 1,
-            None => self.run + read.len(),
-        };
-        self.run = run;
-        if run > MAX_LINE_BYTES {
-            if let Some(slot) = self.slot.upgrade() {
-                slot.log("event", &format!("서버가 {} MiB를 넘는 한 줄을 보내 연결을 끊었습니다", MAX_LINE_BYTES / 1024 / 1024));
+        loop {
+            if self.out_at < self.out.len() {
+                let n = buf.remaining().min(self.out.len() - self.out_at);
+                buf.put_slice(&self.out[self.out_at..self.out_at + n]);
+                self.out_at += n;
+                if self.out_at == self.out.len() {
+                    self.out.clear();
+                    self.out_at = 0;
+                }
+                return std::task::Poll::Ready(Ok(()));
             }
-            return std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "line too long")));
+            if self.ended {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let mut chunk = [0u8; 16 * 1024];
+            let mut read = tokio::io::ReadBuf::new(&mut chunk);
+            std::task::ready!(Pin::new(&mut self.inner).poll_read(cx, &mut read))?;
+            let data = read.filled();
+            if data.is_empty() {
+                // The output ended: a last line without a newline goes as it is.
+                self.ended = true;
+                let line = std::mem::take(&mut self.line);
+                self.pass(line);
+                continue;
+            }
+            let mut start = 0;
+            while let Some(at) = data[start..].iter().position(|&b| b == b'\n') {
+                self.line.extend_from_slice(&data[start..=start + at]);
+                let line = std::mem::take(&mut self.line);
+                self.pass(line);
+                start += at + 1;
+            }
+            self.line.extend_from_slice(&data[start..]);
+            if self.line.len() > MAX_LINE_BYTES {
+                if let Some(slot) = self.slot.upgrade() {
+                    slot.log("event", &format!("서버가 {} MiB를 넘는 한 줄을 보내 연결을 끊었습니다", MAX_LINE_BYTES / 1024 / 1024));
+                }
+                return std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "line too long")));
+            }
         }
-        std::task::Poll::Ready(Ok(()))
     }
 }
 
@@ -1482,7 +1642,7 @@ pub async fn probe(server: &McpServer, model: &str) -> Result<Value> {
             "tools":tools.iter().map(|t| json!({"name":t.name,"exposed":t.exposed,"title":t.title,
                 "description":t.description,"annotations":t.annotations,
                 "allowed":allows(&server.tools, &t.name, &t.exposed),
-                "tokens":crate::context::count(&schema::definition(&t.exposed, &t.description, &t.parameters), model)})).collect::<Vec<_>>(),
+                "tokens":t.tokens(model)})).collect::<Vec<_>>(),
             "log":log
         })),
         Ok(Err(error)) => Ok(json!({"ok":false,"message":slot.failure(&format!("{error:#}")),"log":log})),
@@ -1596,6 +1756,28 @@ mod tests {
         assert_eq!(redact("http://127.0.0.1:9/mcp failed"), "http://127.0.0.1:9/mcp failed");
         assert_eq!(redact("see \"http://h/p?token=a\" and http://h/q?"), "see \"http://h/p?…\" and http://h/q");
         assert_eq!(redact("no url here"), "no url here");
+    }
+
+    #[test]
+    fn statistics_of_tools_no_longer_listed_go() {
+        let slot = Slot::new(server("x"));
+        let tool = |name: &str| {
+            Arc::new(RemoteTool::new(name.into(), format!("x__{name}"), None, String::new(), json!({"type":"object","properties":{}}), Value::Null))
+        };
+        slot.record("old", 5, &Ok(json!({})));
+        slot.record("kept", 5, &Ok(json!({})));
+        slot.set_tools(vec![tool("kept"), tool("new")]);
+        let stats: Vec<String> = slot.state().stats.keys().cloned().collect();
+        assert_eq!(stats, ["kept"]);
+        // Listed again: an unchanged tool stays as it was (its tokens
+        // counted), a changed one is the new one.
+        let kept = slot.state().tools[0].clone();
+        kept.tokens("m");
+        let changed = Arc::new(RemoteTool::new("new".into(), "x__new".into(), None, "now described".into(), json!({"type":"object","properties":{}}), Value::Null));
+        slot.set_tools(vec![tool("kept"), changed.clone()]);
+        let tools = slot.state().tools.clone();
+        assert!(Arc::ptr_eq(&tools[0], &kept) && tools[0].tokens.lock().unwrap().is_some());
+        assert!(Arc::ptr_eq(&tools[1], &changed));
     }
 
     #[test]

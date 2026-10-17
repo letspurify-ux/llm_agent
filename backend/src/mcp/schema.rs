@@ -60,6 +60,61 @@ pub fn description(tool: &Value) -> String {
     cut
 }
 
+/// Descriptions with the server's other tools named as the model sees
+/// them: "use web_fetch_exa" becomes "use exa__web_fetch_exa", or a model
+/// that follows it calls a name that does not exist. Only identifier-like
+/// names (with '_', '.' or '-') are replaced, as whole words: a plain word
+/// such as "search" is also prose. Built once per listing, one pass per
+/// description (a server may list a thousand tools).
+pub struct Renamer {
+    names: Option<regex::Regex>,
+    exposed: std::collections::HashMap<String, String>,
+}
+
+impl Renamer {
+    pub fn new(names: &[(String, String)]) -> Self {
+        let mut renamed: Vec<&(String, String)> =
+            names.iter().filter(|(name, exposed)| name != exposed && name.contains(['_', '.', '-'])).collect();
+        // The longest name first where several start at one place.
+        renamed.sort_by_key(|(name, _)| std::cmp::Reverse(name.len()));
+        let pattern = renamed.iter().map(|(name, _)| regex::escape(name)).collect::<Vec<_>>().join("|");
+        Self {
+            names: (!renamed.is_empty()).then(|| regex::Regex::new(&pattern)).and_then(Result::ok),
+            exposed: renamed.into_iter().cloned().collect(),
+        }
+    }
+
+    pub fn apply(&self, description: &str) -> String {
+        let Some(names) = &self.names else {
+            return description.to_owned();
+        };
+        let part = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        // A word goes on past '-' or '.' with more of it behind: "read-file"
+        // is not the start of "read-file-lines", nor of "fs.read-file".
+        let joined = |chars: &mut dyn Iterator<Item = char>| {
+            let next = chars.next();
+            part(next) || (matches!(next, Some('-' | '.')) && part(chars.next()))
+        };
+        let mut text = String::with_capacity(description.len());
+        let mut copied = 0;
+        for found in names.find_iter(description) {
+            let whole = !joined(&mut description[..found.start()].chars().rev()) && !joined(&mut description[found.end()..].chars());
+            if whole {
+                text.push_str(&description[copied..found.start()]);
+                text.push_str(&self.exposed[found.as_str()]);
+                copied = found.end();
+            }
+        }
+        text.push_str(&description[copied..]);
+        if text.chars().count() > MAX_DESCRIPTION {
+            let mut cut: String = text.chars().take(MAX_DESCRIPTION - 1).collect();
+            cut.push('…');
+            return cut;
+        }
+        text
+    }
+}
+
 /// Function parameters from a tool's input schema: always an object schema.
 /// Top-level combinators and schema identifiers go (providers refuse them in
 /// function parameters); local `$ref`s are expanded in place so a provider
@@ -283,6 +338,48 @@ mod tests {
             }
             assert_eq!(exposed_names("srv-1", &tools), names, "stable");
         }
+    }
+
+    #[test]
+    fn other_tools_are_named_as_the_model_sees_them() {
+        let names = vec![
+            ("web_fetch_exa".to_owned(), "exa__web_fetch_exa".to_owned()),
+            ("search".to_owned(), "exa__search".to_owned()),
+            ("weird.name".to_owned(), "exa__weird_name".to_owned()),
+        ];
+        let renamer = Renamer::new(&names);
+        assert_eq!(
+            renamer.apply("Use after web_search; then web_fetch_exa (or weird.name). Search the web."),
+            "Use after web_search; then exa__web_fetch_exa (or exa__weird_name). Search the web."
+        );
+        // Already exposed, or part of a longer identifier: unchanged.
+        assert_eq!(renamer.apply("exa__web_fetch_exa and web_fetch_exa_v2"), "exa__web_fetch_exa and web_fetch_exa_v2");
+        assert_eq!(renamer.apply("가web_fetch_exa"), "가web_fetch_exa");
+        assert_eq!(renamer.apply("「web_fetch_exa」"), "「exa__web_fetch_exa」");
+        // A word that goes on past '-' or '.' is another name; a sentence's
+        // end is not.
+        let dashed = Renamer::new(&[("read-file".to_owned(), "fs__read_file".to_owned())]);
+        assert_eq!(dashed.apply("read-file-lines, x.read-file and read-file."), "read-file-lines, x.read-file and fs__read_file.");
+        assert_eq!(dashed.apply("read-file- or -read-file"), "fs__read_file- or -fs__read_file");
+        // Of two names starting at one place, the longer.
+        let nested = Renamer::new(&[("a_b".to_owned(), "s__a_b".to_owned()), ("a_b_c".to_owned(), "s__a_b_c".to_owned())]);
+        assert_eq!(nested.apply("a_b_c, a_b and a_b_cd"), "s__a_b_c, s__a_b and a_b_cd");
+        assert_eq!(Renamer::new(&[]).apply("text"), "text");
+    }
+
+    /// A thousand tools whose descriptions name others: one listing's
+    /// renaming stays well under a second even unoptimized.
+    #[test]
+    fn renaming_a_thousand_descriptions_is_quick() {
+        let names: Vec<(String, String)> = (0..1_000).map(|i| (format!("tool_name_{i}"), format!("srv__tool_name_{i}"))).collect();
+        let description: String = (0..60).map(|i| format!("see tool_name_{} here", i * 7)).collect::<Vec<_>>().join(". ").chars().take(1_000).collect();
+        let started = std::time::Instant::now();
+        let renamer = Renamer::new(&names);
+        for _ in 0..1_000 {
+            let renamed = renamer.apply(&description);
+            assert!(renamed.starts_with("see srv__tool_name_0 here"));
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(800), "{:?}", started.elapsed());
     }
 
     #[test]

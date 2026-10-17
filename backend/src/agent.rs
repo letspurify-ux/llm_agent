@@ -203,6 +203,13 @@ async fn run(
     // The MCP tools of this question: the same definitions and system prompt
     // in every request, so a provider's prefix cache keeps them.
     let mcp = app.mcp.snapshot(config);
+    // Definitions past twice the context cannot fit, whatever the
+    // calibration (at least half the local count): said before a request
+    // with them all is counted.
+    if mcp.tokens(&model) / 2 > config.llm.context_tokens {
+        eprintln!("[mcp] the allowed MCP tools' definitions (~{} tokens) are past twice the context", mcp.tokens(&model));
+        bail!(UserFacing(MCP_TOO_LARGE.into()));
+    }
     let system = context::system_prompt(&mcp.prompt());
     let deadline = timing.started + Duration::from_secs(config.agent.run_seconds);
     let mut trace: Vec<Value> = vec![];
@@ -949,7 +956,9 @@ fn runtime_state(
 enum Prepared {
     Voc { args: Value },
     Source { args: Value, project: Project },
-    Mcp { args: Value, tool: Arc<mcp::Offered> },
+    /// `renamed`: called by the server's own name for the tool, and the note
+    /// telling the model the name to use.
+    Mcp { args: Value, tool: Arc<mcp::Offered>, renamed: Option<String> },
     /// Refused before running (its result is the refusal).
     Done(Value),
 }
@@ -1060,7 +1069,23 @@ async fn execute_batch(
         });
         let prepared_call = (|| -> std::result::Result<Prepared, String> {
             if !offered.iter().any(|o| *o == call.name) {
+                // A model that follows a server's own description calls its
+                // tool by the server's name for it: the one MCP tool of that
+                // name runs, and the result says the name to use — unless
+                // the name is one of the agent's own tools, which it may mean.
                 let known = ToolRegistry::specs().iter().any(|s| s.name == call.name);
+                match if known { Ok(None) } else { mcp.find_raw(&call.name) } {
+                    Ok(Some(tool)) => {
+                        let args = parsed.clone()?;
+                        tool.check(&args).map_err(|e| format!("{e:#}"))?;
+                        let renamed = Some(format!("tool name {} was taken as {}; call it {}", call.name, tool.exposed, tool.exposed));
+                        return Ok(Prepared::Mcp { args, tool, renamed });
+                    }
+                    Err(names) => {
+                        return Err(format!("unsupported_tool: {} is a tool of several MCP servers; call one of {}", call.name, names.join(", ")));
+                    }
+                    Ok(None) => {}
+                }
                 return Err(if known {
                     format!("unsupported_tool: {} is not offered now; use the offered tools", call.name)
                 } else {
@@ -1070,7 +1095,7 @@ async fn execute_batch(
             let mut args = parsed.clone()?;
             if let Some(tool) = mcp.find(&call.name) {
                 tool.check(&args).map_err(|e| format!("{e:#}"))?;
-                return Ok(Prepared::Mcp { args, tool });
+                return Ok(Prepared::Mcp { args, tool, renamed: None });
             }
             let adjusted = tools::normalize_arguments(&call.name, &mut args);
             ToolRegistry::validate(&call.name, &args).map_err(|e| format!("{e:#}"))?;
@@ -1108,14 +1133,18 @@ async fn execute_batch(
         });
     }
     // The progress line of an MCP call names its server and tool, a call
-    // refused before it ran (an argument missing) too.
+    // refused before it ran (an argument missing) too, by either name.
     let summaries: Vec<Option<String>> = prepared
         .iter()
         .enumerate()
         .map(|(i, p)| match p {
-            Prepared::Mcp { args, tool } => Some(tool.summary(args)),
+            Prepared::Mcp { args, tool, .. } => Some(tool.summary(args)),
             Prepared::Done(_) => mcp
                 .find(&calls[i].name)
+                .or_else(|| {
+                    let known = ToolRegistry::specs().iter().any(|s| s.name == calls[i].name);
+                    if known { None } else { mcp.find_raw(&calls[i].name).ok().flatten() }
+                })
                 .map(|tool| tool.summary(&serde_json::from_str(&calls[i].arguments).unwrap_or(Value::Null))),
             _ => None,
         })
@@ -1154,7 +1183,7 @@ async fn execute_batch(
         .iter()
         .enumerate()
         .filter_map(|(i, p)| match p {
-            Prepared::Mcp { args, tool } => {
+            Prepared::Mcp { args, tool, .. } => {
                 let tool = tool.clone();
                 let args = args.clone();
                 let cancel = cancel.clone();
@@ -1435,11 +1464,18 @@ async fn execute_batch(
             events.send(json!({"type":"tool_done","id":ids[index],"name":calls[index].name,"status":"error"}));
             Err(anyhow::anyhow!("tool_worker_panic: the tool stopped unexpectedly"))
         });
-        let args = match &prepared[index] {
-            Prepared::Mcp { args, .. } => args.clone(),
-            _ => Value::Null,
+        let (args, renamed) = match &prepared[index] {
+            Prepared::Mcp { args, renamed, .. } => (args.clone(), renamed.clone()),
+            _ => (Value::Null, None),
         };
-        let result = tools::envelope(outcome);
+        let mut result = tools::envelope(outcome);
+        if let Some(note) = renamed {
+            if result["data"].is_object() {
+                result["data"]["adjusted_arguments"] = json!([note]);
+            } else {
+                result["adjusted_arguments"] = json!([note]);
+            }
+        }
         results[index] = Some(tools::bound_result(&mut workspace, &calls[index], &args, result, share));
     }
     // Every result as the model receives it (repeat warnings and recovery

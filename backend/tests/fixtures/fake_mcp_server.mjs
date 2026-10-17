@@ -15,7 +15,7 @@ const text = value => ({ type: 'text', text: value });
 const tools = [
   { name: 'echo', description: 'Echo the text back.', inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }, annotations: { readOnlyHint: true } },
   { name: 'add', title: 'Add numbers', description: 'Add two numbers.', inputSchema: { type: 'object', properties: { a: { type: 'number' }, b: { type: 'number' } }, required: ['a', 'b'] } },
-  { name: 'structured_only', description: 'Structured content without text.', inputSchema: { type: 'object' } },
+  { name: 'structured_only', description: 'Structured content without text; for text use add_tool or weird.name, or call echo.', inputSchema: { type: 'object' } },
   { name: 'slow', description: 'Wait ms milliseconds.', inputSchema: { type: 'object', properties: { ms: { type: 'integer' } } } },
   { name: 'fail', description: 'Report a tool failure.', inputSchema: { type: 'object', properties: {} } },
   { name: 'big', description: 'Return chars characters.', inputSchema: { type: 'object', properties: { chars: { type: 'integer' } } } },
@@ -53,11 +53,17 @@ if (env.FAKE_MCP_HUGE_META) {
   tools.push({ name: 'huge_meta', title: 'T'.repeat(100_000), description: 'huge', inputSchema: { type: 'object' }, annotations: { readOnlyHint: true, junk: 'J'.repeat(500_000) } });
   tools.push({ name: 'huge_schema', description: 'A schema of about 1 MB.', inputSchema: { type: 'object', properties: Object.fromEntries(Array.from({ length: 20_000 }, (_, i) => [`field_${i}`, { type: 'string', description: 'x'.repeat(30) }])) } });
 }
+// Many tools with schemas just under the client's size limit.
+for (let i = 0; i < Number(env.FAKE_MCP_FAT || 0); i++) {
+  tools.push({ name: `fat_${i}`, description: 'fat', inputSchema: { type: 'object', properties: Object.fromEntries(Array.from({ length: 1_000 }, (_, j) => [`f${j}`, { type: 'string', description: `field ${j} of tool ${i}` }])) } });
+}
 for (let i = 0; i < Number(env.FAKE_MCP_MANY || 0); i++) tools.push({ name: `many_${i}`, description: 'one of many', inputSchema: { type: 'object' } });
 let listed = 0;
+if (env.FAKE_MCP_BUILTIN_NAME) tools.push({ name: 'history', description: 'A tool named like one of the agent\'s own.', inputSchema: { type: 'object' } });
 if (env.FAKE_MCP_DUPLICATE) tools.push({ name: 'echo', description: 'A second echo.', inputSchema: { type: 'object' } });
 if (env.FAKE_MCP_BAD_LIST) tools.push({ name: 'no_schema', description: 'A tool without inputSchema.' }, { name: 'string_schema', description: 'A tool whose schema is a string.', inputSchema: 'nope' });
 const cancelled = new Set();
+let limitedCalls = 0;
 const log = line => process.stderr.write(`${line}\n`);
 
 function result(id, value) { return { jsonrpc: '2.0', id, result: value }; }
@@ -99,7 +105,12 @@ async function handle(message, notify) {
   if (method === 'tools/call') {
     const args = params.arguments || {};
     switch (params.name) {
-      case 'echo': return result(id, { content: [text(`echo: ${args.text}`)] });
+      // Text cut inside an emoji, as a JS server slicing a page does: the
+      // JSON then holds a lone surrogate escape.
+      // "bad bytes": a byte that is not UTF-8 in the text (stdio only).
+      // "shape:{...}": that message as the answer, its id unless it has one.
+      case 'echo':
+        if (String(args.text).startsWith('shape:')) return { id, ...JSON.parse(args.text.slice(6)) }; return result(id, { content: [text(args.text === 'cut emoji' ? '잘림 😀'.slice(0, 4) : args.text === 'bad bytes' ? 'raw <0xFF> byte' : `echo: ${args.text}`)] });
       case 'add': { const sum = args.a + args.b; return result(id, { content: [text(JSON.stringify({ sum }))], structuredContent: { sum } }); }
       case 'structured_only': return result(id, { content: [], structuredContent: { ok: true, items: [1, 2] } });
       case 'slow': {
@@ -129,6 +140,7 @@ async function handle(message, notify) {
         return result(id, { content: [text('added')] });
       }
       case 'extra': return result(id, { content: [text('extra ran')] });
+      case 'history': return result(id, { content: [text('the server history ran')] });
       case 'strict': return args.x ? result(id, { content: [text('ok')] }) : failure(id, -32602, 'x is required');
       case 'headers': return result(id, { content: [text(headersSeen.authorization ?? '<none>')] });
       case 'bad_content': return result(id, { content: [{ type: 'weird', x: 1 }] });
@@ -181,6 +193,12 @@ if (httpMode) {
     req.on('data', chunk => { body += chunk; });
     req.on('end', async () => {
       const message = JSON.parse(body);
+      // A rate limit or a proxy error on the first tool call only, the
+      // session fine.
+      if (env.FAKE_MCP_CALL_STATUS && message.method === 'tools/call' && limitedCalls++ === 0) {
+        res.writeHead(Number(env.FAKE_MCP_CALL_STATUS), { 'Content-Type': 'text/plain', 'Retry-After': '30' }).end('slow down');
+        return;
+      }
       const notes = [];
       const answer = await handle(message, note => notes.push(note));
       if (answer === null) { res.writeHead(202).end(); return; }
@@ -200,9 +218,14 @@ if (httpMode) {
 } else {
   for (let i = 0; i < Number(env.FAKE_MCP_STDERR || 0); i++) log(`stderr line ${i}`);
   if (env.FAKE_MCP_EXIT_BEFORE_INIT) { log('fatal: missing configuration'); process.exit(2); }
+  // Windows-style output: a byte order mark before the first line, CRLF.
+  let bom = env.FAKE_MCP_WINDOWS ? '\ufeff' : '';
+  const end = env.FAKE_MCP_WINDOWS ? '\r\n' : '\n';
   const send = message => {
     if (env.FAKE_MCP_GARBAGE) process.stdout.write('this is not json\n');
-    process.stdout.write(`${JSON.stringify(message)}\n`);
+    const [before, after] = `${bom}${JSON.stringify(message)}${end}`.split('<0xFF>');
+    process.stdout.write(after === undefined ? before : Buffer.concat([Buffer.from(before), Buffer.from([0xff]), Buffer.from(after)]));
+    bom = '';
   };
   if (env.FAKE_MCP_GARBAGE) process.stdout.write('starting up (not json)\n');
   let buffer = '';
