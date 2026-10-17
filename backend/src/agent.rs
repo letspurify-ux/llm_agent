@@ -18,7 +18,7 @@ use anyhow::{Result, bail};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -200,6 +200,11 @@ async fn run(
     let deadline = timing.started + Duration::from_secs(config.agent.run_seconds);
     let mut trace: Vec<Value> = vec![];
     let mut tracker = FailureTracker::default();
+    // Query runs of this question (query, target, params) → step: an
+    // identical repeat is refused for result_read on that step. A later
+    // question runs it again: the DB is live, and its user may be asking for
+    // the values as they are now.
+    let mut executed: HashMap<String, u64> = HashMap::new();
     let mut rounds = 0usize;
     let mut withheld = 0usize;
     let mut empty = 0usize;
@@ -738,6 +743,7 @@ async fn run(
             events,
             &tools_cancel,
             &mut tracker,
+            &mut executed,
             &mut trace,
             &mut event_id,
             room,
@@ -1009,6 +1015,7 @@ async fn execute_batch(
     events: &Events,
     cancel: &CancellationToken,
     tracker: &mut FailureTracker,
+    executed: &mut HashMap<String, u64>,
     trace: &mut Vec<Value>,
     event_id: &mut u64,
     room: usize,
@@ -1183,7 +1190,7 @@ async fn execute_batch(
             config,
             cancel,
             results: &c.results,
-            executed: &c.executed,
+            executed,
             clipped: &clipped,
             result_tokens: share,
         };
@@ -1291,7 +1298,7 @@ async fn execute_batch(
                 let name = result.query_name.clone();
                 let capped = result.capped;
                 let step = c.store_result(result, config.agent.result_store_bytes);
-                c.executed.insert(signature, step);
+                executed.insert(signature, step);
                 if let Ok(data) = &mut data_result {
                     // The step first: the model copies it into references.
                     let mut ordered = Map::new();

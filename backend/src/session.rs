@@ -291,9 +291,6 @@ pub struct Conversation {
     /// conversation so a later answer can refer to an earlier result.
     pub results: BTreeMap<u64, StoredResult>,
     pub next_step: u64,
-    /// Executed query calls (name, target, params) → step, to refuse an
-    /// identical repeat.
-    pub executed: HashMap<String, u64>,
     /// Provider/estimate token ratios for calibration (MnemoArc), measured
     /// with `token_ratio_model`.
     pub token_ratios: VecDeque<f64>,
@@ -309,7 +306,6 @@ impl Conversation {
             list_cursor_scopes: VecDeque::new(),
             results: BTreeMap::new(),
             next_step: 1,
-            executed: HashMap::new(),
             token_ratios: VecDeque::new(),
             token_ratio_model: String::new(),
             last_used: Instant::now(),
@@ -331,10 +327,6 @@ impl Conversation {
             }
             total -= self.results.remove(&oldest).map_or(0, |r| r.bytes);
         }
-        // A repeat is refused in favour of result_read on the earlier step;
-        // once that step's rows are gone the query must be allowed to run
-        // again (and the map stays as small as the results it points to).
-        self.executed.retain(|_, kept| self.results.contains_key(kept));
         step
     }
     /// Reserves a step number for a query that failed, so step numbers in the
@@ -674,14 +666,10 @@ mod tests {
             bytes,
         };
         assert_eq!(c.store_result(result(60), 100), 1);
-        c.executed.insert("q-a".into(), 1);
         assert_eq!(c.reserve_step(), 2);
         assert_eq!(c.store_result(result(60), 100), 3);
-        c.executed.insert("q-b".into(), 3);
         assert!(!c.results.contains_key(&1));
         assert!(c.results.contains_key(&3));
-        // The dropped step's call may run again; the kept one is still refused.
-        assert_eq!(c.executed.keys().collect::<Vec<_>>(), ["q-b"]);
     }
 
     #[test]

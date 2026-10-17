@@ -94,13 +94,18 @@ async fn search_method_query_and_table_reference() {
     assert_eq!(run_result["data"]["rows"][0]["JOB_ID"], "BATCH001");
 
     // A follow-up in the same conversation keeps the earlier results in
-    // context, refuses the identical run and returns the referenced rows.
+    // context and runs the identical query again: the DB is live, and a later
+    // question may ask for the values as they are now. Within that question
+    // the repeat is refused for result_read; the earlier question's rows stay
+    // readable and referable.
+    let run = |id: &str| call(id, "query_run", json!({"query_name":"batch_job_status","params":{"job_id":"BATCH001"}}));
     llm.push(vec![
-        calls(vec![call("c4", "query_run", json!({"query_name":"batch_job_status","params":{"job_id":"BATCH001"}}))]),
-        calls(vec![call("c5", "result_read", json!({"step":1,"cols":["status"]}))]),
-        text("앞서 본 결과 그대로입니다.\n\n```chart\ntype: bar\ntitle: 상태\ndata: step 1\n```"),
+        calls(vec![run("c4")]),
+        calls(vec![run("c5")]),
+        calls(vec![call("c6", "result_read", json!({"step":1,"cols":["status"]}))]),
+        text("지금도 실패 상태입니다.\n\n```chart\ntype: bar\ntitle: 상태\ndata: step 1\n```"),
     ]);
-    let (result, _) = ask(&app, "conv-1", "다시 보여줘", vec![]).await;
+    let (result, events) = ask(&app, "conv-1", "지금 다시 조회해줘", vec![]).await;
     let answer = result.unwrap();
     let requests = llm.requests();
     let first_of_followup = &requests[4];
@@ -108,16 +113,60 @@ async fn search_method_query_and_table_reference() {
         first_of_followup["messages"].as_array().unwrap().iter().any(|m| m["tool_call_id"] == "c3"),
         "earlier tool results stay in context"
     );
-    let repeated = tool_result(&requests[5], "c4");
+    let rerun = tool_result(&requests[5], "c4");
+    assert_eq!(rerun["status"], "ok", "{rerun}");
+    assert_eq!(rerun["data"]["step"], 2);
+    let run_done = ev(&events, "run_query_done");
+    assert_eq!(run_done[0]["rowCount"], 1);
+    assert_eq!(run_done[1]["error"], "같은 조회를 이미 실행했습니다.");
+    let repeated = tool_result(&requests[6], "c5");
     assert_eq!(repeated["recovery"]["code"], "repeated_call", "{repeated}");
+    assert!(repeated["error"].as_str().unwrap().contains("이번 질문에서") && repeated["error"].as_str().unwrap().contains("(step 2)"), "{repeated}");
     // The refusal is a loop guard, not a failed query: no error step (the
     // chat_log failed-question query counts steps[].error).
     assert!(answer.trace.iter().all(|s| s.get("error").is_none()), "{:?}", answer.trace);
+    let steps: Vec<&Value> = answer.trace.iter().filter(|s| s["query_name"].is_string()).collect();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert_eq!(steps[0]["step"], 2);
     assert_eq!(answer.log["search"]["searches"], 0);
-    let read = tool_result(&requests[6], "c5");
+    let read = tool_result(&requests[7], "c6");
     assert_eq!(read["data"]["columns"], json!(["STATUS"]));
     assert_eq!(answer.refs[0]["step"], 1);
     assert_eq!(answer.refs[0]["rows"][0]["STATUS"], "FAILED");
+}
+
+#[tokio::test]
+async fn a_repeat_in_a_question_runs_again_once_its_rows_are_gone() {
+    let Some(db) = TestDb::create("rerun") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let run = |id: &str, job: &str| call(id, "query_run", json!({"query_name":"batch_job_status","params":{"job_id":job}}));
+    let llm = Scripted::new(vec![
+        calls(vec![run("c1", "BATCH001")]),
+        calls(vec![run("c2", "BATCH002")]),
+        calls(vec![run("c3", "BATCH001")]),
+        calls(vec![run("c4", "BATCH001")]),
+        text("확인했습니다."),
+    ]);
+    // The result store keeps only the newest result's rows (a size below
+    // what the settings accept, so it is set after saving them).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut config = db.config();
+    config.save(&path).unwrap();
+    config.agent.result_store_bytes = 1;
+    let app = llm_agent::app::App::new(path, config, llm.clone());
+    let (result, _) = ask(&app, "conv-rerun", "배치 상태 확인해줘", vec![]).await;
+    result.unwrap();
+    let requests = llm.requests();
+    // Step 2 dropped step 1's rows: the refusal would point at rows that are
+    // gone, so the repeat runs.
+    let again = tool_result(&requests[3], "c3");
+    assert_eq!(again["data"]["step"], 3, "{again}");
+    // Step 3 is kept: its repeat is refused.
+    let repeated = tool_result(&requests[4], "c4");
+    assert_eq!(repeated["recovery"]["code"], "repeated_call", "{repeated}");
+    assert!(repeated["error"].as_str().unwrap().contains("(step 3)"), "{repeated}");
 }
 
 #[tokio::test]

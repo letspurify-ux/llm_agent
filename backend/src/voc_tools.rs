@@ -237,6 +237,7 @@ pub struct Context<'a> {
     pub config: &'a Config,
     pub cancel: &'a CancellationToken,
     pub results: &'a BTreeMap<u64, StoredResult>,
+    /// This question's query runs (query, target, params) → step.
     pub executed: &'a HashMap<String, u64>,
     pub clipped: &'a Clipped,
     pub result_tokens: usize,
@@ -1017,10 +1018,12 @@ async fn query_run(cx: &Context<'_>, args: &Value) -> Run {
     let canonical = db::text(&row, "query_name");
     let resolved = crate::oracle::resolve_target_db(&row, chosen.as_deref()).ok();
     let signature = run_signature(&canonical, resolved.as_deref().or(chosen.as_deref()), &params);
-    if let Some(step) = cx.executed.get(&signature) {
+    // A repeat in this question is refused for result_read on its step,
+    // unless that step's rows are no longer kept.
+    if let Some(step) = cx.executed.get(&signature).filter(|step| cx.results.contains_key(step)) {
         return Run {
             result: Err(anyhow::anyhow!(
-                "repeated_call: 같은 쿼리를 같은 값과 대상으로 이미 실행했다 (step {step}). 그 결과를 result_read로 읽어라"
+                "repeated_call: 이번 질문에서 같은 쿼리를 같은 값과 대상으로 이미 실행했다 (step {step}). 그 결과를 result_read로 읽어라"
             )),
             effect: Effect::Refused,
             hits: None,
