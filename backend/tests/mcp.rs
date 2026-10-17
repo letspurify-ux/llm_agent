@@ -1023,6 +1023,8 @@ async fn the_model_calls_mcp_tools_like_its_own() {
     // Progress lines and the trace name the server and tool.
     let started = ev(&events, "tool");
     assert_eq!(started[0]["summary"], "fake · echo \"이슈 123\"");
+    assert_eq!(started[3]["summary"], "fake · echo", "a call refused before it ran is named alike");
+    assert_eq!(answer.trace[3]["summary"], "fake · echo");
     let done = ev(&events, "tool_done");
     assert_eq!(done.len(), 4);
     assert_eq!(answer.trace[0]["tool"], "fake__echo");

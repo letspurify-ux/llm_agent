@@ -1107,11 +1107,16 @@ async fn execute_batch(
             Err(message) => Prepared::Done(tools::envelope(Err(anyhow::anyhow!(message)))),
         });
     }
-    // The progress line of an MCP call names its server and tool.
+    // The progress line of an MCP call names its server and tool, a call
+    // refused before it ran (an argument missing) too.
     let summaries: Vec<Option<String>> = prepared
         .iter()
-        .map(|p| match p {
+        .enumerate()
+        .map(|(i, p)| match p {
             Prepared::Mcp { args, tool } => Some(tool.summary(args)),
+            Prepared::Done(_) => mcp
+                .find(&calls[i].name)
+                .map(|tool| tool.summary(&serde_json::from_str(&calls[i].arguments).unwrap_or(Value::Null))),
             _ => None,
         })
         .collect();
