@@ -1134,48 +1134,6 @@ impl llm_agent::llm::LlmClient for RandomModel {
     }
 }
 
-/// The shape every request must keep: the context opens with a user
-/// message, no reply follows a reply, every tool call has its result right
-/// after it, one answer per question, no internal flags.
-fn request_shape(request: &Value) -> Result<(), String> {
-    let messages = request["messages"].as_array().unwrap();
-    if messages[0]["role"] != "system" || messages[1]["role"] != "user" || messages.last().unwrap()["role"] != "user" {
-        return Err("not system, user …, state".into());
-    }
-    let mut pending: Vec<&str> = vec![];
-    let mut answers = 0;
-    let mut previous = "";
-    for message in &messages[1..] {
-        let role = message["role"].as_str().unwrap();
-        if role == "assistant" && previous == "assistant" {
-            return Err("a reply after a reply".into());
-        }
-        if role != "tool" && !pending.is_empty() {
-            return Err(format!("no result for {pending:?}"));
-        }
-        if message.get("partial").is_some() || message.get("restored").is_some() {
-            return Err("internal flag".into());
-        }
-        match role {
-            "assistant" => match message["tool_calls"].as_array() {
-                Some(calls) if !calls.is_empty() => pending = calls.iter().map(|c| c["id"].as_str().unwrap()).collect(),
-                _ => answers += 1,
-            },
-            "tool" => {
-                let id = message["tool_call_id"].as_str().unwrap();
-                let at = pending.iter().position(|p| *p == id).ok_or(format!("result without its call {id}"))?;
-                pending.remove(at);
-            }
-            _ => answers = 0,
-        }
-        if answers > 1 {
-            return Err("two answers to one question".into());
-        }
-        previous = role;
-    }
-    Ok(())
-}
-
 /// Random conversations of three questions keep every request in shape and
 /// within the context, and end every question with an answer or a message
 /// the user may see. CTX_FUZZ sets the number of conversations. Needs no
@@ -1243,35 +1201,6 @@ async fn random_conversations_keep_every_request_in_shape() {
             }
         }
     }
-}
-
-/// What a result in the context goes on in is still held: the archive of a
-/// cut result, the bundle a cut history read reads.
-fn continuations_kept(history: &llm_agent::session::SessionHistory) -> Result<(), String> {
-    for bundle in history.bundles.iter().filter(|b| b.active) {
-        for message in bundle.messages.iter().filter(|m| m["role"] == "tool") {
-            let Ok(result) = serde_json::from_str::<Value>(message["content"].as_str().unwrap_or("")) else {
-                continue;
-            };
-            let mut ids: Vec<u64> = result["archive_id"].as_u64().into_iter().collect();
-            if result["next_cursor"]["tool"] == "history" {
-                ids.extend(result["next_cursor"]["id"].as_u64());
-            }
-            if result["data"]["truncated"] == true && result["next_cursor"]["tool"] != "history" && message["tool_call_id"].as_str().is_some() {
-                // A cut history read without a continuation the prune can see.
-                let call = bundle.messages[0]["tool_calls"].as_array().and_then(|calls| calls.iter().find(|c| c["id"] == message["tool_call_id"]));
-                if call.is_some_and(|c| c["function"]["name"] == "history") {
-                    return Err(format!("bundle {}: a cut history read names no next_cursor", bundle.id));
-                }
-            }
-            for id in ids {
-                if history.read(id).is_err() {
-                    return Err(format!("bundle {}: {id}, which a result in the context goes on in, was dropped", bundle.id));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 // Context management review, third pass (2026-10-16): each failed before its
@@ -1916,11 +1845,19 @@ async fn too_much_material_for_one_question_is_not_sent_to_a_new_conversation() 
     config.llm.context_tokens = 24_000;
     config.llm.output_tokens = 2_000;
     config.projects.push(llm_agent::config::Project { name: "app".into(), root, ..Default::default() });
-    let every_file = calls((0..80).map(|i| call(&format!("r{i}"), "file_read", json!({"path":format!("f{i}.txt")}))).collect());
-    let (app, _dir) = app(config, Scripted::new(vec![every_file, text("답")]));
+    // Calls whose results cannot fit beside them are not run but asked for
+    // again smaller (thirteenth MCP and context pass); a model that keeps
+    // making them ends the question so.
+    let every_file = || calls((0..80).map(|i| call(&format!("r{i}"), "file_read", json!({"path":format!("f{i}.txt")}))).collect());
+    let llm = Scripted::new(vec![every_file(), every_file(), every_file(), text("답")]);
+    let (app, _dir) = app(config, llm.clone());
     let (r, _) = ask(&app, "z", "모든 파일을 요약해줘", vec![]).await;
     let error = r.err().expect("too much material").to_string();
     assert!(error.contains("질문을 나누거나") && !error.contains("새 대화"), "{error}");
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1].to_string().contains("호출 수를 줄여"), "the model is told why");
+    assert!(requests.iter().all(|r| messages(r, "tool").is_empty()), "none of them ran");
 }
 
 // Context management review, sixth pass (2026-10-16): each failed before its

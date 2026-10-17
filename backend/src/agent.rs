@@ -77,6 +77,8 @@ const LENGTH_CONTINUATIONS: usize = 2;
 /// Responses in a row whose tool calls could not be used.
 const UNUSABLE_RETRIES: usize = 2;
 const UNUSABLE_CALLS: &str = "모델이 쓸 수 없는 도구 호출을 거듭해 답변을 마무리하지 못했습니다. 잠시 후 다시 시도하거나 다른 모델을 써 보세요.";
+/// Responses in a row whose calls leave no room for their results.
+const OVERSIZED_RETRIES: usize = 2;
 
 pub struct Question {
     pub conversation_id: String,
@@ -225,6 +227,7 @@ async fn run(
     let mut empty = 0usize;
     let mut outages = 0usize;
     let mut unusable = 0usize;
+    let mut oversized = 0usize;
     let mut partial: Vec<String> = vec![];
     let mut notice: Option<String> = None;
     let mut event_id = 0u64;
@@ -766,6 +769,29 @@ async fn run(
         // What this response's tool results may fill, at the token ratio its
         // own usage has just updated: the next request is checked with it.
         let room = ((config.input_budget() as f64 / context::token_ratio(c, &model)) as usize).saturating_sub(kept);
+        // A response whose own calls (their arguments, a text before them)
+        // leave no room for the smallest results `fit_batch` cuts to is not
+        // run: its results would be cut and the next request still not fit,
+        // ending the question after its tools ran — an MCP tool's effect (an
+        // issue filed, a message sent) to be done again when the question is
+        // asked again. The model is asked for smaller calls instead.
+        let response_tokens = context::count(&assistant_message(&completion), &model);
+        if response_tokens + completion.calls.len() * crate::config::MIN_RESULT_TOKENS > room {
+            eprintln!(
+                "[agent] the response's {} calls (~{response_tokens} tokens) leave no room for their results (~{room} tokens); not run",
+                completion.calls.len()
+            );
+            oversized += 1;
+            if oversized > OVERSIZED_RETRIES {
+                bail!(too_long(true, true));
+            }
+            notice = Some(format!(
+                "이전 응답의 도구 호출 {}개는 하나도 실행하지 않았다: 호출과 그 인수만 약 {response_tokens} 토큰이라 결과를 함께 담을 자리(약 {room} 토큰)가 남지 않는다. 인수를 줄이거나 호출 수를 줄여 다시 하라.",
+                completion.calls.len()
+            ));
+            continue;
+        }
+        oversized = 0;
         let tool_started = Instant::now();
         // The calls stop at the final reserve too, which the final answer keeps.
         let tools_cancel = cancel.child_token();
@@ -800,6 +826,11 @@ async fn run(
         stopper.abort();
         timing.tools.push(json!({"ms":tool_started.elapsed().as_millis() as u64,"calls":completion.calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()}));
         if cancel.is_cancelled() {
+            // The calls of a stopped question stay in the conversation with
+            // what they returned (or `cancelled`): an MCP tool may have taken
+            // effect (an issue filed), and the next question would otherwise
+            // not know it was asked, and ask again.
+            c.history.push(messages, true);
             bail!("cancelled");
         }
         let stopped = tools_cancel.is_cancelled()

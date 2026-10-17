@@ -1315,6 +1315,91 @@ async fn mcp_calls_stop_at_the_final_reserve() {
     app.mcp.shutdown().await;
 }
 
+/// The calls a server's tool shows in its status.
+fn tool_calls(app: &llm_agent::app::App, server: &str, tool: &str) -> u64 {
+    let status = app.mcp.server_status(server, MODEL).unwrap();
+    status["tools"].as_array().unwrap().iter().find(|t| t["name"] == tool).unwrap()["calls"].as_u64().unwrap()
+}
+
+/// Mcp and context review, thirteenth pass: a response whose own calls left
+/// no room for their results was run anyway — an MCP tool's arguments (a
+/// document to file) can be that large — and the question then ended as one
+/// whose material did not fit, after the tool had taken effect, to take it
+/// again when asked again.
+#[tokio::test]
+async fn calls_that_leave_no_room_for_their_results_are_not_run() {
+    if node_missing() {
+        return;
+    }
+    let mut config = config(vec![fake("fake", &["echo"], &[])]);
+    config.llm.context_tokens = 24_000;
+    config.llm.output_tokens = 2_000;
+    let huge = json!({"text":"이슈 본문 ".repeat(6_000)});
+    let llm = Scripted::new(vec![
+        calls(vec![support::call("h1", "fake__echo", huge.clone())]),
+        calls(vec![support::call("s1", "fake__echo", json!({"text":"짧게"}))]),
+        text("끝"),
+    ]);
+    let (app, _dir) = app(config.clone(), llm.clone());
+    app.mcp.apply(&config.mcp_servers);
+    ready(&app.mcp, "fake").await;
+    let (result, _) = ask(&app, "긴 이슈를 만들어줘").await;
+    assert_eq!(result.unwrap().answer, "끝");
+    let requests = llm.requests();
+    assert!(!requests[1].to_string().contains("\"h1\""), "the large call is not in the conversation");
+    let state = requests[1]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_owned();
+    assert!(state.contains("하나도 실행하지 않았다"), "{state}");
+    assert_eq!(tool_result(&requests[2], "s1")["data"]["text"], "echo: 짧게");
+    assert_eq!(tool_calls(&app, "fake", "echo"), 1, "only the call that fits ran");
+    // Asked for again and again, nothing runs and the question ends as one
+    // whose material does not fit.
+    llm.push((0..3).map(|i| calls(vec![support::call(&format!("again{i}"), "fake__echo", huge.clone())])).collect());
+    let (result, _) = ask(&app, "다시 긴 이슈를 만들어줘").await;
+    let error = result.err().expect("not answered").to_string();
+    assert!(error.contains("한 번에 담기지 않아"), "{error}");
+    assert_eq!(tool_calls(&app, "fake", "echo"), 1, "none of them ran");
+    app.mcp.shutdown().await;
+}
+
+/// Mcp and context review, thirteenth pass: the calls of a question stopped
+/// while they ran left the conversation with it, so the next question did not
+/// know an MCP tool had been asked (and may have taken effect).
+#[tokio::test]
+async fn a_stopped_question_keeps_the_calls_it_made() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("fake", &["echo", "slow"], &[])]);
+    let llm = Scripted::new(vec![
+        calls(vec![support::call("e1", "fake__echo", json!({"text":"이슈 생성"})), support::call("w1", "fake__slow", json!({"ms":30_000}))]),
+        text("다음 답"),
+    ]);
+    let (app, _dir) = app(config.clone(), llm.clone());
+    app.mcp.apply(&config.mcp_servers);
+    ready(&app.mcp, "fake").await;
+    let stop = CancellationToken::new();
+    let stopper = {
+        let (app, stop) = (app.clone(), stop.clone());
+        tokio::spawn(async move {
+            while tool_calls(&app, "fake", "echo") == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            stop.cancel();
+        })
+    };
+    let started = Instant::now();
+    let stopped = agent::answer(&app, Question { conversation_id: "mcp".into(), message: "이슈를 만들어줘".into(), history: vec![] }, Events::new(None), stop).await;
+    stopper.await.unwrap();
+    assert_eq!(stopped.err().map(|e| e.to_string()).as_deref(), Some("cancelled"));
+    assert!(started.elapsed() < Duration::from_secs(10), "the slow call stopped with the question");
+    let (result, _) = ask(&app, "만들어졌어?").await;
+    assert_eq!(result.unwrap().answer, "다음 답");
+    let request = llm.requests().last().unwrap().clone();
+    assert_eq!(tool_result(&request, "e1")["data"]["text"], "echo: 이슈 생성");
+    assert_eq!(tool_result(&request, "w1")["status"], "cancelled");
+    app.mcp.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_server_name_for_a_tool_two_servers_have_is_not_guessed() {
     if node_missing() {
@@ -1846,5 +1931,240 @@ async fn slips_of_the_protocol_neither_hang_nor_end_the_session() {
         assert_eq!(call(&hub, &config, "shape__echo", json!({"text":"after"})).await.unwrap()["text"], "echo: after");
         assert_eq!(hub.server_status("shape", MODEL).unwrap()["restarts"], 0, "{mode}");
         hub.shutdown().await;
+    }
+}
+
+/// A model calling MCP tools at random beside the agent's own — results past
+/// the budget, failing and slow ones, a server's own name for a tool — and
+/// following the continuations its last results give, with cut answers.
+struct RandomMcpModel {
+    seed: std::sync::Mutex<u64>,
+    /// Tokens the provider serves; past it a request is refused.
+    real_limit: usize,
+    /// The provider's tokens per estimated token.
+    ratio: f64,
+    rounds: std::sync::Mutex<usize>,
+    next_call: std::sync::Mutex<usize>,
+    requests: std::sync::Mutex<Vec<(Value, bool)>>,
+    /// Calls that follow a continuation, and the continuation.
+    followed: std::sync::Mutex<Vec<(String, Value)>>,
+    problems: std::sync::Mutex<Vec<String>>,
+}
+impl RandomMcpModel {
+    fn next(&self, n: usize) -> usize {
+        let mut seed = self.seed.lock().unwrap();
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 33) as usize) % n.max(1)
+    }
+    fn id(&self) -> String {
+        let mut next = self.next_call.lock().unwrap();
+        *next += 1;
+        format!("c{next}")
+    }
+    fn problem(&self, problem: String) {
+        self.problems.lock().unwrap().push(problem);
+    }
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for RandomMcpModel {
+    async fn complete(&self, request: Value, config: &llm_agent::config::LlmConfig, _c: CancellationToken, _d: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        let input = (llm_agent::context::count(&request, &config.model) as f64 * self.ratio) as usize;
+        let accepted = input + config.output_tokens <= self.real_limit;
+        self.requests.lock().unwrap().push((request.clone(), accepted));
+        if !accepted {
+            anyhow::bail!("http_400: {}", json!({"error":{"message":format!("This model's maximum context length is {} tokens.", self.real_limit),"code":"context_length_exceeded"}}));
+        }
+        // The results of the last response, by call name.
+        let messages = request["messages"].as_array().unwrap();
+        let last = messages.iter().rposition(|m| m["tool_calls"].as_array().is_some_and(|c| !c.is_empty()));
+        let results: Vec<(String, String, Value)> = last
+            .map(|at| {
+                let calls = messages[at]["tool_calls"].as_array().unwrap();
+                messages[at + 1..]
+                    .iter()
+                    .take_while(|m| m["role"] == "tool")
+                    .map(|m| {
+                        let id = m["tool_call_id"].as_str().unwrap().to_owned();
+                        let name = calls.iter().find(|c| c["id"] == id.as_str()).map_or("", |c| c["function"]["name"].as_str().unwrap()).to_owned();
+                        (id, name, serde_json::from_str(m["content"].as_str().unwrap()).unwrap())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A continuation followed reads on from where it was cut.
+        for (id, cursor) in std::mem::take(&mut *self.followed.lock().unwrap()) {
+            let Some((_, _, result)) = results.iter().find(|(r, _, _)| *r == id) else {
+                continue;
+            };
+            if result["status"] != "ok" && result["status"] != "cancelled" {
+                self.problem(format!("following {cursor} gave {result}"));
+            }
+            if result["next_cursor"]["tool"] == "history" && result["next_cursor"]["id"] == cursor["id"] && result["next_cursor"]["offset"].as_u64() <= cursor["offset"].as_u64() {
+                self.problem(format!("following {cursor} went no further: {result}"));
+            }
+        }
+        // A cut result of `big` shows its start.
+        for (_, name, result) in &results {
+            if let Some(text) = result["data"]["text"].as_str().filter(|_| name.ends_with("big"))
+                && !text.chars().enumerate().all(|(i, c)| c == char::from(b'0' + (i % 10) as u8))
+            {
+                self.problem(format!("a cut result of big is not its start: {}", text.chars().take(80).collect::<String>()));
+            }
+        }
+        let rounds = {
+            let mut rounds = self.rounds.lock().unwrap();
+            *rounds += 1;
+            *rounds
+        };
+        let mut out = text("");
+        out.usage = Some(llm_agent::llm::Usage { input, output: 50, cached: None });
+        let offered = request["tools"].as_array().is_some_and(|t| t.iter().any(|d| d["function"]["name"] == "history"));
+        let cursors: Vec<Value> = results.iter().filter(|(_, _, r)| r["next_cursor"]["tool"] == "history").map(|(_, _, r)| r["next_cursor"].clone()).collect();
+        if request["tool_choice"] != "none" && offered && !cursors.is_empty() && self.next(3) > 0 && rounds <= 10 {
+            for cursor in cursors.iter().take(1 + self.next(3)) {
+                let id = self.id();
+                self.followed.lock().unwrap().push((id.clone(), cursor.clone()));
+                out.calls.push(support::call(&id, "history", json!({"action":"read","id":cursor["id"],"offset":cursor["offset"]})));
+            }
+            return Ok(out);
+        }
+        match if rounds > 10 { 99 } else { self.next(100) } {
+            0..=49 => {
+                for _ in 0..1 + self.next(8) {
+                    let id = self.id();
+                    let chars = [50, 3_000, 30_000, 90_000, 150_000, 260_000][self.next(6)];
+                    out.calls.push(match self.next(10) {
+                        0..=2 => support::call(&id, "fake__big", json!({"chars":chars})),
+                        // Now and then arguments as large as a document to file.
+                        3 => support::call(&id, "fake__echo", json!({"text":"말 \"따옴\" \\ 끝 ".repeat(1 + self.next(if self.next(8) == 0 { 400 } else { 40 }))})),
+                        4 => support::call(&id, "fake__fail", json!({})),
+                        5 => support::call(&id, "fake__mixed", json!({})),
+                        6 => support::call(&id, "fake__slow", json!({"ms":([20, 200])[self.next(2)]})),
+                        7 if offered => support::call(&id, "history", json!({"action":"search","query":(["0123456789", "echo", "따옴"])[self.next(3)]})),
+                        7 => support::call(&id, "big", json!({"chars":2_000})),
+                        8 => support::call(&id, "file_read", json!({"path":"big.txt","start_line":1 + self.next(5000)})),
+                        _ => support::call(&id, "fake__echo", json!({})),
+                    });
+                }
+            }
+            50..=62 => {
+                out.text = format!("조각{} {}", self.next(1000), "가나다 ".repeat(self.next(config.output_tokens.min(3000))));
+                out.length_limited = true;
+            }
+            63..=67 => {
+                out.length_limited = true;
+                out.discarded_tool_calls = true;
+            }
+            _ => {
+                out.text = format!("답{}", self.next(1000));
+                *self.rounds.lock().unwrap() = 0;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Mcp and context review, thirteenth pass: random conversations with MCP
+/// tools beside the agent's own keep every request in shape and within the
+/// context, keep what the results in the context go on in, read on from
+/// every continuation they give, and close every progress line; the user
+/// stops now and then. MCP_CTX_FUZZ sets the number of conversations (it
+/// found the calls run with no room for their results).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn random_conversations_with_mcp_tools_keep_their_context() {
+    if node_missing() {
+        return;
+    }
+    let runs: usize = std::env::var("MCP_CTX_FUZZ").ok().and_then(|n| n.parse().ok()).unwrap_or(8);
+    let mut seed: u64 = 0x3cc;
+    let mut next = |n: usize| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as usize) % n.max(1)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    let body: String = (1..=8000).map(|i| format!("line {i} {}\n", "word \"q\" ".repeat(8))).collect();
+    std::fs::write(root.join("big.txt"), &body).unwrap();
+    for run in 0..runs {
+        let mut config = config(vec![fake("fake", &["*"], &[])]);
+        config.llm.model = ["gpt-4o", "unknown-tokenizer"][next(2)].into();
+        let context = [24_000, 32_000, 64_000, 128_000][next(4)];
+        config.llm.context_tokens = context;
+        config.llm.output_tokens = [2_000, 4_000][next(2)];
+        if next(2) == 0 {
+            config.projects.push(llm_agent::config::Project { name: "app".into(), root: root.clone(), ..Default::default() });
+        }
+        if next(2) == 0 {
+            config.agent.history_bytes = 64 * 1024;
+        }
+        if next(3) == 0 {
+            config.agent.result_tokens = Some([1_200, 3_000, 8_000][next(3)]);
+        }
+        let real_limit = if next(4) == 0 { context * (70 + next(30)) / 100 } else { context * 2 };
+        let ratio = if config.llm.model == "gpt-4o" { 1.0 } else { 0.8 + next(40) as f64 / 100.0 };
+        let llm = std::sync::Arc::new(RandomMcpModel {
+            seed: std::sync::Mutex::new(next(1 << 30) as u64 + 1),
+            real_limit,
+            ratio,
+            rounds: Default::default(),
+            next_call: Default::default(),
+            requests: Default::default(),
+            followed: Default::default(),
+            problems: Default::default(),
+        });
+        let (app, _dir) = app(config.clone(), llm.clone());
+        app.mcp.apply(&config.mcp_servers);
+        ready(&app.mcp, "fake").await;
+        let conversation = format!("fuzz{run}");
+        for q in 0..4 {
+            let before = llm.requests.lock().unwrap().len();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let stop = CancellationToken::new();
+            let stopping = (next(4) == 0).then(|| {
+                let (stop, after) = (stop.clone(), next(300) as u64);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(after)).await;
+                    stop.cancel();
+                })
+            });
+            let question = Question { conversation_id: conversation.clone(), message: format!("질문 {q} {}", "자료 ".repeat(next(600))), history: vec![] };
+            let result = agent::answer(&app, question, Events::new(Some(tx)), stop).await;
+            if let Some(stopping) = stopping {
+                stopping.abort();
+            }
+            let mut events = vec![];
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+            let requests = llm.requests.lock().unwrap().clone();
+            for (i, (request, accepted)) in requests.iter().enumerate().skip(before) {
+                if let Err(broken) = request_shape(request) {
+                    panic!("run {run} question {q} request {i}: {broken}");
+                }
+                let input = (llm_agent::context::count(request, &config.llm.model) as f64 * ratio) as usize;
+                assert!(!accepted || i == before || input + config.llm.output_tokens <= context, "run {run} request {i}: {input} tokens past the context {context}");
+            }
+            for started in events.iter().filter(|e| e["type"] == "tool") {
+                assert!(events.iter().any(|e| e["type"] == "tool_done" && e["id"] == started["id"]), "run {run} question {q}: {started} never closed");
+            }
+            if let Err(error) = result {
+                // A question ends answered, stopped, or with what the user may see.
+                assert!(error.to_string() == "cancelled" || error.downcast_ref::<agent::UserFacing>().is_some(), "run {run} question {q}: {error:#}");
+                // With the context served as configured, what the question
+                // gathered always fits: its calls are not run otherwise.
+                let shown = error.to_string();
+                assert!(real_limit < context || !shown.contains("한 번에 담기지 않아"), "run {run} question {q}: {shown}");
+            }
+            let claim = app.sessions.open(&conversation, Duration::from_secs(60), 10, CancellationToken::new());
+            let kept = continuations_kept(&claim.conversation.lock().await.history);
+            app.sessions.finish(&conversation, claim.run);
+            if let Err(lost) = kept {
+                panic!("run {run} question {q}: {lost}");
+            }
+            let problems = std::mem::take(&mut *llm.problems.lock().unwrap());
+            assert!(problems.is_empty(), "run {run} question {q}: {problems:#?}");
+        }
+        app.mcp.shutdown().await;
     }
 }

@@ -255,3 +255,74 @@ pub fn ev(events: &[Value], kind: &str) -> Vec<Value> {
 pub fn json_line(value: &Value) -> String {
     json!(value).to_string()
 }
+
+/// The shape every request must keep: the context opens with a user
+/// message, no reply follows a reply, every tool call has its result right
+/// after it, one answer per question, no internal flags.
+pub fn request_shape(request: &Value) -> Result<(), String> {
+    let messages = request["messages"].as_array().unwrap();
+    if messages[0]["role"] != "system" || messages[1]["role"] != "user" || messages.last().unwrap()["role"] != "user" {
+        return Err("not system, user …, state".into());
+    }
+    let mut pending: Vec<&str> = vec![];
+    let mut answers = 0;
+    let mut previous = "";
+    for message in &messages[1..] {
+        let role = message["role"].as_str().unwrap();
+        if role == "assistant" && previous == "assistant" {
+            return Err("a reply after a reply".into());
+        }
+        if role != "tool" && !pending.is_empty() {
+            return Err(format!("no result for {pending:?}"));
+        }
+        if message.get("partial").is_some() || message.get("restored").is_some() {
+            return Err("internal flag".into());
+        }
+        match role {
+            "assistant" => match message["tool_calls"].as_array() {
+                Some(calls) if !calls.is_empty() => pending = calls.iter().map(|c| c["id"].as_str().unwrap()).collect(),
+                _ => answers += 1,
+            },
+            "tool" => {
+                let id = message["tool_call_id"].as_str().unwrap();
+                let at = pending.iter().position(|p| *p == id).ok_or(format!("result without its call {id}"))?;
+                pending.remove(at);
+            }
+            _ => answers = 0,
+        }
+        if answers > 1 {
+            return Err("two answers to one question".into());
+        }
+        previous = role;
+    }
+    Ok(())
+}
+
+/// What a result in the context goes on in is still held: the archive of a
+/// cut result, the bundle a cut history read reads.
+pub fn continuations_kept(history: &llm_agent::session::SessionHistory) -> Result<(), String> {
+    for bundle in history.bundles.iter().filter(|b| b.active) {
+        for message in bundle.messages.iter().filter(|m| m["role"] == "tool") {
+            let Ok(result) = serde_json::from_str::<Value>(message["content"].as_str().unwrap_or("")) else {
+                continue;
+            };
+            let mut ids: Vec<u64> = result["archive_id"].as_u64().into_iter().collect();
+            if result["next_cursor"]["tool"] == "history" {
+                ids.extend(result["next_cursor"]["id"].as_u64());
+            }
+            if result["data"]["truncated"] == true && result["next_cursor"]["tool"] != "history" && message["tool_call_id"].as_str().is_some() {
+                // A cut history read without a continuation the prune can see.
+                let call = bundle.messages[0]["tool_calls"].as_array().and_then(|calls| calls.iter().find(|c| c["id"] == message["tool_call_id"]));
+                if call.is_some_and(|c| c["function"]["name"] == "history") {
+                    return Err(format!("bundle {}: a cut history read names no next_cursor", bundle.id));
+                }
+            }
+            for id in ids {
+                if history.read(id).is_err() {
+                    return Err(format!("bundle {}: {id}, which a result in the context goes on in, was dropped", bundle.id));
+                }
+            }
+        }
+    }
+    Ok(())
+}
