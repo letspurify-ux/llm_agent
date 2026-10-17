@@ -2530,3 +2530,72 @@ async fn a_counted_refusal_evicts_only_what_the_count_requires() {
     let kept: Vec<String> = answered["messages"].as_array().unwrap().iter().filter_map(|m| m["content"].as_str()).filter_map(|t| t.strip_prefix("턴").map(|t| t[..1].to_owned())).collect();
     assert!(kept.ends_with(&["4".to_owned(), "5".to_owned()]), "the latest exchange stays: {kept:?}");
 }
+
+// Context management review, fifteenth pass (2026-10-17): failed before its
+// fix. Needs no MariaDB.
+
+/// A server serving less context than configured that cuts what does not fit
+/// instead of refusing it (Ollama truncates to its loaded context and says
+/// nothing): it answers every request and counts at most `cap` tokens.
+/// `ratio` is its count per estimated token (a tokenizer more frugal than
+/// the estimate's); every other request hits its prompt cache, whose tokens
+/// the count includes as OpenAI's usage does.
+struct Cutting {
+    cap: usize,
+    ratio: f64,
+    replies: std::sync::Mutex<std::collections::VecDeque<llm_agent::llm::Completion>>,
+    seen: std::sync::Mutex<Vec<(usize, usize)>>,
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for Cutting {
+    async fn complete(&self, request: Value, config: &llm_agent::config::LlmConfig, _c: CancellationToken, _d: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        let estimate = llm_agent::context::count(&request, &config.model);
+        let counted = ((estimate as f64 * self.ratio) as usize).min(self.cap);
+        let mut seen = self.seen.lock().unwrap();
+        let cached = (seen.len() % 2 == 0).then_some(counted * 9 / 10);
+        seen.push((estimate, counted));
+        let mut reply = self.replies.lock().unwrap().pop_front().unwrap_or_else(|| text("끝"));
+        reply.usage = Some(llm_agent::llm::Usage { input: counted, output: 10, cached });
+        Ok(reply)
+    }
+}
+
+/// AE: a server that cuts requests to a smaller context than configured
+/// answered from what was left — the question and the system prompt gone —
+/// and the user got that answer with no sign of the cut (a real Ollama with
+/// its default 4,096 tokens answered with fragments of the runtime state).
+/// A request that grew while the count did not is told to the settings.
+#[tokio::test]
+async fn a_server_that_cuts_requests_is_told_to_the_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    let body: String = (1..=4000).map(|i| format!("line {i} {}\n", "word ".repeat(10))).collect();
+    std::fs::write(root.join("big.txt"), &body).unwrap();
+    let mut config = no_db("gpt-4o");
+    config.llm.context_tokens = 32_000;
+    config.llm.output_tokens = 2_000;
+    config.projects.push(llm_agent::config::Project { name: "app".into(), root, ..Default::default() });
+    let script = || {
+        vec![
+            calls(vec![call("r1", "file_read", json!({"path":"big.txt","start_line":1,"max_lines":400}))]),
+            calls(vec![call("r2", "file_read", json!({"path":"big.txt","start_line":1000,"max_lines":400}))]),
+            text("끝"),
+        ]
+    };
+    // Uncut, a frugal count with a cache hit before a miss is no cut: the
+    // count includes the cached tokens.
+    for (cap, ratio, cut) in [(usize::MAX, 1.0, false), (usize::MAX, 0.45, false), (4_096, 1.0, true)] {
+        let llm = std::sync::Arc::new(Cutting { cap, ratio, replies: std::sync::Mutex::new(script().into()), seen: Default::default() });
+        let (app, _d) = app(config.clone(), llm.clone());
+        let (r, _) = ask(&app, "ae", "big.txt 두 곳을 읽고 비교해줘", vec![]).await;
+        let seen = llm.seen.lock().unwrap().clone();
+        if cut {
+            let error = r.err().expect("told, not answered").to_string();
+            assert!(error.contains("일부를 버린") && error.contains("컨텍스트"), "{error}");
+            assert_eq!(seen.len(), 2, "told at the first request that grew uncounted: {seen:?}");
+        } else {
+            assert_eq!(r.map(|a| a.answer).map_err(|e| e.to_string()), Ok("끝".to_owned()), "{seen:?}");
+        }
+    }
+}

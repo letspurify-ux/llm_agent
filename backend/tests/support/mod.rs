@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use llm_agent::{
     app::App,
     config::{Config, LlmConfig, Secret},
-    llm::{Completion, LlmClient, ToolCall, Usage},
+    llm::{Completion, LlmClient, ToolCall},
 };
 use serde_json::{Value, json};
 use std::{
@@ -147,19 +147,21 @@ pub fn call(id: &str, name: &str, arguments: Value) -> ToolCall {
     }
 }
 
+/// A response that calls tools. It reports no usage, as a server without
+/// usage reporting does: a fixed count would be a server that counts every
+/// request alike however long, which is a server cutting requests.
 pub fn calls(calls: Vec<ToolCall>) -> Completion {
     Completion {
         calls,
-        usage: Some(Usage { input: 1000, output: 50, cached: None }),
         attempts: 1,
         ..Default::default()
     }
 }
 
+/// An answer (no usage, as `calls`).
 pub fn text(text: &str) -> Completion {
     Completion {
         text: text.into(),
-        usage: Some(Usage { input: 1000, output: 50, cached: None }),
         attempts: 1,
         ..Default::default()
     }

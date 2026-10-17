@@ -479,6 +479,29 @@ static RESPONSE_FORMAT_REJECTED: std::sync::Mutex<SchemaCache> =
 static TOOL_CHOICE_NONE_UNSUPPORTED: std::sync::Mutex<SchemaCache> =
     std::sync::Mutex::new(SchemaCache(VecDeque::new()));
 
+/// Endpoints that do not apply an output limit sent as
+/// `max_completion_tokens` (Ollama reads only `max_tokens`): a reply's answer
+/// went past it. Their later requests send the limit as `max_tokens`.
+static COMPLETION_LIMIT_IGNORED: std::sync::Mutex<SchemaCache> =
+    std::sync::Mutex::new(SchemaCache(VecDeque::new()));
+
+/// Tokens an answer may run past the limit without showing it was ignored
+/// (a server that counts the end token, rounding).
+const OUTPUT_LIMIT_SLACK: usize = 16;
+
+/// The name the output limit is sent under: `max_tokens` when the settings
+/// ask for it or the endpoint showed it ignores `max_completion_tokens`.
+fn output_limit_field(c: &Config) -> &'static str {
+    let ignored = COMPLETION_LIMIT_IGNORED
+        .lock()
+        .is_ok_and(|mut ignored| ignored.contains(&schema_endpoint(c)));
+    if c.legacy_max_tokens || ignored {
+        "max_tokens"
+    } else {
+        "max_completion_tokens"
+    }
+}
+
 /// A request that withholds its tools with tool_choice "none".
 fn withholds_tools(request: &Value) -> bool {
     request["tool_choice"] == "none"
@@ -672,11 +695,7 @@ impl OpenAiClient {
         stream_deltas: bool,
     ) -> Result<Completion> {
         request["stream"] = json!(true);
-        request[if c.legacy_max_tokens {
-            "max_tokens"
-        } else {
-            "max_completion_tokens"
-        }] = json!(c.output_tokens);
+        request[output_limit_field(c)] = json!(c.output_tokens);
         let mut req = Self::client(c)?.post(c.completion_url()?).json(&request);
         if let Some(key) = Self::key(c) {
             req = req.bearer_auth(key)
@@ -943,11 +962,7 @@ impl OpenAiClient {
     }
     async fn probe_roundtrip(&self, c: &Config) -> Result<String> {
         let mut body = json!({"model":c.model,"messages":[{"role":"user","content":"Reply OK"}],"stream":false});
-        body[if c.legacy_max_tokens {
-            "max_tokens"
-        } else {
-            "max_completion_tokens"
-        }] = json!(c.output_tokens);
+        body[output_limit_field(c)] = json!(c.output_tokens);
         apply_optional_parameters(&mut body, c, false);
         let mut left_out: Vec<&str> = vec![];
         let plain = loop {
@@ -1139,6 +1154,20 @@ impl LlmClient for OpenAiClient {
                         unsupported.insert(schema_endpoint(c));
                     }
                     remember_rejected_parameters(c, &parameters_left_out);
+                    // An answer past the limit sent as max_completion_tokens
+                    // shows the server never applied it (reasoning a
+                    // provider reports apart may run past an answer's limit).
+                    if let Some(usage) = &r.usage
+                        && output_limit_field(c) == "max_completion_tokens"
+                        && usage.output.saturating_sub(r.reasoning_tokens.unwrap_or(0)) > c.output_tokens.saturating_add(OUTPUT_LIMIT_SLACK)
+                        && let Ok(mut ignored) = COMPLETION_LIMIT_IGNORED.lock()
+                    {
+                        eprintln!(
+                            "[llm] {} wrote {} tokens, past max_completion_tokens {}: the limit goes as max_tokens from now on",
+                            c.model, usage.output, c.output_tokens
+                        );
+                        ignored.insert(schema_endpoint(c));
+                    }
                     r.tools_dropped = withheld && request.get("tools").is_none();
                     r.attempts = attempt.saturating_add(1);
                     r.attempt_diagnostics = attempt_diagnostics;
@@ -1422,6 +1451,12 @@ mod tool_choice_tests {
         /// Refuses tool_choice "none", then the request without its tools
         /// as too long, saying what it counted.
         RefusesThenTooLong,
+        /// Reads the output limit only as max_tokens, as Ollama does: under
+        /// max_completion_tokens alone it writes 500 tokens.
+        IgnoresCompletionLimit,
+        /// Writes 500 tokens of which 450 are reasoning, as a provider whose
+        /// limit bounds only the answer does.
+        ReasonsPastTheLimit,
     }
 
     /// An OpenAI-compatible server on a fresh port (so the endpoint caches
@@ -1456,6 +1491,7 @@ mod tool_choice_tests {
                     };
                     let withheld = body["tool_choice"] == "none";
                     let effort = body.get("reasoning_effort").is_some();
+                    let body_limit = body["max_tokens"].as_u64();
                     record.lock().unwrap().push(body);
                     let event = |v: Value| format!("data: {v}\n\n");
                     let reply = match provider {
@@ -1474,6 +1510,19 @@ mod tool_choice_tests {
                         Provider::RefusesEffort if effort => {
                             let error = r#"{"error":{"message":"Unrecognized request argument supplied: reasoning_effort","type":"invalid_request_error"}}"#;
                             format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}", error.len())
+                        }
+                        Provider::IgnoresCompletionLimit | Provider::ReasonsPastTheLimit => {
+                            let written = match provider {
+                                Provider::IgnoresCompletionLimit => body_limit.unwrap_or(500),
+                                _ => 500,
+                            };
+                            let reasoning = matches!(provider, Provider::ReasonsPastTheLimit).then_some(450);
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}{}{}data: [DONE]\n\n",
+                                event(json!({"choices":[{"delta":{"content":"답"},"finish_reason":null}]})),
+                                event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
+                                event(json!({"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":written,"completion_tokens_details":{"reasoning_tokens":reasoning}}}))
+                            )
                         }
                         Provider::Drops => format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}",
@@ -1589,6 +1638,35 @@ mod tool_choice_tests {
         let failure = error.downcast_ref::<CompletionError>().expect("a completion error");
         assert!(failure.transient(), "{error}");
         assert_eq!(seen.lock().unwrap().len(), 1, "not retried by the client");
+    }
+
+    /// Context management review, sixteenth pass: Ollama reads the output
+    /// limit only as max_tokens. Sent as max_completion_tokens it was never
+    /// applied — an answer ran past the output the context budget keeps for
+    /// it (Ollama then shifts out the start of the prompt), a cut answer was
+    /// never continued and a thinking model thought until the question's
+    /// time ran out. A reply past the limit shows it was ignored.
+    #[tokio::test]
+    async fn an_output_limit_the_server_ignores_is_sent_as_max_tokens() {
+        let (config, seen) = serve(Provider::IgnoresCompletionLimit).await;
+        let config = Config { output_tokens: 100, ..config };
+        for _ in 0..2 {
+            assert_eq!(complete(&config, withheld()).await.unwrap().text, "답");
+        }
+        let limits: Vec<(Option<u64>, Option<u64>)> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| (r["max_completion_tokens"].as_u64(), r["max_tokens"].as_u64()))
+            .collect();
+        assert_eq!(limits, [(Some(100), None), (None, Some(100))], "learned from the first reply");
+        // Reasoning past the limit, with the answer within it, is no sign.
+        let (config, seen) = serve(Provider::ReasonsPastTheLimit).await;
+        let config = Config { output_tokens: 100, ..config };
+        for _ in 0..2 {
+            complete(&config, withheld()).await.unwrap();
+        }
+        assert!(seen.lock().unwrap().iter().all(|r| r["max_completion_tokens"] == 100 && r.get("max_tokens").is_none()));
     }
 
     #[tokio::test]

@@ -661,6 +661,10 @@ Claude Code·opencode처럼 결과마다 따로 받고 호출 수로 나누지 �
 curl -s http://localhost:8000/v1/models | python3 -c 'import json,sys; print([m.get("max_model_len") for m in json.load(sys.stdin)["data"]])'   # vLLM: 131072 이어야 한다
 ```
 
+- Ollama는 모델을 작은 컨텍스트(기본 4,096)로 올리고, 넘치는 요청을 거절하지 않고 잘라 받는다(서버 로그의 `truncating input prompt`).
+  시스템 프롬프트와 도구 정의만으로 그만큼을 거의 다 쓰므로(프로젝트가 있으면 넘는다) `OLLAMA_CONTEXT_LENGTH`(예: `launchctl setenv OLLAMA_CONTEXT_LENGTH 32768` 뒤 Ollama 재기동,
+  Windows는 `setx`)로 늘리고 설정의 컨텍스트 토큰을 그 값에 맞춘다. 잘린 요청은 서버가 센 토큰 수로 알아보고, 남은 것만 보고 답하는 대신
+  그렇게 안내하며 질문을 끝낸다.
 - vLLM은 모델 config의 `max_position_embeddings`를 기본값으로 쓴다. `Qwen/Qwen2.5-32B-Instruct`는 그 값이 32,768이라 그대로 띄우면 **32k**다 — 128k는 YaRN을 켜야 나온다: `--max-model-len 131072 --hf-overrides '{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}}'` (정적 YaRN이라 짧은 입력의 품질이 조금 떨어진다는 것이 Qwen 쪽 안내다).
 - 컨텍스트가 더 작은 모델이면 설정의 컨텍스트 토큰을 그 값으로 줄인다 — 도구 결과 한도와 맥락 비우기 기준이 함께 줄어든다.
   설정이 실제보다 커서 서버가 요청을 길다고 거절하면 오래된 묶음을 모두 빼고 다시 보내 대화는 이어지지만, 거절마다 요청이 한 번 더 든다.
@@ -671,7 +675,7 @@ curl -s http://localhost:8000/v1/models | python3 -c 'import json,sys; print([m.
 호출은 스트림이다. 응답이 시작되기 전과 스트림 도중에 **무응답 한도**(기본 120초) 동안 조각이 오지 않으면 끊고 재시도하므로
 죽은 엔드포인트를 일찍 알아채고, 답변이 흘러오는 동안 화면에 미리보기를 낸다(위 '진행 상황 스트림'의 `answer_delta`).
 서버가 일시적으로 없으면(5xx·연결 실패, 답을 쓰던 스트림이 끊겼을 때도 — 그때는 보인 글을 미리보기에서 거둔다) 5초·15초 쉬었다 다시 부른다. 모델이 출력 한도에 닿아 끊기면 이어 쓰게 하고(2회, 이어 쓸 자리가 없으면 쓴 데까지가 답),
-빈 응답이면 다시 요청한다(2회 — 출력 한도에 닿을 때까지 글이 없던 응답도 같고, 끝내 그러면 출력 한도를 늘리거나 추론 강도를 낮추라고 안내한다). `reasoning_effort`·`stream_options`를 이름을 대며 거절하는 서버(400·422 — "Unrecognized request argument supplied: reasoning_effort" 같은)에는 그 값을 빼고 다시 보내고, 그 서버·모델에는 그 뒤로 보내지 않는다(연결 확인도 같다). 도구 호출 앞에 글을 쓴 응답의 호출이 깨졌으면(인수가 JSON이 아니다 등) 미리보기를 거두고 다시 청한다(연속 2회).
+빈 응답이면 다시 요청한다(2회 — 출력 한도에 닿을 때까지 글이 없던 응답도 같고, 끝내 그러면 출력 한도를 늘리거나 추론 강도를 낮추라고 안내한다). `reasoning_effort`·`stream_options`를 이름을 대며 거절하는 서버(400·422 — "Unrecognized request argument supplied: reasoning_effort" 같은)에는 그 값을 빼고 다시 보내고, 그 서버·모델에는 그 뒤로 보내지 않는다(연결 확인도 같다). 출력 한도는 `max_completion_tokens`로 보내는데, 답이 그보다 길게 오면(Ollama는 `max_tokens`만 읽는다 — 한도 30에 285토큰을 썼다) 한도가 걸리지 않는 서버이므로 그 서버·모델에는 그 뒤로 `max_tokens`로 보낸다(서버가 따로 알려 준 추론 토큰은 빼고 잰다). 설정의 'max_tokens 이름으로 보내기'를 켜 두면 처음부터 그렇게 보낸다. 도구 호출 앞에 글을 쓴 응답의 호출이 깨졌으면(인수가 JSON이 아니다 등) 미리보기를 거두고 다시 청한다(연속 2회).
 
 ## 실제 Oracle 연결
 

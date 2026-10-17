@@ -49,6 +49,12 @@ const FINAL_RESERVE_SECS: u64 = 45;
 const TIME_OVER: &str = "답변 시간이 다 되어 마무리하지 못했습니다. 질문을 좁혀 다시 시도해주세요.";
 /// A short question the model server refused as longer than its context.
 const SERVED_SMALLER: &str = "모델 서버가 받을 수 있는 컨텍스트가 설정보다 작아 답할 수 없습니다. 설정의 컨텍스트와 출력 한도를 모델 서버에 맞춰주세요.";
+/// A model server that cuts what does not fit its context instead of
+/// refusing it (Ollama truncates to the context it loaded).
+const SERVED_CUT: &str = "모델 서버가 요청을 다 받지 못하고 일부를 버린 채 답하고 있어 답할 수 없습니다(서버가 받는 컨텍스트가 설정보다 작습니다). 서버의 컨텍스트를 늘리거나(Ollama는 OLLAMA_CONTEXT_LENGTH) 설정의 컨텍스트를 서버에 맞춰주세요.";
+/// Estimated tokens a request grows by, nothing evicted, past which a
+/// provider count that did not grow means the provider cut the request.
+const CUT_GROWTH: usize = 1_000;
 /// What the model is told when the work before the final reserve stopped.
 const RESERVE_REACHED: &str = "남은 시간이 모자라 이전 요청을 멈췄다.";
 const TOOLS_STOPPED: &str = "남은 시간이 모자라 이전 응답의 도구 실행 일부를 멈췄다(status cancelled).";
@@ -202,6 +208,9 @@ async fn run(
     let mut partial: Vec<String> = vec![];
     let mut notice: Option<String> = None;
     let mut event_id = 0u64;
+    // The last request the provider counted since anything left the context:
+    // its estimate as sent and the tokens the provider saw.
+    let mut counted_before: Option<(usize, usize)> = None;
     // The general-knowledge line says the registered material was searched
     // and lacks the subject. Said before any search in this question, it is
     // refused once and the model asked to search, unless the previous answer
@@ -263,6 +272,7 @@ async fn run(
         // it keeps what fits (the results its answer is written from).
         let evicted = context::evict(c, config, estimate, &[question_bundle], !withheld_tools);
         if !evicted.is_empty() {
+            counted_before = None;
             // What left is readable through the history tool from this
             // request on.
             (offered, state, definitions) = frame(c);
@@ -464,6 +474,7 @@ async fn run(
                     }
                     let evicted = context::evict_all(c, config, &[question_bundle]);
                     if !evicted.is_empty() {
+                        counted_before = None;
                         eprintln!("[context] the provider refused ~{estimate} tokens as too long; evicted {} old bundles", evicted.len());
                         discard();
                         rounds -= 1;
@@ -565,6 +576,36 @@ async fn run(
                 usage.output,
                 usage.cached.unwrap_or(0)
             );
+            // A request that only grew since the last one counted (nothing
+            // left the context) counts more tokens, whatever the tokenizer.
+            // One counted no more, and under half its estimate (below what
+            // calibration takes), was cut to a context smaller than
+            // configured: the answer would be written from what was left —
+            // the question gone, as a real Ollama at its default 4,096 tokens
+            // answered with pieces of the runtime state. The prompt count
+            // includes its cached tokens (OpenAI's usage, which compatible
+            // providers follow — added in, a cache hit before a miss would
+            // look like a shrinking count); more cached than prompt tokens
+            // is a provider counting them apart.
+            let cached = usage.cached.unwrap_or(0);
+            let seen = if cached > usage.input { usage.input.saturating_add(cached) } else { usage.input };
+            if let Some((before, counted)) = counted_before
+                && sent >= before + CUT_GROWTH
+                && seen <= counted
+                && seen.saturating_mul(2) < sent
+            {
+                eprintln!("[context] the provider counted {seen} tokens for ~{sent} after {counted} for ~{before}: it cuts requests to less context than configured");
+                if emitted || !partial.is_empty() {
+                    events.send(json!({"type":"answer_reset"}));
+                }
+                if last_is_partial(c) {
+                    c.history.bundles.pop_back();
+                }
+                bail!(UserFacing(SERVED_CUT.into()));
+            }
+            if seen > 0 {
+                counted_before = Some((sent, seen));
+            }
         }
         timing.llm.push(json!({"ms":ms,"prompt":usage.as_ref().map(|u| u.input),"completion":usage.as_ref().map(|u| u.output),"cached":usage.as_ref().and_then(|u| u.cached),"estimate":estimate}));
         // The general-knowledge line before any search, found in the whole
