@@ -141,6 +141,7 @@ pub fn parameters(schema: &Value) -> Value {
     if !out.get("properties").is_some_and(Value::is_object) {
         out.insert("properties".into(), json!({}));
     }
+    combined_fields(&mut out, object, &definitions);
     let required_ok = out
         .get("required")
         .and_then(Value::as_array)
@@ -153,6 +154,39 @@ pub fn parameters(schema: &Value) -> Value {
     expand(&mut value, &definitions, 0, &mut budget);
     tidy(&mut value, 0);
     value
+}
+
+/// The fields of the schemas a top-level `allOf`, `anyOf` or `oneOf`
+/// combines, which go with it: kept as properties of the object (a schema
+/// generated from types — an OpenAPI composition, an intersection — puts
+/// every field there, and a tool without them cannot be called). An
+/// `allOf` member's required fields stay required (all of them apply); an
+/// alternative's are not (another may be chosen). A property the object
+/// itself defines wins.
+fn combined_fields(out: &mut Map<String, Value>, object: &Map<String, Value>, definitions: &Map<String, Value>) {
+    let mut required: Vec<Value> = out.get("required").and_then(Value::as_array).cloned().unwrap_or_default();
+    let Some(properties) = out.get_mut("properties").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for key in ["allOf", "anyOf", "oneOf"] {
+        for member in object.get(key).and_then(Value::as_array).into_iter().flatten() {
+            // A member is often a reference to a definition.
+            let member = member["$ref"].as_str().and_then(|target| definitions.get(target)).unwrap_or(member);
+            for (name, schema) in member["properties"].as_object().into_iter().flatten().filter(|(_, s)| s.is_object() || **s == true) {
+                properties.entry(name.clone()).or_insert_with(|| schema.clone());
+            }
+            if key == "allOf" {
+                for name in member["required"].as_array().into_iter().flatten().filter(|n| n.is_string()) {
+                    if !required.contains(name) {
+                        required.push(name.clone());
+                    }
+                }
+            }
+        }
+    }
+    if !required.is_empty() {
+        out.insert("required".into(), Value::Array(required));
+    }
 }
 
 /// Nested subschemas are tidied this deep at most (a deeper one a provider
@@ -376,6 +410,33 @@ mod tests {
         // An inlined definition is tidied too.
         let referenced = json!({"type":"object","properties":{"f":{"$ref":"#/$defs/F"}},"$defs":{"F":{"type":"array"}}});
         assert_eq!(parameters(&referenced)["properties"]["f"], json!({"type":"array","items":{}}));
+    }
+
+    #[test]
+    fn fields_combined_at_the_top_stay() {
+        // An intersection (allOf, one part a definition): every field, every
+        // required one.
+        let all = json!({"type":"object","allOf":[
+            {"$ref":"#/$defs/Paging"},
+            {"type":"object","properties":{"query":{"type":"string"},"tags":{"type":"array"}},"required":["query"]}
+        ],"$defs":{"Paging":{"type":"object","properties":{"limit":{"type":"integer"},"cursor":{"$ref":"#/$defs/Cursor"}},"required":["limit"]},"Cursor":{"type":"string"}}});
+        let p = parameters(&all);
+        assert_eq!(p["properties"]["query"], json!({"type":"string"}));
+        assert_eq!(p["properties"]["limit"], json!({"type":"integer"}));
+        assert_eq!(p["properties"]["cursor"], json!({"type":"string"}), "a reference in a combined field is expanded");
+        assert_eq!(p["properties"]["tags"], json!({"type":"array","items":{}}), "and tidied");
+        assert_eq!(p["required"], json!(["limit", "query"]));
+        assert!(p.get("allOf").is_none() && p.get("$defs").is_none());
+        // Alternatives (anyOf, oneOf): their fields, none required; the
+        // object's own field wins over an alternative's.
+        let any = json!({"type":"object","properties":{"id":{"type":"integer","description":"own"}},"required":["id"],"anyOf":[
+            {"properties":{"name":{"type":"string"}},"required":["name"]},
+            {"properties":{"id":{"type":"string"},"email":{"type":"string"},"bad":5}}
+        ],"oneOf":"not a list"});
+        let p = parameters(&any);
+        assert_eq!(p["properties"], json!({"id":{"type":"integer","description":"own"},"name":{"type":"string"},"email":{"type":"string"}}));
+        assert_eq!(p["required"], json!(["id"]));
+        assert_eq!(missing_required(&p, json!({"id":1}).as_object().unwrap()), Vec::<String>::new());
     }
 
     #[test]

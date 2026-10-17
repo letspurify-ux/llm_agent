@@ -732,6 +732,27 @@ async fn a_changed_tool_list_is_read_again() {
 }
 
 #[tokio::test]
+async fn a_reconnect_is_not_held_up_by_a_changed_list_never_answered() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("relist", &["*"], &[("FAKE_MCP_HANG_RELIST", "1"), ("FAKE_MCP_PAGE", "100")])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "relist").await;
+    call(&hub, &config, "relist__add_tool", json!({})).await.unwrap();
+    // The changed list is asked for after a second, and never answered.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let asked = Instant::now();
+    assert!(hub.restart("relist"));
+    // Reconnected now, not once the listing gives up (30 seconds).
+    let back = wait_for(&hub, "relist", |s| s["state"] == "ready" && s["restarts"] == 1).await;
+    assert!(asked.elapsed() < Duration::from_secs(8), "took {:?}", asked.elapsed());
+    assert!(!back["tools"].as_array().unwrap().iter().any(|t| t["name"] == "extra"), "a new process, its own list");
+    hub.shutdown().await;
+}
+
+#[tokio::test]
 async fn commands_get_their_environment_but_not_the_backends_secrets() {
     if node_missing() {
         return;
@@ -999,16 +1020,28 @@ async fn a_rate_limit_or_a_proxy_error_is_not_a_lost_connection() {
     if node_missing() {
         return;
     }
-    for (status, code) in [("429", "mcp_rate_limited:"), ("502", "mcp_request_failed:")] {
-        let remote = HttpServer::start(&[("FAKE_MCP_CALL_STATUS", status)]);
-        let server = McpServer { name: "limited".into(), url: remote.url.clone(), tools: vec!["echo".into()], ..Default::default() };
+    // A rate limit, a proxy error, a body or content the server refuses:
+    // about that one request.
+    for (status, code, said) in [
+        ("429", "mcp_rate_limited:", "요청 수를 제한"),
+        ("502", "mcp_request_failed:", "서버 쪽 오류"),
+        ("413", "mcp_request_failed:", "HTTP 413 Payload Too Large"),
+        ("422", "mcp_request_failed:", "HTTP 422"),
+    ] {
+        let remote = HttpServer::start(&[("FAKE_MCP_CALL_STATUS", status), ("FAKE_MCP_CALL_STATUS_TOOL", "echo")]);
+        let server = McpServer { name: "limited".into(), url: remote.url.clone(), tools: vec!["echo".into(), "slow".into()], ..Default::default() };
         let config = config(vec![server]);
         let hub = McpHub::default();
         hub.apply(&config.mcp_servers);
         ready(&hub, "limited").await;
+        // Another call on the session, under way meanwhile, is not ended.
+        let slow = hub.snapshot(&config).find("limited__slow").unwrap();
+        let under_way = tokio::spawn(async move { slow.call(json!({"ms":1_000}), &CancellationToken::new()).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
         let error = call(&hub, &config, "limited__echo", json!({"text":"x"})).await.unwrap_err().to_string();
         assert!(error.starts_with(code), "{status}: {error}");
-        assert!(error.contains(if status == "429" { "요청 수를 제한" } else { "서버 쪽 오류" }), "{error}");
+        assert!(error.contains(said), "{error}");
+        assert_eq!(under_way.await.unwrap().unwrap()["text"], "slept", "{status}");
         if status == "429" {
             assert_eq!(llm_agent::tools::recovery::describe(&error)["class"], "transient");
         }
@@ -1023,6 +1056,79 @@ async fn a_rate_limit_or_a_proxy_error_is_not_a_lost_connection() {
         assert_eq!(hub.server_status("limited", MODEL).unwrap()["restarts"], 0);
         hub.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn a_server_that_forgot_the_session_is_reconnected_at_once() {
+    if node_missing() {
+        return;
+    }
+    // A restarted server built on the TypeScript SDK's example answers a
+    // session it no longer knows with HTTP 400 and an error for no request
+    // (id null): the call waited out its timeout, and every one after it.
+    for sse in [false, true] {
+        let mut env = vec![("FAKE_MCP_FORGET", "1")];
+        if sse {
+            env.push(("FAKE_MCP_SSE", "1"));
+        }
+        let remote = HttpServer::start(&env);
+        let server = McpServer { name: "ts".into(), url: remote.url.clone(), tools: vec!["echo".into(), "forget".into()], timeout_secs: Some(30), ..Default::default() };
+        let config = config(vec![server]);
+        let hub = McpHub::default();
+        hub.apply(&config.mcp_servers);
+        ready(&hub, "ts").await;
+        call(&hub, &config, "ts__forget", json!({})).await.unwrap();
+        let started = Instant::now();
+        let error = call(&hub, &config, "ts__echo", json!({"text":"x"})).await.unwrap_err().to_string();
+        assert!(started.elapsed() < Duration::from_secs(3), "sse {sse}: took {:?}", started.elapsed());
+        assert!(error.starts_with("mcp_server_unavailable:") && error.contains("세션을 더는 모릅니다"), "{error}");
+        wait_for(&hub, "ts", |s| s["state"] == "ready" && s["restarts"] == 1).await;
+        assert_eq!(call(&hub, &config, "ts__echo", json!({"text":"새 세션"})).await.unwrap()["text"], "echo: 새 세션");
+        hub.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn a_server_that_stops_answering_is_reconnected() {
+    if node_missing() {
+        return;
+    }
+    // One server only slow, one that stops answering anything (a handler
+    // deadlocked) while it still reads its input: each call times out.
+    let mut slow = fake("slow", &["slow"], &[]);
+    slow.timeout_secs = Some(1);
+    let mut wedged = fake("wedged", &["wedge", "echo"], &[("FAKE_MCP_WEDGE", "1")]);
+    wedged.timeout_secs = Some(1);
+    let config = config(vec![slow, wedged]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "slow").await;
+    ready(&hub, "wedged").await;
+    let (slowed, stopped) = tokio::join!(
+        call(&hub, &config, "slow__slow", json!({"ms":3_000})),
+        call(&hub, &config, "wedged__wedge", json!({}))
+    );
+    for outcome in [slowed, stopped] {
+        assert!(outcome.unwrap_err().to_string().starts_with("mcp_timeout:"));
+    }
+    // The stopped one does not answer a ping either: it is taken for
+    // stopped and started again, rather than left ready with every call
+    // waiting out its timeout.
+    let started = Instant::now();
+    let back = loop {
+        let status = hub.server_status("wedged", MODEL).unwrap();
+        if status["state"] == "ready" && status["restarts"] == 1 {
+            break status;
+        }
+        assert!(started.elapsed() < Duration::from_secs(20), "not reconnected: {status:#}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(log_text(&back).contains("ping에도 5초 안에 답하지 않아"), "{back:#}");
+    assert_eq!(call(&hub, &config, "wedged__echo", json!({"text":"다시"})).await.unwrap()["text"], "echo: 다시");
+    // The slow one answered its ping meanwhile: it stays as it is.
+    let slow = hub.server_status("slow", MODEL).unwrap();
+    assert_eq!((slow["state"].clone(), slow["restarts"].clone()), (json!("ready"), json!(0)), "{slow:#}");
+    hub.shutdown().await;
 }
 
 async fn ask(app: &std::sync::Arc<llm_agent::app::App>, message: &str) -> (anyhow::Result<agent::Answer>, Vec<Value>) {

@@ -5,11 +5,14 @@
 //!   sends half a surrogate pair as a `\ud83d` escape, which the JSON parser
 //!   refuses: it becomes U+FFFD, as does a byte that is not UTF-8;
 //! - a message without `"jsonrpc":"2.0"`, or with an error that is not
-//!   `{code, message}`, is put right (the error keeps its text).
+//!   `{code, message}`, is put right (the error keeps its text);
+//! - an HTTP error that answers no request (`"id": null`, a session the
+//!   server no longer knows) fails that request, rather than leave it
+//!   waiting for an answer that never comes.
 
 use futures_util::StreamExt;
 use rmcp::{
-    model::ClientJsonRpcMessage,
+    model::{ClientJsonRpcMessage, RequestId, ServerJsonRpcMessage},
     transport::{
         common::client_side_sse::BoxedSseResponse,
         streamable_http_client::{StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse},
@@ -149,10 +152,35 @@ fn mended_events(stream: BoxedSseResponse) -> BoxedSseResponse {
         .boxed()
 }
 
-fn mended_response(response: StreamableHttpPostResponse) -> StreamableHttpPostResponse {
-    match response {
-        StreamableHttpPostResponse::Sse(stream, session) => StreamableHttpPostResponse::Sse(mended_events(stream), session),
-        other => other,
+/// What the SDK cannot use in an answer. An error that answers no request
+/// (`"id": null`) is how a server refuses a session it no longer knows —
+/// the TypeScript SDK's example answers so (HTTP 400) after the server
+/// restarts. The SDK would hold it for no request and the call would wait
+/// out its timeout, every call after it too: it fails the request as a
+/// lost connection instead, which makes a new session.
+fn mended_response(
+    asked: Option<RequestId>,
+    response: Result<StreamableHttpPostResponse, StreamableHttpError<reqwest13::Error>>,
+) -> Result<StreamableHttpPostResponse, StreamableHttpError<reqwest13::Error>> {
+    match response? {
+        StreamableHttpPostResponse::Sse(stream, session) => Ok(StreamableHttpPostResponse::Sse(mended_events(stream), session)),
+        StreamableHttpPostResponse::Json(ServerJsonRpcMessage::Error(error), _) if asked.is_some() && error.id != asked => {
+            Err(StreamableHttpError::UnexpectedServerResponse(
+                format!("{ANSWERED_NO_REQUEST}: {} (code {})", error.error.message, error.error.code.0).into(),
+            ))
+        }
+        other => Ok(other),
+    }
+}
+
+/// Said of an error answering no request (see `mended_response`).
+pub const ANSWERED_NO_REQUEST: &str = "the server answered with an error for no request";
+
+/// The ID of a request, which its answer carries.
+fn request_id(message: &ClientJsonRpcMessage) -> Option<RequestId> {
+    match message {
+        ClientJsonRpcMessage::Request(request) => Some(request.id.clone()),
+        _ => None,
     }
 }
 
@@ -169,7 +197,8 @@ impl StreamableHttpClient for Lenient {
         auth_header: Option<String>,
         custom_headers: Headers,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        self.0.post_message(uri, message, session_id, auth_header, custom_headers).await.map(mended_response)
+        let asked = request_id(&message);
+        mended_response(asked, self.0.post_message(uri, message, session_id, auth_header, custom_headers).await)
     }
 
     async fn post_message_with_max_sse_event_size(
@@ -181,10 +210,12 @@ impl StreamableHttpClient for Lenient {
         custom_headers: Headers,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        self.0
+        let asked = request_id(&message);
+        let response = self
+            .0
             .post_message_with_max_sse_event_size(uri, message, session_id, auth_header, custom_headers, max_sse_event_size)
-            .await
-            .map(mended_response)
+            .await;
+        mended_response(asked, response)
     }
 
     async fn delete_session(
@@ -264,6 +295,26 @@ mod tests {
         assert_eq!(fixed(r#"{"method":"notifications/message","params":{}}"#)["jsonrpc"], "2.0");
         // Both mended at once.
         assert_eq!(fixed(r#"{"id":1,"result":{"t":"\ud83d"}}"#), json!({"jsonrpc":"2.0","id":1,"result":{"t":"\u{fffd}"}}));
+    }
+
+    #[test]
+    fn an_error_answering_no_request_fails_the_request() {
+        use rmcp::model::{ErrorCode, ErrorData, JsonRpcError, NumberOrString};
+        let error = |id: Option<RequestId>| {
+            Ok(StreamableHttpPostResponse::Json(
+                ServerJsonRpcMessage::Error(JsonRpcError::new(id, ErrorData::new(ErrorCode(-32000), "Bad Request: No valid session ID provided", None))),
+                None,
+            ))
+        };
+        let asked = Some(NumberOrString::Number(7));
+        // A server's restart: its answer names no request (id null).
+        let refused = mended_response(asked.clone(), error(None)).err().expect("fails the request").to_string();
+        assert!(refused.contains(ANSWERED_NO_REQUEST) && refused.contains("No valid session ID provided (code -32000)"), "{refused}");
+        assert!(mended_response(asked.clone(), error(Some(NumberOrString::Number(8)))).is_err(), "another request's");
+        // The answer to the request, and errors to what awaits none, go on.
+        assert!(mended_response(asked, error(Some(NumberOrString::Number(7)))).is_ok());
+        assert!(mended_response(None, error(None)).is_ok(), "a notification's");
+        assert!(matches!(mended_response(None, Ok(StreamableHttpPostResponse::Accepted)), Ok(StreamableHttpPostResponse::Accepted)));
     }
 
     #[test]

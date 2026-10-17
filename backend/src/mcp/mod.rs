@@ -16,7 +16,7 @@ use rmcp::{
     ClientHandler, Peer, ServiceError, ServiceExt,
     model::{
         CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientCapabilities, ClientConfig,
-        ClientRequest, ErrorCode, Implementation, ListToolsRequest, PaginatedRequestParams, ServerResult,
+        ClientRequest, ErrorCode, Implementation, ListToolsRequest, PaginatedRequestParams, PingRequest, ServerResult,
     },
     service::{NotificationContext, PeerRequestOptions, RoleClient, RxJsonRpcMessage, TxJsonRpcMessage},
     transport::{
@@ -98,6 +98,15 @@ const INHERITED_ENV: &[&str] = &[
     "NUMBER_OF_PROCESSORS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
     "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
 ];
+/// HTTP statuses that refuse one request, not the session: timeout,
+/// conflict, body or address or headers too large, media type,
+/// unprocessable. (400, 401, 403, 404 and 410 also answer a session or
+/// token the server no longer takes — a server restarted, a token revoked:
+/// those make a new connection.)
+const REQUEST_REFUSALS: &[u16] = &[408, 409, 413, 414, 415, 422, 431];
+/// Seconds a server whose call timed out is given to answer a ping before
+/// it is taken for stopped and reconnected.
+const PING_SECS: u64 = 5;
 /// Headers the HTTP transport sets itself.
 const RESERVED_HEADERS: &[&str] = &[
     "accept", "content-type", "content-length", "host", "mcp-session-id", "mcp-protocol-version", "last-event-id",
@@ -312,6 +321,9 @@ struct Slot {
     reconnect: Notify,
     state: Mutex<State>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// A ping asking whether the server still answers is on its way (one at
+    /// a time, however many calls timed out).
+    pinging: std::sync::atomic::AtomicBool,
 }
 
 impl Slot {
@@ -338,6 +350,7 @@ impl Slot {
                 stats: BTreeMap::new(),
             }),
             task: Mutex::new(None),
+            pinging: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -427,6 +440,41 @@ impl Slot {
             }
         }
     }
+}
+
+/// After a call on this connection timed out: a server that does not answer
+/// a ping either has stopped (a handler deadlocked, its input no longer
+/// read, a session it lost answered to no request). It is reconnected,
+/// rather than shown ready while every call waits out its timeout. Any
+/// answer, an error too, says it is alive.
+fn check_alive(slot: &Arc<Slot>, peer: &Peer<RoleClient>, broken: &Arc<Notify>, timeout: Duration) {
+    use std::sync::atomic::Ordering;
+    if slot.pinging.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let (slot, peer, broken) = (slot.clone(), peer.clone(), broken.clone());
+    tokio::spawn(async move {
+        let ping = peer.send_request(ClientRequest::PingRequest(PingRequest::default()));
+        let silent = match tokio::time::timeout(Duration::from_secs(PING_SECS), ping).await {
+            Err(_) | Ok(Err(ServiceError::Timeout { .. })) => true,
+            // Closed, the connection's end is its supervisor's to see.
+            Ok(Err(error @ ServiceError::TransportSend(_))) => connection_lost(&error),
+            Ok(_) => false,
+        };
+        if silent {
+            let mut state = slot.state();
+            // Still this connection: a newer one is not told for an older.
+            if state.broken.as_ref().is_some_and(|current| Arc::ptr_eq(current, &broken)) {
+                state.transport_error = Some(format!(
+                    "호출이 {}초 한도를 넘었고, 살아 있는지 묻는 ping에도 {PING_SECS}초 안에 답하지 않아 서버가 멈춘 것으로 보고 다시 연결합니다",
+                    timeout.as_secs()
+                ));
+                drop(state);
+                broken.notify_one();
+            }
+        }
+        slot.pinging.store(false, Ordering::Release);
+    });
 }
 
 /// Everything the connection is made from: command or URL with their
@@ -601,7 +649,7 @@ impl Offered {
         outcome
     }
 
-    async fn call_inner(&self, slot: &Slot, args: Value, cancel: &CancellationToken) -> Result<Value> {
+    async fn call_inner(&self, slot: &Arc<Slot>, args: Value, cancel: &CancellationToken) -> Result<Value> {
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
@@ -625,9 +673,9 @@ impl Offered {
         // reading its input never makes.
         let deadline = tokio::time::Instant::now() + self.timeout;
         let handle = tokio::select! {
-            sent = peer.send_cancellable_request(request, PeerRequestOptions::with_timeout(self.timeout)) => sent.map_err(|e| self.error(e, slot, &broken))?,
+            sent = peer.send_cancellable_request(request, PeerRequestOptions::with_timeout(self.timeout)) => sent.map_err(|e| self.error(e, slot, &peer, &broken))?,
             _ = cancel.cancelled() => bail!("cancelled"),
-            _ = tokio::time::sleep_until(deadline) => return Err(self.error(ServiceError::Timeout { timeout: self.timeout }, slot, &broken)),
+            _ = tokio::time::sleep_until(deadline) => return Err(self.error(ServiceError::Timeout { timeout: self.timeout }, slot, &peer, &broken)),
         };
         let id = handle.id.clone();
         // The SDK's own timeout tells the server before it returns, and that
@@ -643,7 +691,7 @@ impl Offered {
             });
         };
         tokio::select! {
-            response = handle.await_response() => match response.map_err(|e| self.error(e, slot, &broken))? {
+            response = handle.await_response() => match response.map_err(|e| self.error(e, slot, &peer, &broken))? {
                 ServerResult::CallToolResult(result) => convert::tool_result(&serde_json::to_value(result)?),
                 // A result the SDK's types refuse (a content block of an unknown
                 // type, a text block without text) arrives as raw JSON: read it
@@ -659,12 +707,15 @@ impl Offered {
             }
             _ = overdue => {
                 tell("request timeout");
-                Err(self.error(ServiceError::Timeout { timeout: self.timeout }, slot, &broken))
+                Err(self.error(ServiceError::Timeout { timeout: self.timeout }, slot, &peer, &broken))
             }
         }
     }
 
-    fn error(&self, error: ServiceError, slot: &Slot, broken: &Notify) -> anyhow::Error {
+    fn error(&self, error: ServiceError, slot: &Arc<Slot>, peer: &Peer<RoleClient>, broken: &Arc<Notify>) -> anyhow::Error {
+        if matches!(error, ServiceError::Timeout { .. }) {
+            check_alive(slot, peer, broken, self.timeout);
+        }
         match error {
             ServiceError::McpError(e) if e.code == ErrorCode::INVALID_PARAMS => {
                 anyhow!("invalid_tool_arguments: {} refused the arguments: {}", self.exposed, e.message)
@@ -680,30 +731,26 @@ impl Offered {
             ),
             ServiceError::TransportClosed | ServiceError::TransportSend(_) => {
                 let detail = explain(&error);
+                if connection_lost(&error) {
+                    slot.state().transport_error = Some(format!("호출이 서버에 닿지 못해 다시 연결합니다: {detail}"));
+                    broken.notify_one();
+                    return anyhow!(
+                        "mcp_server_unavailable: the connection to MCP server {} failed during the call ({detail}); it is being reconnected",
+                        self.server
+                    );
+                }
                 // An answer to this one request that cannot be read leaves the
                 // session as it is (the SDK serves the next call on it).
                 if unreadable(&error) {
                     return anyhow!("mcp_request_failed: MCP server {} sent an answer that is not readable JSON-RPC ({detail})", self.server);
                 }
-                // An HTTP answer about this one request (a rate limit, a proxy
-                // or server error) leaves the session as it is: only a lost
-                // connection makes a new one.
                 match http_status(&error) {
                     Some(429) => anyhow!(
                         "mcp_rate_limited: MCP server {} is limiting requests (HTTP 429); answer with what is known or call it again later ({detail})",
                         self.server
                     ),
-                    Some(status) if (500..600).contains(&status) => {
-                        anyhow!("mcp_request_failed: MCP server {} answered HTTP {status} ({detail})", self.server)
-                    }
-                    _ => {
-                        slot.state().transport_error = Some(detail.clone());
-                        broken.notify_one();
-                        anyhow!(
-                            "mcp_server_unavailable: the connection to MCP server {} failed during the call ({detail}); it is being reconnected",
-                            self.server
-                        )
-                    }
+                    // A scope the token lacks (403 with its challenge).
+                    status => anyhow!("mcp_request_failed: MCP server {} answered HTTP {} ({detail})", self.server, status.unwrap_or(403)),
                 }
             }
             other => anyhow!("mcp_request_failed: {}", redact(&other.to_string())),
@@ -1140,25 +1187,33 @@ async fn serve(slot: &Arc<Slot>, server: &McpServer, connection: &mut Connection
         Ok(Err(error)) => return Ended::Failed(slot.failure(&format!("도구 목록을 받지 못했습니다: {error:#}"))),
         Err(_) => return Ended::Failed(slot.failure(&format!("{CONNECT_SECS}초 안에 도구 목록을 받지 못했습니다"))),
     }
+    // A call that found the connection broken, or its server stopped.
+    let broken = |slot: &Arc<Slot>| {
+        let cause = slot.state().transport_error.take().unwrap_or_else(|| "연결에 문제가 있어 다시 연결합니다".to_owned());
+        Ended::Failed(slot.failure(&cause))
+    };
     loop {
         tokio::select! {
             _ = slot.stop.cancelled() => return Ended::Stopped,
             _ = slot.reconnect.notified() => return Ended::Requested,
             _ = &mut connection.ended => return Ended::Lost,
-            _ = connection.broken.notified() => {
-                let cause = slot.state().transport_error.take().unwrap_or_default();
-                return Ended::Failed(slot.failure(&format!("호출이 서버에 닿지 못해 다시 연결합니다: {cause}")));
-            }
+            _ = connection.broken.notified() => return broken(slot),
             _ = connection.list_changed.notified() => {
                 // Notices coming while it waits make one more reading at most.
                 tokio::select! {
                     _ = slot.stop.cancelled() => return Ended::Stopped,
                     _ = slot.reconnect.notified() => return Ended::Requested,
                     _ = &mut connection.ended => return Ended::Lost,
+                    _ = connection.broken.notified() => return broken(slot),
                     _ = tokio::time::sleep(RELIST_WAIT) => {}
                 }
+                // A server that stopped answering keeps the list waiting up to
+                // its limit: a reconnect asked meanwhile is not held up by it.
                 let listed = tokio::select! {
                     _ = slot.stop.cancelled() => return Ended::Stopped,
+                    _ = slot.reconnect.notified() => return Ended::Requested,
+                    _ = &mut connection.ended => return Ended::Lost,
+                    _ = connection.broken.notified() => return broken(slot),
                     listed = tokio::time::timeout(Duration::from_secs(CONNECT_SECS), list_tools(&connection.peer, &server.name)) => listed,
                 };
                 match listed {
@@ -1205,9 +1260,11 @@ fn causes(error: &dyn std::error::Error) -> String {
 fn explain<E: std::error::Error + std::fmt::Debug>(error: &E) -> String {
     let shown = regex::Regex::new(r"Transport \[[^\]]*\] error: ").unwrap().replace_all(&causes(error), "").into_owned();
     let debug = format!("{error:?}");
-    // First: the preview of the body it quotes is the server's text, which
-    // may say anything ("HTTP 404" in a fetched page).
-    let cause = if unreadable(error) {
+    // First: what these quote (an error's message, a body's preview) is the
+    // server's text, which may say anything ("HTTP 404" in a fetched page).
+    let cause = if debug.contains(wire::ANSWERED_NO_REQUEST) {
+        Some("서버가 이 세션을 더는 모릅니다(서버가 다시 시작되었을 수 있습니다)".to_owned())
+    } else if unreadable(error) {
         Some("서버 응답을 JSON-RPC 메시지로 읽지 못했습니다(서버의 응답 형식을 확인하세요)".to_owned())
     } else if debug.contains("InvalidCertificate") || debug.contains("certificate is not trusted") || debug.contains("UnknownIssuer") {
         let detail = regex::Regex::new(r#"InvalidCertificate\((?:[^"()]*\()*"?([^"()]+)"?"#)
@@ -1262,13 +1319,32 @@ fn redact(text: &str) -> String {
     .into_owned()
 }
 
-/// The HTTP status an HTTP transport error carries, from its debug form (the
-/// SDK keeps it only as text there).
 /// A response the SDK could not parse as a JSON-RPC message.
 fn unreadable<E: std::fmt::Debug>(error: &E) -> bool {
     format!("{error:?}").contains("could not parse JSON response")
 }
 
+/// Whether a request failed for a connection or session that is lost — a
+/// new one is made — rather than an answer about this one request: one
+/// that cannot be read, a rate limit, a body too large, a proxy or server
+/// error, a scope the token lacks. A new connection for those would end the
+/// other calls on it and help this one no more.
+fn connection_lost(error: &ServiceError) -> bool {
+    if !matches!(error, ServiceError::TransportClosed | ServiceError::TransportSend(_)) {
+        return false;
+    }
+    let debug = format!("{error:?}");
+    // A session the server no longer knows; the rest of the text is the
+    // server's own, no status to read in it.
+    if debug.contains(wire::ANSWERED_NO_REQUEST) {
+        return true;
+    }
+    let refused = |status: u16| status == 429 || (500..600).contains(&status) || REQUEST_REFUSALS.contains(&status);
+    !unreadable(error) && !http_status(error).is_some_and(refused) && !debug.contains("InsufficientScope")
+}
+
+/// The HTTP status an HTTP transport error carries, from its debug form (the
+/// SDK keeps it only as text there).
 fn http_status<E: std::fmt::Debug>(error: &E) -> Option<u16> {
     regex::Regex::new(r"HTTP (\d{3})")
         .unwrap()
@@ -1791,15 +1867,23 @@ pub async fn probe(server: &McpServer, model: &str) -> Result<Value> {
     kill_group(&slot);
     let log: Vec<Value> = slot.state().log.iter().cloned().collect();
     match outcome {
-        Ok(Ok((tools, info))) => Ok(json!({
-            "ok":true,"message":format!("연결됨: {}, 도구 {}개", describe_server(&info), tools.len()),
-            "server_info":server_info(&info),
-            "tools":tools.iter().map(|t| json!({"name":t.name,"exposed":t.exposed,"title":t.title,
-                "description":t.description,"annotations":t.annotations,
-                "allowed":allows(&server.tools, &t.name, &t.exposed),
-                "tokens":t.tokens(model)})).collect::<Vec<_>>(),
-            "log":log
-        })),
+        Ok(Ok((tools, info))) => {
+            let message = format!("연결됨: {}, 도구 {}개", describe_server(&info), tools.len());
+            // A thousand definitions' tokens are counted on a blocking
+            // thread, as the status does.
+            let (allowed, model) = (server.tools.clone(), model.to_owned());
+            let tools = tokio::task::spawn_blocking(move || {
+                tools
+                    .iter()
+                    .map(|t| json!({"name":t.name,"exposed":t.exposed,"title":t.title,
+                        "description":t.description,"annotations":t.annotations,
+                        "allowed":allows(&allowed, &t.name, &t.exposed),
+                        "tokens":t.tokens(&model)}))
+                    .collect::<Vec<_>>()
+            })
+            .await?;
+            Ok(json!({"ok":true,"message":message,"server_info":server_info(&info),"tools":tools,"log":log}))
+        }
         Ok(Err(error)) => Ok(json!({"ok":false,"message":slot.failure(&format!("{error:#}")),"log":log})),
         Err(_) => Ok(json!({"ok":false,"message":slot.failure(&format!("{CONNECT_SECS}초 안에 연결하지 못했습니다")),"log":log})),
     }
@@ -1911,6 +1995,33 @@ mod tests {
         assert_eq!(redact("http://127.0.0.1:9/mcp failed"), "http://127.0.0.1:9/mcp failed");
         assert_eq!(redact("see \"http://h/p?token=a\" and http://h/q?"), "see \"http://h/p?…\" and http://h/q");
         assert_eq!(redact("no url here"), "no url here");
+    }
+
+    #[test]
+    fn a_lost_session_is_told_from_a_refused_request() {
+        use rmcp::transport::streamable_http_client::StreamableHttpError;
+        let send = |text: &str| {
+            ServiceError::TransportSend(rmcp::transport::DynamicTransportError::from_parts(
+                "http",
+                std::any::TypeId::of::<()>(),
+                Box::new(StreamableHttpError::<reqwest13::Error>::UnexpectedServerResponse(text.to_owned().into())),
+            ))
+        };
+        // About this one request: the session stays.
+        for refused in ["HTTP 413 Payload Too Large: too big", "HTTP 429 Too Many Requests: slow", "HTTP 502 Bad Gateway: <html>", "HTTP 422 Unprocessable Entity: {}"] {
+            assert!(!connection_lost(&send(refused)), "{refused}");
+        }
+        assert!(!connection_lost(&send("could not parse JSON response as ServerJsonRpcMessage")), "one answer unreadable");
+        // A session or token refused, or no answer: a new connection.
+        for lost in ["HTTP 400 Bad Request: No valid session ID provided", "HTTP 401 Unauthorized: x", "HTTP 404 Not Found: x", "HTTP 410 Gone: x", "error sending request"] {
+            assert!(connection_lost(&send(lost)), "{lost}");
+        }
+        assert!(connection_lost(&ServiceError::TransportClosed));
+        // An error for no request quotes the server, whatever it says.
+        let quoted = format!("{}: upstream said HTTP 503; could not parse JSON response (code -32000)", wire::ANSWERED_NO_REQUEST);
+        assert!(connection_lost(&send(&quoted)));
+        assert!(explain(&send(&quoted)).starts_with("서버가 이 세션을 더는 모릅니다"));
+        assert!(!connection_lost(&ServiceError::Timeout { timeout: Duration::from_secs(1) }));
     }
 
     #[test]

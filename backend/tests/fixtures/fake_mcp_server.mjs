@@ -60,6 +60,15 @@ for (let i = 0; i < Number(env.FAKE_MCP_FAT || 0); i++) {
 for (let i = 0; i < Number(env.FAKE_MCP_MANY || 0); i++) tools.push({ name: `many_${i}`, description: 'one of many', inputSchema: { type: 'object' } });
 let listed = 0;
 if (env.FAKE_MCP_BUILTIN_NAME) tools.push({ name: 'history', description: 'A tool named like one of the agent\'s own.', inputSchema: { type: 'object' } });
+// A server that stops answering anything (a handler deadlocked), ping too,
+// while it still reads its input.
+let wedged = false;
+// As a restarted TypeScript-SDK server: sessions it no longer knows get
+// HTTP 400 "No valid session ID provided" (its example's answer), id null.
+let session = 'fake-session';
+let forgotten = false;
+if (env.FAKE_MCP_FORGET) tools.push({ name: 'forget', description: 'Forget the session, as a restarted server.', inputSchema: { type: 'object' } });
+if (env.FAKE_MCP_WEDGE) tools.push({ name: 'wedge', description: 'Stop answering every request from now on.', inputSchema: { type: 'object' } });
 if (env.FAKE_MCP_DUPLICATE) tools.push({ name: 'echo', description: 'A second echo.', inputSchema: { type: 'object' } });
 for (let i = 0; i < Number(env.FAKE_MCP_MANY_BAD || 0); i++) tools.push({ name: `bad_${i}`, description: 'a schema that is a string', inputSchema: 'nope' });
 if (env.FAKE_MCP_BAD_LIST) tools.push({ name: 'no_schema', description: 'A tool without inputSchema.' }, { name: 'string_schema', description: 'A tool whose schema is a string.', inputSchema: 'nope' });
@@ -74,6 +83,7 @@ function failure(id, code, message) { return { jsonrpc: '2.0', id, error: { code
 // to send meanwhile through `notify`.
 async function handle(message, notify) {
   const { id, method, params = {} } = message;
+  if (wedged && id !== undefined) return new Promise(() => {});
   if (method === 'initialize') {
     if (env.FAKE_MCP_HANG_INIT) return new Promise(() => {});
     if (env.FAKE_MCP_SLOW_INIT_MS) await new Promise(resolve => setTimeout(resolve, Number(env.FAKE_MCP_SLOW_INIT_MS)));
@@ -99,6 +109,8 @@ async function handle(message, notify) {
     if (env.FAKE_MCP_LIST_STORM) { log(`listed ${listed}`); setTimeout(() => notify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }), 0); }
     if (env.FAKE_MCP_LOG_LISTS) log(`listed ${listed}`);
     if (env.FAKE_MCP_HANG_LIST) return new Promise(() => {});
+    // The first listing answered, a changed list is never read.
+    if (env.FAKE_MCP_HANG_RELIST && listed > 1) return new Promise(() => {});
     const start = env.FAKE_MCP_CURSOR_LOOP ? 0 : Number(params.cursor || 0);
     const page = tools.slice(start, start + PAGE);
     const next = env.FAKE_MCP_CURSOR_LOOP ? 'again' : start + PAGE < tools.length ? String(start + PAGE) : undefined;
@@ -141,6 +153,8 @@ async function handle(message, notify) {
         notify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
         return result(id, { content: [text('added')] });
       }
+      case 'wedge': wedged = true; return new Promise(() => {});
+      case 'forget': forgotten = true; return result(id, { content: [text('forgot the session')] });
       case 'extra': return result(id, { content: [text('extra ran')] });
       case 'history': return result(id, { content: [text('the server history ran')] });
       case 'strict': return args.x ? result(id, { content: [text('ok')] }) : failure(id, -32602, 'x is required');
@@ -195,9 +209,14 @@ if (httpMode) {
     req.on('data', chunk => { body += chunk; });
     req.on('end', async () => {
       const message = JSON.parse(body);
+      if (message.method === 'initialize' && forgotten) { forgotten = false; session = `fake-session-${Date.now()}`; }
+      else if (forgotten || (req.headers['mcp-session-id'] && !env.FAKE_MCP_STATELESS && req.headers['mcp-session-id'] !== session)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Bad Request: No valid session ID provided' }, id: null }));
+        return;
+      }
       // A rate limit or a proxy error on the first tool call only, the
       // session fine.
-      if (env.FAKE_MCP_CALL_STATUS && message.method === 'tools/call' && limitedCalls++ === 0) {
+      if (env.FAKE_MCP_CALL_STATUS && message.method === 'tools/call' && (!env.FAKE_MCP_CALL_STATUS_TOOL || message.params?.name === env.FAKE_MCP_CALL_STATUS_TOOL) && limitedCalls++ === 0) {
         res.writeHead(Number(env.FAKE_MCP_CALL_STATUS), { 'Content-Type': 'text/plain', 'Retry-After': '30' }).end('slow down');
         return;
       }
@@ -205,7 +224,7 @@ if (httpMode) {
       const answer = await handle(message, note => notes.push(note));
       if (answer === null) { res.writeHead(202).end(); return; }
       const headers = { 'Content-Type': env.FAKE_MCP_SSE ? 'text/event-stream' : 'application/json' };
-      if (message.method === 'initialize' && !env.FAKE_MCP_STATELESS) headers['Mcp-Session-Id'] = 'fake-session';
+      if (message.method === 'initialize' && !env.FAKE_MCP_STATELESS) headers['Mcp-Session-Id'] = session;
       res.writeHead(200, headers);
       if (env.FAKE_MCP_SSE) {
         for (const note of notes) res.write(`event: message\ndata: ${JSON.stringify(note)}\n\n`);

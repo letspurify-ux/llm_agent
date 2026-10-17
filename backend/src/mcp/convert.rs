@@ -9,6 +9,11 @@ use serde_json::{Value, json};
 pub const MAX_RESULT_CHARS: usize = 200_000;
 /// Characters of a tool's own error message passed on.
 const MAX_ERROR_CHARS: usize = 4_000;
+/// Blocks named in `omitted_content`, and characters of each name: a result
+/// of thousands of images (each type and address the server's text) would
+/// otherwise be bounded only by the message.
+const MAX_OMITTED: usize = 20;
+const MAX_OMITTED_CHARS: usize = 300;
 
 /// The result's text, or the tool's error. Text parts and text resources
 /// are joined; images, audio and binary resources cannot go into a tool
@@ -60,7 +65,12 @@ pub fn tool_result(result: &Value) -> Result<Value> {
         data["text_cut_chars"] = json!(cut);
     }
     if !omitted.is_empty() {
-        data["omitted_content"] = json!(omitted);
+        let more = omitted.len().saturating_sub(MAX_OMITTED);
+        let mut named: Vec<String> = omitted.iter().take(MAX_OMITTED).map(|name| clip(name, MAX_OMITTED_CHARS).0).collect();
+        if more > 0 {
+            named.push(format!("... and {more} more"));
+        }
+        data["omitted_content"] = json!(named);
     }
     Ok(data)
 }
@@ -152,6 +162,18 @@ mod tests {
                 Err(error) => assert!(error.to_string().starts_with("mcp_tool_error: "), "{result}"),
             }
         }
+    }
+
+    #[test]
+    fn content_left_out_is_named_within_bounds() {
+        let mut blocks = vec![json!({"type":"text","text":"several images"})];
+        blocks.extend((0..5_000).map(|i| json!({"type":"image","data":"AAAA","mimeType":format!("image/png; name={}", "x".repeat(i))})));
+        let data = tool_result(&json!({"content":blocks})).unwrap();
+        let named = data["omitted_content"].as_array().unwrap();
+        assert_eq!(named.len(), MAX_OMITTED + 1);
+        assert!(named.iter().all(|n| n.as_str().unwrap().chars().count() <= MAX_OMITTED_CHARS), "{named:?}");
+        assert_eq!(named[MAX_OMITTED], "... and 4980 more");
+        assert_eq!(data["text"], "several images");
     }
 
     #[test]
