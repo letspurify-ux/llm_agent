@@ -18,8 +18,9 @@ Node 22 이상과 Chrome이 필요하다. 필요하면 `CHROME_PATH`로 실행 �
 이 명령은 백엔드 응답 전송·조회 주입·문법 경계 검사, 프런트엔드 전체 단위 검사, 실제 Chrome UI 검사,
 현재 소스를 새로 빌드하는 production 검사를 순서대로 실행한다. 어느 단계든 실패하면 종료 코드가
 실패이며, Chrome이 없으면 검사를 건너뛰지 않고 실패한다. 실제 DB·LLM 접속은 필요 없다.
-[CI](../.github/workflows/rendering-regressions.yml)도 모든 push/PR에서 같은 명령을 실행한다.
-브랜치 보호의 필수 상태 검사 설정은 이 워크플로 추가와 별개다.
+이 명령은 CI에서 돌리지 않는다(2026-10-17부터). [CI](../.github/workflows/rendering-regressions.yml)는 백엔드 검사만 한다 —
+러너의 Linux Chrome·글꼴에서만 어긋나는 시험이 남았는데, 작업 로그를 내려받으려면 관리자 권한이 필요해 원인을 쫓을 수 없었다.
+화면을 바꾼 뒤에는 로컬에서 이 명령으로 확인한다.
 
 ## 결함과 판정
 

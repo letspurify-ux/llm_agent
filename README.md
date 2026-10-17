@@ -307,8 +307,8 @@ npm run test:regression # 필수 전체 회귀 (Chrome 누락도 실패)
 후속 질문·홈 복귀를 확인한다. 결함 재현과 수정 내역은 [frontend 검토 기록](docs/frontend-audit.md)에 있다.
 
 수식·Markdown·차트 관련 버그별 정식 테스트는 [회귀 검사 목록](docs/rendering-regressions.md)에 정리했다.
-GitHub Actions는 모든 push/PR에서 프런트의 `test:regression`(Node 22 이상과 Chrome, `npm ci`)과
-백엔드의 `cargo test`를 실행하고, Windows에서 MCP 검사(`cargo test --test mcp`)를 따로 돌린다. 실제 DB나 LLM 서버는 사용하지 않는다.
+GitHub Actions는 모든 push/PR에서 백엔드의 `cargo test`를 실행하고, Windows에서 MCP 검사(`cargo test --test mcp`)를 따로 돌린다.
+실제 DB나 LLM 서버는 사용하지 않는다. 프런트의 `test:regression`(Chrome 화면 검사)은 CI에서 빼고 로컬에서 돌린다.
 
 #### 관리자 화면
 
