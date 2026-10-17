@@ -150,6 +150,14 @@ export default function AdminPanel({ onStateChange }) {
     }, search ? 250 : 0);
     return () => { clearTimeout(timer); controller.abort(); };
   }, [kind, search, page, refresh, api]);
+  // 설정·MCP 탭은 자기 패널이 읽는데, 인증 화면이 떠 있는 동안 그 패널은 내려가 있다. 넣은 키를 실어
+  // 보낼 요청이 없으면 맞는 키도 화면이 넘어가지 않으므로, 그 탭이 읽을 주소로 대신 확인한다.
+  useEffect(() => {
+    if (!SECTIONS[kind].singleton || !needsAuth || !authAttempted) return undefined;
+    const controller = new AbortController();
+    api(kind, { signal: controller.signal }).catch(e => { if (!controller.signal.aborted) setError(e.message); });
+    return () => controller.abort();
+  }, [kind, needsAuth, authAttempted, refresh, api]);
   useEffect(() => {
     if (kind !== 'queries') return;
     const controller = new AbortController();

@@ -53,6 +53,7 @@ test('MCP 탭 서버 목록·상태·허용 도구 저장·비밀값 지우기·
       const body = opts.body && JSON.parse(opts.body);
       window.__requests.push({ path, method, ifMatch: opts.headers['If-Match'], body });
       const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
+      if (window.__requireToken && opts.headers['X-Admin-Token'] !== 'test-admin-key') return json({ error: '관리자 인증 키를 입력해주세요.' }, 401);
       if (path === 'mcp' && method === 'GET') return window.__refreshFails ? json({ error: '서버에 연결하지 못했습니다.' }, 503) : json(window.__mcp);
       if (path === 'mcp-check') return json({ ok: true, message: '연결됨: wiki-mcp 1.0, 도구 2개', tools: [
         { name: 'search_pages', exposed: 'wiki__search_pages', description: '페이지 검색', annotations: { readOnlyHint: true }, allowed: false, tokens: 55 },
@@ -158,4 +159,23 @@ test('MCP 탭 서버 목록·상태·허용 도구 저장·비밀값 지우기·
   await page.until(`!!document.querySelector('.admin-editor fieldset')`);
   assert.equal(await page.eval(`document.querySelector('.admin-editor fieldset').disabled`), true);
   assert.equal(await page.eval(`[...document.querySelectorAll('.admin-form-actions button')].some(b => b.textContent === '삭제')`), false);
+
+  // 키가 바뀐 서버: MCP 탭 위에 뜬 인증 화면도 맞는 키를 넣으면 넘어간다. 인증 화면 밑의 패널은
+  // 내려가 있어 키를 실어 보낼 요청이 따로 있어야 한다(없을 때는 오류도 없이 그대로 멈췄다).
+  await clickText('.admin-form-actions button', '닫기');
+  await page.eval('window.__requireToken = true');
+  await clickText('.admin-mcp-caption button', '↻');
+  await page.until(`!!document.querySelector('#admin-token')`);
+  await fill('#admin-token', 'wrong-key'); await click('.admin-auth [type=submit]');
+  await page.until(`document.querySelector('.admin-auth .admin-error')?.textContent.includes('인증에 실패했습니다')`);
+  await fill('#admin-token', 'test-admin-key'); await click('.admin-auth [type=submit]');
+  await page.until(`!document.querySelector('.admin-auth') && !!document.querySelector('.admin-mcp .admin-record')`);
+
+  // 인증 화면에서 설정 탭으로 옮긴 뒤 넣어도 마찬가지다.
+  await click('[aria-label="채팅으로 돌아가기"]'); await click('[aria-label="관리자 화면 열기"]');
+  await page.until(`!!document.querySelector('#admin-token')`);
+  await clickText('.admin-tabs button', '07');
+  await fill('#admin-token', 'test-admin-key'); await click('.admin-auth [type=submit]');
+  await page.until(`!document.querySelector('.admin-auth') && document.querySelector('.admin-section-heading h3')?.textContent === '서버 설정'`);
+  assert.ok((await page.eval(`window.__requests.filter(r => r.path === 'settings').length`)) >= 1, '설정 탭의 인증도 요청으로 확인한다');
 });
