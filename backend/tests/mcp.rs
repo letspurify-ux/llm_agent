@@ -669,10 +669,12 @@ async fn what_a_server_sends_is_bounded() {
         fake("huge", &["*"], &[("FAKE_MCP_HUGE_META", "1")]),
         fake("many", &["*"], &[("FAKE_MCP_MANY", "1500"), ("FAKE_MCP_PAGE", "5000")]),
         fake("storm", &["echo"], &[("FAKE_MCP_LIST_STORM", "1"), ("FAKE_MCP_PAGE", "1000")]),
+        fake("paged", &["*"], &[("FAKE_MCP_MANY", "1500"), ("FAKE_MCP_PAGE", "100"), ("FAKE_MCP_LOG_LISTS", "1")]),
+        fake("faulty", &["*"], &[("FAKE_MCP_MANY_BAD", "500"), ("FAKE_MCP_PAGE", "1000")]),
     ]);
     let hub = McpHub::default();
     hub.apply(&config.mcp_servers);
-    for name in ["huge", "many", "storm"] {
+    for name in ["huge", "many", "storm", "paged", "faulty"] {
         ready(&hub, name).await;
     }
     // A server announcing a changed list after every listing is listed
@@ -694,6 +696,19 @@ async fn what_a_server_sends_is_bounded() {
     let many = hub.server_status("many", MODEL).unwrap();
     assert_eq!(many["tools"].as_array().unwrap().len(), 1_000);
     assert!(log_text(&many).contains("앞의 1000개만"));
+    // Past them, the pages after are not read (review, eleventh pass: all
+    // 100 pages were, each up to a message's 16 MiB).
+    let paged = hub.server_status("paged", MODEL).unwrap();
+    assert_eq!(paged["tools"].as_array().unwrap().len(), 1_000);
+    let pages = log_text(&paged).lines().filter(|l| l.starts_with("listed")).count();
+    assert_eq!(pages, 11, "1,100 tools read of 1,521");
+    // Five hundred faulty tools say so in a few lines: the log keeps the
+    // rest, the console is not flooded at every reconnection.
+    let faulty = hub.server_status("faulty", MODEL).unwrap();
+    assert_eq!(faulty["tools"].as_array().unwrap().len(), 521, "taken without arguments");
+    let lines = log_text(&faulty).lines().count();
+    assert!(lines <= 23, "{lines} lines: {}", log_text(&faulty));
+    assert!(log_text(&faulty).contains("480건은 줄였습니다"), "{}", log_text(&faulty));
     // The admin screen's status stays small however much they send.
     let status = hub.status(MODEL).to_string().len();
     assert!(status < 1_500_000, "status {status} bytes");
@@ -826,7 +841,20 @@ async fn settings_apply_in_place_or_reconnect() {
     hub.apply(&config.mcp_servers);
     // A restart request reconnects at once.
     assert!(hub.restart("live"));
-    wait_for(&hub, "live", |s| s["state"] == "ready" && s["pid"] != renewed["pid"]).await;
+    let restarted = wait_for(&hub, "live", |s| s["state"] == "ready" && s["pid"] != renewed["pid"]).await;
+    // The name starts the tool names: renamed in its case alone, the
+    // server is listed again under it (review, eleventh pass: its tools
+    // kept "live__" under "Live", and an entry "Live__echo" allowed none).
+    server.name = "Live".into();
+    server.tools = vec!["Live__echo".into(), "add".into()];
+    config.mcp_servers = vec![server.clone()];
+    hub.apply(&config.mcp_servers);
+    wait_for(&hub, "Live", |s| s["state"] == "ready" && s["pid"] != restarted["pid"]).await;
+    assert_eq!(hub.snapshot(&config).names().collect::<Vec<_>>(), ["Live__echo", "Live__add"]);
+    assert!(hub.snapshot(&config).prompt().ends_with("- Live: 바뀐 설명"));
+    server.name = "live".into();
+    config.mcp_servers = vec![server.clone()];
+    hub.apply(&config.mcp_servers);
     // Disabled: no process, no tools.
     server.enabled = false;
     config.mcp_servers = vec![server.clone()];
@@ -1242,6 +1270,150 @@ async fn a_question_keeps_its_tools_while_the_server_reconnects() {
     assert_eq!(requests[0]["tools"], requests[2]["tools"]);
     let echo = tool_result(&requests[2], "c2");
     assert!(echo["status"] == "ok" || echo["recovery"]["code"] == "mcp_server_unavailable", "{echo}");
+    app.mcp.shutdown().await;
+}
+
+/// A provider's refusal of the tool `name` at a place among a request's tools.
+type Refusal = fn(&str, usize) -> String;
+
+/// A model endpoint that refuses every request defining the tool `name`,
+/// in the words of `refusal`; other requests are answered from the script.
+struct Picky {
+    inner: std::sync::Arc<Scripted>,
+    name: String,
+    refusal: Refusal,
+}
+
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for Picky {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &llm_agent::config::LlmConfig,
+        cancel: CancellationToken,
+        delta: tokio::sync::mpsc::Sender<String>,
+    ) -> anyhow::Result<llm_agent::llm::Completion> {
+        let at = request["tools"].as_array().and_then(|tools| tools.iter().position(|t| t["function"]["name"] == self.name.as_str()));
+        if let Some(at) = at {
+            self.inner.requests.lock().unwrap().push(request);
+            anyhow::bail!((self.refusal)(&self.name, at));
+        }
+        self.inner.complete(request, config, cancel, delta).await
+    }
+}
+
+fn tool_names(request: &Value) -> Vec<String> {
+    request["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap().to_owned()).collect()
+}
+
+/// Mcp review, eleventh pass: a provider that refused one MCP tool's
+/// definition failed every question with a server error while the tool was
+/// allowed, the agent's own tools and the other MCP tools with it.
+#[tokio::test]
+async fn a_definition_the_model_refuses_leaves_that_tool_out_alone() {
+    if node_missing() {
+        return;
+    }
+    let refusals: [(&str, Refusal); 3] = [
+        ("OpenAI", |name, at| {
+            format!(r#"http_400: {{"error":{{"message":"Invalid schema for function '{name}': In context=('properties', 'tags'), array schema missing items.","type":"invalid_request_error","param":"tools[{at}].function.parameters","code":"invalid_function_parameters"}}}}"#)
+        }),
+        ("Anthropic", |_, at| format!(r#"http_400: {{"type":"error","error":{{"type":"invalid_request_error","message":"tools.{at}.custom.input_schema: JSON schema is invalid. It must match JSON Schema draft 2020-12"}}}}"#)),
+        ("Gemini", |_, at| {
+            format!(r#"http_400: [{{"error":{{"code":400,"message":"* GenerateContentRequest.tools[0].function_declarations[{at}].parameters.properties[tags].items: missing field.\n","status":"INVALID_ARGUMENT"}}}}]"#)
+        }),
+    ];
+    for (provider, refusal) in refusals {
+        let config = config(vec![fake("fake", &["echo", "add"], &[])]);
+        let scripted = Scripted::new(vec![text("끝"), text("둘째"), text("셋째")]);
+        let llm = std::sync::Arc::new(Picky { inner: scripted.clone(), name: "fake__echo".into(), refusal });
+        let (app, _dir) = app(config.clone(), llm);
+        app.mcp.apply(&config.mcp_servers);
+        ready(&app.mcp, "fake").await;
+        let (result, _) = ask(&app, "에코 해줘").await;
+        assert_eq!(result.unwrap_or_else(|e| panic!("{provider}: {e:#}")).answer, "끝", "{provider}");
+        let requests = scripted.requests();
+        assert_eq!(requests.len(), 2, "{provider}: refused once, then asked without the tool");
+        assert!(tool_names(&requests[0]).contains(&"fake__echo".to_owned()));
+        let second = tool_names(&requests[1]);
+        assert!(!second.contains(&"fake__echo".to_owned()) && second.contains(&"fake__add".to_owned()) && second.contains(&"search".to_owned()), "{provider}: {second:?}");
+        let system = requests[1]["messages"][0]["content"].as_str().unwrap();
+        assert!(system.ends_with("- fake: 가짜 MCP 서버 fake"), "the server's other tool is still offered");
+        // Told on the admin screen, and left out of later questions to this
+        // model from the start (no refused request each time).
+        let status = app.mcp.server_status("fake", MODEL).unwrap();
+        let echo = status["tools"].as_array().unwrap().iter().find(|t| t["name"] == "echo").unwrap().clone();
+        assert_eq!(echo["refused"]["model"], MODEL, "{provider}: {echo}");
+        assert!(echo["refused"]["reason"].as_str().unwrap().starts_with("http_400:"), "{echo}");
+        assert!(log_text(&status).contains("도구 fake__echo의 정의를 받지 않아"), "{}", log_text(&status));
+        let (result, _) = ask(&app, "다시").await;
+        assert_eq!(result.unwrap().answer, "둘째");
+        let requests = scripted.requests();
+        assert_eq!(requests.len(), 3, "{provider}");
+        assert!(!tool_names(&requests[2]).contains(&"fake__echo".to_owned()));
+        // Another model endpoint is offered it; a reconnect asked for offers
+        // it again (the server may have fixed it).
+        let mut other = config.clone();
+        other.llm.model = "other-model".into();
+        assert!(app.mcp.snapshot(&other).find("fake__echo").is_some());
+        assert!(app.mcp.snapshot(&config).find("fake__echo").is_none());
+        assert!(app.mcp.restart("fake"));
+        wait_for(&app.mcp, "fake", |s| s["state"] == "ready" && s["restarts"] == 1).await;
+        assert!(app.mcp.snapshot(&config).find("fake__echo").is_some());
+        app.mcp.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_naming_no_mcp_tool_still_fails_the_question() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("fake", &["echo"], &[])]);
+    let scripted = Scripted::new(vec![text("끝")]);
+    // Refuses the agent's own search tool: nothing of MCP to leave out.
+    let refusal: Refusal = |name, at| format!(r#"http_400: {{"error":{{"message":"Invalid schema for function '{name}'","param":"tools[{at}]"}}}}"#);
+    let llm = std::sync::Arc::new(Picky { inner: scripted.clone(), name: "search".into(), refusal });
+    let (app, _dir) = app(config.clone(), llm);
+    app.mcp.apply(&config.mcp_servers);
+    ready(&app.mcp, "fake").await;
+    let (result, _) = ask(&app, "에코").await;
+    let error = result.err().expect("refused");
+    assert!(error.to_string().starts_with("http_400:"), "{error:#}");
+    assert_eq!(scripted.requests().len(), 1);
+    assert!(app.mcp.snapshot(&config).find("fake__echo").is_some(), "no MCP tool was blamed");
+    app.mcp.shutdown().await;
+}
+
+/// Mcp review, eleventh pass: "*" on servers with many tools sent requests
+/// past the 128 tools OpenAI takes, and every question failed.
+#[tokio::test]
+async fn a_request_defines_at_most_the_tool_limit() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("many", &["*"], &[("FAKE_MCP_MANY", "150")])]);
+    let llm = Scripted::new(vec![text("끝"), text("둘째")]);
+    let (app, _dir) = app(config.clone(), llm.clone());
+    app.mcp.apply(&config.mcp_servers);
+    let status = ready(&app.mcp, "many").await;
+    let listed = status["tools"].as_array().unwrap().len();
+    assert!(listed > llm_agent::mcp::MAX_REQUEST_TOOLS, "{listed}");
+    let (result, _) = ask(&app, "안녕").await;
+    assert_eq!(result.unwrap().answer, "끝");
+    let (result, _) = ask(&app, "또").await;
+    assert_eq!(result.unwrap().answer, "둘째");
+    let requests = llm.requests();
+    for request in &requests {
+        let names = tool_names(request);
+        assert!(names.len() <= llm_agent::mcp::MAX_REQUEST_TOOLS, "{}", names.len());
+        assert!(names.contains(&"search".to_owned()), "the agent's own tools first");
+        // Room is kept for the history tool a later round adds.
+        assert_eq!(names.len(), llm_agent::mcp::MAX_REQUEST_TOOLS - 1, "every place the limit leaves is used");
+    }
+    // Said once in the server's log, not at every question.
+    let log = log_text(&app.mcp.server_status("many", MODEL).unwrap());
+    assert_eq!(log.matches("개까지만 싣고").count(), 1, "{log}");
     app.mcp.shutdown().await;
 }
 

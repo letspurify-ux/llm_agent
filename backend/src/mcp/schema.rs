@@ -151,7 +151,62 @@ pub fn parameters(schema: &Value) -> Value {
     let mut budget = REF_EXPANSIONS;
     let mut value = Value::Object(out);
     expand(&mut value, &definitions, 0, &mut budget);
+    tidy(&mut value, 0);
     value
+}
+
+/// Nested subschemas are tidied this deep at most (a deeper one a provider
+/// refuses leaves out its tool alone, see `Snapshot::refused_in`).
+const TIDY_DEPTH: usize = 64;
+
+/// A schema and its subschemas as providers take them, accepting what they
+/// accepted. A provider refuses the whole request over one subschema:
+/// OpenAI and Gemini an array without `items` ("array schema missing
+/// items"), or `properties` that is no object (PHP servers send an empty
+/// one as `[]`). Subschemas are found where JSON Schema puts them, not by
+/// key anywhere: a property may be named "items".
+fn tidy(schema: &mut Value, depth: usize) {
+    let Value::Object(fields) = schema else {
+        return;
+    };
+    if depth > TIDY_DEPTH {
+        return;
+    }
+    let is = |kind: &str| fields.get("type").is_some_and(|t| t == kind || t.as_array().is_some_and(|types| types.iter().any(|t| t == kind)));
+    let (array, object) = (is("array"), is("object"));
+    if array && !fields.get("items").is_some_and(|items| items.is_object() || items.is_array() || *items == false) {
+        fields.insert("items".into(), json!({}));
+    }
+    if fields.get("properties").is_some_and(|p| !p.is_object()) || (object && !fields.contains_key("properties")) {
+        fields.insert("properties".into(), json!({}));
+    }
+    if fields.get("required").is_some_and(|r| !r.as_array().is_some_and(|r| r.iter().all(Value::is_string))) {
+        fields.remove("required");
+    }
+    for (key, sub) in fields.iter_mut() {
+        match (key.as_str(), sub) {
+            ("properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas", Value::Object(named)) => {
+                for sub in named.values_mut() {
+                    // `true` accepts anything, as `{}` does.
+                    if *sub == true {
+                        *sub = json!({});
+                    }
+                    tidy(sub, depth + 1);
+                }
+            }
+            ("anyOf" | "oneOf" | "allOf" | "prefixItems" | "items", Value::Array(list)) => {
+                for sub in list {
+                    tidy(sub, depth + 1);
+                }
+            }
+            (
+                "items" | "additionalProperties" | "additionalItems" | "unevaluatedItems" | "unevaluatedProperties" | "not" | "contains"
+                | "if" | "then" | "else" | "propertyNames",
+                sub,
+            ) => tidy(sub, depth + 1),
+            _ => {}
+        }
+    }
 }
 
 fn expand(value: &mut Value, definitions: &Map<String, Value>, depth: usize, budget: &mut usize) {
@@ -261,6 +316,68 @@ mod tests {
         assert_eq!(parameters(&json!({"type":["object","null"],"properties":{"a":{"type":"string"}}}))["properties"]["a"]["type"], "string");
     }
 
+    /// The first subschema a provider refuses (an array without `items`,
+    /// `properties` that is no object), walked as JSON Schema nests them.
+    fn refused_part(schema: &Value, path: &str) -> Option<String> {
+        let fields = schema.as_object()?;
+        let is = |kind: &str| fields.get("type").is_some_and(|t| t == kind || t.as_array().is_some_and(|ts| ts.iter().any(|t| t == kind)));
+        if is("array") && !fields.get("items").is_some_and(|i| i.is_object() || i.is_array() || *i == false) {
+            return Some(format!("{path} (array without items)"));
+        }
+        if fields.get("properties").is_some_and(|p| !p.is_object()) || (is("object") && !fields.contains_key("properties")) {
+            return Some(format!("{path} (properties)"));
+        }
+        for (key, sub) in fields {
+            let found = match (key.as_str(), sub) {
+                ("properties" | "patternProperties" | "$defs" | "definitions", Value::Object(named)) => named
+                    .iter()
+                    .find_map(|(name, sub)| if *sub == true { Some(format!("{path}/{key}/{name} (true)")) } else { refused_part(sub, &format!("{path}/{key}/{name}")) }),
+                ("anyOf" | "oneOf" | "allOf" | "prefixItems" | "items", Value::Array(list)) => {
+                    list.iter().enumerate().find_map(|(i, sub)| refused_part(sub, &format!("{path}/{key}/{i}")))
+                }
+                ("items" | "additionalProperties" | "not", sub) => refused_part(sub, &format!("{path}/{key}")),
+                _ => None,
+            };
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn nested_schemas_are_put_as_providers_take_them() {
+        let schema = json!({"type":"object","properties":{
+            "tags":{"type":"array","description":"labels"},
+            "maybe":{"type":["array","null"]},
+            "rows":{"type":"array","items":{"type":"object","properties":[],"required":"id"}},
+            "pairs":{"type":"array","items":[{"type":"string"},{"type":"array"}]},
+            "map":{"type":"object","additionalProperties":{"type":"array"}},
+            "any":true,
+            "items":{"type":"string"},
+            "choice":{"anyOf":[{"type":"array"},{"type":"string"}]},
+            "nested":{"type":"object"}
+        }});
+        let p = parameters(&schema);
+        let props = &p["properties"];
+        assert_eq!(props["tags"], json!({"type":"array","description":"labels","items":{}}));
+        assert_eq!(props["maybe"]["items"], json!({}));
+        assert_eq!(props["rows"]["items"], json!({"type":"object","properties":{}}), "a PHP [] and a bad required");
+        assert_eq!(props["pairs"]["items"][1]["items"], json!({}), "tuple items are left as they are, each tidied");
+        assert_eq!(props["map"]["additionalProperties"]["items"], json!({}));
+        assert_eq!(props["any"], json!({}));
+        assert_eq!(props["items"], json!({"type":"string"}), "a property named items is a property");
+        assert_eq!(props["choice"]["anyOf"][0]["items"], json!({}));
+        assert_eq!(props["nested"], json!({"type":"object","properties":{}}));
+        assert_eq!(refused_part(&p, ""), None);
+        // A schema already right is left as it is.
+        let right = json!({"type":"object","properties":{"q":{"type":"string"},"ids":{"type":"array","items":{"type":"integer"}}},"required":["q"]});
+        assert_eq!(parameters(&right), right);
+        // An inlined definition is tidied too.
+        let referenced = json!({"type":"object","properties":{"f":{"$ref":"#/$defs/F"}},"$defs":{"F":{"type":"array"}}});
+        assert_eq!(parameters(&referenced)["properties"]["f"], json!({"type":"array","items":{}}));
+    }
+
     #[test]
     fn a_self_referencing_tree_stays_small() {
         let schema = json!({"type":"object","properties":{"root":{"$ref":"#/$defs/T"}},
@@ -311,6 +428,9 @@ mod tests {
             let p = parameters(&schema);
             assert_eq!(p["type"], "object", "{schema}");
             assert!(p["properties"].is_object(), "{schema}");
+            if let Some(path) = refused_part(&p, "") {
+                panic!("{path} would be refused: {p} from {schema}");
+            }
             assert!(p.get("required").is_none_or(|r| r.as_array().is_some_and(|r| r.iter().all(Value::is_string))));
             for key in ["anyOf", "oneOf", "allOf", "not", "$defs", "definitions", "$schema"] {
                 assert!(p.get(key).is_none(), "{key} left at the top: {schema}");

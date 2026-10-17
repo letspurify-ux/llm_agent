@@ -65,6 +65,10 @@ const MAX_LIST_PAGES: usize = 100;
 /// Tools kept from one server: the admin screen lists every one, and "*"
 /// would put them all in each request.
 const MAX_TOOLS: usize = 1_000;
+/// Notes kept of one listing (a tool left out, a schema read leniently):
+/// a thousand faulty tools would push the rest out of the server's log and
+/// fill the console at each reconnection.
+const MAX_NOTES: usize = 20;
 /// Bytes of one tool's parameter schema. Past it the tool is left out: a
 /// definition that size fills a request on its own.
 const MAX_SCHEMA_BYTES: usize = 64 * 1024;
@@ -78,6 +82,11 @@ const MAX_INSTRUCTIONS_CHARS: usize = 8_000;
 const RELIST_WAIT: Duration = Duration::from_secs(1);
 /// Characters of a server description in the system prompt.
 const PROMPT_DESCRIPTION_CHARS: usize = 1_000;
+/// Tools one request may define: OpenAI refuses more ("array too long",
+/// `array_above_max_length`), and no model chooses well among as many.
+pub const MAX_REQUEST_TOOLS: usize = 128;
+/// Characters of a provider's refusal kept with the tool it refused.
+const REFUSAL_CHARS: usize = 300;
 /// Environment variables a command inherits from the backend: what programs
 /// need to run, find their files and reach the network — not the backend's
 /// own settings and secrets (`.env` joins the process environment). The
@@ -206,12 +215,38 @@ struct RemoteTool {
     /// Its tokens for a model, counted once: the admin screen asks every
     /// few seconds, and a server may list a thousand tools.
     tokens: Mutex<Option<(String, usize)>>,
+    /// A model endpoint that refused this definition: it is left out of the
+    /// questions sent there, until the definition changes (a new tool) or
+    /// the server is reconnected on request.
+    refused: Mutex<Option<Refusal>>,
+}
+
+#[derive(Clone, Debug)]
+struct Refusal {
+    endpoint: String,
+    model: String,
+    reason: String,
+    at: String,
+}
+
+/// The model endpoint questions are sent to: a definition one refuses
+/// another may take.
+fn endpoint(config: &Config) -> String {
+    format!("{} {}", config.llm.base_url.trim().trim_end_matches('/'), config.llm.model)
 }
 
 impl RemoteTool {
     fn new(name: String, exposed: String, title: Option<String>, description: String, parameters: Value, annotations: Value) -> Self {
         let definition = schema::definition(&exposed, &description, &parameters);
-        Self { name, exposed, title, description, parameters, annotations, definition, tokens: Mutex::new(None) }
+        Self { name, exposed, title, description, parameters, annotations, definition, tokens: Mutex::new(None), refused: Mutex::new(None) }
+    }
+
+    fn refusal(&self) -> Option<Refusal> {
+        self.refused.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    fn refused_by(&self, endpoint: &str) -> bool {
+        self.refusal().is_some_and(|r| r.endpoint == endpoint)
     }
 
     fn same(&self, other: &RemoteTool) -> bool {
@@ -395,11 +430,13 @@ impl Slot {
 }
 
 /// Everything the connection is made from: command or URL with their
-/// arguments, folder, environment and headers, secrets included.
+/// arguments, folder, environment and headers, secrets included — and the
+/// name, which starts the tool names (a server renamed "Jira" → "jira" is
+/// listed again, or its tools keep "Jira__").
 fn connection_key(server: &McpServer) -> String {
     use sha2::{Digest, Sha256};
     let secrets = |values: &BTreeMap<String, Secret>| values.iter().map(|(k, v)| (k.clone(), v.0.clone())).collect::<Vec<_>>();
-    let key = json!([server.enabled, server.command, server.args, server.cwd, server.url, server.env, server.headers,
+    let key = json!([server.name, server.enabled, server.command, server.args, server.cwd, server.url, server.env, server.headers,
         secrets(&server.secret_env), secrets(&server.secret_headers)]);
     hex::encode(Sha256::digest(key.to_string().as_bytes()))
 }
@@ -452,6 +489,52 @@ impl Snapshot {
             several => Err(several.iter().map(|t| t.exposed.clone()).collect()),
         }
     }
+    /// The offered tools a provider's refusal of a request names: by name
+    /// (OpenAI: "Invalid schema for function 'jira__search'"), or else by
+    /// their place among the request's `definitions` (Gemini
+    /// "function_declarations[12]", Anthropic "tools.12.custom").
+    pub fn refused_in(&self, refusal: &str, definitions: &[Value]) -> Vec<String> {
+        let named: Vec<String> = self.names().filter(|name| mentions(refusal, name)).map(str::to_owned).collect();
+        if !named.is_empty() {
+            return named;
+        }
+        let place = regex::Regex::new(r"function_declarations\[(\d+)\]").unwrap().captures(refusal)
+            .or_else(|| regex::Regex::new(r"\btools(?:\.|\[)(\d+)\b").unwrap().captures(refusal))
+            .and_then(|c| c[1].parse::<usize>().ok());
+        place
+            .and_then(|at| definitions.get(at))
+            .and_then(|definition| definition["function"]["name"].as_str())
+            .filter(|name| self.find(name).is_some())
+            .map(|name| vec![name.to_owned()])
+            .unwrap_or_default()
+    }
+
+    /// Leaves the tools out of the questions sent to this model endpoint,
+    /// each server's log saying why.
+    pub fn refuse(&self, names: &[String], config: &Config, refusal: &str) {
+        let reason = crate::text::single_line(refusal).chars().take(REFUSAL_CHARS).collect::<String>();
+        for tool in self.tools.iter().filter(|t| names.contains(&t.exposed)) {
+            *tool.remote.refused.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(Refusal { endpoint: endpoint(config), model: config.llm.model.clone(), reason: reason.clone(), at: now() });
+            if let Some(slot) = tool.hub.slots().into_iter().find(|s| s.server().name.eq_ignore_ascii_case(&tool.server)) {
+                slot.log(
+                    "event",
+                    &format!(
+                        "모델 {}이(가) 도구 {}의 정의를 받지 않아, 이 모델에는 이 도구를 빼고 질문합니다(서버가 정의를 고치거나 '다시 연결'하면 다시 싣습니다): {reason}",
+                        config.llm.model, tool.exposed
+                    ),
+                );
+            }
+        }
+    }
+
+    /// The snapshot without these tools (and the servers left without any).
+    pub fn without(&self, names: &[String]) -> Snapshot {
+        let tools: Vec<Arc<Offered>> = self.tools.iter().filter(|t| !names.contains(&t.exposed)).cloned().collect();
+        let servers = self.servers.iter().filter(|(name, _)| tools.iter().any(|t| &t.server == name)).cloned().collect();
+        Snapshot { tools: Arc::new(tools), servers: Arc::new(servers) }
+    }
+
     /// The system prompt section naming the servers whose tools are offered
     /// (empty when none is).
     pub fn prompt(&self) -> String {
@@ -638,6 +721,9 @@ pub struct McpHub {
     /// Set by `shutdown`: the admin API still answers during the
     /// connections' grace, and a save then must not start servers again.
     closed: Arc<std::sync::atomic::AtomicBool>,
+    /// Allowed tools the last question left out for the tool limit of a
+    /// request: logged when they change, not at every question.
+    left_out: Arc<Mutex<Vec<String>>>,
 }
 
 impl McpHub {
@@ -715,10 +801,14 @@ impl McpHub {
         let _ = tokio::time::timeout(Duration::from_secs(CLOSE_SECS + 1), futures_util::future::join_all(tasks)).await;
     }
 
-    /// Reconnects a server now. False when no enabled server has the name.
+    /// Reconnects a server now, its tools offered again to a model that
+    /// refused them. False when no enabled server has the name.
     pub fn restart(&self, name: &str) -> bool {
         match self.slots().into_iter().find(|s| s.server().name.eq_ignore_ascii_case(name)) {
             Some(slot) if slot.server().enabled => {
+                for tool in slot.state().tools.iter() {
+                    *tool.refused.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                }
                 let finished = slot.task.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_none_or(|t| t.is_finished());
                 if finished && !slot.stop.is_cancelled() {
                     spawn_supervisor(&slot);
@@ -733,9 +823,19 @@ impl McpHub {
 
     /// The allowed tools of the connected servers.
     pub fn snapshot(&self, config: &Config) -> Snapshot {
+        self.snapshot_within(config, usize::MAX)
+    }
+
+    /// The allowed tools of the connected servers, `room` at most (the
+    /// tools a request may define beside the agent's own): those past it,
+    /// in server and tool order, are left out and logged. Tools the model
+    /// endpoint refused are left out too.
+    pub fn snapshot_within(&self, config: &Config, room: usize) -> Snapshot {
+        let endpoint = endpoint(config);
         let mut tools: Vec<Arc<Offered>> = vec![];
         let mut servers = vec![];
         let mut names = std::collections::BTreeSet::new();
+        let mut left_out: Vec<(Arc<Slot>, String)> = vec![];
         for slot in self.slots() {
             let server = slot.server();
             let listed = {
@@ -747,10 +847,14 @@ impl McpHub {
             };
             let timeout = Duration::from_secs(server.timeout_secs.unwrap_or(config.agent.tool_timeout_secs));
             let before = tools.len();
-            for tool in listed.iter().filter(|t| allows(&server.tools, &t.name, &t.exposed)) {
+            for tool in listed.iter().filter(|t| allows(&server.tools, &t.name, &t.exposed) && !t.refused_by(&endpoint)) {
                 // Names are unique by construction; a request with one twice
                 // is refused by providers, so a twin is left out regardless.
                 if !names.insert(tool.exposed.to_ascii_lowercase()) {
+                    continue;
+                }
+                if tools.len() >= room {
+                    left_out.push((slot.clone(), tool.exposed.clone()));
                     continue;
                 }
                 tools.push(Arc::new(Offered {
@@ -766,7 +870,39 @@ impl McpHub {
                 servers.push((server.name.clone(), server.description.clone()));
             }
         }
+        self.note_left_out(&left_out, room);
         Snapshot { tools: Arc::new(tools), servers: Arc::new(servers) }
+    }
+
+    /// Logs the tools a question left out for the tool limit, in the log of
+    /// each server they belong to, when they are not those of the last time.
+    fn note_left_out(&self, left_out: &[(Arc<Slot>, String)], room: usize) {
+        let names: Vec<String> = left_out.iter().map(|(_, name)| name.clone()).collect();
+        {
+            let mut last = self.left_out.lock().unwrap_or_else(|p| p.into_inner());
+            if *last == names {
+                return;
+            }
+            *last = names;
+        }
+        let mut by_slot: Vec<(&Arc<Slot>, Vec<&str>)> = vec![];
+        for (slot, name) in left_out {
+            match by_slot.iter_mut().find(|(known, _)| Arc::ptr_eq(known, slot)) {
+                Some((_, names)) => names.push(name),
+                None => by_slot.push((slot, vec![name])),
+            }
+        }
+        for (slot, names) in by_slot {
+            let more = if names.len() > 10 { format!(" 외 {}개", names.len() - 10) } else { String::new() };
+            slot.log(
+                "event",
+                &format!(
+                    "한 요청에 실을 수 있는 도구는 {MAX_REQUEST_TOOLS}개(OpenAI 한도)라 MCP 도구는 {room}개까지만 싣고, 이 서버의 허용 도구 {}개를 빼고 질문합니다: {}{more}. 허용 도구를 줄여주세요",
+                    names.len(),
+                    names[..names.len().min(10)].join(", ")
+                ),
+            );
+        }
     }
 
     /// Every server with its state, tools, call statistics and recent
@@ -788,6 +924,13 @@ impl McpHub {
 /// sees it (`server__tool`); "*" allows every tool.
 fn allows(allowed: &[String], tool: &str, exposed: &str) -> bool {
     allowed.iter().any(|a| a == "*" || a == tool || a == exposed)
+}
+
+/// Whether `text` names `name` whole, not as part of a longer name.
+fn mentions(text: &str, name: &str) -> bool {
+    let part = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    text.match_indices(name)
+        .any(|(at, _)| !text[..at].chars().next_back().is_some_and(part) && !text[at + name.len()..].chars().next().is_some_and(part))
 }
 
 /// Allow-list entries no listed tool answers to (a misspelling).
@@ -821,6 +964,7 @@ fn slot_status(slot: &Arc<Slot>, model: &str) -> Value {
             json!({
                 "name":tool.name,"exposed":tool.exposed,"title":tool.title,"description":tool.description,
                 "annotations":tool.annotations,"allowed":allows(&server.tools, &tool.name, &tool.exposed),
+                "refused":tool.refusal().map(|r| json!({"model":r.model,"reason":r.reason,"at":r.at})),
                 "tokens":tool.tokens(model),
                 "calls":stats.calls,"failures":stats.failures,"cancelled":stats.cancelled,
                 "avg_ms":stats.total_ms.checked_div(stats.calls),"last_ms":(stats.calls > 0).then_some(stats.last_ms),
@@ -979,11 +1123,12 @@ async fn serve(slot: &Arc<Slot>, server: &McpServer, connection: &mut Connection
                 .and_then(|info| serde_json::to_value(&*info).ok())
                 .unwrap_or(Value::Null);
             let described = describe_server(&info);
+            // A tool listed again unchanged on a new connection keeps what
+            // was learned of it: its tokens, a model's refusal.
+            slot.set_tools(tools);
             {
                 let mut state = slot.state();
                 state.info = server_info(&info);
-                state.stats.retain(|name, _| tools.iter().any(|t| &t.name == name));
-                state.tools = tools;
                 state.peer = Some(connection.peer.clone());
                 state.broken = Some(connection.broken.clone());
                 state.transport_error = None;
@@ -1206,6 +1351,11 @@ async fn list_tools(peer: &Peer<RoleClient>, server: &str) -> Result<Listed> {
             _ => bail!("tools/list에 도구 목록이 아닌 응답이 왔습니다"),
         };
         raw.extend(listed["tools"].as_array().cloned().unwrap_or_default());
+        // Past the tools kept, the pages after are not read (each may be
+        // as large as a message).
+        if raw.len() > MAX_TOOLS {
+            break;
+        }
         match listed["nextCursor"].as_str().filter(|c| !c.is_empty()) {
             None => break,
             Some(next) if page >= MAX_LIST_PAGES || !cursors.insert(next.to_owned()) => {
@@ -1217,7 +1367,7 @@ async fn list_tools(peer: &Peer<RoleClient>, server: &str) -> Result<Listed> {
     }
     let mut kept: Vec<Value> = vec![];
     if raw.len() > MAX_TOOLS {
-        notes.push(format!("도구가 {}개라 앞의 {MAX_TOOLS}개만 받았습니다", raw.len()));
+        notes.push(format!("도구가 {MAX_TOOLS}개를 넘어 앞의 {MAX_TOOLS}개만 받았습니다"));
         raw.truncate(MAX_TOOLS);
     }
     for tool in raw {
@@ -1257,6 +1407,11 @@ async fn list_tools(peer: &Peer<RoleClient>, server: &str) -> Result<Listed> {
             ))
         })
         .collect();
+    if notes.len() > MAX_NOTES {
+        let more = notes.len() - MAX_NOTES;
+        notes.truncate(MAX_NOTES);
+        notes.push(format!("그 밖의 기록 {more}건은 줄였습니다"));
+    }
     Ok(Listed { tools, notes })
 }
 
@@ -1793,6 +1948,22 @@ mod tests {
         let mut c = a.clone();
         c.enabled = false;
         assert_ne!(connection_key(&a), connection_key(&c));
+        let mut d = a.clone();
+        d.name = "X".into();
+        assert_ne!(connection_key(&a), connection_key(&d), "the name starts the tool names");
+    }
+
+    #[test]
+    fn a_refusal_names_a_tool_whole() {
+        let refusal = r#"http_400: {"message":"Invalid schema for function 'jira__search': bad"}"#;
+        assert!(mentions(refusal, "jira__search"));
+        for longer in ["jira__searc", "ira__search"] {
+            assert!(!mentions(refusal, longer), "{longer}");
+        }
+        assert!(!mentions("jira__search_all failed", "jira__search"));
+        assert!(!mentions("x-jira__search failed", "jira__search"));
+        assert!(!mentions("jira__search-x failed", "jira__search"));
+        assert!(mentions("tool jira__search.", "jira__search"));
     }
 
     #[test]

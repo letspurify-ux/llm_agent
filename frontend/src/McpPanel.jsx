@@ -156,12 +156,13 @@ export default function McpPanel({ api, onStateChange }) {
               const allowed = tools.filter(tool => tool.allowed).length;
               const calls = tools.reduce((sum, tool) => sum + tool.calls, 0);
               const failures = tools.reduce((sum, tool) => sum + tool.failures, 0);
+              const refused = tools.filter(tool => tool.allowed && tool.refused).length;
               return <button type="button" key={server.name} className={`admin-record${selected === server.name ? ' selected' : ''}`}
                 aria-pressed={selected === server.name} disabled={busy} onClick={() => open(server)}>
                 <span className={`admin-mcp-state ${state}`}>{STATE_LABELS[state] || state}</span>
                 <span className="admin-record-copy"><strong>{server.name} <small>{server.transport === 'http' ? 'HTTP' : '명령'}</small></strong>
                   <span>{server.status?.error || server.description || '설명이 없습니다.'}</span>
-                  <span>도구 {allowed}/{tools.length} 허용 · 호출 {calls}회{failures ? ` · 실패 ${failures}회` : ''}</span></span>
+                  <span>도구 {allowed}/{tools.length} 허용 · 호출 {calls}회{failures ? ` · 실패 ${failures}회` : ''}{refused ? ` · 모델이 받지 않은 도구 ${refused}개` : ''}</span></span>
                 <span className="admin-record-arrow" aria-hidden="true">↗</span>
               </button>;
             })}
@@ -231,6 +232,7 @@ export default function McpPanel({ api, onStateChange }) {
                       <input type="checkbox" disabled={form.allTools} checked={isAllowed(form, tool)} onChange={e => toggle(tool, e.target.checked)} />
                       <span><strong>{tool.name}</strong>{tool.missing ? <em> 지금 목록에 없음</em> : <>
                         {hints.readOnlyHint && <em className="safe"> 읽기 전용</em>}{hints.destructiveHint && <em> 변경·삭제 가능</em>}
+                        {tool.refused && <em title={tool.refused.reason}> 모델 {tool.refused.model}이(가) 정의를 받지 않아 빠짐('다시 연결'하면 다시 시도)</em>}
                         {tool.tokens ? <small> · 약 {tool.tokens.toLocaleString()} 토큰</small> : null}
                         {tool.description && <span className="admin-mcp-tool-description">{tool.description}</span>}</>}</span>
                     </label>;
@@ -274,7 +276,8 @@ function ServerStatus({ status }) {
     {status.tools.length > 0 && <div className="admin-mcp-table"><table>
       <thead><tr><th>도구</th><th>허용</th><th>호출</th><th>실패</th><th>취소</th><th>평균</th><th>최근 오류</th></tr></thead>
       <tbody>{status.tools.map(tool => <tr key={tool.name}>
-        <td title={tool.exposed}>{tool.name}</td><td>{tool.allowed ? '✓' : ''}</td><td>{tool.calls}</td><td>{tool.failures || ''}</td><td>{tool.cancelled || ''}</td>
+        <td title={tool.exposed}>{tool.name}</td>
+        <td>{!tool.allowed ? '' : tool.refused ? <span className="admin-check-fail" title={`모델 ${tool.refused.model}이(가) 정의를 받지 않음: ${tool.refused.reason}`}>✓ 빠짐</span> : '✓'}</td><td>{tool.calls}</td><td>{tool.failures || ''}</td><td>{tool.cancelled || ''}</td>
         <td>{tool.avg_ms != null ? `${tool.avg_ms.toLocaleString()} ms` : ''}</td><td className="admin-mcp-error">{tool.last_error || ''}</td>
       </tr>)}</tbody>
     </table></div>}

@@ -61,6 +61,7 @@ for (let i = 0; i < Number(env.FAKE_MCP_MANY || 0); i++) tools.push({ name: `man
 let listed = 0;
 if (env.FAKE_MCP_BUILTIN_NAME) tools.push({ name: 'history', description: 'A tool named like one of the agent\'s own.', inputSchema: { type: 'object' } });
 if (env.FAKE_MCP_DUPLICATE) tools.push({ name: 'echo', description: 'A second echo.', inputSchema: { type: 'object' } });
+for (let i = 0; i < Number(env.FAKE_MCP_MANY_BAD || 0); i++) tools.push({ name: `bad_${i}`, description: 'a schema that is a string', inputSchema: 'nope' });
 if (env.FAKE_MCP_BAD_LIST) tools.push({ name: 'no_schema', description: 'A tool without inputSchema.' }, { name: 'string_schema', description: 'A tool whose schema is a string.', inputSchema: 'nope' });
 const cancelled = new Set();
 let limitedCalls = 0;
@@ -96,6 +97,7 @@ async function handle(message, notify) {
   if (method === 'tools/list') {
     listed += 1;
     if (env.FAKE_MCP_LIST_STORM) { log(`listed ${listed}`); setTimeout(() => notify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }), 0); }
+    if (env.FAKE_MCP_LOG_LISTS) log(`listed ${listed}`);
     if (env.FAKE_MCP_HANG_LIST) return new Promise(() => {});
     const start = env.FAKE_MCP_CURSOR_LOOP ? 0 : Number(params.cursor || 0);
     const page = tools.slice(start, start + PAGE);

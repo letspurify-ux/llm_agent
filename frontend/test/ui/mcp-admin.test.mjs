@@ -40,7 +40,7 @@ test('MCP 탭 서버 목록·상태·허용 도구 저장·비밀값 지우기·
       revision: '1'.repeat(64),
       status: { name: 'jira', enabled: true, transport: 'stdio', state: 'ready', since: '2026-10-17T01:00:00Z', error: null, restarts: 2, retry_at: null, pid: 42,
         server_info: { name: 'jira-mcp', version: '0.9.0', protocol_version: '2025-06-18', instructions: '검색 먼저 하세요' },
-        tools: [tool('search', true, { annotations: { readOnlyHint: true }, calls: 3, failures: 1, avg_ms: 120, last_error: 'mcp_timeout: 느림' }), tool('delete_issue', false, { annotations: { destructiveHint: true } })],
+        tools: [tool('search', true, { annotations: { readOnlyHint: true }, calls: 3, failures: 1, avg_ms: 120, last_error: 'mcp_timeout: 느림', refused: { model: 'gpt-4o', reason: 'http_400: Invalid schema for function', at: '2026-10-17T01:00:00Z' } }), tool('delete_issue', false, { annotations: { destructiveHint: true } })],
         log: [{ at: '2026-10-17T01:00:00Z', source: 'event', text: '연결됨: jira-mcp 0.9.0' }] },
     }] };
     window.__requests = [];
@@ -83,15 +83,15 @@ test('MCP 탭 서버 목록·상태·허용 도구 저장·비밀값 지우기·
   await clickText('.admin-tabs button', '06');
   await page.until(`!!document.querySelector('.admin-mcp .admin-record')`);
   const card = await page.eval(`document.querySelector('.admin-mcp .admin-record').innerText`);
-  for (const part of ['준비됨', 'jira', '도구 1/2 허용', '호출 3회', '실패 1회']) assert.ok(card.includes(part), `${part} in ${card}`);
+  for (const part of ['준비됨', 'jira', '도구 1/2 허용', '호출 3회', '실패 1회', '모델이 받지 않은 도구 1개']) assert.ok(card.includes(part), `${part} in ${card}`);
 
   // 열면 상태·호출 현황·기록이 보이고, 허용 도구를 바꿔 저장하면 If-Match와 바뀐 목록이 간다.
   await click('.admin-mcp .admin-record');
   await page.until(`!!document.querySelector('.admin-mcp-status table')`);
   const status = await page.eval(`document.querySelector('.admin-mcp-status').innerText`);
-  for (const part of ['재연결', '2회', 'jira-mcp 0.9.0', '120 ms', 'mcp_timeout: 느림', '연결됨: jira-mcp 0.9.0']) assert.ok(status.includes(part), `${part} in status`);
+  for (const part of ['재연결', '2회', 'jira-mcp 0.9.0', '120 ms', 'mcp_timeout: 느림', '연결됨: jira-mcp 0.9.0', '✓ 빠짐']) assert.ok(status.includes(part), `${part} in status`);
   const hints = await page.eval(`document.querySelector('.admin-mcp-tools').innerText`);
-  assert.ok(hints.includes('읽기 전용') && hints.includes('변경·삭제 가능'), hints);
+  assert.ok(hints.includes('읽기 전용') && hints.includes('변경·삭제 가능') && hints.includes('모델 gpt-4o이(가) 정의를 받지 않아 빠짐'), hints);
   assert.equal(await page.eval(`document.querySelector('.admin-form-actions [type=submit]').disabled`), true, '바뀐 것이 없으면 저장하지 않는다');
   await page.eval(`[...document.querySelectorAll('.admin-mcp-tools label')].find(l => l.innerText.startsWith('delete_issue')).querySelector('input').click()`);
   await clickText('.admin-mcp-secrets button', '지우기');

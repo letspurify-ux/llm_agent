@@ -201,8 +201,9 @@ async fn run(
         .push(vec![json!({"role":"user","content":message})], true);
     let model = config.llm.model.clone();
     // The MCP tools of this question: the same definitions and system prompt
-    // in every request, so a provider's prefix cache keeps them.
-    let mcp = app.mcp.snapshot(config);
+    // in every request, so a provider's prefix cache keeps them. A request
+    // defines `MAX_REQUEST_TOOLS` at most, the agent's own tools first.
+    let mut mcp = app.mcp.snapshot_within(config, mcp::MAX_REQUEST_TOOLS.saturating_sub(most_agent_tools(config)));
     // Definitions past twice the context cannot fit, whatever the
     // calibration (at least half the local count): said before a request
     // with them all is counted.
@@ -210,7 +211,7 @@ async fn run(
         eprintln!("[mcp] the allowed MCP tools' definitions (~{} tokens) are past twice the context", mcp.tokens(&model));
         bail!(UserFacing(MCP_TOO_LARGE.into()));
     }
-    let system = context::system_prompt(&mcp.prompt());
+    let mut system = context::system_prompt(&mcp.prompt());
     let deadline = timing.started + Duration::from_secs(config.agent.run_seconds);
     let mut trace: Vec<Value> = vec![];
     let mut tracker = FailureTracker::default();
@@ -524,6 +525,28 @@ async fn run(
                         bail!(if undercounted { too_long(false, true) } else { UserFacing(SERVED_SMALLER.into()) });
                     }
                     bail!(too_long(true, !only_question));
+                }
+                // A model endpoint that does not take an MCP tool's
+                // definition (a schema it refuses) refuses every request the
+                // tool is in: the question goes on without the tools its
+                // refusal names, and later questions sent there leave them
+                // out. Not so for a request sent without its tools, whose
+                // refusal is not about them.
+                let tools_sent = !error
+                    .downcast_ref::<crate::llm::CompletionError>()
+                    .is_some_and(|e| e.tools_dropped());
+                if tools_sent && (refusal.starts_with("http_400:") || refusal.starts_with("http_422:")) {
+                    let refused = mcp.refused_in(&refusal, &definitions);
+                    if !refused.is_empty() {
+                        eprintln!("[mcp] the model endpoint refused the definitions of {}; asking without them", refused.join(", "));
+                        mcp.refuse(&refused, config, &refusal);
+                        mcp = mcp.without(&refused);
+                        system = context::system_prompt(&mcp.prompt());
+                        discard();
+                        rounds -= 1;
+                        notice = round_notice;
+                        continue;
+                    }
                 }
                 // Tool calls that cannot be used (arguments that are not one
                 // JSON object, an empty or repeated call ID, too many calls):
@@ -879,6 +902,13 @@ fn last_is_partial(c: &Conversation) -> bool {
         .back()
         .and_then(|b| b.messages.first())
         .is_some_and(|m| m["partial"] == true)
+}
+
+/// The agent's own tools a round defines at most (`offered_tools` with the
+/// history tool): a request's other tools are the MCP tools'.
+fn most_agent_tools(config: &Config) -> usize {
+    let source = if config.projects.is_empty() { 0 } else { ToolRegistry::source_specs().iter().filter(|s| s.source).count() };
+    voc_tools::specs().len() + source + 1
 }
 
 /// Tools defined this round: the knowledge and query tools always, the
