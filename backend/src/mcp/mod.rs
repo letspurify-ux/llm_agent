@@ -2147,24 +2147,33 @@ fn http_config(server: &McpServer) -> Result<StreamableHttpClientTransportConfig
 pub async fn probe(server: &McpServer, model: &str) -> Result<Value> {
     validate_server(server)?;
     let slot = Slot::new(server.clone());
-    let outcome = tokio::time::timeout(Duration::from_secs(CONNECT_SECS), async {
-        let connection = connect(&slot, server).await?;
-        // Said as the supervisor says it: which step failed.
-        let listed = list_tools(&connection.peer, &server.name, &[]).await.map_err(|e| anyhow!("도구 목록을 받지 못했습니다: {e:#}")).map(|listed| {
-            for note in &listed.notes {
-                slot.log("event", note);
-            }
-            listed.tools
-        });
-        let info = connection
-            .peer
-            .peer_info()
-            .and_then(|info| serde_json::to_value(&*info).ok())
-            .unwrap_or(Value::Null);
-        close(&slot, connection).await;
-        Ok::<_, anyhow::Error>((listed?, info))
-    })
-    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(CONNECT_SECS);
+    let outcome = match tokio::time::timeout_at(deadline, connect(&slot, server)).await {
+        Ok(Ok(connection)) => {
+            // Said as the supervisor says it: which step failed.
+            let listed = match tokio::time::timeout_at(deadline, list_tools(&connection.peer, &server.name, &[])).await {
+                Ok(listed) => listed.map_err(|e| anyhow!("도구 목록을 받지 못했습니다: {e:#}")).map(|listed| {
+                    for note in &listed.notes {
+                        slot.log("event", note);
+                    }
+                    listed.tools
+                }),
+                Err(_) => Err(anyhow!("{CONNECT_SECS}초 안에 도구 목록을 받지 못했습니다")),
+            };
+            let info = connection
+                .peer
+                .peer_info()
+                .and_then(|info| serde_json::to_value(&*info).ok())
+                .unwrap_or(Value::Null);
+            // Closed as a supervisor closes one, past the deadline too: cut
+            // off by it, the group was killed before a server that outlives
+            // its input was asked to stop (a docker container left running).
+            close(&slot, connection).await;
+            Ok(listed.map(|tools| (tools, info)))
+        }
+        Ok(Err(error)) => Ok(Err(error)),
+        Err(elapsed) => Err(elapsed),
+    };
     end_attempt(&slot).await;
     let log: Vec<Value> = slot.state().log.iter().cloned().collect();
     match outcome {

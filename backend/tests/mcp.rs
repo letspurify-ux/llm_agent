@@ -2879,6 +2879,30 @@ async fn a_server_that_outlives_its_input_is_asked_to_stop_before_it_is_killed()
     assert_eq!(std::fs::read_to_string(&starting).ok().as_deref(), Some("SIGTERM"), "the process given up while it started was asked to stop");
 }
 
+/// MCP review (leaks, panics, deadlocks, context): a connection check that
+/// ran out of time once its server had connected (a tool list unanswered)
+/// killed the server's group at once, while the connection was still being
+/// closed in order: a server that outlives its input was never asked to
+/// stop — run as `docker run -i --rm --init`, its container went on running
+/// after each such check.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_connection_check_out_of_time_asks_its_server_to_stop() {
+    if node_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let noted = dir.path().join("checked");
+    let server = fake("slowlist", &["echo"], &[("FAKE_MCP_HANG_LIST", "1"), ("FAKE_MCP_LINGER", "1"), ("FAKE_MCP_TERM_FILE", &noted.display().to_string())]);
+    let started = Instant::now();
+    let checked = probe(&server, MODEL).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(std::fs::read_to_string(&noted).ok().as_deref(), Some("SIGTERM"), "the server checked was asked to stop");
+    assert_eq!(checked["ok"], false, "{checked:#}");
+    assert!(checked["message"].as_str().unwrap().contains("도구 목록을 받지 못했습니다"), "{checked:#}");
+    assert!(started.elapsed() < Duration::from_secs(37), "{:?}", started.elapsed());
+}
+
 /// Resource-leak review: a helper a server starts outside its process group
 /// (a daemon) keeps the server's stderr open after the server is gone. Its
 /// reader ran on until the helper ended — a task and a pipe each time — and

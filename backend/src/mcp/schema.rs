@@ -10,10 +10,14 @@ pub const MAX_NAME: usize = 64;
 /// Characters of a tool description sent to the model: OpenAI refuses the
 /// whole request ("string too long") past 1,024.
 pub const MAX_DESCRIPTION: usize = 1_024;
-/// Local `$ref`s are expanded this deep, and at most this many in all; past
-/// either a reference becomes an unconstrained value.
+/// Local `$ref`s are expanded this deep, at most this many in all, and their
+/// definitions copied as many bytes in all as one schema may be; past any, a
+/// reference becomes an unconstrained value, as does one within the
+/// definition it refers to (a filter of and/or filters). Each request
+/// carries every copy: a 5 KB recursive filter expanded six deep was 300 KB.
 const REF_DEPTH: usize = 6;
 const REF_EXPANSIONS: usize = 64;
+const REF_BYTES: usize = super::MAX_SCHEMA_BYTES;
 
 /// The model-facing names of one server's tools, in order: `server__tool`,
 /// characters outside `[A-Za-z0-9_-]` replaced by '_'. A name past
@@ -186,9 +190,9 @@ pub fn parameters(schema: &Value) -> Value {
     if !required_ok {
         out.remove("required");
     }
-    let mut budget = REF_EXPANSIONS;
+    let mut budget = Budget { expansions: REF_EXPANSIONS, bytes: REF_BYTES, sizes: HashMap::new() };
     let mut value = Value::Object(out);
-    expand(&mut value, &definitions, 0, &mut budget);
+    expand(&mut value, &definitions, &mut vec![], &mut budget);
     tidy(&mut value, 0);
     value
 }
@@ -290,16 +294,34 @@ fn tidy(schema: &mut Value, depth: usize) {
     }
 }
 
-fn expand(value: &mut Value, definitions: &Map<String, Value>, depth: usize, budget: &mut usize) {
+/// What `expand` may still inline: references, and bytes of definitions.
+struct Budget {
+    expansions: usize,
+    bytes: usize,
+    /// Each definition's size, measured once: a schema may refer to one
+    /// past the budget a thousand times.
+    sizes: HashMap<String, usize>,
+}
+
+/// Inlines the local references in `value`, which lies within the
+/// definitions `within` (outermost first).
+fn expand(value: &mut Value, definitions: &Map<String, Value>, within: &mut Vec<String>, budget: &mut Budget) {
     match value {
         Value::Object(fields) => {
             if let Some(target) = fields.get("$ref").and_then(Value::as_str).map(str::to_owned) {
                 fields.remove("$ref");
-                let found = definitions.get(&target).filter(|_| depth < REF_DEPTH && *budget > 0);
-                if let Some(definition) = found {
-                    *budget -= 1;
+                let found = definitions
+                    .get(&target)
+                    .filter(|_| within.len() < REF_DEPTH && budget.expansions > 0 && !within.contains(&target))
+                    .map(|definition| (definition, *budget.sizes.entry(target.clone()).or_insert_with(|| definition.to_string().len())))
+                    .filter(|(_, bytes)| *bytes <= budget.bytes);
+                if let Some((definition, bytes)) = found {
+                    budget.expansions -= 1;
+                    budget.bytes -= bytes;
                     let mut inlined = definition.clone();
-                    expand(&mut inlined, definitions, depth + 1, budget);
+                    within.push(target);
+                    expand(&mut inlined, definitions, within, budget);
+                    within.pop();
                     // Keys beside the reference (a description) stay; the
                     // definition fills in the rest.
                     if let Value::Object(defined) = inlined {
@@ -311,12 +333,12 @@ fn expand(value: &mut Value, definitions: &Map<String, Value>, depth: usize, bud
                 return;
             }
             for field in fields.values_mut() {
-                expand(field, definitions, depth, budget);
+                expand(field, definitions, within, budget);
             }
         }
         Value::Array(items) => {
             for item in items {
-                expand(item, definitions, depth, budget);
+                expand(item, definitions, within, budget);
             }
         }
         _ => {}
@@ -381,7 +403,7 @@ mod tests {
         let item = &p["properties"]["item"];
         assert_eq!(item["description"], "the item");
         assert_eq!(item["properties"]["id"]["type"], "integer");
-        // A recursive definition stops expanding at the depth limit.
+        // A recursive definition is not inlined within itself.
         let mut depth = 0;
         let mut node = item;
         while node["properties"]["next"].is_object() && node["properties"]["next"].get("properties").is_some() {
@@ -547,6 +569,47 @@ mod tests {
         assert_eq!(parameters(&json!({"$ref":"#/$defs/S","$defs":{"S":{"type":"string"}}})), json!({"type":"object","properties":{}}));
         assert_eq!(parameters(&json!({"$ref":"#","properties":{"a":{"type":"string"}}}))["properties"], json!({"a":{"type":"string"}}));
         assert_eq!(parameters(&json!({"$ref":"#/$defs/missing"})), json!({"type":"object","properties":{}}));
+    }
+
+    /// MCP review (leaks, panics, deadlocks, context): every copy of an
+    /// inlined definition goes in each request. A 5 KB filter of and/or/not
+    /// filters, expanded six deep, was 300 KB of parameters (some 63,000
+    /// tokens), and a definition referred to from seventy fields 3.8 MB.
+    #[test]
+    fn definitions_are_inlined_once_per_branch_and_within_bounds() {
+        let mut fields = Map::new();
+        for i in 0..40 {
+            fields.insert(format!("field_{i}"), json!({"type":"string","description":format!("the condition on property {i}")}));
+        }
+        fields.insert("and".into(), json!({"type":"array","items":{"$ref":"#/$defs/Filter"}}));
+        fields.insert("or".into(), json!({"type":"array","items":{"$ref":"#/$defs/Filter"}}));
+        fields.insert("not".into(), json!({"$ref":"#/$defs/Filter","description":"the filter negated"}));
+        let schema = json!({"type":"object","properties":{"filter":{"$ref":"#/$defs/Filter"},"sort":{"type":"string"}},
+            "$defs":{"Filter":{"type":"object","properties":fields}}});
+        let p = parameters(&schema);
+        let filter = &p["properties"]["filter"];
+        assert_eq!(filter["properties"]["field_0"]["type"], "string", "inlined where it is used");
+        // Within itself it is any value (the reference's own words kept).
+        assert_eq!(filter["properties"]["and"], json!({"type":"array","items":{}}));
+        assert_eq!(filter["properties"]["not"], json!({"description":"the filter negated"}));
+        assert!(p.to_string().len() < schema.to_string().len() * 2, "{}", p.to_string().len());
+        // A definition used in several places is inlined in each, as long as
+        // the copies stay within what one schema may be.
+        let mut props = Map::new();
+        for i in 0..70 {
+            props.insert(format!("p{i}"), json!({"$ref":"#/$defs/D"}));
+        }
+        let big = json!({"type":"object","properties":props,"$defs":{"D":{"type":"object","description":"x".repeat(20_000)}}});
+        let p = parameters(&big);
+        let inlined = (0..70).filter(|i| p["properties"][format!("p{i}")]["type"] == "object").count();
+        assert_eq!(inlined, 3, "{inlined}");
+        assert!(p.to_string().len() <= big.to_string().len() + super::super::MAX_SCHEMA_BYTES, "{}", p.to_string().len());
+        // A long chain of distinct definitions is unaffected.
+        let chain = json!({"type":"object","properties":{"a":{"$ref":"#/$defs/A"}},"$defs":{
+            "A":{"type":"object","properties":{"b":{"$ref":"#/$defs/B"}}},
+            "B":{"type":"object","properties":{"c":{"$ref":"#/$defs/C"}}},
+            "C":{"type":"object","properties":{"leaf":{"type":"integer"}}}}});
+        assert_eq!(parameters(&chain)["properties"]["a"]["properties"]["b"]["properties"]["c"]["properties"]["leaf"]["type"], "integer");
     }
 
     #[test]
