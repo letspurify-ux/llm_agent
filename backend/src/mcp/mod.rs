@@ -16,7 +16,8 @@ use rmcp::{
     ClientHandler, Peer, ServiceError, ServiceExt,
     model::{
         CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientCapabilities, ClientConfig,
-        ClientRequest, ErrorCode, Implementation, ListToolsRequest, PaginatedRequestParams, PingRequest, ServerResult,
+        ClientRequest, ErrorCode, Implementation, ListToolsRequest, PaginatedRequestParams, PingRequest, RequestId,
+        ServerResult,
     },
     service::{NotificationContext, PeerRequestOptions, RoleClient, RxJsonRpcMessage, TxJsonRpcMessage},
     transport::{
@@ -51,15 +52,22 @@ const STABLE_SECS: u64 = 60;
 /// Lines of server output and connection events kept per server.
 const LOG_LINES: usize = 200;
 const LOG_LINE_CHARS: usize = 1_000;
-/// Seconds a closing connection is waited for (the SDK gives a stdio server
-/// three after closing its input before killing it).
+/// Seconds a closing connection is waited for (a stdio server is given
+/// `EXIT_GRACE_SECS` once its input closes, as long again once it is told to
+/// stop, then killed).
 const CLOSE_SECS: u64 = 5;
 /// Bytes of one line a stdio server may write, as the HTTP transport's
 /// largest event: past it the connection is cut, rather than the backend
 /// buffering a line without end.
 const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
-/// Seconds a stdio server is given to exit once its input ends.
-const EXIT_GRACE_SECS: u64 = 3;
+/// Seconds a stdio server is given to exit once its input ends, and again
+/// once it is told to stop (SIGTERM), before it is killed — the official
+/// SDKs' two and two.
+const EXIT_GRACE_SECS: u64 = 2;
+/// What a stdio server still writes to stderr once its process has ended is
+/// read this long: a helper it started outside its process group may hold
+/// the pipe open for good.
+const OUTPUT_DRAIN: Duration = Duration::from_secs(1);
 /// Pages of `tools/list` read at most.
 const MAX_LIST_PAGES: usize = 100;
 /// Tools kept from one server: the admin screen lists every one, and "*"
@@ -365,6 +373,20 @@ struct Slot {
     /// A ping asking whether the server still answers is on its way (one at
     /// a time, however many calls timed out).
     pinging: std::sync::atomic::AtomicBool,
+    /// The process of an attempt given up while it started, and the end of
+    /// its output, for `end_attempt` (see `ChildTransport::drop`).
+    abandoned: Mutex<Option<(Box<dyn process_wrap::tokio::ChildWrapper>, CancellationToken)>>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        // Given up while it started and ended by no one (a connection check
+        // dropped midway): killed now, with its group.
+        if let Some((mut child, output)) = self.abandoned.get_mut().unwrap_or_else(|p| p.into_inner()).take() {
+            let _ = child.start_kill();
+            output.cancel();
+        }
+    }
 }
 
 impl Slot {
@@ -395,6 +417,7 @@ impl Slot {
             }),
             task: Mutex::new(None),
             pinging: std::sync::atomic::AtomicBool::new(false),
+            abandoned: Mutex::new(None),
         })
     }
 
@@ -503,6 +526,43 @@ impl Slot {
     }
 }
 
+/// Tells the server to stop a request, in the background: no one waits on a
+/// server that is not reading.
+fn tell(peer: &Peer<RoleClient>, id: RequestId, reason: &str) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let (peer, reason) = (peer.clone(), reason.to_owned());
+    runtime.spawn(async move {
+        let notice = peer.notify_cancelled(CancelledNotificationParam::new(Some(id), Some(reason)));
+        let _ = tokio::time::timeout(Duration::from_secs(CLOSE_SECS), notice).await;
+    });
+}
+
+/// Sends a request of ours (a page of the tool list, a ping) and waits for
+/// its answer. Given up unanswered — past its limit, the connection
+/// stopping — it is cancelled: dropped without a word, it stayed with the
+/// server, and over HTTP its POST held a connection and one of the requests
+/// the session carries (`HTTP_REQUESTS`) until the server answered, if ever.
+async fn ask(peer: &Peer<RoleClient>, request: ClientRequest) -> Result<ServerResult, ServiceError> {
+    let handle = peer.send_cancellable_request(request, PeerRequestOptions::no_options()).await?;
+    let mut waiting = Unanswered(Some((peer.clone(), handle.id.clone())));
+    let answer = handle.await_response().await;
+    waiting.0 = None;
+    answer
+}
+
+/// A request of ours still waiting for its answer (see `ask`).
+struct Unanswered(Option<(Peer<RoleClient>, RequestId)>);
+
+impl Drop for Unanswered {
+    fn drop(&mut self) {
+        if let Some((peer, id)) = self.0.take() {
+            tell(&peer, id, "no longer awaited");
+        }
+    }
+}
+
 /// After a call on this connection timed out: a server that does not answer
 /// a ping either has stopped (a handler deadlocked, its input no longer
 /// read, a session it lost answered to no request). It is reconnected,
@@ -517,7 +577,7 @@ fn check_alive(slot: &Arc<Slot>, peer: &Peer<RoleClient>, link: &Arc<Link>, time
     let (slot, peer, link) = (slot.clone(), peer.clone(), link.clone());
     tokio::spawn(async move {
         let answers = link.answers.load(Ordering::Acquire);
-        let ping = peer.send_request(ClientRequest::PingRequest(PingRequest::default()));
+        let ping = ask(&peer, ClientRequest::PingRequest(PingRequest::default()));
         let silent = match tokio::time::timeout(Duration::from_secs(PING_SECS), ping).await {
             Err(_) | Ok(Err(ServiceError::Timeout { .. })) => true,
             // Closed, the connection's end is its supervisor's to see.
@@ -764,15 +824,6 @@ impl Offered {
         // The SDK's own timeout tells the server before it returns, and that
         // notice waits in the same queue: a second later the call ends anyway.
         let overdue = tokio::time::sleep_until(deadline + Duration::from_secs(1));
-        // A notice the stop or the timeout gives in the background, so the
-        // call does not wait on a server that is not reading.
-        let tell = |reason: &str| {
-            let (peer, id, reason) = (peer.clone(), id.clone(), reason.to_owned());
-            tokio::spawn(async move {
-                let notice = peer.notify_cancelled(CancelledNotificationParam::new(Some(id), Some(reason)));
-                let _ = tokio::time::timeout(Duration::from_secs(CLOSE_SECS), notice).await;
-            });
-        };
         tokio::select! {
             response = handle.await_response() => match response.inspect(|_| link.answered()).map_err(|e| self.error(e, true, slot, &peer, &link))? {
                 ServerResult::CallToolResult(result) => convert::tool_result(&serde_json::to_value(result)?),
@@ -789,11 +840,11 @@ impl Offered {
             // the stop for no effect and asks again. (A call stopped while
             // it waited to be sent was not sent.)
             _ = cancel.cancelled() => {
-                tell("cancelled");
+                tell(&peer, id, "cancelled");
                 bail!("cancelled: {} was sent and the server told to stop; it may still have taken effect on the server", self.exposed)
             }
             _ = overdue => {
-                tell("request timeout");
+                tell(&peer, id, "request timeout");
                 Err(self.error(ServiceError::Timeout { timeout: self.timeout }, true, slot, &peer, &link))
             }
         }
@@ -1203,14 +1254,14 @@ async fn supervise(slot: Arc<Slot>) {
         let started = Instant::now();
         let connected = tokio::select! {
             _ = slot.stop.cancelled() => {
-                kill_group(&slot);
                 slot.set_phase(Phase::Stopped, None);
+                end_attempt(&slot).await;
                 return;
             }
             // A reconnect asked for while connecting starts the connection
             // over now, rather than once more after this one is made.
             _ = slot.reconnect.notified() => {
-                kill_group(&slot);
+                end_attempt(&slot).await;
                 slot.log("event", "연결하는 중에 다시 연결을 요청받아 처음부터 연결합니다.");
                 slot.state().restarts += 1;
                 continue;
@@ -1252,7 +1303,7 @@ async fn supervise(slot: Arc<Slot>) {
                 }
             }
             Err(error) => {
-                kill_group(&slot);
+                end_attempt(&slot).await;
                 let error = slot.fail(&format!("{error:#}"));
                 slot.log("event", &format!("연결 실패: {error}"));
             }
@@ -1584,7 +1635,7 @@ async fn list_tools(peer: &Peer<RoleClient>, server: &str, previous: &[Arc<Remot
         let request = ClientRequest::ListToolsRequest(ListToolsRequest::with_param(
             PaginatedRequestParams::default().with_cursor(cursor.clone()),
         ));
-        let listed = match peer.send_request(request).await {
+        let listed = match ask(peer, request).await {
             Ok(ServerResult::ListToolsResult(result)) => serde_json::to_value(result)?,
             Ok(ServerResult::CustomResult(result)) => result.0,
             Ok(_) => bail!("tools/list에 도구 목록이 아닌 응답이 왔습니다"),
@@ -1755,6 +1806,38 @@ fn kill_group(slot: &Arc<Slot>) {
     let _ = pid;
 }
 
+/// Ends the process of an attempt given up while it started (see
+/// `ChildTransport::drop`) as a closed connection's is, then what is left of
+/// its process group.
+async fn end_attempt(slot: &Arc<Slot>) {
+    let abandoned = slot.abandoned.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some((child, output)) = abandoned {
+        end_process(child).await;
+        output.cancel();
+    }
+    kill_group(slot);
+}
+
+/// Ends a stdio server's process, its input closed: `EXIT_GRACE_SECS` to
+/// exit, then (Unix) SIGTERM to its group and as long again, then killed
+/// with its group. One that outlives its input (a Node server holding a
+/// database pool) so gets to clean up, as the MCP specification has it:
+/// killed outright, a server run as `docker run -i --rm --init` left its
+/// container running.
+async fn end_process(mut child: Box<dyn process_wrap::tokio::ChildWrapper>) {
+    let grace = Duration::from_secs(EXIT_GRACE_SECS);
+    if tokio::time::timeout(grace, child.wait()).await.is_ok() {
+        return;
+    }
+    #[cfg(unix)]
+    let _ = child.signal(libc::SIGTERM);
+    // Windows has no such request: the same time again before the end.
+    if tokio::time::timeout(grace, child.wait()).await.is_ok() {
+        return;
+    }
+    let _ = Box::into_pin(child.kill()).await;
+}
+
 /// A value of `env` or `headers`: itself, or the environment variable an
 /// `ENV:NAME` value names.
 fn resolve(server: &str, key: &str, value: &str) -> Result<String> {
@@ -1848,11 +1931,12 @@ fn spawn(slot: &Arc<Slot>, server: &McpServer) -> Result<ChildTransport> {
         let _ = child.start_kill();
         bail!("{program}의 입출력을 열지 못했습니다");
     };
+    let output = CancellationToken::new();
     if let Some(stderr) = child.stderr().take() {
-        tokio::spawn(read_output(Arc::downgrade(slot), stderr));
+        tokio::spawn(read_output(Arc::downgrade(slot), stderr, output.clone()));
     }
-    let output = LineLimit { inner: stdout, line: vec![], out: vec![], out_at: 0, ended: false, slot: Arc::downgrade(slot) };
-    Ok(ChildTransport { inner: AsyncRwTransport::new_client(output, stdin), child: Some(child) })
+    let lines = LineLimit { inner: stdout, line: vec![], out: vec![], out_at: 0, ended: false, slot: Arc::downgrade(slot) };
+    Ok(ChildTransport { inner: AsyncRwTransport::new_client(lines, stdin), child: Some(child), output, slot: Arc::downgrade(slot) })
 }
 
 /// A stdio server's connection: its output read a line at most
@@ -1860,6 +1944,9 @@ fn spawn(slot: &Arc<Slot>, server: &McpServer) -> Result<ChildTransport> {
 struct ChildTransport {
     inner: AsyncRwTransport<RoleClient, LineLimit<tokio::process::ChildStdout>, tokio::process::ChildStdin>,
     child: Option<Box<dyn process_wrap::tokio::ChildWrapper>>,
+    /// Ends the reading of its stderr (`read_output`), once the process is.
+    output: CancellationToken,
+    slot: Weak<Slot>,
 }
 
 impl Transport<RoleClient> for ChildTransport {
@@ -1873,29 +1960,43 @@ impl Transport<RoleClient> for ChildTransport {
         self.inner.receive()
     }
 
-    /// The server's input ends; it gets `EXIT_GRACE_SECS` to exit, then it
-    /// is killed (with its process group or job).
+    /// The server's input ends, then its process (`end_process`).
     async fn close(&mut self) -> Result<(), Self::Error> {
         // Ending the input waits for a write in progress, which a server that
         // stopped reading never finishes: it gets a second. (Unix kills the
         // process group after `CLOSE_SECS` anyway; on Windows only this kill
         // ends the job before the backend exits.)
         let _ = tokio::time::timeout(Duration::from_secs(1), self.inner.close()).await;
-        if let Some(mut child) = self.child.take()
-            && tokio::time::timeout(Duration::from_secs(EXIT_GRACE_SECS), child.wait()).await.is_err()
-        {
-            let _ = Box::into_pin(child.kill()).await;
+        if let Some(child) = self.child.take() {
+            end_process(child).await;
         }
+        self.output.cancel();
         Ok(())
     }
 }
 
 impl Drop for ChildTransport {
     fn drop(&mut self) {
-        // Not closed (a connection given up mid-start, the runtime ending):
-        // killed now, without waiting.
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.start_kill();
+        let Some(mut child) = self.child.take() else {
+            self.output.cancel();
+            return;
+        };
+        // Not closed: a connection given up while it started (stopped,
+        // asked again, past its limit). Its input ends with this transport;
+        // its supervisor or connection check ends the rest (`end_attempt`).
+        // With no one left to, it is killed now.
+        match self.slot.upgrade() {
+            Some(slot) => {
+                let older = slot.abandoned.lock().unwrap_or_else(|p| p.into_inner()).replace((child, self.output.clone()));
+                if let Some((mut older, output)) = older {
+                    let _ = older.start_kill();
+                    output.cancel();
+                }
+            }
+            None => {
+                let _ = child.start_kill();
+                self.output.cancel();
+            }
         }
     }
 }
@@ -1981,15 +2082,26 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LineLimit<R> {
 }
 
 /// Drains the server's stderr into its log (a full pipe would stop the
-/// server), a line at most `LOG_LINE_CHARS` long.
-async fn read_output(slot: Weak<Slot>, mut stderr: tokio::process::ChildStderr) {
+/// server), a line at most `LOG_LINE_CHARS` long — until the process has
+/// ended (`ended`) and `OUTPUT_DRAIN` more. A helper the server started
+/// outside its process group may hold the pipe open: read on, it kept a
+/// task and a pipe each time, its words in the log of the next process.
+async fn read_output(slot: Weak<Slot>, mut stderr: tokio::process::ChildStderr, ended: CancellationToken) {
     use tokio::io::AsyncReadExt;
     let mut buffer: Vec<u8> = vec![];
     let mut chunk = [0u8; 8192];
+    let over = async move {
+        ended.cancelled().await;
+        tokio::time::sleep(OUTPUT_DRAIN).await;
+    };
+    tokio::pin!(over);
     loop {
-        let read = match stderr.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
+        let read = tokio::select! {
+            read = stderr.read(&mut chunk) => match read {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            },
+            _ = &mut over => break,
         };
         buffer.extend_from_slice(&chunk[..read]);
         while let Some(at) = buffer.iter().position(|&b| b == b'\n') {
@@ -2053,7 +2165,7 @@ pub async fn probe(server: &McpServer, model: &str) -> Result<Value> {
         Ok::<_, anyhow::Error>((listed?, info))
     })
     .await;
-    kill_group(&slot);
+    end_attempt(&slot).await;
     let log: Vec<Value> = slot.state().log.iter().cloned().collect();
     match outcome {
         Ok(Ok((tools, info))) => {

@@ -5,6 +5,7 @@
 // backend passes through a server's `env` setting.
 import http from 'node:http';
 import { spawn } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
 
 const env = process.env;
 const KNOWN = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
@@ -71,6 +72,9 @@ let forgotten = false;
 let initializations = 0;
 if (env.FAKE_MCP_FORGET) tools.push({ name: 'forget', description: 'Forget the session, as a restarted server.', inputSchema: { type: 'object' } });
 if (env.FAKE_MCP_WEDGE) tools.push({ name: 'wedge', description: 'Stop answering every request from now on.', inputSchema: { type: 'object' } });
+// A helper started outside the server's process group (as a daemon is),
+// keeping the server's stderr: it writes there until it is killed.
+if (env.FAKE_MCP_DETACHED) tools.push({ name: 'spawn_detached', description: 'Start a helper outside the process group that writes to stderr; return its pid.', inputSchema: { type: 'object' } });
 if (env.FAKE_MCP_DUPLICATE) tools.push({ name: 'echo', description: 'A second echo.', inputSchema: { type: 'object' } });
 for (let i = 0; i < Number(env.FAKE_MCP_MANY_BAD || 0); i++) tools.push({ name: `bad_${i}`, description: 'a schema that is a string', inputSchema: 'nope' });
 if (env.FAKE_MCP_BAD_LIST) tools.push({ name: 'no_schema', description: 'A tool without inputSchema.' }, { name: 'string_schema', description: 'A tool whose schema is a string.', inputSchema: 'nope' });
@@ -107,7 +111,8 @@ async function handle(message, notify) {
     log(`cancelled ${params.requestId} ${params.reason ?? ''}`);
     return null;
   }
-  if (method === 'ping') return result(id, {});
+  // FAKE_MCP_NO_PING: alive, but a ping is never answered.
+  if (method === 'ping') return env.FAKE_MCP_NO_PING ? new Promise(() => {}) : result(id, {});
   if (method === 'tools/list') {
     listed += 1;
     if (env.FAKE_MCP_NO_TOOLS) { log(`listed ${listed}`); return failure(id, -32601, 'Method not found: tools/list'); }
@@ -158,6 +163,11 @@ async function handle(message, notify) {
         // A Node child, so Windows has it too (no `sleep` there).
         const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { stdio: 'ignore' });
         return result(id, { content: [text(String(child.pid))] });
+      }
+      case 'spawn_detached': {
+        const helper = spawn(process.execPath, ['-e', "setInterval(() => process.stderr.write('helper tick\\n'), 200); setTimeout(() => process.exit(0), 60000)"], { detached: true, stdio: ['ignore', 'ignore', 'inherit'] });
+        helper.unref();
+        return result(id, { content: [text(String(helper.pid))] });
       }
       case 'add_tool': {
         const added = env.FAKE_MCP_EXTRA_NAME || 'extra';
@@ -257,6 +267,11 @@ if (httpMode) {
   const fixed = process.argv.indexOf('--port');
   server.listen(fixed > 0 ? Number(process.argv[fixed + 1]) : 0, '127.0.0.1', () => process.stdout.write(`listening ${server.address().port}\n`));
 } else {
+  // FAKE_MCP_LINGER: the end of its input does not end it (a Node server
+  // holding a database pool); FAKE_MCP_TERM_FILE: SIGTERM is noted in that
+  // file, then it exits (a server cleaning up).
+  if (env.FAKE_MCP_LINGER) setInterval(() => {}, 1 << 30);
+  if (env.FAKE_MCP_TERM_FILE) process.on('SIGTERM', () => { writeFileSync(env.FAKE_MCP_TERM_FILE, 'SIGTERM'); process.exit(0); });
   for (let i = 0; i < Number(env.FAKE_MCP_STDERR || 0); i++) log(`stderr line ${i}`);
   if (env.FAKE_MCP_EXIT_BEFORE_INIT) { log(env.FAKE_MCP_FATAL || 'fatal: missing configuration'); process.exit(2); }
   // Windows-style output: a byte order mark before the first line, CRLF.
@@ -291,5 +306,5 @@ if (httpMode) {
       if (env.FAKE_MCP_SERIAL) serial = serial.then(run); else run();
     }
   });
-  process.stdin.on('end', () => { log('stdin closed'); process.exit(0); });
+  process.stdin.on('end', () => { log('stdin closed'); if (!env.FAKE_MCP_LINGER) process.exit(0); });
 }

@@ -2813,3 +2813,99 @@ async fn an_error_page_the_server_answers_with_is_bounded() {
     let checked = probe(&wrong, MODEL).await.unwrap();
     assert!(checked["message"].as_str().unwrap().chars().count() < 3_000);
 }
+
+/// Resource-leak review: a request given up unanswered — the ping after a
+/// timeout here, a changed tool list read past its limit alike — was only
+/// dropped, never cancelled. The server went on with it, and over HTTP its
+/// POST held a connection and one of the requests the session carries until
+/// the server answered: three changed lists never answered held three
+/// connections, until a reconnection. It is told to stop, as a call is.
+#[tokio::test]
+async fn a_request_given_up_tells_the_server_to_stop() {
+    if node_missing() {
+        return;
+    }
+    let mut server = fake("quiet", &["slow", "echo"], &[("FAKE_MCP_NO_PING", "1")]);
+    server.timeout_secs = Some(1);
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "quiet").await;
+    // The call times out and its ping is never answered; an answer to
+    // another call meanwhile keeps the server taken for alive.
+    let (slowed, answered) = tokio::join!(call(&hub, &config, "quiet__slow", json!({"ms":3_000})), async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        call(&hub, &config, "quiet__echo", json!({"text":"살아 있음"})).await
+    });
+    assert!(slowed.unwrap_err().to_string().starts_with("mcp_timeout:"));
+    assert_eq!(answered.unwrap()["text"], "echo: 살아 있음");
+    // The fake server notes each cancellation it gets on stderr.
+    let status = wait_for(&hub, "quiet", |s| log_text(s).contains("no longer awaited")).await;
+    assert_eq!((status["state"].clone(), status["restarts"].clone()), (json!("ready"), json!(0)), "{status:#}");
+    hub.shutdown().await;
+}
+
+/// Resource-leak review: a stdio server got three seconds once its input
+/// closed, then was killed — never asked to stop. One that outlives its
+/// input (a Node server holding a database pool) could not clean up: run as
+/// `docker run -i --rm --init`, its container went on running after each
+/// reconnection and after the backend ended. SIGTERM now comes first, as
+/// the MCP specification and the official SDKs have it — for a connection
+/// given up while it starts too.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_server_that_outlives_its_input_is_asked_to_stop_before_it_is_killed() {
+    if node_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let noted = dir.path().join("reconnected");
+    let lingering = fake("linger", &["echo"], &[("FAKE_MCP_LINGER", "1"), ("FAKE_MCP_TERM_FILE", &noted.display().to_string())]);
+    let hub = McpHub::default();
+    hub.apply(std::slice::from_ref(&lingering));
+    ready(&hub, "linger").await;
+    assert!(hub.restart("linger"));
+    wait_for(&hub, "linger", |s| s["state"] == "ready" && s["restarts"] == 1).await;
+    assert_eq!(std::fs::read_to_string(&noted).ok().as_deref(), Some("SIGTERM"), "the process closed was asked to stop");
+    hub.shutdown().await;
+    // Stopped while it starts (it never answers the initialization).
+    let starting = dir.path().join("starting");
+    let stuck = fake("stuck", &["echo"], &[("FAKE_MCP_HANG_INIT", "1"), ("FAKE_MCP_LINGER", "1"), ("FAKE_MCP_TERM_FILE", &starting.display().to_string())]);
+    let hub = McpHub::default();
+    hub.apply(std::slice::from_ref(&stuck));
+    wait_for(&hub, "stuck", |s| s["state"] == "connecting" && s["pid"].is_number()).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    hub.shutdown().await;
+    assert_eq!(std::fs::read_to_string(&starting).ok().as_deref(), Some("SIGTERM"), "the process given up while it started was asked to stop");
+}
+
+/// Resource-leak review: a helper a server starts outside its process group
+/// (a daemon) keeps the server's stderr open after the server is gone. Its
+/// reader ran on until the helper ended — a task and a pipe each time — and
+/// what the helper wrote went on into the log of the server's next process.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_output_of_a_server_gone_is_read_no_more() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("daemon", &["spawn_detached"], &[("FAKE_MCP_DETACHED", "1")])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "daemon").await;
+    let helper: i32 = call(&hub, &config, "daemon__spawn_detached", json!({})).await.unwrap()["text"].as_str().unwrap().parse().unwrap();
+    let ticks = |status: &Value| log_text(status).matches("helper tick").count();
+    wait_for(&hub, "daemon", |s| ticks(s) > 0).await;
+    assert!(hub.restart("daemon"));
+    wait_for(&hub, "daemon", |s| s["state"] == "ready" && s["restarts"] == 1).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let before = ticks(&hub.server_status("daemon", MODEL).unwrap());
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let after = ticks(&hub.server_status("daemon", MODEL).unwrap());
+    // SAFETY: only signals the helper the test started.
+    unsafe {
+        libc::kill(helper, libc::SIGKILL);
+    }
+    assert_eq!(before, after, "the helper's output still reaches the log of the server's next process");
+    hub.shutdown().await;
+}
