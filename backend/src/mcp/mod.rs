@@ -1923,6 +1923,8 @@ fn spawn(slot: &Arc<Slot>, server: &McpServer) -> Result<ChildTransport> {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    own_descriptors_only(&mut command);
     let mut wrapped = CommandWrap::from(command);
     #[cfg(unix)]
     wrapped.wrap(process_wrap::tokio::ProcessGroup::leader());
@@ -1941,6 +1943,43 @@ fn spawn(slot: &Arc<Slot>, server: &McpServer) -> Result<ChildTransport> {
     }
     let lines = LineLimit { inner: stdout, line: vec![], out: vec![], out_at: 0, ended: false, slot: Arc::downgrade(slot) };
     Ok(ChildTransport { inner: AsyncRwTransport::new_client(lines, stdin), child: Some(child), output, slot: Arc::downgrade(slot) })
+}
+
+/// Descriptors below this are looked at in a starting server (a soft limit
+/// above it is a setting, not descriptors the backend has open).
+#[cfg(unix)]
+const MAX_INHERITED_FD: libc::c_int = 65_536;
+
+/// The server gets its standard input, output and error, nothing else of
+/// the backend's, as the Python SDK starts its servers (`close_fds`). macOS
+/// marks a new pipe or socket close-on-exec only after making it: a server
+/// started meanwhile by another thread — another server, at the backend's
+/// start — kept the pipes of the one starting beside it (one in six to
+/// fifteen of eight servers started at once). A server that exited was
+/// then not seen to go, its output still open in the other, and each call
+/// waited out its timeout. So the starting process closes, before its
+/// program runs, every descriptor past stderr that exec would not close.
+#[cfg(unix)]
+fn own_descriptors_only(command: &mut tokio::process::Command) {
+    // SAFETY: getrlimit is read here, before the fork; the child only calls
+    // fcntl and close, which are async-signal-safe.
+    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    let last = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+        libc::c_int::try_from(limit.rlim_cur).unwrap_or(MAX_INHERITED_FD).min(MAX_INHERITED_FD)
+    } else {
+        MAX_INHERITED_FD
+    };
+    unsafe {
+        command.pre_exec(move || {
+            for fd in 3..last {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                    libc::close(fd);
+                }
+            }
+            Ok(())
+        });
+    }
 }
 
 /// A stdio server's connection: its output read a line at most
@@ -2165,20 +2204,22 @@ impl McpHub {
     /// --init` left its container running.
     pub async fn probe(&self, server: &McpServer, model: &str) -> Result<Value> {
         validate_server(server)?;
-        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
-            bail!("backend가 멈추는 중이라 연결을 확인하지 않았습니다.");
-        }
         let given_up = self.checks.child_token();
         let _given_up = given_up.clone().drop_guard();
         let (sent, checked) = tokio::sync::oneshot::channel();
         let (server, model) = (server.clone(), model.to_owned());
-        let task = tokio::spawn(async move {
-            let _ = sent.send(check(&server, &model, &given_up).await);
-        });
         {
+            // Started under the lock `shutdown` takes the checks with, once
+            // `closed` is set: a check started as it took them would not be
+            // waited for, its server killed with the runtime.
             let mut retired = self.retired.lock().unwrap_or_else(|p| p.into_inner());
+            if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+                bail!("backend가 멈추는 중이라 연결을 확인하지 않았습니다.");
+            }
             retired.retain(|t| !t.is_finished());
-            retired.push(task);
+            retired.push(tokio::spawn(async move {
+                let _ = sent.send(check(&server, &model, &given_up).await);
+            }));
         }
         checked.await.map_err(|_| anyhow!("연결 확인 작업이 예기치 않게 멈췄습니다."))?
     }

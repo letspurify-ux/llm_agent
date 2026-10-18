@@ -419,6 +419,9 @@ async fn a_save_during_shutdown_starts_nothing() {
     assert!(status.is_none() || status.as_ref().unwrap()["pid"].is_null(), "no process after shutdown: {status:?}");
     assert!(!hub.restart("late"));
     assert!(hub.snapshot(&config).is_empty());
+    // Nor does a connection check: shutdown would not wait for it.
+    let refused = hub.probe(&config.mcp_servers[0], MODEL).await.unwrap_err().to_string();
+    assert!(refused.contains("멈추는 중"), "{refused}");
 }
 
 #[tokio::test]
@@ -851,6 +854,60 @@ async fn stopping_kills_the_children_a_server_started() {
     assert!(!alive(child), "the server's own child is gone too");
 }
 
+/// The descriptors past stderr that process `pid` holds, as lsof lists
+/// them (`3:PIPE`); None without lsof.
+#[cfg(unix)]
+fn held_descriptors(pid: u32) -> Option<Vec<String>> {
+    let listed = Command::new("lsof").args(["-a", "-p", &pid.to_string(), "-d", "3-4096", "-F", "ft"]).output().ok()?;
+    let mut held = vec![];
+    let mut fd = "";
+    for line in std::str::from_utf8(&listed.stdout).ok()?.lines() {
+        if let Some(number) = line.strip_prefix('f') {
+            fd = number;
+        } else if let Some(kind) = line.strip_prefix('t') {
+            held.push(format!("{fd}:{kind}"));
+        }
+    }
+    Some(held)
+}
+
+/// MCP review (leaks, panics, deadlocks, context), twenty-third pass:
+/// macOS marks a new pipe close-on-exec only after making it, and a server
+/// started meanwhile on another thread kept the pipes of the one starting
+/// beside it — one in six to fifteen of eight servers started at once. A
+/// server that exited was then not seen to go (its output still open in the
+/// other), and each call to it waited out its timeout.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn servers_started_together_hold_nothing_of_each_other() {
+    if Command::new("lsof").arg("-v").output().is_err() {
+        skip("lsof is not installed");
+        return;
+    }
+    let hub = McpHub::default();
+    let (mut checked, mut holding) = (0, vec![]);
+    for round in 0..16 {
+        // Servers that never answer: each stays starting, its process up.
+        let servers: Vec<McpServer> = (0..8)
+            .map(|i| McpServer { name: format!("t{round}x{i}"), command: "/bin/sleep".into(), args: vec!["60".into()], tools: vec!["*".into()], ..Default::default() })
+            .collect();
+        hub.apply(&servers);
+        for server in &servers {
+            let status = wait_for(&hub, &server.name, |s| s["pid"].is_u64()).await;
+            let pid = status["pid"].as_u64().unwrap() as u32;
+            let held = held_descriptors(pid).expect("lsof lists the server's descriptors");
+            checked += 1;
+            if !held.is_empty() {
+                holding.push(format!("{} (pid {pid}): {held:?}", server.name));
+            }
+        }
+        hub.apply(&[]);
+    }
+    hub.shutdown().await;
+    assert_eq!(checked, 128);
+    assert!(holding.is_empty(), "servers holding descriptors of the backend (or of each other): {holding:#?}");
+}
+
 #[tokio::test]
 async fn settings_apply_in_place_or_reconnect() {
     if node_missing() {
@@ -958,6 +1015,23 @@ impl HttpServer {
         command.arg(fixture()).arg("--http").arg("--port").arg(port.to_string()).stdout(Stdio::piped()).stderr(Stdio::null());
         for (k, v) in env {
             command.env(k, v);
+        }
+        // Started as the backend starts its servers: without the pipes of a
+        // stdio server another test starts meanwhile, which would then not
+        // be seen to exit (see servers_started_together_hold_nothing_of_each_other).
+        #[cfg(unix)]
+        // SAFETY: the child only calls fcntl and close before its program runs.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                for fd in 3..4096 {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                        libc::close(fd);
+                    }
+                }
+                Ok(())
+            });
         }
         let mut child = command.spawn().unwrap();
         let mut line = String::new();
