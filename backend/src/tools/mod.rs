@@ -1987,7 +1987,7 @@ pub fn bound_result(
                 data.remove("next_cursor");
             }
             if let Some(archived) = &archived {
-                v["next_cursor"]["offset"] = json!(archived.shown_through(&v));
+                v["next_cursor"]["offset"] = json!(archived.shown_through(pointer, &v.pointer(pointer).cloned().unwrap_or_default()));
             }
             v
         };
@@ -2072,7 +2072,7 @@ pub fn bound_result(
                 output["data"]["next_cursor"] = json!(format!("{prefix}:{}", start + low));
             }
             if let Some(archived) = &archived {
-                output["next_cursor"]["offset"] = json!(archived.shown_through(&output));
+                output["next_cursor"]["offset"] = json!(archived.shown_through(&format!("/data/{field}"), &output["data"][field]));
             }
             return output;
         }
@@ -2225,6 +2225,8 @@ fn archive_for(s: &mut Workspace, call: &crate::llm::ToolCall, args: &Value, res
 /// cut result's continuation goes on.
 struct Archived {
     call_id: Value,
+    /// The result as archived, whole.
+    result: Value,
     text: String,
     /// Characters of `text`, as a read's offset counts them.
     chars: usize,
@@ -2234,15 +2236,24 @@ impl Archived {
         let bundle = s.history.read(id).ok()?;
         let message = bundle.messages.first().filter(|m| m["role"] == "tool_archive")?;
         let text = serde_json::to_string(&context::shown_messages(&bundle.messages[..])).ok()?;
-        Some(Self { call_id: message["call_id"].clone(), chars: text.chars().count(), text })
+        Some(Self { call_id: message["call_id"].clone(), result: message["result"].clone(), chars: text.chars().count(), text })
     }
-    /// Where a read of the archive goes on past `shown` (the cut result as
-    /// the model receives it): the read text the two have in common from the
-    /// start, put in the archive's place. The model was given all of that,
-    /// and nothing past it is passed over; a read from the start gave the
-    /// shown part again first, a whole result budget of it.
-    fn shown_through(&self, shown: &Value) -> usize {
-        let cut = json!({"role":"tool_archive","call_id":self.call_id,"result":shown});
+    /// Where a read of the archive goes on past `shown`, what a cut result
+    /// keeps at `pointer` (the start of its text, its first items): the read
+    /// text the archive and the archive with that part alone in its place
+    /// have in common from the start. The model was given all of that, and
+    /// nothing past it is passed over; a read from the start gave the shown
+    /// part again first, a whole result budget of it. The cut result itself
+    /// is not compared: what it says before that part may differ from the
+    /// archive (a search page's own cursor, cut to the matches it shows,
+    /// comes before them), which would place the read before what it shows.
+    fn shown_through(&self, pointer: &str, shown: &Value) -> usize {
+        let mut cut = self.result.clone();
+        let Some(part) = cut.pointer_mut(pointer) else {
+            return 0;
+        };
+        *part = shown.clone();
+        let cut = json!({"role":"tool_archive","call_id":self.call_id,"result":cut});
         let cut = serde_json::to_string(&context::shown_messages(&[cut])).unwrap_or_default();
         self.text.chars().zip(cut.chars()).take_while(|(a, b)| a == b).count()
     }
@@ -2684,6 +2695,63 @@ mod tests {
             }
             assert_eq!(rest, whole.chars().skip(offset).collect::<String>(), "run {run}");
             assert!(result_tokens(&call, &cut, &model) <= limit, "run {run}");
+        }
+    }
+
+    /// Context management review, nineteenth pass: a source search cut while
+    /// pages follow says its own page cursor before its list, and the cut
+    /// moves it to the first item it leaves out. The archive's next_cursor
+    /// was placed where the cut result and the archive stop agreeing from
+    /// the start — at that cursor, before every item shown — so its first
+    /// read gave the shown matches (files, counts) again.
+    #[test]
+    fn a_cut_search_page_goes_on_from_its_archive_past_what_it_shows() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..300 {
+            std::fs::write(dir.path().join(format!("module_{i:03}_with_a_longer_name.rs")), format!("fn f{i}() {{ let needle = \"{i}\"; }}\n").repeat(2)).unwrap();
+        }
+        let read_call = crate::llm::ToolCall { id: "h".into(), name: "history".into(), arguments: "{}".into() };
+        for run in 0..6 {
+            let mut ws = workspace(dir.path());
+            let (mode, field) = [("matches", "matches"), ("files", "files"), ("count", "counts")][run % 3];
+            let call = crate::llm::ToolCall { id: format!("s{run}"), name: "source_search".into(), arguments: "{}".into() };
+            let mut args = json!({"query":"needle","mode":mode,"limit":100});
+            if mode == "matches" {
+                args["before"] = json!(2);
+                args["after"] = json!(2);
+            }
+            let result = envelope(execute(&mut ws, "source_search", args.clone(), &Default::default()));
+            assert!(result["data"]["next_cursor"].is_string(), "run {run}: pages follow: {result}");
+            let full = result_tokens(&call, &result, "gpt-4o");
+            let mut cut = limit_result(&mut ws, &call, &args, result, full / 2);
+            if run >= 3 {
+                // Cut again beside the other results of its response.
+                cut = bound_result(&mut ws, &call, &args, cut, full / 4);
+            }
+            let cursor = &cut["next_cursor"];
+            assert_eq!(cursor["tool"], "history", "run {run}: {cursor}");
+            let id = cursor["id"].as_u64().unwrap();
+            let archive = ws.history.read(id).unwrap().messages[0]["result"].clone();
+            let whole = serde_json::to_string(&context::shown_messages(&ws.history.read(id).unwrap().messages[..])).unwrap();
+            let offset = cursor["offset"].as_u64().unwrap() as usize;
+            // The read goes on at the first item the cut left out.
+            let kept = cut["data"][field].as_array().unwrap().len();
+            let next = serde_json::to_string(&model_result(&archive)["data"][field][kept]).unwrap();
+            let rest: String = whole.chars().skip(offset).collect();
+            assert!(rest.starts_with(&format!(",{next}")), "run {run} ({mode}, {kept} kept): the read starts at {offset} of {}: {}", whole.chars().count(), rest.chars().take(80).collect::<String>());
+            // Followed as given, the reads give the rest of the archive.
+            let mut args = json!({"action":"read","id":id,"offset":offset});
+            let mut read = String::new();
+            for _ in 0..1_000 {
+                let result = envelope(execute(&mut ws, "history", args.clone(), &Default::default()));
+                let result = limit_result(&mut ws, &read_call, &args, result, full / 2);
+                read.push_str(result["data"]["text"].as_str().unwrap());
+                if result["next_cursor"].is_null() {
+                    break;
+                }
+                args = json!({"action":"read","id":id,"offset":result["next_cursor"]["offset"]});
+            }
+            assert_eq!(read, rest, "run {run}");
         }
     }
 

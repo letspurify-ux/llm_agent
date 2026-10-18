@@ -322,6 +322,54 @@ pub fn continuations_kept(history: &llm_agent::session::SessionHistory) -> Resul
                     return Err(format!("bundle {}: {id}, which a result in the context goes on in, was dropped", bundle.id));
                 }
             }
+            let call = bundle.messages[0]["tool_calls"].as_array().and_then(|calls| calls.iter().find(|c| c["id"] == message["tool_call_id"]));
+            if call.is_some_and(|c| c["function"]["name"] != "history") {
+                archive_read_goes_on_past_what_was_shown(history, &result).map_err(|e| format!("bundle {}: {e}", bundle.id))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A cut result's archive is read on right past what the result shows of
+/// it: the item after the last one it shows, the character after the start
+/// of its text it shows (a preview of it is read from the start).
+fn archive_read_goes_on_past_what_was_shown(history: &llm_agent::session::SessionHistory, result: &Value) -> Result<(), String> {
+    let cursor = &result["next_cursor"];
+    let (Some(id), Some(offset)) = (cursor["id"].as_u64().filter(|_| cursor["tool"] == "history"), cursor["offset"].as_u64()) else {
+        return Ok(());
+    };
+    let Some(archive) = history.read(id).ok().filter(|b| b.messages[0]["role"] == "tool_archive") else {
+        return Ok(());
+    };
+    let whole = serde_json::to_string(&llm_agent::context::shown_messages(&archive.messages[..])).unwrap();
+    let (passed, rest): (String, String) = (whole.chars().take(offset as usize).collect(), whole.chars().skip(offset as usize).collect());
+    let shown = llm_agent::tools::model_result(result);
+    let archived = llm_agent::tools::model_result(&archive.messages[0]["result"]);
+    for pointer in ["/data/content/text", "/data/text"] {
+        if let (Some(text), Some(all)) = (shown.pointer(pointer).and_then(Value::as_str), archived.pointer(pointer).and_then(Value::as_str))
+            && !text.is_empty()
+            && text.len() < all.len()
+        {
+            let escaped = serde_json::to_string(text).unwrap();
+            return if passed.ends_with(&escaped[..escaped.len() - 1]) {
+                Ok(())
+            } else {
+                Err(format!("archive {id} is read on at {offset}, not past the {} characters of {pointer} shown", text.chars().count()))
+            };
+        }
+    }
+    for field in ["paths", "matches", "items", "rows", "hits", "outline", "files", "counts"] {
+        if let (Some(items), Some(all)) = (shown["data"][field].as_array(), archived["data"][field].as_array())
+            && !items.is_empty()
+            && items.len() < all.len()
+        {
+            let next = serde_json::to_string(&all[items.len()]).unwrap();
+            return if rest.starts_with(&format!(",{next}")) {
+                Ok(())
+            } else {
+                Err(format!("archive {id} is read on at {offset}, not at the first of {field} left out ({} of {} shown)", items.len(), all.len()))
+            };
         }
     }
     Ok(())
