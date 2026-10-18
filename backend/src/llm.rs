@@ -272,7 +272,7 @@ pub fn overflow_prompt_tokens(error: &str) -> Option<usize> {
     PATTERNS.iter().find_map(|pattern| {
         let found = pattern.captures(error)?;
         let number = |group: usize| found.get(group).and_then(|m| m.as_str().replace(',', "").parse::<usize>().ok());
-        Some(number(1)? + number(2).unwrap_or(0))
+        Some(number(1)?.saturating_add(number(2).unwrap_or(0)))
     })
 }
 
@@ -1509,6 +1509,9 @@ mod diagnostic_tests {
             (r#"http_400: {"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size_error"}}"#, None),
             (r#"http_400: {"error":{"code":"1261","message":"Prompt exceeds max length"}}"#, None),
             ("http_413: Request Entity Too Large", None),
+            // A count past any context (a garbled number) adds up to the
+            // most there is, not past it.
+            (r#"http_400: {"error":{"message":"This model's maximum context length is 8192 tokens. However, you requested 18446744073709551615 tokens (18446744073709551615 in the messages, 300 in the functions, and 2000 in the completion).","code":"context_length_exceeded"}}"#, Some(usize::MAX)),
         ] {
             assert!(context_overflow(refused), "{refused}");
             assert_eq!(overflow_prompt_tokens(refused), counted, "{refused}");

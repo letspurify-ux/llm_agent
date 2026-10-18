@@ -71,6 +71,11 @@ const UNREGISTERED_LEAD: &str = "등록된 지식에 없는 내용";
 /// line: the line with a few words before it. Past them the line is not
 /// what opens the answer, and the answer streams on.
 const OPENING_CHARS: usize = 60;
+/// Characters of blank lines and short headings passed over before the
+/// opening line. Past them the general-knowledge line no longer opens the
+/// answer: a response of heading or blank lines alone (a model repeating
+/// itself) was held whole, and judged from its start again at every token.
+const OPENING_SKIP: usize = 4 * OPENING_CHARS;
 const PROVIDER_WAITS: [u64; 2] = [5, 15];
 const EMPTY_RETRIES: usize = 2;
 const EMPTY_REPLIES: &str = "모델이 빈 응답을 반복해 답변을 만들지 못했습니다. 잠시 후 다시 시도해주세요.";
@@ -363,7 +368,7 @@ async fn run(
                         start.push_str(&text);
                         // The line as the system prompt words it: the rest of
                         // the response is not worth generating.
-                        if lead(opening_line(start).0) == Lead::Claims {
+                        if opening_line(start).is_some_and(|(line, _)| lead(line) == Lead::Claims) {
                             if let Some(claim) = claim.take() {
                                 let _ = claim.send(());
                             }
@@ -494,7 +499,7 @@ async fn run(
                 let refusal = error.to_string();
                 if crate::llm::context_overflow(&refusal) {
                     let counted = crate::llm::overflow_prompt_tokens(&refusal);
-                    let undercounted = counted.is_some_and(|n| n + config.llm.output_tokens + 512 > config.llm.context_tokens);
+                    let undercounted = counted.is_some_and(|n| n.saturating_add(config.llm.output_tokens + 512) > config.llm.context_tokens);
                     if let Some(counted) = counted {
                         let dropped = error
                             .downcast_ref::<crate::llm::CompletionError>()
@@ -942,17 +947,34 @@ fn lead(text: &str) -> Lead {
 
 /// The line an answer opens with, where the system prompt has the
 /// general-knowledge line said: the first with content, past blank lines and
-/// short headings (a title before it), and whether it has ended.
-fn opening_line(text: &str) -> (&str, bool) {
+/// short headings (a title before it), and whether it has ended. None past
+/// `OPENING_SKIP` characters of them: nothing there opens the answer.
+fn opening_line(text: &str) -> Option<(&str, bool)> {
     let mut rest = text;
+    let mut passed = 0usize;
     loop {
-        let start = rest.trim_start();
+        let mut blank = rest.len();
+        for (at, c) in rest.char_indices() {
+            if !c.is_whitespace() {
+                blank = at;
+                break;
+            }
+            passed += 1;
+            if passed > OPENING_SKIP {
+                return None;
+            }
+        }
+        let start = &rest[blank..];
         let Some((line, after)) = start.split_once('\n') else {
-            return (start, false);
+            return Some((start, false));
         };
-        let title = line.trim_start().starts_with('#') && line.chars().count() < OPENING_CHARS;
+        let title = line.starts_with('#') && line.chars().count() < OPENING_CHARS;
         if !title || claims_unregistered(line) {
-            return (line, true);
+            return Some((line, true));
+        }
+        passed += line.chars().count() + 1;
+        if passed > OPENING_SKIP {
+            return None;
         }
         rest = after;
     }
@@ -964,7 +986,9 @@ fn opening_line(text: &str) -> (&str, bool) {
 /// stays the decision for all of it: the relay holds no more than the
 /// opening, and what it shows is never refused after the response ends.
 fn opening(text: &str, done: bool) -> Lead {
-    let (line, ended) = opening_line(text);
+    let Some((line, ended)) = opening_line(text) else {
+        return Lead::Other;
+    };
     let end = line.char_indices().nth(OPENING_CHARS).map_or(line.len(), |(i, _)| i);
     if claims_unregistered(&line[..end]) {
         Lead::Claims
@@ -2016,6 +2040,35 @@ mod tests {
     }
 
     const GENERAL: &str = "*등록된 지식에 없는 내용이라 일반 지식으로 답변합니다.*\n일론 머스크는 기업가입니다.";
+
+    /// Backend review (leaks, panics, deadlocks), fourth pass: a response of
+    /// heading or blank lines alone (a model repeating itself) was held by
+    /// the relay whole and judged from its start again at every token, on
+    /// the async runtime — 5,000 `###` lines took 3.5 s, 20,000 a minute.
+    #[test]
+    fn an_answer_opening_with_headings_or_blank_lines_alone_is_decided_soon() {
+        for line in ["###\n", "\n", "# 제목\n", " \r\n", "  "] {
+            // As the relay judges a streamed response, a piece at a time.
+            let mut text = String::new();
+            while opening(&text, false) == Lead::Undecided {
+                text.push_str(line);
+                assert!(text.chars().count() <= OPENING_SKIP + OPENING_CHARS, "{line:?} still held at {} characters", text.chars().count());
+            }
+            assert_eq!(opening(&text, false), Lead::Other, "{line:?}");
+            let started = Instant::now();
+            assert_eq!(opening(&line.repeat(50_000), true), Lead::Other, "{line:?}");
+            assert!(started.elapsed() < Duration::from_millis(100), "{line:?}: {:?}", started.elapsed());
+        }
+        // A few headings before the line still leave it the opening.
+        assert_eq!(opening("# 답변\n\n## 요약\n\n등록된 지식에 없는 내용이라 일반 지식으로 답합니다.", true), Lead::Claims);
+        // Past the headings an answer opens with, the line opens nothing,
+        // and no prefix decides otherwise.
+        let late = format!("{}등록된 지식에 없는 내용이라 일반 지식으로 답합니다.", "###\n".repeat(100));
+        assert_eq!(opening(&late, true), Lead::Other);
+        for (i, _) in late.char_indices() {
+            assert_ne!(opening(&late[..i], false), Lead::Claims, "{:?}", &late[..i]);
+        }
+    }
 
     #[test]
     fn a_call_refused_before_it_ran_looked_at_nothing() {

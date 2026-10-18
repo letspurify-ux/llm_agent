@@ -2638,3 +2638,27 @@ async fn a_server_that_cuts_requests_is_told_to_the_settings() {
         }
     }
 }
+
+// Backend review (leaks, panics, deadlocks), fourth pass (2026-10-18):
+// failed before its fix. Needs no MariaDB.
+
+/// A provider (or a proxy before it) whose refusal for size states a count
+/// past any context: the messages and functions counts added up, and the
+/// output added to that, overflowed — a panic in a debug build.
+struct CountsPastAnyContext;
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for CountsPastAnyContext {
+    async fn complete(&self, _r: Value, _c: &llm_agent::config::LlmConfig, _t: CancellationToken, _d: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        anyhow::bail!(
+            "http_400: {}",
+            json!({"error":{"message":"This model's maximum context length is 128000 tokens. However, you requested 18446744073709551615 tokens (18446744073709551615 in the messages, 300 in the functions, and 2000 in the completion).","code":"context_length_exceeded"}})
+        )
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_counting_past_any_context_ends_the_question_plainly() {
+    let (app, _dir) = app(no_db("unknown-tokenizer"), std::sync::Arc::new(CountsPastAnyContext));
+    let error = ask(&app, "review4", "질문", vec![]).await.0.err().expect("refused");
+    assert!(error.downcast_ref::<agent::UserFacing>().is_some(), "{error}");
+}

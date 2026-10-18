@@ -1951,7 +1951,7 @@ pub fn bound_result(
         let candidate = |length: usize, s: &Workspace| {
             let mut v = template.clone();
             *v.pointer_mut(pointer).unwrap() = json!(chars[..length].iter().collect::<String>());
-            let offset = args["offset"].as_u64().unwrap_or(0) + length as u64;
+            let offset = args["offset"].as_u64().unwrap_or(0).saturating_add(length as u64);
             if reading {
                 let line = template["data"]["read_start"].as_u64().unwrap_or(1);
                 let offset = template["data"]["read_offset"].as_u64().unwrap_or(0) + length as u64;
@@ -2069,7 +2069,7 @@ pub fn bound_result(
             if let Some(cursor) = output["data"]["next_cursor"].as_str().map(str::to_owned)
                 && let Some((prefix, _)) = cursor.rsplit_once(':')
             {
-                output["data"]["next_cursor"] = json!(format!("{prefix}:{}", start + low));
+                output["data"]["next_cursor"] = json!(format!("{prefix}:{}", start.saturating_add(low)));
             }
             if let Some(archived) = &archived {
                 output["next_cursor"]["offset"] = json!(archived.shown_through(&format!("/data/{field}"), &output["data"][field]));
@@ -2957,6 +2957,22 @@ mod tests {
         let shown = cut["data"]["rows"].as_array().unwrap().len() as u64;
         assert!(shown > 0 && shown < 100, "{shown}");
         assert_eq!(cut["data"]["next_offset"], 400 + shown);
+    }
+
+    /// Backend review (leaks, panics, deadlocks), fourth pass: an MCP tool
+    /// (or the search) called with an `offset` near the largest number had
+    /// its cut text's offset added past it, a panic in a debug build — on
+    /// the async runtime, with the conversation's history moved out for the
+    /// batch, so the conversation lost it.
+    #[test]
+    fn an_offset_argument_past_any_text_cuts_the_result_all_the_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ws = workspace(dir.path());
+        let call = crate::llm::ToolCall { id: "m".into(), name: "exa__web_fetch_exa".into(), arguments: "{}".into() };
+        let fetched = json!({"text":"가져온 문장 ".repeat(2_000)});
+        let cut = bound_result(&mut ws, &call, &json!({"url":"https://example.com","offset":u64::MAX}), envelope(Ok(fetched)), 300);
+        assert_eq!(cut["truncated"], true, "{cut}");
+        assert!(result_tokens(&call, &cut, "gpt-4o") <= 300, "{cut}");
     }
 
     #[test]
