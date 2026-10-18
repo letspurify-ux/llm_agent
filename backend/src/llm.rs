@@ -960,41 +960,9 @@ impl OpenAiClient {
                 anyhow::anyhow!("connection_probe_timeout: check exceeded {timeout_secs}s")
             })?
     }
-    async fn probe_roundtrip(&self, c: &Config) -> Result<String> {
-        let mut body = json!({"model":c.model,"messages":[{"role":"user","content":"Reply OK"}],"stream":false});
-        body[output_limit_field(c)] = json!(c.output_tokens);
-        apply_optional_parameters(&mut body, c, false);
-        let mut left_out: Vec<&str> = vec![];
-        let plain = loop {
-            let mut req = Self::client(c)?.post(c.completion_url()?).json(&body);
-            if let Some(k) = Self::key(c) {
-                req = req.bearer_auth(k)
-            }
-            let plain =
-                tokio::time::timeout(Duration::from_secs(c.request_timeout_secs), req.send()).await??;
-            if plain.status().is_success() {
-                break plain;
-            }
-            let status = plain.status();
-            let detail = tokio::time::timeout(Duration::from_secs(c.request_timeout_secs), plain.bytes())
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .map(|bytes| String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_ERROR_BODY_BYTES)]).chars().take(1000).collect::<String>())
-                .unwrap_or_default();
-            // As a chat request does: an optional parameter refused by name
-            // is left out.
-            if let Some(parameter) = rejected_parameter(&format!("http_{}: {detail}", status.as_u16()), &body) {
-                body.as_object_mut().unwrap().remove(parameter);
-                left_out.push(parameter);
-                continue;
-            }
-            bail!("plain response probe failed: {status} {}", detail.chars().take(300).collect::<String>());
-        };
-        remember_rejected_parameters(c, &left_out);
-        // HTTP 200 alone can be an HTML proxy page or a provider error. Read
-        // and validate the plain answer before testing streaming/tool support.
-        let mut stream = plain.bytes_stream();
+    /// The body of a plain (non-streaming) answer as JSON.
+    async fn read_plain_answer(response: reqwest::Response, c: &Config) -> Result<Value> {
+        let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();
         while let Some(chunk) =
             tokio::time::timeout(Duration::from_secs(c.request_timeout_secs), stream.next())
@@ -1010,21 +978,60 @@ impl OpenAiClient {
             }
             bytes.extend_from_slice(&chunk);
         }
-        let plain: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        serde_json::from_slice(&bytes).map_err(|error| {
             anyhow::anyhow!("plain response probe failed: invalid JSON: {error}")
-        })?;
-        let choice = &plain["choices"][0];
-        if !plain["error"].is_null()
-            || choice["message"]["content"]
-                .as_str()
-                .is_none_or(|text| text.trim().is_empty())
-            || choice["message"]["tool_calls"]
-                .as_array()
-                .is_some_and(|calls| !calls.is_empty())
-            || choice["finish_reason"].as_str() != Some("stop")
-        {
-            bail!("plain response probe failed: expected a complete text response");
+        })
+    }
+    async fn probe_roundtrip(&self, c: &Config) -> Result<String> {
+        let mut body = json!({"model":c.model,"messages":[{"role":"user","content":"Reply OK"}],"stream":false});
+        body[output_limit_field(c)] = json!(c.output_tokens);
+        apply_optional_parameters(&mut body, c, false);
+        let mut left_out: Vec<&str> = vec![];
+        let mut transient_retries = 0usize;
+        // As a chat request does, an overloaded or rate-limited provider is
+        // asked again; the free models of a gateway often are for a while.
+        loop {
+            let mut req = Self::client(c)?.post(c.completion_url()?).json(&body);
+            if let Some(k) = Self::key(c) {
+                req = req.bearer_auth(k)
+            }
+            let response =
+                tokio::time::timeout(Duration::from_secs(c.request_timeout_secs), req.send()).await??;
+            let status = response.status();
+            let problem = if status.is_success() {
+                // HTTP 200 alone can be an HTML proxy page or a provider
+                // error. Read and validate the plain answer before testing
+                // streaming/tool support.
+                let answer = Self::read_plain_answer(response, c).await?;
+                match plain_answer_problem(&answer) {
+                    None => break,
+                    Some(problem) => problem,
+                }
+            } else {
+                let detail = tokio::time::timeout(Duration::from_secs(c.request_timeout_secs), response.bytes())
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .map(|bytes| String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_ERROR_BODY_BYTES)]).chars().take(1000).collect::<String>())
+                    .unwrap_or_default();
+                let refusal = format!("http_{}: {detail}", status.as_u16());
+                // As a chat request does: an optional parameter refused by
+                // name is left out.
+                if let Some(parameter) = rejected_parameter(&refusal, &body) {
+                    body.as_object_mut().unwrap().remove(parameter);
+                    left_out.push(parameter);
+                    continue;
+                }
+                format!("http_{}: {}", status.as_u16(), detail.chars().take(300).collect::<String>())
+            };
+            if transient_error(&problem) && transient_retries < c.retries {
+                transient_retries = transient_retries.saturating_add(1);
+                tokio::time::sleep(Duration::from_millis(500 * (1 << transient_retries.min(5)))).await;
+                continue;
+            }
+            bail!("plain response probe failed: {problem}");
         }
+        remember_rejected_parameters(c, &left_out);
         let (tx, mut rx) = mpsc::channel(32);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let tool = json!({"type":"function","function":{"name":"connection_echo","description":"Return the supplied text","parameters":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}});
@@ -1054,6 +1061,54 @@ impl OpenAiClient {
         Ok("Plain response, SSE streaming and tool round-trip succeeded".into())
     }
 }
+
+/// Why a plain (non-streaming) answer is no complete text response, if it is
+/// none. An `error` object under HTTP 200 is how gateways such as OpenRouter
+/// relay an upstream overload or rate limit ("Upstream error from Nvidia:
+/// Service temporarily overloaded", code 503); it is worded like the HTTP
+/// status it stands for, so [`transient_error`] tells it from a refusal.
+fn plain_answer_problem(answer: &Value) -> Option<String> {
+    let clip = |text: &str| text.chars().take(300).collect::<String>();
+    if !answer["error"].is_null() {
+        let error = &answer["error"];
+        let message = clip(error["message"].as_str().map_or_else(|| error.to_string(), str::to_owned).as_str());
+        let code = error["code"]
+            .as_u64()
+            .or_else(|| error["code"].as_str().and_then(|code| code.parse().ok()));
+        return Some(match code {
+            Some(code) => format!("http_{code}: {message}"),
+            None => format!("provider_error: {message}"),
+        });
+    }
+    let Some(choice) = answer["choices"].as_array().and_then(|choices| choices.first()) else {
+        return Some(format!("no choices in the answer: {}", clip(&answer.to_string())));
+    };
+    let message = &choice["message"];
+    if message["tool_calls"].as_array().is_some_and(|calls| !calls.is_empty()) {
+        return Some("the answer is a tool call, not text".into());
+    }
+    match choice["finish_reason"].as_str() {
+        Some("stop") => {}
+        Some("length") => {
+            return Some(
+                "the answer was cut at the output limit (finish_reason=length); raise the output tokens or lower the reasoning effort".into(),
+            );
+        }
+        other => return Some(format!("finish_reason={} (expected stop)", other.unwrap_or("missing"))),
+    }
+    if message["content"].as_str().is_none_or(|text| text.trim().is_empty()) {
+        let reasoned = ["reasoning", "reasoning_content"]
+            .into_iter()
+            .any(|field| message[field].as_str().is_some_and(|text| !text.trim().is_empty()));
+        return Some(if reasoned {
+            "the answer has reasoning but no text".into()
+        } else {
+            "the answer has no text".into()
+        });
+    }
+    None
+}
+
 #[async_trait]
 impl LlmClient for OpenAiClient {
     async fn complete(
@@ -1689,5 +1744,136 @@ mod tool_choice_tests {
         let (config, seen) = serve(Provider::Refuses).await;
         complete(&config, withheld()).await.unwrap();
         assert!(seen.lock().unwrap().iter().all(|r| r.get("reasoning_effort").is_some()));
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const OVERLOADED: &str = r#"{"id":"gen-1","error":{"message":"Upstream error from Nvidia: Service temporarily overloaded","code":503,"metadata":{"error_type":"provider_overloaded"}}}"#;
+    const ANSWER: &str = r#"{"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"OK","reasoning":"The user wants OK."}}]}"#;
+
+    /// An OpenAI-compatible server on a fresh port. The plain (non-streaming)
+    /// requests get `plain` in turn (the last one repeats); the streaming
+    /// ones get the tool call and then the text the probe's later stages ask
+    /// for. Returns the number of plain requests it answered.
+    async fn serve(plain: Vec<&'static str>) -> (Config, Arc<Mutex<usize>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let plain_requests = Arc::new(Mutex::new(0usize));
+        let counter = plain_requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let counter = counter.clone();
+                let plain = plain.clone();
+                tokio::spawn(async move {
+                    let mut bytes = vec![];
+                    let mut buffer = [0u8; 8192];
+                    let body = loop {
+                        let n = socket.read(&mut buffer).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&buffer[..n]);
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                            let length = head
+                                .lines()
+                                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                                .unwrap_or(0);
+                            if body.len() >= length {
+                                break serde_json::from_str::<Value>(body).unwrap();
+                            }
+                        }
+                    };
+                    let event = |v: Value| format!("data: {v}\n\n");
+                    let reply = if body["stream"] == json!(false) {
+                        let mut count = counter.lock().unwrap();
+                        let answer = plain[(*count).min(plain.len() - 1)];
+                        *count += 1;
+                        // A gateway's keep-alive blanks come before the JSON.
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n \n{answer}")
+                    } else if body["messages"].as_array().is_some_and(|m| m.iter().any(|m| m["role"] == "tool")) {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: PROCESSING\n\n{}{}data: [DONE]\n\n",
+                            event(json!({"choices":[{"delta":{"content":"OK"},"finish_reason":null}]})),
+                            event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]}))
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}{}data: [DONE]\n\n",
+                            event(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"connection_echo","arguments":"{\"text\":\"OK\"}"}}]},"finish_reason":null}]})),
+                            event(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}))
+                        )
+                    };
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        let config = Config {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "probe-test".into(),
+            disable_proxy: true,
+            retries: 0,
+            ..Config::default()
+        };
+        (config, plain_requests)
+    }
+
+    #[test]
+    fn a_plain_answer_says_why_it_is_not_a_complete_text() {
+        let problem = |answer: &str| plain_answer_problem(&serde_json::from_str(answer).unwrap());
+        assert_eq!(problem(ANSWER), None);
+        // The case a live run hit: a gateway relays an overload as HTTP 200.
+        let overloaded = problem(OVERLOADED).unwrap();
+        assert_eq!(overloaded, "http_503: Upstream error from Nvidia: Service temporarily overloaded");
+        assert!(transient_error(&overloaded));
+        let quota = problem(r#"{"error":{"message":"Rate limit exceeded","code":"429"}}"#).unwrap();
+        assert!(transient_error(&quota), "{quota}");
+        // Other refusals are the provider's answer, not a reason to ask again.
+        let key = problem(r#"{"error":{"message":"No auth credentials found","code":401}}"#).unwrap();
+        assert!(!transient_error(&key) && key.contains("No auth credentials found"), "{key}");
+        let bare = problem(r#"{"error":"quota used up"}"#).unwrap();
+        assert!(bare.starts_with("provider_error:") && bare.contains("quota used up"), "{bare}");
+        // A model that spends its limit reasoning leaves no text.
+        let length = problem(r#"{"choices":[{"finish_reason":"length","message":{"content":null,"reasoning":"hmm"}}]}"#).unwrap();
+        assert!(length.contains("finish_reason=length") && length.contains("output tokens"), "{length}");
+        let reasoned = problem(r#"{"choices":[{"finish_reason":"stop","message":{"content":null,"reasoning":"hmm"}}]}"#).unwrap();
+        assert_eq!(reasoned, "the answer has reasoning but no text");
+        assert_eq!(
+            problem(r#"{"choices":[{"finish_reason":"stop","message":{"content":" "}}]}"#).unwrap(),
+            "the answer has no text"
+        );
+        assert!(problem(r#"{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"id":"c"}]}}]}"#).unwrap().contains("tool call"));
+        assert!(problem(r#"{"choices":[{"message":{"content":"OK"}}]}"#).unwrap().contains("finish_reason=missing"));
+        assert!(problem(r#"{"choices":[]}"#).unwrap().starts_with("no choices"));
+    }
+
+    #[tokio::test]
+    async fn an_overload_relayed_with_http_200_is_asked_again() {
+        let (config, plain_requests) = serve(vec![OVERLOADED, ANSWER]).await;
+        let config = Config { retries: 1, ..config };
+        let done = OpenAiClient.probe(&config).await.unwrap();
+        assert!(done.contains("succeeded"), "{done}");
+        assert_eq!(*plain_requests.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_stays_overloaded_names_the_providers_error() {
+        let (config, plain_requests) = serve(vec![OVERLOADED]).await;
+        let error = OpenAiClient.probe(&config).await.unwrap_err().to_string();
+        assert!(error.contains("Service temporarily overloaded") && error.contains("503"), "{error}");
+        assert!(!error.contains("expected a complete text response"), "{error}");
+        assert_eq!(*plain_requests.lock().unwrap(), 1, "no retries are configured");
+        // A refusal that is no overload is not asked again, retries or not.
+        let (config, plain_requests) = serve(vec![r#"{"error":{"message":"No auth credentials found","code":401}}"#]).await;
+        let config = Config { retries: 2, ..config };
+        let error = OpenAiClient.probe(&config).await.unwrap_err().to_string();
+        assert!(error.contains("No auth credentials found"), "{error}");
+        assert_eq!(*plain_requests.lock().unwrap(), 1);
     }
 }
