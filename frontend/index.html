@@ -45,6 +45,16 @@
       }
 
       .app { display: flex; flex-direction: column; height: 100%; }
+      /* 화면 키보드가 떠 있는 동안에는 키보드가 남긴 칸(visual viewport)에 앱을 고정한다 — iOS는 키보드가
+         떠도 100%(레이아웃 뷰포트)를 줄이지 않고, 보이는 칸을 키보드 높이만큼 아래로 옮긴다.
+         값과 클래스는 src/viewport.js가 건다(그 주석 참고). fixed는 레이아웃 뷰포트 기준이라 top에
+         옮겨진 만큼(offsetTop)을 준다. 화면에서만: 인쇄는 아래 print 규칙대로 흐른다. */
+      @media screen {
+        html.keyboard-open .app {
+          position: fixed; left: 0; right: 0;
+          top: var(--app-top, 0px); height: var(--app-height, 100%);
+        }
+      }
 
       /* ===== 헤더 ===== */
       .header {
@@ -527,6 +537,19 @@
         /* 창이 아주 낮으면 이 바닥이 위의 max-height(40dvh)를 밀어낸다 — min-height가 늘 이긴다.
            두 줄을 여는 것은 안내문이 감기기 때문이지 자리를 뺏자는 것이 아니므로 상한에 맞춰 접는다. */
         .composer textarea { min-height: min(64px, 40vh); min-height: min(64px, 40dvh); }
+      }
+      /* iOS Safari는 글자가 16px보다 작은 입력칸에 초점이 가면 화면을 확대하고, 초점이 빠져도 되돌리지
+         않는다 — 폭에 꼭 맞던 화면이 옆으로 넘치게 된다. 그래서 iOS에서만 입력칸을 16px로 올린다
+         (-webkit-touch-callout은 iOS·iPadOS의 WebKit만 안다). maximum-scale=1로 막지 않는 이유:
+         그러면 Android에서는 사용자의 손가락 확대까지 막힌다.
+         !important인 이유: 관리 화면(admin.css)의 입력칸들은 더 구체적인 선택자로 12~13px을 준다. */
+      @supports (-webkit-touch-callout: none) {
+        input, textarea, select { font-size: 16px !important; }
+        /* 글자가 커진 만큼 안내문도 더 넓은 창에서 감긴다(실측: 16px에서 안내문 244px, 창 366px부터
+           한 줄 — 14.5px의 222px·344px과 같은 여백). 위 규칙의 이유 그대로 두 줄을 열어 둔다. */
+        @media (max-width: 369px) {
+          .composer textarea { min-height: min(64px, 40vh); min-height: min(64px, 40dvh); }
+        }
       }
     </style>
   </head>
