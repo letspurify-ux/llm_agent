@@ -288,7 +288,13 @@ struct ToolStats {
 struct State {
     phase: Phase,
     since: String,
+    /// What went wrong, as the admin screen shows it: with the last line of
+    /// the server's own output.
     error: Option<String>,
+    /// The same as the model is told it: without the server's output, which
+    /// may print anything (a connection string, a token) and stays with the
+    /// admin — the model's provider is outside.
+    cause: Option<String>,
     restarts: u32,
     retry_at: Option<String>,
     peer: Option<Peer<RoleClient>>,
@@ -338,6 +344,7 @@ impl Slot {
                 phase,
                 since: now(),
                 error: None,
+                cause: None,
                 restarts: 0,
                 retry_at: None,
                 peer: None,
@@ -375,12 +382,25 @@ impl Slot {
     }
 
     fn set_phase(&self, phase: Phase, error: Option<String>) {
+        self.set_phase_told(phase, error.clone(), error);
+    }
+
+    /// Failed for `cause`, the server's last output beside it on the admin
+    /// screen only. The error as the admin sees it.
+    fn fail(&self, cause: &str) -> String {
+        let error = self.failure(cause);
+        self.set_phase_told(Phase::Failed, Some(error.clone()), Some(cause.to_owned()));
+        error
+    }
+
+    fn set_phase_told(&self, phase: Phase, error: Option<String>, cause: Option<String>) {
         let mut state = self.state();
         if state.phase != phase || state.error != error {
             state.since = now();
         }
         state.phase = phase;
         state.error = error;
+        state.cause = cause;
         if phase != Phase::Ready {
             state.peer = None;
             state.broken = None;
@@ -540,21 +560,29 @@ impl Snapshot {
     /// The offered tools a provider's refusal of a request names: by name
     /// (OpenAI: "Invalid schema for function 'jira__search'"), or else by
     /// their place among the request's `definitions` (Gemini
-    /// "function_declarations[12]", Anthropic "tools.12.custom").
+    /// "function_declarations[12]", Anthropic "tools.12.custom"). Every one
+    /// it names: Gemini lists each declaration it does not take, and one left
+    /// out at a time would cost a refused request each.
     pub fn refused_in(&self, refusal: &str, definitions: &[Value]) -> Vec<String> {
         let named: Vec<String> = self.names().filter(|name| mentions(refusal, name)).map(str::to_owned).collect();
         if !named.is_empty() {
             return named;
         }
-        let place = regex::Regex::new(r"function_declarations\[(\d+)\]").unwrap().captures(refusal)
-            .or_else(|| regex::Regex::new(r"\btools(?:\.|\[)(\d+)\b").unwrap().captures(refusal))
-            .and_then(|c| c[1].parse::<usize>().ok());
-        place
-            .and_then(|at| definitions.get(at))
-            .and_then(|definition| definition["function"]["name"].as_str())
-            .filter(|name| self.find(name).is_some())
-            .map(|name| vec![name.to_owned()])
-            .unwrap_or_default()
+        let places = |pattern: &str| -> Vec<usize> {
+            regex::Regex::new(pattern).unwrap().captures_iter(refusal).filter_map(|c| c[1].parse().ok()).collect()
+        };
+        // Gemini's places are within its first tool ("tools[0]").
+        let mut at = places(r"function_declarations\[(\d+)\]");
+        if at.is_empty() {
+            at = places(r"\btools(?:\.|\[)(\d+)\b");
+        }
+        let mut refused: Vec<String> = vec![];
+        for name in at.into_iter().filter_map(|at| definitions.get(at)?["function"]["name"].as_str()) {
+            if self.find(name).is_some() && !refused.iter().any(|known| known == name) {
+                refused.push(name.to_owned());
+            }
+        }
+        refused
     }
 
     /// Leaves the tools out of the questions sent to this model endpoint,
@@ -713,12 +741,12 @@ impl Offered {
         }
         match error {
             ServiceError::McpError(e) if e.code == ErrorCode::INVALID_PARAMS => {
-                anyhow!("invalid_tool_arguments: {} refused the arguments: {}", self.exposed, e.message)
+                anyhow!("invalid_tool_arguments: {} refused the arguments: {}", self.exposed, convert::error_text(&e.message))
             }
             ServiceError::McpError(e) if e.code == ErrorCode::METHOD_NOT_FOUND => {
-                anyhow!("unsupported_tool: {} does not know {}: {}", self.server, self.tool, e.message)
+                anyhow!("unsupported_tool: {} does not know {}: {}", self.server, self.tool, convert::error_text(&e.message))
             }
-            ServiceError::McpError(e) => anyhow!("mcp_request_failed: {} (code {})", redact(&e.message), e.code.0),
+            ServiceError::McpError(e) => anyhow!("mcp_request_failed: {} (code {})", redact(&convert::error_text(&e.message)), e.code.0),
             // Told to stop, the server may have done the work all the same
             // (an issue filed): said so, against a blind retry.
             ServiceError::Timeout { .. } => anyhow!(
@@ -990,7 +1018,7 @@ fn not_connected(server: &str, state: &State) -> String {
     format!(
         "mcp_server_unavailable: MCP server {server} is not connected ({}{})",
         state.phase.label(),
-        state.error.as_deref().map(|e| format!(": {e}")).unwrap_or_default()
+        state.cause.as_deref().map(|e| format!(": {e}")).unwrap_or_default()
     )
 }
 
@@ -1087,7 +1115,8 @@ enum Ended {
     Stopped,
     Requested,
     Lost,
-    /// Connected, but the tools could not be listed.
+    /// Connected, but the tools could not be listed (the cause, the
+    /// server's own output not added).
     Failed(String),
 }
 
@@ -1137,13 +1166,12 @@ async fn supervise(slot: Arc<Slot>) {
                         requested = true;
                     }
                     Ended::Lost => {
-                        let error = slot.failure("연결이 끊겼습니다");
-                        slot.set_phase(Phase::Failed, Some(error.clone()));
+                        let error = slot.fail("연결이 끊겼습니다");
                         slot.log("event", &error);
                         close(&slot, connection).await;
                     }
-                    Ended::Failed(error) => {
-                        slot.set_phase(Phase::Failed, Some(error.clone()));
+                    Ended::Failed(cause) => {
+                        let error = slot.fail(&cause);
                         slot.log("event", &error);
                         close(&slot, connection).await;
                     }
@@ -1151,9 +1179,8 @@ async fn supervise(slot: Arc<Slot>) {
             }
             Err(error) => {
                 kill_group(&slot);
-                let error = slot.failure(&format!("{error:#}"));
+                let error = slot.fail(&format!("{error:#}"));
                 slot.log("event", &format!("연결 실패: {error}"));
-                slot.set_phase(Phase::Failed, Some(error));
             }
         }
         if requested || started.elapsed() >= Duration::from_secs(STABLE_SECS) {
@@ -1177,10 +1204,12 @@ async fn supervise(slot: Arc<Slot>) {
 
 /// Lists the tools and serves the connection until it ends or is stopped.
 async fn serve(slot: &Arc<Slot>, server: &McpServer, connection: &mut Connection) -> Ended {
+    // Kept from an earlier connection: a tool listed again keeps its name.
+    let known = slot.state().tools.clone();
     let listed = tokio::select! {
         _ = slot.stop.cancelled() => return Ended::Stopped,
         _ = slot.reconnect.notified() => return Ended::Requested,
-        listed = tokio::time::timeout(Duration::from_secs(CONNECT_SECS), list_tools(&connection.peer, &server.name)) => listed,
+        listed = tokio::time::timeout(Duration::from_secs(CONNECT_SECS), list_tools(&connection.peer, &server.name, &known)) => listed,
     };
     match listed {
         Ok(Ok(Listed { tools, notes })) => {
@@ -1211,13 +1240,12 @@ async fn serve(slot: &Arc<Slot>, server: &McpServer, connection: &mut Connection
             let count = slot.state().tools.len();
             slot.log("event", &format!("연결됨: {described}, 도구 {count}개"));
         }
-        Ok(Err(error)) => return Ended::Failed(slot.failure(&format!("도구 목록을 받지 못했습니다: {error:#}"))),
-        Err(_) => return Ended::Failed(slot.failure(&format!("{CONNECT_SECS}초 안에 도구 목록을 받지 못했습니다"))),
+        Ok(Err(error)) => return Ended::Failed(format!("도구 목록을 받지 못했습니다: {error:#}")),
+        Err(_) => return Ended::Failed(format!("{CONNECT_SECS}초 안에 도구 목록을 받지 못했습니다")),
     }
     // A call that found the connection broken, or its server stopped.
     let broken = |slot: &Arc<Slot>| {
-        let cause = slot.state().transport_error.take().unwrap_or_else(|| "연결에 문제가 있어 다시 연결합니다".to_owned());
-        Ended::Failed(slot.failure(&cause))
+        Ended::Failed(slot.state().transport_error.take().unwrap_or_else(|| "연결에 문제가 있어 다시 연결합니다".to_owned()))
     };
     loop {
         tokio::select! {
@@ -1236,12 +1264,13 @@ async fn serve(slot: &Arc<Slot>, server: &McpServer, connection: &mut Connection
                 }
                 // A server that stopped answering keeps the list waiting up to
                 // its limit: a reconnect asked meanwhile is not held up by it.
+                let known = slot.state().tools.clone();
                 let listed = tokio::select! {
                     _ = slot.stop.cancelled() => return Ended::Stopped,
                     _ = slot.reconnect.notified() => return Ended::Requested,
                     _ = &mut connection.ended => return Ended::Lost,
                     _ = connection.broken.notified() => return broken(slot),
-                    listed = tokio::time::timeout(Duration::from_secs(CONNECT_SECS), list_tools(&connection.peer, &server.name)) => listed,
+                    listed = tokio::time::timeout(Duration::from_secs(CONNECT_SECS), list_tools(&connection.peer, &server.name, &known)) => listed,
                 };
                 match listed {
                     Ok(Ok(Listed { tools, notes })) => {
@@ -1438,8 +1467,9 @@ struct Listed {
 /// Reads every page of `tools/list` as raw JSON. The SDK's typed list fails
 /// whole on one tool without an input schema, which would leave the server
 /// failing to connect for good; here only a tool without a name is left out,
-/// and one with a bad schema takes no arguments.
-async fn list_tools(peer: &Peer<RoleClient>, server: &str) -> Result<Listed> {
+/// and one with a bad schema takes no arguments. A tool listed before
+/// (`previous`) keeps its model name.
+async fn list_tools(peer: &Peer<RoleClient>, server: &str, previous: &[Arc<RemoteTool>]) -> Result<Listed> {
     let mut raw: Vec<Value> = vec![];
     let mut notes: Vec<String> = vec![];
     let mut cursor: Option<String> = None;
@@ -1448,10 +1478,20 @@ async fn list_tools(peer: &Peer<RoleClient>, server: &str) -> Result<Listed> {
         let request = ClientRequest::ListToolsRequest(ListToolsRequest::with_param(
             PaginatedRequestParams::default().with_cursor(cursor.clone()),
         ));
-        let listed = match peer.send_request(request).await.map_err(|e| anyhow!("{}", explain(&e)))? {
-            ServerResult::ListToolsResult(result) => serde_json::to_value(result)?,
-            ServerResult::CustomResult(result) => result.0,
-            _ => bail!("tools/list에 도구 목록이 아닌 응답이 왔습니다"),
+        let listed = match peer.send_request(request).await {
+            Ok(ServerResult::ListToolsResult(result)) => serde_json::to_value(result)?,
+            Ok(ServerResult::CustomResult(result)) => result.0,
+            Ok(_) => bail!("tools/list에 도구 목록이 아닌 응답이 왔습니다"),
+            // A server of resources or prompts only has no tools to list:
+            // connected with none, not failed and started again for good.
+            Err(ServiceError::McpError(e)) if e.code == ErrorCode::METHOD_NOT_FOUND && page == 1 => {
+                notes.push(format!(
+                    "서버가 도구 목록 요청(tools/list)을 지원하지 않아 도구 없이 연결합니다(이 에이전트는 MCP 서버의 도구만 씁니다): {}",
+                    redact(&e.message)
+                ));
+                return Ok(Listed { tools: vec![], notes });
+            }
+            Err(e) => bail!("{}", explain(&e)),
         };
         raw.extend(listed["tools"].as_array().cloned().unwrap_or_default());
         // Past the tools kept, the pages after are not read (each may be
@@ -1493,7 +1533,8 @@ async fn list_tools(peer: &Peer<RoleClient>, server: &str) -> Result<Listed> {
         kept.push(tool);
     }
     let names: Vec<String> = kept.iter().map(|t| t["name"].as_str().unwrap_or_default().to_owned()).collect();
-    let exposed = schema::exposed_names(server, &names);
+    let previous: HashMap<String, String> = previous.iter().map(|t| (t.name.clone(), t.exposed.clone())).collect();
+    let exposed = schema::exposed_names(server, &names, &previous);
     let renamer = schema::Renamer::new(&names.iter().cloned().zip(exposed.iter().cloned()).collect::<Vec<_>>());
     let tools = kept
         .iter()
@@ -1560,8 +1601,9 @@ async fn connect(slot: &Arc<Slot>, server: &McpServer) -> Result<Connection> {
         handler.serve_with_ct(process, close.clone()).await
     } else {
         install_tls();
+        let client = wire::Lenient::new().map_err(|e| anyhow!("HTTP 클라이언트를 만들지 못했습니다: {}", causes(&e)))?;
         handler
-            .serve_with_ct(StreamableHttpClientTransport::with_client(wire::Lenient::new(), http_config(server)?), close.clone())
+            .serve_with_ct(StreamableHttpClientTransport::with_client(client, http_config(server)?), close.clone())
             .await
     }
     .map_err(|e| anyhow!("초기화하지 못했습니다: {}", explain(&e)))?;
@@ -1876,7 +1918,7 @@ pub async fn probe(server: &McpServer, model: &str) -> Result<Value> {
     let slot = Slot::new(server.clone());
     let outcome = tokio::time::timeout(Duration::from_secs(CONNECT_SECS), async {
         let connection = connect(&slot, server).await?;
-        let listed = list_tools(&connection.peer, &server.name).await.map(|listed| {
+        let listed = list_tools(&connection.peer, &server.name, &[]).await.map(|listed| {
             for note in &listed.notes {
                 slot.log("event", note);
             }

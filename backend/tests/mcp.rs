@@ -2267,3 +2267,162 @@ async fn random_conversations_with_mcp_tools_keep_their_context() {
         app.mcp.shutdown().await;
     }
 }
+
+/// MCP review, fifteenth pass: a server that was not connected was told to
+/// the model with the last line of the server's own output (its stderr),
+/// which may print anything — a connection string, a token — and the model's
+/// provider is outside. The admin screen keeps it; the model is told the
+/// state and the cause.
+#[tokio::test]
+async fn a_servers_own_output_stays_on_the_admin_screen() {
+    if node_missing() {
+        return;
+    }
+    let fatal = "fatal: cannot reach postgres://voc:s3cret@db.internal/voc";
+    let config = config(vec![fake("fake", &["echo"], &[]), fake("gone", &["*"], &[("FAKE_MCP_EXIT_BEFORE_INIT", "1"), ("FAKE_MCP_FATAL", fatal)])]);
+    let llm = Scripted::new(vec![calls(vec![support::call("g1", "gone__echo", json!({"text":"x"}))]), text("끝")]);
+    let (app, _dir) = app(config.clone(), llm.clone());
+    app.mcp.apply(&config.mcp_servers);
+    ready(&app.mcp, "fake").await;
+    let status = wait_for(&app.mcp, "gone", |s| s["state"] == "failed").await;
+    assert!(status["error"].as_str().unwrap().contains(fatal), "the admin sees it: {status:#}");
+    let (result, _) = ask(&app, "에코").await;
+    assert_eq!(result.unwrap().answer, "끝");
+    let told = tool_result(&llm.requests()[1], "g1")["error"].as_str().unwrap().to_owned();
+    assert!(told.starts_with("mcp_server_unavailable: MCP server gone is not connected (failed: "), "{told}");
+    assert!(!told.contains("s3cret") && !told.contains("서버 출력"), "{told}");
+    app.mcp.shutdown().await;
+}
+
+/// A model endpoint that refuses every request defining any of `names`, its
+/// refusal listing each one's place, as Gemini lists every declaration it
+/// does not take.
+struct RefusesSeveral {
+    inner: std::sync::Arc<Scripted>,
+    names: Vec<&'static str>,
+}
+
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for RefusesSeveral {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &llm_agent::config::LlmConfig,
+        cancel: CancellationToken,
+        delta: tokio::sync::mpsc::Sender<String>,
+    ) -> anyhow::Result<llm_agent::llm::Completion> {
+        let places: Vec<usize> = request["tools"].as_array().into_iter().flatten().enumerate()
+            .filter(|(_, tool)| self.names.iter().any(|name| tool["function"]["name"] == *name))
+            .map(|(at, _)| at)
+            .collect();
+        if !places.is_empty() {
+            self.inner.requests.lock().unwrap().push(request);
+            let lines: String = places.iter().map(|at| format!(r"* GenerateContentRequest.tools[0].function_declarations[{at}].parameters.properties[tags].items: missing field.\n")).collect();
+            anyhow::bail!(format!(r#"http_400: [{{"error":{{"code":400,"message":"{lines}","status":"INVALID_ARGUMENT"}}}}]"#));
+        }
+        self.inner.complete(request, config, cancel, delta).await
+    }
+}
+
+/// MCP review, fifteenth pass: a refusal naming several MCP tools left one
+/// out at a time — a request refused again for each, a server of many faulty
+/// tools taking as many requests before the question could start.
+#[tokio::test]
+async fn a_refusal_naming_several_tools_leaves_them_all_out_at_once() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("fake", &["echo", "add", "big"], &[])]);
+    let scripted = Scripted::new(vec![text("끝")]);
+    let llm = std::sync::Arc::new(RefusesSeveral { inner: scripted.clone(), names: vec!["fake__echo", "fake__add"] });
+    let (app, _dir) = app(config.clone(), llm);
+    app.mcp.apply(&config.mcp_servers);
+    ready(&app.mcp, "fake").await;
+    let (result, _) = ask(&app, "에코").await;
+    assert_eq!(result.unwrap().answer, "끝");
+    let requests = scripted.requests();
+    assert_eq!(requests.len(), 2, "refused once, then asked without both");
+    let second = tool_names(&requests[1]);
+    assert!(!second.contains(&"fake__echo".to_owned()) && !second.contains(&"fake__add".to_owned()) && second.contains(&"fake__big".to_owned()), "{second:?}");
+    let status = app.mcp.server_status("fake", MODEL).unwrap();
+    for name in ["echo", "add"] {
+        let tool = status["tools"].as_array().unwrap().iter().find(|t| t["name"] == name).unwrap();
+        assert_eq!(tool["refused"]["model"], MODEL, "{tool}");
+    }
+    app.mcp.shutdown().await;
+}
+
+/// MCP review, fifteenth pass: of two tools whose names clean alike
+/// (`weird.name`, `weird_name`), the one listed first took the plain model
+/// name. A server listing its tools in another order (from a map) or adding
+/// the twin later moved `fake__weird_name` to the other tool: the
+/// conversation's calls and an allow-list entry of that name then meant
+/// another tool.
+#[tokio::test]
+async fn a_tools_model_name_stays_with_it_whatever_the_listing_order() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("fake", &["*"], &[("FAKE_MCP_EXTRA_NAME", "weird_name"), ("FAKE_MCP_REVERSE_RELIST", "1")])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "fake").await;
+    let tool_of = |name: &str| hub.snapshot(&config).find(name).map(|t| t.tool.clone());
+    assert_eq!(tool_of("fake__weird_name").as_deref(), Some("weird.name"));
+    call(&hub, &config, "fake__add_tool", json!({})).await.unwrap();
+    wait_for(&hub, "fake", |s| s["tools"].as_array().unwrap().iter().any(|t| t["name"] == "weird_name")).await;
+    assert_eq!(tool_of("fake__weird_name").as_deref(), Some("weird.name"), "the name stays with its tool");
+    let snapshot = hub.snapshot(&config);
+    let twin = snapshot.names().find(|n| n.starts_with("fake__weird_name_")).expect("the twin gets a name of its own").to_owned();
+    assert_eq!(snapshot.find(&twin).unwrap().tool, "weird_name");
+    hub.shutdown().await;
+}
+
+/// MCP review, sixteenth pass: a server of resources or prompts only does
+/// not know `tools/list`. It was taken for one failing to connect and its
+/// process started again and again (every minute at last), shown failed.
+#[tokio::test]
+async fn a_server_without_tools_is_connected_with_none() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("res", &["*"], &[("FAKE_MCP_NO_TOOLS", "1")])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    let status = ready(&hub, "res").await;
+    assert_eq!(status["tools"], json!([]), "{status:#}");
+    assert!(log_text(&status).contains("tools/list"), "{}", log_text(&status));
+    // Not started again: one listing, no reconnection.
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    let status = hub.server_status("res", MODEL).unwrap();
+    assert_eq!((status["state"].as_str(), status["restarts"].as_u64()), (Some("ready"), Some(0)), "{status:#}");
+    assert_eq!(log_text(&status).matches("listed ").count(), 1, "{}", log_text(&status));
+    assert!(hub.snapshot(&config).is_empty());
+    hub.shutdown().await;
+    // The connection check says so too.
+    let checked = probe(&config.mcp_servers[0], MODEL).await.unwrap();
+    assert_eq!((checked["ok"].as_bool(), checked["tools"].as_array().map(Vec::len)), (Some(true), Some(0)), "{checked:#}");
+}
+
+/// MCP review, sixteenth pass: a tool's own failure text was cut to 4,000
+/// characters, but a protocol error's message went to the model whole —
+/// a server echoing a large input in its "invalid params" error filled the
+/// result, its archive and the token counting with it.
+#[tokio::test]
+async fn a_servers_error_message_is_bounded_like_a_tools() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("shape", &["echo"], &[])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "shape").await;
+    for code in [-32602, -32601, -32000] {
+        let message = format!("bad input: {}", "가".repeat(300_000));
+        let shape = json!({"jsonrpc":"2.0","error":{"code":code,"message":message}});
+        let error = call(&hub, &config, "shape__echo", json!({"text":format!("shape:{shape}")})).await.unwrap_err().to_string();
+        assert!(error.contains("bad input: 가가"), "{code}: {}", &error[..200.min(error.len())]);
+        assert!(error.chars().count() < 4_400, "{code}: {} characters", error.chars().count());
+    }
+    hub.shutdown().await;
+}

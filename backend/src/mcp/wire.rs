@@ -127,13 +127,15 @@ fn escapes_mended(json: &[u8]) -> Option<Vec<u8>> {
 pub struct Lenient(reqwest13::Client);
 
 impl Lenient {
-    pub fn new() -> Self {
+    /// Fails where the client cannot be built (no certificate store the
+    /// platform verifier can load): the server's connection fails with why,
+    /// rather than its supervisor or the admin's request with a panic.
+    pub fn new() -> Result<Self, reqwest13::Error> {
         let client = reqwest13::Client::builder()
             .pool_max_idle_per_host(0)
             .redirect(reqwest13::redirect::Policy::none())
-            .build()
-            .expect("the MCP HTTP client builds once TLS is installed");
-        Self(client)
+            .build()?;
+        Ok(Self(client))
     }
 }
 

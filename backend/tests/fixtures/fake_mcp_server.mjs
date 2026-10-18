@@ -59,6 +59,7 @@ for (let i = 0; i < Number(env.FAKE_MCP_FAT || 0); i++) {
 }
 for (let i = 0; i < Number(env.FAKE_MCP_MANY || 0); i++) tools.push({ name: `many_${i}`, description: 'one of many', inputSchema: { type: 'object' } });
 let listed = 0;
+let readings = 0;
 if (env.FAKE_MCP_BUILTIN_NAME) tools.push({ name: 'history', description: 'A tool named like one of the agent\'s own.', inputSchema: { type: 'object' } });
 // A server that stops answering anything (a handler deadlocked), ping too,
 // while it still reads its input.
@@ -89,7 +90,9 @@ async function handle(message, notify) {
     if (env.FAKE_MCP_SLOW_INIT_MS) await new Promise(resolve => setTimeout(resolve, Number(env.FAKE_MCP_SLOW_INIT_MS)));
     const asked = params.protocolVersion;
     const version = KNOWN.includes(asked) ? asked : '2025-06-18';
-    const info = { protocolVersion: version, capabilities: { tools: { listChanged: true }, logging: {} }, serverInfo: env.FAKE_MCP_HUGE_META ? { name: 'N'.repeat(50_000), version: 'V'.repeat(50_000) } : { name: 'fake-mcp', version: '1.2.3' } };
+    // A server of resources only: no tools capability, tools/list unknown.
+    const capabilities = env.FAKE_MCP_NO_TOOLS ? { resources: {}, logging: {} } : { tools: { listChanged: true }, logging: {} };
+    const info = { protocolVersion: version, capabilities, serverInfo: env.FAKE_MCP_HUGE_META ? { name: 'N'.repeat(50_000), version: 'V'.repeat(50_000) } : { name: 'fake-mcp', version: '1.2.3' } };
     if (env.FAKE_MCP_HUGE_META) info.instructions = 'I'.repeat(2_000_000);
     if (env.FAKE_MCP_INSTRUCTIONS) info.instructions = env.FAKE_MCP_INSTRUCTIONS;
     return result(id, info);
@@ -106,14 +109,19 @@ async function handle(message, notify) {
   if (method === 'ping') return result(id, {});
   if (method === 'tools/list') {
     listed += 1;
+    if (env.FAKE_MCP_NO_TOOLS) { log(`listed ${listed}`); return failure(id, -32601, 'Method not found: tools/list'); }
     if (env.FAKE_MCP_LIST_STORM) { log(`listed ${listed}`); setTimeout(() => notify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }), 0); }
     if (env.FAKE_MCP_LOG_LISTS) log(`listed ${listed}`);
     if (env.FAKE_MCP_HANG_LIST) return new Promise(() => {});
     // The first listing answered, a changed list is never read.
     if (env.FAKE_MCP_HANG_RELIST && listed > 1) return new Promise(() => {});
+    // A list read again in the other order (a server listing from a map):
+    // a reading starts without a cursor, its later pages have one.
+    if (!params.cursor) readings += 1;
+    const listing = env.FAKE_MCP_REVERSE_RELIST && readings > 1 ? [...tools].reverse() : tools;
     const start = env.FAKE_MCP_CURSOR_LOOP ? 0 : Number(params.cursor || 0);
-    const page = tools.slice(start, start + PAGE);
-    const next = env.FAKE_MCP_CURSOR_LOOP ? 'again' : start + PAGE < tools.length ? String(start + PAGE) : undefined;
+    const page = listing.slice(start, start + PAGE);
+    const next = env.FAKE_MCP_CURSOR_LOOP ? 'again' : start + PAGE < listing.length ? String(start + PAGE) : undefined;
     return result(id, next ? { tools: page, nextCursor: next } : { tools: page });
   }
   if (method === 'tools/call') {
@@ -149,7 +157,8 @@ async function handle(message, notify) {
         return result(id, { content: [text(String(child.pid))] });
       }
       case 'add_tool': {
-        if (!tools.some(t => t.name === 'extra')) tools.push({ name: 'extra', description: 'Added later.', inputSchema: { type: 'object' } });
+        const added = env.FAKE_MCP_EXTRA_NAME || 'extra';
+        if (!tools.some(t => t.name === added)) tools.push({ name: added, description: 'Added later.', inputSchema: { type: 'object' } });
         notify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
         return result(id, { content: [text('added')] });
       }
@@ -238,7 +247,7 @@ if (httpMode) {
   server.listen(fixed > 0 ? Number(process.argv[fixed + 1]) : 0, '127.0.0.1', () => process.stdout.write(`listening ${server.address().port}\n`));
 } else {
   for (let i = 0; i < Number(env.FAKE_MCP_STDERR || 0); i++) log(`stderr line ${i}`);
-  if (env.FAKE_MCP_EXIT_BEFORE_INIT) { log('fatal: missing configuration'); process.exit(2); }
+  if (env.FAKE_MCP_EXIT_BEFORE_INIT) { log(env.FAKE_MCP_FATAL || 'fatal: missing configuration'); process.exit(2); }
   // Windows-style output: a byte order mark before the first line, CRLF.
   let bom = env.FAKE_MCP_WINDOWS ? '\ufeff' : '';
   const end = env.FAKE_MCP_WINDOWS ? '\r\n' : '\n';

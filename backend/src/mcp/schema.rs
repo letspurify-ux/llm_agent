@@ -3,7 +3,7 @@
 
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 /// Longest function name providers accept.
 pub const MAX_NAME: usize = 64;
@@ -17,30 +17,49 @@ const REF_EXPANSIONS: usize = 64;
 
 /// The model-facing names of one server's tools, in order: `server__tool`,
 /// characters outside `[A-Za-z0-9_-]` replaced by '_'. A name past
-/// `MAX_NAME`, or one an earlier tool already has (case-insensitively), is
-/// shortened and given a hash of the tool's own name.
-pub fn exposed_names(server: &str, tools: &[String]) -> Vec<String> {
-    let mut taken = BTreeSet::new();
-    tools
+/// `MAX_NAME`, or one another tool has (case-insensitively), is shortened and
+/// given a hash of the tool's own name.
+///
+/// A name stays with its tool whatever the order of the listing — a server
+/// may list from a map, or add a tool whose name cleans alike — or the
+/// conversation's calls and an allow-list entry of that name would mean
+/// another tool: a tool keeps the name it had (`previous`, by the server's
+/// name), then a tool named as the model sees it takes the plain name (`a_b`
+/// before `a.b`, `search` before `Search`), the others by their names (not
+/// by their place).
+pub fn exposed_names(server: &str, tools: &[String], previous: &HashMap<String, String>) -> Vec<String> {
+    let cleaned: Vec<String> = tools
         .iter()
-        .map(|tool| {
-            let clean: String = tool
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-                .collect();
-            let mut name = format!("{server}__{clean}");
-            let mut salt = 0u32;
-            while name.len() > MAX_NAME || taken.contains(&name.to_ascii_lowercase()) {
-                let digest = hex::encode(Sha256::digest(format!("{tool}\u{0}{salt}").as_bytes()));
-                let keep = MAX_NAME - 9;
-                let base = format!("{server}__{clean}");
-                name = format!("{}_{}", &base[..base.len().min(keep)], &digest[..8]);
-                salt += 1;
-            }
-            taken.insert(name.to_ascii_lowercase());
-            name
-        })
-        .collect()
+        .map(|tool| tool.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect())
+        .collect();
+    let mut names: Vec<Option<String>> = vec![None; tools.len()];
+    let mut taken = BTreeSet::new();
+    let prefix = format!("{server}__");
+    for (at, tool) in tools.iter().enumerate() {
+        if let Some(name) = previous.get(tool)
+            && name.len() <= MAX_NAME
+            && name.starts_with(&prefix)
+            && taken.insert(name.to_ascii_lowercase())
+        {
+            names[at] = Some(name.clone());
+        }
+    }
+    let mut order: Vec<usize> = (0..tools.len()).filter(|at| names[*at].is_none()).collect();
+    order.sort_by_key(|at| (cleaned[*at] != tools[*at], tools[*at].bytes().any(|b| b.is_ascii_uppercase()), &tools[*at]));
+    for at in order {
+        let tool = &tools[at];
+        let base = format!("{prefix}{}", cleaned[at]);
+        let mut name = base.clone();
+        let mut salt = 0u32;
+        while name.len() > MAX_NAME || taken.contains(&name.to_ascii_lowercase()) {
+            let digest = hex::encode(Sha256::digest(format!("{tool}\u{0}{salt}").as_bytes()));
+            name = format!("{}_{}", &base[..base.len().min(MAX_NAME - 9)], &digest[..8]);
+            salt += 1;
+        }
+        taken.insert(name.to_ascii_lowercase());
+        names[at] = Some(name);
+    }
+    names.into_iter().map(Option::unwrap_or_default).collect()
 }
 
 /// The tool's description (its title when it has none), cut to
@@ -137,6 +156,20 @@ pub fn parameters(schema: &Value) -> Value {
             }
         }
     }
+    // A schema that is a reference to its definition — the default of
+    // invopop/jsonschema and ts-json-schema-generator, and zod-to-json-schema
+    // given a name — is that definition with what is beside the reference:
+    // read as an `allOf` of the two, or the object's empty `properties`
+    // would hide every field of the definition.
+    let mut object = object.clone();
+    if let Some(target) = object.remove("$ref").as_ref().and_then(Value::as_str)
+        && definitions.contains_key(target)
+    {
+        let mut all = vec![json!({"$ref":target})];
+        all.extend(object.get("allOf").and_then(Value::as_array).cloned().unwrap_or_default());
+        object.insert("allOf".into(), Value::Array(all));
+    }
+    let object = &object;
     let mut out = object.clone();
     for key in ["$schema", "$id", "$comment", "oneOf", "anyOf", "allOf", "not", "$defs", "definitions"] {
         out.remove(key);
@@ -220,6 +253,16 @@ fn tidy(schema: &mut Value, depth: usize) {
     }
     if fields.get("required").is_some_and(|r| !r.as_array().is_some_and(|r| r.iter().all(Value::is_string))) {
         fields.remove("required");
+    }
+    // A required field the schema does not define is defined as any value:
+    // Gemini refuses the request over it ("required[0]: property is not
+    // defined"), and the model still sees the field it must give.
+    if let Some(required) = fields.get("required").and_then(Value::as_array).cloned()
+        && let Some(Value::Object(properties)) = fields.get_mut("properties")
+    {
+        for name in required.iter().filter_map(Value::as_str) {
+            properties.entry(name.to_owned()).or_insert_with(|| json!({}));
+        }
     }
     for (key, sub) in fields.iter_mut() {
         match (key.as_str(), sub) {
@@ -310,18 +353,18 @@ mod tests {
             "Search".to_owned(),
             "x".repeat(80),
         ];
-        let names = exposed_names("jira", &tools);
+        let names = exposed_names("jira", &tools, &HashMap::new());
         assert_eq!(names[0], "jira__search");
-        assert_eq!(names[1], "jira__weird_name");
-        // The plain name is taken by the cleaned one before it.
-        assert!(names[2].starts_with("jira__weird_name_") && names[2].len() == "jira__weird_name".len() + 9);
+        // The plain name is the tool's named so, wherever it is listed.
+        assert!(names[1].starts_with("jira__weird_name_") && names[1].len() == "jira__weird_name".len() + 9);
+        assert_eq!(names[2], "jira__weird_name");
         assert!(names[3].starts_with("jira__Search_"));
         assert!(names[4].len() <= MAX_NAME && names[4].starts_with("jira__xxx"));
         let unique: BTreeSet<_> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
         assert_eq!(unique.len(), names.len());
         assert!(names.iter().all(|n| n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')));
         // The same list names the same way every time.
-        assert_eq!(exposed_names("jira", &tools), names);
+        assert_eq!(exposed_names("jira", &tools, &HashMap::new()), names);
     }
 
     #[test]
@@ -364,6 +407,11 @@ mod tests {
         }
         if fields.get("properties").is_some_and(|p| !p.is_object()) || (is("object") && !fields.contains_key("properties")) {
             return Some(format!("{path} (properties)"));
+        }
+        if let (Some(required), Some(properties)) = (fields.get("required").and_then(Value::as_array), fields.get("properties").and_then(Value::as_object))
+            && let Some(name) = required.iter().filter_map(Value::as_str).find(|name| !properties.contains_key(*name))
+        {
+            return Some(format!("{path} (required {name} not defined)"));
         }
         for (key, sub) in fields {
             let found = match (key.as_str(), sub) {
@@ -416,6 +464,29 @@ mod tests {
         assert_eq!(parameters(&referenced)["properties"]["f"], json!({"type":"array","items":{}}));
     }
 
+    /// MCP review, sixteenth pass: a required field the schema does not
+    /// define (a sloppy server, a generator that put the field elsewhere) is
+    /// refused by Gemini for the whole request ("required[0]: property is
+    /// not defined"): it is defined as any value, as the schema accepted it.
+    #[test]
+    fn a_required_field_is_defined() {
+        let schema = json!({"type":"object","properties":{"q":{"type":"string"}},"required":["q","id"],
+            "patternProperties":{"^x-":{"type":"string"}}});
+        let p = parameters(&schema);
+        assert_eq!(p["properties"], json!({"q":{"type":"string"},"id":{}}));
+        assert_eq!(p["required"], json!(["q", "id"]));
+        assert_eq!(missing_required(&p, json!({"q":"a"}).as_object().unwrap()), vec!["id".to_owned()], "still checked");
+        // Nested objects too, and an object without properties.
+        let nested = json!({"type":"object","properties":{"filter":{"type":"object","required":["field"]},
+            "rows":{"type":"array","items":{"type":"object","properties":{"a":{"type":"integer"}},"required":["a","b"]}}},"required":["filter"]});
+        let p = parameters(&nested);
+        assert_eq!(p["properties"]["filter"], json!({"type":"object","properties":{"field":{}},"required":["field"]}));
+        assert_eq!(p["properties"]["rows"]["items"]["properties"]["b"], json!({}));
+        assert_eq!(refused_part(&p, ""), None);
+        // Without one, as before.
+        assert_eq!(parameters(&json!({"type":"object","required":["x"]}))["properties"], json!({"x":{}}));
+    }
+
     #[test]
     fn fields_combined_at_the_top_stay() {
         // An intersection (allOf, one part a definition): every field, every
@@ -443,12 +514,82 @@ mod tests {
         assert_eq!(missing_required(&p, json!({"id":1}).as_object().unwrap()), Vec::<String>::new());
     }
 
+    /// MCP review, sixteenth pass: a schema that is a reference to its
+    /// definition (invopop/jsonschema's and ts-json-schema-generator's
+    /// default, zod-to-json-schema given a name) showed the model no field at
+    /// all, while its required fields were still checked.
+    #[test]
+    fn a_schema_that_refers_to_its_definition_keeps_its_fields() {
+        // Go's invopop/jsonschema: no type beside the reference.
+        let invopop = json!({"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"#/$defs/SearchArgs","$defs":{
+            "SearchArgs":{"type":"object","properties":{"query":{"type":"string"},"tags":{"type":"array"},"page":{"$ref":"#/$defs/Page"}},"required":["query"],"additionalProperties":false},
+            "Page":{"type":"object","properties":{"size":{"type":"integer"}}}
+        }});
+        let p = parameters(&invopop);
+        assert_eq!(p["properties"]["query"], json!({"type":"string"}), "{p}");
+        assert_eq!(p["properties"]["tags"], json!({"type":"array","items":{}}), "tidied");
+        assert_eq!(p["properties"]["page"]["properties"]["size"], json!({"type":"integer"}), "its own references expanded");
+        assert_eq!(p["required"], json!(["query"]));
+        assert!(p.get("$ref").is_none() && p.get("$defs").is_none() && p.get("$schema").is_none(), "{p}");
+        assert_eq!(missing_required(&p, json!({"query":"x"}).as_object().unwrap()), Vec::<String>::new());
+        // zod-to-json-schema given a name: "definitions".
+        let named = json!({"$ref":"#/definitions/Args","definitions":{"Args":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}});
+        assert_eq!(parameters(&named)["properties"]["id"], json!({"type":"string"}));
+        // Fields beside the reference apply with it (2019-09 on); the
+        // object's own win, every required field stays required.
+        let beside = json!({"type":"object","$ref":"#/$defs/Base","properties":{"extra":{"type":"boolean"},"id":{"type":"integer","description":"own"}},"required":["extra"],
+            "$defs":{"Base":{"properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":["id"]}}});
+        let p = parameters(&beside);
+        assert_eq!(p["properties"], json!({"extra":{"type":"boolean"},"id":{"type":"integer","description":"own"},"name":{"type":"string"}}));
+        assert_eq!(p["required"], json!(["extra", "id"]));
+        // A definition that is no object, a reference to the root or to no
+        // definition: an object of what is beside it.
+        assert_eq!(parameters(&json!({"$ref":"#/$defs/S","$defs":{"S":{"type":"string"}}})), json!({"type":"object","properties":{}}));
+        assert_eq!(parameters(&json!({"$ref":"#","properties":{"a":{"type":"string"}}}))["properties"], json!({"a":{"type":"string"}}));
+        assert_eq!(parameters(&json!({"$ref":"#/$defs/missing"})), json!({"type":"object","properties":{}}));
+    }
+
     #[test]
     fn a_self_referencing_tree_stays_small() {
         let schema = json!({"type":"object","properties":{"root":{"$ref":"#/$defs/T"}},
             "$defs":{"T":{"type":"object","properties":{"l":{"$ref":"#/$defs/T"},"r":{"$ref":"#/$defs/T"},"m":{"$ref":"#/$defs/T"}}}}});
         let p = parameters(&schema);
         assert!(p.to_string().len() < 20_000, "{}", p.to_string().len());
+    }
+
+    /// MCP review, fifteenth pass: of tools whose names clean alike, the one
+    /// listed first took the plain name — another listing order, or the twin
+    /// added later, moved the name to the other tool.
+    #[test]
+    fn a_name_stays_with_its_tool_in_any_order() {
+        let tools: Vec<String> = ["a.b", "a_b", "Search", "search", "files/read", "files_read", "x".repeat(70).as_str(), "x".repeat(71).as_str()]
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        let names = exposed_names("s", &tools, &HashMap::new());
+        let of = |tools: &[String], names: &[String], tool: &str| names[tools.iter().position(|t| t == tool).unwrap()].clone();
+        let mut shuffled = tools.clone();
+        for turn in 0..20 {
+            shuffled.rotate_left(3);
+            if turn % 2 == 0 {
+                shuffled.reverse();
+            }
+            let again = exposed_names("s", &shuffled, &HashMap::new());
+            for tool in &tools {
+                assert_eq!(of(&shuffled, &again, tool), of(&tools, &names, tool), "{tool} in {shuffled:?}");
+            }
+        }
+        assert_eq!((of(&tools, &names, "a_b"), of(&tools, &names, "search"), of(&tools, &names, "files_read")), ("s__a_b".into(), "s__search".into(), "s__files_read".into()));
+        // A twin added later does not take the name a tool has.
+        let before = exposed_names("s", &["a.b".to_owned(), "Search".to_owned()], &HashMap::new());
+        assert_eq!(before, ["s__a_b", "s__Search"]);
+        let previous: HashMap<String, String> = [("a.b", "s__a_b"), ("Search", "s__Search")].iter().map(|(t, n)| (t.to_string(), n.to_string())).collect();
+        let after = exposed_names("s", &["search".to_owned(), "a_b".to_owned(), "a.b".to_owned(), "Search".to_owned()], &previous);
+        assert_eq!((after[2].as_str(), after[3].as_str()), ("s__a_b", "s__Search"));
+        assert!(after[0].starts_with("s__search_") && after[1].starts_with("s__a_b_"), "{after:?}");
+        // A name kept from another server's prefix or past the limit is not kept.
+        let foreign: HashMap<String, String> = [("a_b".to_owned(), "t__a_b".to_owned())].into();
+        assert_eq!(exposed_names("s", &["a_b".to_owned()], &foreign), ["s__a_b"]);
     }
 
     #[test]
@@ -513,7 +654,7 @@ mod tests {
             let tools: Vec<String> = (0..rng.gen_range(1..30))
                 .map(|_| (0..rng.gen_range(1..40)).map(|_| PARTS[rng.gen_range(0..PARTS.len())]).collect())
                 .collect();
-            let names = exposed_names("srv-1", &tools);
+            let names = exposed_names("srv-1", &tools, &HashMap::new());
             assert_eq!(names.len(), tools.len());
             let unique: BTreeSet<_> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
             assert_eq!(unique.len(), names.len(), "{tools:?} → {names:?}");
@@ -521,7 +662,24 @@ mod tests {
                 assert!(name.len() <= MAX_NAME && name.starts_with("srv-1__"), "{name}");
                 assert!(name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'), "{name}");
             }
-            assert_eq!(exposed_names("srv-1", &tools), names, "stable");
+            assert_eq!(exposed_names("srv-1", &tools, &HashMap::new()), names, "stable");
+            // Listed again (some tools gone, others new, in another order):
+            // unique and valid still, and a tool listed before keeps its name.
+            let previous: HashMap<String, String> = tools.iter().cloned().zip(names.iter().cloned()).collect();
+            let mut next: Vec<String> = tools.iter().filter(|_| rng.gen_bool(0.7)).cloned().collect();
+            next.extend((0..rng.gen_range(0..10)).map(|_| (0..rng.gen_range(1..40)).map(|_| PARTS[rng.gen_range(0..PARTS.len())]).collect::<String>()));
+            next.sort();
+            next.dedup();
+            next.reverse();
+            let renamed = exposed_names("srv-1", &next, &previous);
+            let unique: BTreeSet<_> = renamed.iter().map(|n| n.to_ascii_lowercase()).collect();
+            assert_eq!(unique.len(), renamed.len(), "{next:?} → {renamed:?}");
+            for (tool, name) in next.iter().zip(&renamed) {
+                assert!(name.len() <= MAX_NAME && name.starts_with("srv-1__"), "{name}");
+                if let Some(kept) = previous.get(tool) {
+                    assert_eq!(name, kept, "{tool} in {next:?}");
+                }
+            }
         }
     }
 

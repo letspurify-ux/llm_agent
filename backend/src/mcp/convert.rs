@@ -75,6 +75,13 @@ pub fn tool_result(result: &Value) -> Result<Value> {
     Ok(data)
 }
 
+/// A server's error message as the model is told it: cut as a tool's own
+/// failure text is (a server may echo a large input in it).
+pub fn error_text(message: &str) -> String {
+    let (text, cut) = clip(message, MAX_ERROR_CHARS);
+    if cut > 0 { format!("{text}… ({cut} more characters)") } else { text }
+}
+
 fn mime(block: &Value) -> String {
     block["mimeType"].as_str().map_or_else(|| "(unknown type)".to_owned(), |m| format!("({m})"))
 }
