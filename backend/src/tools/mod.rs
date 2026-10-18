@@ -240,7 +240,7 @@ impl ToolRegistry {
         }
         specs.push(ToolSpec {
             name: "history",
-            description: "Search this conversation's earlier questions, answers, tool calls and tool results, including those that left the active context (this tool is offered once part of the conversation has left it); continue a search with after: next_cursor. Read one by ID and character offset (read requires id; a search item's offset reads from its match). A result archived because it was too large is read here with the id its next_cursor names.",
+            description: "Search this conversation's earlier questions, answers, tool calls and tool results, including those that left the active context (this tool is offered once part of the conversation has left it); continue a search with after: next_cursor. Read one by ID and character offset (read requires id; a search item's offset reads from its match). A result archived because it was too large is read on here from the id and offset its next_cursor names.",
             source: false,
             parameters: schema(
                 json!({"action":action(&["search","read"]),"query":string(),"id":number(),"offset":number(),"after":number(),"limit":{"type":"integer","minimum":1,"maximum":50}}),
@@ -1920,13 +1920,18 @@ pub fn bound_result(
     // own words for the searches after it to find.
     let pages = call.name == "history" && args["action"] == "search";
     output["truncated"] = json!(true);
-    // A history read goes on where it started; other archives from the start.
+    // A history read goes on where it started; an archive past what a cut
+    // text or list shows of it (`Archived`), or from the start after a preview.
     let from = if call.name == "history" && args["action"] == "read" { args["offset"].as_u64().unwrap_or(0) } else { 0 };
     if !reads_file && !pages {
         let archive = archive_for(s, call, args, &result);
         output["archive_id"] = json!(archive);
         output["next_cursor"] = json!({"tool":"history","action":"read","id":archive,"offset":from});
     }
+    let archived = output["archive_id"]
+        .as_u64()
+        .filter(|_| call.name != "history")
+        .and_then(|id| Archived::new(s, id));
     for pointer in ["/data/content/text", "/data/text"] {
         let Some(text) = output
             .pointer(pointer)
@@ -1981,6 +1986,9 @@ pub fn bound_result(
                 data.remove("complete_to_end");
                 data.remove("next_cursor");
             }
+            if let Some(archived) = &archived {
+                v["next_cursor"]["offset"] = json!(archived.shown_through(&v));
+            }
             v
         };
         let low = longest_within(chars.len(), limit, |length| {
@@ -2005,6 +2013,11 @@ pub fn bound_result(
         };
         if items.is_empty() {
             continue;
+        }
+        // Measured with an offset as long as any the archive can take (a
+        // shorter number is no more tokens), placed once the cut is known.
+        if let Some(archived) = &archived {
+            output["next_cursor"]["offset"] = json!(archived.chars);
         }
         let mut fits = |keep: usize| {
             output["data"][field] = Value::Array(items[..keep].to_vec());
@@ -2057,6 +2070,9 @@ pub fn bound_result(
                 && let Some((prefix, _)) = cursor.rsplit_once(':')
             {
                 output["data"]["next_cursor"] = json!(format!("{prefix}:{}", start + low));
+            }
+            if let Some(archived) = &archived {
+                output["next_cursor"]["offset"] = json!(archived.shown_through(&output));
             }
             return output;
         }
@@ -2203,6 +2219,33 @@ fn archive_for(s: &mut Workspace, call: &crate::llm::ToolCall, args: &Value, res
         bundle.active = false;
     }
     id
+}
+
+/// A cut result's archive as a history read shows it, to place where the
+/// cut result's continuation goes on.
+struct Archived {
+    call_id: Value,
+    text: String,
+    /// Characters of `text`, as a read's offset counts them.
+    chars: usize,
+}
+impl Archived {
+    fn new(s: &Workspace, id: u64) -> Option<Self> {
+        let bundle = s.history.read(id).ok()?;
+        let message = bundle.messages.first().filter(|m| m["role"] == "tool_archive")?;
+        let text = serde_json::to_string(&context::shown_messages(&bundle.messages[..])).ok()?;
+        Some(Self { call_id: message["call_id"].clone(), chars: text.chars().count(), text })
+    }
+    /// Where a read of the archive goes on past `shown` (the cut result as
+    /// the model receives it): the read text the two have in common from the
+    /// start, put in the archive's place. The model was given all of that,
+    /// and nothing past it is passed over; a read from the start gave the
+    /// shown part again first, a whole result budget of it.
+    fn shown_through(&self, shown: &Value) -> usize {
+        let cut = json!({"role":"tool_archive","call_id":self.call_id,"result":shown});
+        let cut = serde_json::to_string(&context::shown_messages(&[cut])).unwrap_or_default();
+        self.text.chars().zip(cut.chars()).take_while(|(a, b)| a == b).count()
+    }
 }
 
 /// Removes the project root prefix from `path` values. Reference documents
@@ -2586,6 +2629,62 @@ mod tests {
         let past = envelope(execute(&mut ws, "history", json!({"action":"read","id":id,"offset":length + 5_000}), &Default::default()));
         assert_eq!(past["status"], "error", "{past}");
         assert!(past["error"].as_str().unwrap().starts_with("invalid_offset") && past["error"].as_str().unwrap().contains(&format!("{length} characters")), "{past}");
+    }
+
+    /// Context management review, eighteenth pass: a result cut to its text's
+    /// start or its first items (an MCP tool's text, a list of methods) went
+    /// on from its archive at offset 0, so the first read of its next_cursor
+    /// gave again what the cut result had shown — a whole result budget of
+    /// it, where an MCP tool's large results are cut every time.
+    #[test]
+    fn a_cut_result_goes_on_from_its_archive_where_it_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seed: u64 = 0x18c7;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n.max(1)
+        };
+        let text: String = (1..=3_000).map(|i| format!("line {i}: \"q\" \\ 가나 😀\n")).collect();
+        let items: Vec<Value> = (1..=40).map(|i| json!({"id":format!("m{i}"),"title":format!("방법 {i}"),"method":"절차 \"따옴\" ".repeat(30)})).collect();
+        for run in 0..16 {
+            let mut ws = workspace(dir.path());
+            ws.config.model = ["gpt-4o", "unknown-model"][run % 2].into();
+            let model = ws.config.model.clone();
+            let (name, data) = if run % 4 < 2 { ("fs__read_text_file", json!({"text":text})) } else { ("method_read", json!({"items":items})) };
+            let call = crate::llm::ToolCall { id: format!("c{run}"), name: name.into(), arguments: "{}".into() };
+            let limit = 1_000 + next(4_000);
+            let mut cut = bound_result(&mut ws, &call, &json!({}), envelope(Ok(data)), limit);
+            if next(2) == 0 {
+                // Cut again beside the other results of its response.
+                cut = bound_result(&mut ws, &call, &json!({}), cut, (limit / 2).max(800));
+            }
+            let cursor = &cut["next_cursor"];
+            assert_eq!(cursor["tool"], "history", "run {run}: {cut}");
+            let id = cursor["id"].as_u64().unwrap();
+            let whole = serde_json::to_string(&context::shown_messages(&ws.history.read(id).unwrap().messages[..])).unwrap();
+            let offset = cursor["offset"].as_u64().unwrap() as usize;
+            // Past what the cut result shows of the archive, and no further.
+            let shown = serde_json::to_string(&context::shown_messages(&[json!({"role":"tool_archive","call_id":call.id,"result":cut})])).unwrap();
+            let passed: String = whole.chars().take(offset).collect();
+            assert!(shown.starts_with(&passed), "run {run}: the offset passes over what was not shown");
+            let start = if name == "method_read" { serde_json::to_string(&cut["data"]["items"]).unwrap() } else { serde_json::to_string(&cut["data"]["text"]).unwrap() };
+            assert!(passed.ends_with(&start[..start.len() - 1]), "run {run}: the read starts at offset {offset}, before the end of what was shown");
+            // Followed as given, the reads give the rest of the archive.
+            let read_call = crate::llm::ToolCall { id: "h".into(), name: "history".into(), arguments: "{}".into() };
+            let mut args = json!({"action":"read","id":id,"offset":offset});
+            let mut rest = String::new();
+            for _ in 0..1_000 {
+                let result = envelope(execute(&mut ws, "history", args.clone(), &Default::default()));
+                let result = limit_result(&mut ws, &read_call, &args, result, limit);
+                rest.push_str(result["data"]["text"].as_str().unwrap());
+                if result["next_cursor"].is_null() {
+                    break;
+                }
+                args = json!({"action":"read","id":id,"offset":result["next_cursor"]["offset"]});
+            }
+            assert_eq!(rest, whole.chars().skip(offset).collect::<String>(), "run {run}");
+            assert!(result_tokens(&call, &cut, &model) <= limit, "run {run}");
+        }
     }
 
     /// Random files read at random ranges and limits, cut again at a smaller

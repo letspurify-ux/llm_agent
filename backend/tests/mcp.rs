@@ -1311,10 +1311,13 @@ async fn many_large_mcp_results_are_cut_to_fit_and_read_back_from_history() {
     assert!(llm_agent::context::count(second, MODEL) < config.llm.context_tokens - config.llm.output_tokens, "the request fits the context");
     assert_eq!(archives.iter().collect::<std::collections::BTreeSet<_>>().len(), 8, "one archive per result");
     // The rest of a cut result is read from the history where it was
-    // archived, the next question in the same conversation too.
+    // archived, the next question in the same conversation too: from where
+    // the cut text stopped, as its next_cursor says.
+    let cut = tool_result(second, "b3");
+    let shown = cut["data"]["text"].as_str().unwrap().chars().count();
     llm.push(vec![
         calls(vec![
-            support::call("h1", "history", json!({"action":"read","id":archives[3],"offset":0})),
+            support::call("h1", "history", json!({"action":"read","id":archives[3],"offset":cut["next_cursor"]["offset"]})),
             support::call("h2", "history", json!({"action":"read","id":archives[3],"offset":50_000})),
         ]),
         text("다 읽음"),
@@ -1329,6 +1332,9 @@ async fn many_large_mcp_results_are_cut_to_fit_and_read_back_from_history() {
         assert_eq!(read["status"], "ok", "{read}");
         assert!(read["data"]["text"].as_str().unwrap().contains("0123456789"), "{id}: {read}");
     }
+    // The first read goes on with the next character, not the shown start.
+    let first = tool_result(&requests[3], "h1")["data"]["text"].as_str().unwrap().to_owned();
+    assert!(!first.contains("tool_archive") && first.starts_with(char::from(b'0' + (shown % 10) as u8)), "{}", first.chars().take(80).collect::<String>());
     app.mcp.shutdown().await;
 }
 
@@ -2184,6 +2190,14 @@ impl llm_agent::llm::LlmClient for RandomMcpModel {
                 && !text.chars().enumerate().all(|(i, c)| c == char::from(b'0' + (i % 10) as u8))
             {
                 self.problem(format!("a cut result of big is not its start: {}", text.chars().take(80).collect::<String>()));
+            }
+            // Its archive is read on from where the text shown stops.
+            if name.ends_with("big")
+                && result["data"]["text"].as_str().is_some_and(|text| !text.is_empty())
+                && result["next_cursor"]["tool"] == "history"
+                && result["next_cursor"]["offset"] == 0
+            {
+                self.problem(format!("a cut result of big goes on from the start of its archive: {}", result["next_cursor"]));
             }
         }
         let rounds = {
