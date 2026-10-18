@@ -1033,7 +1033,9 @@ impl llm_agent::llm::LlmClient for StoppedMidAnswer {
         if !first {
             return Ok(text("이어서 답합니다."));
         }
-        for part in ["배치 상태는 ", "다음 표와 같습니다."] {
+        // A whole opening line: before anything is looked up, the line is
+        // held until it ends (the general-knowledge line guard).
+        for part in ["배치 상태는 ", "다음 표와 같습니다.\n"] {
             let _ = delta.send(part.to_owned()).await;
         }
         // The user stops once it is on the screen (nothing sent after a stop
@@ -1059,7 +1061,7 @@ async fn what_a_stopped_answer_showed_stays_in_the_conversation() {
     assert_eq!(answered.map(|a| a.answer).map_err(|e| e.to_string()), Ok("이어서 답합니다.".to_owned()));
     let next = llm.requests.lock().unwrap()[1].clone();
     let replies: Vec<Value> = messages(&next, "assistant").iter().map(|m| m["content"].clone()).collect();
-    assert_eq!(replies, vec![json!("배치 상태는 다음 표와 같습니다.")]);
+    assert_eq!(replies, vec![json!("배치 상태는 다음 표와 같습니다.\n")]);
 }
 
 /// A model answering at random: tool calls (history ones too), answers cut
@@ -1642,12 +1644,12 @@ async fn the_general_knowledge_line_before_any_search_asks_for_a_search() {
     assert_eq!(llm.requests().len(), 4, "the follow-up was not asked to search");
 }
 
-/// V: the line is refused once per question, found in the whole answer when
-/// it did not open it, and left alone where no search can follow (the final
+/// V: the line is refused once per question, found after a title and in
+/// other words, and left alone where no search can follow (the final
 /// request) or no line is said.
 #[tokio::test]
 async fn the_search_first_guard_asks_once_and_spares_other_answers() {
-    // After a heading it streams before it is found: taken back, asked once,
+    // After a title and in other words it is held unseen too: asked once,
     // and the second time it stands.
     let late = "### 답변\n\n등록된 자료에서 찾을 수 없어 일반 지식으로 답합니다. 쿠버네티스는 컨테이너 오케스트레이션입니다.";
     let llm = Scripted::new(vec![text(late), text(late)]);
@@ -1655,9 +1657,9 @@ async fn the_search_first_guard_asks_once_and_spares_other_answers() {
     let (r, events) = ask(&late_app, "v", "쿠버네티스가 뭐야?", vec![]).await;
     assert_eq!(r.unwrap().answer, late);
     assert_eq!(llm.requests().len(), 2);
-    assert_eq!(ev(&events, "answer_reset").len(), 1);
+    assert!(ev(&events, "answer_reset").is_empty(), "{events:?}");
     assert_eq!(preview(&events), late);
-    // Ordinary answers, held for their first characters only, stream whole.
+    // Ordinary answers, held for their first line only, stream whole.
     for (n, ordinary) in ["**요약**\n배치는 정상입니다.", "등록된 쿼리로 확인한 결과 정상입니다.", "안녕하세요!"].into_iter().enumerate() {
         let llm = Scripted::new(vec![text(ordinary)]);
         let (ordinary_app, _ordinary_dir) = app(no_db("gpt-4o"), llm.clone());
@@ -1690,6 +1692,57 @@ async fn a_refused_line_stops_its_request_at_its_start() {
     assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
     assert_eq!(preview(&events), "찾아보니 기업가입니다.");
     assert!(ev(&events, "answer_reset").is_empty(), "{events:?}");
+}
+
+/// 2026-10-18: an answer describing this project quoted the line from the
+/// README's examples near its end. Judged on the whole answer, it was taken
+/// back after it had streamed in full and written again — and a second time
+/// the model wrote only empty replies, ending the question in an error. Only
+/// the opening line says the line: such an answer stands as it streamed.
+#[tokio::test]
+async fn the_line_quoted_after_the_opening_is_no_claim() {
+    let quoted = "llm_agent는 사내 지식과 DB를 함께 보는 에이전트입니다.\n\n| 질문 | 동작 |\n|---|---|\n| 쿠버네티스가 뭐야 | 검색 후 일반 지식으로 답변 (\"*등록된 지식에 없는 내용이라 일반 지식으로 답변합니다.*\" 표시) |";
+    let llm = Scripted::new(vec![text(quoted)]);
+    let (app, _dir) = app(no_db("gpt-4o"), llm.clone());
+    let (r, events) = ask(&app, "quoted", "llm_agent 프로젝트에 대해 설명해줘.", vec![]).await;
+    let answer = r.unwrap();
+    assert_eq!((answer.answer.as_str(), llm.requests().len()), (quoted, 1));
+    assert!(ev(&events, "answer_reset").is_empty(), "{events:?}");
+    assert_eq!(preview(&events), quoted);
+    // Streamed from its first line on, not held to the end.
+    let first = ev(&events, "answer_delta")[0]["text"].as_str().unwrap().to_owned();
+    assert!(first.starts_with("llm_agent는") && first.len() < quoted.len(), "{first:?}");
+    assert!(answer.log.get("searchFirst").is_none());
+}
+
+/// 2026-10-18: a question that read a registered project's files (or used an
+/// MCP tool) was taken for one that looked nothing up, as only `search`
+/// counted. A tool that answered counts; a call refused before it ran does
+/// not.
+#[tokio::test]
+async fn a_tool_that_answered_counts_as_looking() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("README.md"), "# app\n").unwrap();
+    let mut config = no_db("gpt-4o");
+    config.projects.push(llm_agent::config::Project {
+        name: "app".into(),
+        description: "검색 서버".into(),
+        root: dir.path().to_path_buf(),
+        ..Default::default()
+    });
+    let llm = Scripted::new(vec![calls(vec![call("l1", "file_list", json!({}))]), text(GENERAL_LINE)]);
+    let (listed, _listed_dir) = app(config, llm.clone());
+    let (r, _) = ask(&listed, "listed", "일론 머스크가 누구야?", vec![]).await;
+    let answer = r.unwrap();
+    assert_eq!((answer.answer.as_str(), llm.requests().len()), (GENERAL_LINE, 2));
+    assert_eq!(answer.trace[0]["status"], "ok", "{:?}", answer.trace);
+    assert!(answer.log.get("searchFirst").is_none());
+    let llm = Scripted::new(vec![calls(vec![call("n1", "nope", json!({}))]), text(GENERAL_LINE), text("찾아보니 기업가입니다.")]);
+    let (refused, _refused_dir) = app(no_db("gpt-4o"), llm.clone());
+    let (r, _) = ask(&refused, "refused", "일론 머스크가 누구야?", vec![]).await;
+    let answer = r.unwrap();
+    assert_eq!((answer.answer.as_str(), llm.requests().len()), ("찾아보니 기업가입니다.", 3));
+    assert_eq!(answer.log["searchFirst"], true);
 }
 
 /// A model whose first answer opens with `start` and is stopped there by the

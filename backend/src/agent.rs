@@ -67,6 +67,10 @@ const SEARCH_FIRST: &str = "이전 응답은 search 없이 '등록된 지식에 
 /// The start of the general-knowledge line of the system prompt, which a
 /// streamed answer is held against before any search.
 const UNREGISTERED_LEAD: &str = "등록된 지식에 없는 내용";
+/// Characters of an answer's opening line judged for the general-knowledge
+/// line: the line with a few words before it. Past them the line is not
+/// what opens the answer, and the answer streams on.
+const OPENING_CHARS: usize = 60;
 const PROVIDER_WAITS: [u64; 2] = [5, 15];
 const EMPTY_RETRIES: usize = 2;
 const EMPTY_REPLIES: &str = "모델이 빈 응답을 반복해 답변을 만들지 못했습니다. 잠시 후 다시 시도해주세요.";
@@ -235,9 +239,10 @@ async fn run(
     // its estimate as sent and the tokens the provider saw.
     let mut counted_before: Option<(usize, usize)> = None;
     // The general-knowledge line says the registered material was searched
-    // and lacks the subject. Said before any search in this question, it is
-    // refused once and the model asked to search, unless the previous answer
-    // said it too (a follow-up on the same unregistered subject).
+    // and lacks the subject. Opening an answer before this question looked
+    // anything up, it is refused once and the model asked to search, unless
+    // the previous answer opened with it too (a follow-up on the same
+    // unregistered subject).
     let previous_claimed = c
         .history
         .bundles
@@ -247,7 +252,7 @@ async fn run(
         .flat_map(|b| b.messages.iter().rev())
         .find(|m| m["role"] == "assistant" && !m["tool_calls"].as_array().is_some_and(|calls| !calls.is_empty()))
         .and_then(|m| m["content"].as_str())
-        .is_some_and(claims_unregistered);
+        .is_some_and(|text| opening(text, true) == Lead::Claims);
     let mut search_first_asked = false;
     let answer_text = loop {
         if cancel.is_cancelled() {
@@ -330,10 +335,7 @@ async fn run(
             bail!(too_long(fits(frame_tokens), fits(alone)));
         }
         rounds += 1;
-        let search_first = !withheld_tools
-            && !search_first_asked
-            && !previous_claimed
-            && !trace.iter().any(|step| step.get("search").is_some());
+        let search_first = !withheld_tools && !search_first_asked && !previous_claimed && !looked(&trace);
         let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(64);
         let relay_events = events.clone();
         let writing = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -345,9 +347,10 @@ async fn run(
         // The text shown while the response streams, kept for a stop.
         let relay = tokio::spawn(async move {
             let mut shown = String::new();
-            // Before a search, the start is held while it may still be the
-            // general-knowledge line, which is then refused unseen. An
-            // ordinary answer parts from it at its first characters.
+            // Before anything is looked up, the opening line is held while it
+            // may still be the general-knowledge line, which is then refused
+            // unseen; an answer that opens otherwise streams on. What was
+            // shown is never taken back for the line.
             let mut held = search_first.then(String::new);
             let mut claim = Some(claim_tx);
             while let Some(text) = delta_rx.recv().await {
@@ -358,14 +361,18 @@ async fn run(
                 let text = match held.as_mut() {
                     Some(start) => {
                         start.push_str(&text);
-                        match lead(start) {
-                            Lead::Undecided => continue,
-                            Lead::Claims => {
-                                if let Some(claim) = claim.take() {
-                                    let _ = claim.send(());
-                                }
-                                continue;
+                        // The line as the system prompt words it: the rest of
+                        // the response is not worth generating.
+                        if lead(opening_line(start).0) == Lead::Claims {
+                            if let Some(claim) = claim.take() {
+                                let _ = claim.send(());
                             }
+                            continue;
+                        }
+                        match opening(start, false) {
+                            // Words to that effect stay held, judged with the
+                            // whole response (one with calls is no answer).
+                            Lead::Undecided | Lead::Claims => continue,
                             Lead::Other => held.take().unwrap_or_default(),
                         }
                     }
@@ -374,12 +381,14 @@ async fn run(
                 shown.push_str(&text);
                 relay_events.send(json!({"type":"answer_delta","text":text}));
             }
-            // A response that ended while undecided shows its start (not
-            // after a stop: the stream ended because the browser closed it).
+            // A response that ended while undecided shows its start unless it
+            // opens with the line (not after a stop: the stream ended because
+            // the browser closed it).
             if let Some(start) = held
                 && claim.is_some()
                 && !start.is_empty()
                 && !stopped.is_cancelled()
+                && opening(&start, true) == Lead::Other
             {
                 shown.push_str(&start);
                 relay_events.send(json!({"type":"answer_delta","text":start}));
@@ -666,17 +675,19 @@ async fn run(
             }
         }
         timing.llm.push(json!({"ms":ms,"prompt":usage.as_ref().map(|u| u.input),"completion":usage.as_ref().map(|u| u.output),"cached":usage.as_ref().and_then(|u| u.cached),"estimate":estimate}));
-        // The general-knowledge line before any search, found in the whole
-        // answer (one that did not open with it streamed in full).
+        // An answer opening with words to the effect of the general-knowledge
+        // line before anything was looked up, held unseen while it streamed.
+        // Only its opening line is judged: the same words further on are no
+        // claim (a quote of the line, as the README's own examples hold), and
+        // when the whole answer was judged, one shown in full was taken back
+        // and written again for them. What was shown stands.
         if search_first
+            && !emitted
             && completion.calls.is_empty()
             && !completion.discarded_tool_calls
-            && claims_unregistered(&completion.text)
+            && opening(&completion.text, true) == Lead::Claims
         {
             eprintln!("[agent] the answer said the registered material lacks it before any search; asking for a search");
-            if emitted {
-                retract(events, &partial);
-            }
             if let Some(last) = timing.llm.last_mut() {
                 last["searchFirst"] = json!(true);
             }
@@ -927,6 +938,48 @@ fn lead(text: &str) -> Lead {
     } else {
         Lead::Other
     }
+}
+
+/// The line an answer opens with, where the system prompt has the
+/// general-knowledge line said: the first with content, past blank lines and
+/// short headings (a title before it), and whether it has ended.
+fn opening_line(text: &str) -> (&str, bool) {
+    let mut rest = text;
+    loop {
+        let start = rest.trim_start();
+        let Some((line, after)) = start.split_once('\n') else {
+            return (start, false);
+        };
+        let title = line.trim_start().starts_with('#') && line.chars().count() < OPENING_CHARS;
+        if !title || claims_unregistered(line) {
+            return (line, true);
+        }
+        rest = after;
+    }
+}
+
+/// Whether an answer opens with words to the effect of the general-knowledge
+/// line, as far as `text` tells; `done` when the response has ended. Judged
+/// on the start of the opening line, a decision a prefix of the text makes
+/// stays the decision for all of it: the relay holds no more than the
+/// opening, and what it shows is never refused after the response ends.
+fn opening(text: &str, done: bool) -> Lead {
+    let (line, ended) = opening_line(text);
+    let end = line.char_indices().nth(OPENING_CHARS).map_or(line.len(), |(i, _)| i);
+    if claims_unregistered(&line[..end]) {
+        Lead::Claims
+    } else if done || ended || line.chars().count() >= OPENING_CHARS {
+        Lead::Other
+    } else {
+        Lead::Undecided
+    }
+}
+
+/// Whether this question has looked anything up: a search or a query as
+/// they ran, or another tool that answered (a registered project's files, an
+/// MCP tool). A call refused before it ran looked at nothing.
+fn looked(trace: &[Value]) -> bool {
+    trace.iter().any(|step| step.get("tool").is_none() || step["status"] == "ok")
 }
 
 /// Whether the newest bundle holds the pieces of an answer being continued.
@@ -1902,8 +1955,7 @@ mod tests {
         for other in ["배치 재시작은 등록된 지식의 절차를 따릅니다.", "등록된 쿼리로 조회했습니다. 결과가 없습니다.", "안녕하세요!"] {
             assert!(!claims_unregistered(other), "{other}");
         }
-        // Held while the start may still be the line, decided at its first
-        // other character.
+        // The line as the system prompt words it stops its request at once.
         for (start, expected) in [
             ("", Lead::Undecided),
             ("*", Lead::Undecided),
@@ -1916,6 +1968,66 @@ mod tests {
             ("# 배치", Lead::Other),
         ] {
             assert_eq!(lead(start), expected, "{start:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_opening_line_says_the_general_knowledge_line() {
+        let quoted = "llm_agent는 사내 지식과 DB를 함께 보는 에이전트입니다.\n\n| 질문 | 동작 |\n|---|---|\n| 쿠버네티스가 뭐야 | 검색 후 일반 지식으로 답변 (\"등록된 지식에 없는 내용…\" 표시) |";
+        let long_first = format!("{}등록된 지식에 없는 내용입니다.", "가".repeat(OPENING_CHARS));
+        let long_title = format!("# {}\n등록된 지식에 없는 내용이라 일반 지식으로 답합니다.", "제목".repeat(OPENING_CHARS));
+        for (text, done, expected) in [
+            ("", false, Lead::Undecided),
+            ("\n\n", false, Lead::Undecided),
+            ("*등록된 지식에 없는 내용이라 일반 지식으로 답변합니다.*\n일론 머스크는", false, Lead::Claims),
+            ("죄송하지만 이 질문은 등록된 자료에서 찾을 수 없어", false, Lead::Claims),
+            // A title before it is passed over, and is held as it comes.
+            ("### 답변\n\n등록된 자료에서 찾을 수 없어 일반 지식으로 답합니다.", true, Lead::Claims),
+            ("### 답변", false, Lead::Undecided),
+            ("### 답변\n\n등록된 자료", false, Lead::Undecided),
+            // An answer that opens otherwise, at its line's end or past its
+            // first characters.
+            (quoted, true, Lead::Other),
+            ("**요약**\n등록된 지식에 없는 내용", false, Lead::Other),
+            ("쿠버네티스는 컨테이너", false, Lead::Undecided),
+            ("쿠버네티스는 컨테이너", true, Lead::Other),
+            (long_first.as_str(), false, Lead::Other),
+            (long_title.as_str(), true, Lead::Other),
+        ] {
+            assert_eq!(opening(text, done), expected, "{text:?} done={done}");
+        }
+        // A prefix that decides decides for the whole text: the relay never
+        // shows what the finished response is refused for.
+        for text in [
+            quoted,
+            GENERAL,
+            "### 답변\n\n등록된 자료에서 찾을 수 없어 일반 지식으로 답합니다.",
+            "## 등록된 지식에 없는 내용\n쿠버네티스는",
+            long_first.as_str(),
+            long_title.as_str(),
+            "## 개요\r\n\r\n배치는 정상입니다.\n등록된 자료에 없",
+        ] {
+            let whole = opening(text, true);
+            for (i, _) in text.char_indices().chain([(text.len(), ' ')]) {
+                let decided = opening(&text[..i], false);
+                assert!(decided == Lead::Undecided || decided == whole, "{:?} decided {decided:?}, the whole {whole:?}", &text[..i]);
+            }
+        }
+    }
+
+    const GENERAL: &str = "*등록된 지식에 없는 내용이라 일반 지식으로 답변합니다.*\n일론 머스크는 기업가입니다.";
+
+    #[test]
+    fn a_call_refused_before_it_ran_looked_at_nothing() {
+        assert!(!looked(&[]));
+        assert!(!looked(&[json!({"tool":"nope","summary":"nope","status":"error"})]));
+        for step in [
+            json!({"search":"배치","targets":["knowledge"],"hits":{"knowledge":0}}),
+            json!({"step":1,"query_name":"q","error":"조회 중 오류가 발생했습니다."}),
+            json!({"tool":"file_read","summary":"[app] 파일 읽기 README.md","status":"ok"}),
+            json!({"tool":"exa__web_search_exa","summary":"exa · web_search_exa","status":"ok"}),
+        ] {
+            assert!(looked(std::slice::from_ref(&step)), "{step}");
         }
     }
 
