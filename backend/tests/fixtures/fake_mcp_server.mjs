@@ -283,6 +283,28 @@ if (httpMode) {
         res.writeHead(Number(env.FAKE_MCP_CALL_STATUS), { 'Content-Type': page ? 'text/html' : 'text/plain', 'Retry-After': '30' }).end(page || 'slow down');
         return;
       }
+      // flood_line: an answer `mb` MiB long, without end when `mb` is left
+      // out (a tool dumping a table, a body that never ends), as one SSE
+      // event under FAKE_MCP_SSE; FAKE_MCP_FLOOD_STATUS answers it with that
+      // HTTP status.
+      if (message.params?.name === 'flood_line') {
+        const mb = message.params.arguments?.mb;
+        const sse = Boolean(env.FAKE_MCP_SSE);
+        res.writeHead(Number(env.FAKE_MCP_FLOOD_STATUS || 200), { 'Content-Type': sse ? 'text/event-stream' : 'application/json' });
+        if (sse) res.write(`event: message\ndata: ${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/message', params: { level: 'info', data: 'flooding' } })}\n\nevent: message\ndata: `);
+        res.write(`{"jsonrpc":"2.0","id":${JSON.stringify(message.id)},"result":{"content":[{"type":"text","text":"`);
+        const chunk = 'x'.repeat(1 << 20);
+        let sent = 0;
+        const more = () => {
+          while (!res.destroyed && (mb === undefined || sent < mb)) {
+            sent += 1;
+            if (!res.write(chunk)) { res.once('drain', more); return; }
+          }
+          if (!res.destroyed) res.end(sse ? '"}]}}\n\n' : '"}]}}');
+        };
+        more();
+        return;
+      }
       const notes = [];
       // A stream opened before the answer, as a server streaming a long call does.
       if (env.FAKE_MCP_SSE && message.params?.name === 'cut_stream') res.writeHead(200, { 'Content-Type': 'text/event-stream' }).flushHeaders();

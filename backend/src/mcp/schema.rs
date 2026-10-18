@@ -18,6 +18,13 @@ pub const MAX_DESCRIPTION: usize = 1_024;
 const REF_DEPTH: usize = 6;
 const REF_EXPANSIONS: usize = 64;
 const REF_BYTES: usize = super::MAX_SCHEMA_BYTES;
+/// Nor is a definition inlined where it would nest the parameters past this
+/// many levels of JSON. Definitions each nested within what one message may
+/// be (128 levels), and inlined one in another, made parameters 722 levels
+/// deep: a model server reading requests with serde_json's default limit
+/// (128, as TGI's does) refused every request with the tool, without naming
+/// it, so that it could not be left out.
+const REF_NESTING: usize = 64;
 
 /// The model-facing names of one server's tools, in order: `server__tool`,
 /// characters outside `[A-Za-z0-9_-]` replaced by '_'. A name past
@@ -192,7 +199,7 @@ pub fn parameters(schema: &Value) -> Value {
     }
     let mut budget = Budget { expansions: REF_EXPANSIONS, bytes: REF_BYTES, sizes: HashMap::new() };
     let mut value = Value::Object(out);
-    expand(&mut value, &definitions, &mut vec![], &mut budget);
+    expand(&mut value, 1, &definitions, &mut vec![], &mut budget);
     tidy(&mut value, 0);
     value
 }
@@ -298,14 +305,24 @@ fn tidy(schema: &mut Value, depth: usize) {
 struct Budget {
     expansions: usize,
     bytes: usize,
-    /// Each definition's size, measured once: a schema may refer to one
-    /// past the budget a thousand times.
-    sizes: HashMap<String, usize>,
+    /// Each definition's size and nesting, measured once: a schema may refer
+    /// to one past the budget a thousand times.
+    sizes: HashMap<String, (usize, usize)>,
 }
 
-/// Inlines the local references in `value`, which lies within the
-/// definitions `within` (outermost first).
-fn expand(value: &mut Value, definitions: &Map<String, Value>, within: &mut Vec<String>, budget: &mut Budget) {
+/// The levels of JSON `value` nests (a scalar none, `{}` one).
+fn nesting(value: &Value) -> usize {
+    match value {
+        Value::Object(fields) => 1 + fields.values().map(nesting).max().unwrap_or(0),
+        Value::Array(items) => 1 + items.iter().map(nesting).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Inlines the local references in `value`, at level `level` of the
+/// parameters (their object the first) and within the definitions `within`
+/// (outermost first).
+fn expand(value: &mut Value, level: usize, definitions: &Map<String, Value>, within: &mut Vec<String>, budget: &mut Budget) {
     match value {
         Value::Object(fields) => {
             if let Some(target) = fields.get("$ref").and_then(Value::as_str).map(str::to_owned) {
@@ -313,14 +330,15 @@ fn expand(value: &mut Value, definitions: &Map<String, Value>, within: &mut Vec<
                 let found = definitions
                     .get(&target)
                     .filter(|_| within.len() < REF_DEPTH && budget.expansions > 0 && !within.contains(&target))
-                    .map(|definition| (definition, *budget.sizes.entry(target.clone()).or_insert_with(|| definition.to_string().len())))
-                    .filter(|(_, bytes)| *bytes <= budget.bytes);
-                if let Some((definition, bytes)) = found {
+                    .map(|definition| (definition, *budget.sizes.entry(target.clone()).or_insert_with(|| (definition.to_string().len(), nesting(definition)))))
+                    // The definition's object is this one.
+                    .filter(|(_, (bytes, nested))| *bytes <= budget.bytes && level + nested.saturating_sub(1) <= REF_NESTING);
+                if let Some((definition, (bytes, _))) = found {
                     budget.expansions -= 1;
                     budget.bytes -= bytes;
                     let mut inlined = definition.clone();
                     within.push(target);
-                    expand(&mut inlined, definitions, within, budget);
+                    expand(&mut inlined, level, definitions, within, budget);
                     within.pop();
                     // Keys beside the reference (a description) stay; the
                     // definition fills in the rest.
@@ -333,12 +351,12 @@ fn expand(value: &mut Value, definitions: &Map<String, Value>, within: &mut Vec<
                 return;
             }
             for field in fields.values_mut() {
-                expand(field, definitions, within, budget);
+                expand(field, level + 1, definitions, within, budget);
             }
         }
         Value::Array(items) => {
             for item in items {
-                expand(item, definitions, within, budget);
+                expand(item, level + 1, definitions, within, budget);
             }
         }
         _ => {}
@@ -612,6 +630,49 @@ mod tests {
         assert_eq!(parameters(&chain)["properties"]["a"]["properties"]["b"]["properties"]["c"]["properties"]["leaf"]["type"], "integer");
     }
 
+    /// MCP review, twenty-sixth pass: definitions nested deep, each inlined
+    /// in the one before, made parameters 722 levels deep from a message of
+    /// 128 — refused whole by a model server reading with serde_json's limit.
+    #[test]
+    fn inlined_definitions_nest_within_bounds() {
+        // Chained definitions, each `steps` objects deep, the last a string.
+        let chain = |steps: usize| {
+            let mut defs = Map::new();
+            for i in 0..8 {
+                let mut def = if i < 7 { json!({"$ref":format!("#/$defs/D{}", i + 1)}) } else { json!({"type":"string"}) };
+                for _ in 0..steps {
+                    def = json!({"type":"object","properties":{"x":def}});
+                }
+                defs.insert(format!("D{i}"), def);
+            }
+            json!({"type":"object","properties":{"a":{"$ref":"#/$defs/D0"}},"$defs":defs})
+        };
+        // The objects inlined under "a", and what ends them.
+        let inlined = |p: &Value| {
+            let mut node = &p["properties"]["a"];
+            let mut levels = 0;
+            while let Some(next) = node["properties"].get("x") {
+                node = next;
+                levels += 1;
+            }
+            (levels, node.clone())
+        };
+        // As deep as a message lets them be: none fits.
+        let deepest = chain(58);
+        let message = json!({"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"t","inputSchema":deepest}]}});
+        assert!(serde_json::from_str::<Value>(&message.to_string()).is_ok(), "a message the SDK reads");
+        let p = parameters(&deepest);
+        assert!(nesting(&p) <= REF_NESTING, "{} levels", nesting(&p));
+        assert_eq!(inlined(&p), (0, json!({})));
+        // The request with it reads back with serde_json's limit.
+        let request = json!({"model":"m","tools":[definition("s__t", "", &p)]});
+        assert!(serde_json::from_str::<Value>(&request.to_string()).is_ok());
+        // Twenty deep: the first fits, the one in it not.
+        let p = parameters(&chain(20));
+        assert!(nesting(&p) <= REF_NESTING, "{} levels", nesting(&p));
+        assert_eq!(inlined(&p), (20, json!({})));
+    }
+
     #[test]
     fn a_self_referencing_tree_stays_small() {
         let schema = json!({"type":"object","properties":{"root":{"$ref":"#/$defs/T"}},
@@ -801,3 +862,4 @@ mod tests {
         assert_eq!(missing_required(&p, &args), vec!["b".to_owned()]);
     }
 }
+

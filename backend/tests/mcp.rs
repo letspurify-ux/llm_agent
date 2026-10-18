@@ -2265,9 +2265,10 @@ async fn the_status_counts_tokens_without_holding_up_questions() {
 
 /// Text a JavaScript server cut inside an emoji holds half a surrogate pair
 /// (a `\ud83d` escape), which JSON parsers refuse: the result comes with
-/// U+FFFD in its place, over stdio and SSE (so does a byte that is not
-/// UTF-8 over stdio). A plain JSON response is parsed inside the SDK: that
-/// call fails, the session stays.
+/// U+FFFD in its place, over stdio, SSE and plain JSON (so does a byte that
+/// is not UTF-8 over stdio). A plain JSON response was parsed inside the SDK,
+/// and that call failed, until the client read answers itself (twenty-sixth
+/// pass).
 #[tokio::test]
 async fn text_cut_inside_an_emoji_does_not_hang_or_end_the_session() {
     if node_missing() {
@@ -2288,12 +2289,7 @@ async fn text_cut_inside_an_emoji_does_not_hang_or_end_the_session() {
         let started = Instant::now();
         let outcome = call(&hub, &config, "cut__echo", json!({"text":"cut emoji"})).await;
         assert!(started.elapsed() < Duration::from_secs(5), "{mode}: answered at once, not at the timeout");
-        if mode == "json" {
-            let error = outcome.unwrap_err().to_string();
-            assert!(error.starts_with("mcp_request_failed:") && error.contains("JSON-RPC 메시지로 읽지 못했습니다"), "{error}");
-        } else {
-            assert_eq!(outcome.unwrap()["text"], "잘림 \u{fffd}", "{mode}");
-        }
+        assert_eq!(outcome.unwrap()["text"], "잘림 \u{fffd}", "{mode}");
         if mode == "stdio" {
             let bytes = call(&hub, &config, "cut__echo", json!({"text":"bad bytes"})).await;
             assert_eq!(bytes.unwrap()["text"], "raw \u{fffd} byte", "a byte that is not UTF-8");
@@ -3264,4 +3260,73 @@ async fn a_call_whose_stream_is_cut_fails_alone() {
     assert!(error.starts_with("mcp_server_unavailable:") && error.ends_with("it may have taken effect on the server"), "{error}");
     wait_for(&hub, "json", |s| s["state"] == "failed").await;
     hub.shutdown().await;
+}
+
+
+/// The process's largest resident memory so far, in MiB.
+#[cfg(unix)]
+fn peak_memory_mib() -> u64 {
+    // SAFETY: getrusage only writes the struct it is given.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    // Bytes on macOS, kilobytes elsewhere.
+    let unit = if cfg!(target_os = "macos") { 1 } else { 1024 };
+    usage.ru_maxrss as u64 * unit / (1 << 20)
+}
+
+/// MCP review, twenty-sixth pass: the SDK read an HTTP answer in plain JSON,
+/// and an HTTP error's body, whole — over stdio a line, over SSE an event
+/// is read to 16 MiB. A tool answering 300 MiB took some 1.2 GB of the
+/// backend's memory, a 300 MiB error page 1.6 GB, and an error page without
+/// end grew it until the system killed the backend. An answer is read to
+/// 16 MiB: past it, it answers its call with an error, at once, and the
+/// session stays.
+#[tokio::test]
+async fn an_answer_past_what_one_message_may_be_is_not_read() {
+    if node_missing() {
+        return;
+    }
+    // (served as, size in MiB or without end, what the model is told)
+    for (mode, mb, told) in [
+        ("json", Some(300), "more than 16 MiB"),
+        ("json", None, "more than 16 MiB"),
+        ("sse", None, "more than 16 MiB"),
+        ("500", None, "answered HTTP 500"),
+    ] {
+        let env: &[(&str, &str)] = match mode {
+            "sse" => &[("FAKE_MCP_SSE", "1")],
+            "500" => &[("FAKE_MCP_FLOOD_STATUS", "500")],
+            _ => &[],
+        };
+        let remote = HttpServer::start(env);
+        let server = McpServer {
+            name: "flood".into(),
+            url: remote.url.clone(),
+            tools: vec!["flood_line".into(), "echo".into()],
+            timeout_secs: Some(20),
+            ..Default::default()
+        };
+        let config = config(vec![server]);
+        let hub = McpHub::default();
+        hub.apply(&config.mcp_servers);
+        ready(&hub, "flood").await;
+        #[cfg(unix)]
+        let before = peak_memory_mib();
+        let started = Instant::now();
+        let args = mb.map_or(json!({}), |mb| json!({"mb":mb}));
+        let error = call(&hub, &config, "flood__flood_line", args).await.unwrap_err().to_string();
+        assert!(started.elapsed() < Duration::from_secs(5), "{mode} {mb:?}: {:?}, not at the timeout", started.elapsed());
+        assert!(error.starts_with("mcp_request_failed:") && error.contains(told), "{mode} {mb:?}: {}", &error[..400.min(error.len())]);
+        assert!(error.chars().count() < 3_000, "{mode} {mb:?}: {} characters to the model", error.chars().count());
+        #[cfg(unix)]
+        {
+            let grown = peak_memory_mib().saturating_sub(before);
+            assert!(grown < 256, "{mode} {mb:?}: the peak memory grew {grown} MiB");
+        }
+        // The session stays, and serves the next call.
+        assert_eq!(call(&hub, &config, "flood__echo", json!({"text":"다음"})).await.unwrap()["text"], "echo: 다음", "{mode}");
+        let status = hub.server_status("flood", MODEL).unwrap();
+        assert_eq!((status["state"].clone(), status["restarts"].clone()), (json!("ready"), json!(0)), "{mode} {mb:?}");
+        hub.shutdown().await;
+    }
 }

@@ -1,6 +1,6 @@
 //! A server's messages made readable before they are parsed. What the SDK
-//! cannot read is dropped over stdio (the call waits out its timeout) and
-//! ends the whole session over SSE. So:
+//! cannot read is dropped over stdio (the call waits out its timeout), ends
+//! the whole session over SSE and fails the call in plain JSON. So:
 //! - a JavaScript server that cuts a text inside an emoji (`slice(0, n)`)
 //!   sends half a surrogate pair as a `\ud83d` escape, which the JSON parser
 //!   refuses: it becomes U+FFFD, as does a byte that is not UTF-8;
@@ -16,16 +16,22 @@
 //!   server no longer knows) fails that request, rather than leave it
 //!   waiting for an answer that never comes.
 //!
-//! The HTTP client also paces the event streams it opens (see `Lenient`),
-//! and says when the SDK initialized a new session in place of one the
-//! server forgot.
+//! The HTTP client also reads an answer as far as one message may be (see
+//! `Lenient::post`), paces the event streams it opens, and says when the
+//! SDK initialized a new session in place of one the server forgot.
 
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use rmcp::{
-    model::{ClientJsonRpcMessage, ClientRequest, RequestId, ServerJsonRpcMessage},
+    ErrorData,
+    model::{ClientJsonRpcMessage, ClientRequest, ErrorCode, RequestId, ServerJsonRpcMessage},
     transport::{
-        common::client_side_sse::BoxedSseResponse,
-        streamable_http_client::{StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse},
+        common::{
+            client_side_sse::BoxedSseResponse,
+            http_header::{EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID, HEADER_SESSION_ID, JSON_MIME_TYPE},
+        },
+        streamable_http_client::{
+            AuthRequiredError, InsufficientScopeError, StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse,
+        },
     },
 };
 use serde_json::{Value, json};
@@ -345,10 +351,21 @@ fn escapes_mended(json: &[u8]) -> Option<Vec<u8>> {
 const STREAMS_AT_ONCE: u32 = 8;
 const STREAM_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Bytes of one answer read, as of a stdio server's line and of an SSE event
+/// (the SDK's limit): rmcp read a plain JSON answer, and an HTTP error's
+/// body, whole. A tool answering a gigabyte took three of the backend's
+/// memory, and an error page without end took it all, until the system
+/// killed the backend.
+const MAX_ANSWER_BYTES: usize = super::MAX_LINE_BYTES;
+/// Bytes of an HTTP error's body quoted in its message (a message is cut to
+/// a thousand characters where it is shown).
+const QUOTED_BYTES: usize = 64 * 1024;
+/// The error an answer past `MAX_ANSWER_BYTES` is read as, answering its
+/// request.
+pub const TOO_LARGE: &str = "the server answered with more than 16 MiB, which is not read: the request ran on the server, but its answer is lost; ask for less (a narrower query, fewer rows or fields)";
+
 /// The MCP HTTP client of one connection: rmcp's own (no redirects, no
-/// idle connections) with the events of its SSE responses mended. A plain
-/// JSON response is parsed inside rmcp, out of reach: one that cannot be
-/// read fails that call only.
+/// idle connections), its answers mended and read within bounds (`post`).
 #[derive(Clone)]
 pub struct Lenient {
     client: reqwest13::Client,
@@ -392,6 +409,131 @@ impl Lenient {
         }
     }
 
+    /// Posts a message as rmcp's client does, its answer read within
+    /// `MAX_ANSWER_BYTES` and mended: a plain JSON answer as a stdio line is,
+    /// the events of an SSE answer one by one (`bounded_events`). An answer
+    /// past the limit is not read on: it answers its request with an error
+    /// (`TOO_LARGE`), the session left as it is.
+    async fn post(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: Headers,
+        max_event_size: usize,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<reqwest13::Error>> {
+        let (asked, with_session, initialize) = (request_id(&message), session_id.is_some(), initializes(&message));
+        let response = self.send(uri, &message, session_id, auth_header, custom_headers, max_event_size).await;
+        let response = mended_response(asked, with_session, response);
+        if initialize {
+            self.initialized(&response);
+        }
+        response
+    }
+
+    /// rmcp's `post_message` for reqwest (3.5), but for how much is read.
+    async fn send(
+        &self,
+        uri: Arc<str>,
+        message: &ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: Headers,
+        max_event_size: usize,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<reqwest13::Error>> {
+        use reqwest13::{
+            StatusCode,
+            header::{ACCEPT, CONTENT_TYPE, WWW_AUTHENTICATE},
+        };
+        let mut request = self.client.post(uri.as_ref()).header(ACCEPT, format!("{EVENT_STREAM_MIME_TYPE}, {JSON_MIME_TYPE}"));
+        if let Some(token) = auth_header {
+            request = request.bearer_auth(token);
+        }
+        for (name, value) in custom_headers {
+            // The transport's own headers, but the protocol version it sets
+            // through these.
+            if ["accept", HEADER_SESSION_ID, HEADER_LAST_EVENT_ID].iter().any(|own| name.as_str().eq_ignore_ascii_case(own)) {
+                return Err(StreamableHttpError::ReservedHeaderConflict(name.to_string()));
+            }
+            request = request.header(name, value);
+        }
+        let with_session = session_id.is_some();
+        if let Some(session) = session_id {
+            request = request.header(HEADER_SESSION_ID, session.as_ref());
+        }
+        let mut response = request.json(message).send().await?;
+        let status = response.status();
+        if let Some(challenge) = response.headers().get(WWW_AUTHENTICATE).filter(|_| matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)) {
+            let challenge = challenge
+                .to_str()
+                .map_err(|_| StreamableHttpError::UnexpectedServerResponse("invalid www-authenticate header value".into()))?
+                .to_owned();
+            return Err(if status == StatusCode::UNAUTHORIZED {
+                StreamableHttpError::AuthRequired(AuthRequiredError::new(challenge))
+            } else {
+                let scope = scope(&challenge);
+                StreamableHttpError::InsufficientScope(InsufficientScopeError::new(challenge, scope))
+            });
+        }
+        if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT) {
+            return Ok(StreamableHttpPostResponse::Accepted);
+        }
+        if status == StatusCode::NOT_FOUND && with_session {
+            return Err(StreamableHttpError::SessionExpired);
+        }
+        let header = |name| response.headers().get(name).map(|v: &reqwest13::header::HeaderValue| String::from_utf8_lossy(v.as_bytes()).into_owned());
+        let (content_type, session) = (header(CONTENT_TYPE), header(reqwest13::header::HeaderName::from_static("mcp-session-id")));
+        let asked = request_id(message);
+        // Some servers answer a notification with an empty 200, not 202.
+        if status.is_success() && response.content_length() == Some(0) && asked.is_none() {
+            return Ok(StreamableHttpPostResponse::Accepted);
+        }
+        let json = content_type.as_deref().is_some_and(|t| t.starts_with(JSON_MIME_TYPE));
+        if !status.is_success() {
+            let (body, cut) = read_within(&mut response, MAX_ANSWER_BYTES).await.unwrap_or_else(|_| (b"<failed to read response body>".to_vec(), false));
+            let body = String::from_utf8_lossy(&body);
+            if !cut {
+                if let Some(refused) = discover_refused(message, with_session, status, &body) {
+                    return Ok(refused);
+                }
+                // A JSON-RPC error is the server's answer, whatever its status.
+                if json && let Ok(error @ ServerJsonRpcMessage::Error(_)) = serde_json::from_str(&body) {
+                    return Ok(StreamableHttpPostResponse::Json(error, session));
+                }
+            }
+            let quoted = cut_at(&body, QUOTED_BYTES);
+            let more = if cut || quoted.len() < body.len() { "…" } else { "" };
+            return Err(StreamableHttpError::UnexpectedServerResponse(format!("HTTP {status}: {quoted}{more}").into()));
+        }
+        match content_type.as_deref() {
+            Some(t) if t.starts_with(EVENT_STREAM_MIME_TYPE) => Ok(StreamableHttpPostResponse::Sse(bounded_events(response.bytes_stream(), max_event_size, asked), session)),
+            Some(_) if json => {
+                // Known too long, it is not read at all.
+                let (body, cut) = match response.content_length() {
+                    Some(length) if length > MAX_ANSWER_BYTES as u64 => (vec![], true),
+                    _ => read_within(&mut response, MAX_ANSWER_BYTES).await?,
+                };
+                if cut {
+                    return Ok(match asked {
+                        Some(id) => StreamableHttpPostResponse::Json(too_large(id), session),
+                        None => StreamableHttpPostResponse::Accepted,
+                    });
+                }
+                let body = mend(&body).unwrap_or(body);
+                match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
+                    Ok(parsed) => Ok(StreamableHttpPostResponse::Json(parsed, session)),
+                    // What answers no request needs no reading.
+                    Err(_) if asked.is_none() => Ok(StreamableHttpPostResponse::Accepted),
+                    Err(error) => Err(StreamableHttpError::UnexpectedServerResponse(
+                        format!("could not parse JSON response as ServerJsonRpcMessage: {error}: {}", preview(&body)).into(),
+                    )),
+                }
+            }
+            _ => Err(StreamableHttpError::UnexpectedContentType(content_type)),
+        }
+    }
+
     /// Counts an initialization the server answered (not with an error).
     fn initialized(&self, response: &Result<StreamableHttpPostResponse, StreamableHttpError<reqwest13::Error>>) {
         if matches!(response, Ok(StreamableHttpPostResponse::Json(ServerJsonRpcMessage::Error(_), _)) | Err(_)) {
@@ -405,6 +547,177 @@ impl Lenient {
 
 fn initializes(message: &ClientJsonRpcMessage) -> bool {
     matches!(message, ClientJsonRpcMessage::Request(request) if matches!(request.request, ClientRequest::InitializeRequest(_)))
+}
+
+/// The body, `limit` bytes of it at most, and whether there was more (not
+/// read: the response is dropped, its connection closed).
+async fn read_within(response: &mut reqwest13::Response, limit: usize) -> Result<(Vec<u8>, bool), reqwest13::Error> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > limit {
+            body.extend_from_slice(&chunk[..limit - body.len()]);
+            return Ok((body, true));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((body, false))
+}
+
+/// The text's first `limit` bytes, on a character boundary.
+fn cut_at(text: &str, limit: usize) -> &str {
+    let mut end = text.len().min(limit);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// The start of a body that could not be read, as rmcp quotes it.
+fn preview(body: &[u8]) -> String {
+    if body.is_empty() {
+        return "<empty>".to_owned();
+    }
+    cut_at(&String::from_utf8_lossy(body), 256).to_owned()
+}
+
+/// The error answering request `id` in place of an answer past the limit.
+fn too_large(id: RequestId) -> ServerJsonRpcMessage {
+    ServerJsonRpcMessage::error(ErrorData::new(ErrorCode::INTERNAL_ERROR, TOO_LARGE, None), Some(id))
+}
+
+/// The `scope` a refusal's `WWW-Authenticate` challenge names, as rmcp
+/// reads it.
+fn scope(challenge: &str) -> Option<String> {
+    let at = challenge.to_ascii_lowercase().find("scope=")? + "scope=".len();
+    let value = &challenge[at..];
+    match value.strip_prefix('"') {
+        Some(quoted) => quoted.find('"').map(|end| quoted[..end].to_owned()),
+        None => {
+            let end = value.find(|c: char| c == ',' || c == ';' || c.is_whitespace()).unwrap_or(value.len());
+            (end > 0).then(|| value[..end].to_owned())
+        }
+    }
+}
+
+/// A refused `server/discover` sent without a session, as rmcp reads it
+/// (`legacy_discover_response`): the error answering it, so that the SDK
+/// falls back to the older protocol.
+fn discover_refused(message: &ClientJsonRpcMessage, with_session: bool, status: reqwest13::StatusCode, body: &str) -> Option<StreamableHttpPostResponse> {
+    use reqwest13::StatusCode;
+    if with_session || !status.is_client_error() || matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return None;
+    }
+    let ClientJsonRpcMessage::Request(request) = message else {
+        return None;
+    };
+    if !matches!(request.request, ClientRequest::DiscoverRequest(_)) {
+        return None;
+    }
+    let error = match serde_json::from_str::<ServerJsonRpcMessage>(body) {
+        Ok(ServerJsonRpcMessage::Error(error)) => error.error,
+        _ => ErrorData::invalid_request(format!("server/discover rejected with HTTP {status}: {body}"), None),
+    };
+    Some(StreamableHttpPostResponse::Json(ServerJsonRpcMessage::error(error, Some(request.id.clone())), None))
+}
+
+/// The size of the SSE event being read, as rmcp counts it: its lines but
+/// comments, each with the newline that joins them.
+struct EventSize {
+    limit: usize,
+    /// The event's lines so far, and the line being read.
+    event: usize,
+    line: usize,
+    comment: bool,
+    after_cr: bool,
+}
+
+impl EventSize {
+    fn new(limit: usize) -> Self {
+        Self { limit, event: 0, line: 0, comment: false, after_cr: false }
+    }
+
+    /// Where in `chunk` the event being read passes the limit, if it does.
+    fn past(&mut self, chunk: &[u8]) -> Option<usize> {
+        for (at, &byte) in chunk.iter().enumerate() {
+            if std::mem::take(&mut self.after_cr) && byte == b'\n' {
+                continue;
+            }
+            match byte {
+                b'\r' | b'\n' => {
+                    // An empty line ends the event.
+                    if self.line == 0 {
+                        self.event = 0;
+                    } else if !self.comment {
+                        self.event = self.event.saturating_add(self.line + 1);
+                    }
+                    self.line = 0;
+                    self.comment = false;
+                    self.after_cr = byte == b'\r';
+                }
+                _ => {
+                    if self.line == 0 {
+                        self.comment = byte == b':';
+                    }
+                    self.line += 1;
+                }
+            }
+            if self.event.saturating_add(self.line) > self.limit {
+                return Some(at);
+            }
+        }
+        None
+    }
+}
+
+/// An SSE answer's events, each within `limit` bytes. rmcp ends its own
+/// stream at one past it, but knows only its own error for that: from
+/// another it would open the stream again, and a server would send that
+/// event again. So the event is ended before the line that passes the limit,
+/// its data cut (unread), and an error answering the request (`TOO_LARGE`)
+/// ends the stream. Lines go to the parser whole: half a line ("da") is an
+/// error of the stream, which rmcp would also open again.
+fn bounded_events(bytes: impl Stream<Item = Result<bytes::Bytes, reqwest13::Error>> + Send + 'static, limit: usize, asked: Option<RequestId>) -> BoxedSseResponse {
+    let ends = |b: &u8| matches!(b, b'\n' | b'\r');
+    // The bytes, the event's size, the line not yet passed on, and the
+    // request answered — while the stream is open.
+    let open = Some((bytes.boxed(), EventSize::new(limit), Vec::new(), asked));
+    let bounded = futures_util::stream::unfold(open, move |open| async move {
+        let (mut bytes, mut size, mut line, asked) = open?;
+        loop {
+            let chunk = match bytes.next().await {
+                Some(Ok(chunk)) => chunk,
+                Some(Err(error)) => return Some((Err(error), None)),
+                // A last line without its end goes as it is.
+                None => return (!line.is_empty()).then(|| (Ok(bytes::Bytes::from(line)), None)),
+            };
+            let past = size.past(&chunk);
+            // The whole lines of the chunk (before the one past the limit).
+            let whole = chunk[..past.unwrap_or(chunk.len())].iter().rposition(ends);
+            let mut out = match whole {
+                Some(end) => {
+                    let mut out = std::mem::take(&mut line);
+                    out.extend_from_slice(&chunk[..=end]);
+                    out
+                }
+                None => vec![],
+            };
+            if past.is_none() {
+                line.extend_from_slice(&chunk[whole.map_or(0, |end| end + 1)..]);
+                if out.is_empty() {
+                    continue;
+                }
+                return Some((Ok(bytes::Bytes::from(out)), Some((bytes, size, line, asked))));
+            }
+            // Two line ends: the first may end a CR's line.
+            out.extend_from_slice(b"\n\n");
+            if let Some(id) = asked {
+                let error = serde_json::to_string(&too_large(id)).unwrap_or_default();
+                out.extend_from_slice(format!("data: {error}\n\n").as_bytes());
+            }
+            return Some((Ok(bytes::Bytes::from(out)), None));
+        }
+    });
+    sse_stream::SseStream::from_bytes_stream(bounded).boxed()
 }
 
 fn mended_events(stream: BoxedSseResponse) -> BoxedSseResponse {
@@ -474,12 +787,7 @@ impl StreamableHttpClient for Lenient {
         auth_header: Option<String>,
         custom_headers: Headers,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        let (asked, with_session, initialize) = (request_id(&message), session_id.is_some(), initializes(&message));
-        let response = mended_response(asked, with_session, self.client.post_message(uri, message, session_id, auth_header, custom_headers).await);
-        if initialize {
-            self.initialized(&response);
-        }
-        response
+        self.post(uri, message, session_id, auth_header, custom_headers, MAX_ANSWER_BYTES).await
     }
 
     async fn post_message_with_max_sse_event_size(
@@ -491,16 +799,7 @@ impl StreamableHttpClient for Lenient {
         custom_headers: Headers,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        let (asked, with_session, initialize) = (request_id(&message), session_id.is_some(), initializes(&message));
-        let response = self
-            .client
-            .post_message_with_max_sse_event_size(uri, message, session_id, auth_header, custom_headers, max_sse_event_size)
-            .await;
-        let response = mended_response(asked, with_session, response);
-        if initialize {
-            self.initialized(&response);
-        }
-        response
+        self.post(uri, message, session_id, auth_header, custom_headers, max_sse_event_size).await
     }
 
     async fn delete_session(
@@ -763,6 +1062,106 @@ mod tests {
         // Streams that lasted leave room for as many at once again.
         tokio::time::advance(Duration::from_secs(60)).await;
         assert_eq!(opened().await, [0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3]);
+    }
+
+    /// Twenty-sixth pass: an SSE answer's events pass whole within the limit
+    /// (split anywhere, CRLF, comments not counted); one past it is cut there
+    /// and the request is answered with an error, nothing read after it.
+    #[tokio::test]
+    async fn sse_events_pass_within_the_limit_and_one_past_it_answers_its_request() {
+        use rmcp::model::NumberOrString;
+        let events = |chunks: Vec<&'static [u8]>, endless: bool, asked: Option<RequestId>| async move {
+            let head = futures_util::stream::iter(chunks.into_iter().map(|c| Ok::<_, reqwest13::Error>(bytes::Bytes::from_static(c))));
+            // A server that would go on without end past the limit.
+            let tail = futures_util::stream::repeat_with(|| Ok(bytes::Bytes::from_static(b"yyyyyyyy"))).take(if endless { usize::MAX } else { 0 });
+            bounded_events(head.chain(tail), 16, asked).map(|e| e.unwrap().data.unwrap_or_default()).collect::<Vec<_>>().await
+        };
+        let id = Some(NumberOrString::Number(7));
+        // Within the limit: an event's lines, each with its newline, 16
+        // bytes in all; comments are not counted.
+        let within = events(vec![b"data:1", b"\r\n: cmt\r\ndata:12", b"3\r", b"\n\r\n", b"data: next\n\n"], false, id.clone()).await;
+        assert_eq!(within, ["1\n123", "next"]);
+        // Past it: the event before stays, the long one ends before its line
+        // past the limit (split anywhere, its field name too), its request
+        // answered with an error; the rest is not read (the tail is endless).
+        for long in [vec![b"data: first\n\ndata:12\nda".as_slice(), b"ta:0123456789"], vec![b"data: first\n\ndata:12\ndata:0123456789".as_slice()]] {
+            let past = events(long.clone(), true, id.clone()).await;
+            assert_eq!(past.len(), 3, "{past:?}");
+            assert_eq!(past[..2], ["first", "12"]);
+            let error: Value = serde_json::from_str(&past[2]).unwrap();
+            assert_eq!((error["id"].clone(), error["error"]["message"].clone()), (json!(7), json!(TOO_LARGE)));
+            // Answering no request, it ends there.
+            assert_eq!(events(long, true, None).await, ["first", "12"]);
+        }
+        // A line past the limit on its own, comment or not.
+        for long in [b": a comment past the limit\n\n".as_slice(), b"data:0123456789012345\n\n"] {
+            let past = events(vec![long], false, id.clone()).await;
+            assert_eq!(past.len(), 1, "{past:?}");
+            assert!(past[0].contains("more than 16 MiB"), "{past:?}");
+        }
+    }
+
+    /// Random event streams split anywhere read as they read whole: the
+    /// same events, never an error of the stream, and past the limit the
+    /// whole lines before it, then the error answering the request.
+    #[tokio::test]
+    async fn random_event_streams_read_alike_however_split() {
+        use rand::{Rng, SeedableRng};
+        use std::ops::Not;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(26);
+        let read = |chunks: Vec<Vec<u8>>, limit: Option<usize>| async move {
+            let source = futures_util::stream::iter(chunks.into_iter().map(|c| Ok::<_, reqwest13::Error>(bytes::Bytes::from(c))));
+            let events: Vec<_> = match limit {
+                Some(limit) => bounded_events(source, limit, Some(RequestId::Number(1))).collect().await,
+                None => sse_stream::SseStream::from_bytes_stream(source).boxed().collect().await,
+            };
+            // Each event's data (what an event without data does is nothing).
+            events.into_iter().map(|e| e.map(|e| e.data).map_err(|e| e.to_string())).filter(|e| e.as_ref().is_ok_and(Option::is_none).not()).collect::<Vec<_>>()
+        };
+        for _ in 0..3_000 {
+            // Valid streams: an empty line after a CR is a CR too (a LF
+            // would join it into one line end).
+            let mut text: Vec<u8> = vec![];
+            let end = |text: &mut Vec<u8>, rng: &mut rand::rngs::StdRng| {
+                let ending = if text.last() == Some(&b'\r') { "\r" } else { ["\n", "\r\n", "\r"][rng.gen_range(0..3)] };
+                text.extend_from_slice(ending.as_bytes());
+            };
+            for _ in 0..rng.gen_range(0..6) {
+                if rng.gen_bool(0.3) {
+                    text.extend_from_slice(format!("id: {}", rng.gen_range(0..99)).as_bytes());
+                    end(&mut text, &mut rng);
+                }
+                for _ in 0..rng.gen_range(0..4) {
+                    let line = if rng.gen_bool(0.2) { ":".to_owned() } else { "data:".to_owned() } + &"가x".repeat(rng.gen_range(0..12));
+                    text.extend_from_slice(line.as_bytes());
+                    let ending = ["\n", "\r\n", "\r"][rng.gen_range(0..3)];
+                    text.extend_from_slice(ending.as_bytes());
+                }
+                end(&mut text, &mut rng);
+            }
+            let limit = rng.gen_range(8..80);
+            // As the stream reads unsplit, cut where the limit is passed.
+            let expected = match EventSize::new(limit).past(&text) {
+                Some(at) => {
+                    let mut kept = text[..text[..at].iter().rposition(|b| matches!(b, b'\n' | b'\r')).map_or(0, |end| end + 1)].to_vec();
+                    kept.extend_from_slice(b"\n\n");
+                    let mut events = read(vec![kept], None).await;
+                    events.push(Ok(Some(serde_json::to_string(&too_large(RequestId::Number(1))).unwrap())));
+                    events
+                }
+                None => read(vec![text.clone()], None).await,
+            };
+            let mut chunks = vec![];
+            let mut rest = text.as_slice();
+            while !rest.is_empty() {
+                let (chunk, after) = rest.split_at(rng.gen_range(0..=rest.len().min(9)));
+                chunks.push(chunk.to_vec());
+                rest = after;
+            }
+            // An error of the stream would be the text's own, never one of
+            // the cut.
+            assert_eq!(read(chunks, Some(limit)).await, expected, "limit {limit}: {:?}", String::from_utf8_lossy(&text));
+        }
     }
 
     #[test]
