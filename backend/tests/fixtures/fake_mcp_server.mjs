@@ -68,6 +68,7 @@ let wedged = false;
 // HTTP 400 "No valid session ID provided" (its example's answer), id null.
 let session = 'fake-session';
 let forgotten = false;
+let initializations = 0;
 if (env.FAKE_MCP_FORGET) tools.push({ name: 'forget', description: 'Forget the session, as a restarted server.', inputSchema: { type: 'object' } });
 if (env.FAKE_MCP_WEDGE) tools.push({ name: 'wedge', description: 'Stop answering every request from now on.', inputSchema: { type: 'object' } });
 if (env.FAKE_MCP_DUPLICATE) tools.push({ name: 'echo', description: 'A second echo.', inputSchema: { type: 'object' } });
@@ -110,6 +111,8 @@ async function handle(message, notify) {
   if (method === 'tools/list') {
     listed += 1;
     if (env.FAKE_MCP_NO_TOOLS) { log(`listed ${listed}`); return failure(id, -32601, 'Method not found: tools/list'); }
+    // The list answered with this message (and the request's id).
+    if (env.FAKE_MCP_LIST_SHAPE) { log(`listed ${listed}`); return { id, ...JSON.parse(env.FAKE_MCP_LIST_SHAPE) }; }
     if (env.FAKE_MCP_LIST_STORM) { log(`listed ${listed}`); setTimeout(() => notify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }), 0); }
     if (env.FAKE_MCP_LOG_LISTS) log(`listed ${listed}`);
     if (env.FAKE_MCP_HANG_LIST) return new Promise(() => {});
@@ -221,6 +224,12 @@ if (httpMode) {
       if (message.method === 'initialize' && forgotten) { forgotten = false; session = `fake-session-${Date.now()}`; }
       else if (forgotten || (req.headers['mcp-session-id'] && !env.FAKE_MCP_STATELESS && req.headers['mcp-session-id'] !== session)) {
         res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Bad Request: No valid session ID provided' }, id: null }));
+        return;
+      }
+      // As a TypeScript-SDK server built on one transport: it takes one
+      // initialization, and refuses another with HTTP 400 and id null.
+      if (env.FAKE_MCP_SINGLE_INIT && message.method === 'initialize' && initializations++ > 0) {
+        res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32600, message: 'Invalid Request: Server already initialized' }, id: null }));
         return;
       }
       // A rate limit or a proxy error on the first tool call only, the

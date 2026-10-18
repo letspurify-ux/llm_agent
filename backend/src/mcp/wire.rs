@@ -36,23 +36,37 @@ struct Head {
     jsonrpc: Value,
     #[serde(default)]
     error: Value,
-    result: Option<serde::de::IgnoredAny>,
+    /// `Some(None)`: there, and null.
+    #[serde(default, deserialize_with = "present")]
+    result: Option<Option<serde::de::IgnoredAny>>,
     method: Option<serde::de::IgnoredAny>,
+}
+
+/// A field that is there, null or not.
+fn present<'de, D: serde::Deserializer<'de>>(field: D) -> Result<Option<Option<serde::de::IgnoredAny>>, D::Error> {
+    serde::Deserialize::deserialize(field).map(Some)
 }
 
 /// The message with its version and error as JSON-RPC has them, when either
 /// is not. Only such a message is read whole.
 fn put_right(text: &[u8]) -> Option<Vec<u8>> {
     let head: Head = serde_json::from_slice(text).ok()?;
-    if head.result.is_none() && head.method.is_none() && head.error.is_null() {
+    if !matches!(head.result, Some(Some(_))) && head.method.is_none() && head.error.is_null() {
         return None;
     }
     let error_ok = head.error.is_null() || (head.error["code"].is_i64() && head.error["message"].is_string());
-    if head.jsonrpc == "2.0" && error_ok {
+    // An error beside a null result (JSON-RPC 1.0 sends both, so does a Go
+    // struct without omitempty) reads as a success with a null result, the
+    // error lost: a tool list refused would be a list without tools.
+    let null_result = !head.error.is_null() && matches!(head.result, Some(None));
+    if head.jsonrpc == "2.0" && error_ok && !null_result {
         return None;
     }
     let mut message: serde_json::Map<String, Value> = serde_json::from_slice(text).ok()?;
     message.insert("jsonrpc".into(), json!("2.0"));
+    if null_result {
+        message.remove("result");
+    }
     if !error_ok {
         let error = &head.error;
         let text = error["message"].as_str().map(str::to_owned).or_else(|| error.as_str().map(str::to_owned)).unwrap_or_else(|| error.to_string());
@@ -159,24 +173,31 @@ fn mended_events(stream: BoxedSseResponse) -> BoxedSseResponse {
 /// the TypeScript SDK's example answers so (HTTP 400) after the server
 /// restarts. The SDK would hold it for no request and the call would wait
 /// out its timeout, every call after it too: it fails the request as a
-/// lost connection instead, which makes a new session.
+/// lost connection instead, which makes a new session. A request sent
+/// without a session (the initialization) has none to lose: such an error
+/// refuses it (a server taking one initialization only, a token, a
+/// protocol version).
 fn mended_response(
     asked: Option<RequestId>,
+    with_session: bool,
     response: Result<StreamableHttpPostResponse, StreamableHttpError<reqwest13::Error>>,
 ) -> Result<StreamableHttpPostResponse, StreamableHttpError<reqwest13::Error>> {
     match response? {
         StreamableHttpPostResponse::Sse(stream, session) => Ok(StreamableHttpPostResponse::Sse(mended_events(stream), session)),
         StreamableHttpPostResponse::Json(ServerJsonRpcMessage::Error(error), _) if asked.is_some() && error.id != asked => {
+            let said = if with_session { ANSWERED_NO_REQUEST } else { REFUSED_NO_REQUEST };
             Err(StreamableHttpError::UnexpectedServerResponse(
-                format!("{ANSWERED_NO_REQUEST}: {} (code {})", error.error.message, error.error.code.0).into(),
+                format!("{said}: {} (code {})", error.error.message, error.error.code.0).into(),
             ))
         }
         other => Ok(other),
     }
 }
 
-/// Said of an error answering no request (see `mended_response`).
+/// Said of an error answering no request (see `mended_response`) of a
+/// session, and of a request sent without one.
 pub const ANSWERED_NO_REQUEST: &str = "the server answered with an error for no request";
+pub const REFUSED_NO_REQUEST: &str = "the server refused a request without a session with an error for no request";
 
 /// The ID of a request, which its answer carries.
 fn request_id(message: &ClientJsonRpcMessage) -> Option<RequestId> {
@@ -199,8 +220,8 @@ impl StreamableHttpClient for Lenient {
         auth_header: Option<String>,
         custom_headers: Headers,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        let asked = request_id(&message);
-        mended_response(asked, self.0.post_message(uri, message, session_id, auth_header, custom_headers).await)
+        let (asked, with_session) = (request_id(&message), session_id.is_some());
+        mended_response(asked, with_session, self.0.post_message(uri, message, session_id, auth_header, custom_headers).await)
     }
 
     async fn post_message_with_max_sse_event_size(
@@ -212,12 +233,12 @@ impl StreamableHttpClient for Lenient {
         custom_headers: Headers,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        let asked = request_id(&message);
+        let (asked, with_session) = (request_id(&message), session_id.is_some());
         let response = self
             .0
             .post_message_with_max_sse_event_size(uri, message, session_id, auth_header, custom_headers, max_sse_event_size)
             .await;
-        mended_response(asked, response)
+        mended_response(asked, with_session, response)
     }
 
     async fn delete_session(
@@ -288,6 +309,11 @@ mod tests {
         assert_eq!(fixed(r#"{"jsonrpc":"2.0","id":1,"error":{"code":"E1","message":"m","data":[1]}}"#)["error"], json!({"code":-32603,"message":"m","data":[1]}));
         assert_eq!(fixed(r#"{"jsonrpc":"2.0","id":1,"error":"just text"}"#)["error"], json!({"code":-32603,"message":"just text"}));
         assert_eq!(fixed(r#"{"jsonrpc":"2.0","id":1,"error":{"code":5}}"#)["error"], json!({"code":5,"message":"{\"code\":5}"}));
+        // An error beside a null result is the error (JSON-RPC 1.0 sends both).
+        assert_eq!(fixed(r#"{"jsonrpc":"2.0","id":1,"result":null,"error":{"code":-32602,"message":"m"}}"#), json!({"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"m"}}));
+        assert_eq!(fixed(r#"{"id":1,"result":null,"error":{"code":-1,"message":"m"}}"#), json!({"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"m"}}));
+        assert!(mend(br#"{"jsonrpc":"2.0","id":1,"result":{},"error":null}"#).is_none(), "a result beside no error reads as it is");
+        assert!(mend(br#"{"jsonrpc":"2.0","id":1,"result":null}"#).is_none());
         // Already right, or not a message: left alone, read once.
         assert!(mend(br#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#).is_none());
         assert!(mend(br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"bad"}}"#).is_none());
@@ -310,13 +336,16 @@ mod tests {
         };
         let asked = Some(NumberOrString::Number(7));
         // A server's restart: its answer names no request (id null).
-        let refused = mended_response(asked.clone(), error(None)).err().expect("fails the request").to_string();
+        let refused = mended_response(asked.clone(), true, error(None)).err().expect("fails the request").to_string();
         assert!(refused.contains(ANSWERED_NO_REQUEST) && refused.contains("No valid session ID provided (code -32000)"), "{refused}");
-        assert!(mended_response(asked.clone(), error(Some(NumberOrString::Number(8)))).is_err(), "another request's");
+        assert!(mended_response(asked.clone(), true, error(Some(NumberOrString::Number(8)))).is_err(), "another request's");
+        // Without a session (the initialization) there is none to lose.
+        let refused = mended_response(asked.clone(), false, error(None)).err().expect("fails the request").to_string();
+        assert!(refused.contains(REFUSED_NO_REQUEST) && !refused.contains(ANSWERED_NO_REQUEST), "{refused}");
         // The answer to the request, and errors to what awaits none, go on.
-        assert!(mended_response(asked, error(Some(NumberOrString::Number(7)))).is_ok());
-        assert!(mended_response(None, error(None)).is_ok(), "a notification's");
-        assert!(matches!(mended_response(None, Ok(StreamableHttpPostResponse::Accepted)), Ok(StreamableHttpPostResponse::Accepted)));
+        assert!(mended_response(asked, true, error(Some(NumberOrString::Number(7)))).is_ok());
+        assert!(mended_response(None, true, error(None)).is_ok(), "a notification's");
+        assert!(matches!(mended_response(None, true, Ok(StreamableHttpPostResponse::Accepted)), Ok(StreamableHttpPostResponse::Accepted)));
     }
 
     #[test]

@@ -201,7 +201,10 @@ async fn a_slow_call_times_out_or_is_cancelled_and_the_server_is_told() {
         stopper.cancel();
     });
     let stopped = tool.call(json!({"ms":5000}), &cancel).await.unwrap_err();
-    assert_eq!(stopped.to_string(), "cancelled");
+    // Sent, it may have done its work all the same (seventeenth pass): said
+    // so, under the code a stop has.
+    assert!(stopped.to_string().starts_with("cancelled: slow__slow was sent"), "{stopped}");
+    assert!(stopped.to_string().contains("may still have taken effect"), "{stopped}");
     wait_for(&hub, "slow", |s| log_text(s).matches("cancelled").count() >= 2).await;
     // The connection still serves.
     assert_eq!(call(&hub, &config, "slow__echo", json!({"text":"x"})).await.unwrap()["text"], "echo: x");
@@ -256,7 +259,11 @@ async fn calls_to_a_server_that_stopped_reading_end_at_their_timeout() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         stop.cancel();
     });
-    assert_eq!(tool.call(json!({"text":"x"}), &stopper).await.unwrap_err().to_string(), "cancelled");
+    // Stopped while it waits to be sent ("cancelled": not sent), or once
+    // handed to the connection (the server may read it yet, so the stop
+    // says it may take effect).
+    let stopped = tool.call(json!({"text":"x"}), &stopper).await.unwrap_err().to_string();
+    assert!(stopped == "cancelled" || (stopped.starts_with("cancelled: stuck__echo") && stopped.contains("may still have taken effect")), "{stopped}");
     assert!(started.elapsed() < Duration::from_millis(900));
     // Closing it does not wait on the input it no longer reads: a second
     // for the input, the grace to exit, then the kill (on Windows the only
@@ -604,6 +611,32 @@ async fn a_missing_working_folder_is_named() {
     hub.shutdown().await;
 }
 
+/// MCP review, seventeenth pass: a failure was told with the last line the
+/// server ever wrote — that of a process gone before this attempt (its
+/// startup banner, its last words), beside a cause it had no part in.
+#[tokio::test]
+async fn a_failure_is_told_with_the_output_of_its_own_attempt() {
+    if node_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = fake("stale", &["crash"], &[]);
+    server.cwd = dir.path().display().to_string();
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "stale").await;
+    // Its folder gone, the server exits mid-call ("crashing on purpose").
+    drop(dir);
+    assert!(call(&hub, &config, "stale__crash", json!({})).await.is_err());
+    let failed = wait_for(&hub, "stale", |s| s["error"].as_str().is_some_and(|e| e.contains("작업 폴더"))).await;
+    let error = failed["error"].as_str().unwrap();
+    assert!(!error.contains("서버 출력"), "the reconnection started no process to speak: {error}");
+    // The process that crashed is still told with its own words.
+    assert!(log_text(&failed).contains("연결이 끊겼습니다 (서버 출력: crashing on purpose)"), "{}", log_text(&failed));
+    hub.shutdown().await;
+}
+
 #[tokio::test]
 async fn results_and_server_requests_outside_the_types_are_read_leniently() {
     if node_missing() {
@@ -936,6 +969,35 @@ impl Drop for HttpServer {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// MCP review, seventeenth pass: an error for no request (`"id": null`)
+/// answering the initialization — sent before there is a session — was told
+/// as a session the server no longer knows, "restarted maybe". A server that
+/// takes one initialization (a TypeScript-SDK server built on one transport)
+/// refuses the next so; so does one refusing a token or protocol version.
+#[tokio::test]
+async fn a_refused_initialization_is_not_told_as_a_lost_session() {
+    if node_missing() {
+        return;
+    }
+    let remote = HttpServer::start(&[("FAKE_MCP_SINGLE_INIT", "1")]);
+    let server = McpServer { name: "single".into(), url: remote.url.clone(), tools: vec!["echo".into()], ..Default::default() };
+    let hub = McpHub::default();
+    hub.apply(std::slice::from_ref(&server));
+    ready(&hub, "single").await;
+    // Reconnected, it is initialized again and refused at once.
+    let started = Instant::now();
+    assert!(hub.restart("single"));
+    let failed = wait_for(&hub, "single", |s| s["state"] == "failed").await;
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    let error = failed["error"].as_str().unwrap();
+    assert!(error.contains("Server already initialized"), "{error}");
+    assert!(!error.contains("세션을 더는 모릅니다"), "{error}");
+    hub.shutdown().await;
+    let checked = probe(&server, MODEL).await.unwrap();
+    let message = checked["message"].as_str().unwrap();
+    assert!(checked["ok"] == false && message.contains("Server already initialized") && !message.contains("세션을 더는 모릅니다"), "{checked:#}");
 }
 
 #[tokio::test]
@@ -1404,7 +1466,12 @@ async fn a_stopped_question_keeps_the_calls_it_made() {
     assert_eq!(result.unwrap().answer, "다음 답");
     let request = llm.requests().last().unwrap().clone();
     assert_eq!(tool_result(&request, "e1")["data"]["text"], "echo: 이슈 생성");
-    assert_eq!(tool_result(&request, "w1")["status"], "cancelled");
+    let slow = tool_result(&request, "w1");
+    assert_eq!((slow["status"].as_str(), slow["recovery"]["code"].as_str()), (Some("cancelled"), Some("cancelled")), "{slow}");
+    // MCP review, seventeenth pass: the next question is told the stopped
+    // call was sent and may have taken effect, not only "cancelled" (taken
+    // for no effect, asked again).
+    assert!(slow["error"].as_str().unwrap().contains("may still have taken effect"), "{slow}");
     app.mcp.shutdown().await;
 }
 
@@ -2005,6 +2072,11 @@ async fn slips_of_the_protocol_neither_hang_nor_end_the_session() {
         (r#"{"jsonrpc":"2.0","error":{"message":"no code"}}"#, Err("mcp_request_failed: no code (code -32603)")),
         (r#"{"jsonrpc":"2.0","error":{"code":"E1","message":"text code"}}"#, Err("mcp_request_failed: text code (code -32603)")),
         (r#"{"jsonrpc":"2.0","error":"just text"}"#, Err("mcp_request_failed: just text (code -32603)")),
+        // An error beside a null result (JSON-RPC 1.0 sends both, so does a
+        // Go struct without omitempty) is the error, not a null success.
+        (r#"{"jsonrpc":"2.0","result":null,"error":{"code":-32602,"message":"text must be short"}}"#, Err("invalid_tool_arguments: shape__echo refused the arguments: text must be short")),
+        (r#"{"result":null,"error":{"code":-32000,"message":"old style"}}"#, Err("mcp_request_failed: old style (code -32000)")),
+        (r#"{"result":{"content":[{"type":"text","text":"no error"}]},"error":null}"#, Ok("no error")),
     ];
     for mode in ["stdio", "sse"] {
         let remote;
@@ -2402,6 +2474,42 @@ async fn a_server_without_tools_is_connected_with_none() {
     // The connection check says so too.
     let checked = probe(&config.mcp_servers[0], MODEL).await.unwrap();
     assert_eq!((checked["ok"].as_bool(), checked["tools"].as_array().map(Vec::len)), (Some(true), Some(0)), "{checked:#}");
+}
+
+/// MCP review, seventeenth pass: an error beside a null result (JSON-RPC
+/// 1.0 sends both, so does a Go struct without omitempty) was read as a
+/// success with a null result. A tool list refused so (a token expired)
+/// connected the server as one without tools, its cause unsaid; a call
+/// refused so lost the server's words for "an unexpected response".
+#[tokio::test]
+async fn an_error_beside_a_null_result_is_the_error() {
+    if node_missing() {
+        return;
+    }
+    for (mode, shape) in [
+        ("2.0", r#"{"jsonrpc":"2.0","result":null,"error":{"code":-32001,"message":"token expired"}}"#),
+        ("1.0", r#"{"result":null,"error":{"code":-32001,"message":"token expired"}}"#),
+    ] {
+        let server = fake("sloppy", &["*"], &[("FAKE_MCP_LIST_SHAPE", shape)]);
+        let hub = McpHub::default();
+        hub.apply(std::slice::from_ref(&server));
+        let status = wait_for(&hub, "sloppy", |s| s["state"] == "failed").await;
+        assert!(status["error"].as_str().unwrap().contains("token expired"), "{mode}: {status:#}");
+        hub.shutdown().await;
+        let checked = probe(&server, MODEL).await.unwrap();
+        assert_eq!(checked["ok"], false, "{mode}: {checked:#}");
+        let message = checked["message"].as_str().unwrap();
+        assert!(message.starts_with("도구 목록을 받지 못했습니다: ") && message.contains("token expired"), "{mode}: {checked:#}");
+    }
+    // A null result without an error: connected, its log saying why it
+    // shows no tools.
+    let server = fake("sloppy", &["*"], &[("FAKE_MCP_LIST_SHAPE", r#"{"jsonrpc":"2.0","result":null}"#)]);
+    let hub = McpHub::default();
+    hub.apply(std::slice::from_ref(&server));
+    let status = ready(&hub, "sloppy").await;
+    assert_eq!(status["tools"], json!([]));
+    assert!(log_text(&status).contains("도구 배열(tools)이 없어"), "{}", log_text(&status));
+    hub.shutdown().await;
 }
 
 /// MCP review, sixteenth pass: a tool's own failure text was cut to 4,000

@@ -1285,7 +1285,7 @@ async fn execute_batch(
                         let outcome = tool.call(args, &cancel).await;
                         let status = match &outcome {
                             Ok(_) => "ok",
-                            Err(e) if e.to_string() == "cancelled" => "cancelled",
+                            Err(e) if tools::recovery::error_code(&e.to_string()) == "cancelled" => "cancelled",
                             Err(_) => "error",
                         };
                         events.send(json!({"type":"tool_done","id":id,"name":name,"status":status,"ms":started.elapsed().as_millis() as u64}));

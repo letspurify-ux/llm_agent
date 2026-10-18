@@ -309,6 +309,11 @@ struct State {
     /// the lock, not copied in it.
     tools: Vec<Arc<RemoteTool>>,
     log: VecDeque<Value>,
+    /// Lines ever logged, and how many there were when the process of this
+    /// attempt started: a failure is told with its own output, not with the
+    /// last words of a process gone before it.
+    logged: u64,
+    output_from: u64,
     stats: BTreeMap<String, ToolStats>,
 }
 
@@ -354,6 +359,8 @@ impl Slot {
                 info: Value::Null,
                 tools: vec![],
                 log: VecDeque::new(),
+                logged: 0,
+                output_from: 0,
                 stats: BTreeMap::new(),
             }),
             task: Mutex::new(None),
@@ -379,6 +386,7 @@ impl Slot {
             state.log.pop_front();
         }
         state.log.push_back(json!({"at":now(),"source":source,"text":text}));
+        state.logged += 1;
     }
 
     fn set_phase(&self, phase: Phase, error: Option<String>) {
@@ -410,12 +418,15 @@ impl Slot {
         }
     }
 
-    /// The last stderr line, to explain a failure.
+    /// The last stderr line of this attempt's process, to explain a failure.
     fn last_output(&self) -> Option<String> {
-        self.state()
+        let state = self.state();
+        let own = state.logged.saturating_sub(state.output_from).min(state.log.len() as u64) as usize;
+        state
             .log
             .iter()
             .rev()
+            .take(own)
             .find(|line| line["source"] == "stderr")
             .and_then(|line| line["text"].as_str().map(str::to_owned))
     }
@@ -453,7 +464,7 @@ impl Slot {
         stats.last_at = Some(now());
         match outcome {
             Ok(_) => {}
-            Err(error) if error.to_string() == "cancelled" => stats.cancelled += 1,
+            Err(error) if crate::tools::recovery::error_code(&error.to_string()) == "cancelled" => stats.cancelled += 1,
             Err(error) => {
                 stats.failures += 1;
                 stats.last_error = Some(error.to_string().chars().take(LOG_LINE_CHARS).collect());
@@ -724,9 +735,13 @@ impl Offered {
                 ServerResult::InputRequiredResult(_) => bail!("mcp_request_failed: {} asked for user input, which this agent cannot give", self.exposed),
                 _ => bail!("mcp_request_failed: {} sent an unexpected response", self.exposed),
             },
+            // Sent, the call may have done its work before the server read the
+            // notice (an issue filed): said so, or the next question takes
+            // the stop for no effect and asks again. (A call stopped while
+            // it waited to be sent was not sent.)
             _ = cancel.cancelled() => {
                 tell("cancelled");
-                bail!("cancelled")
+                bail!("cancelled: {} was sent and the server told to stop; it may still have taken effect on the server", self.exposed)
             }
             _ = overdue => {
                 tell("request timeout");
@@ -1320,6 +1335,9 @@ fn explain<E: std::error::Error + std::fmt::Debug>(error: &E) -> String {
     // server's text, which may say anything ("HTTP 404" in a fetched page).
     let cause = if debug.contains(wire::ANSWERED_NO_REQUEST) {
         Some("서버가 이 세션을 더는 모릅니다(서버가 다시 시작되었을 수 있습니다)".to_owned())
+    } else if debug.contains(wire::REFUSED_NO_REQUEST) {
+        // Before a session (the initialization): what the server says is why.
+        Some("서버가 요청을 거절했습니다(뒤의 서버 문구를 확인하세요)".to_owned())
     } else if unreadable(error) {
         Some("서버 응답을 JSON-RPC 메시지로 읽지 못했습니다(서버의 응답 형식을 확인하세요)".to_owned())
     } else if debug.contains("InvalidCertificate") || debug.contains("certificate is not trusted") || debug.contains("UnknownIssuer") {
@@ -1390,9 +1408,10 @@ fn connection_lost(error: &ServiceError) -> bool {
         return false;
     }
     let debug = format!("{error:?}");
-    // A session the server no longer knows; the rest of the text is the
+    // A session the server no longer knows, or (a server without sessions)
+    // a request refused for no request: the rest of the text is the
     // server's own, no status to read in it.
-    if debug.contains(wire::ANSWERED_NO_REQUEST) {
+    if debug.contains(wire::ANSWERED_NO_REQUEST) || debug.contains(wire::REFUSED_NO_REQUEST) {
         return true;
     }
     let refused = |status: u16| status == 429 || (500..600).contains(&status) || REQUEST_REFUSALS.contains(&status);
@@ -1493,7 +1512,12 @@ async fn list_tools(peer: &Peer<RoleClient>, server: &str, previous: &[Arc<Remot
             }
             Err(e) => bail!("{}", explain(&e)),
         };
-        raw.extend(listed["tools"].as_array().cloned().unwrap_or_default());
+        // A page without its list (a null result) is no list of no tools:
+        // the admin is told why the server shows none.
+        match listed["tools"].as_array() {
+            Some(tools) => raw.extend(tools.iter().cloned()),
+            None => notes.push(format!("도구 목록 응답({page}쪽)에 도구 배열(tools)이 없어 그 쪽의 도구를 받지 못했습니다: {}", clipped(&json!(listed.to_string()), MAX_LABEL_CHARS).as_str().unwrap_or_default())),
+        }
         // Past the tools kept, the pages after are not read (each may be
         // as large as a message).
         if raw.len() > MAX_TOOLS {
@@ -1686,6 +1710,12 @@ fn environment(server: &McpServer) -> Result<Vec<(String, std::ffi::OsString)>> 
 
 fn spawn(slot: &Arc<Slot>, server: &McpServer) -> Result<ChildTransport> {
     use process_wrap::tokio::{CommandWrap, KillOnDrop};
+    // What the server writes from here on is this attempt's (it may not
+    // even start).
+    {
+        let mut state = slot.state();
+        state.output_from = state.logged;
+    }
     let program = server.command.trim();
     let path = std::path::Path::new(program);
     let environment = environment(server)?;
@@ -1918,7 +1948,8 @@ pub async fn probe(server: &McpServer, model: &str) -> Result<Value> {
     let slot = Slot::new(server.clone());
     let outcome = tokio::time::timeout(Duration::from_secs(CONNECT_SECS), async {
         let connection = connect(&slot, server).await?;
-        let listed = list_tools(&connection.peer, &server.name, &[]).await.map(|listed| {
+        // Said as the supervisor says it: which step failed.
+        let listed = list_tools(&connection.peer, &server.name, &[]).await.map_err(|e| anyhow!("도구 목록을 받지 못했습니다: {e:#}")).map(|listed| {
             for note in &listed.notes {
                 slot.log("event", note);
             }
