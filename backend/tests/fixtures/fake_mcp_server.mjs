@@ -75,6 +75,9 @@ if (env.FAKE_MCP_WEDGE) tools.push({ name: 'wedge', description: 'Stop answering
 // A helper started outside the server's process group (as a daemon is),
 // keeping the server's stderr: it writes there until it is killed.
 if (env.FAKE_MCP_DETACHED) tools.push({ name: 'spawn_detached', description: 'Start a helper outside the process group that writes to stderr; return its pid.', inputSchema: { type: 'object' } });
+// HTTP: a call whose event stream ends before its answer (a proxy's idle
+// timeout cutting a long call), the session fine.
+if (env.FAKE_MCP_CUT) tools.push({ name: 'cut_stream', description: 'End the event stream of the call before its answer.', inputSchema: { type: 'object', properties: { ms: { type: 'integer' } } } });
 if (env.FAKE_MCP_DUPLICATE) tools.push({ name: 'echo', description: 'A second echo.', inputSchema: { type: 'object' } });
 for (let i = 0; i < Number(env.FAKE_MCP_MANY_BAD || 0); i++) tools.push({ name: `bad_${i}`, description: 'a schema that is a string', inputSchema: 'nope' });
 if (env.FAKE_MCP_BAD_LIST) tools.push({ name: 'no_schema', description: 'A tool without inputSchema.' }, { name: 'string_schema', description: 'A tool whose schema is a string.', inputSchema: 'nope' });
@@ -139,7 +142,10 @@ async function handle(message, notify) {
       // JSON then holds a lone surrogate escape.
       // "bad bytes": a byte that is not UTF-8 in the text (stdio only).
       // "shape:{...}": that message as the answer, its id unless it has one.
+      // "raw:...": that text as the answer, as it is, @ID@ its id (JSON
+      // that JSON.stringify would not write: NaN, 1e999, deep nesting).
       case 'echo':
+        if (String(args.text).startsWith('raw:')) return { raw: args.text.slice(4).replaceAll('@ID@', JSON.stringify(id)) };
         if (String(args.text).startsWith('shape:')) return { id, ...JSON.parse(args.text.slice(6)) }; return result(id, { content: [text(args.text === 'cut emoji' ? '잘림 😀'.slice(0, 4) : args.text === 'bad bytes' ? 'raw <0xFF> byte' : `echo: ${args.text}`)] });
       case 'add': { const sum = args.a + args.b; return result(id, { content: [text(JSON.stringify({ sum }))], structuredContent: { sum } }); }
       case 'structured_only': return result(id, { content: [], structuredContent: { ok: true, items: [1, 2] } });
@@ -178,6 +184,8 @@ async function handle(message, notify) {
       case 'wedge': wedged = true; return new Promise(() => {});
       case 'forget': forgotten = true; return result(id, { content: [text('forgot the session')] });
       case 'extra': return result(id, { content: [text('extra ran')] });
+      // Its stream is open from the start (see the HTTP server); hold: never ends.
+      case 'cut_stream': await new Promise(resolve => setTimeout(resolve, args.ms ?? 0)); return args.hold ? new Promise(() => {}) : { cut: true };
       case 'history': return result(id, { content: [text('the server history ran')] });
       case 'strict': return args.x ? result(id, { content: [text('ok')] }) : failure(id, -32602, 'x is required');
       case 'headers': return result(id, { content: [text(headersSeen.authorization ?? '<none>')] });
@@ -251,16 +259,20 @@ if (httpMode) {
         return;
       }
       const notes = [];
+      // A stream opened before the answer, as a server streaming a long call does.
+      if (env.FAKE_MCP_SSE && message.params?.name === 'cut_stream') res.writeHead(200, { 'Content-Type': 'text/event-stream' }).flushHeaders();
       const answer = await handle(message, note => notes.push(note));
+      if (answer?.cut) { res.end(); return; }
       if (answer === null) { res.writeHead(202).end(); return; }
       const headers = { 'Content-Type': env.FAKE_MCP_SSE ? 'text/event-stream' : 'application/json' };
       if (message.method === 'initialize' && !env.FAKE_MCP_STATELESS) headers['Mcp-Session-Id'] = session;
       res.writeHead(200, headers);
+      const written = answer.raw ?? JSON.stringify(answer);
       if (env.FAKE_MCP_SSE) {
         for (const note of notes) res.write(`event: message\ndata: ${JSON.stringify(note)}\n\n`);
-        res.end(`event: message\ndata: ${JSON.stringify(answer)}\n\n`);
+        res.end(`event: message\ndata: ${written}\n\n`);
       } else {
-        res.end(JSON.stringify(answer));
+        res.end(written);
       }
     });
   });
@@ -279,7 +291,7 @@ if (httpMode) {
   const end = env.FAKE_MCP_WINDOWS ? '\r\n' : '\n';
   const send = message => {
     if (env.FAKE_MCP_GARBAGE) process.stdout.write('this is not json\n');
-    const [before, after] = `${bom}${JSON.stringify(message)}${end}`.split('<0xFF>');
+    const [before, after] = `${bom}${message.raw ?? JSON.stringify(message)}${end}`.split('<0xFF>');
     process.stdout.write(after === undefined ? before : Buffer.concat([Buffer.from(before), Buffer.from([0xff]), Buffer.from(after)]));
     bom = '';
   };

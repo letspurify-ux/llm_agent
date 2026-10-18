@@ -6,6 +6,12 @@
 //!   refuses: it becomes U+FFFD, as does a byte that is not UTF-8;
 //! - a message without `"jsonrpc":"2.0"`, or with an error that is not
 //!   `{code, message}`, is put right (the error keeps its text);
+//! - a number JSON cannot write becomes null (`NaN`, `Infinity` — Python's
+//!   `json.dumps` writes them; JavaScript and pydantic write null), or a
+//!   string of its digits past a double's range; an answer the parser still refuses
+//!   (nested past its 128 levels, a trailing comma) becomes an error
+//!   answering its request, and one without a result (a JavaScript handler
+//!   that returned `undefined`) has a null one;
 //! - an HTTP error that answers no request (`"id": null`, a session the
 //!   server no longer knows) fails that request, rather than leave it
 //!   waiting for an answer that never comes.
@@ -26,32 +32,90 @@ use std::{collections::HashMap, sync::Arc};
 pub fn mend(json: &[u8]) -> Option<Vec<u8>> {
     let escaped = escapes_mended(json);
     let text = escaped.as_deref().unwrap_or(json);
-    put_right(text).or(escaped)
+    match serde_json::from_slice::<Head>(text) {
+        Ok(head) => put_right(text, &head),
+        Err(error) => readable(text, error),
+    }
+    .or(escaped)
 }
 
-/// The top of a message: its version and error, the rest skipped unread.
+/// The top of a message: its version, ID and error, the rest skipped unread.
 #[derive(serde::Deserialize)]
 struct Head {
     #[serde(default)]
     jsonrpc: Value,
     #[serde(default)]
+    id: Value,
+    #[serde(default)]
     error: Value,
     /// `Some(None)`: there, and null.
     #[serde(default, deserialize_with = "present")]
-    result: Option<Option<serde::de::IgnoredAny>>,
+    result: Option<Option<Skipped>>,
     method: Option<serde::de::IgnoredAny>,
 }
 
 /// A field that is there, null or not.
-fn present<'de, D: serde::Deserializer<'de>>(field: D) -> Result<Option<Option<serde::de::IgnoredAny>>, D::Error> {
+fn present<'de, D: serde::Deserializer<'de>>(field: D) -> Result<Option<Option<Skipped>>, D::Error> {
     serde::Deserialize::deserialize(field).map(Some)
+}
+
+/// A value skipped as the SDK reads it: its numbers made doubles and its
+/// nesting counted, so that a number past a double's range or nesting past
+/// the parser's 128 levels fails here as there. (`IgnoredAny` passes both.)
+struct Skipped;
+
+impl<'de> serde::Deserialize<'de> for Skipped {
+    fn deserialize<D: serde::Deserializer<'de>>(value: D) -> Result<Self, D::Error> {
+        value.deserialize_any(Skipped)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Skipped {
+    type Value = Skipped;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Skipped, E> {
+        Ok(Skipped)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Skipped, E> {
+        Ok(Skipped)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Skipped, E> {
+        Ok(Skipped)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Skipped, E> {
+        Ok(Skipped)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Skipped, E> {
+        Ok(Skipped)
+    }
+    fn visit_unit<E>(self) -> Result<Skipped, E> {
+        Ok(Skipped)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut items: A) -> Result<Skipped, A::Error> {
+        while items.next_element::<Skipped>()?.is_some() {}
+        Ok(Skipped)
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut fields: A) -> Result<Skipped, A::Error> {
+        while fields.next_entry::<serde::de::IgnoredAny, Skipped>()?.is_some() {}
+        Ok(Skipped)
+    }
 }
 
 /// The message with its version and error as JSON-RPC has them, when either
 /// is not. Only such a message is read whole.
-fn put_right(text: &[u8]) -> Option<Vec<u8>> {
-    let head: Head = serde_json::from_slice(text).ok()?;
-    if !matches!(head.result, Some(Some(_))) && head.method.is_none() && head.error.is_null() {
+fn put_right(text: &[u8], head: &Head) -> Option<Vec<u8>> {
+    // An answer without a result: what JSON.stringify writes of a JavaScript
+    // handler's `undefined`. The SDK took it for no message (the call waited
+    // out its timeout over stdio, the session ended over SSE); a null result
+    // is read as an unexpected answer by a call, and as no tools by a list.
+    let resultless = head.jsonrpc == "2.0"
+        && (head.id.is_number() || head.id.is_string())
+        && head.result.is_none()
+        && head.method.is_none()
+        && head.error.is_null();
+    if !matches!(head.result, Some(Some(_))) && head.method.is_none() && head.error.is_null() && !resultless {
         return None;
     }
     // The SDK reads a code as a 32-bit integer: one past it, or written as a
@@ -65,13 +129,17 @@ fn put_right(text: &[u8]) -> Option<Vec<u8>> {
     // struct without omitempty) reads as a success with a null result, the
     // error lost: a tool list refused would be a list without tools.
     let null_result = !head.error.is_null() && matches!(head.result, Some(None));
-    if head.jsonrpc == "2.0" && error_ok && !null_result {
+    if head.jsonrpc == "2.0" && error_ok && !null_result && !resultless {
         return None;
     }
     let mut message: serde_json::Map<String, Value> = serde_json::from_slice(text).ok()?;
     message.insert("jsonrpc".into(), json!("2.0"));
     if null_result {
         message.remove("result");
+    }
+    if resultless {
+        message.remove("error");
+        message.insert("result".into(), Value::Null);
     }
     if !error_ok {
         let error = &head.error;
@@ -83,6 +151,122 @@ fn put_right(text: &[u8]) -> Option<Vec<u8>> {
         message.insert("error".into(), fixed);
     }
     serde_json::to_vec(&message).ok()
+}
+
+/// A message the parser refuses, read as far as it can be. A number JSON
+/// cannot write becomes null (`NaN`, `Infinity`), or a string of its digits
+/// (past a double's range: an integer of 400 digits). An answer still refused (nested past the parser's 128 levels, a
+/// trailing comma) becomes an error answering its request: the SDK dropped
+/// it, and the call waited out its timeout over stdio, or the session ended
+/// over SSE — with every other conversation's call on it. What is no
+/// message (a line of text) is left as it is.
+fn readable(text: &[u8], error: serde_json::Error) -> Option<Vec<u8>> {
+    // A line cut short (a server that died writing it) is left to the
+    // connection's end, which says so.
+    if error.classify() != serde_json::error::Category::Syntax {
+        return None;
+    }
+    let scan = Scan::of(text).filter(|scan| scan.answer || scan.method)?;
+    let mut error = error;
+    if !scan.unwritable.is_empty() {
+        let mut nulled = Vec::with_capacity(text.len());
+        let mut copied = 0;
+        for token in &scan.unwritable {
+            nulled.extend_from_slice(&text[copied..token.start]);
+            let digits = text[token.start..token.end].iter().find(|b| **b != b'-').is_some_and(u8::is_ascii_digit);
+            if digits {
+                nulled.push(b'"');
+                nulled.extend_from_slice(&text[token.clone()]);
+                nulled.push(b'"');
+            } else {
+                nulled.extend_from_slice(b"null");
+            }
+            copied = token.end;
+        }
+        nulled.extend_from_slice(&text[copied..]);
+        match serde_json::from_slice::<Head>(&nulled) {
+            Ok(head) => return put_right(&nulled, &head).or(Some(nulled)),
+            Err(again) => error = again,
+        }
+    }
+    let id = scan.id.filter(|_| scan.answer && !scan.method)?;
+    let message = format!("the server answered, but its answer could not be read as JSON ({error})");
+    serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"error":{"code":-32700,"message":message}})).ok()
+}
+
+/// What a message the parser refuses shows of itself, read token by token.
+#[derive(Default)]
+struct Scan {
+    /// The request it names (a number or a string).
+    id: Option<Value>,
+    /// It has a `result` or an `error`: an answer.
+    answer: bool,
+    method: bool,
+    /// The numbers JSON cannot write, outside strings.
+    unwritable: Vec<std::ops::Range<usize>>,
+}
+
+impl Scan {
+    /// None unless the text is an object.
+    fn of(text: &[u8]) -> Option<Self> {
+        let first = text.iter().position(|b| !b.is_ascii_whitespace())?;
+        if text[first] != b'{' {
+            return None;
+        }
+        let mut scan = Scan::default();
+        let mut depth = 0usize;
+        // The top-level key whose value is being read.
+        let mut key: &[u8] = b"";
+        let mut at = first;
+        while at < text.len() {
+            match text[at] {
+                b'"' => {
+                    let end = string_end(text, at);
+                    if depth == 1 && text[end..].iter().find(|b| !b.is_ascii_whitespace()) == Some(&b':') {
+                        // Followed by a colon, the string was closed before it.
+                        key = &text[at + 1..end - 1];
+                        scan.answer |= matches!(key, b"result" | b"error");
+                        scan.method |= key == b"method";
+                    } else if depth == 1 && key == b"id" {
+                        scan.id = serde_json::from_slice(&text[at..end]).ok();
+                    }
+                    at = end;
+                    continue;
+                }
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => depth = depth.saturating_sub(1),
+                b if b.is_ascii_alphanumeric() || b == b'-' || b == b'+' => {
+                    let end = at + text[at..].iter().take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'.')).count();
+                    let token = &text[at..end];
+                    // Rust reads NaN, Infinity and 1e999 as doubles that are not finite.
+                    match std::str::from_utf8(token).ok().and_then(|t| t.parse::<f64>().ok()) {
+                        Some(number) if !number.is_finite() => scan.unwritable.push(at..end),
+                        Some(_) if depth == 1 && key == b"id" => scan.id = serde_json::from_slice(token).ok(),
+                        _ => {}
+                    }
+                    at = end;
+                    continue;
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        Some(scan)
+    }
+}
+
+/// Where the string starting at `at` ends: past its closing quote, or at
+/// the end of the text.
+fn string_end(text: &[u8], at: usize) -> usize {
+    let mut i = at + 1;
+    while i < text.len() {
+        match text[i] {
+            b'\\' => i += 2,
+            b'"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    text.len()
 }
 
 /// JSON text with each escape of a lone surrogate replaced by `\ufffd`, and
@@ -359,6 +543,131 @@ mod tests {
         assert!(mended_response(asked, true, error(Some(NumberOrString::Number(7)))).is_ok());
         assert!(mended_response(None, true, error(None)).is_ok(), "a notification's");
         assert!(matches!(mended_response(None, true, Ok(StreamableHttpPostResponse::Accepted)), Ok(StreamableHttpPostResponse::Accepted)));
+    }
+
+    /// Twenty-fourth pass: over stdio the SDK dropped these answers and the
+    /// call waited out its timeout; over SSE they ended the session.
+    #[test]
+    fn answers_json_cannot_hold_still_answer_their_request() {
+        let fixed = |text: &str| -> Value {
+            let mended = mend(text.as_bytes()).unwrap_or_else(|| panic!("{text}"));
+            assert!(serde_json::from_slice::<ServerJsonRpcMessage>(&mended).is_ok(), "the SDK reads it: {}", String::from_utf8_lossy(&mended));
+            serde_json::from_slice(&mended).unwrap()
+        };
+        // Python's json.dumps writes NaN and Infinity; a double ends near 1.8e308.
+        assert_eq!(
+            fixed(r#"{"jsonrpc":"2.0","id":1,"result":{"a":NaN,"b":[Infinity,-Infinity,1e999,-2E400],"c":"NaN, 1e999 stay text","d":1.5e300,"e":true}}"#),
+            json!({"jsonrpc":"2.0","id":1,"result":{"a":null,"b":[null,null,"1e999","-2E400"],"c":"NaN, 1e999 stay text","d":1.5e300,"e":true}})
+        );
+        // Python writes an integer of any size: factorial(200) has 375 digits.
+        let factorial = format!("78865786{}", "0".repeat(367));
+        assert_eq!(fixed(&format!(r#"{{"jsonrpc":"2.0","id":4,"result":{{"n":{factorial}}}}}"#))["result"]["n"], json!(factorial));
+        assert_eq!(fixed(r#"{"id":"x","result":{"v":NaN}}"#), json!({"jsonrpc":"2.0","id":"x","result":{"v":null}}), "put right as well");
+        assert_eq!(fixed(r#"{"jsonrpc":"2.0","id":2,"method":"sampling/createMessage","params":{"t":NaN}}"#)["params"]["t"], Value::Null, "a request too");
+        // Nested past the parser's 128 levels, a trailing comma: an error
+        // answering the request it names.
+        let deep = format!(r#"{{"jsonrpc":"2.0","result":{{"v":{}1{}}},"id":7}}"#, "[".repeat(200), "]".repeat(200));
+        let answered = fixed(&deep);
+        assert_eq!((answered["id"].clone(), answered["error"]["code"].clone()), (json!(7), json!(-32700)), "{answered}");
+        assert!(answered["error"]["message"].as_str().unwrap().contains("recursion limit exceeded"), "{answered}");
+        let answered = fixed(r#"{"jsonrpc":"2.0","id":"a\"b","result":{"v":NaN,"w":[1,]}}"#);
+        assert_eq!((answered["id"].clone(), answered["error"]["code"].clone()), (json!("a\"b"), json!(-32700)), "{answered}");
+        // Without a result (JavaScript's undefined): a null one.
+        assert_eq!(fixed(r#"{"jsonrpc":"2.0","id":3}"#), json!({"jsonrpc":"2.0","id":3,"result":null}));
+        assert_eq!(fixed(r#"{"jsonrpc":"2.0","id":"q","error":null}"#), json!({"jsonrpc":"2.0","id":"q","result":null}));
+        // No answer to a request: left as it is.
+        for line in [
+            "starting up (not json)",
+            r#"{"level":"info","id":3}"#,
+            r#"{"msg":"a log line","v":NaN}"#,
+            r#"{"jsonrpc":"2.0","id":null}"#,
+            r#"{"jsonrpc":"2.0","method":"x","params":[1,]}"#,
+            r#"{"jsonrpc":"2.0","id":{"x":1},"result":[1,]}"#,
+            "{", "{\"", "\"", "", "{\"id\":",
+            // Cut short: the server died writing it.
+            r#"{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"cut"#,
+        ] {
+            assert!(mend(line.as_bytes()).is_none(), "{line}");
+        }
+    }
+
+    /// Around the parser's nesting limit and a double's range, an answer is
+    /// left as it is exactly when the SDK reads it, and mended into one it
+    /// reads otherwise.
+    #[test]
+    fn the_sdk_reads_each_answer_as_it_is_or_mended() {
+        let sdk = |text: &[u8]| serde_json::from_slice::<ServerJsonRpcMessage>(text).is_ok();
+        let mut answers: Vec<String> = (100..160)
+            .flat_map(|depth| {
+                [
+                    format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"v":{}1{}}}}}"#, "[".repeat(depth), "]".repeat(depth)),
+                    format!(r#"{{"jsonrpc":"2.0","id":1,"result":{}{}}}"#, r#"{"a":"#.repeat(depth), "}".repeat(depth)),
+                    format!(r#"{{"jsonrpc":"2.0","id":1,"error":{{"code":1,"message":"m","data":{}1{}}}}}"#, "[".repeat(depth), "]".repeat(depth)),
+                ]
+            })
+            .collect();
+        answers.extend((300..320).map(|digits| format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"n":1{}}}}}"#, "0".repeat(digits))));
+        answers.extend((300..320).map(|exponent| format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"n":-1.7e{exponent}}}}}"#)));
+        for answer in answers {
+            match mend(answer.as_bytes()) {
+                None => assert!(sdk(answer.as_bytes()), "left as it is, unread: {answer}"),
+                Some(mended) => assert!(!sdk(answer.as_bytes()) && sdk(&mended), "mended: {answer}"),
+            }
+        }
+    }
+
+    /// Answers built of whole values, some numbers JSON cannot write among
+    /// them: mended, each reads as the value with those numbers null (or
+    /// their digits), its strings as they were; without one it is left as
+    /// it is.
+    #[test]
+    fn random_unwritable_numbers_become_null_and_nothing_else_changes() {
+        use rand::{Rng, SeedableRng};
+        fn value(rng: &mut rand::rngs::StdRng, depth: usize, unwritable: &mut bool) -> (String, Value) {
+            let texts = [("NaN", "NaN"), (r#"\"Infinity\""#, "\"Infinity\""), (r"\\", "\\"), ("1e999", "1e999"), ("가", "가"), ("{[:,", "{[:,"), (r"A", "A")];
+            match rng.gen_range(0..if depth > 3 { 4 } else { 6 }) {
+                0 => {
+                    *unwritable = true;
+                    let token = ["NaN", "Infinity", "-Infinity", "1e999", "-2E400"][rng.gen_range(0..5)];
+                    (token.to_owned(), if token.contains('e') || token.contains('E') { json!(token) } else { Value::Null })
+                }
+                1 => {
+                    let n: i64 = rng.gen_range(-1_000_000..1_000_000);
+                    (n.to_string(), json!(n))
+                }
+                2 => {
+                    let parts: Vec<(&str, &str)> = (0..rng.gen_range(0..4)).map(|_| texts[rng.gen_range(0..texts.len())]).collect();
+                    (format!("\"{}\"", parts.iter().map(|p| p.0).collect::<String>()), json!(parts.iter().map(|p| p.1).collect::<String>()))
+                }
+                3 => {
+                    let (raw, read) = [("true", json!(true)), ("null", Value::Null), ("1.5e300", json!(1.5e300))][rng.gen_range(0..3)].clone();
+                    (raw.to_owned(), read)
+                }
+                4 => {
+                    let items: Vec<(String, Value)> = (0..rng.gen_range(0..4)).map(|_| value(rng, depth + 1, unwritable)).collect();
+                    (format!("[{}]", items.iter().map(|i| i.0.as_str()).collect::<Vec<_>>().join(",")), Value::Array(items.into_iter().map(|i| i.1).collect()))
+                }
+                _ => {
+                    let fields: Vec<(String, (String, Value))> = (0..rng.gen_range(0..4)).map(|i| (format!("k{i}"), value(rng, depth + 1, unwritable))).collect();
+                    let raw = fields.iter().map(|(k, (raw, _))| format!("\"{k}\": {raw}")).collect::<Vec<_>>().join(", ");
+                    (format!("{{{raw}}}"), Value::Object(fields.into_iter().map(|(k, (_, v))| (k, v)).collect()))
+                }
+            }
+        }
+        let mut rng = rand::rngs::StdRng::seed_from_u64(24);
+        for round in 0..20_000 {
+            let mut unwritable = false;
+            let (raw, expected) = value(&mut rng, 0, &mut unwritable);
+            let text = format!(r#"{{"jsonrpc":"2.0","id":{round},"result":{{"v":{raw}}}}}"#);
+            match mend(text.as_bytes()) {
+                Some(mended) => {
+                    assert!(unwritable, "{text}");
+                    let read: Value = serde_json::from_slice(&mended).unwrap_or_else(|e| panic!("{text}: {e}"));
+                    assert_eq!((&read["id"], &read["result"]["v"]), (&json!(round), &expected), "{text}");
+                }
+                None => assert!(!unwritable, "{text}"),
+            }
+        }
     }
 
     #[test]

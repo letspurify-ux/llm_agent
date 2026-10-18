@@ -563,13 +563,14 @@ impl Drop for Unanswered {
     }
 }
 
-/// After a call on this connection timed out: a server that does not answer
-/// a ping either has stopped (a handler deadlocked, its input no longer
-/// read, a session it lost answered to no request). It is reconnected,
-/// rather than shown ready while every call waits out its timeout. Any
-/// answer, an error too, says it is alive — and so does an answer to
-/// another call while the ping waits.
-fn check_alive(slot: &Arc<Slot>, peer: &Peer<RoleClient>, link: &Arc<Link>, timeout: Duration) {
+/// After a call on this connection timed out, or lost its answer: a server
+/// that does not answer a ping either has stopped (a handler deadlocked, its
+/// input no longer read, a session it lost answered to no request, the
+/// server gone). It is reconnected, rather than shown ready while every
+/// call waits out its timeout. Any answer, an error too, says it is alive —
+/// and so does an answer to another call while the ping waits. `why` starts
+/// the log line.
+fn check_alive(slot: &Arc<Slot>, peer: &Peer<RoleClient>, link: &Arc<Link>, why: String) {
     use std::sync::atomic::Ordering;
     if slot.pinging.swap(true, Ordering::AcqRel) {
         return;
@@ -588,10 +589,8 @@ fn check_alive(slot: &Arc<Slot>, peer: &Peer<RoleClient>, link: &Arc<Link>, time
             let mut state = slot.state();
             // Still this connection: a newer one is not told for an older.
             if state.link.as_ref().is_some_and(|current| Arc::ptr_eq(current, &link)) {
-                state.transport_error = Some(format!(
-                    "호출이 {}초 한도를 넘었고, 살아 있는지 묻는 ping에도 {PING_SECS}초 안에 답하지 않아 서버가 멈춘 것으로 보고 다시 연결합니다",
-                    timeout.as_secs()
-                ));
+                state.transport_error =
+                    Some(format!("{why}, 살아 있는지 묻는 ping에도 {PING_SECS}초 안에 답하지 않아 서버가 멈춘 것으로 보고 다시 연결합니다"));
                 drop(state);
                 link.broken.notify_one();
             }
@@ -856,7 +855,7 @@ impl Offered {
             link.answered();
         }
         if matches!(error, ServiceError::Timeout { .. }) {
-            check_alive(slot, peer, link, self.timeout);
+            check_alive(slot, peer, link, format!("호출이 {}초 한도를 넘었고", self.timeout.as_secs()));
         }
         match error {
             ServiceError::McpError(e) if e.code == ErrorCode::INVALID_PARAMS => {
@@ -876,14 +875,38 @@ impl Offered {
             ServiceError::TransportClosed | ServiceError::TransportSend(_) => {
                 let shown = explain(&error);
                 let detail = for_model(&shown);
+                // An HTTP connection carries its calls through a limit (stdio's
+                // none).
+                let http = link.calls.is_some();
+                // Over HTTP the event stream of one call may close before
+                // its answer while the session goes on — a proxy's idle
+                // timeout cutting a long call; the SDK fails that request
+                // alone so. Made again, the session ended every other
+                // conversation's call on it: the server is asked whether it
+                // still answers instead, and one gone is reconnected. (Over
+                // stdio this is the process gone, its end the supervisor's to see.)
+                if sent && http && matches!(error, ServiceError::TransportClosed) {
+                    check_alive(slot, peer, link, "호출의 답이 오기 전에 연결이 끊겼고".to_owned());
+                    return anyhow!(
+                        "mcp_request_failed: the connection to MCP server {} closed before {} answered ({detail}); it may have taken effect on the server",
+                        self.server,
+                        self.exposed
+                    );
+                }
                 if connection_lost(&error) {
                     slot.state().transport_error = Some(format!("호출이 서버에 닿지 못해 다시 연결합니다: {shown}"));
                     link.broken.notify_one();
                     // Closed with the call on the server (the connection made
                     // again for another conversation's call, the process
-                    // gone), it may have done its work: said so, as a stop
-                    // is, against a blind retry.
-                    let effect = if sent && matches!(error, ServiceError::TransportClosed) { "; it may have taken effect on the server" } else { "" };
+                    // gone), or cut while an HTTP server worked on it, it may
+                    // have done its work: said so, as a stop is, against a
+                    // blind retry. (Not written to a stdio server's input, it
+                    // never got there.)
+                    let effect = if sent && (matches!(error, ServiceError::TransportClosed) || (http && !unreached(&error))) {
+                        "; it may have taken effect on the server"
+                    } else {
+                        ""
+                    };
                     return anyhow!(
                         "mcp_server_unavailable: the connection to MCP server {} failed during the call ({detail}); it is being reconnected{effect}",
                         self.server
@@ -894,13 +917,16 @@ impl Offered {
                 if unreadable(&error) {
                     return anyhow!("mcp_request_failed: MCP server {} sent an answer that is not readable JSON-RPC ({detail})", self.server);
                 }
+                // A server's or a proxy's error (a proxy's 504 for a long
+                // call) does not say whether the tool ran.
+                let effect = if sent && !unreached(&error) { "; it may have taken effect on the server" } else { "" };
                 match http_status(&error) {
                     Some(429) => anyhow!(
                         "mcp_rate_limited: MCP server {} is limiting requests (HTTP 429); answer with what is known or call it again later ({detail})",
                         self.server
                     ),
                     // A scope the token lacks (403 with its challenge).
-                    status => anyhow!("mcp_request_failed: MCP server {} answered HTTP {} ({detail})", self.server, status.unwrap_or(403)),
+                    status => anyhow!("mcp_request_failed: MCP server {} answered HTTP {} ({detail}){effect}", self.server, status.unwrap_or(403)),
                 }
             }
             other => anyhow!("mcp_request_failed: {}", for_model(&redact(&other.to_string()))),
@@ -1532,6 +1558,22 @@ fn for_model(text: &str) -> String {
         format!("{}{}{rest}", &c[1], &c[3])
     })
     .into_owned()
+}
+
+/// Whether a request that failed over HTTP is known not to have reached a
+/// tool: refused by the connection (no server listening, its host not
+/// found, its certificate not trusted) or by the server itself (a 4xx
+/// status, a session it no longer knows, a scope the token lacks). Another
+/// failure of a call sent — a server's or a proxy's error, a connection cut
+/// while the server worked — may have left it done.
+fn unreached<E: std::fmt::Debug>(error: &E) -> bool {
+    let debug = format!("{error:?}");
+    let refused = [
+        "ConnectionRefused", "Connection refused", "dns error", "failed to lookup address", "nodename nor servname",
+        "InvalidCertificate", "certificate is not trusted", "UnknownIssuer", "AuthRequired", "InsufficientScope",
+        wire::ANSWERED_NO_REQUEST, wire::REFUSED_NO_REQUEST,
+    ];
+    http_status(error).is_some_and(|status| (400..500).contains(&status)) || refused.iter().any(|said| debug.contains(said))
 }
 
 /// A response the SDK could not parse as a JSON-RPC message.

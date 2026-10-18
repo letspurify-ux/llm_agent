@@ -1168,6 +1168,7 @@ async fn a_rate_limit_or_a_proxy_error_is_not_a_lost_connection() {
         ("502", "mcp_request_failed:", "서버 쪽 오류"),
         ("413", "mcp_request_failed:", "HTTP 413 Payload Too Large"),
         ("422", "mcp_request_failed:", "HTTP 422"),
+        ("504", "mcp_request_failed:", "HTTP 504"),
     ] {
         let remote = HttpServer::start(&[("FAKE_MCP_CALL_STATUS", status), ("FAKE_MCP_CALL_STATUS_TOOL", "echo")]);
         let server = McpServer { name: "limited".into(), url: remote.url.clone(), tools: vec!["echo".into(), "slow".into()], ..Default::default() };
@@ -1182,6 +1183,9 @@ async fn a_rate_limit_or_a_proxy_error_is_not_a_lost_connection() {
         let error = call(&hub, &config, "limited__echo", json!({"text":"x"})).await.unwrap_err().to_string();
         assert!(error.starts_with(code), "{status}: {error}");
         assert!(error.contains(said), "{error}");
+        // A server's or a proxy's error (a proxy's 504 for a long call) does
+        // not say whether the tool ran; a refusal (4xx) does (twenty-fourth pass).
+        assert_eq!(error.contains("may have taken effect"), status.starts_with('5'), "{status}: {error}");
         assert_eq!(under_way.await.unwrap().unwrap()["text"], "slept", "{status}");
         if status == "429" {
             assert_eq!(llm_agent::tools::recovery::describe(&error)["class"], "transient");
@@ -3046,5 +3050,131 @@ async fn the_output_of_a_server_gone_is_read_no_more() {
         libc::kill(helper, libc::SIGKILL);
     }
     assert_eq!(before, after, "the helper's output still reaches the log of the server's next process");
+    hub.shutdown().await;
+}
+
+/// Answers JSON cannot hold as the SDK reads it — a number it cannot write
+/// (NaN and Infinity from Python's json.dumps, an integer of 400 digits),
+/// nesting past the parser's 128 levels — and an answer without its result
+/// (a JavaScript handler's `undefined`): over stdio the SDK dropped them
+/// and the call waited out its timeout; over SSE they ended the session,
+/// with every call on it (twenty-fourth pass). Each ends its call at once.
+#[tokio::test]
+async fn answers_json_cannot_hold_neither_hang_nor_end_the_session() {
+    if node_missing() {
+        return;
+    }
+    let digits = format!("1{}", "0".repeat(400));
+    let deep = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+    let answers: Vec<(String, Result<String, &str>)> = vec![
+        (
+            r#"{"jsonrpc":"2.0","id":@ID@,"result":{"content":[],"structuredContent":{"mean":NaN,"range":[-Infinity,Infinity]}}}"#.into(),
+            Ok(r#"{"mean":null,"range":[null,null]}"#.into()),
+        ),
+        (format!(r#"{{"jsonrpc":"2.0","id":@ID@,"result":{{"content":[],"structuredContent":{{"n":{digits}}}}}}}"#), Ok(format!(r#"{{"n":"{digits}"}}"#))),
+        (
+            format!(r#"{{"jsonrpc":"2.0","id":@ID@,"result":{{"content":[],"structuredContent":{{"v":{deep}}}}}}}"#),
+            Err("mcp_request_failed: the server answered, but its answer could not be read as JSON (recursion limit exceeded"),
+        ),
+        (r#"{"jsonrpc":"2.0","id":@ID@}"#.into(), Err("mcp_request_failed: raw__echo sent an unexpected response")),
+    ];
+    for mode in ["stdio", "sse"] {
+        let remote;
+        let server = if mode == "stdio" {
+            fake("raw", &["echo"], &[])
+        } else {
+            remote = HttpServer::start(&[("FAKE_MCP_SSE", "1")]);
+            McpServer { name: "raw".into(), url: remote.url.clone(), tools: vec!["echo".into()], ..Default::default() }
+        };
+        let config = config(vec![McpServer { timeout_secs: Some(10), ..server }]);
+        let hub = McpHub::default();
+        hub.apply(&config.mcp_servers);
+        ready(&hub, "raw").await;
+        for (answer, expected) in &answers {
+            let started = Instant::now();
+            let outcome = call(&hub, &config, "raw__echo", json!({"text":format!("raw:{answer}")})).await;
+            let shown: String = answer.chars().take(100).collect();
+            assert!(started.elapsed() < Duration::from_secs(3), "{mode}: answered at once, not at the timeout: {shown}");
+            match expected {
+                Ok(text) => assert_eq!(outcome.unwrap()["text"], json!(text), "{mode}: {shown}"),
+                Err(start) => {
+                    let error = outcome.unwrap_err().to_string();
+                    assert!(error.starts_with(start), "{mode}: {shown}: {error}");
+                }
+            }
+        }
+        assert_eq!(call(&hub, &config, "raw__echo", json!({"text":"after"})).await.unwrap()["text"], "echo: after", "{mode}");
+        let status = hub.server_status("raw", MODEL).unwrap();
+        assert_eq!((status["state"].clone(), status["restarts"].clone()), (json!("ready"), json!(0)), "{mode}: the session stayed");
+        hub.shutdown().await;
+    }
+}
+
+/// A call whose event stream ends before its answer — a proxy's idle
+/// timeout cutting a long call (nginx's is 60 s), the session fine — fails
+/// alone: it was taken for a lost connection, and the session made again
+/// ended every other conversation's call on it (twenty-fourth pass). A
+/// server gone during a call is still reconnected at once.
+#[tokio::test]
+async fn a_call_whose_stream_is_cut_fails_alone() {
+    if node_missing() {
+        return;
+    }
+    let remote = HttpServer::start(&[("FAKE_MCP_SSE", "1"), ("FAKE_MCP_CUT", "1")]);
+    let server = McpServer { name: "web".into(), url: remote.url.clone(), tools: vec!["slow".into(), "cut_stream".into()], timeout_secs: Some(10), ..Default::default() };
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "web").await;
+    let snapshot = hub.snapshot(&config);
+    let slow = snapshot.find("web__slow").unwrap();
+    let others = slow_calls(&slow, Instant::now(), &[("a", 0.0, 2_000), ("b", 0.0, 2_000), ("c", 0.8, 1_500)]);
+    let cut = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = Instant::now();
+        let outcome = snapshot.find("web__cut_stream").unwrap().call(json!({"ms":200}), &CancellationToken::new()).await;
+        (outcome.unwrap_err().to_string(), started.elapsed())
+    };
+    let (others, (error, took)) = tokio::join!(others, cut);
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    assert!(error.starts_with("mcp_request_failed: the connection to MCP server web closed before web__cut_stream answered"), "{error}");
+    assert!(error.ends_with("it may have taken effect on the server"), "{error}");
+    for (tag, outcome) in &others {
+        assert!(outcome.is_ok(), "{tag}: the other conversations' calls go on: {outcome:?}");
+    }
+    let status = hub.server_status("web", MODEL).unwrap();
+    assert_eq!((status["state"].clone(), status["restarts"].clone()), (json!("ready"), json!(0)), "{}", log_text(&status));
+    // Gone during a call: the ping after it finds no server.
+    let gone = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(remote);
+    };
+    let started = Instant::now();
+    let never = CancellationToken::new();
+    let held = snapshot.find("web__cut_stream").unwrap();
+    let (outcome, ()) = tokio::join!(held.call(json!({"hold":true}), &never), gone);
+    let error = outcome.unwrap_err().to_string();
+    assert!(error.starts_with("mcp_request_failed: the connection to MCP server web closed before") && error.contains("may have taken effect"), "{error}");
+    let failed = wait_for(&hub, "web", |s| s["state"] == "failed").await;
+    assert!(started.elapsed() < Duration::from_secs(4), "reconnected at once: {:?}", started.elapsed());
+    assert!(log_text(&failed).contains("호출의 답이 오기 전에 연결이 끊겼고, 살아 있는지 묻는 ping에도"), "{}", log_text(&failed));
+    hub.shutdown().await;
+    // A server answering in plain JSON, gone while it worked on the call:
+    // the call may have done its work.
+    let remote = HttpServer::start(&[]);
+    let server = McpServer { name: "json".into(), url: remote.url.clone(), tools: vec!["slow".into()], timeout_secs: Some(10), ..Default::default() };
+    let config = self::config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "json").await;
+    let slow = hub.snapshot(&config).find("json__slow").unwrap();
+    let gone = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(remote);
+    };
+    let (outcome, ()) = tokio::join!(slow.call(json!({"ms":5_000}), &never), gone);
+    let error = outcome.unwrap_err().to_string();
+    assert!(error.starts_with("mcp_server_unavailable:") && error.ends_with("it may have taken effect on the server"), "{error}");
+    wait_for(&hub, "json", |s| s["state"] == "failed").await;
     hub.shutdown().await;
 }
