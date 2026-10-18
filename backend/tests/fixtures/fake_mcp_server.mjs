@@ -270,6 +270,9 @@ if (httpMode) {
   };
   if (env.FAKE_MCP_GARBAGE) process.stdout.write('starting up (not json)\n');
   let buffer = '';
+  // FAKE_MCP_SERIAL: one message at a time, in order, a ping too (a server
+  // that awaits each handler before it reads the next).
+  let serial = Promise.resolve();
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', chunk => {
     buffer += chunk;
@@ -284,7 +287,8 @@ if (httpMode) {
         asked.delete(message.id);
         continue;
       }
-      Promise.resolve(handle(message, send)).then(answer => { if (answer) send(answer); });
+      const run = () => Promise.resolve(handle(message, send)).then(answer => { if (answer) send(answer); });
+      if (env.FAKE_MCP_SERIAL) serial = serial.then(run); else run();
     }
   });
   process.stdin.on('end', () => { log('stdin closed'); process.exit(0); });

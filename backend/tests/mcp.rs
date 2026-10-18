@@ -432,6 +432,8 @@ async fn a_server_that_exits_mid_call_is_reconnected() {
     let first = ready(&hub, "crashy").await;
     let error = call(&hub, &config, "crashy__crash", json!({})).await.unwrap_err();
     assert!(error.to_string().starts_with("mcp_server_unavailable:"), "{error}");
+    // On the server when its connection ended, the call may have done its work.
+    assert!(error.to_string().ends_with("it may have taken effect on the server"), "{error}");
     let failed = wait_for(&hub, "crashy", |s| s["state"] == "failed").await;
     assert!(failed["error"].as_str().unwrap().contains("crashing on purpose"), "the last output explains it: {failed:#}");
     assert!(failed["retry_at"].is_string());
@@ -1071,6 +1073,7 @@ async fn an_http_server_that_goes_away_is_marked_failed_and_reconnected() {
     let failed = wait_for(&hub, "web", |s| s["state"] == "failed").await;
     assert!(failed["error"].as_str().unwrap().contains("연결이 거부되었습니다"), "{failed:#}");
     assert!(error.contains("연결이 거부되었습니다"), "{error}");
+    assert!(!error.contains("may have taken effect"), "refused, it reached no server: {error}");
     assert!(hub.snapshot(&config).is_empty());
     let back = HttpServer::start_on(&[], port);
     wait_for(&hub, "web", |s| s["state"] == "ready").await;
@@ -1192,6 +1195,96 @@ async fn a_server_that_stops_answering_is_reconnected() {
     // The slow one answered its ping meanwhile: it stays as it is.
     let slow = hub.server_status("slow", MODEL).unwrap();
     assert_eq!((slow["state"].clone(), slow["restarts"].clone()), (json!("ready"), json!(0)), "{slow:#}");
+    hub.shutdown().await;
+}
+
+/// `slow` calls of `ms` each, started `at` seconds after `start`: each
+/// call's tag and outcome (Ok, or its error).
+async fn slow_calls(tool: &std::sync::Arc<llm_agent::mcp::Offered>, start: Instant, plan: &[(&str, f64, u64)]) -> Vec<(String, Result<(), String>)> {
+    let tasks: Vec<_> = plan
+        .iter()
+        .map(|(tag, at, ms)| {
+            let (tool, tag, at, ms) = (tool.clone(), (*tag).to_owned(), *at, *ms);
+            tokio::spawn(async move {
+                tokio::time::sleep_until((start + Duration::from_secs_f64(at)).into()).await;
+                let outcome = tool.call(json!({"ms": ms}), &CancellationToken::new()).await;
+                (tag, outcome.map(|_| ()).map_err(|e| e.to_string()))
+            })
+        })
+        .collect();
+    let mut outcomes = vec![];
+    for task in tasks {
+        outcomes.push(task.await.unwrap());
+    }
+    outcomes
+}
+
+/// Several conversations, one HTTP server answering in plain JSON: one call
+/// times out while fifteen others' run within their limit and one more
+/// comes. The SDK carried 16 such requests and queued the rest, the ping
+/// after the timeout too: unanswered in five seconds, the busy server was
+/// taken for stopped and reconnected, the sixteen others failing two
+/// seconds before they would have ended.
+#[tokio::test]
+async fn many_conversations_on_one_http_server_do_not_take_it_for_stopped() {
+    if node_missing() {
+        return;
+    }
+    let remote = HttpServer::start(&[]);
+    let server = McpServer { name: "web".into(), url: remote.url.clone(), tools: vec!["slow".into()], timeout_secs: Some(10), ..Default::default() };
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "web").await;
+    let tool = hub.snapshot(&config).find("web__slow").unwrap();
+    let mut plan = vec![("stuck", 0.0, 60_000)];
+    plan.extend(std::iter::repeat_n(("running", 7.0, 9_000), 15));
+    plan.push(("later", 7.5, 8_000));
+    let outcomes = slow_calls(&tool, Instant::now(), &plan).await;
+    for (tag, outcome) in &outcomes {
+        if tag == "stuck" {
+            assert!(outcome.as_ref().unwrap_err().starts_with("mcp_timeout:"), "{outcome:?}");
+        } else {
+            assert!(outcome.is_ok(), "{tag}: {outcome:?}");
+        }
+    }
+    let status = hub.server_status("web", MODEL).unwrap();
+    assert!(!log_text(&status).contains("ping에도"), "{}", log_text(&status));
+    assert_eq!((status["state"].clone(), status["restarts"].clone()), (json!("ready"), json!(0)), "{status:#}");
+    hub.shutdown().await;
+}
+
+/// A server that handles one message at a time, a ping too: the ping after
+/// a timeout waits behind other conversations' calls, which it answers one
+/// by one meanwhile. An answer while the ping waits says it is alive; it
+/// was reconnected, the calls still in its queue failing.
+#[tokio::test]
+async fn a_server_answering_calls_while_its_ping_waits_is_not_reconnected() {
+    if node_missing() {
+        return;
+    }
+    let mut server = fake("serial", &["slow"], &[("FAKE_MCP_SERIAL", "1")]);
+    server.timeout_secs = Some(8);
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "serial").await;
+    let tool = hub.snapshot(&config).find("serial__slow").unwrap();
+    // Run from 0 to 8.5 s (timed out at 8, the ping then behind the queue),
+    // then the queue from 8.5 to 14.1 s, each within its limit at 15.
+    let mut plan = vec![("stuck", 0.0, 8_500)];
+    plan.extend(std::iter::repeat_n(("queued", 7.0, 800), 7));
+    let outcomes = slow_calls(&tool, Instant::now(), &plan).await;
+    for (tag, outcome) in &outcomes {
+        if tag == "stuck" {
+            assert!(outcome.as_ref().unwrap_err().starts_with("mcp_timeout:"), "{outcome:?}");
+        } else {
+            assert!(outcome.is_ok(), "{tag}: {outcome:?}");
+        }
+    }
+    let status = hub.server_status("serial", MODEL).unwrap();
+    assert!(!log_text(&status).contains("ping에도"), "{}", log_text(&status));
+    assert_eq!(status["restarts"], 0, "{status:#}");
     hub.shutdown().await;
 }
 

@@ -107,6 +107,14 @@ const REQUEST_REFUSALS: &[u16] = &[408, 409, 413, 414, 415, 422, 431];
 /// Seconds a server whose call timed out is given to answer a ping before
 /// it is taken for stopped and reconnected.
 const PING_SECS: u64 = 5;
+/// Requests one HTTP connection carries at once. The SDK holds a call's
+/// POST while the server answers it as plain JSON and queues the rest (16
+/// by default), ahead of a ping too: the calls of many conversations on one
+/// server filled it, and a busy server was taken for stopped.
+const HTTP_REQUESTS: usize = 64;
+/// Of those, the calls': the rest stays free for the ping and a tool list
+/// read again.
+const HTTP_CALLS: usize = HTTP_REQUESTS - 2;
 /// Characters of a connection error quoted in a message (it ends in the
 /// body an HTTP server answered with).
 const MAX_QUOTED_CHARS: usize = 1_000;
@@ -301,10 +309,7 @@ struct State {
     restarts: u32,
     retry_at: Option<String>,
     peer: Option<Peer<RoleClient>>,
-    /// Rung by a call whose request could not reach the server (an HTTP
-    /// server gone, a refused token): the SDK keeps such a session open, so
-    /// the supervisor would otherwise show it ready while every call fails.
-    broken: Option<Arc<Notify>>,
+    link: Option<Arc<Link>>,
     transport_error: Option<String>,
     pid: Option<u32>,
     info: Value,
@@ -318,6 +323,28 @@ struct State {
     logged: u64,
     output_from: u64,
     stats: BTreeMap<String, ToolStats>,
+}
+
+/// What the calls of one connection share with its supervisor.
+#[derive(Default)]
+struct Link {
+    /// Rung by a call whose request could not reach the server (an HTTP
+    /// server gone, a refused token): the SDK keeps such a session open, so
+    /// the supervisor would otherwise show it ready while every call fails.
+    broken: Notify,
+    /// Answers the calls got. One while a ping waits says the server still
+    /// answers: it handles a request at a time (or a few), and the ping
+    /// waited behind other conversations' calls.
+    answers: std::sync::atomic::AtomicU64,
+    /// The calls an HTTP connection carries at once (`HTTP_CALLS`); none
+    /// for stdio, which queues nothing of ours.
+    calls: Option<tokio::sync::Semaphore>,
+}
+
+impl Link {
+    fn answered(&self) {
+        self.answers.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 fn now() -> String {
@@ -356,7 +383,7 @@ impl Slot {
                 restarts: 0,
                 retry_at: None,
                 peer: None,
-                broken: None,
+                link: None,
                 transport_error: None,
                 pid: None,
                 info: Value::Null,
@@ -414,7 +441,7 @@ impl Slot {
         state.cause = cause;
         if phase != Phase::Ready {
             state.peer = None;
-            state.broken = None;
+            state.link = None;
         }
         if phase != Phase::Failed {
             state.retry_at = None;
@@ -480,14 +507,16 @@ impl Slot {
 /// a ping either has stopped (a handler deadlocked, its input no longer
 /// read, a session it lost answered to no request). It is reconnected,
 /// rather than shown ready while every call waits out its timeout. Any
-/// answer, an error too, says it is alive.
-fn check_alive(slot: &Arc<Slot>, peer: &Peer<RoleClient>, broken: &Arc<Notify>, timeout: Duration) {
+/// answer, an error too, says it is alive — and so does an answer to
+/// another call while the ping waits.
+fn check_alive(slot: &Arc<Slot>, peer: &Peer<RoleClient>, link: &Arc<Link>, timeout: Duration) {
     use std::sync::atomic::Ordering;
     if slot.pinging.swap(true, Ordering::AcqRel) {
         return;
     }
-    let (slot, peer, broken) = (slot.clone(), peer.clone(), broken.clone());
+    let (slot, peer, link) = (slot.clone(), peer.clone(), link.clone());
     tokio::spawn(async move {
+        let answers = link.answers.load(Ordering::Acquire);
         let ping = peer.send_request(ClientRequest::PingRequest(PingRequest::default()));
         let silent = match tokio::time::timeout(Duration::from_secs(PING_SECS), ping).await {
             Err(_) | Ok(Err(ServiceError::Timeout { .. })) => true,
@@ -495,16 +524,16 @@ fn check_alive(slot: &Arc<Slot>, peer: &Peer<RoleClient>, broken: &Arc<Notify>, 
             Ok(Err(error @ ServiceError::TransportSend(_))) => connection_lost(&error),
             Ok(_) => false,
         };
-        if silent {
+        if silent && link.answers.load(Ordering::Acquire) == answers {
             let mut state = slot.state();
             // Still this connection: a newer one is not told for an older.
-            if state.broken.as_ref().is_some_and(|current| Arc::ptr_eq(current, &broken)) {
+            if state.link.as_ref().is_some_and(|current| Arc::ptr_eq(current, &link)) {
                 state.transport_error = Some(format!(
                     "호출이 {}초 한도를 넘었고, 살아 있는지 묻는 ping에도 {PING_SECS}초 안에 답하지 않아 서버가 멈춘 것으로 보고 다시 연결합니다",
                     timeout.as_secs()
                 ));
                 drop(state);
-                broken.notify_one();
+                link.broken.notify_one();
             }
         }
         slot.pinging.store(false, Ordering::Release);
@@ -695,10 +724,10 @@ impl Offered {
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
-        let (peer, broken) = {
+        let (peer, link) = {
             let state = slot.state();
             match (&state.peer, state.phase) {
-                (Some(peer), Phase::Ready) => (peer.clone(), state.broken.clone().unwrap_or_default()),
+                (Some(peer), Phase::Ready) => (peer.clone(), state.link.clone().unwrap_or_default()),
                 _ => bail!(not_connected(&self.server, &state)),
             }
         };
@@ -709,10 +738,27 @@ impl Offered {
         // for room in the SDK's bounded queue, which a server that stops
         // reading its input never makes.
         let deadline = tokio::time::Instant::now() + self.timeout;
+        // Past the calls an HTTP connection carries, a call waits here, not
+        // in the SDK's queue, where the ping after a timeout would wait
+        // behind it. Not sent, it had no effect.
+        let _carried = match &link.calls {
+            Some(calls) => Some(tokio::select! {
+                carried = calls.acquire() => carried?,
+                _ = cancel.cancelled() => bail!("cancelled"),
+                _ = tokio::time::sleep_until(deadline) => bail!(
+                    "mcp_timeout: {} was not sent within {}s: other calls held all {HTTP_CALLS} calls the connection to MCP server {} carries at once; it had no effect",
+                    self.exposed,
+                    self.timeout.as_secs(),
+                    self.server
+                ),
+            }),
+            None => None,
+        };
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         let handle = tokio::select! {
-            sent = peer.send_cancellable_request(request, PeerRequestOptions::with_timeout(self.timeout)) => sent.map_err(|e| self.error(e, slot, &peer, &broken))?,
+            sent = peer.send_cancellable_request(request, PeerRequestOptions::with_timeout(left)) => sent.map_err(|e| self.error(e, false, slot, &peer, &link))?,
             _ = cancel.cancelled() => bail!("cancelled"),
-            _ = tokio::time::sleep_until(deadline) => return Err(self.error(ServiceError::Timeout { timeout: self.timeout }, slot, &peer, &broken)),
+            _ = tokio::time::sleep_until(deadline) => return Err(self.error(ServiceError::Timeout { timeout: self.timeout }, false, slot, &peer, &link)),
         };
         let id = handle.id.clone();
         // The SDK's own timeout tells the server before it returns, and that
@@ -728,7 +774,7 @@ impl Offered {
             });
         };
         tokio::select! {
-            response = handle.await_response() => match response.map_err(|e| self.error(e, slot, &peer, &broken))? {
+            response = handle.await_response() => match response.inspect(|_| link.answered()).map_err(|e| self.error(e, true, slot, &peer, &link))? {
                 ServerResult::CallToolResult(result) => convert::tool_result(&serde_json::to_value(result)?),
                 // A result the SDK's types refuse (a content block of an unknown
                 // type, a text block without text) arrives as raw JSON: read it
@@ -748,14 +794,18 @@ impl Offered {
             }
             _ = overdue => {
                 tell("request timeout");
-                Err(self.error(ServiceError::Timeout { timeout: self.timeout }, slot, &peer, &broken))
+                Err(self.error(ServiceError::Timeout { timeout: self.timeout }, true, slot, &peer, &link))
             }
         }
     }
 
-    fn error(&self, error: ServiceError, slot: &Arc<Slot>, peer: &Peer<RoleClient>, broken: &Arc<Notify>) -> anyhow::Error {
+    /// The error `error` makes of the call, `sent` past the SDK's queue.
+    fn error(&self, error: ServiceError, sent: bool, slot: &Arc<Slot>, peer: &Peer<RoleClient>, link: &Arc<Link>) -> anyhow::Error {
+        if matches!(error, ServiceError::McpError(_)) {
+            link.answered();
+        }
         if matches!(error, ServiceError::Timeout { .. }) {
-            check_alive(slot, peer, broken, self.timeout);
+            check_alive(slot, peer, link, self.timeout);
         }
         match error {
             ServiceError::McpError(e) if e.code == ErrorCode::INVALID_PARAMS => {
@@ -777,9 +827,14 @@ impl Offered {
                 let detail = for_model(&shown);
                 if connection_lost(&error) {
                     slot.state().transport_error = Some(format!("호출이 서버에 닿지 못해 다시 연결합니다: {shown}"));
-                    broken.notify_one();
+                    link.broken.notify_one();
+                    // Closed with the call on the server (the connection made
+                    // again for another conversation's call, the process
+                    // gone), it may have done its work: said so, as a stop
+                    // is, against a blind retry.
+                    let effect = if sent && matches!(error, ServiceError::TransportClosed) { "; it may have taken effect on the server" } else { "" };
                     return anyhow!(
-                        "mcp_server_unavailable: the connection to MCP server {} failed during the call ({detail}); it is being reconnected",
+                        "mcp_server_unavailable: the connection to MCP server {} failed during the call ({detail}); it is being reconnected{effect}",
                         self.server
                     );
                 }
@@ -1127,7 +1182,7 @@ struct Connection {
     ended: Pin<Box<dyn FusedFuture<Output = ()> + Send>>,
     close: CancellationToken,
     list_changed: Arc<Notify>,
-    broken: Arc<Notify>,
+    link: Arc<Link>,
 }
 
 enum Ended {
@@ -1252,7 +1307,7 @@ async fn serve(slot: &Arc<Slot>, server: &McpServer, connection: &mut Connection
                 let mut state = slot.state();
                 state.info = server_info(&info);
                 state.peer = Some(connection.peer.clone());
-                state.broken = Some(connection.broken.clone());
+                state.link = Some(connection.link.clone());
                 state.transport_error = None;
             }
             slot.set_phase(Phase::Ready, None);
@@ -1271,14 +1326,14 @@ async fn serve(slot: &Arc<Slot>, server: &McpServer, connection: &mut Connection
             _ = slot.stop.cancelled() => return Ended::Stopped,
             _ = slot.reconnect.notified() => return Ended::Requested,
             _ = &mut connection.ended => return Ended::Lost,
-            _ = connection.broken.notified() => return broken(slot),
+            _ = connection.link.broken.notified() => return broken(slot),
             _ = connection.list_changed.notified() => {
                 // Notices coming while it waits make one more reading at most.
                 tokio::select! {
                     _ = slot.stop.cancelled() => return Ended::Stopped,
                     _ = slot.reconnect.notified() => return Ended::Requested,
                     _ = &mut connection.ended => return Ended::Lost,
-                    _ = connection.broken.notified() => return broken(slot),
+                    _ = connection.link.broken.notified() => return broken(slot),
                     _ = tokio::time::sleep(RELIST_WAIT) => {}
                 }
                 // A server that stopped answering keeps the list waiting up to
@@ -1288,7 +1343,7 @@ async fn serve(slot: &Arc<Slot>, server: &McpServer, connection: &mut Connection
                     _ = slot.stop.cancelled() => return Ended::Stopped,
                     _ = slot.reconnect.notified() => return Ended::Requested,
                     _ = &mut connection.ended => return Ended::Lost,
-                    _ = connection.broken.notified() => return broken(slot),
+                    _ = connection.link.broken.notified() => return broken(slot),
                     listed = tokio::time::timeout(Duration::from_secs(CONNECT_SECS), list_tools(&connection.peer, &server.name, &known)) => listed,
                 };
                 match listed {
@@ -1670,7 +1725,8 @@ async fn connect(slot: &Arc<Slot>, server: &McpServer) -> Result<Connection> {
         }
         .fuse(),
     );
-    Ok(Connection { peer, ended, close, list_changed, broken: Arc::new(Notify::new()) })
+    let calls = (!server.url.trim().is_empty()).then(|| tokio::sync::Semaphore::new(HTTP_CALLS));
+    Ok(Connection { peer, ended, close, list_changed, link: Arc::new(Link { calls, ..Default::default() }) })
 }
 
 /// Closes the connection and waits for it (a stdio server is given its
@@ -1970,6 +2026,7 @@ fn http_config(server: &McpServer) -> Result<StreamableHttpClientTransportConfig
         headers.insert(name, value);
     }
     config.custom_headers = headers;
+    config.max_concurrent_requests = HTTP_REQUESTS;
     Ok(config)
 }
 
