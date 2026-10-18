@@ -912,9 +912,12 @@ impl Offered {
 #[derive(Clone, Default)]
 pub struct McpHub {
     slots: Arc<Mutex<Vec<Arc<Slot>>>>,
-    /// Supervisors of servers removed or replaced by `apply`, still closing:
-    /// `shutdown` waits for them too, or their processes outlive the backend.
+    /// Supervisors of servers removed or replaced by `apply`, still closing,
+    /// and connection checks (`probe`): `shutdown` waits for them too, or
+    /// their processes outlive the backend.
     retired: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Gives up the connection checks under way, at `shutdown`.
+    checks: CancellationToken,
     /// Set by `shutdown`: the admin API still answers during the
     /// connections' grace, and a save then must not start servers again.
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -988,6 +991,7 @@ impl McpHub {
             self.closed.store(true, std::sync::atomic::Ordering::Release);
             std::mem::take(&mut *slots)
         };
+        self.checks.cancel();
         let mut tasks = std::mem::take(&mut *self.retired.lock().unwrap_or_else(|p| p.into_inner()));
         for slot in &slots {
             slot.stop.cancel();
@@ -2143,22 +2147,75 @@ fn http_config(server: &McpServer) -> Result<StreamableHttpClientTransportConfig
 }
 
 /// Connects with draft settings, lists the tools and disconnects: the admin
-/// screen's connection check. Definition tokens are counted for `model`.
+/// screen's connection check (see `McpHub::probe`), for a hub of its own.
 pub async fn probe(server: &McpServer, model: &str) -> Result<Value> {
-    validate_server(server)?;
+    McpHub::default().probe(server, model).await
+}
+
+impl McpHub {
+    /// Connects with draft settings, lists the tools and disconnects: the
+    /// admin screen's connection check. Definition tokens are counted for
+    /// `model`.
+    ///
+    /// The check runs in a task of its own, which `shutdown` waits for.
+    /// Given up — its request dropped (the admin screen reloaded while a
+    /// docker image downloads), the backend stopping — it stops waiting and
+    /// closes its server in order: dropped with the request, a server still
+    /// starting was killed outright, and one run as `docker run -i --rm
+    /// --init` left its container running.
+    pub async fn probe(&self, server: &McpServer, model: &str) -> Result<Value> {
+        validate_server(server)?;
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            bail!("backend가 멈추는 중이라 연결을 확인하지 않았습니다.");
+        }
+        let given_up = self.checks.child_token();
+        let _given_up = given_up.clone().drop_guard();
+        let (sent, checked) = tokio::sync::oneshot::channel();
+        let (server, model) = (server.clone(), model.to_owned());
+        let task = tokio::spawn(async move {
+            let _ = sent.send(check(&server, &model, &given_up).await);
+        });
+        {
+            let mut retired = self.retired.lock().unwrap_or_else(|p| p.into_inner());
+            retired.retain(|t| !t.is_finished());
+            retired.push(task);
+        }
+        checked.await.map_err(|_| anyhow!("연결 확인 작업이 예기치 않게 멈췄습니다."))?
+    }
+}
+
+/// Why a connection check stopped waiting.
+enum Cut {
+    Late,
+    GivenUp,
+}
+
+/// `work` until the check's deadline, unless the check is given up first.
+async fn within<T>(deadline: tokio::time::Instant, given_up: &CancellationToken, work: impl Future<Output = T>) -> Result<T, Cut> {
+    tokio::select! {
+        // Given up already, nothing is started.
+        biased;
+        _ = given_up.cancelled() => Err(Cut::GivenUp),
+        done = tokio::time::timeout_at(deadline, work) => done.map_err(|_| Cut::Late),
+    }
+}
+
+async fn check(server: &McpServer, model: &str, given_up: &CancellationToken) -> Result<Value> {
+    const GIVEN_UP: &str = "연결 확인을 그만두었습니다(backend가 멈추는 중입니다)";
     let slot = Slot::new(server.clone());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(CONNECT_SECS);
-    let outcome = match tokio::time::timeout_at(deadline, connect(&slot, server)).await {
+    let outcome = match within(deadline, given_up, connect(&slot, server)).await {
         Ok(Ok(connection)) => {
             // Said as the supervisor says it: which step failed.
-            let listed = match tokio::time::timeout_at(deadline, list_tools(&connection.peer, &server.name, &[])).await {
+            let listed = match within(deadline, given_up, list_tools(&connection.peer, &server.name, &[])).await {
                 Ok(listed) => listed.map_err(|e| anyhow!("도구 목록을 받지 못했습니다: {e:#}")).map(|listed| {
                     for note in &listed.notes {
                         slot.log("event", note);
                     }
                     listed.tools
                 }),
-                Err(_) => Err(anyhow!("{CONNECT_SECS}초 안에 도구 목록을 받지 못했습니다")),
+                Err(Cut::Late) => Err(anyhow!("{CONNECT_SECS}초 안에 도구 목록을 받지 못했습니다")),
+                Err(Cut::GivenUp) => Err(anyhow!(GIVEN_UP)),
             };
             let info = connection
                 .peer
@@ -2172,11 +2229,12 @@ pub async fn probe(server: &McpServer, model: &str) -> Result<Value> {
             Ok(listed.map(|tools| (tools, info)))
         }
         Ok(Err(error)) => Ok(Err(error)),
-        Err(elapsed) => Err(elapsed),
+        Err(cut) => Err(cut),
     };
     end_attempt(&slot).await;
     let log: Vec<Value> = slot.state().log.iter().cloned().collect();
     match outcome {
+        Ok(Ok(_)) if given_up.is_cancelled() => Ok(json!({"ok":false,"message":GIVEN_UP,"log":log})),
         Ok(Ok((tools, info))) => {
             let message = format!("연결됨: {}, 도구 {}개", describe_server(&info), tools.len());
             // A thousand definitions' tokens are counted on a blocking
@@ -2195,7 +2253,8 @@ pub async fn probe(server: &McpServer, model: &str) -> Result<Value> {
             Ok(json!({"ok":true,"message":message,"server_info":server_info(&info),"tools":tools,"log":log}))
         }
         Ok(Err(error)) => Ok(json!({"ok":false,"message":slot.failure(&format!("{error:#}")),"log":log})),
-        Err(_) => Ok(json!({"ok":false,"message":slot.failure(&format!("{CONNECT_SECS}초 안에 연결하지 못했습니다")),"log":log})),
+        Err(Cut::Late) => Ok(json!({"ok":false,"message":slot.failure(&format!("{CONNECT_SECS}초 안에 연결하지 못했습니다")),"log":log})),
+        Err(Cut::GivenUp) => Ok(json!({"ok":false,"message":GIVEN_UP,"log":log})),
     }
 }
 

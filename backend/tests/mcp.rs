@@ -2903,6 +2903,47 @@ async fn a_connection_check_out_of_time_asks_its_server_to_stop() {
     assert!(started.elapsed() < Duration::from_secs(37), "{:?}", started.elapsed());
 }
 
+/// MCP review, twenty-second pass: a connection check ran in the admin's
+/// request, which the web server drops once its client leaves (the screen
+/// reloaded while a docker image downloads). Dropped while its server
+/// started, the server was killed outright — run as `docker run -i --rm
+/// --init`, its container went on running. Given up, it now closes its
+/// server in order; so does a check under way when the backend stops, which
+/// waits for it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_connection_check_given_up_closes_its_server_in_order() {
+    if node_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let starting = |noted: &std::path::Path| {
+        fake("starting", &["echo"], &[("FAKE_MCP_HANG_INIT", "1"), ("FAKE_MCP_LINGER", "1"), ("FAKE_MCP_TERM_FILE", &noted.display().to_string())])
+    };
+    let dropped = dir.path().join("dropped");
+    let _ = tokio::time::timeout(Duration::from_millis(1_500), probe(&starting(&dropped), MODEL)).await;
+    let asked = Instant::now();
+    while !dropped.exists() && asked.elapsed() < Duration::from_secs(8) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(std::fs::read_to_string(&dropped).ok().as_deref(), Some("SIGTERM"), "the server of a check dropped was asked to stop");
+    let stopped = dir.path().join("stopped");
+    let hub = McpHub::default();
+    let checking = {
+        let (hub, server) = (hub.clone(), starting(&stopped));
+        tokio::spawn(async move { hub.probe(&server, MODEL).await })
+    };
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let started = Instant::now();
+    hub.shutdown().await;
+    assert_eq!(std::fs::read_to_string(&stopped).ok().as_deref(), Some("SIGTERM"), "the backend stopped once its check's server was asked to stop");
+    assert!(started.elapsed() < Duration::from_secs(7), "{:?}", started.elapsed());
+    let checked = checking.await.unwrap().unwrap();
+    assert_eq!(checked["ok"], false, "{checked:#}");
+    assert!(checked["message"].as_str().unwrap().contains("그만두었습니다"), "{checked:#}");
+    assert!(hub.probe(&starting(&stopped), MODEL).await.is_err(), "no check starts once the backend stops");
+}
+
 /// Resource-leak review: a helper a server starts outside its process group
 /// (a daemon) keeps the server's stderr open after the server is gone. Its
 /// reader ran on until the helper ended — a task and a pipe each time — and

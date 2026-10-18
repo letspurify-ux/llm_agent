@@ -1336,7 +1336,7 @@ async fn mcp_check(State(app): State<Arc<App>>, body: Bytes) -> ApiResult<Json<V
     };
     let server = mcp_draft(&body, base)?;
     let model = app.config().llm.model.clone();
-    let result = crate::mcp::probe(&server, &model).await.map_err(|e| ApiError::new(400, e.to_string()))?;
+    let result = app.mcp.probe(&server, &model).await.map_err(|e| ApiError::new(400, e.to_string()))?;
     Ok(Json(result))
 }
 
