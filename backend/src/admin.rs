@@ -1084,6 +1084,7 @@ async fn mcp_read(State(app): State<Arc<App>>, Path(name): Path<String>) -> ApiR
 fn mcp_draft(body: &Value, mut server: McpServer) -> ApiResult<McpServer> {
     let object = body.as_object().ok_or_else(|| ApiError::new(400, "입력 내용을 확인해주세요."))?;
     let (before_url, before_secrets): (String, Vec<String>) = (server.url.clone(), server.secret_headers.keys().cloned().collect());
+    let before_name = server.name.clone();
     let bad = |key: &str| ApiError::new(400, format!("MCP 서버 설정의 {key} 값 형식이 올바르지 않습니다."));
     let text = |key: &str| -> ApiResult<Option<String>> {
         match object.get(key) {
@@ -1142,6 +1143,23 @@ fn mcp_draft(body: &Value, mut server: McpServer) -> ApiResult<McpServer> {
     if let Some(v) = list("tools")? {
         let mut tools: Vec<String> = vec![];
         for tool in v.iter().map(|t| js_trim(t).to_owned()).filter(|t| !t.is_empty()) {
+            if !tools.contains(&tool) {
+                tools.push(tool);
+            }
+        }
+        server.tools = tools;
+    }
+    // An entry naming a tool as the model sees it (`old__search`) follows a
+    // renamed server, or no tool answers it any more and the tool leaves
+    // every question unseen.
+    if !before_name.is_empty() && server.name != before_name {
+        let old = format!("{before_name}__");
+        let mut tools: Vec<String> = vec![];
+        for tool in &server.tools {
+            let tool = match tool.strip_prefix(&old) {
+                Some(rest) => format!("{}__{rest}", server.name),
+                None => tool.clone(),
+            };
             if !tools.contains(&tool) {
                 tools.push(tool);
             }

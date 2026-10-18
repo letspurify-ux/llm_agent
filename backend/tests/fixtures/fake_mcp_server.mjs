@@ -209,7 +209,9 @@ if (httpMode) {
   const server = http.createServer((req, res) => {
     if (req.url.startsWith('/moved')) { res.writeHead(302, { Location: '/mcp' }).end(); return; }
     if (req.url.startsWith('/page')) { res.writeHead(200, { 'Content-Type': 'text/html' }).end('<html>login</html>'); return; }
-    if (!req.url.startsWith('/mcp')) { res.writeHead(404).end('not found'); return; }
+    // FAKE_MCP_ERROR_BODY: an error page that many characters long (a proxy's).
+    const page = env.FAKE_MCP_ERROR_BODY && `<html><body>${'x'.repeat(Number(env.FAKE_MCP_ERROR_BODY))}</body></html>`;
+    if (!req.url.startsWith('/mcp')) { res.writeHead(404, page ? { 'Content-Type': 'text/html' } : {}).end(page || 'not found'); return; }
     if (env.FAKE_MCP_AUTH && req.headers.authorization !== env.FAKE_MCP_AUTH) {
       res.writeHead(401, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'unauthorized' }));
       return;
@@ -235,7 +237,7 @@ if (httpMode) {
       // A rate limit or a proxy error on the first tool call only, the
       // session fine.
       if (env.FAKE_MCP_CALL_STATUS && message.method === 'tools/call' && (!env.FAKE_MCP_CALL_STATUS_TOOL || message.params?.name === env.FAKE_MCP_CALL_STATUS_TOOL) && limitedCalls++ === 0) {
-        res.writeHead(Number(env.FAKE_MCP_CALL_STATUS), { 'Content-Type': 'text/plain', 'Retry-After': '30' }).end('slow down');
+        res.writeHead(Number(env.FAKE_MCP_CALL_STATUS), { 'Content-Type': page ? 'text/html' : 'text/plain', 'Retry-After': '30' }).end(page || 'slow down');
         return;
       }
       const notes = [];

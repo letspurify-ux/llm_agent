@@ -433,6 +433,19 @@ pub fn unusable_tool_calls(error: &str) -> bool {
         .any(|code| error.starts_with(code))
 }
 
+/// A refusal of the tool calls the model wrote, not of the request: a
+/// provider that validates them (Groq's `tool_use_failed`, "tool call
+/// validation failed", with the `failed_generation`) refuses the request
+/// with HTTP 400 when one does not match its tool. The tool it names was
+/// defined well; asked again, the model may write the call right.
+pub fn refused_generation(error: &str) -> bool {
+    if !(error.starts_with("http_400:") || error.starts_with("http_422:")) {
+        return false;
+    }
+    let error = error.to_ascii_lowercase();
+    ["tool_use_failed", "failed_generation", "tool call validation failed"].iter().any(|said| error.contains(said))
+}
+
 fn response_format_rejected(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     // OpenAI-compatible servers do not agree on the error body: some name
@@ -1453,6 +1466,24 @@ mod diagnostic_tests {
             "stream_interrupted: missing completion terminator",
         ] {
             assert!(!context_overflow(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_of_the_calls_written_is_told_from_one_of_the_request() {
+        for refused in [
+            r#"http_400: {"error":{"message":"tool call validation failed: parameters for tool jira__search did not match schema: errors: [missing properties: 'query']","type":"invalid_request_error","code":"tool_use_failed","failed_generation":"..."}}"#,
+            r#"http_400: {"error":{"message":"tool call validation failed: attempted to call tool 'jira__find' which was not in request.tools","type":"invalid_request_error","code":"tool_use_failed"}}"#,
+            r#"http_400: {"error":{"message":"Failed to call a function. Please adjust your prompt. See 'failed_generation' for more details.","type":"invalid_request_error","code":"tool_use_failed","failed_generation":"<function=jira__search>{}</function>"}}"#,
+        ] {
+            assert!(refused_generation(refused), "{refused}");
+        }
+        for other in [
+            r#"http_400: {"error":{"message":"Invalid schema for function 'jira__search': array schema missing items","code":"invalid_function_parameters"}}"#,
+            r#"http_400: {"error":{"message":"This model's maximum context length is 128000 tokens.","code":"context_length_exceeded"}}"#,
+            r#"http_500: {"error":{"message":"tool_use_failed upstream"}}"#,
+        ] {
+            assert!(!refused_generation(other), "{other}");
         }
     }
 

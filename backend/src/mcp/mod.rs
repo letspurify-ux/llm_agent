@@ -107,6 +107,9 @@ const REQUEST_REFUSALS: &[u16] = &[408, 409, 413, 414, 415, 422, 431];
 /// Seconds a server whose call timed out is given to answer a ping before
 /// it is taken for stopped and reconnected.
 const PING_SECS: u64 = 5;
+/// Characters of a connection error quoted in a message (it ends in the
+/// body an HTTP server answered with).
+const MAX_QUOTED_CHARS: usize = 1_000;
 /// Headers the HTTP transport sets itself.
 const RESERVED_HEADERS: &[&str] = &[
     "accept", "content-type", "content-length", "host", "mcp-session-id", "mcp-protocol-version", "last-event-id",
@@ -397,7 +400,7 @@ impl Slot {
     /// screen only. The error as the admin sees it.
     fn fail(&self, cause: &str) -> String {
         let error = self.failure(cause);
-        self.set_phase_told(Phase::Failed, Some(error.clone()), Some(cause.to_owned()));
+        self.set_phase_told(Phase::Failed, Some(error.clone()), Some(for_model(cause)));
         error
     }
 
@@ -770,9 +773,10 @@ impl Offered {
                 self.timeout.as_secs()
             ),
             ServiceError::TransportClosed | ServiceError::TransportSend(_) => {
-                let detail = explain(&error);
+                let shown = explain(&error);
+                let detail = for_model(&shown);
                 if connection_lost(&error) {
-                    slot.state().transport_error = Some(format!("호출이 서버에 닿지 못해 다시 연결합니다: {detail}"));
+                    slot.state().transport_error = Some(format!("호출이 서버에 닿지 못해 다시 연결합니다: {shown}"));
                     broken.notify_one();
                     return anyhow!(
                         "mcp_server_unavailable: the connection to MCP server {} failed during the call ({detail}); it is being reconnected",
@@ -793,7 +797,7 @@ impl Offered {
                     status => anyhow!("mcp_request_failed: MCP server {} answered HTTP {} ({detail})", self.server, status.unwrap_or(403)),
                 }
             }
-            other => anyhow!("mcp_request_failed: {}", redact(&other.to_string())),
+            other => anyhow!("mcp_request_failed: {}", for_model(&redact(&other.to_string()))),
         }
     }
 }
@@ -1340,6 +1344,17 @@ fn explain<E: std::error::Error + std::fmt::Debug>(error: &E) -> String {
         Some("서버가 요청을 거절했습니다(뒤의 서버 문구를 확인하세요)".to_owned())
     } else if unreadable(error) {
         Some("서버 응답을 JSON-RPC 메시지로 읽지 못했습니다(서버의 응답 형식을 확인하세요)".to_owned())
+    } else if let Some(status) = http_status(error) {
+        // An answer: its status says why, not a status or a cause its body
+        // quotes (a proxy's page naming its upstream's).
+        match status {
+            429 => Some("서버가 요청 수를 제한하고 있습니다(잠시 뒤 다시 시도하거나, 호스팅 서비스라면 API 키를 비밀 헤더에 넣으세요)".to_owned()),
+            500..=599 => Some("서버 쪽 오류입니다(HTTP 5xx — 서버나 사이의 프록시 상태를 확인하세요)".to_owned()),
+            401 | 403 => Some("서버가 인증을 거절했습니다(인증 헤더의 토큰을 확인하세요)".to_owned()),
+            301 | 302 | 303 | 307 | 308 => Some("서버가 다른 주소로 보내려 합니다(리디렉션을 따라가지 않습니다). 최종 주소를 직접 적어주세요".to_owned()),
+            404 | 405 => Some("주소에 MCP 엔드포인트가 없습니다(경로를 확인하세요, 예: /mcp)".to_owned()),
+            _ => None,
+        }
     } else if debug.contains("InvalidCertificate") || debug.contains("certificate is not trusted") || debug.contains("UnknownIssuer") {
         let detail = regex::Regex::new(r#"InvalidCertificate\((?:[^"()]*\()*"?([^"()]+)"?"#)
             .unwrap()
@@ -1351,27 +1366,29 @@ fn explain<E: std::error::Error + std::fmt::Debug>(error: &E) -> String {
         Some("연결이 거부되었습니다(서버가 꺼져 있거나 주소·포트가 틀렸습니다)".to_owned())
     } else if debug.contains("dns error") || debug.contains("failed to lookup address") || debug.contains("nodename nor servname") {
         Some("주소의 호스트 이름을 찾지 못했습니다".to_owned())
-    } else if debug.contains("HTTP 429") {
-        Some("서버가 요청 수를 제한하고 있습니다(잠시 뒤 다시 시도하거나, 호스팅 서비스라면 API 키를 비밀 헤더에 넣으세요)".to_owned())
-    } else if regex::Regex::new(r"HTTP 5\d\d").unwrap().is_match(&debug) {
-        Some("서버 쪽 오류입니다(HTTP 5xx — 서버나 사이의 프록시 상태를 확인하세요)".to_owned())
-    } else if debug.contains("HTTP 401") || debug.contains("HTTP 403") || debug.contains("AuthRequired") {
+    } else if debug.contains("AuthRequired") {
         Some("서버가 인증을 거절했습니다(인증 헤더의 토큰을 확인하세요)".to_owned())
     } else if debug.contains("TimedOut") || debug.contains("timed out") {
         Some("연결 시간이 초과되었습니다".to_owned())
-    } else if ["HTTP 301", "HTTP 302", "HTTP 303", "HTTP 307", "HTTP 308"].iter().any(|code| debug.contains(code)) {
-        Some("서버가 다른 주소로 보내려 합니다(리디렉션을 따라가지 않습니다). 최종 주소를 직접 적어주세요".to_owned())
-    } else if debug.contains("HTTP 404") || debug.contains("HTTP 405") {
-        Some("주소에 MCP 엔드포인트가 없습니다(경로를 확인하세요, 예: /mcp)".to_owned())
     } else if debug.contains("UnexpectedContentType") {
         Some("MCP 서버가 아닌 응답(웹 페이지 등)이 왔습니다. 주소와 사이의 프록시를 확인하세요".to_owned())
     } else {
         None
     };
-    redact(&match cause {
+    // The error ends in the body the server answered with (a proxy's error
+    // page, a web app's 404 page), all of it: it goes to the model and the
+    // admin screen cut as a server's error message is.
+    let shown = redact(&shown);
+    let total = shown.chars().count();
+    let shown = if total > MAX_QUOTED_CHARS {
+        format!("{}… ({} more characters)", shown.chars().take(MAX_QUOTED_CHARS).collect::<String>(), total - MAX_QUOTED_CHARS)
+    } else {
+        shown
+    };
+    match cause {
         Some(cause) => format!("{cause} — {shown}"),
         None => shown,
-    })
+    }
 }
 
 /// A message as one console line: the server's words in it (its name, an
@@ -1389,6 +1406,20 @@ fn redact(text: &str) -> String {
     url.replace_all(text, |c: &regex::Captures| {
         let query = if c.get(5).is_some_and(|q| q.as_str().len() > 1) { "?…" } else { "" };
         format!("{}{}{}{query}", &c[1], &c[3], &c[4])
+    })
+    .into_owned()
+}
+
+/// A message of ours (a connection error quotes the server's address) as
+/// the model is told it: each URL its scheme and host only. Hosted MCP
+/// services put their secret in the path (Zapier `…/api/mcp/s/<secret>/mcp`,
+/// Make `…/u/<token>/…`), and the model's provider is outside; the admin
+/// screen shows the address configured anyway.
+fn for_model(text: &str) -> String {
+    let url = regex::Regex::new(r#"(?i)\b(https?://)([^\s/?#)"'@]*@)?([^\s/?#)"']+)([^\s)"']*)"#).unwrap();
+    url.replace_all(text, |c: &regex::Captures| {
+        let rest = if c.get(4).is_some_and(|rest| rest.as_str().len() > 1) { "/…" } else { "" };
+        format!("{}{}{rest}", &c[1], &c[3])
     })
     .into_owned()
 }
@@ -1419,9 +1450,10 @@ fn connection_lost(error: &ServiceError) -> bool {
 }
 
 /// The HTTP status an HTTP transport error carries, from its debug form (the
-/// SDK keeps it only as text there).
+/// SDK keeps it only as text there, before the body: "HTTP 404 Not Found:
+/// …"). A status a server's message or a body names is not the answer's.
 fn http_status<E: std::fmt::Debug>(error: &E) -> Option<u16> {
-    regex::Regex::new(r"HTTP (\d{3})")
+    regex::Regex::new(r#"UnexpectedServerResponse\("HTTP (\d{3})"#)
         .unwrap()
         .captures(&format!("{error:?}"))
         .and_then(|c| c[1].parse().ok())
@@ -2095,6 +2127,13 @@ mod tests {
         assert_eq!(redact("http://127.0.0.1:9/mcp failed"), "http://127.0.0.1:9/mcp failed");
         assert_eq!(redact("see \"http://h/p?token=a\" and http://h/q?"), "see \"http://h/p?…\" and http://h/q");
         assert_eq!(redact("no url here"), "no url here");
+        // The model is told the host only: hosted services put a secret in the path.
+        assert_eq!(
+            for_model("error sending request for url (https://mcp.zapier.com/api/mcp/s/s3cret/mcp), when send"),
+            "error sending request for url (https://mcp.zapier.com/…), when send"
+        );
+        assert_eq!(for_model("http://127.0.0.1:9 failed, http://h/ too"), "http://127.0.0.1:9 failed, http://h too");
+        assert_eq!(for_model("see \"https://u:pw@h:1/p?k=v\""), "see \"https://h:1/…\"");
     }
 
     #[test]
@@ -2122,6 +2161,16 @@ mod tests {
         assert!(connection_lost(&send(&quoted)));
         assert!(explain(&send(&quoted)).starts_with("서버가 이 세션을 더는 모릅니다"));
         assert!(!connection_lost(&ServiceError::Timeout { timeout: Duration::from_secs(1) }));
+        // The hint follows the status answered, not a status the body names
+        // (eighteenth pass: a 401 whose page said "HTTP 503" was a server error).
+        for (said, hint) in [
+            ("HTTP 401 Unauthorized: the upstream said HTTP 503 earlier", "서버가 인증을 거절했습니다"),
+            ("HTTP 404 Not Found: <p>HTTP 429 limits apply</p>", "주소에 MCP 엔드포인트가 없습니다"),
+            ("HTTP 502 Bad Gateway: HTTP 401 from the backend", "서버 쪽 오류입니다"),
+            ("HTTP 429 Too Many Requests: see HTTP 404 docs", "서버가 요청 수를 제한하고"),
+        ] {
+            assert!(explain(&send(said)).starts_with(hint), "{said}: {}", explain(&send(said)));
+        }
     }
 
     #[test]

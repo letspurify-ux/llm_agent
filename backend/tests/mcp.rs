@@ -2077,6 +2077,10 @@ async fn slips_of_the_protocol_neither_hang_nor_end_the_session() {
         (r#"{"jsonrpc":"2.0","result":null,"error":{"code":-32602,"message":"text must be short"}}"#, Err("invalid_tool_arguments: shape__echo refused the arguments: text must be short")),
         (r#"{"result":null,"error":{"code":-32000,"message":"old style"}}"#, Err("mcp_request_failed: old style (code -32000)")),
         (r#"{"result":{"content":[{"type":"text","text":"no error"}]},"error":null}"#, Ok("no error")),
+        // A code past the SDK's 32-bit one, or written as a float, read as
+        // the error it is (eighteenth pass: the SDK dropped the message).
+        (r#"{"jsonrpc":"2.0","error":{"code":5000000000,"message":"big code"}}"#, Err("mcp_request_failed: big code (code -32603)")),
+        (r#"{"jsonrpc":"2.0","error":{"code":-32602.0,"message":"float code"}}"#, Err("invalid_tool_arguments: shape__echo refused the arguments: float code")),
     ];
     for mode in ["stdio", "sse"] {
         let remote;
@@ -2533,4 +2537,172 @@ async fn a_servers_error_message_is_bounded_like_a_tools() {
         assert!(error.chars().count() < 4_400, "{code}: {} characters", error.chars().count());
     }
     hub.shutdown().await;
+}
+
+/// A model endpoint that refuses its first requests in the words given, one
+/// each, and answers the rest from the script.
+struct RefusesFirst {
+    inner: std::sync::Arc<Scripted>,
+    refusals: std::sync::Mutex<std::collections::VecDeque<String>>,
+}
+
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for RefusesFirst {
+    async fn complete(
+        &self,
+        request: Value,
+        config: &llm_agent::config::LlmConfig,
+        cancel: CancellationToken,
+        delta: tokio::sync::mpsc::Sender<String>,
+    ) -> anyhow::Result<llm_agent::llm::Completion> {
+        let refusal = self.refusals.lock().unwrap().pop_front();
+        if let Some(refusal) = refusal {
+            self.inner.requests.lock().unwrap().push(request);
+            anyhow::bail!(refusal);
+        }
+        self.inner.complete(request, config, cancel, delta).await
+    }
+}
+
+/// MCP review, eighteenth pass: a provider that validates the model's tool
+/// calls (Groq: `tool_use_failed`) refuses the request when the model writes
+/// a call that does not match its tool, naming the tool. That was taken for
+/// a refusal of the tool's definition: the tool was left out of the question
+/// and of every later one sent there, though its definition was taken — the
+/// model only wrote one bad call.
+#[tokio::test]
+async fn a_bad_call_the_provider_refuses_does_not_leave_its_tool_out() {
+    if node_missing() {
+        return;
+    }
+    let refusals = [
+        r#"http_400: {"error":{"message":"tool call validation failed: parameters for tool fake__echo did not match schema: errors: [missing properties: 'text']","type":"invalid_request_error","code":"tool_use_failed","failed_generation":"<function=fake__echo>{}</function>"}}"#,
+        r#"http_400: {"error":{"message":"Failed to call a function. Please adjust your prompt. See 'failed_generation' for more details.","type":"invalid_request_error","code":"tool_use_failed","failed_generation":"<function=fake__echo>{\"tex\": \"x\"}</function>"}}"#,
+    ];
+    for refusal in refusals {
+        let config = config(vec![fake("fake", &["echo", "add"], &[])]);
+        let scripted = Scripted::new(vec![text("끝"), text("둘째")]);
+        let llm = std::sync::Arc::new(RefusesFirst { inner: scripted.clone(), refusals: std::sync::Mutex::new([refusal.to_owned()].into()) });
+        let (app, _dir) = app(config.clone(), llm);
+        app.mcp.apply(&config.mcp_servers);
+        ready(&app.mcp, "fake").await;
+        let (result, _) = ask(&app, "에코 해줘").await;
+        assert_eq!(result.unwrap_or_else(|e| panic!("{refusal}: {e:#}")).answer, "끝");
+        let requests = scripted.requests();
+        assert_eq!(requests.len(), 2, "refused once, then asked again");
+        assert!(tool_names(&requests[1]).contains(&"fake__echo".to_owned()), "{:?}", tool_names(&requests[1]));
+        // Asked again told why, as for any call that could not be used.
+        assert!(requests[1].to_string().contains("tool_use_failed"), "the model is told what was wrong");
+        let status = app.mcp.server_status("fake", MODEL).unwrap();
+        let echo = status["tools"].as_array().unwrap().iter().find(|t| t["name"] == "echo").unwrap().clone();
+        assert!(echo["refused"].is_null(), "{echo}");
+        assert!(app.mcp.snapshot(&config).find("fake__echo").is_some());
+        let (result, _) = ask(&app, "다시").await;
+        assert_eq!(result.unwrap().answer, "둘째");
+        assert!(tool_names(&scripted.requests()[2]).contains(&"fake__echo".to_owned()));
+        app.mcp.shutdown().await;
+    }
+}
+
+/// MCP review, eighteenth pass: an allow-list entry may name a tool as the
+/// model sees it (`fake__echo`). Renaming the server on the admin screen
+/// kept such an entry under the old name, which no tool answers any more:
+/// the tool silently left every question.
+#[tokio::test]
+async fn renaming_a_server_keeps_its_tools_allowed() {
+    if node_missing() {
+        return;
+    }
+    let mut keyed = config(vec![]);
+    keyed.admin_token = Some(Secret("key".into()));
+    let (app, _dir) = app(keyed, Scripted::new(vec![]));
+    let admin = Admin { router: llm_agent::web::router(app.clone()), token: Some("key".into()) };
+    let draft = json!({"name":"fake","command":"node","args":[fixture().display().to_string()],"tools":["fake__echo","add","FAKE__strict"]});
+    let (status, created, text) = admin.send("POST", "mcp", Some(draft), None).await;
+    assert_eq!(status, 201, "{text}");
+    ready(&app.mcp, "fake").await;
+    assert_eq!(app.mcp.snapshot(&app.config()).names().collect::<Vec<_>>(), ["fake__echo", "fake__add"]);
+    // As the screen sends it: the whole form, the entries as they were.
+    let renamed = json!({"name":"jira","command":"node","args":[fixture().display().to_string()],"tools":["fake__echo","add","FAKE__strict"]});
+    let (status, updated, text) = admin.send("PUT", "mcp/fake", Some(renamed), Some(created["revision"].as_str().unwrap())).await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(updated["tools"], json!(["jira__echo", "add", "FAKE__strict"]), "an entry that named no tool of it (another case) stays as it was");
+    ready(&app.mcp, "jira").await;
+    assert_eq!(app.mcp.snapshot(&app.config()).names().collect::<Vec<_>>(), ["jira__echo", "jira__add"]);
+    // A name changed in case only: the model's names follow it.
+    let (status, updated, text) = admin.send("PUT", "mcp/jira", Some(json!({"name":"Jira"})), Some(updated["revision"].as_str().unwrap())).await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(updated["tools"], json!(["Jira__echo", "add", "FAKE__strict"]));
+    ready(&app.mcp, "Jira").await;
+    assert_eq!(app.mcp.snapshot(&app.config()).names().collect::<Vec<_>>(), ["Jira__echo", "Jira__add"]);
+    app.mcp.shutdown().await;
+}
+
+/// MCP review, eighteenth pass: hosted MCP services put their secret in the
+/// address's path (Zapier `…/api/mcp/s/<secret>/mcp`, Make `…/u/<token>/…`).
+/// A connection error quotes the address whole, and it went to the model's
+/// provider in `mcp_server_unavailable`, the path with it: the model is told
+/// the server's host only. The admin screen, which shows the address
+/// anyway, keeps it.
+#[tokio::test]
+async fn a_secret_in_the_address_path_is_not_told_to_the_model() {
+    if node_missing() {
+        return;
+    }
+    let remote = HttpServer::start(&[]);
+    let port: u16 = remote.url.rsplit(':').next().unwrap().trim_end_matches("/mcp").parse().unwrap();
+    let url = format!("{}/s/SECRETPATH/mcp", remote.url);
+    let server = McpServer { name: "web".into(), url, tools: vec!["echo".into()], ..Default::default() };
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "web").await;
+    drop(remote);
+    let error = call(&hub, &config, "web__echo", json!({"text":"x"})).await.unwrap_err().to_string();
+    assert!(error.starts_with("mcp_server_unavailable:") && error.contains("연결이 거부되었습니다"), "{error}");
+    assert!(!error.contains("SECRETPATH"), "{error}");
+    assert!(error.contains(&format!("127.0.0.1:{port}")), "the host is still named: {error}");
+    let failed = wait_for(&hub, "web", |s| s["state"] == "failed").await;
+    let told = hub.unoffered("web__echo").expect("told why");
+    assert!(told.starts_with("mcp_server_unavailable:") && !told.contains("SECRETPATH"), "{told}");
+    assert!(told.contains("연결이 거부되었습니다"), "the cause is kept: {told}");
+    assert!(failed["error"].as_str().unwrap().contains("SECRETPATH"), "the admin sees the address configured: {failed:#}");
+    hub.shutdown().await;
+}
+
+/// MCP review, eighteenth pass: an HTTP error quotes the body the server
+/// answered with — a proxy's error page, a web app's 404 page — and the
+/// whole of it went to the model in the call's error (and stayed in the
+/// server's error, which the admin screen reads every few seconds), as the
+/// JSON-RPC error messages bounded in the sixteenth pass did.
+#[tokio::test]
+async fn an_error_page_the_server_answers_with_is_bounded() {
+    if node_missing() {
+        return;
+    }
+    let body = "200000";
+    let remote = HttpServer::start(&[("FAKE_MCP_CALL_STATUS", "502"), ("FAKE_MCP_CALL_STATUS_TOOL", "echo"), ("FAKE_MCP_ERROR_BODY", body)]);
+    let server = McpServer { name: "proxied".into(), url: remote.url.clone(), tools: vec!["echo".into()], ..Default::default() };
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "proxied").await;
+    let error = call(&hub, &config, "proxied__echo", json!({"text":"x"})).await.unwrap_err().to_string();
+    assert!(error.starts_with("mcp_request_failed:") && error.contains("서버 쪽 오류") && error.contains("<html><body>xxx"), "{}", &error[..300.min(error.len())]);
+    assert!(error.chars().count() < 3_000, "{} characters to the model", error.chars().count());
+    hub.shutdown().await;
+    // A page at an address that is no MCP endpoint, at the initialization:
+    // the server's error, the model's cause and the probe's message.
+    let wrong = McpServer { name: "wrong".into(), url: remote.url.replace("/mcp", "/app"), tools: vec!["echo".into()], ..Default::default() };
+    let hub = McpHub::default();
+    hub.apply(std::slice::from_ref(&wrong));
+    let failed = wait_for(&hub, "wrong", |s| s["state"] == "failed").await;
+    let shown = failed["error"].as_str().unwrap();
+    assert!(shown.contains("MCP 엔드포인트가 없습니다") && shown.contains("<html><body>xxx"), "{}", &shown[..300.min(shown.len())]);
+    assert!(shown.chars().count() < 3_000, "{} characters on the admin screen", shown.chars().count());
+    let told = hub.unoffered("wrong__echo").unwrap();
+    assert!(told.chars().count() < 3_000, "{} characters to the model", told.chars().count());
+    hub.shutdown().await;
+    let checked = probe(&wrong, MODEL).await.unwrap();
+    assert!(checked["message"].as_str().unwrap().chars().count() < 3_000);
 }

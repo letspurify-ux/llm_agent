@@ -54,7 +54,13 @@ fn put_right(text: &[u8]) -> Option<Vec<u8>> {
     if !matches!(head.result, Some(Some(_))) && head.method.is_none() && head.error.is_null() {
         return None;
     }
-    let error_ok = head.error.is_null() || (head.error["code"].is_i64() && head.error["message"].is_string());
+    // The SDK reads a code as a 32-bit integer: one past it, or written as a
+    // float (-32602.0), fails the whole message.
+    let code = |error: &Value| {
+        let integral = error["code"].as_f64().filter(|c| c.fract() == 0.0).map(|c| c as i64);
+        error["code"].as_i64().or(integral).and_then(|c| i32::try_from(c).ok())
+    };
+    let error_ok = head.error.is_null() || (head.error["code"].is_i64() && code(&head.error).is_some() && head.error["message"].is_string());
     // An error beside a null result (JSON-RPC 1.0 sends both, so does a Go
     // struct without omitempty) reads as a success with a null result, the
     // error lost: a tool list refused would be a list without tools.
@@ -70,7 +76,7 @@ fn put_right(text: &[u8]) -> Option<Vec<u8>> {
     if !error_ok {
         let error = &head.error;
         let text = error["message"].as_str().map(str::to_owned).or_else(|| error.as_str().map(str::to_owned)).unwrap_or_else(|| error.to_string());
-        let mut fixed = json!({"code":error["code"].as_i64().unwrap_or(-32603),"message":text});
+        let mut fixed = json!({"code":code(error).unwrap_or(-32603),"message":text});
         if !error["data"].is_null() {
             fixed["data"] = error["data"].clone();
         }
@@ -309,6 +315,13 @@ mod tests {
         assert_eq!(fixed(r#"{"jsonrpc":"2.0","id":1,"error":{"code":"E1","message":"m","data":[1]}}"#)["error"], json!({"code":-32603,"message":"m","data":[1]}));
         assert_eq!(fixed(r#"{"jsonrpc":"2.0","id":1,"error":"just text"}"#)["error"], json!({"code":-32603,"message":"just text"}));
         assert_eq!(fixed(r#"{"jsonrpc":"2.0","id":1,"error":{"code":5}}"#)["error"], json!({"code":5,"message":"{\"code\":5}"}));
+        // The SDK reads a code as a 32-bit integer: one past it, or written
+        // as a float, would drop the whole message.
+        for (code, read) in [("5000000000", -32603), ("-32602.0", -32602), ("1.5", -32603)] {
+            let text = format!(r#"{{"jsonrpc":"2.0","id":1,"error":{{"code":{code},"message":"m"}}}}"#);
+            assert_eq!(fixed(&text)["error"], json!({"code":read,"message":"m"}), "{code}");
+            assert!(serde_json::from_slice::<ServerJsonRpcMessage>(&mend(text.as_bytes()).unwrap()).is_ok(), "{code}");
+        }
         // An error beside a null result is the error (JSON-RPC 1.0 sends both).
         assert_eq!(fixed(r#"{"jsonrpc":"2.0","id":1,"result":null,"error":{"code":-32602,"message":"m"}}"#), json!({"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"m"}}));
         assert_eq!(fixed(r#"{"id":1,"result":null,"error":{"code":-1,"message":"m"}}"#), json!({"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"m"}}));

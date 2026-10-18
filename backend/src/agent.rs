@@ -534,11 +534,13 @@ async fn run(
                 // tool is in: the question goes on without the tools its
                 // refusal names, and later questions sent there leave them
                 // out. Not so for a request sent without its tools, whose
-                // refusal is not about them.
+                // refusal is not about them, nor for a refusal of the calls
+                // the model wrote, which names the tool it called.
                 let tools_sent = !error
                     .downcast_ref::<crate::llm::CompletionError>()
                     .is_some_and(|e| e.tools_dropped());
-                if tools_sent && (refusal.starts_with("http_400:") || refusal.starts_with("http_422:")) {
+                let generation = crate::llm::refused_generation(&refusal);
+                if tools_sent && !generation && (refusal.starts_with("http_400:") || refusal.starts_with("http_422:")) {
                     let refused = mcp.refused_in(&refusal, &definitions);
                     if !refused.is_empty() {
                         eprintln!("[mcp] the model endpoint refused the definitions of {}; asking without them", refused.join(", "));
@@ -556,9 +558,10 @@ async fn run(
                 // nothing ran. The client asks again only while none of the
                 // response's text has gone out, so one that wrote first (a
                 // sentence before its calls) ended the question; it is asked
-                // again here, told what was wrong.
+                // again here, told what was wrong. So is a response whose
+                // calls the provider refused.
                 let message = error.to_string();
-                if crate::llm::unusable_tool_calls(&message) {
+                if crate::llm::unusable_tool_calls(&message) || generation {
                     if unusable < UNUSABLE_RETRIES {
                         unusable += 1;
                         discard();
