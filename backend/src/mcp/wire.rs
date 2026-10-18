@@ -15,17 +15,29 @@
 //! - an HTTP error that answers no request (`"id": null`, a session the
 //!   server no longer knows) fails that request, rather than leave it
 //!   waiting for an answer that never comes.
+//!
+//! The HTTP client also paces the event streams it opens (see `Lenient`),
+//! and says when the SDK initialized a new session in place of one the
+//! server forgot.
 
 use futures_util::StreamExt;
 use rmcp::{
-    model::{ClientJsonRpcMessage, RequestId, ServerJsonRpcMessage},
+    model::{ClientJsonRpcMessage, ClientRequest, RequestId, ServerJsonRpcMessage},
     transport::{
         common::client_side_sse::BoxedSseResponse,
         streamable_http_client::{StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse},
     },
 };
 use serde_json::{Value, json};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+use tokio::sync::Notify;
 
 /// A message as the SDK can read it; `None` when it already can (or is no
 /// JSON-RPC message at all, which the SDK drops anyway).
@@ -324,23 +336,75 @@ fn escapes_mended(json: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// The MCP HTTP client: rmcp's own (no redirects, no idle connections) with
-/// the events of its SSE responses mended. A plain JSON response is parsed
-/// inside rmcp, out of reach: one that cannot be read fails that call only.
+/// Event streams (GET) one connection opens at once, then one each
+/// `STREAM_INTERVAL`. The SDK opens a stream again as soon as one breaks,
+/// without a wait, and again at once when the server's `retry` says 0: a
+/// server or proxy that broke each stream as it opened it was asked some
+/// fourteen thousand times a second, for as long as the connection lasted,
+/// while it showed ready.
+const STREAMS_AT_ONCE: u32 = 8;
+const STREAM_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The MCP HTTP client of one connection: rmcp's own (no redirects, no
+/// idle connections) with the events of its SSE responses mended. A plain
+/// JSON response is parsed inside rmcp, out of reach: one that cannot be
+/// read fails that call only.
 #[derive(Clone)]
-pub struct Lenient(reqwest13::Client);
+pub struct Lenient {
+    client: reqwest13::Client,
+    /// When the next event stream may open, the ones at once aside.
+    next_stream: Arc<Mutex<tokio::time::Instant>>,
+    /// Sessions initialized: past the first, the SDK made a new one for a
+    /// session the server forgot (HTTP 404 — a server restarted, deployed
+    /// again), without a word to its handler. `renewed` is rung for each.
+    sessions: Arc<AtomicU64>,
+    renewed: Arc<Notify>,
+}
 
 impl Lenient {
     /// Fails where the client cannot be built (no certificate store the
     /// platform verifier can load): the server's connection fails with why,
     /// rather than its supervisor or the admin's request with a panic.
-    pub fn new() -> Result<Self, reqwest13::Error> {
+    pub fn new(renewed: Arc<Notify>) -> Result<Self, reqwest13::Error> {
         let client = reqwest13::Client::builder()
             .pool_max_idle_per_host(0)
             .redirect(reqwest13::redirect::Policy::none())
             .build()?;
-        Ok(Self(client))
+        Ok(Self { client, next_stream: Arc::new(Mutex::new(tokio::time::Instant::now())), sessions: Arc::default(), renewed })
     }
+
+    /// The sessions initialized so far.
+    pub fn sessions(&self) -> Arc<AtomicU64> {
+        self.sessions.clone()
+    }
+
+    /// Waits until an event stream may open: `STREAMS_AT_ONCE` right away,
+    /// then one each `STREAM_INTERVAL`.
+    async fn paced(&self) {
+        let start = {
+            let mut next = self.next_stream.lock().unwrap_or_else(|p| p.into_inner());
+            let at = (*next).max(tokio::time::Instant::now());
+            *next = at + STREAM_INTERVAL;
+            at.checked_sub(STREAM_INTERVAL * (STREAMS_AT_ONCE - 1))
+        };
+        if let Some(start) = start {
+            tokio::time::sleep_until(start).await;
+        }
+    }
+
+    /// Counts an initialization the server answered (not with an error).
+    fn initialized(&self, response: &Result<StreamableHttpPostResponse, StreamableHttpError<reqwest13::Error>>) {
+        if matches!(response, Ok(StreamableHttpPostResponse::Json(ServerJsonRpcMessage::Error(_), _)) | Err(_)) {
+            return;
+        }
+        if self.sessions.fetch_add(1, Ordering::AcqRel) > 0 {
+            self.renewed.notify_one();
+        }
+    }
+}
+
+fn initializes(message: &ClientJsonRpcMessage) -> bool {
+    matches!(message, ClientJsonRpcMessage::Request(request) if matches!(request.request, ClientRequest::InitializeRequest(_)))
 }
 
 fn mended_events(stream: BoxedSseResponse) -> BoxedSseResponse {
@@ -410,8 +474,12 @@ impl StreamableHttpClient for Lenient {
         auth_header: Option<String>,
         custom_headers: Headers,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        let (asked, with_session) = (request_id(&message), session_id.is_some());
-        mended_response(asked, with_session, self.0.post_message(uri, message, session_id, auth_header, custom_headers).await)
+        let (asked, with_session, initialize) = (request_id(&message), session_id.is_some(), initializes(&message));
+        let response = mended_response(asked, with_session, self.client.post_message(uri, message, session_id, auth_header, custom_headers).await);
+        if initialize {
+            self.initialized(&response);
+        }
+        response
     }
 
     async fn post_message_with_max_sse_event_size(
@@ -423,12 +491,16 @@ impl StreamableHttpClient for Lenient {
         custom_headers: Headers,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        let (asked, with_session) = (request_id(&message), session_id.is_some());
+        let (asked, with_session, initialize) = (request_id(&message), session_id.is_some(), initializes(&message));
         let response = self
-            .0
+            .client
             .post_message_with_max_sse_event_size(uri, message, session_id, auth_header, custom_headers, max_sse_event_size)
             .await;
-        mended_response(asked, with_session, response)
+        let response = mended_response(asked, with_session, response);
+        if initialize {
+            self.initialized(&response);
+        }
+        response
     }
 
     async fn delete_session(
@@ -438,7 +510,7 @@ impl StreamableHttpClient for Lenient {
         auth_header: Option<String>,
         custom_headers: Headers,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
-        self.0.delete_session(uri, session_id, auth_header, custom_headers).await
+        self.client.delete_session(uri, session_id, auth_header, custom_headers).await
     }
 
     async fn get_stream(
@@ -449,7 +521,8 @@ impl StreamableHttpClient for Lenient {
         auth_header: Option<String>,
         custom_headers: Headers,
     ) -> Result<BoxedSseResponse, StreamableHttpError<Self::Error>> {
-        self.0.get_stream(uri, session_id, last_event_id, auth_header, custom_headers).await.map(mended_events)
+        self.paced().await;
+        self.client.get_stream(uri, session_id, last_event_id, auth_header, custom_headers).await.map(mended_events)
     }
 
     async fn get_stream_with_max_sse_event_size(
@@ -461,7 +534,8 @@ impl StreamableHttpClient for Lenient {
         custom_headers: Headers,
         max_sse_event_size: usize,
     ) -> Result<BoxedSseResponse, StreamableHttpError<Self::Error>> {
-        self.0
+        self.paced().await;
+        self.client
             .get_stream_with_max_sse_event_size(uri, session_id, last_event_id, auth_header, custom_headers, max_sse_event_size)
             .await
             .map(mended_events)
@@ -668,6 +742,27 @@ mod tests {
                 None => assert!(!unwritable, "{text}"),
             }
         }
+    }
+
+    /// Twenty-fifth pass: the SDK opened a broken event stream again
+    /// without a wait, some fourteen thousand times a second.
+    #[tokio::test(start_paused = true)]
+    async fn event_streams_open_eight_at_once_then_one_a_second() {
+        super::super::install_tls();
+        let client = Lenient::new(Arc::default()).unwrap();
+        let opened = async || {
+            let started = tokio::time::Instant::now();
+            let mut at = vec![];
+            for _ in 0..11 {
+                client.paced().await;
+                at.push(started.elapsed().as_secs());
+            }
+            at
+        };
+        assert_eq!(opened().await, [0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3]);
+        // Streams that lasted leave room for as many at once again.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(opened().await, [0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3]);
     }
 
     #[test]

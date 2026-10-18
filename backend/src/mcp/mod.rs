@@ -1263,6 +1263,8 @@ struct Connection {
     ended: Pin<Box<dyn FusedFuture<Output = ()> + Send>>,
     close: CancellationToken,
     list_changed: Arc<Notify>,
+    /// Sessions an HTTP connection initialized (see `wire::Lenient`).
+    sessions: Arc<std::sync::atomic::AtomicU64>,
     link: Arc<Link>,
 }
 
@@ -1402,6 +1404,15 @@ async fn serve(slot: &Arc<Slot>, server: &McpServer, connection: &mut Connection
     let broken = |slot: &Arc<Slot>| {
         Ended::Failed(slot.state().transport_error.take().unwrap_or_else(|| "연결에 문제가 있어 다시 연결합니다".to_owned()))
     };
+    use std::sync::atomic::Ordering;
+    // Sessions an HTTP server forgot are logged as the SDK makes new ones.
+    let mut seen = connection.sessions.load(Ordering::Acquire).max(1);
+    let mut renewed = |slot: &Arc<Slot>, now: u64| {
+        if now > seen {
+            seen = now;
+            slot.log("event", "서버가 세션을 잊어(다시 시작되었거나 새로 배포되었을 수 있습니다) 새 세션으로 이어 가고 도구 목록을 다시 읽습니다");
+        }
+    };
     loop {
         tokio::select! {
             _ = slot.stop.cancelled() => return Ended::Stopped,
@@ -1417,6 +1428,8 @@ async fn serve(slot: &Arc<Slot>, server: &McpServer, connection: &mut Connection
                     _ = connection.link.broken.notified() => return broken(slot),
                     _ = tokio::time::sleep(RELIST_WAIT) => {}
                 }
+                let before = connection.sessions.load(Ordering::Acquire);
+                renewed(slot, before);
                 // A server that stopped answering keeps the list waiting up to
                 // its limit: a reconnect asked meanwhile is not held up by it.
                 let known = slot.state().tools.clone();
@@ -1427,6 +1440,15 @@ async fn serve(slot: &Arc<Slot>, server: &McpServer, connection: &mut Connection
                     _ = connection.link.broken.notified() => return broken(slot),
                     listed = tokio::time::timeout(Duration::from_secs(CONNECT_SECS), list_tools(&connection.peer, &server.name, &known)) => listed,
                 };
+                // A session made anew while the list was read (its request
+                // finding the old one forgotten) is the one it was read from,
+                // and not read again: a server that forgets each new session
+                // would be read without end.
+                let after = connection.sessions.load(Ordering::Acquire);
+                if after != before {
+                    renewed(slot, after);
+                    let _ = connection.list_changed.notified().now_or_never();
+                }
                 match listed {
                     Ok(Ok(Listed { tools, notes })) => {
                         let names = |tools: &[Arc<RemoteTool>]| tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
@@ -1804,12 +1826,16 @@ async fn connect(slot: &Arc<Slot>, server: &McpServer) -> Result<Connection> {
     let list_changed = Arc::new(Notify::new());
     let handler = Handler { slot: Arc::downgrade(slot), list_changed: list_changed.clone() };
     let close = CancellationToken::new();
+    let mut sessions = Arc::default();
     let service = if server.url.trim().is_empty() {
         let process = spawn(slot, server)?;
         handler.serve_with_ct(process, close.clone()).await
     } else {
         install_tls();
-        let client = wire::Lenient::new().map_err(|e| anyhow!("HTTP 클라이언트를 만들지 못했습니다: {}", causes(&e)))?;
+        // A session made anew in place of one the server forgot is read as
+        // a changed tool list: a server deployed again may list others.
+        let client = wire::Lenient::new(list_changed.clone()).map_err(|e| anyhow!("HTTP 클라이언트를 만들지 못했습니다: {}", causes(&e)))?;
+        sessions = client.sessions();
         handler
             .serve_with_ct(StreamableHttpClientTransport::with_client(client, http_config(server)?), close.clone())
             .await
@@ -1823,7 +1849,7 @@ async fn connect(slot: &Arc<Slot>, server: &McpServer) -> Result<Connection> {
         .fuse(),
     );
     let calls = (!server.url.trim().is_empty()).then(|| tokio::sync::Semaphore::new(HTTP_CALLS));
-    Ok(Connection { peer, ended, close, list_changed, link: Arc::new(Link { calls, ..Default::default() }) })
+    Ok(Connection { peer, ended, close, list_changed, sessions, link: Arc::new(Link { calls, ..Default::default() }) })
 }
 
 /// Closes the connection and waits for it (a stdio server is given its
@@ -2224,6 +2250,12 @@ fn http_config(server: &McpServer) -> Result<StreamableHttpClientTransportConfig
     }
     config.custom_headers = headers;
     config.max_concurrent_requests = HTTP_REQUESTS;
+    // An event stream that cannot be opened again is tried after a wait
+    // that doubles, without bound in the SDK: a server away for an hour was
+    // then not heard for about as long (its tool list changes unread).
+    let mut backoff = rmcp::transport::common::client_side_sse::ExponentialBackoff::default();
+    backoff.max_delay = Some(Duration::from_secs(MAX_BACKOFF_SECS));
+    config.retry_config = Arc::new(backoff);
     Ok(config)
 }
 

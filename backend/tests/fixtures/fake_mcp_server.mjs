@@ -70,6 +70,19 @@ let wedged = false;
 let session = 'fake-session';
 let forgotten = false;
 let initializations = 0;
+// FAKE_MCP_SPEC_SESSIONS: a forgotten session gets HTTP 404, as the
+// specification has it (the SDK then makes a new one by itself). A POST to
+// /redeploy forgets it, and the tools listed from then on change: "fail"
+// goes, "fresh" comes (a server deployed again). FAKE_MCP_FORGET_LISTS: each
+// listing after the first forgets the session too (a load balancer without
+// sticky sessions; a listing starts without a cursor).
+let deployed = false;
+let listings = 0;
+// FAKE_MCP_GET: the event stream a client opens with GET breaks as it opens
+// ("break": the connection cut after its headers) or ends at once asking to
+// be opened again without a wait ("retry0"). GET /counts tells how many
+// streams were opened and sessions initialized.
+let streams = 0;
 if (env.FAKE_MCP_FORGET) tools.push({ name: 'forget', description: 'Forget the session, as a restarted server.', inputSchema: { type: 'object' } });
 if (env.FAKE_MCP_WEDGE) tools.push({ name: 'wedge', description: 'Stop answering every request from now on.', inputSchema: { type: 'object' } });
 // A helper started outside the server's process group (as a daemon is),
@@ -129,7 +142,8 @@ async function handle(message, notify) {
     // A list read again in the other order (a server listing from a map):
     // a reading starts without a cursor, its later pages have one.
     if (!params.cursor) readings += 1;
-    const listing = env.FAKE_MCP_REVERSE_RELIST && readings > 1 ? [...tools].reverse() : tools;
+    const current = deployed ? [...tools.filter(tool => tool.name !== 'fail'), { name: 'fresh', description: 'A tool of the new deployment.', inputSchema: { type: 'object' } }] : tools;
+    const listing = env.FAKE_MCP_REVERSE_RELIST && readings > 1 ? [...current].reverse() : current;
     const start = env.FAKE_MCP_CURSOR_LOOP ? 0 : Number(params.cursor || 0);
     const page = listing.slice(start, start + PAGE);
     const next = env.FAKE_MCP_CURSOR_LOOP ? 'again' : start + PAGE < listing.length ? String(start + PAGE) : undefined;
@@ -227,6 +241,8 @@ if (httpMode) {
   const server = http.createServer((req, res) => {
     if (req.url.startsWith('/moved')) { res.writeHead(302, { Location: '/mcp' }).end(); return; }
     if (req.url.startsWith('/page')) { res.writeHead(200, { 'Content-Type': 'text/html' }).end('<html>login</html>'); return; }
+    if (req.url === '/counts') { res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ streams, initializations })); return; }
+    if (req.url === '/redeploy') { deployed = true; forgotten = true; res.writeHead(200).end('deployed'); return; }
     // FAKE_MCP_ERROR_BODY: an error page that many characters long (a proxy's).
     const page = env.FAKE_MCP_ERROR_BODY && `<html><body>${'x'.repeat(Number(env.FAKE_MCP_ERROR_BODY))}</body></html>`;
     if (!req.url.startsWith('/mcp')) { res.writeHead(404, page ? { 'Content-Type': 'text/html' } : {}).end(page || 'not found'); return; }
@@ -235,20 +251,29 @@ if (httpMode) {
       return;
     }
     if (req.method === 'DELETE') { res.writeHead(200).end(); return; }
+    if (req.method === 'GET' && env.FAKE_MCP_GET) {
+      streams += 1;
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+      if (env.FAKE_MCP_GET === 'retry0') res.end('retry: 0\n\n');
+      else { res.flushHeaders(); setImmediate(() => res.socket.destroy()); }
+      return;
+    }
     if (req.method !== 'POST') { res.writeHead(405).end(); return; }
     headersSeen = req.headers;
     let body = '';
     req.on('data', chunk => { body += chunk; });
     req.on('end', async () => {
       const message = JSON.parse(body);
-      if (message.method === 'initialize' && forgotten) { forgotten = false; session = `fake-session-${Date.now()}`; }
+      if (message.method === 'initialize') initializations += 1;
+      if (env.FAKE_MCP_FORGET_LISTS && message.method === 'tools/list' && !message.params?.cursor && listings++ > 0) forgotten = true;
+      if (message.method === 'initialize' && forgotten) { forgotten = false; session = `fake-session-${Date.now()}-${initializations}`; }
       else if (forgotten || (req.headers['mcp-session-id'] && !env.FAKE_MCP_STATELESS && req.headers['mcp-session-id'] !== session)) {
-        res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Bad Request: No valid session ID provided' }, id: null }));
+        res.writeHead(env.FAKE_MCP_SPEC_SESSIONS ? 404 : 400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Bad Request: No valid session ID provided' }, id: null }));
         return;
       }
       // As a TypeScript-SDK server built on one transport: it takes one
       // initialization, and refuses another with HTTP 400 and id null.
-      if (env.FAKE_MCP_SINGLE_INIT && message.method === 'initialize' && initializations++ > 0) {
+      if (env.FAKE_MCP_SINGLE_INIT && message.method === 'initialize' && initializations > 1) {
         res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32600, message: 'Invalid Request: Server already initialized' }, id: null }));
         return;
       }

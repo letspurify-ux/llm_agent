@@ -1233,6 +1233,93 @@ async fn a_server_that_forgot_the_session_is_reconnected_at_once() {
     }
 }
 
+/// The fake HTTP server's counts: event streams opened, sessions initialized.
+async fn counts(remote: &HttpServer) -> Value {
+    reqwest::get(format!("{}/counts", remote.url.trim_end_matches("/mcp"))).await.unwrap().json().await.unwrap()
+}
+
+#[tokio::test]
+async fn event_streams_that_break_as_they_open_are_opened_again_at_a_pace() {
+    if node_missing() {
+        return;
+    }
+    // Twenty-fifth pass: the SDK opens the server's event stream (GET)
+    // again at once when it breaks, and when it ends asking for no wait
+    // ("retry: 0") — some fourteen thousand GETs a second, for as long as
+    // the connection lasted, the server shown ready.
+    for mode in ["break", "retry0"] {
+        let remote = HttpServer::start(&[("FAKE_MCP_GET", mode)]);
+        let server = McpServer { name: "streams".into(), url: remote.url.clone(), tools: vec!["echo".into()], ..Default::default() };
+        let config = config(vec![server]);
+        let hub = McpHub::default();
+        hub.apply(&config.mcp_servers);
+        ready(&hub, "streams").await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        // Eight at once, then one a second (eleven by now; tens of thousands before).
+        let opened = counts(&remote).await["streams"].as_u64().unwrap();
+        assert!((2..=20).contains(&opened), "{mode}: {opened} streams in about three seconds");
+        assert_eq!(call(&hub, &config, "streams__echo", json!({"text":"x"})).await.unwrap()["text"], "echo: x", "{mode}");
+        assert_eq!(hub.server_status("streams", MODEL).unwrap()["restarts"], 0, "{mode}");
+        hub.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn a_session_the_server_forgot_is_listed_again() {
+    if node_missing() {
+        return;
+    }
+    // A server following the specification answers a session it forgot
+    // with HTTP 404, and the SDK makes a new one by itself, without a word
+    // to its handler. Deployed again with other tools, the server was still
+    // offered with its old ones (twenty-fifth pass): one removed, called in
+    // vain, and the new one never offered.
+    let remote = HttpServer::start(&[("FAKE_MCP_SPEC_SESSIONS", "1")]);
+    let server = McpServer { name: "spec".into(), url: remote.url.clone(), tools: vec!["*".into()], ..Default::default() };
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "spec").await;
+    let offered = |hub: &McpHub| hub.snapshot(&config).names().map(str::to_owned).collect::<Vec<_>>();
+    assert!(offered(&hub).contains(&"spec__fail".to_owned()) && !offered(&hub).contains(&"spec__fresh".to_owned()));
+    reqwest::get(format!("{}/redeploy", remote.url.trim_end_matches("/mcp"))).await.unwrap();
+    // The call goes through the new session, and the tools are read again
+    // on the same connection.
+    assert_eq!(call(&hub, &config, "spec__echo", json!({"text":"x"})).await.unwrap()["text"], "echo: x");
+    let status = wait_for(&hub, "spec", |s| s["tools"].as_array().unwrap().iter().any(|t| t["name"] == "fresh")).await;
+    assert!(!status["tools"].as_array().unwrap().iter().any(|t| t["name"] == "fail"), "{status:#}");
+    assert!(offered(&hub).contains(&"spec__fresh".to_owned()) && !offered(&hub).contains(&"spec__fail".to_owned()));
+    assert_eq!((status["state"].clone(), status["restarts"].clone()), (json!("ready"), json!(0)), "{status:#}");
+    assert!(log_text(&status).contains("세션을 잊어"), "{}", log_text(&status));
+    assert_eq!(counts(&remote).await["initializations"], 2);
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_server_forgetting_each_new_session_is_not_listed_without_end() {
+    if node_missing() {
+        return;
+    }
+    // Behind a load balancer without sticky sessions each listing finds its
+    // session forgotten: read again for each session made anew, the list
+    // would be read, and a session made, every second for good.
+    let remote = HttpServer::start(&[("FAKE_MCP_SPEC_SESSIONS", "1"), ("FAKE_MCP_FORGET_LISTS", "1")]);
+    let server = McpServer { name: "balanced".into(), url: remote.url.clone(), tools: vec!["echo".into()], ..Default::default() };
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "balanced").await;
+    reqwest::get(format!("{}/redeploy", remote.url.trim_end_matches("/mcp"))).await.unwrap();
+    assert_eq!(call(&hub, &config, "balanced__echo", json!({"text":"x"})).await.unwrap()["text"], "echo: x");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let settled = counts(&remote).await["initializations"].as_u64().unwrap();
+    assert!(settled >= 3, "the list was read again once: {settled}");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(counts(&remote).await["initializations"].as_u64().unwrap(), settled, "no listing without end");
+    assert_eq!(hub.server_status("balanced", MODEL).unwrap()["state"], "ready");
+    hub.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_server_that_stops_answering_is_reconnected() {
     if node_missing() {
