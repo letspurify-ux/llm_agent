@@ -1171,17 +1171,25 @@ fn mcp_draft(body: &Value, mut server: McpServer) -> ApiResult<McpServer> {
             // A header is one whatever the case of its name: a token entered
             // again as "Authorization" replaces the "authorization" stored.
             let folded = kind == "headers";
-            for (key, value) in values.as_object().ok_or_else(|| bad("secrets"))? {
-                let key = js_trim(key).to_owned();
-                let other = |known: &String| if folded { !known.eq_ignore_ascii_case(&key) } else { *known != key };
-                match value {
-                    Value::Null => target.retain(|known, _| other(known)),
-                    Value::String(v) if !v.is_empty() => {
-                        target.retain(|known, _| other(known));
-                        target.insert(key, Secret(v.clone()));
+            let values = values.as_object().ok_or_else(|| bad("secrets"))?;
+            if values.values().any(|v| !v.is_null() && !v.is_string()) {
+                return Err(bad("secrets"));
+            }
+            // Removals first: the screen lists a value entered in another
+            // case beside the stored one, and the stored one's removal may
+            // follow it in the body.
+            for removals in [true, false] {
+                for (key, value) in values.iter().filter(|(_, v)| v.is_null() == removals) {
+                    let key = js_trim(key).to_owned();
+                    let other = |known: &String| if folded { !known.eq_ignore_ascii_case(&key) } else { *known != key };
+                    match value.as_str() {
+                        None => target.retain(|known, _| other(known)),
+                        Some(v) if !v.is_empty() => {
+                            target.retain(|known, _| other(known));
+                            target.insert(key, Secret(v.to_owned()));
+                        }
+                        Some(_) => {}
                     }
-                    Value::String(_) => {}
-                    _ => return Err(bad("secrets")),
                 }
             }
         }

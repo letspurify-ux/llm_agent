@@ -63,7 +63,7 @@ pub fn description(tool: &Value) -> String {
 /// Descriptions with the server's other tools named as the model sees
 /// them: "use web_fetch_exa" becomes "use exa__web_fetch_exa", or a model
 /// that follows it calls a name that does not exist. Only identifier-like
-/// names (with '_', '.' or '-') are replaced, as whole words: a plain word
+/// names (with '_', '.', '-' or '/') are replaced, as whole words: a plain word
 /// such as "search" is also prose. Built once per listing, one pass per
 /// description (a server may list a thousand tools).
 pub struct Renamer {
@@ -73,8 +73,9 @@ pub struct Renamer {
 
 impl Renamer {
     pub fn new(names: &[(String, String)]) -> Self {
+        // '/' namespaces a name in the 2025-11-25 protocol ("files/read").
         let mut renamed: Vec<&(String, String)> =
-            names.iter().filter(|(name, exposed)| name != exposed && name.contains(['_', '.', '-'])).collect();
+            names.iter().filter(|(name, exposed)| name != exposed && name.contains(['_', '.', '-', '/'])).collect();
         // The longest name first where several start at one place.
         renamed.sort_by_key(|(name, _)| std::cmp::Reverse(name.len()));
         let pattern = renamed.iter().map(|(name, _)| regex::escape(name)).collect::<Vec<_>>().join("|");
@@ -90,15 +91,18 @@ impl Renamer {
         };
         let part = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
         // A word goes on past '-' or '.' with more of it behind: "read-file"
-        // is not the start of "read-file-lines", nor of "fs.read-file".
-        let joined = |chars: &mut dyn Iterator<Item = char>| {
+        // is not the start of "read-file-lines", nor of "fs.read-file". A
+        // name with '/' goes on past '/' too ("files/read" in a path or an
+        // address); another stops there ("web_search/web_fetch").
+        let joined = |chars: &mut dyn Iterator<Item = char>, slashed: bool| {
             let next = chars.next();
-            part(next) || (matches!(next, Some('-' | '.')) && part(chars.next()))
+            part(next) || ((matches!(next, Some('-' | '.')) || (slashed && next == Some('/'))) && part(chars.next()))
         };
         let mut text = String::with_capacity(description.len());
         let mut copied = 0;
         for found in names.find_iter(description) {
-            let whole = !joined(&mut description[..found.start()].chars().rev()) && !joined(&mut description[found.end()..].chars());
+            let slashed = found.as_str().contains('/');
+            let whole = !joined(&mut description[..found.start()].chars().rev(), slashed) && !joined(&mut description[found.end()..].chars(), slashed);
             if whole {
                 text.push_str(&description[copied..found.start()]);
                 text.push_str(&self.exposed[found.as_str()]);
@@ -542,6 +546,12 @@ mod tests {
         let dashed = Renamer::new(&[("read-file".to_owned(), "fs__read_file".to_owned())]);
         assert_eq!(dashed.apply("read-file-lines, x.read-file and read-file."), "read-file-lines, x.read-file and fs__read_file.");
         assert_eq!(dashed.apply("read-file- or -read-file"), "fs__read_file- or -fs__read_file");
+        // Names of the 2025-11-25 protocol may be namespaced with '/'.
+        let slashed = Renamer::new(&[("files/read".to_owned(), "fs__files_read".to_owned())]);
+        assert_eq!(slashed.apply("Use files/read, not files/read/all or my/files/read."), "Use fs__files_read, not files/read/all or my/files/read.");
+        assert_eq!(slashed.apply("from https://h/files/read"), "from https://h/files/read");
+        // Other names stop at '/': alternatives are each a name.
+        assert_eq!(renamer.apply("web_fetch_exa/weird.name"), "exa__web_fetch_exa/exa__weird_name");
         // Of two names starting at one place, the longer.
         let nested = Renamer::new(&[("a_b".to_owned(), "s__a_b".to_owned()), ("a_b_c".to_owned(), "s__a_b_c".to_owned())]);
         assert_eq!(nested.apply("a_b_c, a_b and a_b_cd"), "s__a_b_c, s__a_b and a_b_cd");

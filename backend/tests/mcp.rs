@@ -187,6 +187,8 @@ async fn a_slow_call_times_out_or_is_cancelled_and_the_server_is_told() {
     let started = Instant::now();
     let timed_out = call(&hub, &config, "slow__slow", json!({"ms":5000})).await.unwrap_err();
     assert!(timed_out.to_string().starts_with("mcp_timeout:"), "{timed_out}");
+    // Told to stop, the server may have done the work anyway: no blind retry.
+    assert!(timed_out.to_string().contains("may still have taken effect"), "{timed_out}");
     assert!(started.elapsed() < Duration::from_secs(3));
     wait_for(&hub, "slow", |s| log_text(s).contains("cancelled")).await;
 
@@ -1204,6 +1206,12 @@ async fn the_model_calls_mcp_tools_like_its_own() {
     assert_eq!(started[5]["summary"], "fake · echo", "by the server's name for it too");
     let done = ev(&events, "tool_done");
     assert_eq!(done.len(), 6);
+    // Under the name the model sees, whichever name it called.
+    for started in &started[4..] {
+        let done = done.iter().find(|d| d["id"] == started["id"]).unwrap();
+        assert_eq!((started["name"].clone(), done["name"].clone()), (json!("fake__echo"), json!("fake__echo")));
+    }
+    assert_eq!((answer.trace[4]["tool"].clone(), answer.trace[5]["tool"].clone()), (json!("fake__echo"), json!("fake__echo")));
     assert_eq!(answer.trace[0]["tool"], "fake__echo");
     assert_eq!(answer.trace[0]["summary"], "fake · echo \"이슈 123\"");
     assert_eq!(answer.trace[1]["status"], "error");
@@ -1218,7 +1226,7 @@ async fn many_large_mcp_results_are_cut_to_fit_and_read_back_from_history() {
     let mut config = config(vec![fake("fake", &["big"], &[])]);
     config.llm.context_tokens = 40_000;
     config.llm.output_tokens = 4_000;
-    let calls_made: Vec<_> = (0..8).map(|i| support::call(&format!("b{i}"), "fake__big", json!({"chars":60_000}))).collect();
+    let calls_made: Vec<_> = (0..8).map(|i| support::call(&format!("b{i}"), "fake__big", json!({"chars":60_000 + i}))).collect();
     let llm = Scripted::new(vec![calls(calls_made), text("끝")]);
     let (app, _dir) = app(config.clone(), llm.clone());
     app.mcp.apply(&config.mcp_servers);
@@ -1397,6 +1405,89 @@ async fn a_stopped_question_keeps_the_calls_it_made() {
     let request = llm.requests().last().unwrap().clone();
     assert_eq!(tool_result(&request, "e1")["data"]["text"], "echo: 이슈 생성");
     assert_eq!(tool_result(&request, "w1")["status"], "cancelled");
+    app.mcp.shutdown().await;
+}
+
+/// MCP review, fourteenth pass: a response holding the same call twice (a
+/// model's parallel calls now and then do) ran it twice — an issue filed
+/// twice, a message sent twice. The repeat is refused, as the agent's own
+/// repeated query is: the arguments compared whatever their order, the tool
+/// by either of its names.
+#[tokio::test]
+async fn a_call_repeated_within_one_response_runs_once() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("fake", &["echo", "add"], &[])]);
+    let llm = Scripted::new(vec![
+        calls(vec![
+            support::call("e1", "fake__echo", json!({"text":"이슈 생성"})),
+            support::call("e2", "fake__echo", json!({"text":"이슈 생성"})),
+            support::call("e3", "echo", json!({"text":"이슈 생성"})),
+            support::call("e4", "fake__echo", json!({"text":"다른 이슈"})),
+            support::call("a1", "fake__add", json!({"a":1,"b":2})),
+            support::call("a2", "fake__add", json!({"b":2,"a":1})),
+        ]),
+        text("끝"),
+    ]);
+    let (app, _dir) = app(config.clone(), llm.clone());
+    app.mcp.apply(&config.mcp_servers);
+    ready(&app.mcp, "fake").await;
+    let (result, events) = ask(&app, "이슈를 만들어줘").await;
+    assert_eq!(result.unwrap().answer, "끝");
+    let second = &llm.requests()[1];
+    assert_eq!(tool_result(second, "e1")["data"]["text"], "echo: 이슈 생성");
+    assert_eq!(tool_result(second, "e4")["data"]["text"], "echo: 다른 이슈");
+    assert_eq!(tool_result(second, "a1")["data"]["text"], "{\"sum\":3}");
+    for id in ["e2", "e3", "a2"] {
+        let refused = tool_result(second, id);
+        assert!(refused["error"].as_str().unwrap().starts_with("repeated_call:"), "{id}: {refused}");
+    }
+    assert_eq!((tool_calls(&app, "fake", "echo"), tool_calls(&app, "fake", "add")), (2, 1));
+    assert_eq!(ev(&events, "tool_done").len(), 6, "every progress line closes");
+    app.mcp.shutdown().await;
+}
+
+/// MCP review, fourteenth pass: a tool the conversation called before, no
+/// longer offered (its server off or not connected, the tool not allowed),
+/// was told to the model as one that "does not exist" — which the model may
+/// pass on to the user. It is told why it is not there.
+#[tokio::test]
+async fn a_tool_called_before_and_not_offered_now_is_told_why() {
+    if node_missing() {
+        return;
+    }
+    let mut config = config(vec![fake("fake", &["echo", "add"], &[]), fake("gone", &["*"], &[("FAKE_MCP_EXIT_BEFORE_INIT", "1")])]);
+    let llm = Scripted::new(vec![
+        calls(vec![
+            support::call("e1", "fake__echo", json!({"text":"x"})),
+            support::call("g1", "gone__echo", json!({"text":"x"})),
+            support::call("n1", "nosuch__echo", json!({"text":"x"})),
+            support::call("n2", "fake__nosuch", json!({})),
+        ]),
+        text("끝"),
+    ]);
+    let (app, _dir) = app(config.clone(), llm.clone());
+    app.mcp.apply(&config.mcp_servers);
+    ready(&app.mcp, "fake").await;
+    wait_for(&app.mcp, "gone", |s| s["state"] == "failed").await;
+    config.mcp_servers[0].tools = vec!["add".into()];
+    app.mcp.apply(&config.mcp_servers);
+    let (result, _) = ask(&app, "에코").await;
+    assert_eq!(result.unwrap().answer, "끝");
+    let second = &llm.requests()[1];
+    assert_eq!(tool_result(second, "e1")["error"], "unsupported_tool: fake__echo is not offered now; use the offered tools");
+    let gone = tool_result(second, "g1");
+    assert!(gone["error"].as_str().unwrap().starts_with("mcp_server_unavailable: MCP server gone is not connected (failed"), "{gone}");
+    assert_eq!(gone["recovery"]["action"], "answer_with_gathered_evidence");
+    assert_eq!(tool_result(second, "n1")["error"], "unsupported_tool: nosuch__echo does not exist");
+    assert_eq!(tool_result(second, "n2")["error"], "unsupported_tool: fake__nosuch does not exist");
+    config.mcp_servers[0].enabled = false;
+    app.mcp.apply(&config.mcp_servers);
+    llm.push(vec![calls(vec![support::call("a1", "fake__add", json!({"a":1,"b":2}))]), text("끝")]);
+    let (result, _) = ask(&app, "더하기").await;
+    assert_eq!(result.unwrap().answer, "끝");
+    assert_eq!(tool_result(&llm.requests()[3], "a1")["error"], "mcp_server_unavailable: MCP server fake is turned off");
     app.mcp.shutdown().await;
 }
 
@@ -1767,6 +1858,14 @@ async fn the_admin_screen_edits_servers_only_behind_a_key() {
     assert_eq!(updated["secrets"]["headers"], json!(["authorization"]));
     let stored = app.config().mcp_servers.iter().find(|s| s.name == "web").cloned().unwrap();
     assert_eq!(stored.secret_headers.values().map(|s| s.0.as_str()).collect::<Vec<_>>(), ["Bearer newer"]);
+    // The screen lists a value entered in another case beside the stored
+    // one, whose removal may come after it in the body: the new value stays.
+    let replaced = json!({"secrets":{"headers":{"Authorization":"Bearer newest","authorization":null}}});
+    let (status, updated, text) = admin.send("PUT", "mcp/web", Some(replaced), Some(updated["revision"].as_str().unwrap())).await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(updated["secrets"]["headers"], json!(["Authorization"]), "{updated:#}");
+    let stored = app.config().mcp_servers.iter().find(|s| s.name == "web").cloned().unwrap();
+    assert_eq!(stored.secret_headers.values().map(|s| s.0.as_str()).collect::<Vec<_>>(), ["Bearer newest"]);
     let (_, listed, _) = admin.send("GET", "mcp", None, None).await;
     let revision = listed["servers"][1]["revision"].as_str().unwrap().to_owned();
     let (status, _, _) = admin.send("DELETE", "mcp/web", None, Some(&revision)).await;

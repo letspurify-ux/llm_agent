@@ -657,12 +657,7 @@ impl Offered {
             let state = slot.state();
             match (&state.peer, state.phase) {
                 (Some(peer), Phase::Ready) => (peer.clone(), state.broken.clone().unwrap_or_default()),
-                (_, phase) => bail!(
-                    "mcp_server_unavailable: MCP server {} is not connected ({}{})",
-                    self.server,
-                    phase.label(),
-                    state.error.as_deref().map(|e| format!(": {e}")).unwrap_or_default()
-                ),
+                _ => bail!(not_connected(&self.server, &state)),
             }
         };
         let mut params = CallToolRequestParams::new(self.tool.clone());
@@ -724,8 +719,10 @@ impl Offered {
                 anyhow!("unsupported_tool: {} does not know {}: {}", self.server, self.tool, e.message)
             }
             ServiceError::McpError(e) => anyhow!("mcp_request_failed: {} (code {})", redact(&e.message), e.code.0),
+            // Told to stop, the server may have done the work all the same
+            // (an issue filed): said so, against a blind retry.
             ServiceError::Timeout { .. } => anyhow!(
-                "mcp_timeout: {} did not answer within {}s; the call was cancelled",
+                "mcp_timeout: {} did not answer within {}s and was told to stop; it may still have taken effect on the server",
                 self.exposed,
                 self.timeout.as_secs()
             ),
@@ -965,6 +962,36 @@ impl McpHub {
             .find(|s| s.server().name.eq_ignore_ascii_case(name))
             .map(|slot| slot_status(slot, model))
     }
+
+    /// Why a tool of the model's form (`server__tool`) that a question does
+    /// not offer is not there — one the conversation called before: its
+    /// server off or not connected, or the tool not offered now. None when
+    /// no server has the name, or its connection lists no such tool.
+    pub fn unoffered(&self, name: &str) -> Option<String> {
+        let (server, _) = name.split_once("__")?;
+        let slot = self.slots().into_iter().find(|s| s.server().name.eq_ignore_ascii_case(server))?;
+        let settings = slot.server();
+        if !settings.enabled {
+            return Some(format!("mcp_server_unavailable: MCP server {} is turned off", settings.name));
+        }
+        let state = slot.state();
+        if state.phase != Phase::Ready {
+            return Some(not_connected(&settings.name, &state));
+        }
+        state
+            .tools
+            .iter()
+            .any(|t| t.exposed == name)
+            .then(|| format!("unsupported_tool: {name} is not offered now; use the offered tools"))
+    }
+}
+
+fn not_connected(server: &str, state: &State) -> String {
+    format!(
+        "mcp_server_unavailable: MCP server {server} is not connected ({}{})",
+        state.phase.label(),
+        state.error.as_deref().map(|e| format!(": {e}")).unwrap_or_default()
+    )
 }
 
 /// An allow-list entry names a tool as the server does or as the model

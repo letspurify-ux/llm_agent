@@ -1119,6 +1119,9 @@ async fn execute_batch(
     let mut prepared: Vec<Prepared> = Vec::with_capacity(calls.len());
     let mut ids: Vec<u64> = vec![];
     let mut batch_runs = BTreeSet::new();
+    // MCP calls of this response (tool, arguments): a repeat is refused, as
+    // a repeated query is — an MCP tool may file an issue or send a message.
+    let mut mcp_runs: Vec<(String, Value)> = vec![];
     let root = |p: &Project| p.root.canonicalize().unwrap_or_else(|_| p.root.clone());
     let mut roots: BTreeMap<usize, String> = BTreeMap::new();
     for (index, call) in calls.iter().enumerate() {
@@ -1128,6 +1131,14 @@ async fn execute_batch(
         let parsed: std::result::Result<Value, String> = serde_json::from_str(raw).map_err(|e| {
             format!("invalid_tool_arguments: {e}; send one complete JSON object; nothing was executed")
         });
+        let mut once = |tool: &mcp::Offered, args: &Value| -> std::result::Result<(), String> {
+            // Compared as values: the same arguments in another order repeat.
+            if mcp_runs.iter().any(|(name, known)| *name == tool.exposed && known == args) {
+                return Err(format!("repeated_call: 이 응답 안에서 {}을(를) 같은 인수로 두 번 부르려 했다. 하나만 실행된다", tool.exposed));
+            }
+            mcp_runs.push((tool.exposed.clone(), args.clone()));
+            Ok(())
+        };
         let prepared_call = (|| -> std::result::Result<Prepared, String> {
             if !offered.iter().any(|o| *o == call.name) {
                 // A model that follows a server's own description calls its
@@ -1139,6 +1150,7 @@ async fn execute_batch(
                     Ok(Some(tool)) => {
                         let args = parsed.clone()?;
                         tool.check(&args).map_err(|e| format!("{e:#}"))?;
+                        once(&tool, &args)?;
                         let renamed = Some(format!("tool name {} was taken as {}; call it {}", call.name, tool.exposed, tool.exposed));
                         return Ok(Prepared::Mcp { args, tool, renamed });
                     }
@@ -1147,15 +1159,18 @@ async fn execute_batch(
                     }
                     Ok(None) => {}
                 }
+                // An MCP tool the conversation called before is told why it
+                // is not there, not as one that does not exist.
                 return Err(if known {
                     format!("unsupported_tool: {} is not offered now; use the offered tools", call.name)
                 } else {
-                    format!("unsupported_tool: {} does not exist", call.name)
+                    app.mcp.unoffered(&call.name).unwrap_or_else(|| format!("unsupported_tool: {} does not exist", call.name))
                 });
             }
             let mut args = parsed.clone()?;
             if let Some(tool) = mcp.find(&call.name) {
                 tool.check(&args).map_err(|e| format!("{e:#}"))?;
+                once(&tool, &args)?;
                 return Ok(Prepared::Mcp { args, tool, renamed: None });
             }
             let adjusted = tools::normalize_arguments(&call.name, &mut args);
@@ -1193,22 +1208,35 @@ async fn execute_batch(
             Err(message) => Prepared::Done(tools::envelope(Err(anyhow::anyhow!(message)))),
         });
     }
-    // The progress line of an MCP call names its server and tool, a call
-    // refused before it ran (an argument missing) too, by either name.
-    let summaries: Vec<Option<String>> = prepared
+    // The MCP tool of each call, a call refused before it ran (an argument
+    // missing) too, by either name: its progress line and trace name its
+    // server and tool, under the name the model sees.
+    let mcp_tools: Vec<Option<Arc<mcp::Offered>>> = prepared
         .iter()
         .enumerate()
         .map(|(i, p)| match p {
-            Prepared::Mcp { args, tool, .. } => Some(tool.summary(args)),
-            Prepared::Done(_) => mcp
-                .find(&calls[i].name)
-                .or_else(|| {
-                    let known = ToolRegistry::specs().iter().any(|s| s.name == calls[i].name);
-                    if known { None } else { mcp.find_raw(&calls[i].name).ok().flatten() }
-                })
-                .map(|tool| tool.summary(&serde_json::from_str(&calls[i].arguments).unwrap_or(Value::Null))),
+            Prepared::Mcp { tool, .. } => Some(tool.clone()),
+            Prepared::Done(_) => mcp.find(&calls[i].name).or_else(|| {
+                let known = ToolRegistry::specs().iter().any(|s| s.name == calls[i].name);
+                if known { None } else { mcp.find_raw(&calls[i].name).ok().flatten() }
+            }),
             _ => None,
         })
+        .collect();
+    let summaries: Vec<Option<String>> = mcp_tools
+        .iter()
+        .enumerate()
+        .map(|(i, tool)| {
+            tool.as_ref().map(|tool| match &prepared[i] {
+                Prepared::Mcp { args, .. } => tool.summary(args),
+                _ => tool.summary(&serde_json::from_str(&calls[i].arguments).unwrap_or(Value::Null)),
+            })
+        })
+        .collect();
+    let names: Vec<String> = calls
+        .iter()
+        .zip(&mcp_tools)
+        .map(|(call, tool)| tool.as_ref().map_or_else(|| call.name.clone(), |tool| tool.exposed.clone()))
         .collect();
     // Start events, in call order.
     for (index, call) in calls.iter().enumerate() {
@@ -1218,7 +1246,7 @@ async fn execute_batch(
             Prepared::Done(_) => serde_json::from_str(&call.arguments).unwrap_or(Value::Null),
         };
         if let Some(summary) = &summaries[index] {
-            events.send(json!({"type":"tool","id":id,"name":call.name,"summary":summary}));
+            events.send(json!({"type":"tool","id":id,"name":names[index],"summary":summary}));
             continue;
         }
         match call.name.as_str() {
@@ -1249,7 +1277,7 @@ async fn execute_batch(
                 let args = args.clone();
                 let cancel = cancel.clone();
                 let events = events.clone();
-                let (id, name) = (ids[i], calls[i].name.clone());
+                let (id, name) = (ids[i], names[i].clone());
                 Some((
                     i,
                     tokio::spawn(async move {
@@ -1522,7 +1550,7 @@ async fn execute_batch(
     for (index, task) in mcp_tasks {
         // A task that panicked never closed its progress line.
         let outcome = task.await.unwrap_or_else(|_| {
-            events.send(json!({"type":"tool_done","id":ids[index],"name":calls[index].name,"status":"error"}));
+            events.send(json!({"type":"tool_done","id":ids[index],"name":names[index],"status":"error"}));
             Err(anyhow::anyhow!("tool_worker_panic: the tool stopped unexpectedly"))
         });
         let (args, renamed) = match &prepared[index] {
@@ -1562,9 +1590,9 @@ async fn execute_batch(
         if !matches!(call.name.as_str(), "search" | "query_run") {
             let root = result["root"].as_str().map(std::path::PathBuf::from).unwrap_or_default();
             let summary = summaries[index].clone().unwrap_or_else(|| tools::call_summary(&root, &call.name, &call.arguments));
-            trace.push(json!({"tool":call.name,"summary":summary,"status":result["status"]}));
+            trace.push(json!({"tool":names[index],"summary":summary,"status":result["status"]}));
             if let Prepared::Done(_) = &prepared[index] {
-                events.send(json!({"type":"tool_done","id":ids[index],"name":call.name,"status":result["status"]}));
+                events.send(json!({"type":"tool_done","id":ids[index],"name":names[index],"status":result["status"]}));
             }
         } else if let Prepared::Done(_) = &prepared[index] {
             // A refused search or query still closes its progress line.
