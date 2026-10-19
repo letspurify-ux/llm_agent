@@ -99,3 +99,55 @@ async fn queries_routines_types_and_cancellation() {
     assert!(out.rows[0]["TODAY"].is_string());
     assert_eq!(app.oracle.pool_count(), 1);
 }
+
+/// A run stopped while it waited for a session (the pool's eight in use)
+/// had nothing to break: once a session came free, its statement ran to its
+/// end, up to the call timeout, the question waiting. It now returns as soon
+/// as it has the session, running nothing, and the pool goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_stopped_while_waiting_for_a_session_runs_nothing() {
+    if std::env::var("LLM_AGENT_TEST_ORACLE").ok().as_deref() != Some("1") {
+        return skip("LLM_AGENT_TEST_ORACLE is not set");
+    }
+    let Some(test_db) = TestDb::create("oracle_wait") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    test_db.sql_in("INSERT INTO query_registry (query_name, query_sql, target_db_name) VALUES ('slow_probe', 'SELECT COUNT(*) AS N FROM all_objects a, all_objects b, all_objects c', 'ORDER_DB')");
+    let mut config = test_db.config();
+    config.oracle.mock = false;
+    config.oracle.timeout_ms = 15_000;
+    config.oracle.client_lib_dir = std::env::var("ORACLE_CLIENT_LIB_DIR").unwrap_or_default();
+    let (app, _dir) = app(config, Scripted::new(vec![]));
+    let config = app.config();
+    let row = |name: &str| {
+        let (app, config, name) = (app.clone(), config.clone(), name.to_owned());
+        async move { db::queries_by_names(&app.db, &config.mariadb, &[name]).await.unwrap().remove(0) }
+    };
+    let run = |row: db::Row, cancel: CancellationToken| {
+        let (app, config) = (app.clone(), config.clone());
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let never = |_: &str| false;
+            let result = app.oracle.run(&app.db, &config, &row, &Map::new(), None, &never, &cancel).await.map_err(|e| e.to_string());
+            (result.map(|o| o.rows), started.elapsed())
+        })
+    };
+    let slow = row("slow_probe").await;
+    let busy = CancellationToken::new();
+    let holders: Vec<_> = (0..8).map(|_| run(slow.clone(), busy.clone())).collect();
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let stop = CancellationToken::new();
+    let waiting = run(slow, stop.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    stop.cancel();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    busy.cancel();
+    for holder in holders {
+        assert_eq!(holder.await.unwrap().0.unwrap_err(), "cancelled");
+    }
+    let (result, took) = waiting.await.unwrap();
+    assert_eq!(result.unwrap_err(), "cancelled");
+    assert!(took < std::time::Duration::from_secs(5), "the stopped run returned after {took:?}");
+    let out = run(row("today_date").await, CancellationToken::new()).await.unwrap().0.unwrap();
+    assert!(out[0]["TODAY"].is_string());
+}

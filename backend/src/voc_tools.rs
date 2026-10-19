@@ -244,14 +244,32 @@ pub struct Context<'a> {
 }
 
 pub async fn run(cx: &Context<'_>, name: &str, args: &Value) -> Run {
-    match name {
-        "search" => search_tool(cx, args).await,
-        "knowledge_read" => Run::plain(knowledge_read(cx, args).await),
-        "method_read" => Run::plain(method_read(cx, args).await),
-        "query_describe" => Run::plain(query_describe(cx, args).await),
-        "query_run" => query_run(cx, args).await,
-        "result_read" => Run::plain(result_read(cx, args)),
-        _ => Run::plain(Err(anyhow::anyhow!("unsupported_tool: {name}"))),
+    // A query run stops its Oracle statement itself, and is not dropped
+    // midway. The others read the management DB, whose queries wait for
+    // their time limit alone: a stopped question held its conversation, and
+    // the question asked next in it, until each query's limit (30 s).
+    if name == "query_run" {
+        return query_run(cx, args).await;
+    }
+    let reading = async {
+        match name {
+            "search" => search_tool(cx, args).await,
+            "knowledge_read" => Run::plain(knowledge_read(cx, args).await),
+            "method_read" => Run::plain(method_read(cx, args).await),
+            "query_describe" => Run::plain(query_describe(cx, args).await),
+            "result_read" => Run::plain(result_read(cx, args)),
+            _ => Run::plain(Err(anyhow::anyhow!("unsupported_tool: {name}"))),
+        }
+    };
+    until_stopped(cx.cancel, reading).await.unwrap_or_else(|stopped| Run::plain(Err(stopped)))
+}
+
+/// `work`, unless the question stops first.
+async fn until_stopped<T>(cancel: &CancellationToken, work: impl std::future::Future<Output = T>) -> Result<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
+        done = work => Ok(done),
     }
 }
 
@@ -997,7 +1015,11 @@ async fn query_run(cx: &Context<'_>, args: &Value) -> Run {
         hits: None,
         public_error: Some(public),
     };
-    let rows = match db::queries_by_names(&cx.app.db, &cx.config.mariadb, std::slice::from_ref(&name)).await {
+    let lookup = db::queries_by_names(&cx.app.db, &cx.config.mariadb, std::slice::from_ref(&name));
+    let Ok(found) = until_stopped(cx.cancel, lookup).await else {
+        return Run::plain(Err(anyhow::anyhow!("cancelled")));
+    };
+    let rows = match found {
         Ok(rows) => rows,
         Err(e) => {
             eprintln!("[query_run] registry lookup failed: {e}");

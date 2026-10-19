@@ -92,7 +92,8 @@ impl EmbedSync {
         }
         let result = async {
             let cfg = &config.mariadb;
-            let mut lock = db.conn(cfg).await?;
+            // Not one of the pool's, which the sync uses meanwhile.
+            let mut lock = db.lock_conn(cfg).await?;
             let got = query_on(cfg, &mut lock, &format!("SELECT GET_LOCK('{LOCK_NAME}', 0) AS l"), vec![]).await?;
             if got.first().map_or(0, |r| db::int(r, "l")) != 1 {
                 return Ok(Summary {
@@ -106,7 +107,7 @@ impl EmbedSync {
         };
         // A panic would otherwise leave `running` set (every later sync
         // skipped as busy) and end the periodic sync's loop with it. The
-        // lock's connection is reset when the pool takes it back.
+        // lock goes with its connection, closed when dropped.
         let result = AssertUnwindSafe(result)
             .catch_unwind()
             .await

@@ -605,7 +605,8 @@ curl -sN localhost:5173/api/chat -H 'Content-Type: application/json' -H 'Accept:
 화면(`frontend/src/stream.js`)은 조각 경계와 예전 JSON 응답을 같은 함수로 읽고, 답을 기다리는 말풍선에 진행 줄을
 세웠다가 답이 오면 같은 내용을 ⚡ 패널에 남긴다. 답변 조각은 미리보기로 그려지는데(`preview.js`), 표·차트·그림
 블록은 done 뒤에야 성립하므로 그 자리는 안내 한 줄로 바꾼다. 연결이 끊기면(정지·창 닫기) 서버는 모델 요청과
-Oracle 실행(`break`)을 멈춘다. 프록시가 본문을 모아 두면 스트림의 뜻이 사라진다 — nginx는
+Oracle 실행(`break`)을 멈추고, 관리 DB를 기다리던 검색·지식·처리 방법·쿼리 정의 읽기도 그 자리에서 그만둔다(쿼리마다
+관리 DB 한도(30초)까지 기다리던 동안 같은 대화의 다음 질문도 기다렸다). 프록시가 본문을 모아 두면 스트림의 뜻이 사라진다 — nginx는
 `X-Accel-Buffering: no`를 서버가 보내고, 다른 프록시는 `Cache-Control: no-transform`을 본다.
 
 ## 도구 — 얼마나 가져갈지는 모델이 정한다
@@ -939,7 +940,8 @@ INSERT INTO query_registry (query_name, query_desc, input_desc, query_sql, outpu
   MCP 탭의 오류·기록에만 남고 모델에게 가는 오류에는 싣지 않는다
 - **설정의 비밀값**(LLM API 키·관리 DB 비밀번호·관리자 인증 키·MCP 서버의 비밀 환경변수/헤더)은 `backend/config.credentials.json`(소유자만 읽기)에만 저장되고 화면·API 응답으로 돌아오지 않는다
 - 관리 DB 조회 한도(설정 '관리 DB → 쿼리 한도', 기본 30초) — 검색은 답변 루프의 시간 검사보다 앞에서 돌기 때문에, 여기가 매달리면 요청 상한이 통째로 성립하지 않는다
-- 조회 쿼리 한도(설정 'Oracle → 조회 한도', 기본 30초) — 느린 쿼리가 요청을 무한 대기시키지 않는다. 한도·정지·연결 끊김에는 실행 중인 문장을 `break`로 끊는다
+- 조회 쿼리 한도(설정 'Oracle → 조회 한도', 기본 30초) — 느린 쿼리가 요청을 무한 대기시키지 않는다. 한도·정지·연결 끊김에는 실행 중인 문장을 `break`로 끊는다.
+  세션을 기다리던 중(풀 8개가 다 쓰이는 중, 새 세션을 만드는 중)에 멈춘 실행은 세션을 받자마자 아무것도 실행하지 않고 끝낸다 — 끊을 문장이 없어, 멈춘 뒤에도 그 문장이 끝까지(조회 한도까지) 돌았다
 - 조회 결과는 1,000행(`MAX_ROWS`) 제한. 셀당 4,000자 절단은 드라이버 경계(`oracle.rs`)에서, 모델에게 보이는 행 수는 `query_run`의 미리보기와 `result_read`가 정한다.
   LOB/이진 값도 이 경계에서 문자열로 정규화된다
 
@@ -990,6 +992,8 @@ INSERT INTO query_registry (query_name, query_desc, input_desc, query_sql, outpu
 - **임베딩**: 로컬 Ollama의 OpenAI 호환 API (`backend/src/embedding.rs`). 기본 모델 qwen3-embedding:0.6b(1024차원, bge-m3도 쓸 수 있다). 기동 시 한 번 예열한다
 - **동기화**: `backend/src/embed_sync.rs`가 원본 텍스트의 MD5를 비교해 신규/변경분만 임베딩(diff, 멱등).
   서버 기동 시 1회 + 설정의 동기화 주기(기본 60초) + `llm-agent embed-sync` 수동.
+  한 번에 하나만 돌도록 잡는 잠금(`GET_LOCK`)은 풀 밖의 연결 하나로 쥔다 — 풀에서 꺼내 쥐면 연결 수 1인 설정에서
+  동기화가 나머지 일에 쓸 연결을 영영 못 얻어 매번 DB 한도의 두 배를 기다린 뒤 실패했고, 그동안 다른 DB 사용도 막혔다.
   청크 규칙·해시 식은 Node 백엔드와 바이트 단위로 같아, 이전한 설치에서 다시 나누거나 다시 임베딩하지 않는다.
   SQL로 직접 등록한 데이터는 다음 동기화(최대 1분) 뒤부터 검색된다
 

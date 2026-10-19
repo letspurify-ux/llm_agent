@@ -172,7 +172,14 @@ impl Oracle {
                 .collect();
             return Ok(cap(mock_rows(&query_name, &inputs)?, target));
         }
-        let Some(row) = db::load_target_db(db, &config.mariadb, &target).await? else {
+        // The management DB waits for its time limit alone; the statement's
+        // own stop is below.
+        let row = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("cancelled"),
+            row = db::load_target_db(db, &config.mariadb, &target) => row?,
+        };
+        let Some(row) = row else {
             eprintln!("[oracle] target_db row not found: {target} (registered for {query_name})");
             return Err(wasted("조회대상 DB 접속 정보가 등록되어 있지 않습니다.", UNRUNNABLE_HINT));
         };
@@ -209,9 +216,21 @@ impl Oracle {
             .collect();
         let connection: Arc<Mutex<Option<Arc<oracle::Connection>>>> = Arc::new(Mutex::new(None));
         let slot = connection.clone();
+        let stopped = cancel.clone();
         let work = tokio::task::spawn_blocking(move || -> Result<Vec<Map<String, Value>>> {
             let conn = Arc::new(pool.get()?);
             *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(conn.clone());
+            // Stopped while it waited for a session (all in use, a new one
+            // being made), there was nothing to break: the statement then ran
+            // to its end, up to the call timeout, the question waiting.
+            // Checked once the session is in `slot`, a stop is seen here or
+            // breaks the statement; a session it may have broken idle is
+            // closed rather than pooled.
+            if stopped.is_cancelled() {
+                *slot.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                let _ = conn.close_with_mode(oracle::conn::CloseMode::Drop);
+                bail!("cancelled");
+            }
             conn.set_call_timeout(Some(timeout))?;
             if conn.is_new_connection()
                 && let Err(e) = conn.execute(NLS_SESSION_FORMATS, &[])

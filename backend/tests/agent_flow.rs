@@ -239,6 +239,52 @@ async fn cancelling_stops_the_run_and_unknown_tools_are_refused() {
     assert!(request["tools"].as_array().unwrap().iter().all(|t| t["function"]["name"] != "file_read"));
 }
 
+/// A stopped question whose tools waited on the management DB (a table
+/// another session locked, the DB unreachable) went on until each query's
+/// time limit (30 s), holding its conversation: the question asked next in
+/// it waited as long. Its reads now end with the stop, and the calls stay in
+/// the conversation as cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_next_question_does_not_wait_for_the_db_reads_of_a_stopped_one() {
+    let Some(db) = TestDb::create("stopdb") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let run = json!({"query_name":"batch_job_status","params":{"job_id":"BATCH001"}});
+    // The knowledge and registry reads; the target DB's registration, read
+    // before an Oracle statement (not in mock mode).
+    for (tables, mock, reads) in [
+        ("knowledge_chunk WRITE, query_registry WRITE", true, vec![call("r1", "knowledge_read", json!({"id":"k1"})), call("q1", "query_run", run.clone())]),
+        ("target_db WRITE", false, vec![call("q1", "query_run", run.clone())]),
+    ] {
+        let mut config = db.config();
+        config.mariadb.timeout_ms = 20_000;
+        config.oracle.mock = mock;
+        let ids: Vec<String> = reads.iter().map(|c| c.id.clone()).collect();
+        let llm = Scripted::new(vec![calls(reads), text("두 번째 답")]);
+        let (app, _dir) = app(config, llm.clone());
+        let cfg = app.config();
+        let mut holder = app.db.lock_conn(&cfg.mariadb).await.unwrap();
+        llm_agent::db::plain_on(&cfg.mariadb, &mut holder, &format!("LOCK TABLES {tables}")).await.unwrap();
+        let first = {
+            let app = app.clone();
+            tokio::spawn(async move { ask(&app, "c", "첫 질문", vec![]).await.0.map(|a| a.answer).map_err(|e| e.to_string()) })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        // Asked again in the conversation, as after the stop button.
+        let started = std::time::Instant::now();
+        let (second, _) = tokio::time::timeout(std::time::Duration::from_secs(10), ask(&app, "c", "두 번째 질문", vec![]))
+            .await
+            .unwrap_or_else(|_| panic!("{tables}: the next question waited for the stopped one's DB reads"));
+        assert_eq!(second.unwrap().answer, "두 번째 답", "{tables}: after {:?}", started.elapsed());
+        assert_eq!(first.await.unwrap().unwrap_err(), "cancelled");
+        let request = llm.requests().last().unwrap().clone();
+        for id in ids {
+            assert_eq!(tool_result(&request, &id)["status"], "cancelled", "{tables}: {id}");
+        }
+        llm_agent::db::plain_on(&cfg.mariadb, &mut holder, "UNLOCK TABLES").await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn every_call_of_a_response_runs() {
     let Some(db) = TestDb::create("calls") else {

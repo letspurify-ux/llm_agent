@@ -50,15 +50,7 @@ impl Db {
         }
         let constraints = PoolConstraints::new(0, cfg.pool_size.max(1))
             .ok_or_else(|| anyhow::anyhow!("invalid pool size"))?;
-        let opts = OptsBuilder::default()
-            .ip_or_hostname(cfg.host.clone())
-            .tcp_port(cfg.port)
-            .user((!cfg.user.is_empty()).then(|| cfg.user.clone()))
-            .pass(cfg.password.as_ref().map(|s| s.0.clone()))
-            .db_name(Some(cfg.database.clone()))
-            .prefer_socket(false)
-            .pool_opts(PoolOpts::default().with_constraints(constraints))
-            .init(vec!["SET NAMES utf8mb4"]);
+        let opts = options(cfg).pool_opts(PoolOpts::default().with_constraints(constraints));
         let pool = Pool::new(Opts::from(opts));
         if let Some((_, old)) = slot.replace((fingerprint, pool.clone())) {
             tokio::spawn(async move {
@@ -72,6 +64,16 @@ impl Db {
     pub async fn conn(&self, cfg: &MariaDbConfig) -> Result<Conn> {
         let pool = self.pool(cfg)?;
         timed(cfg, async move { Ok(pool.get_conn().await?) }).await
+    }
+
+    /// A connection outside the pool, for a session lock held while the
+    /// pool's connections do the work. Taken from the pool, the lock's
+    /// connection waited for a second one, which a pool of one never freed:
+    /// every embedding sync failed after twice the DB timeout, every other
+    /// use of the DB waiting meanwhile. Closed when dropped.
+    pub async fn lock_conn(&self, cfg: &MariaDbConfig) -> Result<Conn> {
+        let opts = Opts::from(options(cfg));
+        timed(cfg, async move { Ok(Conn::new(opts).await?) }).await
     }
 
     pub async fn query(&self, cfg: &MariaDbConfig, sql: &str, params: Vec<Param>) -> Result<Vec<Row>> {
@@ -91,6 +93,19 @@ impl Db {
             let _ = pool.disconnect().await;
         }
     }
+}
+
+/// How the management DB is reached, by the pool or by a connection of its
+/// own.
+fn options(cfg: &MariaDbConfig) -> OptsBuilder {
+    OptsBuilder::default()
+        .ip_or_hostname(cfg.host.clone())
+        .tcp_port(cfg.port)
+        .user((!cfg.user.is_empty()).then(|| cfg.user.clone()))
+        .pass(cfg.password.as_ref().map(|s| s.0.clone()))
+        .db_name(Some(cfg.database.clone()))
+        .prefer_socket(false)
+        .init(vec!["SET NAMES utf8mb4"])
 }
 
 async fn timed<T>(cfg: &MariaDbConfig, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
