@@ -160,7 +160,7 @@ async fn wait_for_signal() {
 
 /// Embedding warm-up, the embedding sync (at start and every interval), the
 /// chat log retention cleanup (at start and hourly), and every minute the
-/// release of idle conversations and Oracle pools.
+/// release of idle conversations, Oracle pools and kept syntax trees.
 fn background_jobs(app: &Arc<App>) {
     let housekeeping = app.clone();
     tokio::spawn(async move {
@@ -172,6 +172,7 @@ fn background_jobs(app: &Arc<App>) {
             let idle = housekeeping.config().agent.session_idle_minutes.saturating_mul(60);
             housekeeping.sessions.sweep(Duration::from_secs(idle));
             housekeeping.oracle.close_idle(llm_agent::oracle::POOL_IDLE);
+            let _ = tokio::task::spawn_blocking(|| llm_agent::tools::release_idle_syntax(llm_agent::tools::SYNTAX_IDLE)).await;
         }
     });
     let warm = app.clone();

@@ -24,6 +24,17 @@ use std::{
 };
 pub use summary::call_summary;
 
+/// How long a syntax tree the structure tools keep for the next look at the
+/// same file stays unused before it is freed (checked every minute): the
+/// calls of a question and the next question's, not the life of the process.
+pub const SYNTAX_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Frees the syntax trees unused for `idle` (see `SYNTAX_IDLE`); returns how
+/// many. Run on a blocking thread: freeing a large tree takes a while.
+pub fn release_idle_syntax(idle: std::time::Duration) -> usize {
+    structure::release_idle_syntax(idle)
+}
+
 #[derive(Clone, Debug)]
 pub struct ToolSpec {
     pub name: &'static str,

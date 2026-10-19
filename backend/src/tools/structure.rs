@@ -4,9 +4,13 @@ use tree_sitter::{Node, Parser, Tree};
 // Cache only syntax, never sources, permissions, filtered results or evidence.
 // Every call still reads and hashes the current allowed file before lookup.
 // Entry count and aggregate input size bound retention; large files bypass it.
+// A tree takes 40 to 130 bytes per source byte, so the 4 MiB of source kept
+// are 170 to 520 MiB of trees: a tree no call has used for SYNTAX_IDLE goes
+// (`release_idle_syntax`), instead of staying for the life of the process
+// after one look at a large file.
 #[derive(Default)]
 struct SyntaxCache {
-    entries: std::collections::VecDeque<(&'static str, String, usize, Tree)>,
+    entries: std::collections::VecDeque<(&'static str, String, usize, Tree, std::time::Instant)>,
 }
 impl SyntaxCache {
     const MAX_ENTRIES: usize = 8;
@@ -16,8 +20,9 @@ impl SyntaxCache {
         let index = self
             .entries
             .iter()
-            .position(|(lang, hash, _, _)| *lang == language && hash == digest)?;
-        let entry = self.entries.remove(index)?;
+            .position(|(lang, hash, _, _, _)| *lang == language && hash == digest)?;
+        let mut entry = self.entries.remove(index)?;
+        entry.4 = std::time::Instant::now();
         let tree = entry.3.clone();
         self.entries.push_back(entry);
         Some(tree)
@@ -28,20 +33,38 @@ impl SyntaxCache {
             return;
         }
         self.entries
-            .retain(|(lang, hash, _, _)| *lang != language || *hash != digest);
+            .retain(|(lang, hash, _, _, _)| *lang != language || *hash != digest);
         while self.entries.len() >= Self::MAX_ENTRIES
             || self.entries.iter().map(|entry| entry.2).sum::<usize>() + bytes
                 > Self::MAX_SOURCE_BYTES
         {
             self.entries.pop_front();
         }
-        self.entries.push_back((language, digest, bytes, tree));
+        self.entries.push_back((language, digest, bytes, tree, std::time::Instant::now()));
+    }
+
+    /// Takes out the trees unused for `idle`, to be freed outside the lock.
+    fn expire(&mut self, idle: std::time::Duration) -> Vec<Tree> {
+        let now = std::time::Instant::now();
+        let (expired, kept): (std::collections::VecDeque<_>, _) = std::mem::take(&mut self.entries)
+            .into_iter()
+            .partition(|entry| now.duration_since(entry.4) >= idle);
+        self.entries = kept;
+        expired.into_iter().map(|entry| entry.3).collect()
     }
 }
 
 fn syntax_cache() -> &'static std::sync::Mutex<SyntaxCache> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<SyntaxCache>> = std::sync::OnceLock::new();
     CACHE.get_or_init(Default::default)
+}
+
+/// Frees the kept syntax trees no call has used for `idle`, and returns how
+/// many. Freeing a large tree takes a while (90 ms for 4 MiB of source): run
+/// it on a blocking thread.
+pub(super) fn release_idle_syntax(idle: std::time::Duration) -> usize {
+    let expired = syntax_cache().lock().unwrap_or_else(|p| p.into_inner()).expire(idle);
+    expired.len()
 }
 
 pub(super) fn language(path: &Path) -> Result<&'static str> {
@@ -908,5 +931,41 @@ mod cache_tests {
         assert!(cache.get("rust", "old").is_some());
         assert!(cache.get("rust", "changed").is_none());
         assert!(cache.get("javascript", "old").is_none());
+    }
+
+    /// Resource leak review, eighth pass: the kept trees had no time bound.
+    /// A tree takes 40 to 130 bytes per source byte (4 MiB of source, 170 to
+    /// 520 MiB), and after one outline of a large file it stayed until the
+    /// process ended.
+    #[test]
+    fn trees_unused_for_the_idle_time_are_freed() {
+        use std::time::{Duration, Instant};
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_rust::LANGUAGE.into()).unwrap();
+        let tree = parser.parse("fn kept() {}", None).unwrap();
+        let mut cache = SyntaxCache::default();
+        for digest in ["a", "b", "c"] {
+            cache.insert("rust", digest.into(), 12, tree.clone());
+        }
+        assert!(cache.expire(SYNTAX_IDLE).is_empty(), "trees just made stay");
+        let long_ago = Instant::now().checked_sub(SYNTAX_IDLE + Duration::from_secs(1)).unwrap();
+        for entry in &mut cache.entries {
+            entry.4 = long_ago;
+        }
+        // A look at a tree keeps it, whatever its age.
+        assert!(cache.get("rust", "b").is_some());
+        assert_eq!(cache.expire(SYNTAX_IDLE).len(), 2);
+        assert!(cache.get("rust", "a").is_none() && cache.get("rust", "c").is_none());
+        assert!(cache.get("rust", "b").is_some());
+
+        // The process-wide cache, as the minute's housekeeping frees it.
+        syntax_cache().lock().unwrap().insert("rust", "review-8-old".into(), 12, tree.clone());
+        for entry in &mut syntax_cache().lock().unwrap().entries {
+            if entry.1 == "review-8-old" {
+                entry.4 = long_ago;
+            }
+        }
+        crate::tools::release_idle_syntax(SYNTAX_IDLE);
+        assert!(syntax_cache().lock().unwrap().get("rust", "review-8-old").is_none());
     }
 }
