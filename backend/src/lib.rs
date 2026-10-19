@@ -1,3 +1,12 @@
+/// std's `eprintln!` for every module below, but one that cannot panic in
+/// the server (see `console`).
+macro_rules! eprintln {
+    ($($arg:tt)*) => {
+        $crate::console::line(format_args!($($arg)*))
+    };
+}
+
+pub mod console;
 pub mod config;
 pub mod context;
 pub mod llm;

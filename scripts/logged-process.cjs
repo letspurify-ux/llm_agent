@@ -18,18 +18,29 @@ let rotation;
 let stopping;
 // Rotate idle logs too. Each write also checks the date after machine sleep.
 function schedule() {
-  rotation = setTimeout(() => { log.maintain(); schedule(); }, DAY - (Date.now() % DAY));
+  rotation = setTimeout(() => {
+    // A rotation that fails is tried again with the next write.
+    try { log.maintain(); } catch {}
+    schedule();
+  }, DAY - (Date.now() % DAY));
   rotation.unref();
 }
 schedule();
-for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
-  process.on(signal, () => {
-    if (stopping) return;
-    child.kill(signal);
-    stopping = setTimeout(() => child.kill('SIGKILL'), Number(process.env.APP_LOG_STOP_MS) || 11000);
-    stopping.unref();
-  });
+// Stops the server with `signal`, killed past the stop deadline.
+function stop(signal) {
+  if (stopping) return;
+  child.kill(signal);
+  stopping = setTimeout(() => child.kill('SIGKILL'), Number(process.env.APP_LOG_STOP_MS) || 11000);
+  stopping.unref();
 }
+for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => stop(signal));
+// Whatever else goes wrong here ends the launcher only with its server: left
+// behind, the server ran on with its output a broken pipe and nothing to
+// stop it (stop.sh signals this launcher, and start.sh then found the port taken).
+process.on('uncaughtException', error => {
+  log.write(`[launcher] ${error.stack}\n`);
+  stop('SIGTERM');
+});
 child.on('close', (code, signal) => {
   clearTimeout(rotation);
   clearTimeout(stopping);

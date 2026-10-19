@@ -85,10 +85,19 @@ impl Db {
     /// pool's connections do the work. Taken from the pool, the lock's
     /// connection waited for a second one, which a pool of one never freed:
     /// every embedding sync failed after twice the DB timeout, every other
-    /// use of the DB waiting meanwhile. Closed when dropped.
+    /// use of the DB waiting meanwhile. Closed with `close_conn`.
     pub async fn lock_conn(&self, cfg: &MariaDbConfig) -> Result<Conn> {
         let opts = Opts::from(options(cfg));
         timed(cfg, async move { Ok(Conn::new(opts).await?) }).await
+    }
+
+    /// Closes a connection of its own (`lock_conn`) as the protocol has it,
+    /// within the DB time limit. Dropped instead, it was cut without a word
+    /// (mysql_async marks it closed before it says so), which the server
+    /// counts and logs as an aborted connection — at every embedding sync,
+    /// once a minute by default, into a log nothing trims.
+    pub async fn close_conn(&self, cfg: &MariaDbConfig, conn: Conn) {
+        let _ = timed(cfg, async { Ok(conn.disconnect().await?) }).await;
     }
 
     pub async fn query(&self, cfg: &MariaDbConfig, sql: &str, params: Vec<Param>) -> Result<Vec<Row>> {

@@ -50,7 +50,8 @@ backend/                     # Rust (cargo) — 실행 파일 target/release/llm
   config.toml                # 설정 (관리자 화면 설정 탭이 쓴다 — 저장소에는 없다)
   config.credentials.json    # 비밀값: LLM API 키·관리 DB 비밀번호·관리자 인증 키 (0600)
   sql/schema.sql, seed.sql   # MariaDB DDL + 데모 데이터
-  src/main.rs                # 기동·백그라운드 작업(임베딩 동기화·로그 정리)·종료
+  src/main.rs                # 기동·백그라운드 작업(임베딩 동기화·로그 정리)·종료(SIGINT·SIGTERM·SIGHUP)
+  src/console.rs             # 콘솔 출력 — 출력을 읽던 쪽(로그 실행기·터미널)이 사라져도 서버를 멈추지 않는다
   src/web.rs                 # POST /api/chat (NDJSON), /api/health
   src/admin.rs               # /api/admin — 관리 테이블 CRUD·프로젝트·설정·폴더 선택·연결 확인
   src/agent.rs               # 답변 루프 (도구 일괄 실행·진행 이벤트·최종 답)
@@ -267,6 +268,12 @@ Windows는 `start_all.bat` / `stop_all.bat`을 쓴다(`--apps-only`는 앱만). 
 `tail -F backend/logs/backend.log`로 날짜가 바뀌어도 계속 추적할 수 있다. 날짜 기준 보관이므로
 3일 안에 발생하는 로그의 총용량 제한은 없다. `cargo run` / `npm run dev`의 직접 실행은 콘솔 출력만 한다.
 Windows의 `start.bat`(`start_all.bat`도 이것을 부른다)은 같은 파일에 덧붙이기만 하고 날짜별 정리는 하지 않는다.
+로그를 쓸 수 없어도(실행 중에 `logs` 폴더를 지웠거나, 디스크가 찼거나, 권한이 바뀌었을 때) 실행기(`scripts/logged-process.cjs`)는
+멈추지 않는다 — 지운 폴더는 다시 만들고, 쓰지 못한 출력은 다시 쓸 수 있게 되면 그 바이트 수를 로그에 남긴다. 전에는 실행기가 끝나
+서버가 출력이 끊긴 채 관리 밖에서 계속 돌았다(stop.sh는 멈출 실행기를 못 찾고, start.sh는 포트가 잡혀 실패). 실행기에 다른 오류가
+나도 서버를 먼저 멈춘 뒤 끝난다. backend는 출력을 읽는 쪽이 사라져도(실행기 강제 종료, 직접 띄운 터미널 닫기) 로그 줄 때문에
+질문·기록·종료가 실패하지 않는다(콘솔 쓰기 실패를 무시한다 — 전에는 줄마다 panic이었다). SIGHUP(터미널을 닫을 때, 실행기가 넘길 때)도
+SIGINT·SIGTERM처럼 정리하고 끝난다.
 로그 보관·종료 동작 검증: 저장소 루트에서 `node --test scripts/retained-log.test.cjs`.
 
 #### 회귀 검증
@@ -277,6 +284,7 @@ cd backend && cargo test   # 청커·SQL 가드·바인드·NUMBER·설정·도�
 
 MCP 검사(`tests/mcp.rs`)는 `node`로 가짜 MCP 서버(`tests/fixtures/fake_mcp_server.mjs`)를 stdio·HTTP로 띄워 연결·호출·시간 초과와 취소·
 호출 중 프로세스 죽음과 재연결·stdout 오염·stderr 폭주·도구 목록 변경·손자 프로세스 정리·SIGTERM 뒤 종료·버린 요청의 취소·환경 격리·관리 API를 잰다(node가 없으면 건너뛴다).
+프로세스 검사(`tests/process.rs`, Unix)는 실제 `llm-agent` 실행 파일을 띄워 SIGHUP에 MCP 서버를 닫고 끝나는지, 출력을 읽는 쪽이 사라진 뒤에도 답하고 정리하며 끝나는지 잰다.
 
 MariaDB·Oracle·임베딩이 필요한 통합 검사는 환경변수가 있을 때만 돈다(없으면 건너뛰었다고 찍는다).
 검사마다 `llm_agent_rs_test_*` DB를 새로 만들어 `schema.sql`·`seed.sql`을 싣고 끝나면 지운다 — 운영 DB는 건드리지 않는다.
@@ -733,6 +741,7 @@ JIRA_TOKEN = "ENV:JIRA_TOKEN"       # ENV:이름 = backend 환경변수(.env 포
   stdout에 섞인 JSON 아닌 줄은 건너뛴다. 명령은 Unix에서는 프로세스 그룹, Windows에서는 Job Object로 띄워 멈출 때(종료·재연결·삭제)
   손자 프로세스까지 정리한다. 멈출 때는 입력을 닫고 2초, 그래도 남으면 SIGTERM을 보내고 2초 더 기다린 뒤 죽인다(MCP 명세의 순서).
   `docker run -i --rm`으로 띄우는 서버에는 `--init`을 붙인다 — 없으면 컨테이너 안의 첫 프로세스가 SIGTERM을 무시해, 입력이 닫혀도 끝나지 않는 서버의 컨테이너가 남는다.
+  backend가 SIGHUP으로 끝날 때도 이 순서로 닫는다 — 전에는 SIGHUP의 기본 동작으로 그 자리에서 끝나, 입력이 닫혀도 끝나지 않는 서버가 고아로 남았다.
   서버는 표준 입출력 말고는 backend가 연 파일(다른 서버의 파이프, 연결)을 물려받지 않는다 — macOS에서 함께 뜬 서버가 서로의 파이프를 쥐면, 끝난 서버가 끝난 것으로 보이지 않아 호출이 시간 한도까지 기다렸다.
   서버가 띄운 프로세스가 서버의 표준 입출력을 물려받아 서버가 끝난 뒤에도 출력이 열려 있으면, 1초 뒤 ping으로 묻고 답이 없으면 다시 연결한다.
   끝난 서버 프로세스는 연결을 닫을 때까지 거두지 않는다(Unix) — 먼저 거두면 그 ID를 받은 다른 프로그램이 닫을 때의 그룹 종료를 맞을 수 있었다.
@@ -996,6 +1005,8 @@ INSERT INTO query_registry (query_name, query_desc, input_desc, query_sql, outpu
   서버 기동 시 1회 + 설정의 동기화 주기(기본 60초) + `llm-agent embed-sync` 수동.
   한 번에 하나만 돌도록 잡는 잠금(`GET_LOCK`)은 풀 밖의 연결 하나로 쥔다 — 풀에서 꺼내 쥐면 연결 수 1인 설정에서
   동기화가 나머지 일에 쓸 연결을 영영 못 얻어 매번 DB 한도의 두 배를 기다린 뒤 실패했고, 그동안 다른 DB 사용도 막혔다.
+  그 연결은 끝날 때 프로토콜대로(COM_QUIT) 닫는다 — 버리기만 하면 mysql_async가 인사 없이 끊어, 서버가 동기화마다(기본 1분마다)
+  aborted connection으로 세고 오류 로그에 한 줄씩 남겼다.
   청크 규칙·해시 식은 Node 백엔드와 바이트 단위로 같아, 이전한 설치에서 다시 나누거나 다시 임베딩하지 않는다.
   SQL로 직접 등록한 데이터는 다음 동기화(최대 1분) 뒤부터 검색된다
 

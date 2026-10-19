@@ -2,8 +2,21 @@
 //! embedding sync and exits. `--config <path>` (or LLM_AGENT_CONFIG) names
 //! the settings file; the default is config.toml in the working directory.
 
-use llm_agent::{app::App, config::Config, embed_sync, llm::OpenAiClient, web};
+use llm_agent::{app::App, config::Config, console, embed_sync, llm::OpenAiClient, web};
 use std::{path::PathBuf, sync::Arc, time::Duration};
+
+// Console lines that cannot panic once the output's reader is gone (see
+// `console`).
+macro_rules! eprintln {
+    ($($arg:tt)*) => {
+        console::line(format_args!($($arg)*))
+    };
+}
+macro_rules! println {
+    ($($arg:tt)*) => {
+        console::out_line(format_args!($($arg)*))
+    };
+}
 
 fn config_path(args: &[String]) -> PathBuf {
     if let Some(at) = args.iter().position(|a| a == "--config")
@@ -17,6 +30,7 @@ fn config_path(args: &[String]) -> PathBuf {
 }
 
 fn main() {
+    console::drop_unwritable();
     let args: Vec<String> = std::env::args().collect();
     // `.env` values (ENV:NAME target DB passwords, first-start import) join
     // the process environment without overriding it.
@@ -142,14 +156,20 @@ async fn serve(path: PathBuf, config: Config) -> i32 {
     code
 }
 
+/// SIGINT, SIGTERM or SIGHUP (the terminal closed, or the log launcher
+/// passing on its own): left to its default, a hangup ended the backend on
+/// the spot, and an MCP server that outlives its input (a Node server
+/// holding a database pool, its docker container) was left running.
 async fn wait_for_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
         let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        let mut hangup = signal(SignalKind::hangup()).expect("SIGHUP handler");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = term.recv() => {}
+            _ = hangup.recv() => {}
         }
     }
     #[cfg(not(unix))]

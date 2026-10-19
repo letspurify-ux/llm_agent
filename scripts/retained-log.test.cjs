@@ -53,6 +53,73 @@ test('launcher kills a server that ignores SIGTERM within its shutdown deadline'
   serverPid = undefined;
 });
 
+const read = file => { try { return fs.readFileSync(file, 'utf8'); } catch { return ''; } };
+
+async function waitFor(check, what) {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    const found = check();
+    if (found) return found;
+    assert.ok(Date.now() < deadline, what);
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+}
+
+// A launcher over a server that writes a line every 20 ms and stops in order
+// on SIGTERM, logging into `logs/backend.log` of a fresh folder.
+function launchChatty(t, prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const logs = path.join(dir, 'logs');
+  const file = path.join(logs, 'backend.log');
+  const launcher = spawn(process.execPath, [path.join(__dirname, 'logged-process.cjs'), '-e', `
+    console.log('ready pid=' + process.pid);
+    let n = 0;
+    setInterval(() => console.log('line ' + n++), 20);
+    process.on('SIGTERM', () => { console.log('stopped in order'); process.exit(0); });
+  `], { env: { ...process.env, APP_LOG_FILE: file }, stdio: 'ignore' });
+  const closed = new Promise(resolve => launcher.on('close', resolve));
+  const started = waitFor(() => read(file).match(/ready pid=(\d+)/), 'the server should start').then(m => Number(m[1]));
+  t.after(async () => {
+    if (launcher.exitCode === null) launcher.kill('SIGKILL');
+    try { process.kill(await started, 'SIGKILL'); } catch {}
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  return { launcher, closed, started, logs, file };
+}
+
+// A log write that failed (its folder removed) threw out of the launcher:
+// it ended and its server ran on unlogged, its output a broken pipe, with
+// nothing to stop it (stop.sh found no launcher, start.sh the port taken).
+test('launcher outlives its log folder removed and keeps its server under it', { timeout: 15_000 }, async t => {
+  const { launcher, closed, started, logs, file } = launchChatty(t, 'logged-process-removed-');
+  await started;
+  fs.rmSync(logs, { recursive: true, force: true });
+  await waitFor(() => /line \d+/.test(read(file)), 'logging should go on in a folder made anew');
+  assert.equal(launcher.exitCode, null, 'the launcher runs on');
+  assert.ok(fs.existsSync(`${file}.day`), 'the log keeps its date');
+  launcher.kill('SIGTERM');
+  assert.equal(await closed, 0);
+  assert.match(read(file), /stopped in order/);
+});
+
+test('launcher outlives a log it cannot write and notes the output lost', { timeout: 15_000 }, async t => {
+  const { launcher, closed, started, logs, file } = launchChatty(t, 'logged-process-unwritable-');
+  await started;
+  fs.rmSync(logs, { recursive: true, force: true });
+  fs.writeFileSync(logs, 'a file where the log folder was');
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal(launcher.exitCode, null, 'the launcher runs on');
+  fs.rmSync(logs);
+  const note = await waitFor(
+    () => read(file).match(/\[launcher\] (\d+) bytes of output could not be written to the log \((\w+)\)/),
+    'the lost output should be noted',
+  );
+  assert.ok(Number(note[1]) > 0 && ['ENOTDIR', 'EEXIST'].includes(note[2]), note[0]);
+  launcher.kill('SIGTERM');
+  assert.equal(await closed, 0);
+  assert.match(read(file), /stopped in order/);
+});
+
 test('rotation retains only today and two preceding UTC dates, including idle cleanup and restart', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'retained-log-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

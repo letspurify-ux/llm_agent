@@ -94,20 +94,25 @@ impl EmbedSync {
             let cfg = &config.mariadb;
             // Not one of the pool's, which the sync uses meanwhile.
             let mut lock = db.lock_conn(cfg).await?;
-            let got = query_on(cfg, &mut lock, &format!("SELECT GET_LOCK('{LOCK_NAME}', 0) AS l"), vec![]).await?;
-            if got.first().map_or(0, |r| db::int(r, "l")) != 1 {
-                return Ok(Summary {
-                    skipped: Skipped::Busy,
-                    ..Default::default()
-                });
+            let locked = async {
+                let got = query_on(cfg, &mut lock, &format!("SELECT GET_LOCK('{LOCK_NAME}', 0) AS l"), vec![]).await?;
+                if got.first().map_or(0, |r| db::int(r, "l")) != 1 {
+                    return Ok(Summary {
+                        skipped: Skipped::Busy,
+                        ..Default::default()
+                    });
+                }
+                let summary = sync(db, config, stop).await;
+                let _ = plain_on(cfg, &mut lock, &format!("SELECT RELEASE_LOCK('{LOCK_NAME}')")).await;
+                summary
             }
-            let summary = sync(db, config, stop).await;
-            let _ = plain_on(cfg, &mut lock, &format!("SELECT RELEASE_LOCK('{LOCK_NAME}')")).await;
-            summary
+            .await;
+            db.close_conn(cfg, lock).await;
+            locked
         };
         // A panic would otherwise leave `running` set (every later sync
         // skipped as busy) and end the periodic sync's loop with it. The
-        // lock goes with its connection, closed when dropped.
+        // lock goes with its connection, cut when dropped.
         let result = AssertUnwindSafe(result)
             .catch_unwind()
             .await
