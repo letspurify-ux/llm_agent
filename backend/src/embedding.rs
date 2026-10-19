@@ -13,7 +13,15 @@ use tokio_util::sync::CancellationToken;
 
 /// Longest text embedded (UTF-16 units); longer texts are cut.
 pub const MAX_EMBED_TEXT_LEN: usize = 4000;
-const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+/// The most a response for `texts` inputs may be: 64 bytes a number (a
+/// float with all its digits, an indented line each) and 1 MiB besides.
+/// The whole of it is held and parsed into JSON values, about ten times its
+/// size; 256 MiB for any request let a wrong server take gigabytes.
+fn max_response_bytes(texts: usize) -> usize {
+    texts.saturating_mul(EMBEDDING_DIMENSIONS * 64).saturating_add(1024 * 1024)
+}
+/// The most of a refusal's body read.
+const MAX_ERROR_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct EmbedError {
@@ -72,6 +80,19 @@ fn embeddings_url(base: &str) -> String {
     format!("{}/embeddings", base.trim_end_matches('/'))
 }
 
+/// The HTTP client of embedding requests, shared so a request takes the
+/// connection the previous one left (a sync's batches, a question's
+/// searches) instead of opening and closing one of its own each time.
+fn client() -> reqwest::Result<reqwest::Client> {
+    static CLIENTS: crate::llm::ClientCache<()> = crate::llm::ClientCache::new();
+    CLIENTS.get((), || {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .pool_idle_timeout(crate::llm::IDLE_CONNECTION_TTL)
+            .build()
+    })
+}
+
 pub async fn embed(
     cfg: &EmbeddingConfig,
     texts: &[String],
@@ -80,10 +101,7 @@ pub async fn embed(
     if !cfg.enabled() {
         return Err(error("임베딩 주소가 설정되지 않았습니다", false));
     }
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| error(e.to_string(), false))?;
+    let client = client().map_err(|e| error(e.to_string(), false))?;
     let work = async {
         let response = client
             .post(embeddings_url(&cfg.url))
@@ -96,7 +114,12 @@ pub async fn embed(
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| error(format!("임베딩 응답을 읽지 못했습니다: {e}"), true))?;
-            if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            // A refusal is shown by its start.
+            if !status.is_success() && bytes.len() + chunk.len() > MAX_ERROR_BYTES {
+                bytes.extend_from_slice(&chunk[..MAX_ERROR_BYTES.saturating_sub(bytes.len())]);
+                break;
+            }
+            if bytes.len() + chunk.len() > max_response_bytes(texts.len()) {
                 return Err(error("임베딩 응답이 너무 큽니다", false));
             }
             bytes.extend_from_slice(&chunk);

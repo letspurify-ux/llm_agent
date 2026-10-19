@@ -677,17 +677,67 @@ impl SseDecoder {
         Ok(event)
     }
 }
+/// How long a connection back from a request waits for the next one before
+/// it is closed. Under the 5 s most servers keep an idle connection open
+/// (uvicorn, which vLLM runs on, Node, llama.cpp's server; Node's own client
+/// keeps 4 s), so a request does not take a connection as the server closes
+/// it.
+pub(crate) const IDLE_CONNECTION_TTL: Duration = Duration::from_secs(4);
+/// How long the end of a streamed response is read for after its [DONE].
+const STREAM_END_WAIT: Duration = Duration::from_secs(1);
+
+/// HTTP clients kept so that a request takes the connection the previous
+/// one left. A client made for each request opened and closed a connection
+/// of its own every time: a TCP and TLS handshake and a DNS lookup (on a
+/// thread of its own) per request, and a socket left in TIME_WAIT. Kept by
+/// runtime, whose tasks run a client's connections, and by `K`; the last few.
+pub(crate) struct ClientCache<K>(std::sync::Mutex<VecDeque<(ClientKey<K>, reqwest::Client)>>);
+type ClientKey<K> = (Option<tokio::runtime::Id>, K);
+impl<K: PartialEq> ClientCache<K> {
+    const MAX_CLIENTS: usize = 4;
+
+    pub(crate) const fn new() -> Self {
+        Self(std::sync::Mutex::new(VecDeque::new()))
+    }
+
+    /// The client for `key`, made by `build` when none is kept.
+    pub(crate) fn get(&self, key: K, build: impl FnOnce() -> reqwest::Result<reqwest::Client>) -> reqwest::Result<reqwest::Client> {
+        let key = (tokio::runtime::Handle::try_current().ok().map(|runtime| runtime.id()), key);
+        let mut clients = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(at) = clients.iter().position(|(known, _)| *known == key) {
+            let entry = clients.remove(at).unwrap();
+            let client = entry.1.clone();
+            clients.push_back(entry);
+            return Ok(client);
+        }
+        let client = build()?;
+        if clients.len() == Self::MAX_CLIENTS {
+            clients.pop_front();
+        }
+        clients.push_back((key, client.clone()));
+        Ok(client)
+    }
+}
+
+/// The clients of LLM requests, by proxy setting (a settings check may try
+/// another).
+static CLIENTS: ClientCache<(bool, Option<String>)> = ClientCache::new();
+
 impl OpenAiClient {
     fn client(c: &Config) -> Result<reqwest::Client> {
-        let mut b = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .dns_resolver(Arc::new(dns::SystemDns::default()));
-        if c.disable_proxy {
-            b = b.no_proxy();
-        } else if let Some(proxy) = c.proxy.as_deref().filter(|p| !p.trim().is_empty()) {
-            b = b.proxy(reqwest::Proxy::all(proxy)?)
-        }
-        Ok(b.build()?)
+        let proxy = if c.disable_proxy { None } else { c.proxy.clone().filter(|p| !p.trim().is_empty()) };
+        Ok(CLIENTS.get((c.disable_proxy, proxy.clone()), || {
+            let mut b = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .pool_idle_timeout(IDLE_CONNECTION_TTL)
+                .dns_resolver(Arc::new(dns::SystemDns::default()));
+            if c.disable_proxy {
+                b = b.no_proxy();
+            } else if let Some(proxy) = &proxy {
+                b = b.proxy(reqwest::Proxy::all(proxy)?)
+            }
+            b.build()
+        })?)
     }
     pub fn has_key(c: &Config) -> bool {
         Self::key(c).is_some()
@@ -911,6 +961,14 @@ impl OpenAiClient {
                 break;
             }
         }
+        if done {
+            // The response's end follows [DONE], often a moment later: read
+            // apart, so its connection goes back for the next request without
+            // the answer waiting (a response dropped unread closes it).
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(STREAM_END_WAIT, async { while let Some(Ok(_)) = stream.next().await {} }).await;
+            });
+        }
         if !done || finish_reason.is_none() {
             bail!("stream_interrupted: missing completion terminator");
         }
@@ -1021,12 +1079,21 @@ impl OpenAiClient {
                     Some(problem) => problem,
                 }
             } else {
-                let detail = tokio::time::timeout(Duration::from_secs(c.request_timeout_secs), response.bytes())
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .map(|bytes| String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_ERROR_BODY_BYTES)]).chars().take(1000).collect::<String>())
-                    .unwrap_or_default();
+                // Read as far as a chat request reads a refusal: the whole
+                // body, which a server may make as large as it likes, was
+                // taken in before it was cut.
+                let detail = tokio::time::timeout(Duration::from_secs(c.request_timeout_secs), async {
+                    let mut stream = response.bytes_stream();
+                    let mut bytes = Vec::new();
+                    while bytes.len() < MAX_ERROR_BODY_BYTES
+                        && let Some(Ok(chunk)) = stream.next().await
+                    {
+                        bytes.extend_from_slice(&chunk[..chunk.len().min(MAX_ERROR_BODY_BYTES - bytes.len())]);
+                    }
+                    String::from_utf8_lossy(&bytes).chars().take(1000).collect::<String>()
+                })
+                .await
+                .unwrap_or_default();
                 let refusal = format!("http_{}: {detail}", status.as_u16());
                 // As a chat request does: an optional parameter refused by
                 // name is left out.
