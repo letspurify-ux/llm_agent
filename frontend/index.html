@@ -456,7 +456,6 @@
         /* 높이가 자동이므로 사용자가 끄트머리를 끌어 늘리는 손잡이는 거짓말이 된다 — 없앤다. */
         resize: none;
       }
-      .composer textarea::placeholder { color: #9aa4bd; }
       .send {
         width: 42px; height: 42px; border-radius: 50%; border: none; flex-shrink: 0;
         background: var(--grad); color: #fff; font-size: 17px; cursor: pointer;
@@ -529,15 +528,6 @@
         .bubble.assistant { max-width: 100%; }
         .bubble.user { max-width: 88%; }
       }
-      /* 이보다 좁아지면 입력창 안내문이 두 줄로 감긴다(실측: 창 344px까지는 한 줄, 340px부터 두 줄).
-         상자 높이는 '들어 있는 글'로 정해지는데 안내문은 글이 아니라서 한 줄 높이에 잘린다 —
-         폭 320px에서 아랫줄 22px이 잘려 '줄바꿈)'만 반쯤 보였다. 빈 상자만 두 줄로 열어 둔다
-         (글을 넣으면 App.jsx의 fitInput이 그때부터 재고, min-height는 그 위에서 바닥만 잡는다). */
-      @media (max-width: 343px) {
-        /* 창이 아주 낮으면 이 바닥이 위의 max-height(40dvh)를 밀어낸다 — min-height가 늘 이긴다.
-           두 줄을 여는 것은 안내문이 감기기 때문이지 자리를 뺏자는 것이 아니므로 상한에 맞춰 접는다. */
-        .composer textarea { min-height: min(64px, 40vh); min-height: min(64px, 40dvh); }
-      }
       /* iOS Safari는 글자가 16px보다 작은 입력칸에 초점이 가면 화면을 확대하고, 초점이 빠져도 되돌리지
          않는다 — 폭에 꼭 맞던 화면이 옆으로 넘치게 된다. 그래서 iOS에서만 입력칸을 16px로 올린다
          (-webkit-touch-callout은 iOS·iPadOS의 WebKit만 안다). maximum-scale=1로 막지 않는 이유:
@@ -545,11 +535,6 @@
          !important인 이유: 관리 화면(admin.css)의 입력칸들은 더 구체적인 선택자로 12~13px을 준다. */
       @supports (-webkit-touch-callout: none) {
         input, textarea, select { font-size: 16px !important; }
-        /* 글자가 커진 만큼 안내문도 더 넓은 창에서 감긴다(실측: 16px에서 안내문 244px, 창 366px부터
-           한 줄 — 14.5px의 222px·344px과 같은 여백). 위 규칙의 이유 그대로 두 줄을 열어 둔다. */
-        @media (max-width: 369px) {
-          .composer textarea { min-height: min(64px, 40vh); min-height: min(64px, 40dvh); }
-        }
       }
     </style>
   </head>

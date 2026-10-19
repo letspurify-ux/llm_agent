@@ -1388,7 +1388,7 @@ export default function App() {
               // Safari는 compositionend를 keydown보다 먼저 보내 확정 Enter가 여기로 온다 — 그대로 보낸다.
               submitInput();
             }}
-            placeholder="질문을 입력하세요 (Alt+Enter 줄바꿈)"
+            aria-label="질문"
             maxLength={20000}  /* 입력 단계 안내용 사본 — 실제 제한은 서버가 검증한다 (backend/src/agent.rs MAX_QUESTION_LEN) */
             autoFocus
           />
