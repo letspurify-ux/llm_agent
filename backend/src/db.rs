@@ -25,6 +25,17 @@ pub struct Db {
     pool: Mutex<Option<(String, Pool)>>,
 }
 
+/// How long a connection back in the pool waits idle for the next query
+/// before it is closed (checked every 30 s), down to none: an idle server
+/// holds no connection. With no idle time the pool kept none at all, and
+/// every query opened, logged in to and closed a connection of its own —
+/// about four round trips more per query, and a closed socket left in
+/// TIME_WAIT each time. A connection back in the pool is reset first
+/// (COM_RESET_CONNECTION: session variables, locks, an open transaction;
+/// the character set goes back to the login's, which MariaDB maps to the
+/// collation SET NAMES gives), so it is taken again as a new one.
+const IDLE_CONNECTION_TTL: Duration = Duration::from_secs(60);
+
 /// MariaDB error codes the admin API reports with their own status.
 pub const ER_DUP_ENTRY: u16 = 1062;
 pub const ER_DBACCESS_DENIED: u16 = 1044;
@@ -50,7 +61,11 @@ impl Db {
         }
         let constraints = PoolConstraints::new(0, cfg.pool_size.max(1))
             .ok_or_else(|| anyhow::anyhow!("invalid pool size"))?;
-        let opts = options(cfg).pool_opts(PoolOpts::default().with_constraints(constraints));
+        let opts = options(cfg).pool_opts(
+            PoolOpts::default()
+                .with_constraints(constraints)
+                .with_inactive_connection_ttl(IDLE_CONNECTION_TTL),
+        );
         let pool = Pool::new(Opts::from(opts));
         if let Some((_, old)) = slot.replace((fingerprint, pool.clone())) {
             tokio::spawn(async move {
