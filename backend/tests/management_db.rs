@@ -55,3 +55,58 @@ async fn queries_take_the_pools_connections_again_as_new() {
     assert!(!ids.contains(&db::int(&row, "id")));
     db.close().await;
 }
+
+/// Resource review, eleventh pass: a settings change made a new pool and
+/// disconnected the one before at once, failing every connection still
+/// being taken from it ("Pool was disconnected"): the tool calls and chat
+/// log of questions under way, an admin save. A question goes on with the
+/// settings it started with, so it made the old pool again and ended the
+/// new one in turn. Queries under both settings at once all run, and every
+/// connection closes with the pools.
+#[tokio::test]
+async fn queries_under_settings_changed_meanwhile_all_run() {
+    let Some(test_db) = TestDb::create("pool_change") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    // Small pools, so connections are waited for as under load.
+    let mut before = test_db.config().mariadb;
+    before.pool_size = 1;
+    let mut after = before.clone();
+    after.pool_size = 2;
+    let db = std::sync::Arc::new(Db::default());
+    let runs: Vec<_> = (0..32)
+        .map(|i| {
+            let (db, cfg) = (db.clone(), if i % 2 == 0 { before.clone() } else { after.clone() });
+            tokio::spawn(async move {
+                let mut failed = vec![];
+                for _ in 0..20 {
+                    if let Err(e) = db.query(&cfg, "SELECT 1 AS one", vec![]).await {
+                        failed.push(e.to_string());
+                    }
+                }
+                failed
+            })
+        })
+        .collect();
+    let mut failed = vec![];
+    for run in runs {
+        failed.extend(run.await.unwrap());
+    }
+    assert!(failed.is_empty(), "{} of 640 queries failed, as {:?}", failed.len(), failed.first());
+    db.close().await;
+    let probe = Db::default();
+    let mut open = -1;
+    for _ in 0..40 {
+        let rows = probe
+            .query(&before, "SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST WHERE DB = DATABASE() AND ID <> CONNECTION_ID()", vec![])
+            .await
+            .unwrap();
+        open = db::int(&rows[0], "n");
+        if open == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(open, 0, "connections left open after the pools closed");
+    probe.close().await;
+}

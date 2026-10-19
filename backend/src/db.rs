@@ -1,12 +1,12 @@
 //! The management MariaDB: knowledge, Q&A methods, the query registry,
-//! target DB registrations, vectors and the chat log. The pool is rebuilt
+//! target DB registrations, vectors and the chat log. A new pool is made
 //! when the connection settings change in the settings screen.
 
 use crate::config::MariaDbConfig;
 use anyhow::{Result, bail};
 use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, prelude::Queryable};
 use serde_json::{Map, Value, json};
-use std::{sync::Mutex, time::Duration};
+use std::{collections::VecDeque, sync::Mutex, time::Duration};
 
 pub type Row = Map<String, Value>;
 pub type Param = mysql_async::Value;
@@ -22,8 +22,18 @@ pub fn n(value: i64) -> Param {
 
 #[derive(Default)]
 pub struct Db {
-    pool: Mutex<Option<(String, Pool)>>,
+    /// Pools by the settings they connect with, the last used last.
+    pools: Mutex<VecDeque<(String, Pool)>>,
 }
+
+/// Pools kept for settings no longer the latest. A settings change made a
+/// new pool and disconnected the one before at once, which fails every
+/// connection still being taken from it ("Pool was disconnected"): the tool
+/// calls and chat log of questions under way, an admin save. A question goes
+/// on with the settings it started with, so it made the old pool again,
+/// ending the new one in turn. A pool left out here closes once the queries
+/// using it are done; one kept closes its idle connections as any pool does.
+const POOLS_KEPT: usize = 4;
 
 /// How long a connection back in the pool waits idle for the next query
 /// before it is closed (checked every 30 s), down to none: an idle server
@@ -53,11 +63,12 @@ pub fn server_code(error: &anyhow::Error) -> Option<u16> {
 impl Db {
     fn pool(&self, cfg: &MariaDbConfig) -> Result<Pool> {
         let fingerprint = cfg.fingerprint();
-        let mut slot = self.pool.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((known, pool)) = slot.as_ref()
-            && *known == fingerprint
-        {
-            return Ok(pool.clone());
+        let mut pools = self.pools.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(at) = pools.iter().position(|(known, _)| *known == fingerprint) {
+            let entry = pools.remove(at).unwrap();
+            let pool = entry.1.clone();
+            pools.push_back(entry);
+            return Ok(pool);
         }
         let constraints = PoolConstraints::new(0, cfg.pool_size.max(1))
             .ok_or_else(|| anyhow::anyhow!("invalid pool size"))?;
@@ -67,10 +78,9 @@ impl Db {
                 .with_inactive_connection_ttl(IDLE_CONNECTION_TTL),
         );
         let pool = Pool::new(Opts::from(opts));
-        if let Some((_, old)) = slot.replace((fingerprint, pool.clone())) {
-            tokio::spawn(async move {
-                let _ = old.disconnect().await;
-            });
+        pools.push_back((fingerprint, pool.clone()));
+        if pools.len() > POOLS_KEPT {
+            pools.pop_front();
         }
         Ok(pool)
     }
@@ -112,10 +122,8 @@ impl Db {
     }
 
     pub async fn close(&self) {
-        let pool = self.pool.lock().unwrap_or_else(|p| p.into_inner()).take();
-        if let Some((_, pool)) = pool {
-            let _ = pool.disconnect().await;
-        }
+        let pools = std::mem::take(&mut *self.pools.lock().unwrap_or_else(|p| p.into_inner()));
+        futures_util::future::join_all(pools.into_iter().map(|(_, pool)| pool.disconnect())).await;
     }
 }
 

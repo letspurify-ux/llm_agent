@@ -43,10 +43,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let runtime = llm_agent::app::runtime().expect("tokio runtime");
     let code = runtime.block_on(async move {
         if args.iter().any(|a| a == "embed-sync") {
             sync_once(path, config).await
