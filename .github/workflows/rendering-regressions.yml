@@ -28,7 +28,8 @@ jobs:
           key: cargo-${{ hashFiles('backend/Cargo.lock') }}
       # DB·LLM·Oracle 없이 도는 검사만 실행한다. MariaDB·Oracle 통합 검사는 환경변수
       # (LLM_AGENT_TEST_MARIADB·LLM_AGENT_TEST_ORACLE)가 있을 때만 돈다 — README '검사' 참고.
-      - run: cargo test --manifest-path backend/Cargo.toml
+      # 실패한 시험은 이름과 메시지를 주석(annotation)으로도 남긴다 — 실행 로그는 저장소 관리자만 읽는다.
+      - run: bash .github/annotate-test-failures.sh cargo test --manifest-path backend/Cargo.toml
 
   # MCP 도구 서버는 Windows에서 Job Object로 프로세스를 묶고 npx.cmd 같은 배치 파일을 실행한다 —
   # macOS·Linux에서는 그 경로를 잴 수 없어 Windows에서 따로 돌린다(가짜 MCP 서버는 Node로 뜬다).
@@ -50,5 +51,9 @@ jobs:
             ~/.cargo/git
             backend/target
           key: cargo-windows-${{ hashFiles('backend/Cargo.lock') }}
-      - run: cargo test --manifest-path backend/Cargo.toml --test mcp
-      - run: "cargo test --manifest-path backend/Cargo.toml --lib mcp::"
+      - run: bash .github/annotate-test-failures.sh cargo test --manifest-path backend/Cargo.toml --test mcp
+        shell: bash
+      - run: "bash .github/annotate-test-failures.sh cargo test --manifest-path backend/Cargo.toml --lib mcp::"
+        shell: bash
+        # Also when the step above failed: what fails here is seen in the same run.
+        if: ${{ !cancelled() }}

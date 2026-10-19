@@ -712,6 +712,10 @@ async fn a_missing_working_folder_is_named() {
 /// MCP review, seventeenth pass: a failure was told with the last line the
 /// server ever wrote — that of a process gone before this attempt (its
 /// startup banner, its last words), beside a cause it had no part in.
+/// Unix only: it removes the working folder of a server still running, which
+/// Windows does not allow (the folder stayed, the next attempt started in
+/// it, and the test waited for a missing folder in vain).
+#[cfg(unix)]
 #[tokio::test]
 async fn a_failure_is_told_with_the_output_of_its_own_attempt() {
     if node_missing() {
