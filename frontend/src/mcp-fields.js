@@ -7,7 +7,7 @@ const PAIR = { env: { separator: '=', label: '환경변수' }, headers: { separa
 
 export function blankForm() {
   return {
-    name: '', description: '', enabled: true, transport: 'stdio', command: '', args: '', cwd: '', url: '',
+    name: '', description: '', enabled: true, transport: 'stdio', command: '', args: '', cwd: '', url: '', disableProxy: false,
     env: '', headers: '', allTools: false, tools: [], timeout: '',
     secretNames: { env: [], headers: [] }, secretChanges: { env: {}, headers: {} },
   };
@@ -42,6 +42,7 @@ export function formOf(server) {
     name: server.name || '', description: server.description || '', enabled: server.enabled !== false,
     transport: server.transport || (server.url ? 'http' : 'stdio'),
     command: server.command || '', args: (server.args || []).join('\n'), cwd: server.cwd || '', url: server.url || '',
+    disableProxy: server.disable_proxy === true,
     env: pairsText(server.env, 'env'), headers: pairsText(server.headers, 'headers'),
     allTools: tools.includes('*'), tools: tools.filter(tool => tool !== '*'),
     timeout: server.timeout_secs == null ? '' : String(server.timeout_secs),
@@ -71,7 +72,7 @@ export function bodyOf(form) {
     name: form.name.trim(), description: form.description, enabled: form.enabled,
     command: http ? '' : form.command.trim(),
     args: http ? [] : form.args.split('\n').map(line => line.replace(/\r$/, '')).filter(line => line.trim()),
-    cwd: http ? '' : form.cwd.trim(), url: http ? form.url.trim() : '',
+    cwd: http ? '' : form.cwd.trim(), url: http ? form.url.trim() : '', disable_proxy: form.disableProxy,
     env: env.values, headers: headers.values,
     tools: form.allTools ? ['*'] : [...form.tools],
     timeout_secs: timeout ? Number(timeout) : null,

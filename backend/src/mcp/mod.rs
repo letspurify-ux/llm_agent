@@ -106,6 +106,8 @@ const INHERITED_ENV: &[&str] = &[
     "NUMBER_OF_PROCESSORS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
     "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
 ];
+/// Of those, the proxy's: left out for a server set to go direct.
+const PROXY_ENV: &[&str] = &["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"];
 /// HTTP statuses that refuse one request, not the session: timeout,
 /// conflict, body or address or headers too large, media type,
 /// unprocessable. (400, 401, 403, 404 and 410 also answer a session or
@@ -606,7 +608,7 @@ fn check_alive(slot: &Arc<Slot>, peer: &Peer<RoleClient>, link: &Arc<Link>, why:
 fn connection_key(server: &McpServer) -> String {
     use sha2::{Digest, Sha256};
     let secrets = |values: &BTreeMap<String, Secret>| values.iter().map(|(k, v)| (k.clone(), v.0.clone())).collect::<Vec<_>>();
-    let key = json!([server.name, server.enabled, server.command, server.args, server.cwd, server.url, server.env, server.headers,
+    let key = json!([server.name, server.enabled, server.command, server.args, server.cwd, server.url, server.disable_proxy, server.env, server.headers,
         secrets(&server.secret_env), secrets(&server.secret_headers)]);
     hex::encode(Sha256::digest(key.to_string().as_bytes()))
 }
@@ -1834,7 +1836,7 @@ async fn connect(slot: &Arc<Slot>, server: &McpServer) -> Result<Connection> {
         install_tls();
         // A session made anew in place of one the server forgot is read as
         // a changed tool list: a server deployed again may list others.
-        let client = wire::Lenient::new(list_changed.clone()).map_err(|e| anyhow!("HTTP 클라이언트를 만들지 못했습니다: {}", causes(&e)))?;
+        let client = wire::Lenient::new(list_changed.clone(), server.disable_proxy).map_err(|e| anyhow!("HTTP 클라이언트를 만들지 못했습니다: {}", causes(&e)))?;
         sessions = client.sessions();
         handler
             .serve_with_ct(StreamableHttpClientTransport::with_client(client, http_config(server)?), close.clone())
@@ -1943,9 +1945,17 @@ fn values(server: &McpServer, plain: &BTreeMap<String, String>, secret: &BTreeMa
 fn environment(server: &McpServer) -> Result<Vec<(String, std::ffi::OsString)>> {
     let mut env: Vec<(String, std::ffi::OsString)> = INHERITED_ENV
         .iter()
+        .filter(|name| !(server.disable_proxy && PROXY_ENV.contains(name)))
         .filter_map(|name| std::env::var_os(name).map(|value| ((*name).to_owned(), value)))
         .collect();
-    for (key, value) in values(server, &server.env, &server.secret_env, false)? {
+    let own = values(server, &server.env, &server.secret_env, false)?;
+    // Programs that also read the system's proxy (Python's on macOS and
+    // Windows) take `NO_PROXY=*` as going direct, unless the server's `env`
+    // names its own.
+    if server.disable_proxy && !own.iter().any(|(key, _)| key.eq_ignore_ascii_case("NO_PROXY")) {
+        env.extend(["NO_PROXY", "no_proxy"].map(|name| (name.to_owned(), "*".into())));
+    }
+    for (key, value) in own {
         env.push((key, value.into()));
     }
     Ok(env)

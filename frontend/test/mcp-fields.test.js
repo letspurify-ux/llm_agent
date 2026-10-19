@@ -12,9 +12,18 @@ test('저장된 서버는 화면 글자로 갔다가 같은 본문으로 돌아�
   const { body, problems } = bodyOf(formOf(SERVER));
   assert.deepEqual(problems, []);
   assert.deepEqual(body, {
-    name: 'jira', description: '사내 Jira', enabled: true, command: 'npx', args: ['-y', 'jira-mcp'], cwd: '', url: '',
+    name: 'jira', description: '사내 Jira', enabled: true, command: 'npx', args: ['-y', 'jira-mcp'], cwd: '', url: '', disable_proxy: false,
     env: { JIRA_URL: 'https://j', TOKEN: 'ENV:JIRA_TOKEN' }, headers: {}, tools: ['search', 'get'], timeout_secs: 20,
   });
+});
+
+test('프록시 사용 안 함은 두 연결 방식 모두 그대로 오간다', () => {
+  assert.equal(formOf(SERVER).disableProxy, false);
+  assert.equal(blankForm().disableProxy, false);
+  const form = formOf({ ...SERVER, disable_proxy: true });
+  assert.equal(form.disableProxy, true);
+  assert.equal(bodyOf(form).body.disable_proxy, true);
+  assert.equal(bodyOf({ ...form, transport: 'http', url: 'https://wiki/mcp' }).body.disable_proxy, true);
 });
 
 test('비밀값은 바꾼 것만 보내고, 지우기는 null이다', () => {

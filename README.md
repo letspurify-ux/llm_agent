@@ -671,6 +671,7 @@ command = "npx"                     # 명령 실행(stdio, 상대 경로는 cwd 
 args = ["-y", "jira-mcp-server"]
 tools = ["search_issues", "get_issue"]  # 허용 도구(서버의 이름 또는 jira__search_issues). ["*"]는 전부, 비우면 하나도 안 보인다
 timeout_secs = 30                   # 호출 한도. 비우면 설정의 도구 시간 한도
+disable_proxy = true                # 프록시 사용 안 함(기본 false) — HTTP는 HTTP_PROXY 등을 거치지 않고 바로 접속, 명령은 프록시 변수 대신 NO_PROXY=*
 
 [mcp_servers.env]
 JIRA_URL = "https://jira.example.com"
@@ -685,6 +686,9 @@ JIRA_TOKEN = "ENV:JIRA_TOKEN"       # ENV:이름 = backend 환경변수(.env 포
   - HTTP 주소의 호스트를 바꾸면 저장된 비밀 헤더는 새 주소로 가지 않는다. 다시 넣거나 지워야 저장된다(주소 오타로 토큰이 새는 것을 막는다).
 - **명령의 환경**: backend의 환경변수를 통째로 넘기지 않는다(`.env`의 DB 비밀번호가 따라간다). PATH·HOME·USERPROFILE·TEMP·
   SYSTEMROOT·프록시·CA 인증서 변수처럼 실행에 필요한 것만 상속하고 설정한 `env`를 더한다.
+- **프록시 사용 안 함**(`disable_proxy`, MCP 탭의 체크박스): 사내 서버처럼 프록시를 거치면 안 되는 서버에 쓴다. HTTP 서버는 backend 환경변수
+  (`HTTP_PROXY`·`HTTPS_PROXY`·`ALL_PROXY`, `.env` 포함)의 프록시를 무시하고 바로 접속한다. 명령은 프록시 변수를 상속하지 않고 `NO_PROXY=*`를 받는다
+  (macOS·Windows의 시스템 프록시를 읽는 Python 등도 바로 접속한다). 서버의 `env`에 `NO_PROXY`나 프록시 변수를 적으면 그것이 우선한다.
 - **질문 하나 동안 같은 도구**: 질문이 시작될 때 연결된 서버의 허용 도구를 정해, 그 질문의 모든 요청에 같은 정의를 보낸다(제공자 프롬프트 캐시가 유지된다).
   - 도구 설명 속 같은 서버의 다른 도구 이름은 모델이 보는 이름(`exa__web_fetch_exa`)으로 바꿔 싣는다. 모델이 원래 이름으로 부르면, 그 이름의 도구가 하나뿐일 때 그 도구로 실행하고 쓸 이름을 알린다.
   - 도구 설명은 1,024자까지 싣는다. OpenAI는 이보다 긴 함수 설명이 하나라도 있으면 요청 전체를 거절한다.

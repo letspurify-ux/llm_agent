@@ -28,6 +28,7 @@ args = ["-y", "jira-mcp-server"]
 cwd = ""
 tools = ["search_issues", "get_issue"]  # 서버의 도구 이름 또는 모델이 보는 이름(jira__search_issues)
 timeout_secs = 30                  # 비우면 agent.tool_timeout_secs
+disable_proxy = true               # 프록시 사용 안 함(기본 false, false면 저장하지 않음)
 
 [mcp_servers.env]
 JIRA_URL = "https://jira.example.com"
@@ -47,6 +48,7 @@ tools = ["*"]
 
 - 연결에 쓰는 값 = `env`/`headers`(보이는 값) 위에 비밀값을 덮은 것. 값이 `ENV:이름`이면 그 환경변수를 읽는다.
 - **자식 프로세스 환경**: backend의 환경을 통째로 넘기지 않는다(.env의 DB 비밀번호 등이 따라간다). 실행에 필요한 안전 목록(PATH, HOME, USERPROFILE, APPDATA, TEMP, SYSTEMROOT, 프록시 변수 등)만 상속하고 설정한 `env`를 더한다(MCP 공식 SDK의 기본값과 같은 방식).
+- **프록시 사용 안 함**(`disable_proxy`): HTTP 서버는 `wire::Lenient`의 클라이언트를 `no_proxy()`로 만들어 환경변수 프록시를 거치지 않는다. 명령은 안전 목록에서 프록시 변수(`HTTP_PROXY`·`HTTPS_PROXY`·`NO_PROXY`와 소문자)를 빼고 `NO_PROXY=*`·`no_proxy=*`를 준다 — 서버의 `env`(비밀값 포함)가 `NO_PROXY`를 적으면 주지 않는다. 바꾸면 다시 연결한다(`connection_key`). 시험: `tests/mcp_proxy.rs`(프록시 변수가 프로세스 전체 값이라 따로 된 시험 바이너리).
 - 1단계(파일 편집)는 재시작해야 반영된다. 2단계(관리 화면)는 저장 즉시 반영된다.
 
 ## 3. 연결과 수명 (backend/src/mcp/ `McpHub`)

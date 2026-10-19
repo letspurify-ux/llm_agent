@@ -446,6 +446,11 @@ pub struct McpServer {
     pub cwd: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub url: String,
+    /// Reach the server without a proxy: an HTTP server is connected to
+    /// directly, and a command does not inherit the proxy variables (it is
+    /// given `NO_PROXY=*` unless its `env` says otherwise).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub disable_proxy: bool,
     /// Tools offered to the model: their names, or "*" for every tool.
     pub tools: Vec<String>,
     /// Seconds one call may take; unset is `agent.tool_timeout_secs`.
@@ -475,6 +480,7 @@ impl Default for McpServer {
             args: vec![],
             cwd: String::new(),
             url: String::new(),
+            disable_proxy: false,
             tools: vec![],
             timeout_secs: None,
             env: BTreeMap::new(),

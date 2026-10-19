@@ -382,11 +382,16 @@ impl Lenient {
     /// Fails where the client cannot be built (no certificate store the
     /// platform verifier can load): the server's connection fails with why,
     /// rather than its supervisor or the admin's request with a panic.
-    pub fn new(renewed: Arc<Notify>) -> Result<Self, reqwest13::Error> {
-        let client = reqwest13::Client::builder()
+    /// `direct` leaves out the proxy of the environment (`HTTP_PROXY`,
+    /// `HTTPS_PROXY`, `.env` included).
+    pub fn new(renewed: Arc<Notify>, direct: bool) -> Result<Self, reqwest13::Error> {
+        let mut builder = reqwest13::Client::builder()
             .pool_max_idle_per_host(0)
-            .redirect(reqwest13::redirect::Policy::none())
-            .build()?;
+            .redirect(reqwest13::redirect::Policy::none());
+        if direct {
+            builder = builder.no_proxy();
+        }
+        let client = builder.build()?;
         Ok(Self { client, next_stream: Arc::new(Mutex::new(tokio::time::Instant::now())), sessions: Arc::default(), renewed })
     }
 
@@ -1048,7 +1053,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn event_streams_open_eight_at_once_then_one_a_second() {
         super::super::install_tls();
-        let client = Lenient::new(Arc::default()).unwrap();
+        let client = Lenient::new(Arc::default(), false).unwrap();
         let opened = async || {
             let started = tokio::time::Instant::now();
             let mut at = vec![];

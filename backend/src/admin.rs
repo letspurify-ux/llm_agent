@@ -1041,7 +1041,7 @@ fn mcp_view(app: &App, server: &McpServer) -> Value {
         "name":server.name,"description":server.description,"enabled":server.enabled,
         "transport":if server.url.trim().is_empty() { "stdio" } else { "http" },
         "command":server.command,"args":server.args,"cwd":server.cwd,"url":server.url,
-        "tools":server.tools,"timeout_secs":server.timeout_secs,"env":server.env,"headers":server.headers,
+        "disable_proxy":server.disable_proxy,"tools":server.tools,"timeout_secs":server.timeout_secs,"env":server.env,"headers":server.headers,
         "secrets":{"env":server.secret_env.keys().collect::<Vec<_>>(),"headers":server.secret_headers.keys().collect::<Vec<_>>()},
         "revision":mcp_revision(app, server),
         "status":app.mcp.server_status(&server.name, &config.llm.model)
@@ -1127,6 +1127,11 @@ fn mcp_draft(body: &Value, mut server: McpServer) -> ApiResult<McpServer> {
         None => {}
         Some(Value::Bool(v)) => server.enabled = *v,
         Some(_) => return Err(bad("enabled")),
+    }
+    match object.get("disable_proxy") {
+        None => {}
+        Some(Value::Bool(v)) => server.disable_proxy = *v,
+        Some(_) => return Err(bad("disable_proxy")),
     }
     if let Some(v) = text("command")? {
         server.command = js_trim(&v).to_owned();
@@ -1343,6 +1348,21 @@ async fn mcp_check(State(app): State<Arc<App>>, body: Bytes) -> ApiResult<Json<V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_draft_reads_disable_proxy() {
+        let base = McpServer { name: "web".into(), command: "node".into(), ..Default::default() };
+        let direct = mcp_draft(&json!({"disable_proxy":true}), base.clone()).unwrap();
+        assert!(direct.disable_proxy);
+        // Absent keeps it; it is no field of one connection kind.
+        assert!(mcp_draft(&json!({"url":"https://h/mcp","command":""}), direct.clone()).unwrap().disable_proxy);
+        assert!(!mcp_draft(&json!({"disable_proxy":false}), direct).unwrap().disable_proxy);
+        assert!(mcp_draft(&json!({"disable_proxy":"yes"}), base).is_err());
+        // Saved only when on.
+        let toml = |server: &McpServer| toml::to_string(server).unwrap();
+        assert!(!toml(&McpServer::default()).contains("disable_proxy"));
+        assert!(toml(&McpServer { disable_proxy: true, ..Default::default() }).contains("disable_proxy = true"));
+    }
 
     #[test]
     fn records_are_validated_like_the_former_api() {

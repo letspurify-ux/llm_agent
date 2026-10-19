@@ -203,6 +203,10 @@ export default function McpPanel({ api, onStateChange }) {
                 <textarea id="mcp-headers" rows={2} spellCheck={false} value={form.headers} placeholder={'한 줄에 하나: 이름: 값\nX-Team: voc'} onChange={e => update('headers', e.target.value)} />
                 <small>인증 토큰처럼 숨길 값은 아래 비밀값에 넣으세요.</small></div>
             </>}
+            <div className="admin-field admin-field-check"><label htmlFor="mcp-disable-proxy"><input id="mcp-disable-proxy" type="checkbox" checked={form.disableProxy} onChange={e => update('disableProxy', e.target.checked)} /> 프록시 사용 안 함</label>
+              <small>{form.transport === 'http'
+                ? 'backend 환경변수(HTTP_PROXY·HTTPS_PROXY, .env 포함)의 프록시를 거치지 않고 서버 주소에 바로 접속합니다.'
+                : 'backend의 프록시 환경변수(HTTP_PROXY·HTTPS_PROXY)를 넘기지 않고 NO_PROXY=*를 줍니다. 위 환경변수에 적은 값이 우선합니다.'}</small></div>
             <div className="admin-field"><span className="admin-field-label">비밀값({secretKind === 'env' ? '환경변수' : 'HTTP 헤더'})</span>
               <div className="admin-mcp-secrets">
                 {form.secretNames[secretKind].map(name => {
