@@ -370,7 +370,7 @@ async fn conversations_are_released_when_requests_end() {
     assert!(
         eventually(|| {
             app.sessions.sweep(idle);
-            app.sessions.len() == 0
+            app.sessions.is_empty()
         })
         .await,
         "a run whose client left still holds its conversation"

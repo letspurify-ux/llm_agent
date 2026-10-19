@@ -911,11 +911,11 @@ mod tests {
         };
         let asked = Some(NumberOrString::Number(7));
         // A server's restart: its answer names no request (id null).
-        let refused = mended_response(asked.clone(), true, error(None)).err().expect("fails the request").to_string();
+        let refused = mended_response(asked.clone(), true, error(None)).expect_err("fails the request").to_string();
         assert!(refused.contains(ANSWERED_NO_REQUEST) && refused.contains("No valid session ID provided (code -32000)"), "{refused}");
         assert!(mended_response(asked.clone(), true, error(Some(NumberOrString::Number(8)))).is_err(), "another request's");
         // Without a session (the initialization) there is none to lose.
-        let refused = mended_response(asked.clone(), false, error(None)).err().expect("fails the request").to_string();
+        let refused = mended_response(asked.clone(), false, error(None)).expect_err("fails the request").to_string();
         assert!(refused.contains(REFUSED_NO_REQUEST) && !refused.contains(ANSWERED_NO_REQUEST), "{refused}");
         // The answer to the request, and errors to what awaits none, go on.
         assert!(mended_response(asked, true, error(Some(NumberOrString::Number(7)))).is_ok());

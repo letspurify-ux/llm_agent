@@ -255,7 +255,7 @@ async fn run(
         .rev()
         .filter(|b| b.id != question_bundle)
         .flat_map(|b| b.messages.iter().rev())
-        .find(|m| m["role"] == "assistant" && !m["tool_calls"].as_array().is_some_and(|calls| !calls.is_empty()))
+        .find(|m| m["role"] == "assistant" && m["tool_calls"].as_array().is_none_or(|calls| calls.is_empty()))
         .and_then(|m| m["content"].as_str())
         .is_some_and(|text| opening(text, true) == Lead::Claims);
     let mut search_first_asked = false;
@@ -1220,7 +1220,7 @@ async fn execute_batch(
             Ok(())
         };
         let prepared_call = (|| -> std::result::Result<Prepared, String> {
-            if !offered.iter().any(|o| *o == call.name) {
+            if !offered.contains(&call.name) {
                 // A model that follows a server's own description calls its
                 // tool by the server's name for it: the one MCP tool of that
                 // name runs, and the result says the name to use — unless

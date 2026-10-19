@@ -479,7 +479,7 @@ pub fn normalize_arguments(name: &str, args: &mut Value) -> Vec<String> {
         return adjusted;
     };
     // A continuation object copied whole: its own `tool` names this tool.
-    if fields.get("tool").is_some_and(|tool| tool == name) && !properties.get("tool").is_some() {
+    if fields.get("tool").is_some_and(|tool| tool == name) && properties.get("tool").is_none() {
         fields.remove("tool");
     }
     let continuation = match fields.get("cursor") {
@@ -740,7 +740,7 @@ fn resolve_path(p: &Project, path: &str, hints: bool) -> Result<PathBuf> {
     })?;
     utf8_path(&canonical)?;
     // A configured reference document may live outside the root.
-    if doc_paths(p).iter().any(|doc| *doc == canonical) {
+    if doc_paths(p).contains(&canonical) {
         return Ok(canonical);
     }
     if !canonical.starts_with(&root) {
@@ -2365,7 +2365,7 @@ mod tests {
             std::thread::spawn(move || {
                 let project = Project { name: "app".into(), root: root.clone(), ..Default::default() };
                 let found = candidate_paths_counted(&project, None, &tokio_util::sync::CancellationToken::new(), None, None)
-                    .map(|(paths, _)| paths.iter().map(|p| p.strip_prefix(&root.canonicalize().unwrap()).unwrap().display().to_string()).collect::<Vec<_>>());
+                    .map(|(paths, _)| paths.iter().map(|p| p.strip_prefix(root.canonicalize().unwrap()).unwrap().display().to_string()).collect::<Vec<_>>());
                 let _ = tx.send(found);
             });
             rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the walk blocked on an ignore file")

@@ -97,6 +97,7 @@ impl Oracle {
     }
 
     /// Runs a registry row with the model's params.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         self: &Arc<Self>,
         db: &Db,
@@ -143,9 +144,10 @@ impl Oracle {
                         Value::String(s) => s.clone(),
                         other => other.to_string(),
                     };
-                    let shape_ok = regex::Regex::new(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
-                        .unwrap()
-                        .is_match(text.trim());
+                    static DECIMAL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+                        regex::Regex::new(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$").unwrap()
+                    });
+                    let shape_ok = DECIMAL.is_match(text.trim());
                     return Err(safe(if shape_ok && text.trim().parse::<f64>().is_ok_and(f64::is_finite) {
                         format!(":{}의 값이 Oracle NUMBER 범위(0 또는 절댓값 1e-130 이상 1e126 미만)를 벗어났습니다.", b.name)
                     } else {
@@ -211,10 +213,10 @@ impl Oracle {
             let conn = Arc::new(pool.get()?);
             *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(conn.clone());
             conn.set_call_timeout(Some(timeout))?;
-            if conn.is_new_connection() {
-                if let Err(e) = conn.execute(NLS_SESSION_FORMATS, &[]) {
-                    eprintln!("[oracle] failed to fix the session date format — the DB default stays: {e}");
-                }
+            if conn.is_new_connection()
+                && let Err(e) = conn.execute(NLS_SESSION_FORMATS, &[])
+            {
+                eprintln!("[oracle] failed to fix the session date format — the DB default stays: {e}");
             }
             let result = execute(&conn, &spec, &inputs, read_only);
             let mut drop_connection = false;

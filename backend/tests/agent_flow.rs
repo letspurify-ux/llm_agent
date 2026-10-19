@@ -2591,7 +2591,7 @@ impl llm_agent::llm::LlmClient for Cutting {
         let estimate = llm_agent::context::count(&request, &config.model);
         let counted = ((estimate as f64 * self.ratio) as usize).min(self.cap);
         let mut seen = self.seen.lock().unwrap();
-        let cached = (seen.len() % 2 == 0).then_some(counted * 9 / 10);
+        let cached = seen.len().is_multiple_of(2).then_some(counted * 9 / 10);
         seen.push((estimate, counted));
         let mut reply = self.replies.lock().unwrap().pop_front().unwrap_or_else(|| text("끝"));
         reply.usage = Some(llm_agent::llm::Usage { input: counted, output: 10, cached });

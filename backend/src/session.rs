@@ -478,6 +478,10 @@ impl SessionStore {
     pub fn len(&self) -> usize {
         self.entries.lock().map_or(0, |entries| entries.len())
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[cfg(test)]
