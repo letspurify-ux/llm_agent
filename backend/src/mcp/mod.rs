@@ -2010,7 +2010,7 @@ fn spawn(slot: &Arc<Slot>, server: &McpServer) -> Result<ChildTransport> {
         tokio::spawn(read_output(Arc::downgrade(slot), stderr, output.clone()));
     }
     let lines = LineLimit { inner: stdout, line: vec![], out: vec![], out_at: 0, ended: false, slot: Arc::downgrade(slot) };
-    Ok(ChildTransport { inner: AsyncRwTransport::new_client(lines, stdin), child: Some(child), output, slot: Arc::downgrade(slot) })
+    Ok(ChildTransport { inner: AsyncRwTransport::new_client(lines, stdin), child: Some(child), output, slot: Arc::downgrade(slot), exited: None })
 }
 
 /// Descriptors below this are looked at in a starting server (a soft limit
@@ -2058,6 +2058,33 @@ struct ChildTransport {
     /// Ends the reading of its stderr (`read_output`), once the process is.
     output: CancellationToken,
     slot: Weak<Slot>,
+    /// When the process was seen to end, while its output was still open
+    /// (`receive`); None once that was looked into.
+    exited: Option<Option<tokio::time::Instant>>,
+}
+
+impl ChildTransport {
+    /// The process ended `OUTPUT_DRAIN` ago and its output is still open: a
+    /// process it started holds it (a Python server's subprocess inherits
+    /// its standard streams). The output would never end, the server shown
+    /// ready while each call waited out its timeout: whatever holds it is
+    /// asked whether it answers — a launcher that handed its streams to the
+    /// server it started does — and reconnected if it does not.
+    fn ended_with_output_open(&self) {
+        let Some(slot) = self.slot.upgrade() else {
+            return;
+        };
+        let (peer, link) = {
+            let state = slot.state();
+            match (&state.peer, &state.link, state.phase) {
+                (Some(peer), Some(link), Phase::Ready) => (peer.clone(), link.clone()),
+                // Still connecting: its limit ends a server gone.
+                _ => return,
+            }
+        };
+        slot.log("event", "서버 프로세스가 끝났는데 그 출력은 아직 열려 있어(서버가 띄운 다른 프로세스가 물려받았을 수 있습니다) 살아 있는지 묻습니다");
+        check_alive(&slot, &peer, &link, "서버 프로세스가 끝났는데 그 출력은 다른 프로세스가 아직 열어 두고 있고".to_owned());
+    }
 }
 
 impl Transport<RoleClient> for ChildTransport {
@@ -2067,8 +2094,25 @@ impl Transport<RoleClient> for ChildTransport {
         self.inner.send(item)
     }
 
-    fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleClient>>> + Send {
-        self.inner.receive()
+    /// The next message, the server's process watched meanwhile: its end
+    /// is not always the end of its output (`ended_with_output_open`).
+    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
+        loop {
+            match (self.exited, self.child.as_mut()) {
+                (None, Some(child)) => tokio::select! {
+                    message = self.inner.receive() => return message,
+                    _ = child.wait() => self.exited = Some(Some(tokio::time::Instant::now())),
+                },
+                (Some(Some(at)), _) => tokio::select! {
+                    message = self.inner.receive() => return message,
+                    _ = tokio::time::sleep_until(at + OUTPUT_DRAIN) => {
+                        self.exited = Some(None);
+                        self.ended_with_output_open();
+                    }
+                },
+                _ => return self.inner.receive().await,
+            }
+        }
     }
 
     /// The server's input ends, then its process (`end_process`).

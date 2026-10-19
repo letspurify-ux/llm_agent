@@ -448,6 +448,66 @@ async fn a_server_that_exits_mid_call_is_reconnected() {
     hub.shutdown().await;
 }
 
+/// A server gone while a process it started holds its output open (a
+/// Python server's `subprocess.Popen` inherits its standard streams): the
+/// output never ended, and the server showed ready while each call waited
+/// out its timeout. Its end is seen, and one that does not answer then is
+/// reconnected.
+#[tokio::test]
+async fn a_server_gone_is_seen_though_a_process_it_started_holds_its_output() {
+    if node_missing() {
+        return;
+    }
+    let mut server = fake("heir", &["spawn_heir", "crash", "echo"], &[("FAKE_MCP_HEIR", "1")]);
+    server.timeout_secs = Some(30);
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    let first = ready(&hub, "heir").await;
+    let heir: i32 = call(&hub, &config, "heir__spawn_heir", json!({})).await.unwrap()["text"].as_str().unwrap().parse().unwrap();
+    let started = Instant::now();
+    let error = call(&hub, &config, "heir__crash", json!({})).await.unwrap_err().to_string();
+    assert!(started.elapsed() < Duration::from_secs(12), "the call waited {:?}: {error}", started.elapsed());
+    assert!(error.starts_with("mcp_server_unavailable:") && error.ends_with("it may have taken effect on the server"), "{error}");
+    let again = wait_for(&hub, "heir", |s| s["state"] == "ready" && s["pid"] != first["pid"]).await;
+    assert!(log_text(&again).contains("서버 프로세스가 끝났는데"), "{again:#}");
+    assert_eq!(call(&hub, &config, "heir__echo", json!({"text":"x"})).await.unwrap()["text"], "echo: x");
+    // Closed with its server's process group.
+    #[cfg(unix)]
+    {
+        let started = Instant::now();
+        while alive(heir) && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!alive(heir), "the process holding the output is gone");
+    }
+    #[cfg(not(unix))]
+    let _ = heir;
+    hub.shutdown().await;
+}
+
+/// A server whose process hands its streams to another and exits (a
+/// launcher) still answers: it stays connected.
+#[tokio::test]
+async fn a_server_handed_over_to_another_process_stays_connected() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("relay", &["hand_over", "echo"], &[("FAKE_MCP_HEIR", "1")])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "relay").await;
+    call(&hub, &config, "relay__hand_over", json!({})).await.unwrap();
+    // Past the drain and a ping's limit.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let status = hub.server_status("relay", MODEL).unwrap();
+    assert_eq!((status["state"].clone(), status["restarts"].clone()), (json!("ready"), json!(0)), "{status:#}");
+    // Its process's end was looked into, and the one now serving answered.
+    assert!(log_text(&status).contains("살아 있는지 묻습니다"), "{status:#}");
+    assert_eq!(call(&hub, &config, "relay__echo", json!({"text":"x"})).await.unwrap()["text"], "echo: x");
+    hub.shutdown().await;
+}
+
 #[tokio::test]
 async fn noisy_output_and_failing_servers_stay_apart() {
     if node_missing() {

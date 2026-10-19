@@ -91,6 +91,13 @@ if (env.FAKE_MCP_DETACHED) tools.push({ name: 'spawn_detached', description: 'St
 // HTTP: a call whose event stream ends before its answer (a proxy's idle
 // timeout cutting a long call), the session fine.
 if (env.FAKE_MCP_CUT) tools.push({ name: 'cut_stream', description: 'End the event stream of the call before its answer.', inputSchema: { type: 'object', properties: { ms: { type: 'integer' } } } });
+// A process the server started on its own standard streams (a Python
+// server's subprocess.Popen, inheriting them by default): it outlives the
+// server and holds its output open.
+if (env.FAKE_MCP_HEIR) tools.push({ name: 'spawn_heir', description: 'Start a process holding this server\'s stdin and stdout; return its pid.', inputSchema: { type: 'object' } });
+// The server's work handed over to a process of its own on the same
+// streams, and the server gone (a launcher that exits once its server runs).
+if (env.FAKE_MCP_HEIR) tools.push({ name: 'hand_over', description: 'Hand this server\'s streams to a new server process and exit; return its pid.', inputSchema: { type: 'object' } });
 if (env.FAKE_MCP_DUPLICATE) tools.push({ name: 'echo', description: 'A second echo.', inputSchema: { type: 'object' } });
 for (let i = 0; i < Number(env.FAKE_MCP_MANY_BAD || 0); i++) tools.push({ name: `bad_${i}`, description: 'a schema that is a string', inputSchema: 'nope' });
 if (env.FAKE_MCP_BAD_LIST) tools.push({ name: 'no_schema', description: 'A tool without inputSchema.' }, { name: 'string_schema', description: 'A tool whose schema is a string.', inputSchema: 'nope' });
@@ -188,6 +195,20 @@ async function handle(message, notify) {
         const helper = spawn(process.execPath, ['-e', "setInterval(() => process.stderr.write('helper tick\\n'), 200); setTimeout(() => process.exit(0), 60000)"], { detached: true, stdio: ['ignore', 'ignore', 'inherit'] });
         helper.unref();
         return result(id, { content: [text(String(helper.pid))] });
+      }
+      case 'spawn_heir': {
+        const heir = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: ['inherit', 'inherit', 'ignore'] });
+        heir.unref();
+        return result(id, { content: [text(String(heir.pid))] });
+      }
+      case 'hand_over': {
+        process.stdin.removeAllListeners('data');
+        process.stdin.removeAllListeners('end');
+        process.stdin.pause();
+        const next = spawn(process.execPath, process.argv.slice(1), { stdio: 'inherit' });
+        next.unref();
+        setTimeout(() => process.exit(0), 200);
+        return result(id, { content: [text(String(next.pid))] });
       }
       case 'add_tool': {
         const added = env.FAKE_MCP_EXTRA_NAME || 'extra';
