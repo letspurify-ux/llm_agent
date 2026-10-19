@@ -508,6 +508,39 @@ async fn a_server_handed_over_to_another_process_stays_connected() {
     hub.shutdown().await;
 }
 
+/// MCP review, twenty-eighth pass: the end of a server's process was seen
+/// by reaping it. Handed over to a process in a session of its own, its
+/// group was left empty and its ID free while the connection went on, and
+/// the group's kill at the close reached whatever came to have the ID (a
+/// process leading its own group, found among ~99,000 started meanwhile,
+/// was killed). The ended process now holds its ID until the close.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_server_gone_out_of_its_group_holds_its_id_until_closed() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("relay", &["hand_over", "echo"], &[("FAKE_MCP_HEIR", "1")])]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    let first: i32 = ready(&hub, "relay").await["pid"].as_i64().unwrap().try_into().unwrap();
+    let next: i32 = call(&hub, &config, "relay__hand_over", json!({"detached":true})).await.unwrap()["text"].as_str().unwrap().parse().unwrap();
+    // Its end seen, and the one now serving asked.
+    let status = wait_for(&hub, "relay", |s| log_text(s).contains("살아 있는지 묻습니다")).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(hub.server_status("relay", MODEL).unwrap()["state"], "ready", "{status:#}");
+    assert!(alive(first), "the ended process {first} holds its ID");
+    assert_eq!(call(&hub, &config, "relay__echo", json!({"text":"x"})).await.unwrap()["text"], "echo: x");
+    hub.shutdown().await;
+    assert!(!alive(first), "reaped at the close");
+    // The one it handed over to, outside the group, ends with its input.
+    let started = Instant::now();
+    while alive(next) && started.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!alive(next));
+}
+
 #[tokio::test]
 async fn noisy_output_and_failing_servers_stay_apart() {
     if node_missing() {

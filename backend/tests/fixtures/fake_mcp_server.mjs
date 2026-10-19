@@ -96,7 +96,8 @@ if (env.FAKE_MCP_CUT) tools.push({ name: 'cut_stream', description: 'End the eve
 // server and holds its output open.
 if (env.FAKE_MCP_HEIR) tools.push({ name: 'spawn_heir', description: 'Start a process holding this server\'s stdin and stdout; return its pid.', inputSchema: { type: 'object' } });
 // The server's work handed over to a process of its own on the same
-// streams, and the server gone (a launcher that exits once its server runs).
+// streams, and the server gone (a launcher that exits once its server runs;
+// `detached`, the new one out of the server's process group).
 if (env.FAKE_MCP_HEIR) tools.push({ name: 'hand_over', description: 'Hand this server\'s streams to a new server process and exit; return its pid.', inputSchema: { type: 'object' } });
 if (env.FAKE_MCP_DUPLICATE) tools.push({ name: 'echo', description: 'A second echo.', inputSchema: { type: 'object' } });
 for (let i = 0; i < Number(env.FAKE_MCP_MANY_BAD || 0); i++) tools.push({ name: `bad_${i}`, description: 'a schema that is a string', inputSchema: 'nope' });
@@ -205,7 +206,8 @@ async function handle(message, notify) {
         process.stdin.removeAllListeners('data');
         process.stdin.removeAllListeners('end');
         process.stdin.pause();
-        const next = spawn(process.execPath, process.argv.slice(1), { stdio: 'inherit' });
+        // detached: the new one leads a session of its own (setsid), out of this group.
+        const next = spawn(process.execPath, process.argv.slice(1), { stdio: 'inherit', detached: !!args.detached });
         next.unref();
         setTimeout(() => process.exit(0), 200);
         return result(id, { content: [text(String(next.pid))] });

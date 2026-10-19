@@ -2101,7 +2101,7 @@ impl Transport<RoleClient> for ChildTransport {
             match (self.exited, self.child.as_mut()) {
                 (None, Some(child)) => tokio::select! {
                     message = self.inner.receive() => return message,
-                    _ = child.wait() => self.exited = Some(Some(tokio::time::Instant::now())),
+                    _ = ended(child) => self.exited = Some(Some(tokio::time::Instant::now())),
                 },
                 (Some(Some(at)), _) => tokio::select! {
                     message = self.inner.receive() => return message,
@@ -2128,6 +2128,43 @@ impl Transport<RoleClient> for ChildTransport {
         self.output.cancel();
         Ok(())
     }
+}
+
+/// How often a stdio server's process is looked at while it runs (Unix,
+/// see `ended`): its end is usually that of its output, which needs none.
+#[cfg(unix)]
+const PROCESS_LOOK: Duration = Duration::from_secs(1);
+
+/// Once the server's process has ended. Unix leaves it unreaped, its ID
+/// held until the connection closes: reaped as it ended, the ID was free
+/// for another program while the connection went on (a server that handed
+/// its streams to a process in a session of its own stays connected), and
+/// the group's kill at the close (`kill_group`, `end_process`) reached the
+/// group that came to have it — a shell's job, another server.
+#[cfg(unix)]
+async fn ended(child: &mut Box<dyn process_wrap::tokio::ChildWrapper>) {
+    let Some(pid) = child.id() else {
+        return std::future::pending().await;
+    };
+    while !ended_unreaped(pid) {
+        tokio::time::sleep(PROCESS_LOOK).await;
+    }
+}
+
+#[cfg(unix)]
+fn ended_unreaped(pid: u32) -> bool {
+    // SAFETY: waitid only writes `info`; WNOWAIT leaves the child as it is.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let looked = unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
+    // With WNOHANG a process still running leaves no PID in `info`;
+    // ECHILD: reaped already.
+    if looked == 0 { unsafe { info.si_pid() != 0 } } else { std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) }
+}
+
+/// Windows holds the process's handle, its ID with it, until it closes.
+#[cfg(not(unix))]
+async fn ended(child: &mut Box<dyn process_wrap::tokio::ChildWrapper>) {
+    let _ = child.wait().await;
 }
 
 impl Drop for ChildTransport {
