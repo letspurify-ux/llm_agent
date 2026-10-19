@@ -267,10 +267,13 @@ async fn calls_to_a_server_that_stopped_reading_end_at_their_timeout() {
     assert!(started.elapsed() < Duration::from_millis(900));
     // Closing it does not wait on the input it no longer reads: a second
     // for the input, the grace to exit, then the kill (on Windows the only
-    // thing that ends it before the backend exits).
+    // thing that ends it before the backend exits). Unix asks it to stop
+    // after the grace, which ends it; Windows has no such request and waits
+    // the grace again before the kill (5 s in all, within shutdown's 6 s).
     let closing = Instant::now();
     hub.shutdown().await;
-    assert!(closing.elapsed() < Duration::from_millis(4_800), "closed in {:?}", closing.elapsed());
+    let limit = Duration::from_millis(if cfg!(windows) { 5_800 } else { 4_800 });
+    assert!(closing.elapsed() < limit, "closed in {:?}", closing.elapsed());
 }
 
 #[tokio::test]
@@ -470,7 +473,13 @@ async fn a_server_gone_is_seen_though_a_process_it_started_holds_its_output() {
     assert!(started.elapsed() < Duration::from_secs(12), "the call waited {:?}: {error}", started.elapsed());
     assert!(error.starts_with("mcp_server_unavailable:") && error.ends_with("it may have taken effect on the server"), "{error}");
     let again = wait_for(&hub, "heir", |s| s["state"] == "ready" && s["pid"] != first["pid"]).await;
+    // On Windows the output ends with the server's process here (the
+    // process it started does not keep it, CI shows): its end is a closed
+    // connection, not an output still open.
+    #[cfg(unix)]
     assert!(log_text(&again).contains("서버 프로세스가 끝났는데"), "{again:#}");
+    #[cfg(not(unix))]
+    let _ = again;
     assert_eq!(call(&hub, &config, "heir__echo", json!({"text":"x"})).await.unwrap()["text"], "echo: x");
     // Closed with its server's process group.
     #[cfg(unix)]
@@ -487,7 +496,10 @@ async fn a_server_gone_is_seen_though_a_process_it_started_holds_its_output() {
 }
 
 /// A server whose process hands its streams to another and exits (a
-/// launcher) still answers: it stays connected.
+/// launcher) still answers: it stays connected. Unix only: on Windows the
+/// output ends with the process that started the other (CI shows), so the
+/// hand-over is a closed connection and the server is connected again.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_server_handed_over_to_another_process_stays_connected() {
     if node_missing() {
