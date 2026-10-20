@@ -93,7 +93,7 @@ pub async fn serve_within(
             // bytes with no limit.
             let mut builder = Builder::new(TokioExecutor::new()).http1_only();
             builder.http1().timer(TokioTimer::new()).header_read_timeout(idle);
-            let connection = builder.serve_connection(TokioIo::new(io), service);
+            let connection = builder.serve_connection(TokioIo::new(WriteStall::new(io, idle)), service);
             tokio::pin!(connection);
             tokio::select! {
                 _ = connection.as_mut() => return,
@@ -109,6 +109,82 @@ pub async fn serve_within(
         eprintln!("[shutdown] connections still open after {}s were closed", SHUTDOWN_GRACE.as_secs());
     }
     Ok(())
+}
+
+/// A connection whose client stopped reading: a write that makes no
+/// progress for `limit` fails, and the connection with it. Nothing else
+/// ended one — the idle limit is for reading a request, and TCP keepalive
+/// is answered by a client that keeps its receive window shut — so each
+/// was kept for good, with its descriptor and what was left of its response
+/// (20 connections asking for the screen's script and reading none of it:
+/// all 20 still open after 105 s). A response still being written, however
+/// long, or slow to be read, is not limited.
+struct WriteStall<T> {
+    inner: T,
+    limit: Duration,
+    stalled: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<T> WriteStall<T> {
+    fn new(inner: T, limit: Duration) -> Self {
+        Self { inner, limit, stalled: None }
+    }
+
+    /// `written` as the inner write left it, a pending one failed once it
+    /// has waited `limit`.
+    fn bound<R>(&mut self, written: std::task::Poll<std::io::Result<R>>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<R>> {
+        use std::task::Poll;
+        if written.is_ready() {
+            self.stalled = None;
+            return written;
+        }
+        let limit = self.limit;
+        let stalled = self.stalled.get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+        match stalled.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the client stopped reading"))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WriteStall<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteStall<T> {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        let written = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.bound(written, cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let written = std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.bound(written, cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        let flushed = std::pin::Pin::new(&mut self.inner).poll_flush(cx);
+        self.bound(flushed, cx)
+    }
+
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        let shut = std::pin::Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.bound(shut, cx)
+    }
 }
 
 fn keep_alive(stream: &mut tokio::net::TcpStream) {

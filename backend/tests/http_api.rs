@@ -640,3 +640,80 @@ async fn connections_without_a_request_under_way_are_closed() {
         [("silent", true), ("half head", true), ("half body", true), ("kept idle", true)]
     );
 }
+
+/// A model that writes a long answer, a part at a time.
+struct Long(String);
+
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for Long {
+    async fn complete(
+        &self,
+        _request: Value,
+        _config: &llm_agent::config::LlmConfig,
+        _cancel: tokio_util::sync::CancellationToken,
+        delta: tokio::sync::mpsc::Sender<String>,
+    ) -> anyhow::Result<llm_agent::llm::Completion> {
+        let mut rest = self.0.as_str();
+        while !rest.is_empty() {
+            let mut at = rest.len().min(65536);
+            while !rest.is_char_boundary(at) {
+                at -= 1;
+            }
+            let (part, after) = rest.split_at(at);
+            let _ = delta.send(part.to_owned()).await;
+            rest = after;
+        }
+        Ok(text(&self.0))
+    }
+}
+
+/// Resource review, twentieth pass: a client that stopped reading its
+/// response was kept for good — the idle limit is for reading a request,
+/// and TCP keepalive is answered by a client that keeps its window shut —
+/// with its descriptor and the rest of the response. A write that makes no
+/// progress for the limit now ends the connection; a client that reads gets
+/// the whole answer.
+#[tokio::test]
+async fn a_client_that_stops_reading_its_answer_is_let_go() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let idle = std::time::Duration::from_secs(1);
+    let mut config = llm_agent::config::Config::default();
+    config.mariadb.port = 9;
+    config.llm.model = "gpt-4o".into();
+    config.llm.base_url = "http://127.0.0.1:9/v1".into();
+    let answer = "긴 답변의 한 줄이다.\n".repeat(150_000);
+    let (app, _dir) = app(config, std::sync::Arc::new(Long(answer.clone())));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(web::serve_within(listener, app, std::future::pending(), idle));
+    let request = |id: &str| {
+        let body = json!({"message":"질문","conversation_id":id}).to_string();
+        format!(
+            "POST /api/chat HTTP/1.1\r\nHost: x\r\nAccept: application/x-ndjson\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let read_all = |mut stream: tokio::net::TcpStream| async move {
+        let mut out = vec![];
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(20), stream.read_to_end(&mut out)).await;
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    let done = |response: &str| response.lines().any(|l| l.contains(r#""type":"done""#));
+
+    // Reads nothing, a small window open, past the limit.
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    socket.connect(&address.into()).unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let mut stalled = tokio::net::TcpStream::from_std(socket.into()).unwrap();
+    stalled.write_all(request("stalled").as_bytes()).await.unwrap();
+    tokio::time::sleep(idle * 4).await;
+    let stalled = read_all(stalled).await;
+
+    let mut reading = tokio::net::TcpStream::connect(address).await.unwrap();
+    reading.write_all(request("reading").as_bytes()).await.unwrap();
+    let reading = read_all(reading).await;
+    server.abort();
+    assert!(stalled.starts_with("HTTP/1.1 200") && !done(&stalled), "the stalled client got {} bytes, the end among them", stalled.len());
+    assert!(done(&reading) && reading.len() > answer.len(), "the reading client got {} bytes", reading.len());
+}
