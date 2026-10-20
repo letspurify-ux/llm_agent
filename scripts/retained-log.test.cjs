@@ -168,3 +168,15 @@ test('launcher captures stdout/stderr and forwards SIGTERM through shutdown', as
   assert.match(content, /stderr captured/);
   assert.match(content, /shutdown complete/);
 });
+
+test('launcher names itself to the server it starts', { timeout: 10_000 }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'logged-process-pid-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'backend.log');
+  const child = spawn(process.execPath, [path.join(__dirname, 'logged-process.cjs'), '-e', `
+    console.log('launcher=' + process.env.APP_LAUNCHER_PID + ' parent=' + process.ppid);
+  `], { env: { ...process.env, APP_LOG_FILE: file, APP_LAUNCHER_PID: '1' }, stdio: 'ignore' });
+  t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
+  assert.equal(await new Promise(resolve => child.on('close', resolve)), 0);
+  assert.match(fs.readFileSync(file, 'utf8'), new RegExp(`launcher=${child.pid} parent=${child.pid}\\n`));
+});

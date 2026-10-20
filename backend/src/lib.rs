@@ -7,6 +7,7 @@ macro_rules! eprintln {
 }
 
 pub mod console;
+pub mod launcher;
 pub mod config;
 pub mod context;
 pub mod llm;

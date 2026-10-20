@@ -156,7 +156,8 @@ async fn serve(path: PathBuf, config: Config) -> i32 {
 /// SIGINT, SIGTERM or SIGHUP (the terminal closed, or the log launcher
 /// passing on its own): left to its default, a hangup ended the backend on
 /// the spot, and an MCP server that outlives its input (a Node server
-/// holding a database pool, its docker container) was left running.
+/// holding a database pool, its docker container) was left running. Or the
+/// end of the log launcher that started the server (see `launcher`).
 async fn wait_for_signal() {
     #[cfg(unix)]
     {
@@ -167,6 +168,7 @@ async fn wait_for_signal() {
             _ = tokio::signal::ctrl_c() => {}
             _ = term.recv() => {}
             _ = hangup.recv() => {}
+            _ = llm_agent::launcher::gone() => {}
         }
     }
     #[cfg(not(unix))]

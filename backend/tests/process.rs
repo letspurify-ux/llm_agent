@@ -224,3 +224,115 @@ async fn a_backend_whose_output_is_no_longer_read_answers_and_stops_in_order() {
     let stopped = tokio::time::timeout(Duration::from_secs(20), child.wait()).await.expect("the backend did not stop").unwrap();
     assert!(stopped.success(), "{stopped:?}");
 }
+
+/// A shell standing in for start.sh's log launcher: it starts the backend
+/// (with `APP_LAUNCHER_PID` when `told`) and prints its process ID.
+async fn launched(dir: &Path, settings: &Path, told: bool) -> (Child, u32) {
+    let script = if told {
+        r#"APP_LAUNCHER_PID=$$ "$0" --config "$1" </dev/null >/dev/null 2>&1 & echo $!; wait"#
+    } else {
+        r#""$0" --config "$1" </dev/null >/dev/null 2>&1 & echo $!; wait"#
+    };
+    let mut launcher = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .arg(env!("CARGO_BIN_EXE_llm-agent"))
+        .arg(settings)
+        .current_dir(dir)
+        .env_remove("LLM_AGENT_CONFIG")
+        .env_remove("APP_LAUNCHER_PID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(launcher.stdout.take().unwrap()).read_line(&mut line).await.unwrap();
+    (launcher, line.trim().parse().unwrap())
+}
+
+fn kill(pid: u32, signal: libc::c_int) {
+    // SAFETY: kill only sends a signal.
+    unsafe {
+        libc::kill(pid as libc::pid_t, signal);
+    }
+}
+
+/// Whether `pid` runs: an orphan that ended stays a zombie until the
+/// process that took it in (init, a subreaper) reaps it.
+fn running(pid: u32) -> bool {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    let zombie = stat.rsplit_once(')').is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'));
+    alive(pid) && !zombie
+}
+
+/// Whether `pid` ends within `limit` (a process not ours to wait for).
+async fn ends_within(pid: u32, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    while running(pid) {
+        if Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    true
+}
+
+/// The log launcher killed outright (SIGKILL: a force quit, the out-of-memory
+/// killer) left its backend running on, orphaned: still holding the port,
+/// its DB connections and its MCP servers, while stop.sh, which signals the
+/// launcher, found nothing to stop and start.sh then found the port taken.
+#[tokio::test]
+async fn a_backend_whose_launcher_is_killed_stops_in_order() {
+    if node_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let term = dir.path().join("term");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_mcp_server.mjs");
+    let command = format!("exec node '{}' 2>/dev/null", fixture.display());
+    let mcp = format!(
+        "\n[[mcp_servers]]\nname = \"linger\"\ncommand = \"sh\"\nargs = [\"-c\", {}]\ntools = [\"*\"]\n\n\
+         [mcp_servers.env]\nFAKE_MCP_LINGER = \"1\"\nFAKE_MCP_TERM_FILE = {}\n",
+        toml_string(&command),
+        toml_string(&term.display().to_string())
+    );
+    let port = free_port();
+    let path = settings(dir.path(), port, 9, &mcp);
+    let (mut launcher, backend) = launched(dir.path(), &path, true).await;
+    let server = ready_mcp(port).await;
+    let mcp_pid = server["pid"].as_u64().unwrap() as u32;
+    signal(&launcher, libc::SIGKILL);
+    let _ = launcher.wait().await;
+    let stopped = ends_within(backend, Duration::from_secs(20)).await;
+    let left = running(mcp_pid);
+    for pid in [backend, mcp_pid] {
+        kill(pid, libc::SIGKILL);
+    }
+    assert!(stopped, "the backend outlived its launcher");
+    assert!(!left, "the MCP server outlived the backend");
+    assert_eq!(std::fs::read_to_string(&term).ok().as_deref(), Some("SIGTERM"), "the MCP server was not asked to stop");
+}
+
+/// Started without the launcher (`nohup`, a shell of its own), the backend
+/// still outlives the process that started it.
+#[tokio::test]
+async fn a_backend_started_otherwise_outlives_its_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let path = settings(dir.path(), port, 9, "");
+    let (mut launcher, backend) = launched(dir.path(), &path, false).await;
+    let health = format!("http://127.0.0.1:{port}/api/health");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while client().get(&health).send().await.is_err() {
+        assert!(Instant::now() < deadline, "the backend did not start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    signal(&launcher, libc::SIGKILL);
+    let _ = launcher.wait().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let serving = client().get(&health).send().await.is_ok_and(|r| r.status().is_success());
+    kill(backend, libc::SIGTERM);
+    assert!(ends_within(backend, Duration::from_secs(20)).await, "the backend did not stop on SIGTERM");
+    assert!(serving, "the backend stopped with the process that started it");
+}

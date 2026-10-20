@@ -8,8 +8,11 @@ log.write(`===== ${new Date().toISOString()} start =====\n`);
 // otherwise the arguments are a Node script and its arguments (the frontend's Vite).
 const args = process.argv.slice(2);
 const [command, commandArgs] = args[0] === '--exec' ? [args[1], args.slice(2)] : [process.execPath, args];
+// The server is told who started it (APP_LAUNCHER_PID): this launcher killed
+// outright, the Rust backend stops in order instead of running on, orphaned.
 const child = spawn(command, commandArgs, {
   stdio: ['ignore', 'pipe', 'pipe'],
+  env: { ...process.env, APP_LAUNCHER_PID: String(process.pid) },
 });
 child.stdout.on('data', chunk => log.write(chunk));
 child.stderr.on('data', chunk => log.write(chunk));

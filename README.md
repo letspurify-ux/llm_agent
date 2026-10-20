@@ -52,6 +52,7 @@ backend/                     # Rust (cargo) — 실행 파일 target/release/llm
   sql/schema.sql, seed.sql   # MariaDB DDL + 데모 데이터
   src/main.rs                # 기동·백그라운드 작업(임베딩 동기화·로그 정리)·종료(SIGINT·SIGTERM·SIGHUP)
   src/console.rs             # 콘솔 출력 — 출력을 읽던 쪽(로그 실행기·터미널)이 사라져도 서버를 멈추지 않는다
+  src/launcher.rs            # 서버를 띄운 로그 실행기가 끝나면(강제 종료 포함) 정리하고 끝난다
   src/web.rs                 # POST /api/chat (NDJSON), /api/health
   src/admin.rs               # /api/admin — 관리 테이블 CRUD·프로젝트·설정·폴더 선택·연결 확인
   src/agent.rs               # 답변 루프 (도구 일괄 실행·진행 이벤트·최종 답)
@@ -273,7 +274,10 @@ Windows의 `start.bat`(`start_all.bat`도 이것을 부른다)은 같은 파일�
 서버가 출력이 끊긴 채 관리 밖에서 계속 돌았다(stop.sh는 멈출 실행기를 못 찾고, start.sh는 포트가 잡혀 실패). 실행기에 다른 오류가
 나도 서버를 먼저 멈춘 뒤 끝난다. backend는 출력을 읽는 쪽이 사라져도(실행기 강제 종료, 직접 띄운 터미널 닫기) 로그 줄 때문에
 질문·기록·종료가 실패하지 않는다(콘솔 쓰기 실패를 무시한다 — 전에는 줄마다 panic이었다). SIGHUP(터미널을 닫을 때, 실행기가 넘길 때)도
-SIGINT·SIGTERM처럼 정리하고 끝난다.
+SIGINT·SIGTERM처럼 정리하고 끝난다. 실행기는 자기 PID를 `APP_LAUNCHER_PID`로 서버에 알리고, backend는 그 실행기가
+끝나면(SIGKILL로 강제 종료돼 신호를 넘기지 못해도) SIGTERM처럼 정리하고 끝난다 — 전에는 포트·DB 연결·MCP 서버를 쥔 채 고아로 남아
+stop.sh가 멈추지 못하고 start.sh는 포트가 잡혀 실패했다. 시스템이 알려 주는 방식(macOS kqueue, Linux pidfd)이라 폴링하지 않는다.
+이 값 없이 직접 띄운 서버(`nohup`, 터미널)는 띄운 프로세스가 끝나도 그대로 돈다.
 로그 보관·종료 동작 검증: 저장소 루트에서 `node --test scripts/retained-log.test.cjs`.
 
 #### 회귀 검증
@@ -284,7 +288,8 @@ cd backend && cargo test   # 청커·SQL 가드·바인드·NUMBER·설정·도�
 
 MCP 검사(`tests/mcp.rs`)는 `node`로 가짜 MCP 서버(`tests/fixtures/fake_mcp_server.mjs`)를 stdio·HTTP로 띄워 연결·호출·시간 초과와 취소·
 호출 중 프로세스 죽음과 재연결·stdout 오염·stderr 폭주·도구 목록 변경·손자 프로세스 정리·SIGTERM 뒤 종료·버린 요청의 취소·환경 격리·관리 API를 잰다(node가 없으면 건너뛴다).
-프로세스 검사(`tests/process.rs`, Unix)는 실제 `llm-agent` 실행 파일을 띄워 SIGHUP에 MCP 서버를 닫고 끝나는지, 출력을 읽는 쪽이 사라진 뒤에도 답하고 정리하며 끝나는지 잰다.
+프로세스 검사(`tests/process.rs`, Unix)는 실제 `llm-agent` 실행 파일을 띄워 SIGHUP에 MCP 서버를 닫고 끝나는지, 출력을 읽는 쪽이 사라진 뒤에도 답하고 정리하며 끝나는지,
+띄운 실행기가 강제 종료되면 MCP 서버를 닫고 끝나는지(실행기 없이 띄운 서버는 계속 도는지) 잰다.
 
 MariaDB·Oracle·임베딩이 필요한 통합 검사는 환경변수가 있을 때만 돈다(없으면 건너뛰었다고 찍는다).
 검사마다 `llm_agent_rs_test_*` DB를 새로 만들어 `schema.sql`·`seed.sql`을 싣고 끝나면 지운다 — 운영 DB는 건드리지 않는다.
