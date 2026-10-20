@@ -483,11 +483,19 @@ fn execute(
     }
     conn.execute(PREPARE_DBMS_OUTPUT, &[])?;
     if spec.kind == Kind::Query {
+        // Not kept in the session's statement cache: a cached query kept the
+        // rows it prefetched, each registered query a session had run its
+        // last result's size, twenty a session (1,000 rows of 4,000
+        // characters: 4 MB a query, 78 MB a session, eight sessions a
+        // target DB) for as long as the session was in use. Parsed again
+        // on the server instead, in the same round trip (about 1 ms more,
+        // local).
         let mut stmt = conn
             .statement(&spec.sql)
             .fetch_array_size(FETCH_ROWS)
             .prefetch_rows((MAX_ROWS + 2) as u32)
             .lob_locator()
+            .exclude_from_cache()
             .build()?;
         let args: Vec<(String, BindArg)> = inputs
             .iter()

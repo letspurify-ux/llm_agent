@@ -291,3 +291,77 @@ async fn lob_cells_are_read_only_as_far_as_a_cell_keeps() {
     assert_eq!(row["NC"], "짧다");
     assert_eq!(row["BIN"], "<binary 2000 bytes>");
 }
+
+/// Bytes this process has allocated, where the platform says.
+fn heap_in_use() -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        #[derive(Default)]
+        struct Statistics {
+            blocks_in_use: u32,
+            size_in_use: usize,
+            max_size_in_use: usize,
+            size_allocated: usize,
+        }
+        unsafe extern "C" {
+            fn malloc_zone_statistics(zone: *const std::ffi::c_void, stats: *mut Statistics);
+        }
+        let mut stats = Statistics::default();
+        // SAFETY: a null zone sums every zone into `stats`.
+        unsafe { malloc_zone_statistics(std::ptr::null(), &mut stats) };
+        Some(stats.size_in_use)
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: reads the allocator's counters.
+        let info = unsafe { libc::mallinfo2() };
+        Some(info.uordblks + info.hblkhd)
+    }
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+    {
+        None
+    }
+}
+
+/// A query's rows, once read, stay with its session no longer. The client
+/// library caches a session's statements, and a cached query kept the rows
+/// it prefetched (a result's thousand rows come in one round trip): each
+/// registered query a session ran held its last result's size, twenty of
+/// them a session, eight sessions a target DB, as long as the sessions were
+/// in use (1,000 rows of 4,000 characters: 4 MB a query, 78 MB a session).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_query_keeps_no_rows_on_its_session_once_read() {
+    if std::env::var("LLM_AGENT_TEST_ORACLE").ok().as_deref() != Some("1") {
+        return skip("LLM_AGENT_TEST_ORACLE is not set");
+    }
+    if heap_in_use().is_none() {
+        return skip("the heap in use is not measured on this platform");
+    }
+    let Some(test_db) = TestDb::create("oracle_cache") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let queries = 16;
+    let values: Vec<String> = (0..queries)
+        .map(|i| format!("('wide_{i}', 'SELECT RPAD(''x'', 4000, ''y'') AS BODY, {i} AS Q, LEVEL AS N FROM DUAL CONNECT BY LEVEL <= 1000', 'ORDER_DB')"))
+        .collect();
+    test_db.sql_in(&format!("INSERT INTO query_registry (query_name, query_sql, target_db_name) VALUES {}", values.join(",")));
+    let mut config = test_db.config();
+    config.oracle.mock = false;
+    config.oracle.client_lib_dir = std::env::var("ORACLE_CLIENT_LIB_DIR").unwrap_or_default();
+    let (app, _dir) = app(config, Scripted::new(vec![]));
+    let config = app.config();
+    let names: Vec<String> = (0..queries).map(|i| format!("wide_{i}")).collect();
+    let rows = db::queries_by_names(&app.db, &config.mariadb, &names).await.unwrap();
+    let never = |_: &str| false;
+    // One after another, so one session runs them all.
+    let mut first = None;
+    for row in &rows {
+        let out = app.oracle.run(&app.db, &config, row, &Map::new(), None, &never, &CancellationToken::new()).await.unwrap();
+        assert_eq!(out.rows.len(), 1000);
+        drop(out);
+        first.get_or_insert_with(|| heap_in_use().unwrap());
+    }
+    let grown = heap_in_use().unwrap().saturating_sub(first.unwrap());
+    assert!(grown < 20 << 20, "{} MiB more after {} more queries on one session", grown >> 20, queries - 1);
+}
