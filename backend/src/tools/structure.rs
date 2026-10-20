@@ -497,7 +497,32 @@ pub(super) fn check_budget(
     Ok(())
 }
 
+fn grammar(language: &str) -> tree_sitter::Language {
+    match language {
+        "rust" => tree_sitter_rust::LANGUAGE.into(),
+        "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        "typescriptreact" => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        "python" => tree_sitter_python::LANGUAGE.into(),
+        "java" => tree_sitter_java::LANGUAGE.into(),
+        "csharp" => tree_sitter_c_sharp::LANGUAGE.into(),
+        _ => unreachable!(),
+    }
+}
+
 impl SyntaxFile {
+    /// Lets the tree go, that of an empty source in its place: for what
+    /// needs only the source and what was read from the tree already. A
+    /// tree takes 40 to 130 bytes a source byte.
+    pub fn release_tree(&mut self) {
+        let mut parser = Parser::new();
+        if parser.set_language(&grammar(self.language)).is_ok()
+            && let Some(empty) = parser.parse("", None)
+        {
+            self.tree = empty;
+        }
+    }
+
     pub fn parse(
         path: PathBuf,
         source: String,
@@ -507,16 +532,7 @@ impl SyntaxFile {
         check_budget(cancel, deadline)?;
         let digest = hash(source.as_bytes());
         let language = language(&path)?;
-        let grammar = match language {
-            "rust" => tree_sitter_rust::LANGUAGE.into(),
-            "javascript" => tree_sitter_javascript::LANGUAGE.into(),
-            "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            "typescriptreact" => tree_sitter_typescript::LANGUAGE_TSX.into(),
-            "python" => tree_sitter_python::LANGUAGE.into(),
-            "java" => tree_sitter_java::LANGUAGE.into(),
-            "csharp" => tree_sitter_c_sharp::LANGUAGE.into(),
-            _ => unreachable!(),
-        };
+        let grammar = grammar(language);
         if cancel.is_cancelled() {
             bail!("cancelled");
         }

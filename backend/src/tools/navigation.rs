@@ -11,8 +11,10 @@ const MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SYMBOLS: usize = 100_000;
 
 struct IndexedFile {
+    /// Its tree is kept only where `Workspace::load` was told to.
     syntax: SyntaxFile,
     symbols: Vec<Value>,
+    parse_error: bool,
 }
 
 struct Workspace {
@@ -24,12 +26,18 @@ struct Workspace {
 }
 
 impl Workspace {
+    /// The files in scope with their declarations. `each` is told of each
+    /// file as it loads (its index, the file) and says whether its tree is
+    /// still needed; the trees of the others go once their declarations are
+    /// read. Kept, the trees of the 32 MiB a snapshot may hold were held at
+    /// once: a search of 25 MB of Rust took 657 MiB.
     fn load(
         s: &crate::tools::Workspace,
         args: &Value,
         target: Option<&Path>,
         cancel: &CancellationToken,
         deadline: Instant,
+        each: &mut dyn FnMut(usize, &IndexedFile) -> bool,
     ) -> Result<Self> {
         check_budget(cancel, deadline)?;
         let root = s.project.root.canonicalize()?;
@@ -109,7 +117,12 @@ impl Workspace {
             if symbols_count > MAX_SYMBOLS {
                 bail!("navigation_too_broad: limit path_glob; too many declarations");
             }
-            files.push(IndexedFile { syntax, symbols });
+            let parse_error = syntax.tree.root_node().has_error();
+            let mut file = IndexedFile { syntax, symbols, parse_error };
+            if !each(files.len(), &file) {
+                file.syntax.release_tree();
+            }
+            files.push(file);
         }
         Ok(Self {
             files,
@@ -152,7 +165,7 @@ impl Workspace {
         let errors: Vec<_> = self
             .files
             .iter()
-            .filter(|f| f.syntax.tree.root_node().has_error())
+            .filter(|f| f.parse_error)
             .map(|f| self.relative(&f.syntax.path))
             .collect();
         json!({"engine":"tree-sitter","matched_files":self.matched_files,"scanned_files":self.files.len(),
@@ -238,7 +251,8 @@ pub(super) fn search(s: &mut crate::tools::Workspace, args: &Value, cancel: &Can
         );
     }
     let deadline = crate::config::deadline_after(s.config.tool_timeout_secs)?;
-    let workspace = Workspace::load(s, args, None, cancel, deadline)?;
+    // Declaration lines are read from the source.
+    let workspace = Workspace::load(s, args, None, cancel, deadline, &mut |_, _| false)?;
     let fingerprint = request_fingerprint(&workspace, "symbol_search", args);
     let mut rows = Vec::new();
     for (index, file) in workspace.files.iter().enumerate() {

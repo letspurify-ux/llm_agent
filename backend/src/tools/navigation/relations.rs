@@ -2512,7 +2512,8 @@ pub(super) fn execute(s: &crate::tools::Workspace, args: &Value, cancel: &Cancel
     let deadline = crate::config::deadline_after(s.config.tool_timeout_secs)?;
     let path = read_path(&s.project, text(args, "path")?)?;
     let id = text(args, "symbol_id")?;
-    let workspace = Workspace::load(s, args, Some(&path), cancel, deadline)?;
+    // Resolution reads the trees of every file (receivers, exports).
+    let workspace = Workspace::load(s, args, Some(&path), cancel, deadline, &mut |_, _| true)?;
     let file = workspace
         .files
         .iter()
