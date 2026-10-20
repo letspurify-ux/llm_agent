@@ -544,3 +544,99 @@ async fn connection_checks_refuse_settings_out_of_range() {
     let r = client.admin("POST", "settings/check", Some(json!({"target":"mariadb","config":{"mariadb":{"pool_size":1u64 << 60}}})), None).await;
     assert!(r.body["message"].as_str().unwrap().contains("풀 크기"), "{}", r.text);
 }
+
+/// A model that takes `0` to write its answer.
+struct Slow(std::time::Duration);
+
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for Slow {
+    async fn complete(
+        &self,
+        _request: Value,
+        _config: &llm_agent::config::LlmConfig,
+        _cancel: tokio_util::sync::CancellationToken,
+        delta: tokio::sync::mpsc::Sender<String>,
+    ) -> anyhow::Result<llm_agent::llm::Completion> {
+        tokio::time::sleep(self.0).await;
+        let _ = delta.send("늦은 답".into()).await;
+        Ok(text("늦은 답"))
+    }
+}
+
+/// Whether the server closes `stream` within `limit`, reading what it sends.
+async fn closed_within(stream: &mut tokio::net::TcpStream, limit: std::time::Duration) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut buffer = [0u8; 4096];
+    tokio::time::timeout(limit, async {
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// Resource review, sixteenth pass: a connection that never finished a
+/// request — one that sent nothing, part of a request head, or a body that
+/// stopped — was kept for good (axum's server set no timer, and hyper's
+/// header timeout needs one), and so was an idle keep-alive connection. Each
+/// held a descriptor: 250 of them took a backend at macOS's default limit
+/// of 256 out of service (no answer, the management DB not reached).
+#[tokio::test]
+async fn connections_without_a_request_under_way_are_closed() {
+    use tokio::io::AsyncWriteExt;
+    let idle = std::time::Duration::from_secs(1);
+    let mut config = llm_agent::config::Config::default();
+    config.mariadb.port = 9;
+    config.llm.model = "gpt-4o".into();
+    config.llm.base_url = "http://127.0.0.1:9/v1".into();
+    let (app, _dir) = app(config, std::sync::Arc::new(Slow(idle * 3)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(web::serve_within(listener, app, std::future::pending(), idle));
+
+    let mut silent = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut half_head = tokio::net::TcpStream::connect(address).await.unwrap();
+    half_head.write_all(b"GET /api/health HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+    let mut half_body = tokio::net::TcpStream::connect(address).await.unwrap();
+    half_body
+        .write_all(b"POST /api/chat HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"message\":")
+        .await
+        .unwrap();
+    // Kept alive between requests while the next comes soon enough.
+    let mut kept = tokio::net::TcpStream::connect(address).await.unwrap();
+    for _ in 0..2 {
+        kept.write_all(b"GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        let mut reply = [0u8; 512];
+        let n = tokio::io::AsyncReadExt::read(&mut kept, &mut reply).await.unwrap();
+        assert!(String::from_utf8_lossy(&reply[..n]).starts_with("HTTP/1.1 200"), "{}", String::from_utf8_lossy(&reply[..n]));
+        tokio::time::sleep(idle / 3).await;
+    }
+    // An answer written for longer than the limit streams to its end.
+    let streamed = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("http://{address}/api/chat"))
+        .header("accept", "application/x-ndjson")
+        .json(&json!({"message":"질문","conversation_id":"slow"}))
+        .send();
+    let limit = idle * 4;
+    let (silent, half_head, half_body, kept, streamed) = tokio::join!(
+        closed_within(&mut silent, limit),
+        closed_within(&mut half_head, limit),
+        closed_within(&mut half_body, limit),
+        closed_within(&mut kept, limit),
+        async { streamed.await.unwrap().text().await.unwrap() },
+    );
+    server.abort();
+    let last: Value = streamed.lines().last().map(|l| serde_json::from_str(l).unwrap()).unwrap_or_default();
+    assert_eq!((last["type"].as_str(), last["answer"].as_str()), (Some("done"), Some("늦은 답")), "{streamed}");
+    assert_eq!(
+        [("silent", silent), ("half head", half_head), ("half body", half_body), ("kept idle", kept)],
+        [("silent", true), ("half head", true), ("half body", true), ("kept idle", true)]
+    );
+}

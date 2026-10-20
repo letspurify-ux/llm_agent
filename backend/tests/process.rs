@@ -336,3 +336,61 @@ async fn a_backend_started_otherwise_outlives_its_parent() {
     assert!(ends_within(backend, Duration::from_secs(20)).await, "the backend did not stop on SIGTERM");
     assert!(serving, "the backend stopped with the process that started it");
 }
+
+/// Resource review, sixteenth pass: started from a macOS terminal the
+/// backend had 256 descriptors (Node, which ran the former backend, raises
+/// its limit at start; the Rust one did not), and a few hundred connections
+/// at once — clients, the management DB, the model — took it out of
+/// service: no answer, "too many open files" for the next connection.
+#[tokio::test]
+async fn a_backend_started_with_few_descriptors_serves_hundreds_of_connections() {
+    let llm = model().await;
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let path = settings(dir.path(), port, llm, "");
+    // The limit is checked once raised: a system whose hard limit is 256
+    // has nothing to raise it to.
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(r#"ulimit -S -n 256 && exec "$0" --config "$1""#)
+        .arg(env!("CARGO_BIN_EXE_llm-agent"))
+        .arg(&path)
+        .current_dir(dir.path())
+        .env_remove("LLM_AGENT_CONFIG")
+        .env_remove("APP_LAUNCHER_PID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let health = format!("http://127.0.0.1:{port}/api/health");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while client().get(&health).send().await.is_err() {
+        assert!(Instant::now() < deadline, "the backend did not start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut held = vec![];
+    for _ in 0..300 {
+        held.push(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let checked = tokio::time::timeout(Duration::from_secs(20), async {
+        let up = client().get(&health).send().await.map(|r| r.status().as_u16());
+        let answer = async {
+            let response = client()
+                .post(format!("http://127.0.0.1:{port}/api/chat"))
+                .json(&json!({"message":"안녕","conversation_id":"many"}))
+                .send()
+                .await?;
+            response.json::<Value>().await
+        }
+        .await;
+        (up.ok(), answer.ok().and_then(|a| a["answer"].as_str().map(str::to_owned)))
+    })
+    .await;
+    drop(held);
+    signal(&child, libc::SIGTERM);
+    let _ = tokio::time::timeout(Duration::from_secs(20), child.wait()).await;
+    assert_eq!(checked.ok(), Some((Some(200), Some("답입니다.".to_owned()))), "the backend was out of service");
+}

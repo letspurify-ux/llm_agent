@@ -278,6 +278,10 @@ SIGINT·SIGTERM처럼 정리하고 끝난다. 실행기는 자기 PID를 `APP_LA
 끝나면(SIGKILL로 강제 종료돼 신호를 넘기지 못해도) SIGTERM처럼 정리하고 끝난다 — 전에는 포트·DB 연결·MCP 서버를 쥔 채 고아로 남아
 stop.sh가 멈추지 못하고 start.sh는 포트가 잡혀 실패했다. 시스템이 알려 주는 방식(macOS kqueue, Linux pidfd)이라 폴링하지 않는다.
 이 값 없이 직접 띄운 서버(`nohup`, 터미널)는 띄운 프로세스가 끝나도 그대로 돈다.
+backend는 시작할 때 열린 파일 수 한도를 시스템이 허용하는 최대로 올린다(macOS 터미널에서 띄우면 256이라, 연결 수백 개가 한꺼번에
+열리면 관리 DB·모델·다음 요청 연결이 "too many open files"로 실패했다 — 전 Node backend는 Node가 올려 주었다). 진행 중인 요청이 없는
+연결(요청 사이에 놀고 있거나, 요청 머리나 본문을 보내다 멈춘 연결)은 30초 뒤 닫는다 — 전에는 아무것도 보내지 않는 연결도 끝없이
+붙들었다. 스트리밍 중인 답은 시간과 상관없이 끝까지 보낸다.
 로그 보관·종료 동작 검증: 저장소 루트에서 `node --test scripts/retained-log.test.cjs`.
 
 #### 회귀 검증
@@ -289,7 +293,7 @@ cd backend && cargo test   # 청커·SQL 가드·바인드·NUMBER·설정·도�
 MCP 검사(`tests/mcp.rs`)는 `node`로 가짜 MCP 서버(`tests/fixtures/fake_mcp_server.mjs`)를 stdio·HTTP로 띄워 연결·호출·시간 초과와 취소·
 호출 중 프로세스 죽음과 재연결·stdout 오염·stderr 폭주·도구 목록 변경·손자 프로세스 정리·SIGTERM 뒤 종료·버린 요청의 취소·환경 격리·관리 API를 잰다(node가 없으면 건너뛴다).
 프로세스 검사(`tests/process.rs`, Unix)는 실제 `llm-agent` 실행 파일을 띄워 SIGHUP에 MCP 서버를 닫고 끝나는지, 출력을 읽는 쪽이 사라진 뒤에도 답하고 정리하며 끝나는지,
-띄운 실행기가 강제 종료되면 MCP 서버를 닫고 끝나는지(실행기 없이 띄운 서버는 계속 도는지) 잰다.
+띄운 실행기가 강제 종료되면 MCP 서버를 닫고 끝나는지(실행기 없이 띄운 서버는 계속 도는지), 파일 한도 256으로 띄워도 연결 300개를 붙든 채 답하는지 잰다.
 
 MariaDB·Oracle·임베딩이 필요한 통합 검사는 환경변수가 있을 때만 돈다(없으면 건너뛰었다고 찍는다).
 검사마다 `llm_agent_rs_test_*` DB를 새로 만들어 `schema.sql`·`seed.sql`을 싣고 끝나면 지운다 — 운영 DB는 건드리지 않는다.

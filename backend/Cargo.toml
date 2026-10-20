@@ -46,14 +46,16 @@ subtle = "2"
 tempfile = "3"
 tiktoken-rs = "0.9"
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["io"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
 toml = "0.8"
 unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 caseless = "0.2"
 
 axum = "0.8"
-tower-http = { version = "0.6", features = ["limit"] }
+# The server's connections, served with a timer (web::serve_within).
+hyper-util = { version = "0.1", features = ["tokio", "server", "service", "http1"] }
+tower-http = { version = "0.6", features = ["limit", "timeout"] }
 tree-sitter = "0.27.0"
 tree-sitter-rust = "0.24.2"
 tree-sitter-javascript = "0.25.0"

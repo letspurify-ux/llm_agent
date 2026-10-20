@@ -18,7 +18,6 @@ use axum::{
 use futures_util::{FutureExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
-    future::IntoFuture,
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
@@ -41,6 +40,16 @@ const KEEPALIVE: socket2::TcpKeepalive = socket2::TcpKeepalive::new()
     .with_interval(Duration::from_secs(10))
     .with_retries(6);
 
+/// How long a connection may go without a request under way: idle between
+/// requests, or sending its request head or body. axum's server set no
+/// timer, and hyper's own header timeout needs one: a connection that sent
+/// nothing (or part of a request) was kept for good, and an idle keep-alive
+/// one as long as its client liked. Each held a descriptor, and 250 took a
+/// backend at macOS's default limit of 256 out of service. A browser opens a
+/// new connection for its next request; an answer being streamed is not
+/// limited.
+pub const CONNECTION_IDLE: Duration = Duration::from_secs(30);
+
 /// Serves the router until `signal` resolves, then shuts down: connections
 /// still open after SHUTDOWN_GRACE are dropped rather than waited for.
 pub async fn serve(
@@ -48,23 +57,58 @@ pub async fn serve(
     app: Arc<App>,
     signal: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    use axum::serve::ListenerExt;
+    serve_within(listener, app, signal, CONNECTION_IDLE).await
+}
+
+/// `serve` with connections closed past `idle` without a request under way
+/// (see `CONNECTION_IDLE`).
+pub async fn serve_within(
+    listener: tokio::net::TcpListener,
+    app: Arc<App>,
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+    idle: Duration,
+) -> std::io::Result<()> {
+    use axum::serve::{Listener, ListenerExt};
+    use hyper_util::{
+        rt::{TokioExecutor, TokioIo, TokioTimer},
+        server::conn::auto::Builder,
+        service::TowerToHyperService,
+    };
+    // A request body that stops coming ends the request (the timeout is
+    // between its parts, not on the whole of a large upload).
+    let service = TowerToHyperService::new(tower_http::timeout::RequestBodyTimeout::new(router(app), idle));
+    let mut listener = listener.tap_io(keep_alive);
+    let connections = tokio_util::task::TaskTracker::new();
     let stopping = CancellationToken::new();
-    let stopped = stopping.clone();
-    let server = axum::serve(listener.tap_io(keep_alive), router(app)).with_graceful_shutdown(async move {
-        signal.await;
-        stopped.cancel();
-    });
-    tokio::select! {
-        result = server.into_future() => result,
-        _ = async {
-            stopping.cancelled().await;
-            tokio::time::sleep(SHUTDOWN_GRACE).await;
-        } => {
-            eprintln!("[shutdown] connections still open after {}s were closed", SHUTDOWN_GRACE.as_secs());
-            Ok(())
-        }
+    tokio::pin!(signal);
+    loop {
+        let (io, _) = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = &mut signal => break,
+        };
+        let (service, stopping) = (service.clone(), stopping.clone());
+        connections.spawn(async move {
+            // HTTP/1 only, as axum serves it here: told apart from HTTP/2
+            // first, a connection that sent nothing waited for its first
+            // bytes with no limit.
+            let mut builder = Builder::new(TokioExecutor::new()).http1_only();
+            builder.http1().timer(TokioTimer::new()).header_read_timeout(idle);
+            let connection = builder.serve_connection(TokioIo::new(io), service);
+            tokio::pin!(connection);
+            tokio::select! {
+                _ = connection.as_mut() => return,
+                _ = stopping.cancelled() => connection.as_mut().graceful_shutdown(),
+            }
+            let _ = connection.await;
+        });
     }
+    drop(listener);
+    stopping.cancel();
+    connections.close();
+    if tokio::time::timeout(SHUTDOWN_GRACE, connections.wait()).await.is_err() {
+        eprintln!("[shutdown] connections still open after {}s were closed", SHUTDOWN_GRACE.as_secs());
+    }
+    Ok(())
 }
 
 fn keep_alive(stream: &mut tokio::net::TcpStream) {

@@ -31,6 +31,8 @@ fn config_path(args: &[String]) -> PathBuf {
 
 fn main() {
     console::drop_unwritable();
+    #[cfg(unix)]
+    llm_agent::app::raise_open_file_limit();
     let args: Vec<String> = std::env::args().collect();
     // `.env` values (ENV:NAME target DB passwords, first-start import) join
     // the process environment without overriding it.

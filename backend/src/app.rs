@@ -35,6 +35,47 @@ pub fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
+/// Raises this process's open-file limit to the most the system allows and
+/// returns the limit before and after, when it was raised. Each connection
+/// (a browser's, the management DB's, a provider's) and each MCP server's
+/// pipes take a descriptor, and a backend started from a macOS terminal
+/// had 256: a few hundred connections at once failed new ones ("too many
+/// open files") — the management DB, the model, the browser's next request.
+/// Node, which ran the former backend, raises it at start in the same way.
+#[cfg(unix)]
+pub fn raise_open_file_limit() -> Option<(libc::rlim_t, libc::rlim_t)> {
+    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit and setrlimit read and write this process's limit.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 || limit.rlim_cur >= limit.rlim_max {
+        return None;
+    }
+    let before = limit.rlim_cur;
+    let set = |value: libc::rlim_t| {
+        let wanted = libc::rlimit { rlim_cur: value, rlim_max: limit.rlim_max };
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &wanted) == 0 }
+    };
+    // The hard limit, or the most below it the system takes (macOS refuses
+    // a soft limit past kern.maxfilesperproc, even under an unlimited hard
+    // one).
+    let (mut taken, mut refused) = (before, limit.rlim_max);
+    if !set(refused) {
+        while refused - taken > 1 {
+            let middle = taken + (refused - taken) / 2;
+            if set(middle) {
+                taken = middle;
+            } else {
+                refused = middle;
+            }
+        }
+        if !set(taken) {
+            return None;
+        }
+    } else {
+        taken = refused;
+    }
+    (taken > before).then_some((before, taken))
+}
+
 pub struct App {
     pub config_path: PathBuf,
     config: RwLock<Arc<Config>>,
