@@ -2328,3 +2328,55 @@ it('복제한 탭은 같은 말풍선으로 이어 가되 대화 번호는 새�
   assert.notEqual(await page.eval(`JSON.parse(sessionStorage.getItem('llm-agent.chat.v1')).conversationId`), id, '새 대화 번호');
 });
 
+
+// mermaid가 글자 크기를 재어 두는 캐시(calculateTextDimensions·wrapLabel·breakString)는 es-toolkit memoize의 Map이라
+// 지우는 길이 없다 — 서로 다른 글자의 시퀀스 그림 하나마다 약 5KB가 쌓여, 홈으로 돌아가도 탭이 열려 있는 내내
+// 자랐다(실측: 그림 40개 뒤 1,280항목). src/mermaid-memo.js가 memoize.Cache를 상한 있는 캐시로 바꾸는데, 그것은
+// mermaid의 모듈이 평가되기 '전'이어야 닿는다 — import 순서가 바뀌거나 번들러가 순서를 바꾸면 오류도 화면의 차이도
+// 없이 다시 Map이 된다. 그 순서는 실제 번들에서만 보이므로 힙 스냅샷에서 mermaid의 memoize 캐시가 무엇인지 직접 본다.
+it('mermaid의 글자 크기 캐시는 상한 있는 캐시다 — 서로 다른 그림이 거듭 와도 끝없이 자라지 않는다', async () => {
+  await page.touchMode(false);
+  await page.viewport(1000, 760);
+  await page.goto(url(), '.chip');
+  // 시퀀스 그림은 메시지마다 글자 크기를 잰다(흐름도는 이 캐시를 쓰지 않는다).
+  const answer = ['```mermaid', 'sequenceDiagram', '  participant A as 사용자', '  participant B as 서버',
+    ...Array.from({ length: 12 }, (_, i) => `  A->>B: 요청 ${i} 번째 메시지`), '```'].join('\n');
+  await page.eval(`window.fetch = async () => new Response(JSON.stringify({ answer: ${JSON.stringify(answer)} }),
+    { headers: { 'Content-Type': 'application/json' } })`);
+  await sendQuestion('시퀀스 그림', 1);
+  await page.until(`document.querySelector('.mermaid svg')`, { what: '시퀀스 그림이 그려지기' });
+  // 스냅샷은 조각으로 온다 — 드라이버의 메시지 처리기 앞에서 그 조각만 받아 모은다.
+  const chunks = [];
+  const handler = page.ws.onmessage;
+  page.ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.method === 'HeapProfiler.addHeapSnapshotChunk') chunks.push(m.params.chunk);
+    else handler(ev);
+  };
+  try {
+    await page.send('HeapProfiler.enable');
+    await page.send('HeapProfiler.takeHeapSnapshot', { reportProgress: false }, { timeoutMs: 120_000 });
+  } finally {
+    page.ws.onmessage = handler;
+    await page.send('HeapProfiler.disable').catch(() => {});
+  }
+  const s = JSON.parse(chunks.join(''));
+  const nf = s.snapshot.meta.node_fields, ef = s.snapshot.meta.edge_fields;
+  const W = nf.length, EW = ef.length;
+  const [iType, iName, iEdges] = ['type', 'name', 'edge_count'].map(f => nf.indexOf(f));
+  const [eType, eName, eTo] = ['type', 'name_or_index', 'to_node'].map(f => ef.indexOf(f));
+  const nodeTypes = s.snapshot.meta.node_types[0], edgeTypes = s.snapshot.meta.edge_types[0];
+  // memoize가 돌려준 함수(이름 memoized)의 cache 속성이 가리키는 객체의 생성자 이름을 모은다.
+  const caches = [];
+  for (let k = 0, e = 0; k < s.nodes.length / W; k++) {
+    const count = s.nodes[k * W + iEdges];
+    const memoized = nodeTypes[s.nodes[k * W + iType]] === 'closure' && s.strings[s.nodes[k * W + iName]] === 'memoized';
+    for (let j = 0; j < count; j++, e++) {
+      if (!memoized || edgeTypes[s.edges[e * EW + eType]] !== 'property' || s.strings[s.edges[e * EW + eName]] !== 'cache') continue;
+      caches.push(s.strings[s.nodes[s.edges[e * EW + eTo] + iName]]);
+    }
+  }
+  assert.ok(caches.filter(n => n === 'BoundedCache').length >= 3,
+    `mermaid의 글자 크기 캐시 셋이 상한 있는 캐시가 아니다: ${JSON.stringify(caches)} — src/mermaid-memo.js가 mermaid보다 먼저 평가되는지 볼 것`);
+  assert.ok(!caches.includes('Map'), `상한 없는 memoize 캐시(Map)가 남았다: ${JSON.stringify(caches)}`);
+});

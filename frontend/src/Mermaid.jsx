@@ -1,6 +1,8 @@
 // ```mermaid 블록 하나를 그림으로. 지식 답변의 절차·흐름을 모델이 흐름도로 쓸 때 쓰인다.
 // App.jsx가 React.lazy로 부른다 — mermaid는 번들이 수 MB라 첫 흐름도가 나올 때까지 내려받지 않는다.
 import { useEffect, useLayoutEffect, useRef, useState, useId } from 'react';
+// mermaid보다 먼저 — mermaid가 모듈을 평가하며 만드는 글자 크기 캐시에 상한을 둔다 (mermaid-memo.js 주석 참고).
+import './mermaid-memo.js';
 import mermaid from 'mermaid';
 // 그림 안 링크의 주소 규칙과 그림 노드의 판정은 답변의 링크·그림과 같은 자리에 있다 (markdown.js).
 import { rawLinkTarget, mermaidLoadsImage, mermaidFetchesViaStyle, mermaidMathLabels } from './markdown.js';

@@ -581,3 +581,60 @@ GFM의 자동 링크(autolink literal)가 그 백슬래시를 주소의 일부�
 - 새로 붙인 시험은 모두 **돌연변이로 확인**했다(고친 자리를 되돌리면 실제로 깨진다) — 표 계약 2개·
   큰 값 표기 1개·`structuredClone` 폴리필 2개(단위·화면)·칸 수 불변식 1개·계약 공백 5개.
 - production 변경은 `src/chart.js`(구분 줄·줄머리 파이프·큰 값 표기)와 `src/polyfills.js`(structuredClone)다.
+
+## 자원 누수 정밀 검토 — 2026-10-21 (무제한·지속 상승만 결함으로 센다)
+
+기준은 backend 25차와 같다: 시간·질문 수에 따라 **끝없이 늘어나는 것**만 결함이다. 한 번에 크게 잡았다 놓는
+것, 한 벌만 남는 것은 따로 적는다. 전 소스 정독(리스너·관찰자·타이머·rAF·스트림·WebGL·모듈 상태) 뒤
+headless Chrome 소크에서 매 측정 전 GC를 세 번 돌리고 JS 힙·DOM 노드·리스너 수를 쟀고, 늘어난 것은 힙 스냅샷
+차분과 retainer 경로로 출처를 확정했다.
+
+### 찾아 고친 것 — mermaid의 글자 크기 캐시가 끝없이 자랐다
+
+mermaid는 라벨의 폭·높이(calculateTextDimensions)와 줄 나누기(wrapLabel·breakString)를 es-toolkit의
+`memoize`로 기억하는데 그 캐시는 지우는 길이 없는 `Map`이고 키가 '글자 + 글꼴'이다. 답변의 그림 글자에는
+조회 결과가 섞여 같은 글자가 다시 오지 않으므로, 서로 다른 그림이 그려질 때마다 항목이 늘고 **홈으로 돌아가도
+줄지 않는다**. 실측: 메시지 30개짜리 시퀀스 그림 하나에 약 32항목·5KB, 클래스 그림 하나에 약 1.3KB — 그림 40개
+뒤 1,280항목·200KB, 100개 뒤 약 3,200항목이 탭이 열려 있는 내내 남았다(흐름도·간트는 이 캐시를 쓰지 않는다).
+`src/mermaid-memo.js`가 mermaid보다 먼저 평가되며 `memoize.Cache`를 최근 사용 순 상한 캐시(2,000항목)로 바꾼다
+— memoize는 캐시를 만들 때 그 값을 읽으므로 mermaid의 세 캐시가 모두 그것이 된다. 수정 뒤 같은 소크(100개)에서
+캐시가 2,000항목에서 멈췄고, 프로덕션 번들에서도 교체가 세 memoize 호출보다 앞에서 평가됨을 확인했다.
+es-toolkit을 직접 의존성으로 둔 것은 mermaid와 같은 한 벌을 받기 위해서다(두 벌이면 교체가 mermaid에 닿지 않는다).
+
+시험: 단위 `test/mermaid-memo.test.js` 3개(mermaid와 같은 es-toolkit 한 벌·mermaid가 memoize를 es-toolkit에서
+가져옴·상한과 LRU), 화면 1개(시퀀스 그림을 그린 뒤 힙 스냅샷에서 mermaid의 memoize 캐시가 `BoundedCache`인지 —
+import 순서는 실제 번들에서만 보인다). 돌연변이 4종(import 제거·mermaid 아래로 옮김·Cache 대입 제거·LRU get 제거)
+모두 깨짐을 확인했다.
+
+### 확인해 결함이 아닌 것 (재조사 금지)
+
+- **질문→답→패널 펼침→홈 600회**(rich: 차트 4·흐름도·수식·trace): 노드 2,227·리스너 1,220 고정, 힙은 300회 이후
+  21.0~21.5MB에서 평탄. 130회 vs 30회 차분의 증가분 1.1MB 중 약 1MB는 V8 JIT 코드(InstructionStream·
+  TrustedByteArray — 최적화 단계 상승, 상한 있음)였다.
+- **매번 다른 글자의 흐름도·깨진 흐름도·수식·차트 400회**: 50회당 증가가 0.48→0.07MB로 줄며 수렴. 150↔260회
+  차분에서 새로 남은 문자열은 마지막 그림 한 벌(FlowDB 정점·현재 테마·마지막 말풍선)뿐이었다. recharts의 글자 폭
+  캐시는 스스로 2,000개 상한(LRUCache)이다.
+- **스트림 도중 정지·답 전에 홈(요청 중단)·관리자 화면 여닫기와 탭 돌기·1000행×30열 표를 펼친 답** 각 40~60회:
+  노드·리스너 고정. 큰 표도 홈 뒤 노드 86개로 완전히 풀린다.
+- **한 대화 40턴**: 턴마다 힙 ~1.45MB·노드 ~760·리스너 ~1,080이 늘지만 화면에 그려진 대화 그 자체이고, 홈을 누르면
+  처음 수준(약 20MB·862노드)으로 돌아온다. 리스너가 많은 것은 recharts 3가 z-index 레이어 `<g>`마다 React 포털을
+  만들고 React가 포털 컨테이너마다 ~170개 이벤트를 위임 등록하기 때문이다(노드와 함께 수거된다).
+- **한 벌만 남는 것**: 홈 뒤에도 '마지막으로 차트를 그린 말풍선 하나'의 분리된 DOM이 남는다 — recharts의 모듈
+  수준 reselect 선택자(selectZIndexPortalElement)가 마지막 결과로 그 `<g>`를 쥔다. 다음 차트가 그려지면 교체되므로
+  늘지 않는다. mermaid의 직렬 큐도 마지막 렌더 결과(SVG 문자열) 하나를 쥔다.
+- matchMedia+add/removeEventListener 1만 회(recharts usePrefersReducedMotion과 같은 모양): Blink MediaQuery 잔여 0.
+- 코드: App.jsx의 창·문서 리스너 14종과 관찰자·타이머·rAF는 모두 짝 맞게 걷힌다(wheel은 capture 플래그로 맞게
+  뗀다). robotScene은 dispose·forceContextLoss·리스너 해제를 다 한다. stream.js는 done 뒤 cancel·releaseLock,
+  AdminPanel api는 abort 리스너·타이머를 finally에서 걷는다. KaTeX는 렌더마다 새 매크로 표를 쓴다(공유 상태 없음).
+
+### 결정 대기(관찰만)
+
+- 한 대화 안의 말풍선과 그 trace 행은 홈을 누르기 전까지 전부 메모리에 남는다(그려진 내용이라 누수로 세지 않았다).
+  조회 결과가 큰 질문을 한 대화에서 수백 번 거듭하면 수백 MB가 될 수 있다 — 서버가 대화 보관에 상한을 둔 것처럼
+  오래된 말풍선의 행을 덜어 낼지는 화면 동작이 바뀌는 일이라 결정을 기다린다.
+- MCP 탭의 5초 상태 읽기는 앞 읽기가 끝나지 않아도 다음을 보낸다. 요청마다 60초 한도가 있어 최대 12개로 묶인다.
+
+### 최종 검증
+
+- 단위 **427개 통과**, Chrome UI **92개 통과**, 관리자 **3개**, production **4개**, inline-math **2개 통과**.
+- production 변경은 `src/mermaid-memo.js`(새 파일)·`src/Mermaid.jsx`(import 한 줄)·`package.json`(es-toolkit 직접 의존성)이다.

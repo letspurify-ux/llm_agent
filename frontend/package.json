@@ -15,6 +15,7 @@
     "test:regression": "node test/run-regressions.mjs"
   },
   "dependencies": {
+    "es-toolkit": "^1.52.0",
     "hast-util-from-html-isomorphic": "^2.0.0",
     "katex": "^0.16.47",
     "mdast-util-from-markdown": "^2.0.3",
