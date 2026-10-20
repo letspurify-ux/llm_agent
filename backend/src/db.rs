@@ -4,7 +4,7 @@
 
 use crate::config::MariaDbConfig;
 use anyhow::{Result, bail};
-use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, prelude::Queryable};
+use mysql_async::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, prelude::Queryable};
 use serde_json::{Map, Value, json};
 use std::{collections::VecDeque, sync::Mutex, time::Duration};
 
@@ -45,6 +45,75 @@ const POOLS_KEPT: usize = 4;
 /// the character set goes back to the login's, which MariaDB maps to the
 /// collation SET NAMES gives), so it is taken again as a new one.
 const IDLE_CONNECTION_TTL: Duration = Duration::from_secs(60);
+
+/// The largest row or parameter a connection may have carried and still go
+/// back to the pool. The driver reads a row, and sends a statement with its
+/// parameters, in buffers of the connection's own that grow to the largest
+/// it has carried and stay that size as long as the connection lives: a
+/// knowledge document of 10 MB read, or saved, left 10 to 20 MB on each
+/// connection that did, for as long as the pool used it (8 connections:
+/// 172 MB, measured). Past this, the connection is closed when let go.
+const LARGE_PACKET: usize = 1024 * 1024;
+
+/// The largest buffer the driver keeps for later in its process-wide pool
+/// (`MYSQL_ASYNC_BUFFER_SIZE_CAP`). It kept 128 of up to 4 MiB each for good:
+/// a larger buffer, used once for a large row, came back cut to 4 MiB and
+/// stayed — 512 MiB at most, 44 MB after 8 connections read 10 MB rows.
+/// Rows past this take a buffer of their own, freed when read.
+const DRIVER_BUFFER_CAP: usize = 256 * 1024;
+
+/// Sets the driver's buffer cap (`DRIVER_BUFFER_CAP`), unless the
+/// environment gives one. The driver reads it once, when it first connects,
+/// so this goes first, while the process has a single thread.
+pub fn cap_driver_buffers() {
+    if std::env::var_os("MYSQL_ASYNC_BUFFER_SIZE_CAP").is_none() {
+        // SAFETY: called at the start of main, before any other thread runs
+        // (nothing else reads or writes the environment meanwhile).
+        unsafe { std::env::set_var("MYSQL_ASYNC_BUFFER_SIZE_CAP", DRIVER_BUFFER_CAP.to_string()) };
+    }
+}
+
+/// A connection, pooled or of its own, that knows the largest row or
+/// parameter it has carried (`LARGE_PACKET`): past it, the connection is
+/// closed when let go (politely, on a task of its own) rather than pooled.
+pub struct Conn {
+    inner: Option<mysql_async::Conn>,
+    largest: usize,
+    timeout: Duration,
+}
+
+impl Conn {
+    fn new(inner: mysql_async::Conn, cfg: &MariaDbConfig) -> Self {
+        Self {
+            inner: Some(inner),
+            largest: 0,
+            timeout: Duration::from_millis(cfg.timeout_ms),
+        }
+    }
+
+    fn carried(&mut self, bytes: usize) {
+        self.largest = self.largest.max(bytes);
+    }
+
+    fn inner(&mut self) -> &mut mysql_async::Conn {
+        self.inner.as_mut().expect("a connection being used is held")
+    }
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        if self.largest <= LARGE_PACKET {
+            return;
+        }
+        let (Some(conn), Ok(runtime)) = (self.inner.take(), tokio::runtime::Handle::try_current()) else {
+            return;
+        };
+        let timeout = self.timeout;
+        runtime.spawn(async move {
+            let _ = tokio::time::timeout(timeout, conn.disconnect()).await;
+        });
+    }
+}
 
 /// MariaDB error codes the admin API reports with their own status.
 pub const ER_DUP_ENTRY: u16 = 1062;
@@ -88,7 +157,8 @@ impl Db {
     /// A connection of its own, for a transaction or a session lock.
     pub async fn conn(&self, cfg: &MariaDbConfig) -> Result<Conn> {
         let pool = self.pool(cfg)?;
-        timed(cfg, async move { Ok(pool.get_conn().await?) }).await
+        let conn = timed(cfg, async move { Ok(pool.get_conn().await?) }).await?;
+        Ok(Conn::new(conn, cfg))
     }
 
     /// A connection outside the pool, for a session lock held while the
@@ -98,7 +168,8 @@ impl Db {
     /// use of the DB waiting meanwhile. Closed with `close_conn`.
     pub async fn lock_conn(&self, cfg: &MariaDbConfig) -> Result<Conn> {
         let opts = Opts::from(options(cfg));
-        timed(cfg, async move { Ok(Conn::new(opts).await?) }).await
+        let conn = timed(cfg, async move { Ok(mysql_async::Conn::new(opts).await?) }).await?;
+        Ok(Conn::new(conn, cfg))
     }
 
     /// Closes a connection of its own (`lock_conn`) as the protocol has it,
@@ -106,8 +177,10 @@ impl Db {
     /// (mysql_async marks it closed before it says so), which the server
     /// counts and logs as an aborted connection — at every embedding sync,
     /// once a minute by default, into a log nothing trims.
-    pub async fn close_conn(&self, cfg: &MariaDbConfig, conn: Conn) {
-        let _ = timed(cfg, async { Ok(conn.disconnect().await?) }).await;
+    pub async fn close_conn(&self, cfg: &MariaDbConfig, mut conn: Conn) {
+        if let Some(conn) = conn.inner.take() {
+            let _ = timed(cfg, async { Ok(conn.disconnect().await?) }).await;
+        }
     }
 
     pub async fn query(&self, cfg: &MariaDbConfig, sql: &str, params: Vec<Param>) -> Result<Vec<Row>> {
@@ -162,7 +235,8 @@ fn options(cfg: &MariaDbConfig) -> OptsBuilder {
 /// connection for the next query, and the server logged an aborted
 /// connection each time (223 stopped questions: 187 connections, 191
 /// aborted, against 5 and none for as many answered). Given up before a
-/// connection came, nothing runs.
+/// connection came, nothing runs. A connection that carried a large row or
+/// parameter is closed then (`LARGE_PACKET`).
 async fn to_the_end<T, F>(pool: Pool, cfg: MariaDbConfig, work: impl FnOnce(MariaDbConfig, Conn) -> F + Send + 'static) -> Result<T>
 where
     T: Send + 'static,
@@ -171,7 +245,7 @@ where
     let (answer, answered) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let conn = match timed(&cfg, async { Ok(pool.get_conn().await?) }).await {
-            Ok(conn) => conn,
+            Ok(conn) => Conn::new(conn, &cfg),
             Err(e) => {
                 let _ = answer.send(Err(e));
                 return;
@@ -221,18 +295,33 @@ fn limited(cfg: &MariaDbConfig, settings: &str, sql: &str) -> String {
     format!("SET STATEMENT max_statement_time={secs}{more} FOR {sql}")
 }
 
+/// Bytes a value takes on the wire, about.
+fn value_bytes(value: &mysql_async::Value) -> usize {
+    match value {
+        mysql_async::Value::Bytes(bytes) => bytes.len(),
+        _ => 16,
+    }
+}
+
 async fn rows(cfg: &MariaDbConfig, conn: &mut Conn, statement: &str, values: Vec<Param>) -> Result<Vec<Row>> {
-    timed(cfg, async {
-        let rows: Vec<mysql_async::Row> = conn.exec(statement, params(values)).await?;
-        Ok(rows.into_iter().map(row_json).collect())
-    })
-    .await
+    conn.carried(statement.len() + values.iter().map(value_bytes).sum::<usize>());
+    let link = conn.inner();
+    let rows: Vec<mysql_async::Row> = timed(cfg, async { Ok(link.exec(statement, params(values)).await?) }).await?;
+    let largest = rows
+        .iter()
+        .map(|row| (0..row.len()).filter_map(|i| row.as_ref(i)).map(value_bytes).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    conn.carried(largest);
+    Ok(rows.into_iter().map(row_json).collect())
 }
 
 async fn affected(cfg: &MariaDbConfig, conn: &mut Conn, statement: &str, values: Vec<Param>) -> Result<(u64, u64)> {
+    conn.carried(statement.len() + values.iter().map(value_bytes).sum::<usize>());
+    let link = conn.inner();
     timed(cfg, async {
-        conn.exec_drop(statement, params(values)).await?;
-        Ok((conn.affected_rows(), conn.last_insert_id().unwrap_or(0)))
+        link.exec_drop(statement, params(values)).await?;
+        Ok((link.affected_rows(), link.last_insert_id().unwrap_or(0)))
     })
     .await
 }
@@ -247,8 +336,10 @@ pub async fn exec_on(cfg: &MariaDbConfig, conn: &mut Conn, sql: &str, values: Ve
 
 /// A text-protocol statement without parameters (SET, transactions).
 pub async fn plain_on(cfg: &MariaDbConfig, conn: &mut Conn, sql: &str) -> Result<()> {
+    conn.carried(sql.len());
+    let link = conn.inner();
     timed(cfg, async {
-        conn.query_drop(sql).await?;
+        link.query_drop(sql).await?;
         Ok(())
     })
     .await

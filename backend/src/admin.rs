@@ -357,7 +357,7 @@ fn public_columns(config: &Resource) -> String {
 }
 
 /// A record by number, with its revision; `conn` reads inside a write.
-async fn get_record(app: &App, kind: &str, id: i64, conn: Option<&mut mysql_async::Conn>, lock: bool) -> anyhow::Result<Value> {
+async fn get_record(app: &App, kind: &str, id: i64, conn: Option<&mut db::Conn>, lock: bool) -> anyhow::Result<Value> {
     let config = resource(kind).ok_or_else(|| problem(404, "관리 항목을 찾을 수 없습니다."))?;
     let sql = format!(
         "SELECT {} FROM {} WHERE seq = ?{}",
@@ -382,7 +382,7 @@ async fn get_record(app: &App, kind: &str, id: i64, conn: Option<&mut mysql_asyn
 /// Runs `work` in a transaction under the admin lock.
 async fn write_transaction<T>(
     app: &App,
-    work: impl AsyncFnOnce(&mut mysql_async::Conn) -> anyhow::Result<T>,
+    work: impl AsyncFnOnce(&mut db::Conn) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     let cfg = app.config();
     let cfg = &cfg.mariadb;
@@ -411,7 +411,7 @@ async fn write_transaction<T>(
     result
 }
 
-async fn check_references(app: &App, kind: &str, row: &Value, conn: &mut mysql_async::Conn) -> anyhow::Result<()> {
+async fn check_references(app: &App, kind: &str, row: &Value, conn: &mut db::Conn) -> anyhow::Result<()> {
     let cfg = app.config();
     let cfg = &cfg.mariadb;
     if kind == "databases" {

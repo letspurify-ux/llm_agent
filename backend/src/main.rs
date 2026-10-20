@@ -30,6 +30,7 @@ fn config_path(args: &[String]) -> PathBuf {
 }
 
 fn main() {
+    llm_agent::db::cap_driver_buffers();
     console::drop_unwritable();
     #[cfg(unix)]
     llm_agent::app::raise_open_file_limit();

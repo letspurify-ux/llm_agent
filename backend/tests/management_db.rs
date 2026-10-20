@@ -234,3 +234,48 @@ fn the_sql_files_choose_no_database() {
     }
     assert!(chosen.is_empty(), "statements that choose a database: {chosen:#?}");
 }
+
+/// Resource review, twenty-second pass: the driver reads a row, and sends a
+/// statement with its parameters, in buffers of the connection's own that
+/// stay as large as the largest it carried, for as long as the connection
+/// lives — a 10 MB knowledge document read or saved left 10 to 20 MB on
+/// each connection that did. A connection that carried a large row or
+/// parameter is closed once let go, in order; any other goes on pooled.
+#[tokio::test]
+async fn a_connection_that_carried_a_large_row_is_not_pooled_again() {
+    let Some(test_db) = TestDb::create("large_rows") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let mut config = test_db.config();
+    config.mariadb.pool_size = 1;
+    let cfg = &config.mariadb;
+    let db = Db::default();
+    let id = async |sql: &str, params: Vec<db::Param>| db::int(&db.query(cfg, sql, params).await.unwrap()[0], "id");
+    let plain = "SELECT CONNECTION_ID() AS id";
+    let first = id(plain, vec![]).await;
+    assert_eq!(id("SELECT CONNECTION_ID() AS id, REPEAT('x', 100000) AS kept", vec![]).await, first);
+    assert_eq!(id(plain, vec![]).await, first, "a connection that carried 100 KB goes on pooled");
+
+    assert_eq!(id("SELECT CONNECTION_ID() AS id, REPEAT('x', 2000000) AS large", vec![]).await, first);
+    let second = id(plain, vec![]).await;
+    assert_ne!(second, first, "the connection that read a 2 MB row was closed");
+
+    assert_eq!(id("SELECT CONNECTION_ID() AS id, LENGTH(?) AS n", vec![db::p("y".repeat(2_000_000))]).await, second);
+    let third = id(plain, vec![]).await;
+    assert_ne!(third, second, "the connection that sent a 2 MB parameter was closed");
+
+    // A connection of its own for a transaction, the same.
+    let mut conn = db.conn(cfg).await.unwrap();
+    db::query_on(cfg, &mut conn, "SELECT REPEAT('x', 2000000) AS large", vec![]).await.unwrap();
+    drop(conn);
+    let fourth = id(plain, vec![]).await;
+    assert_ne!(fourth, third);
+
+    // Closed in order, not left open.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let open = test_db.scalar(&format!(
+        "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID IN ({first}, {second}, {third})"
+    ));
+    assert_eq!(open, "0");
+    db.close().await;
+}

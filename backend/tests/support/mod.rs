@@ -374,3 +374,35 @@ fn archive_read_goes_on_past_what_was_shown(history: &llm_agent::session::Sessio
     }
     Ok(())
 }
+
+/// Bytes this process has allocated, where the platform says.
+pub fn heap_in_use() -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        #[derive(Default)]
+        struct Statistics {
+            blocks_in_use: u32,
+            size_in_use: usize,
+            max_size_in_use: usize,
+            size_allocated: usize,
+        }
+        unsafe extern "C" {
+            fn malloc_zone_statistics(zone: *const std::ffi::c_void, stats: *mut Statistics);
+        }
+        let mut stats = Statistics::default();
+        // SAFETY: a null zone sums every zone into `stats`.
+        unsafe { malloc_zone_statistics(std::ptr::null(), &mut stats) };
+        Some(stats.size_in_use)
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: reads the allocator's counters.
+        let info = unsafe { libc::mallinfo2() };
+        Some(info.uordblks + info.hblkhd)
+    }
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+    {
+        None
+    }
+}
