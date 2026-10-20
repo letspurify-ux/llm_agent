@@ -133,6 +133,75 @@ async fn the_locks_connection_says_goodbye() {
     assert!(taken >= 3 && ended.len() == taken && ended.iter().all(|quit| *quit), "{taken} connections, closed with a goodbye: {ended:?}");
 }
 
+/// A proxy to the test server that notes the most bytes the server sent
+/// between two of a client's writes: the largest answer to one statement.
+async fn answer_watcher(host: &str, port: u16) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = listener.local_addr().unwrap().port();
+    let largest = Arc::new(AtomicUsize::new(0));
+    let (noted, upstream) = (largest.clone(), format!("{host}:{port}"));
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let (largest, upstream) = (noted.clone(), upstream.clone());
+            tokio::spawn(async move {
+                let server = tokio::net::TcpStream::connect(upstream).await.unwrap();
+                let (mut client_in, mut client_out) = client.into_split();
+                let (mut server_in, mut server_out) = server.into_split();
+                let answer = Arc::new(AtomicUsize::new(0));
+                let sent = answer.clone();
+                tokio::spawn(async move {
+                    let mut buffer = vec![0u8; 65536];
+                    while let Ok(n @ 1..) = server_in.read(&mut buffer).await {
+                        let so_far = sent.fetch_add(n, Ordering::AcqRel) + n;
+                        largest.fetch_max(so_far, Ordering::AcqRel);
+                        if client_out.write_all(&buffer[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                let mut buffer = vec![0u8; 65536];
+                while let Ok(n @ 1..) = client_in.read(&mut buffer).await {
+                    answer.store(0, Ordering::Release);
+                    if server_out.write_all(&buffer[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (local, largest)
+}
+
+/// Documents to chunk were read a thousand at once: the sync held every
+/// one, twice over, while it split the first (40 documents of 11 MiB: a
+/// 0.9 GiB peak), and a document's content has no size limit. They are read
+/// one at a time.
+#[tokio::test]
+async fn documents_are_read_one_at_a_time_to_be_chunked() {
+    let _turn = SYNCING.lock().await;
+    let Some(test_db) = TestDb::create("sync_one_doc") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let mut config = test_db.config();
+    config.embedding.url = String::new();
+    // Four documents of about 500 KB each.
+    test_db.sql_in(
+        "INSERT INTO knowledge (title, content) SELECT CONCAT('큰 문서 ', seq), REPEAT(CONCAT('문장 ', seq, '이 길게 이어진다.\n\n'), 18000) FROM seq_1_to_4;",
+    );
+    let document: usize = test_db.scalar("SELECT MAX(LENGTH(content)) FROM knowledge").parse().unwrap();
+    let (port, largest) = answer_watcher(&config.mariadb.host, config.mariadb.port).await;
+    config.mariadb.host = "127.0.0.1".into();
+    config.mariadb.port = port;
+    let db = Db::default();
+    let summary = EmbedSync::default().run(&db, &config, &CancellationToken::new()).await.expect("the sync runs");
+    db.close().await;
+    assert_eq!(summary.chunks_failed, 0, "{summary}");
+    assert_eq!(test_db.scalar("SELECT COUNT(DISTINCT doc_seq) FROM knowledge_chunk WHERE title LIKE '큰 문서 %'"), "4");
+    let largest = largest.load(std::sync::atomic::Ordering::Acquire);
+    assert!(largest < document * 3 / 2, "an answer of {largest} bytes for documents of {document}");
+}
+
 /// An embedding server that never answers; each request but the warm-up's
 /// is told on the returned channel.
 #[cfg(unix)]

@@ -9,7 +9,7 @@ use crate::{
     execution::{BindType, Dir, Kind, MAX_RESULT_COLS, execution_spec},
     numbers::{number_from_text, number_json, valid_number_input},
     sql::{SafeError, safe, wasted},
-    text::{TRUNC_MARK, clip_marked, clip_utf16, name_key, target_db_names},
+    text::{TRUNC_MARK, clip_marked, clip_utf16, name_key, target_db_names, utf16_len},
 };
 use anyhow::{Result, bail};
 use oracle::sql_type::OracleType;
@@ -218,7 +218,16 @@ impl Oracle {
         let slot = connection.clone();
         let stopped = cancel.clone();
         let work = tokio::task::spawn_blocking(move || -> Result<Vec<Map<String, Value>>> {
-            let conn = Arc::new(pool.get()?);
+            let mut conn = pool.get()?;
+            // A LOB cell's start comes with its row, all of a LOB that fits
+            // a cell (`lob_start`): read as locators alone, each cell took a
+            // round trip of its own (1,000 short CLOBs: 7 ms as values,
+            // 200 ms so, on a local server; 10 ms with it). Its buffers count
+            // in what the session keeps (`FETCH_ROWS`). Set on the session,
+            // it holds for the cursors its routines open too; a client
+            // without it only reads slower.
+            let _ = conn.set_oci_attr::<oracle::oci_attr::DefaultLobPrefetchSize>(&LOB_PREFETCH_CHARS);
+            let conn = Arc::new(conn);
             *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(conn.clone());
             // Stopped while it waited for a session (all in use, a new one
             // being made), there was nothing to break: the statement then ran
@@ -476,8 +485,9 @@ fn execute(
     if spec.kind == Kind::Query {
         let mut stmt = conn
             .statement(&spec.sql)
-            .fetch_array_size((MAX_ROWS + 1) as u32)
+            .fetch_array_size(FETCH_ROWS)
             .prefetch_rows((MAX_ROWS + 2) as u32)
+            .lob_locator()
             .build()?;
         let args: Vec<(String, BindArg)> = inputs
             .iter()
@@ -488,7 +498,8 @@ fn execute(
         let rows = stmt.query_named(&named)?;
         return collect(rows);
     }
-    let mut stmt = conn.statement(&spec.sql).build()?;
+    // A REF CURSOR's rows are read as the statement's (`lob_locator`).
+    let mut stmt = conn.statement(&spec.sql).lob_locator().build()?;
     let mut held: Vec<String> = vec![];
     for b in &spec.bindings {
         let input = (b.dir != Dir::Out).then(|| {
@@ -664,7 +675,29 @@ fn cell(row: &oracle::Row, i: usize, ty: &OracleType) -> Value {
             Ok(None) => Value::Null,
             Err(_) => text(row),
         },
-        OracleType::BLOB | OracleType::Raw(_) | OracleType::LongRaw => {
+        // LOB cells as locators (`lob_locator`): read up to the cell's
+        // limit, a BLOB only measured. Fetched as values, a LOB was read
+        // whole, the fetch's every row at once — 200 rows of a 1 MB CLOB
+        // were 206 MiB, to keep 4,000 characters of each.
+        OracleType::CLOB => match row.get::<usize, Option<oracle::sql_type::Clob>>(i) {
+            Ok(Some(lob)) => lob_cell(lob_start(lob), ty),
+            Ok(None) => Value::Null,
+            Err(_) => text(row),
+        },
+        OracleType::NCLOB => match row.get::<usize, Option<oracle::sql_type::Nclob>>(i) {
+            Ok(Some(lob)) => lob_cell(lob_start(lob), ty),
+            Ok(None) => Value::Null,
+            Err(_) => text(row),
+        },
+        OracleType::BLOB => match row.get::<usize, Option<oracle::sql_type::Blob>>(i) {
+            Ok(Some(lob)) => match oracle::sql_type::Lob::size(&lob) {
+                Ok(size) => json!(format!("<binary {size} bytes>")),
+                Err(_) => json!("<binary>"),
+            },
+            Ok(None) => Value::Null,
+            Err(_) => json!("<binary>"),
+        },
+        OracleType::Raw(_) | OracleType::LongRaw => {
             match row.get::<usize, Option<Vec<u8>>>(i) {
                 Ok(Some(bytes)) => json!(format!("<binary {} bytes>", bytes.len())),
                 Ok(None) => Value::Null,
@@ -673,6 +706,56 @@ fn cell(row: &oracle::Row, i: usize, ty: &OracleType) -> Value {
         }
         OracleType::BFILE | OracleType::Object(_) => json!(format!("<{ty} 값 — 지원하지 않는 컬럼 타입>")),
         _ => text(row),
+    }
+}
+
+/// Rows a fetch takes. All of a result's come in its first round trip
+/// (`prefetch_rows`) unless it has LOB columns, which are fetched a fetch's
+/// rows at a time — and the session keeps buffers for each LOB column as
+/// large as a fetch's rows take (about 18 KiB a row with its prefetched
+/// start), until it closes idle: 1,001 rows a fetch were 16 MiB a column
+/// for even a one-row result (11 CLOB columns: 87 MiB), times each pooled
+/// session. A thousand rows of a LOB, beyond what a result shows the model
+/// anyway, so take nine more round trips.
+const FETCH_ROWS: u32 = 100;
+
+/// Characters of each LOB cell sent with its row: more than a cell keeps.
+const LOB_PREFETCH_CHARS: u32 = MAX_CELL_LEN as u32 + 1;
+
+/// A CLOB's first MAX_CELL_LEN characters, marked cut by its length: both
+/// come with the row (`LOB_PREFETCH_CHARS`), so a cell takes no round trip.
+/// A read stops at what came with the row, one less where that cuts a
+/// surrogate pair, and Oracle refuses a read that ends inside one
+/// (ORA-22831): the one past it reads on only a start that falls short of
+/// the cell. An empty LOB is null, as it was read as a value.
+fn lob_start<L: std::io::Read + oracle::sql_type::Lob>(mut lob: L) -> Result<Option<String>> {
+    // UTF-16 units, as Oracle counts a CLOB's characters.
+    let size = usize::try_from(lob.size()?).unwrap_or(usize::MAX);
+    if size == 0 {
+        return Ok(None);
+    }
+    let wanted = size.min(MAX_CELL_LEN);
+    let mut text = String::new();
+    let mut buffer = vec![0u8; (MAX_CELL_LEN + 1) * 4];
+    while utf16_len(&text) < wanted {
+        let read = lob.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        text.push_str(std::str::from_utf8(&buffer[..read])?);
+    }
+    Ok(Some(if size > MAX_CELL_LEN || utf16_len(&text) > MAX_CELL_LEN {
+        format!("{}{TRUNC_MARK}", clip_utf16(&text, MAX_CELL_LEN))
+    } else {
+        text
+    }))
+}
+
+fn lob_cell(start: Result<Option<String>>, ty: &OracleType) -> Value {
+    match start {
+        Ok(Some(text)) => json!(text),
+        Ok(None) => Value::Null,
+        Err(e) => json!(format!("<{ty} 값 — 읽을 수 없음: {e}>")),
     }
 }
 

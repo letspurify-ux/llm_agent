@@ -162,78 +162,80 @@ async fn rebuild_chunks(db: &Db, config: &Config, stop: &CancellationToken, out:
         })
         .map(|d| db::int(d, "seq"))
         .collect();
-    for seqs in stale.chunks(IN_CHUNK) {
+    // One document read at a time: a document's content has no size limit
+    // (LONGTEXT), and read a thousand at once, the sync held every one of
+    // them, twice over, while it split the first (40 documents of 11 MiB:
+    // 0.9 GiB at its peak).
+    for seq in stale {
         if stop.is_cancelled() {
-            break;
+            return Ok(());
         }
-        let mut params = vec![p(CHUNK_RULE)];
-        params.extend(seqs.iter().map(|s| n(*s)));
-        let rows = db
+        let Some(mut row) = db
             .query(
                 cfg,
-                &format!("SELECT seq, title, content, {DOC_HASH_EXPR} AS h FROM knowledge WHERE seq IN ({})", marks(seqs.len())),
-                params,
+                &format!("SELECT title, content, {DOC_HASH_EXPR} AS h FROM knowledge WHERE seq = ?"),
+                vec![p(CHUNK_RULE), n(seq)],
             )
-            .await?;
-        for row in rows {
-            if stop.is_cancelled() {
-                return Ok(());
-            }
-            let seq = db::int(&row, "seq");
-            let parts = split_content(&db::text(&row, "content"));
-            let mut conn = db.conn(cfg).await?;
-            let result: Result<Option<u64>> = async {
-                plain_on(cfg, &mut conn, "START TRANSACTION").await?;
-                for (i, content) in parts.iter().enumerate() {
-                    if stop.is_cancelled() {
-                        return Ok(None);
-                    }
-                    exec_on(
-                        cfg,
-                        &mut conn,
-                        "INSERT INTO knowledge_chunk (doc_seq, chunk_no, chunk_of, doc_hash, title, content)
-                         VALUES (?, ?, ?, ?, ?, ?)
-                         ON DUPLICATE KEY UPDATE chunk_of = VALUES(chunk_of), doc_hash = VALUES(doc_hash),
-                                                 title = VALUES(title), content = VALUES(content)",
-                        vec![
-                            n(seq),
-                            n(i as i64 + 1),
-                            n(parts.len() as i64),
-                            p(db::text(&row, "h")),
-                            p(db::text(&row, "title")),
-                            p(content.clone()),
-                        ],
-                    )
-                    .await?;
-                }
-                let (dropped, _) = exec_on(
-                    cfg,
-                    &mut conn,
-                    "DELETE FROM knowledge_chunk WHERE doc_seq = ? AND chunk_no > ?",
-                    vec![n(seq), n(parts.len() as i64)],
-                )
-                .await?;
+            .await?
+            .pop()
+        else {
+            // Deleted meanwhile: its chunks went with it.
+            continue;
+        };
+        let parts = split_content(&db::text(&row, "content"));
+        row.remove("content");
+        let mut conn = db.conn(cfg).await?;
+        let result: Result<Option<u64>> = async {
+            plain_on(cfg, &mut conn, "START TRANSACTION").await?;
+            for (i, content) in parts.iter().enumerate() {
                 if stop.is_cancelled() {
                     return Ok(None);
                 }
-                plain_on(cfg, &mut conn, "COMMIT").await?;
-                Ok(Some(dropped))
+                exec_on(
+                    cfg,
+                    &mut conn,
+                    "INSERT INTO knowledge_chunk (doc_seq, chunk_no, chunk_of, doc_hash, title, content)
+                     VALUES (?, ?, ?, ?, ?, ?)
+                     ON DUPLICATE KEY UPDATE chunk_of = VALUES(chunk_of), doc_hash = VALUES(doc_hash),
+                                             title = VALUES(title), content = VALUES(content)",
+                    vec![
+                        n(seq),
+                        n(i as i64 + 1),
+                        n(parts.len() as i64),
+                        p(db::text(&row, "h")),
+                        p(db::text(&row, "title")),
+                        p(content.clone()),
+                    ],
+                )
+                .await?;
             }
-            .await;
-            match result {
-                Ok(Some(dropped)) => {
-                    out.chunks += parts.len();
-                    out.chunks_dropped += dropped;
-                }
-                Ok(None) => {
-                    let _ = plain_on(cfg, &mut conn, "ROLLBACK").await;
-                    return Ok(());
-                }
-                Err(e) => {
-                    let _ = plain_on(cfg, &mut conn, "ROLLBACK").await;
-                    out.chunks_failed += 1;
-                    eprintln!("[embed] knowledge#{seq} chunking failed — skipping this document only: {e}");
-                }
+            let (dropped, _) = exec_on(
+                cfg,
+                &mut conn,
+                "DELETE FROM knowledge_chunk WHERE doc_seq = ? AND chunk_no > ?",
+                vec![n(seq), n(parts.len() as i64)],
+            )
+            .await?;
+            if stop.is_cancelled() {
+                return Ok(None);
+            }
+            plain_on(cfg, &mut conn, "COMMIT").await?;
+            Ok(Some(dropped))
+        }
+        .await;
+        match result {
+            Ok(Some(dropped)) => {
+                out.chunks += parts.len();
+                out.chunks_dropped += dropped;
+            }
+            Ok(None) => {
+                let _ = plain_on(cfg, &mut conn, "ROLLBACK").await;
+                return Ok(());
+            }
+            Err(e) => {
+                let _ = plain_on(cfg, &mut conn, "ROLLBACK").await;
+                out.chunks_failed += 1;
+                eprintln!("[embed] knowledge#{seq} chunking failed — skipping this document only: {e}");
             }
         }
     }
@@ -294,7 +296,10 @@ async fn sync(db: &Db, config: &Config, stop: &CancellationToken) -> Result<Summ
                 .await?;
             out.deleted += deleted;
         }
-        for seqs in stale.chunks(IN_CHUNK) {
+        // Read as many rows as one embedding call takes: a thousand rows of
+        // three TEXT columns each were up to 190 MiB read at once, for
+        // texts cut to MAX_EMBED_TEXT_LEN.
+        for seqs in stale.chunks(BATCH) {
             if stop.is_cancelled() {
                 out.skipped = Skipped::Stopped;
                 break;
