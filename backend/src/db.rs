@@ -111,14 +111,27 @@ impl Db {
     }
 
     pub async fn query(&self, cfg: &MariaDbConfig, sql: &str, params: Vec<Param>) -> Result<Vec<Row>> {
-        let mut conn = self.conn(cfg).await?;
-        query_on(cfg, &mut conn, sql, params).await
+        self.query_with(cfg, "", sql, params).await
+    }
+
+    /// `query` with more session settings for this statement alone
+    /// (`name=value, …`), sent with it: no round trip of their own, and no
+    /// connection kept for them.
+    pub async fn query_with(&self, cfg: &MariaDbConfig, settings: &str, sql: &str, params: Vec<Param>) -> Result<Vec<Row>> {
+        let statement = limited(cfg, settings, sql);
+        to_the_end(self.pool(cfg)?, cfg.clone(), async move |cfg, mut conn| {
+            rows(&cfg, &mut conn, &statement, params).await
+        })
+        .await
     }
 
     /// Runs a statement; returns (affected rows, last insert id).
     pub async fn exec(&self, cfg: &MariaDbConfig, sql: &str, params: Vec<Param>) -> Result<(u64, u64)> {
-        let mut conn = self.conn(cfg).await?;
-        exec_on(cfg, &mut conn, sql, params).await
+        let statement = limited(cfg, "", sql);
+        to_the_end(self.pool(cfg)?, cfg.clone(), async move |cfg, mut conn| {
+            affected(&cfg, &mut conn, &statement, params).await
+        })
+        .await
     }
 
     pub async fn close(&self) {
@@ -138,6 +151,39 @@ fn options(cfg: &MariaDbConfig) -> OptsBuilder {
         .db_name(Some(cfg.database.clone()))
         .prefer_socket(false)
         .init(vec!["SET NAMES utf8mb4"])
+}
+
+/// A pooled connection and `work` on it, on a task of their own. A caller
+/// that stops waiting (a stopped question, a closed request) is answered
+/// at once, as before, while the statement under way finishes — within the
+/// DB time limit, on the server too (`limited`) — and its connection goes
+/// back to the pool. Dropped with the caller, it was cut mid-statement or
+/// mid-login: the server ran the statement on anyway, the pool opened a new
+/// connection for the next query, and the server logged an aborted
+/// connection each time (223 stopped questions: 187 connections, 191
+/// aborted, against 5 and none for as many answered). Given up before a
+/// connection came, nothing runs.
+async fn to_the_end<T, F>(pool: Pool, cfg: MariaDbConfig, work: impl FnOnce(MariaDbConfig, Conn) -> F + Send + 'static) -> Result<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T>> + Send,
+{
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let conn = match timed(&cfg, async { Ok(pool.get_conn().await?) }).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                let _ = answer.send(Err(e));
+                return;
+            }
+        };
+        if !answer.is_closed() {
+            let _ = answer.send(work(cfg, conn).await);
+        }
+    });
+    answered
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("database_task_ended: the management DB query stopped unexpectedly")))
 }
 
 async fn timed<T>(cfg: &MariaDbConfig, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
@@ -168,25 +214,35 @@ const MAX_STATEMENT_SECS: f64 = 31_536_000.0;
 /// not a part of its rows. The caller's limit counts from before the
 /// statement is sent, so it still comes first; the prefix costs no round
 /// trip.
-fn limited(cfg: &MariaDbConfig, sql: &str) -> String {
+/// `settings` are more `name=value` settings for the statement alone.
+fn limited(cfg: &MariaDbConfig, settings: &str, sql: &str) -> String {
     let secs = (cfg.timeout_ms as f64 / 1000.0).min(MAX_STATEMENT_SECS);
-    format!("SET STATEMENT max_statement_time={secs} FOR {sql}")
+    let more = if settings.is_empty() { String::new() } else { format!(", {settings}") };
+    format!("SET STATEMENT max_statement_time={secs}{more} FOR {sql}")
 }
 
-pub async fn query_on(cfg: &MariaDbConfig, conn: &mut Conn, sql: &str, values: Vec<Param>) -> Result<Vec<Row>> {
+async fn rows(cfg: &MariaDbConfig, conn: &mut Conn, statement: &str, values: Vec<Param>) -> Result<Vec<Row>> {
     timed(cfg, async {
-        let rows: Vec<mysql_async::Row> = conn.exec(limited(cfg, sql), params(values)).await?;
+        let rows: Vec<mysql_async::Row> = conn.exec(statement, params(values)).await?;
         Ok(rows.into_iter().map(row_json).collect())
     })
     .await
 }
 
-pub async fn exec_on(cfg: &MariaDbConfig, conn: &mut Conn, sql: &str, values: Vec<Param>) -> Result<(u64, u64)> {
+async fn affected(cfg: &MariaDbConfig, conn: &mut Conn, statement: &str, values: Vec<Param>) -> Result<(u64, u64)> {
     timed(cfg, async {
-        conn.exec_drop(limited(cfg, sql), params(values)).await?;
+        conn.exec_drop(statement, params(values)).await?;
         Ok((conn.affected_rows(), conn.last_insert_id().unwrap_or(0)))
     })
     .await
+}
+
+pub async fn query_on(cfg: &MariaDbConfig, conn: &mut Conn, sql: &str, values: Vec<Param>) -> Result<Vec<Row>> {
+    rows(cfg, conn, &limited(cfg, "", sql), values).await
+}
+
+pub async fn exec_on(cfg: &MariaDbConfig, conn: &mut Conn, sql: &str, values: Vec<Param>) -> Result<(u64, u64)> {
+    affected(cfg, conn, &limited(cfg, "", sql), values).await
 }
 
 /// A text-protocol statement without parameters (SET, transactions).

@@ -6,7 +6,7 @@
 
 use crate::{
     config::{Config, EMBEDDING_DIMENSIONS, MariaDbConfig},
-    db::{self, Db, Param, Row, n, p, plain_on, query_on},
+    db::{self, Db, Param, Row, n, p},
     embedding::vector_text,
 };
 use anyhow::Result;
@@ -81,12 +81,12 @@ async fn nearest(db: &Db, config: &Config, table: &str, vector: &[f32], limit: u
     let current = hash_expr(&columns(table).iter().map(|c| format!("t.{c}")).collect::<Vec<_>>());
     let encoded = vector_text(vector);
     let model = config.embedding.model.clone();
-    let mut conn = db.conn(cfg).await?;
-    plain_on(cfg, &mut conn, &format!("SET SESSION mhnsw_ef_search = {}", config.embedding.ef_search)).await?;
+    // With each statement rather than on a connection kept for both.
+    let settings = format!("mhnsw_ef_search={}", config.embedding.ef_search);
     let vec = vec_table(table);
-    let candidates = query_on(
+    let candidates = db.query_with(
         cfg,
-        &mut conn,
+        &settings,
         &format!(
             "SELECT t.*, v._dist,
                (t.seq IS NULL OR v.embed_hash <> {current}) AS _stale,
@@ -113,9 +113,9 @@ async fn nearest(db: &Db, config: &Config, table: &str, vector: &[f32], limit: u
     if valid.len() == total {
         return Ok(valid);
     }
-    let refill = query_on(
+    let refill = db.query_with(
         cfg,
-        &mut conn,
+        &settings,
         &format!(
             "SELECT t.*, VEC_DISTANCE_COSINE(v.embedding, VEC_FromText(?)) AS _dist
              FROM {vec} v IGNORE INDEX (embedding) JOIN {table} t ON t.seq = v.seq

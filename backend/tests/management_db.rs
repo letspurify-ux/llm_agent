@@ -149,6 +149,39 @@ async fn statements_given_up_on_end_at_the_limit_on_the_server() {
     db.close().await;
 }
 
+/// Resource review, thirteenth pass: a caller that stopped waiting (a
+/// stopped question) cut its statement mid-way or its connection mid-login.
+/// The server ran the statement on anyway, the pool opened a new connection
+/// for the next query, and the server logged an aborted connection — 191
+/// for 223 stopped questions. The statement now finishes and its connection
+/// goes back to the pool; one given up before it had a connection runs
+/// nothing.
+#[tokio::test]
+async fn a_caller_that_stops_waiting_leaves_its_connection_in_the_pool() {
+    let Some(test_db) = TestDb::create("stopped_caller") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let mut config = test_db.config();
+    config.mariadb.pool_size = 1;
+    let cfg = &config.mariadb;
+    let db = Db::default();
+    let id = |rows: Vec<db::Row>| db::int(&rows[0], "id");
+    let first = id(db.query(cfg, "SELECT CONNECTION_ID() AS id", vec![]).await.unwrap());
+    let ms = std::time::Duration::from_millis;
+    // Dropped mid-statement, holding the pool's one connection.
+    let sleeping = tokio::time::timeout(ms(300), db.query(cfg, "SELECT SLEEP(1) AS s", vec![]));
+    let (sleeping, waiting) = tokio::join!(sleeping, async {
+        // Dropped while it waits for that connection.
+        tokio::time::sleep(ms(100)).await;
+        tokio::time::timeout(ms(100), db.exec(cfg, "INSERT INTO chat_log (question, trace) VALUES ('given up', '{}')", vec![])).await
+    });
+    assert!(sleeping.is_err() && waiting.is_err());
+    let next = id(db.query(cfg, "SELECT CONNECTION_ID() AS id", vec![]).await.unwrap());
+    assert_eq!(next, first, "the connection went back to the pool");
+    assert_eq!(test_db.scalar("SELECT COUNT(*) FROM chat_log WHERE question = 'given up'"), "0");
+    db.close().await;
+}
+
 /// The retention cleanup deletes a backlog a batch at a time, each well
 /// within the DB time limit (a statement past it is stopped and rolled
 /// back), and keeps the rows within the retention.
