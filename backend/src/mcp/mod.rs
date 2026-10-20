@@ -21,7 +21,7 @@ use rmcp::{
     },
     service::{NotificationContext, PeerRequestOptions, RoleClient, RxJsonRpcMessage, TxJsonRpcMessage},
     transport::{
-        StreamableHttpClientTransport, Transport, async_rw::AsyncRwTransport,
+        StreamableHttpClientTransport, Transport,
         streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
@@ -2019,8 +2019,14 @@ fn spawn(slot: &Arc<Slot>, server: &McpServer) -> Result<ChildTransport> {
     if let Some(stderr) = child.stderr().take() {
         tokio::spawn(read_output(Arc::downgrade(slot), stderr, output.clone()));
     }
-    let lines = LineLimit { inner: stdout, line: vec![], out: vec![], out_at: 0, ended: false, slot: Arc::downgrade(slot) };
-    Ok(ChildTransport { inner: AsyncRwTransport::new_client(lines, stdin), child: Some(child), output, slot: Arc::downgrade(slot), exited: None })
+    Ok(ChildTransport {
+        lines: LineLimit::new(stdout, Arc::downgrade(slot)),
+        input: Arc::new(tokio::sync::Mutex::new(Some(stdin))),
+        child: Some(child),
+        output,
+        slot: Arc::downgrade(slot),
+        exited: None,
+    })
 }
 
 /// Descriptors below this are looked at in a starting server (a soft limit
@@ -2063,7 +2069,9 @@ fn own_descriptors_only(command: &mut tokio::process::Command) {
 /// A stdio server's connection: its output read a line at most
 /// `MAX_LINE_BYTES` long, and its process ended with the connection.
 struct ChildTransport {
-    inner: AsyncRwTransport<RoleClient, LineLimit<tokio::process::ChildStdout>, tokio::process::ChildStdin>,
+    lines: LineLimit<tokio::process::ChildStdout>,
+    /// The server's input, a message a line; None once closed.
+    input: Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>,
     child: Option<Box<dyn process_wrap::tokio::ChildWrapper>>,
     /// Ends the reading of its stderr (`read_output`), once the process is.
     output: CancellationToken,
@@ -2101,7 +2109,7 @@ impl Transport<RoleClient> for ChildTransport {
     type Error = std::io::Error;
 
     fn send(&mut self, item: TxJsonRpcMessage<RoleClient>) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
-        self.inner.send(item)
+        write_message(self.input.clone(), item)
     }
 
     /// The next message, the server's process watched meanwhile: its end
@@ -2110,17 +2118,17 @@ impl Transport<RoleClient> for ChildTransport {
         loop {
             match (self.exited, self.child.as_mut()) {
                 (None, Some(child)) => tokio::select! {
-                    message = self.inner.receive() => return message,
+                    message = next_message(&mut self.lines, &self.input) => return message,
                     _ = ended(child) => self.exited = Some(Some(tokio::time::Instant::now())),
                 },
                 (Some(Some(at)), _) => tokio::select! {
-                    message = self.inner.receive() => return message,
+                    message = next_message(&mut self.lines, &self.input) => return message,
                     _ = tokio::time::sleep_until(at + OUTPUT_DRAIN) => {
                         self.exited = Some(None);
                         self.ended_with_output_open();
                     }
                 },
-                _ => return self.inner.receive().await,
+                _ => return next_message(&mut self.lines, &self.input).await,
             }
         }
     }
@@ -2131,7 +2139,7 @@ impl Transport<RoleClient> for ChildTransport {
         // stopped reading never finishes: it gets a second. (Unix kills the
         // process group after `CLOSE_SECS` anyway; on Windows only this kill
         // ends the job before the backend exits.)
-        let _ = tokio::time::timeout(Duration::from_secs(1), self.inner.close()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), async { self.input.lock().await.take() }).await;
         if let Some(child) = self.child.take() {
             end_process(child).await;
         }
@@ -2203,66 +2211,59 @@ impl Drop for ChildTransport {
     }
 }
 
-/// A server's output, passed on a whole line at a time: mended (see
-/// `wire`), and ending in an error once a line runs past `MAX_LINE_BYTES`
-/// (the SDK's reader would buffer it without end).
+/// A server's output, a whole line at a time: mended (see `wire`), and
+/// ending in an error once a line runs past `MAX_LINE_BYTES` (the SDK's
+/// reader would buffer it without end). Each line is its own buffer, let
+/// go of once read: the SDK's reader kept one the size of the longest line
+/// the server ever sent, 16 to 32 MiB a server after one large answer,
+/// for as long as it stayed connected.
 struct LineLimit<R> {
     inner: R,
     /// The line being read, up to its newline.
     line: Vec<u8>,
-    /// Whole lines not yet passed on, `out_at` bytes of them passed.
-    out: Vec<u8>,
-    out_at: usize,
+    /// Whole lines not yet read.
+    ready: VecDeque<Vec<u8>>,
     ended: bool,
     slot: Weak<Slot>,
 }
 
-impl<R> LineLimit<R> {
-    fn pass(&mut self, mut line: Vec<u8>) {
-        // Mended without its line end, which a message written anew lacks.
-        let body = line.len() - line.iter().rev().take_while(|&&b| b == b'\n' || b == b'\r').count();
-        if let Some(mended) = wire::mend(&line[..body]) {
-            let end = line.split_off(body);
-            line = mended;
-            line.extend_from_slice(&end);
-        }
-        if self.out.is_empty() {
-            self.out = line;
-        } else {
-            self.out.extend_from_slice(&line);
-        }
+impl<R: tokio::io::AsyncRead + Unpin> LineLimit<R> {
+    fn new(inner: R, slot: Weak<Slot>) -> Self {
+        Self { inner, line: vec![], ready: VecDeque::new(), ended: false, slot }
     }
-}
 
-impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LineLimit<R> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+    /// Mended without its line end.
+    fn pass(&mut self, mut line: Vec<u8>) {
+        let body = line.len() - line.iter().rev().take_while(|&&b| b == b'\n' || b == b'\r').count();
+        line.truncate(body);
+        if let Some(mended) = wire::mend(&line) {
+            line = mended;
+        }
+        self.ready.push_back(line);
+    }
+
+    /// The next line, without its end; None once the output has ended.
+    /// Given up while it waits (the transport's `receive` is raced), it
+    /// loses nothing: what was read is kept here.
+    async fn next(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        use tokio::io::AsyncReadExt;
         loop {
-            if self.out_at < self.out.len() {
-                let n = buf.remaining().min(self.out.len() - self.out_at);
-                buf.put_slice(&self.out[self.out_at..self.out_at + n]);
-                self.out_at += n;
-                if self.out_at == self.out.len() {
-                    self.out.clear();
-                    self.out_at = 0;
-                }
-                return std::task::Poll::Ready(Ok(()));
+            if let Some(line) = self.ready.pop_front() {
+                return Ok(Some(line));
             }
             if self.ended {
-                return std::task::Poll::Ready(Ok(()));
+                return Ok(None);
             }
             let mut chunk = [0u8; 16 * 1024];
-            let mut read = tokio::io::ReadBuf::new(&mut chunk);
-            std::task::ready!(Pin::new(&mut self.inner).poll_read(cx, &mut read))?;
-            let data = read.filled();
+            let read = self.inner.read(&mut chunk).await?;
+            let data = &chunk[..read];
             if data.is_empty() {
                 // The output ended: a last line without a newline goes as it is.
                 self.ended = true;
                 let line = std::mem::take(&mut self.line);
-                self.pass(line);
+                if !line.is_empty() {
+                    self.pass(line);
+                }
                 continue;
             }
             let mut start = 0;
@@ -2277,10 +2278,125 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LineLimit<R> {
                 if let Some(slot) = self.slot.upgrade() {
                     slot.log("event", &format!("서버가 {} MiB를 넘는 한 줄을 보내 연결을 끊었습니다", MAX_LINE_BYTES / 1024 / 1024));
                 }
-                return std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "line too long")));
+                self.line = vec![];
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "line too long"));
             }
         }
     }
+}
+
+/// The server's next message, as the SDK's stdio transport reads it. Given
+/// up while it waits, it loses nothing (`LineLimit::next`).
+async fn next_message(
+    lines: &mut LineLimit<tokio::process::ChildStdout>,
+    input: &Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>,
+) -> Option<RxJsonRpcMessage<RoleClient>> {
+    loop {
+        match read_line(&lines.next().await.ok()??) {
+            Line::Message(message) => return Some(*message),
+            Line::Skipped => {}
+            // Answered only while nothing else is being written: a server
+            // not reading its input would otherwise gather an answer a line.
+            Line::Invalid => {
+                if let Ok(writing) = input.clone().try_lock_owned() {
+                    let error = rmcp::model::ErrorData::invalid_request("Invalid request", None);
+                    tokio::spawn(write_line(writing, TxJsonRpcMessage::<RoleClient>::error(error, None)));
+                }
+            }
+        }
+    }
+}
+
+/// A message to the server, a line written whole from a buffer of its own:
+/// one kept for the next message would stay the size of the largest sent.
+async fn write_message(input: Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>, item: TxJsonRpcMessage<RoleClient>) -> std::io::Result<()> {
+    write_line(input.lock_owned().await, item).await
+}
+
+async fn write_line(
+    mut input: tokio::sync::OwnedMutexGuard<Option<tokio::process::ChildStdin>>,
+    item: TxJsonRpcMessage<RoleClient>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut line = serde_json::to_vec(&item)?;
+    line.push(b'\n');
+    let Some(input) = input.as_mut() else {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "Transport is closed"));
+    };
+    input.write_all(&line).await?;
+    input.flush().await
+}
+
+/// What a line of a server's output is, read as the SDK's stdio transport
+/// reads it.
+enum Line {
+    Message(Box<RxJsonRpcMessage<RoleClient>>),
+    /// Nothing to answer: an empty line, one that is not JSON (answering
+    /// it could start an exchange of errors with a server that echoes), a
+    /// notification outside the protocol (a language server's).
+    Skipped,
+    /// JSON but no message: answered as an invalid request.
+    Invalid,
+}
+
+fn read_line(line: &[u8]) -> Line {
+    let line = line.strip_prefix(b"\xEF\xBB\xBF".as_slice()).unwrap_or(line);
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return Line::Skipped;
+    }
+    let error = match serde_json::from_slice(line) {
+        Ok(message) => return Line::Message(Box::new(message)),
+        Err(error) => error,
+    };
+    if let Ok(value) = serde_json::from_slice::<Value>(line)
+        && let Some(method) = value.get("method").and_then(Value::as_str)
+        && ignored_notification(&value, method)
+    {
+        return Line::Skipped;
+    }
+    match error.classify() {
+        serde_json::error::Category::Syntax | serde_json::error::Category::Eof => Line::Skipped,
+        serde_json::error::Category::Data | serde_json::error::Category::Io => Line::Invalid,
+    }
+}
+
+/// A notification the SDK passes over: one without an id and outside the
+/// protocol's methods, or under `notifications/` but not one of its own.
+fn ignored_notification(value: &Value, method: &str) -> bool {
+    const NOTIFICATIONS: &[&str] = &[
+        "notifications/cancelled",
+        "notifications/initialized",
+        "notifications/message",
+        "notifications/progress",
+        "notifications/prompts/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/resources/updated",
+        "notifications/roots/list_changed",
+        "notifications/subscriptions/acknowledged",
+        "notifications/tools/list_changed",
+    ];
+    const METHODS: &[&str] = &[
+        "initialize",
+        "ping",
+        "server/discover",
+        "prompts/get",
+        "prompts/list",
+        "resources/list",
+        "resources/read",
+        "resources/subscribe",
+        "resources/unsubscribe",
+        "resources/templates/list",
+        "subscriptions/listen",
+        "tools/call",
+        "tools/list",
+        "completion/complete",
+        "elicitation/create",
+        "logging/setLevel",
+        "roots/list",
+        "sampling/createMessage",
+    ];
+    let standard = NOTIFICATIONS.contains(&method);
+    (value.get("id").is_none() && !standard && !METHODS.contains(&method)) || (method.starts_with("notifications/") && !standard)
 }
 
 /// Drains the server's stderr into its log (a full pipe would stop the
@@ -2470,6 +2586,31 @@ mod tests {
 
     fn server(name: &str) -> McpServer {
         McpServer { name: name.into(), command: "node".into(), ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn server_output_is_read_a_line_at_a_time_and_kept_no_longer() {
+        let output: &[u8] = b"a\r\n\xEF\xBB\xBF{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"x\":\"\\ud800\"}}\nlast";
+        let mut lines = LineLimit::new(output, Weak::new());
+        let mut read = vec![];
+        while let Some(line) = lines.next().await.unwrap() {
+            read.push(String::from_utf8(line).unwrap());
+        }
+        assert_eq!(read, ["a", "\u{feff}{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}", "", "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"x\":\"\\ufffd\"}}", "last"]);
+        assert!(matches!(read_line(read[1].as_bytes()), Line::Message(_)));
+        assert!(matches!(read_line(read[3].as_bytes()), Line::Message(_)));
+        for skipped in ["", " \r", "a", "{\"jsonrpc\":\"2.0\",\"method\":\"$/progress\",\"params\":5}", "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/other\",\"params\":5}"] {
+            assert!(matches!(read_line(skipped.as_bytes()), Line::Skipped), "{skipped:?}");
+        }
+        assert!(matches!(read_line(b"{\"jsonrpc\":\"2.0\",\"method\":\"$/progress\",\"params\":{}}"), Line::Message(_)));
+        for invalid in ["{\"foo\":1}", "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":5}"] {
+            assert!(matches!(read_line(invalid.as_bytes()), Line::Invalid), "{invalid:?}");
+        }
+
+        let long = vec![b'x'; MAX_LINE_BYTES + 1];
+        let mut lines = LineLimit::new(long.as_slice(), Weak::new());
+        assert_eq!(lines.next().await.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(lines.line.capacity(), 0);
     }
 
     #[test]

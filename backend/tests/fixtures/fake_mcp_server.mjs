@@ -79,8 +79,9 @@ let initializations = 0;
 let deployed = false;
 let listings = 0;
 // FAKE_MCP_GET: the event stream a client opens with GET breaks as it opens
-// ("break": the connection cut after its headers) or ends at once asking to
-// be opened again without a wait ("retry0"). GET /counts tells how many
+// ("break": the connection cut after its headers), ends at once asking to
+// be opened again without a wait ("retry0"), or sends a log message of 12 MB
+// and stays open ("big"). GET /counts tells how many
 // streams were opened and sessions initialized.
 let streams = 0;
 if (env.FAKE_MCP_FORGET) tools.push({ name: 'forget', description: 'Forget the session, as a restarted server.', inputSchema: { type: 'object' } });
@@ -278,6 +279,7 @@ if (httpMode) {
       streams += 1;
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
       if (env.FAKE_MCP_GET === 'retry0') res.end('retry: 0\n\n');
+      else if (env.FAKE_MCP_GET === 'big') res.write(`event: message\ndata: ${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/message', params: { level: 'info', data: 'b'.repeat(12_000_000) } })}\n\n`);
       else { res.flushHeaders(); setImmediate(() => res.socket.destroy()); }
       return;
     }
