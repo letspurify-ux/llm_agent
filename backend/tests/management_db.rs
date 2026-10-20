@@ -110,3 +110,61 @@ async fn queries_under_settings_changed_meanwhile_all_run() {
     assert_eq!(open, 0, "connections left open after the pools closed");
     probe.close().await;
 }
+
+/// Resource review, twelfth pass: a statement given up on (past the DB time
+/// limit, or dropped with a stopped question) had its connection closed,
+/// but the server ran it on to its end, holding a thread, a connection and
+/// CPU — still running 16 s after a 1 s limit. It ends at the limit there
+/// too.
+#[tokio::test]
+async fn statements_given_up_on_end_at_the_limit_on_the_server() {
+    let Some(test_db) = TestDb::create("given_up") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let mut config = test_db.config();
+    config.mariadb.timeout_ms = 1000;
+    let cfg = &config.mariadb;
+    let db = Db::default();
+    // Work the server cannot cut short: a digest of every number up to 1e11.
+    let endless = |tag: &str| format!("SELECT COUNT(*) AS n FROM seq_1_to_100000000000 WHERE MD5(seq) = '{tag}'");
+    let running = |tag: &str| {
+        test_db.scalar(&format!(
+            "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE INFO LIKE '%{tag}%' AND ID <> CONNECTION_ID()"
+        ))
+    };
+    let error = db.query(cfg, &endless("past_the_limit"), vec![]).await.unwrap_err();
+    assert!(error.to_string().starts_with("database_timeout"), "{error}");
+    let dropped = tokio::time::timeout(std::time::Duration::from_millis(300), db.query(cfg, &endless("dropped_meanwhile"), vec![])).await;
+    assert!(dropped.is_err());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (past, dropped) = (running("past_the_limit"), running("dropped_meanwhile"));
+        if (past.as_str(), dropped.as_str()) == ("0", "0") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "still running on the server: {past} past the limit, {dropped} dropped");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(db.query(cfg, "SELECT 1 AS one", vec![]).await.unwrap()[0]["one"], 1);
+    db.close().await;
+}
+
+/// The retention cleanup deletes a backlog a batch at a time, each well
+/// within the DB time limit (a statement past it is stopped and rolled
+/// back), and keeps the rows within the retention.
+#[tokio::test]
+async fn the_chat_log_cleanup_clears_a_backlog_in_batches() {
+    let Some(test_db) = TestDb::create("cleanup") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    test_db.sql_in(
+        "INSERT INTO chat_log (question, trace, created_at) SELECT CONCAT('old ', seq), '{\"v\":5}', NOW() - INTERVAL 10 DAY FROM seq_1_to_2500;
+         INSERT INTO chat_log (question, trace) SELECT CONCAT('new ', seq), '{\"v\":5}' FROM seq_1_to_3;",
+    );
+    let config = test_db.config();
+    let db = Db::default();
+    assert_eq!(db::cleanup_chat_logs(&db, &config.mariadb, 3).await.unwrap(), 2500);
+    assert_eq!(test_db.scalar("SELECT GROUP_CONCAT(question ORDER BY seq) FROM chat_log"), "new 1,new 2,new 3");
+    assert_eq!(db::cleanup_chat_logs(&db, &config.mariadb, 3).await.unwrap(), 0);
+    db.close().await;
+}

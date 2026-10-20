@@ -238,11 +238,17 @@ impl Oracle {
                 eprintln!("[oracle] failed to fix the session date format — the DB default stays: {e}");
             }
             let result = execute(&conn, &spec, &inputs, read_only);
-            let mut drop_connection = false;
-            if spec.kind != Kind::Query && conn.rollback().is_err() {
+            // A routine that opened its REF CURSOR and then failed (raised,
+            // was stopped, ran past the call timeout) never handed the
+            // cursor over: the session keeps it open until it ends. Pooled,
+            // a session gathered one per failure until its statements failed
+            // with ORA-01000 (open_cursors, 300 by default), anyone's.
+            let mut drop_connection =
+                result.is_err() && spec.bindings.iter().any(|b| b.kind == BindType::Cursor);
+            if !drop_connection && spec.kind != Kind::Query && conn.rollback().is_err() {
                 drop_connection = true;
             }
-            if conn.execute(CLEAR_DBMS_OUTPUT, &[]).is_err() {
+            if !drop_connection && conn.execute(CLEAR_DBMS_OUTPUT, &[]).is_err() {
                 drop_connection = true;
             }
             *slot.lock().unwrap_or_else(|p| p.into_inner()) = None;

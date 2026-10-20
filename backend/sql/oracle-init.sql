@@ -105,7 +105,7 @@ CREATE OR REPLACE SYNONYM VOC_READER.ORDERS     FOR APP_USER.ORDERS;
 -- ===== 프로시저·함수 샘플 =====
 -- 에이전트의 루틴 실행 기능을 실제 Oracle에서 바로 확인할 수 있는 읽기 전용 예시.
 -- 프로시저는 주문 목록을 REF CURSOR로 반환하고, 함수는 고객별 주문 합계를 반환한다.
--- 두 루틴 모두 DML 없이 조회만 수행하며 VOC_READER에는 EXECUTE 권한만 추가한다.
+-- 모든 루틴은 DML 없이 조회만 수행하며 VOC_READER에는 EXECUTE 권한만 추가한다.
 
 CREATE OR REPLACE PROCEDURE APP_USER.GET_CUSTOMER_ORDERS(
   p_customer_id IN  VARCHAR2,
@@ -135,7 +135,31 @@ BEGIN
 END;
 /
 
-GRANT EXECUTE ON APP_USER.GET_CUSTOMER_ORDERS      TO VOC_READER;
-GRANT EXECUTE ON APP_USER.GET_CUSTOMER_ORDER_TOTAL TO VOC_READER;
+-- 커서를 연 뒤 없는 고객이면 오류를 내는 변형. 실패한 호출이 연 커서는 호출자에게
+-- 넘어가지 않아 세션이 끝날 때까지 열려 있다 — 앱이 그런 세션을 풀에 돌려놓지 않는지
+-- 확인하는 데 쓴다 (backend/tests/oracle_live.rs).
+CREATE OR REPLACE PROCEDURE APP_USER.GET_CUSTOMER_ORDERS_STRICT(
+  p_customer_id IN  VARCHAR2,
+  p_rows        OUT SYS_REFCURSOR
+) AUTHID DEFINER AS
+  v_found NUMBER;
+BEGIN
+  OPEN p_rows FOR
+    SELECT ORDER_ID, STATUS,
+           TO_CHAR(ORDER_DATE, 'YYYY-MM-DD') AS ORDER_DATE,
+           AMOUNT
+      FROM APP_USER.ORDERS
+     WHERE CUSTOMER_ID = p_customer_id
+     ORDER BY ORDER_DATE DESC;
+  SELECT COUNT(*) INTO v_found FROM APP_USER.CUSTOMERS WHERE CUSTOMER_ID = p_customer_id;
+  IF v_found = 0 THEN
+    RAISE_APPLICATION_ERROR(-20001, 'unknown customer: ' || p_customer_id);
+  END IF;
+END;
+/
+
+GRANT EXECUTE ON APP_USER.GET_CUSTOMER_ORDERS        TO VOC_READER;
+GRANT EXECUTE ON APP_USER.GET_CUSTOMER_ORDER_TOTAL   TO VOC_READER;
+GRANT EXECUTE ON APP_USER.GET_CUSTOMER_ORDERS_STRICT TO VOC_READER;
 
 EXIT

@@ -151,3 +151,52 @@ async fn a_run_stopped_while_waiting_for_a_session_runs_nothing() {
     let out = run(row("today_date").await, CancellationToken::new()).await.unwrap().0.unwrap();
     assert!(out[0]["TODAY"].is_string());
 }
+
+/// A routine that opened its REF CURSOR and then raised left the cursor open
+/// in its session (the caller never receives it), and the pool handed the
+/// session out again: one more open cursor per failure, until every
+/// statement on it failed with ORA-01000 (open_cursors, 300 by default),
+/// other questions' routines too. Such a session is closed instead; one
+/// whose routine succeeded, or whose plain query failed, goes on.
+#[tokio::test]
+async fn a_failed_cursor_routine_does_not_pool_its_session() {
+    if std::env::var("LLM_AGENT_TEST_ORACLE").ok().as_deref() != Some("1") {
+        return skip("LLM_AGENT_TEST_ORACLE is not set");
+    }
+    let Some(test_db) = TestDb::create("oracle_cursor") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    test_db.sql_in(
+        r#"INSERT INTO query_registry (query_name, query_type, bind_config, query_sql, target_db_name) VALUES
+         ('strict_orders', 'PROCEDURE', '{"customer_id":{"dir":"IN","type":"STRING"},"rows":{"dir":"OUT","type":"CURSOR"}}',
+          'BEGIN APP_USER.GET_CUSTOMER_ORDERS_STRICT(:customer_id, :rows); END;', 'ORDER_DB'),
+         ('session_probe', 'QUERY', NULL, 'SELECT SYS_CONTEXT(''USERENV'', ''SESSIONID'') AS SESSION_ID FROM DUAL', 'ORDER_DB'),
+         ('number_probe', 'QUERY', NULL, 'SELECT TO_NUMBER(:v) AS N FROM DUAL', 'ORDER_DB')"#,
+    );
+    let mut config = test_db.config();
+    config.oracle.mock = false;
+    config.oracle.client_lib_dir = std::env::var("ORACLE_CLIENT_LIB_DIR").unwrap_or_default();
+    let (app, _dir) = app(config, Scripted::new(vec![]));
+    let config = app.config();
+    let names = ["strict_orders", "session_probe", "number_probe"].map(str::to_owned);
+    let rows = db::queries_by_names(&app.db, &config.mariadb, &names).await.unwrap();
+    let registry = |name: &str| rows.iter().find(|r| db::text(r, "query_name") == name).unwrap().clone();
+    let run = |name: &str, p: Value| {
+        let (app, config, row) = (app.clone(), config.clone(), registry(name));
+        async move {
+            let never = |_: &str| false;
+            app.oracle.run(&app.db, &config, &row, &params(p), None, &never, &CancellationToken::new()).await
+        }
+    };
+    // Runs one after another take the pool's one session.
+    let session = || async { run("session_probe", json!({})).await.unwrap().rows[0]["SESSION_ID"].clone() };
+    let first = session().await;
+    let out = run("strict_orders", json!({"customer_id":"C-1001"})).await.unwrap();
+    assert!(out.rows[0].contains_key("ORDER_ID"), "{:?}", out.rows);
+    let error = run("number_probe", json!({"v":"x"})).await.unwrap_err();
+    assert!(error.to_string().contains("ORA-01722"), "{error}");
+    assert_eq!(session().await, first, "kept after a routine that succeeded and a query that failed");
+    let error = run("strict_orders", json!({"customer_id":"C-404"})).await.unwrap_err();
+    assert!(error.to_string().contains("ORA-20001"), "{error}");
+    assert_ne!(session().await, first, "closed after the routine failed with its cursor open");
+}

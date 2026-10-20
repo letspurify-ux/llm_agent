@@ -155,9 +155,27 @@ fn params(values: Vec<Param>) -> mysql_async::Params {
     }
 }
 
+/// Longest `max_statement_time` the server takes (a year, in seconds).
+const MAX_STATEMENT_SECS: f64 = 31_536_000.0;
+
+/// `sql` under the DB time limit on the server too. A statement its caller
+/// gave up on (past the limit, or dropped with a stopped question or a
+/// closed request) had its connection closed, but MariaDB notices that only
+/// when it sends the result, and ran it on to its end — a search over a
+/// large table for its whole length, holding a server thread, a connection
+/// and CPU, each retry after a time limit adding one more (still running
+/// 16 s after a 1 s limit, measured). It now ends at the limit: an error,
+/// not a part of its rows. The caller's limit counts from before the
+/// statement is sent, so it still comes first; the prefix costs no round
+/// trip.
+fn limited(cfg: &MariaDbConfig, sql: &str) -> String {
+    let secs = (cfg.timeout_ms as f64 / 1000.0).min(MAX_STATEMENT_SECS);
+    format!("SET STATEMENT max_statement_time={secs} FOR {sql}")
+}
+
 pub async fn query_on(cfg: &MariaDbConfig, conn: &mut Conn, sql: &str, values: Vec<Param>) -> Result<Vec<Row>> {
     timed(cfg, async {
-        let rows: Vec<mysql_async::Row> = conn.exec(sql, params(values)).await?;
+        let rows: Vec<mysql_async::Row> = conn.exec(limited(cfg, sql), params(values)).await?;
         Ok(rows.into_iter().map(row_json).collect())
     })
     .await
@@ -165,7 +183,7 @@ pub async fn query_on(cfg: &MariaDbConfig, conn: &mut Conn, sql: &str, values: V
 
 pub async fn exec_on(cfg: &MariaDbConfig, conn: &mut Conn, sql: &str, values: Vec<Param>) -> Result<(u64, u64)> {
     timed(cfg, async {
-        conn.exec_drop(sql, params(values)).await?;
+        conn.exec_drop(limited(cfg, sql), params(values)).await?;
         Ok((conn.affected_rows(), conn.last_insert_id().unwrap_or(0)))
     })
     .await
@@ -256,11 +274,22 @@ pub async fn insert_chat_log(db: &Db, cfg: &MariaDbConfig, question: &str, answe
     Ok(())
 }
 
+/// Rows one retention delete removes: a long backlog (the retention
+/// shortened, a server long off) deleted at once could run past the DB time
+/// limit, where the server ends it too (`limited`) and rolls it back — each
+/// hour again, the backlog never cleared.
+const CLEANUP_BATCH: u64 = 1000;
+
 pub async fn cleanup_chat_logs(db: &Db, cfg: &MariaDbConfig, days: u32) -> Result<u64> {
-    let (affected, _) = db
-        .exec(cfg, "DELETE FROM chat_log WHERE created_at < NOW() - INTERVAL ? DAY", vec![n(days.into())])
-        .await?;
-    Ok(affected)
+    let sql = format!("DELETE FROM chat_log WHERE created_at < NOW() - INTERVAL ? DAY ORDER BY created_at LIMIT {CLEANUP_BATCH}");
+    let mut total = 0;
+    loop {
+        let (affected, _) = db.exec(cfg, &sql, vec![n(days.into())]).await?;
+        total += affected;
+        if affected < CLEANUP_BATCH {
+            return Ok(total);
+        }
+    }
 }
 
 pub async fn load_target_db(db: &Db, cfg: &MariaDbConfig, name: &str) -> Result<Option<Row>> {
