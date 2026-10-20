@@ -334,7 +334,8 @@ pub struct AgentConfig {
     /// Share eviction brings the estimate down to.
     pub low_water: f64,
     /// Bytes of evicted history (bundles out of the context and archived
-    /// results) one conversation keeps for the history tool.
+    /// results) one conversation keeps for the history tool, as held in
+    /// memory (`session::Held`).
     pub history_bytes: usize,
     /// Tokens of one tool result. Empty: see `Config::result_budget`.
     pub result_tokens: Option<usize>,
@@ -357,7 +358,7 @@ pub struct AgentConfig {
     pub session_idle_minutes: u64,
     pub max_sessions: usize,
     /// Bytes of fetched query rows one conversation keeps for result_read
-    /// and table references.
+    /// and table references, as held in memory (`session::Held`).
     pub result_store_bytes: usize,
 }
 impl Default for AgentConfig {

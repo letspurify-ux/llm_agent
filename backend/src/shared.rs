@@ -68,12 +68,10 @@ impl<T: Clone> DerefMut for Shared<T> {
     }
 }
 
-impl<T: Serialize> Shared<T> {
+impl<T: crate::session::Held> Shared<T> {
+    /// Bytes the payload holds in memory (`session::Held`).
     pub(crate) fn bytes(&self) -> usize {
-        *self
-            .0
-            .bytes
-            .get_or_init(|| crate::session::serialized_bytes(&self.0.value))
+        *self.0.bytes.get_or_init(|| self.0.value.held())
     }
 }
 
@@ -120,7 +118,7 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(copy.len(), 2);
         assert_eq!(first.bytes(), bytes);
-        assert_eq!(copy.bytes(), crate::session::serialized_bytes(&*copy));
+        assert_eq!(copy.bytes(), crate::session::Held::held(&*copy));
         assert_eq!(
             serde_json::to_value(&first).unwrap(),
             serde_json::to_value(&*first).unwrap()

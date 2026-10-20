@@ -1063,7 +1063,7 @@ async fn query_run(cx: &Context<'_>, args: &Value) -> Run {
     match outcome {
         Ok(outcome) => {
             let columns = columns_of(&outcome.rows);
-            let bytes = crate::session::serialized_bytes(&outcome.rows);
+            let bytes = crate::session::Held::held(&outcome.rows);
             let shown: Vec<&Map<String, Value>> = outcome.rows.iter().take(preview).collect();
             let mut data = json!({
                 "query_name":canonical,"target_db":outcome.target_db,"columns":columns,

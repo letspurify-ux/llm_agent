@@ -2,7 +2,8 @@
 //! bundles as in MnemoArc: one user message, or one model response with the
 //! results of its tool calls. Bundles leave the model's context whole (see
 //! `context::evict`), and stay readable through the `history` tool until the
-//! history byte limit drops the oldest.
+//! history byte limit drops the oldest. Kept bytes are those held in memory
+//! (`Held`).
 
 use crate::shared::Shared;
 use anyhow::Result;
@@ -15,20 +16,73 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub(crate) fn serialized_bytes(value: &(impl Serialize + ?Sized)) -> usize {
-    #[derive(Default)]
-    struct Counter(usize);
-    impl std::io::Write for Counter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(bytes.len());
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+/// Bytes a value holds in memory, about: its allocations as the allocator
+/// rounds them, and the inline size of what they hold. The byte limits a
+/// conversation keeps count these: its JSON is far smaller than what holds
+/// it — query rows of short cells nine times (a column name and a map entry
+/// a cell, an index a row), a history of small messages eight. Counted as
+/// JSON, the 32 MiB of rows kept held about 300 MiB, a conversation.
+pub trait Held {
+    fn held(&self) -> usize;
+}
+
+/// An allocation of `n` bytes as the allocator gives it: in 16-byte steps,
+/// glibc's with a header of 8 bytes and 32 at least.
+fn allocation(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    if cfg!(all(target_os = "linux", target_env = "gnu")) {
+        (n.saturating_add(8 + 15) & !15).max(32)
+    } else {
+        n.saturating_add(15) & !15
+    }
+}
+
+impl Held for Value {
+    fn held(&self) -> usize {
+        match self {
+            Value::String(text) => text.held(),
+            Value::Array(items) => items.held(),
+            Value::Object(fields) => fields.held(),
+            Value::Null | Value::Bool(_) | Value::Number(_) => 0,
         }
     }
-    let mut counter = Counter::default();
-    serde_json::to_writer(&mut counter, value).map_or(usize::MAX, |()| counter.0)
+}
+
+impl Held for String {
+    fn held(&self) -> usize {
+        allocation(self.capacity())
+    }
+}
+
+impl<T: Held> Held for Vec<T> {
+    fn held(&self) -> usize {
+        self.iter().fold(allocation(self.capacity() * std::mem::size_of::<T>()), |total, item| total.saturating_add(item.held()))
+    }
+}
+
+/// An ordered map (`preserve_order`): a hash table of indices and a vector
+/// of entries (hash, key, value), both grown as the table is.
+impl Held for Map<String, Value> {
+    fn held(&self) -> usize {
+        let len = self.len();
+        if len == 0 {
+            return 0;
+        }
+        let buckets = if len < 4 {
+            4
+        } else if len < 8 {
+            8
+        } else {
+            (len * 8 / 7).next_power_of_two()
+        };
+        let entries = if buckets < 8 { buckets - 1 } else { buckets / 8 * 7 };
+        let entry = std::mem::size_of::<u64>() + std::mem::size_of::<String>() + std::mem::size_of::<Value>();
+        self.iter().fold(allocation(buckets * 9 + 16) + allocation(entries * entry), |total, (key, value)| {
+            total.saturating_add(key.held()).saturating_add(value.held())
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -498,8 +552,9 @@ mod tests {
         assert_eq!(h.bundles.len(), 3, "active bundles stay");
         h.bundles[0].active = false;
         h.bundles[1].active = false;
-        // Only the evicted bundles count toward the limit.
-        h.prune(1500);
+        // Only the evicted bundles count toward the limit: one and a half.
+        let one = h.bundles[0].bytes();
+        h.prune(one + one / 2);
         assert_eq!(h.bundles.len(), 2);
         assert_eq!(h.pruned_through, Some(a));
         let gone = h.read(a).unwrap_err().to_string();
