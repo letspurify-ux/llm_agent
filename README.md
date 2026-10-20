@@ -78,16 +78,19 @@ frontend/
 ### 1. MariaDB 스키마 적용
 
 ```bash
-mariadb --default-character-set=utf8mb4 < backend/sql/schema.sql
+mariadb -e "CREATE DATABASE IF NOT EXISTS llm_agent DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci"
+mariadb --default-character-set=utf8mb4 llm_agent < backend/sql/schema.sql
 ```
 
 > **이미 운영 중인 DB에는 실행하지 말 것** — schema.sql은 맨 앞에서 모든 테이블을 DROP한다.
+> `backend/sql`의 파일은 DB를 고르지 않는다 — 적용할 DB 이름(`llm_agent` 자리)을 명령줄로 준다. 이름 없이 실행하면
+> "No database selected"로 멈춘다. 예전에는 파일 안에서 `llm_agent`를 골라, 다른 DB에 적용하려 해도 운영 DB가 DROP됐다.
 > 기존 설치는 앱 업데이트 전에 `backend/sql/migrate-routines.sql`을 적용한다.
 > 기존 실행 항목을 `QUERY`로 유지하면서 `query_type`, `bind_config`만 추가하며 재실행할 수 있다.
 > 지식 본문을 65,535바이트보다 길게 저장하려면 기존 설치에 `backend/sql/migrate-knowledge-content.sql`도 적용한다.
 >
 > ```bash
-> mariadb --default-character-set=utf8mb4 -u <관리자> -p < backend/sql/migrate-knowledge-content.sql
+> mariadb --default-character-set=utf8mb4 -u <관리자> -p llm_agent < backend/sql/migrate-knowledge-content.sql
 > ```
 > 더 오래된 설치의 변경분은 아래 마이그레이션을 쓴다:
 >
@@ -126,7 +129,7 @@ mariadb --default-character-set=utf8mb4 < backend/sql/schema.sql
 > 임베딩 저장소를 소스별로 나누고 `knowledge_chunk`를 만든다:
 >
 > ```bash
-> mariadb --default-character-set=utf8mb4 < backend/sql/migrate-chunk.sql
+> mariadb --default-character-set=utf8mb4 llm_agent < backend/sql/migrate-chunk.sql
 > cd backend && cargo run --release -- embed-sync     # 청크 생성 + 최초 임베딩
 > ```
 >
@@ -135,7 +138,7 @@ mariadb --default-character-set=utf8mb4 < backend/sql/schema.sql
 > 미리 돌리는 편이 낫다. 검색이 정상인 것을 확인한 뒤 `DROP TABLE vec_store;` 로 옛 테이블을 지운다.
 
 ```bash
-mariadb --default-character-set=utf8mb4 < backend/sql/seed.sql
+mariadb --default-character-set=utf8mb4 llm_agent < backend/sql/seed.sql
 ```
 
 앱 계정 생성 (관리자 화면의 저장·삭제를 위해 관리 테이블에도 쓰기 권한이 필요하다).
@@ -163,7 +166,7 @@ GRANT SELECT, INSERT, DELETE ON llm_agent.chat_log TO 'agent'@'localhost';"
 SPACE 시스템 지식 데이터도 함께 등록:
 
 ```bash
-mariadb --default-character-set=utf8mb4 < backend/sql/seed-space.sql
+mariadb --default-character-set=utf8mb4 llm_agent < backend/sql/seed-space.sql
 ```
 
 ### 1-2. 조회용 Oracle 테스트 DB (Docker)
@@ -833,7 +836,7 @@ QUERY·PROCEDURE·FUNCTION은 모두 실행할 커넥션에서 `DBMS_OUTPUT.ENAB
 기존 관리 DB는 **앱 업데이트 전에** 아래 파일을 적용한다. `schema.sql`로 초기화하지 않는다.
 
 ```bash
-mariadb --default-character-set=utf8mb4 -u <관리자> -p < backend/sql/migrate-routines.sql
+mariadb --default-character-set=utf8mb4 -u <관리자> -p llm_agent < backend/sql/migrate-routines.sql
 ```
 
 관리자 화면의 쿼리 탭에서 실행 유형과 SQL을 입력한다. 바인드 설정은 프로시저·함수에만 표시된다.

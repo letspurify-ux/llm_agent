@@ -5,8 +5,9 @@
 --  4) "홍길동 주문 목록을 프로시저로 조회해줘" → get_customer_orders_proc 1회 실행
 --  5) "홍길동 주문 합계를 함수로 계산해줘"      → get_customer_order_total_fn 1회 실행
 
+-- 적용: mariadb --default-character-set=utf8mb4 -u <user> -p <DB 이름> < seed.sql (DB는 명령줄로만 정한다 — schema.sql 머리말)
+
 SET NAMES utf8mb4;
-USE llm_agent;
 
 -- 재실행 가능(멱등): 자연키(title / query_name / db_name)의 UNIQUE에 얹어 덮어쓴다.
 -- 조건 없는 DELETE로 비우지 않는 이유는 seed-space.sql이 넣은 SPACE 지식까지 지우기 때문이고,

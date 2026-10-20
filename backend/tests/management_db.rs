@@ -207,3 +207,30 @@ async fn the_chat_log_cleanup_clears_a_backlog_in_batches() {
     assert_eq!(db::cleanup_chat_logs(&db, &config.mariadb, 3, &go_on).await.unwrap(), 0);
     db.close().await;
 }
+
+/// The SQL files chose the `llm_agent` database themselves (`CREATE
+/// DATABASE`, `USE`): applied to any other database, a test's or a
+/// throwaway one, schema.sql dropped the tables of the one in use instead
+/// (twice, unrecoverably). They name no database; the command line does.
+#[test]
+fn the_sql_files_choose_no_database() {
+    let folder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sql");
+    let mut chosen = vec![];
+    for entry in std::fs::read_dir(&folder).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "sql") {
+            continue;
+        }
+        for (at, line) in std::fs::read_to_string(&path).unwrap().lines().enumerate() {
+            let statement = line.split("--").next().unwrap().trim().to_ascii_uppercase();
+            let names = statement.starts_with("USE ")
+                || statement.starts_with("CREATE DATABASE")
+                || statement.starts_with("DROP DATABASE")
+                || (statement.starts_with("ALTER DATABASE") && !statement.starts_with("ALTER DATABASE CHARACTER"));
+            if names {
+                chosen.push(format!("{}:{}: {line}", path.file_name().unwrap().to_string_lossy(), at + 1));
+            }
+        }
+    }
+    assert!(chosen.is_empty(), "statements that choose a database: {chosen:#?}");
+}

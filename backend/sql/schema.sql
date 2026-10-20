@@ -8,17 +8,19 @@
 --   낮은 버전에서 돌리면 앞쪽 테이블은 만들어지고 vec_*에서 멈춘다(부분 적용).
 --   그래서 vec_*를 파일 맨 뒤에 둔다 — 거기서 실패해도 나머지 스키마는 온전하다.
 --
--- 적용: mariadb --default-character-set=utf8mb4 -u <user> -p < schema.sql
+-- 적용: mariadb --default-character-set=utf8mb4 -u <user> -p <DB 이름> < schema.sql
+--   DB 이름은 명령줄로만 정한다 — 이 파일은 DB를 고르지 않는다. 예전에는 맨 앞에서 llm_agent를 만들고
+--   USE했기 때문에, 다른 DB(시험·임시용)에 적용하려 해도 명령줄의 이름이 무시되고 운영 llm_agent가 DROP됐다.
+--   이름 없이 실행하면 첫 문장에서 "No database selected"로 멈추고 아무것도 지우지 않는다.
+--   DB는 먼저 만든다: CREATE DATABASE <DB 이름> DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 
 SET NAMES utf8mb4;
 
 -- collation을 명시하는 이유: 서버 기본값이 버전에 따라 다르다(11.5+는 utf8mb4_uca1400_ai_ci,
 -- 그 이전은 utf8mb4_general_ci). 그런데 agent.js는 query_name 조회가 대소문자를 무시한다는 전제로
 -- nameKey()를 두고 있어, 배포 서버에 따라 조회와 루프 가드가 어긋날 수 있다. 전제를 고정한다.
-CREATE DATABASE IF NOT EXISTS llm_agent DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
--- 이미 있는 DB에는 위 CREATE가 아무 일도 하지 않으므로 기본값을 따로 맞춰준다.
-ALTER DATABASE llm_agent CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
-USE llm_agent;
+-- 이름 없는 ALTER DATABASE는 명령줄로 고른 DB에 적용된다(아래 테이블이 이 기본값을 따른다).
+ALTER DATABASE CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 
 DROP TABLE IF EXISTS chat_log;
 DROP TABLE IF EXISTS vec_store;               -- 소스별로 나뉘기 전의 이름 (마이그레이션 참고)

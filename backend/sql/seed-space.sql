@@ -2,8 +2,9 @@
 -- 주의: 아래 내용은 "AI 가상계측 시스템"의 일반적인 개념을 바탕으로 작성한 예시다.
 --       실제 사내 문서의 정확한 내용(구성 모듈명, 지표 기준, 운영 절차 등)으로 교체할 것.
 
+-- 적용: mariadb --default-character-set=utf8mb4 -u <user> -p <DB 이름> < seed-space.sql (DB는 명령줄로만 정한다 — schema.sql 머리말)
+
 SET NAMES utf8mb4;
-USE llm_agent;
 
 -- 재실행 가능(멱등): knowledge.title UNIQUE에 얹어 덮어쓴다 (seed.sql과 같은 방식).
 -- 지울 제목 목록을 따로 두면 아래 INSERT와 손으로 맞춰야 하는 사본이 생기고,
