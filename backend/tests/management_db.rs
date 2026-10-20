@@ -5,6 +5,7 @@ mod support;
 use llm_agent::db::{self, Db};
 use std::collections::BTreeSet;
 use support::*;
+use tokio_util::sync::CancellationToken;
 
 /// Resource review, sixth pass: the pool kept no idle connection (its lower
 /// bound, 0, and no idle time), so every query opened, logged in to and
@@ -184,7 +185,8 @@ async fn a_caller_that_stops_waiting_leaves_its_connection_in_the_pool() {
 
 /// The retention cleanup deletes a backlog a batch at a time, each well
 /// within the DB time limit (a statement past it is stopped and rolled
-/// back), and keeps the rows within the retention.
+/// back), and keeps the rows within the retention. Shutdown, which waits
+/// for it, ends it after the batch under way.
 #[tokio::test]
 async fn the_chat_log_cleanup_clears_a_backlog_in_batches() {
     let Some(test_db) = TestDb::create("cleanup") else {
@@ -196,8 +198,12 @@ async fn the_chat_log_cleanup_clears_a_backlog_in_batches() {
     );
     let config = test_db.config();
     let db = Db::default();
-    assert_eq!(db::cleanup_chat_logs(&db, &config.mariadb, 3).await.unwrap(), 2500);
+    let stopped = CancellationToken::new();
+    stopped.cancel();
+    assert_eq!(db::cleanup_chat_logs(&db, &config.mariadb, 3, &stopped).await.unwrap(), 1000);
+    let go_on = CancellationToken::new();
+    assert_eq!(db::cleanup_chat_logs(&db, &config.mariadb, 3, &go_on).await.unwrap(), 1500);
     assert_eq!(test_db.scalar("SELECT GROUP_CONCAT(question ORDER BY seq) FROM chat_log"), "new 1,new 2,new 3");
-    assert_eq!(db::cleanup_chat_logs(&db, &config.mariadb, 3).await.unwrap(), 0);
+    assert_eq!(db::cleanup_chat_logs(&db, &config.mariadb, 3, &go_on).await.unwrap(), 0);
     db.close().await;
 }

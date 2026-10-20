@@ -59,14 +59,28 @@ fn main() {
 
 async fn sync_once(path: PathBuf, config: Config) -> i32 {
     let app = App::new(path, config, Arc::new(OpenAiClient));
+    // Ctrl+C or a stop signal ends the sync as the server's shutdown does:
+    // after the batch under way, its lock's connection and the pool closed
+    // in order. Left to its default, the signal ended the process on the
+    // spot, each of its connections cut (aborted, in the server's log).
+    let stop = app.shutdown.clone();
+    let stopping = tokio::spawn(async move {
+        wait_for_signal().await;
+        stop.cancel();
+    });
     let started = std::time::Instant::now();
     let config = app.config();
     let result = app.sync.run(&app.db, &config, &app.shutdown).await;
+    stopping.abort();
     app.db.close().await;
     match result {
         Ok(summary) => {
             println!("embedding sync complete: {summary}, {:.1}s", started.elapsed().as_secs_f64());
-            i32::from(summary.failed > 0 || summary.chunks_failed > 0 || summary.skipped == embed_sync::Skipped::Unavailable)
+            i32::from(
+                summary.failed > 0
+                    || summary.chunks_failed > 0
+                    || matches!(summary.skipped, embed_sync::Skipped::Unavailable | embed_sync::Skipped::Stopped),
+            )
         }
         Err(e) => {
             eprintln!("[embed] sync failed: {e:#}");
@@ -97,7 +111,6 @@ async fn serve(path: PathBuf, config: Config) -> i32 {
             ),
         });
     }
-    background_jobs(&app);
     let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
         Ok(listener) => listener,
         Err(e) => {
@@ -105,6 +118,10 @@ async fn serve(path: PathBuf, config: Config) -> i32 {
             return 1;
         }
     };
+    // Once the server can start: begun before, a server that could not
+    // (its port taken by the one already running) started a sync and a
+    // cleanup it then cut off on its way out.
+    let jobs = background_jobs(&app);
     // MCP tool servers connect in the background once the server can start
     // (a failed start leaves no process behind); one that fails is retried
     // and never holds up the start. They stop as soon as shutdown begins,
@@ -150,7 +167,16 @@ async fn serve(path: PathBuf, config: Config) -> i32 {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     app.shutdown.cancel();
-    let _ = stopping_mcp.await;
+    // The background jobs end their DB work in order before the pools
+    // close, beside the MCP servers' stop. Left to the runtime's end, a
+    // sync stopped mid-way was dropped there: its lock's connection cut
+    // without a goodbye (an aborted connection in the server's log at
+    // every stop during a sync) and its summary never written.
+    let jobs = tokio::time::timeout(web::SHUTDOWN_GRACE, futures_util::future::join_all(jobs));
+    let (_, jobs) = tokio::join!(stopping_mcp, jobs);
+    if jobs.is_err() {
+        eprintln!("[shutdown] background jobs still running after {}s were stopped", web::SHUTDOWN_GRACE.as_secs());
+    }
     app.db.close().await;
     code
 }
@@ -181,10 +207,11 @@ async fn wait_for_signal() {
 
 /// Embedding warm-up, the embedding sync (at start and every interval), the
 /// chat log retention cleanup (at start and hourly), and every minute the
-/// release of idle conversations, Oracle pools and kept syntax trees.
-fn background_jobs(app: &Arc<App>) {
+/// release of idle conversations, Oracle pools and kept syntax trees. Each
+/// ends soon after shutdown begins; the handles are waited for then.
+fn background_jobs(app: &Arc<App>) -> Vec<tokio::task::JoinHandle<()>> {
     let housekeeping = app.clone();
-    tokio::spawn(async move {
+    let housekeeping = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = housekeeping.shutdown.cancelled() => break,
@@ -197,7 +224,7 @@ fn background_jobs(app: &Arc<App>) {
         }
     });
     let warm = app.clone();
-    tokio::spawn(async move {
+    let warm = tokio::spawn(async move {
         let config = warm.config();
         if config.embedding.enabled()
             && llm_agent::embedding::embed(&config.embedding, &["warm-up".to_owned()], &warm.shutdown)
@@ -208,7 +235,7 @@ fn background_jobs(app: &Arc<App>) {
         }
     });
     let sync = app.clone();
-    tokio::spawn(async move {
+    let sync = tokio::spawn(async move {
         let mut first = true;
         loop {
             let config = sync.config();
@@ -232,10 +259,10 @@ fn background_jobs(app: &Arc<App>) {
         }
     });
     let cleanup = app.clone();
-    tokio::spawn(async move {
+    let cleanup = tokio::spawn(async move {
         loop {
             let config = cleanup.config();
-            match llm_agent::db::cleanup_chat_logs(&cleanup.db, &config.mariadb, config.server.chat_log_retention_days).await {
+            match llm_agent::db::cleanup_chat_logs(&cleanup.db, &config.mariadb, config.server.chat_log_retention_days, &cleanup.shutdown).await {
                 Ok(0) => {}
                 Ok(n) => eprintln!("[chat_log] cleaned up {n} rows (older than {} days)", config.server.chat_log_retention_days),
                 Err(e) => eprintln!("[chat_log] cleanup failed: {e:#}"),
@@ -246,4 +273,5 @@ fn background_jobs(app: &Arc<App>) {
             }
         }
     });
+    vec![housekeeping, warm, sync, cleanup]
 }

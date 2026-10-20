@@ -336,13 +336,15 @@ pub async fn insert_chat_log(db: &Db, cfg: &MariaDbConfig, question: &str, answe
 /// hour again, the backlog never cleared.
 const CLEANUP_BATCH: u64 = 1000;
 
-pub async fn cleanup_chat_logs(db: &Db, cfg: &MariaDbConfig, days: u32) -> Result<u64> {
+/// Deletes the chat log rows past the retention, a batch at a time; `stop`
+/// (shutdown, which waits for it) ends it between batches.
+pub async fn cleanup_chat_logs(db: &Db, cfg: &MariaDbConfig, days: u32, stop: &tokio_util::sync::CancellationToken) -> Result<u64> {
     let sql = format!("DELETE FROM chat_log WHERE created_at < NOW() - INTERVAL ? DAY ORDER BY created_at LIMIT {CLEANUP_BATCH}");
     let mut total = 0;
     loop {
         let (affected, _) = db.exec(cfg, &sql, vec![n(days.into())]).await?;
         total += affected;
-        if affected < CLEANUP_BATCH {
+        if affected < CLEANUP_BATCH || stop.is_cancelled() {
             return Ok(total);
         }
     }
