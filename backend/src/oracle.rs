@@ -501,10 +501,14 @@ enum BindArg {
 impl BindArg {
     fn of(v: &Value) -> Self {
         match v {
-            Value::Number(n) => n
-                .as_i64()
-                .map(BindArg::Int)
-                .unwrap_or_else(|| BindArg::Float(n.as_f64().unwrap_or(0.0))),
+            // An integer past i64 (a 20-digit ID sent as a number) is bound
+            // as its exact digits: as a double it was another number, and
+            // `WHERE id = :id` matched nothing, without a word.
+            Value::Number(n) => match (n.as_i64(), n.as_u64()) {
+                (Some(i), _) => BindArg::Int(i),
+                (None, Some(_)) => BindArg::Text(n.to_string()),
+                _ => BindArg::Float(n.as_f64().unwrap_or(0.0)),
+            },
             Value::String(s) => BindArg::Text(s.clone()),
             other => BindArg::Text(other.to_string()),
         }
@@ -662,9 +666,11 @@ fn two(n: impl Into<i64>) -> String {
 }
 
 fn timestamp_text(ts: &oracle::sql_type::Timestamp, fraction: bool, offset: bool) -> String {
+    // A year before 1 (Oracle's -4712 to -1) keeps four digits after its
+    // sign: `{:04}` counts the sign, and -44 came out as "-044".
+    let year = if ts.year() < 0 { format!("-{:04}", ts.year().unsigned_abs()) } else { format!("{:04}", ts.year()) };
     let mut text = format!(
-        "{:04}-{}-{} {}:{}:{}",
-        ts.year(),
+        "{year}-{}-{} {}:{}:{}",
         two(ts.month()),
         two(ts.day()),
         two(ts.hour()),
@@ -974,6 +980,35 @@ mod tests {
         let mut params = Map::new();
         params.insert("JOB_ID".into(), json!("x"));
         assert_eq!(bind_value(&params, "job_id"), Some(&json!("x")));
+    }
+
+    /// Tool review, 2026-10-22 (sixth pass): an integer past i64 was bound as
+    /// a double (12345678901234567890 as 1.2345678901234567e19).
+    #[test]
+    fn integers_past_i64_bind_as_their_digits() {
+        let bound = |v: Value| match BindArg::of(&v) {
+            BindArg::Text(t) => format!("text {t}"),
+            BindArg::Int(i) => format!("int {i}"),
+            BindArg::Float(f) => format!("float {f}"),
+        };
+        assert_eq!(bound(json!(12345678901234567890u64)), "text 12345678901234567890");
+        assert_eq!(bound(json!(-9)), "int -9");
+        assert_eq!(bound(json!(9_007_199_254_740_993i64)), "int 9007199254740993");
+        assert_eq!(bound(json!(0.5)), "float 0.5");
+        assert_eq!(bound(json!("C-1")), "text C-1");
+    }
+
+    /// Tool review, 2026-10-22 (sixth pass): a year before 1 lost a digit to
+    /// its sign ("-044-03-15").
+    #[test]
+    fn timestamps_keep_four_year_digits_and_their_offset() {
+        use oracle::sql_type::Timestamp;
+        let bc = Timestamp::new(-44, 3, 15, 0, 0, 0, 0).unwrap();
+        assert_eq!(timestamp_text(&bc, false, false), "-0044-03-15 00:00:00");
+        let old = Timestamp::new(99, 1, 2, 3, 4, 5, 123_456_789).unwrap();
+        assert_eq!(timestamp_text(&old, true, false), "0099-01-02 03:04:05.123");
+        let zoned = Timestamp::new(2026, 1, 2, 3, 4, 5, 0).unwrap().and_tz_hm_offset(-5, -30).unwrap();
+        assert_eq!(timestamp_text(&zoned, true, true), "2026-01-02 03:04:05.000 -05:30");
     }
 
     #[test]
