@@ -15,34 +15,75 @@
 // 확대는 scale이 아니라 폭으로 알아본다(실측, iPhone): Safari의 페이지 확대(가가 → 115%)를 켜면
 // 손가락을 대지 않아도 scale이 1.15로 나온다 — 그때 높이·offsetTop은 그대로 CSS px이고 폭도 줄지 않는다.
 // 손가락 확대만 보이는 폭을 레이아웃 뷰포트보다 좁힌다. 키보드는 폭을 건드리지 않는다.
+//
+// 키보드는 글을 쓰는 칸에 초점이 있을 때만 떠 있다 — 그 조건도 함께 본다. visualViewport만 믿으면 키보드가
+// 내려간 뒤에도 앱이 키보드 높이에 고정된 채 남을 수 있다: iOS Safari는 키보드를 닫을 때 보이는 칸의 값을
+// 늦게 바꾸거나 마지막 resize를 보내지 않는 일이 있고(아이폰에서 키보드를 닫자 앱이 화면 절반 높이로 남아
+// 대화가 보이지 않고 답도 더 그려지지 않았다), 그러면 아무도 다시 sync를 부르지 않는다. 그래서 초점이
+// 빠지면 곧바로 다시 보고(그때는 값과 무관하게 푼다), 늦게 오는 값까지 잡도록 잠시 몇 번 더 읽는다.
+// 풀 때 페이지가 스크롤된 채면(키보드가 칸을 옮겨 둔 그대로) 맨 위로 되돌린다 — 이 문서는 스스로 스크롤되지
+// 않는다(.chat이 스크롤 상자다). 남겨 두면 머리글이 화면 위로 밀려난 채 아래가 빈다.
+const EDITABLE = /^(INPUT|TEXTAREA|SELECT)$/;
+const SETTLE_MS = [50, 150, 300, 600, 1000];
 export function fitToVisualViewport(win = window) {
   const vv = win.visualViewport;
   if (!vv) return () => {};
-  const root = win.document.documentElement;
-  const release = () => {
+  const doc = win.document;
+  const root = doc.documentElement;
+  const editing = () => {
+    const el = doc.activeElement;
+    return !!el && (el.isContentEditable || EDITABLE.test(el.tagName ?? ''));
+  };
+  let pinned = false;
+  const release = (restore = true) => {
     root.classList.remove('keyboard-open');
     root.style.removeProperty('--app-height');
     root.style.removeProperty('--app-top');
+    // 고정을 풀 때 남은 스크롤을 되돌린다. 보이는 칸(offsetTop)만 옮겨진 채 남은 것도 같다 — 그 상태에서는
+    // 그려진 자리와 누르는 자리가 어긋나 아무것도 눌리지 않았다(실기기, 새로고침해야 풀렸다).
+    // 손가락으로 확대해 풀린 것이면 두지 않는다 — 그 스크롤은 사용자가 옮겨 보는 자리다.
+    if (restore && pinned && (win.scrollY > 0 || vv.offsetTop > 0)) win.scrollTo?.(0, 0);
+    pinned = false;
   };
   const sync = () => {
     // 견줄 것은 innerHeight가 아니라 루트의 clientWidth·clientHeight다 — 그것이 height: 100%가 가리키는
     // 레이아웃 뷰포트이고(루트에서는 CSS 높이와 무관하게 뷰포트를 돌려준다), iOS의 innerHeight는 키보드가
     // 뜨면 보이는 높이로 따라 줄어 견줄 기준이 되지 못한다(실측: 619 → 347). 1px 미만의 차이는 반올림 오차다.
     const zoomed = vv.width < root.clientWidth - 1;
-    if (!zoomed && vv.height < root.clientHeight - 1) {
+    if (!zoomed && editing() && vv.height < root.clientHeight - 1) {
       root.style.setProperty('--app-height', `${vv.height}px`);
       root.style.setProperty('--app-top', `${vv.offsetTop}px`);
       root.classList.add('keyboard-open');
+      pinned = true;
     } else {
-      release();
+      release(!zoomed);
     }
+  };
+  // 초점이 오가면(키보드가 뜨고 지는 계기) 지금 한 번, 그리고 보이는 칸이 자리 잡을 때까지 몇 번 더 본다.
+  // 초점이 다른 입력칸으로 옮겨 가는 중이면 focusout 때는 아직 activeElement가 비어 있으므로 지금 한 번은
+  // 다음 과제에서 본다.
+  let timers = [];
+  const settle = () => {
+    timers.forEach(t => win.clearTimeout(t));
+    timers = [0, ...SETTLE_MS].map(ms => win.setTimeout(sync, ms));
   };
   vv.addEventListener('resize', sync);
   vv.addEventListener('scroll', sync);
+  // iOS가 키보드를 닫으며 페이지를 되돌릴 때 visualViewport 대신 창의 이벤트만 오는 일도 있다.
+  win.addEventListener?.('resize', sync);
+  win.addEventListener?.('scroll', sync);
+  doc.addEventListener('focusin', settle);
+  doc.addEventListener('focusout', settle);
   sync();
   return () => {
     vv.removeEventListener('resize', sync);
     vv.removeEventListener('scroll', sync);
+    win.removeEventListener?.('resize', sync);
+    win.removeEventListener?.('scroll', sync);
+    doc.removeEventListener('focusin', settle);
+    doc.removeEventListener('focusout', settle);
+    timers.forEach(t => win.clearTimeout(t));
+    timers = [];
     release();
   };
 }
