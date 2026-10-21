@@ -216,6 +216,37 @@ async fn one_response_runs_a_query_once_however_its_calls_spell_it() {
     assert!(unknown["error"].as_str().unwrap().contains("\"STATUS\""), "{unknown}");
 }
 
+/// Tool review, 2026-10-22 (tenth pass): a target_db not among a query's
+/// candidates was told as a query that cannot run (choose another query or
+/// answer), though its own hint said to run it again with a candidate. Only
+/// a query with no candidate registered cannot run.
+#[tokio::test]
+async fn a_wrong_target_db_is_corrected_not_given_up() {
+    let Some(db) = TestDb::create("target") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    db.sql_in("INSERT INTO query_registry (query_name, query_desc, query_sql, target_db_name) VALUES ('no_target_q', 'x', 'SELECT 1 FROM dual', '')");
+    let llm = Scripted::new(vec![
+        calls(vec![
+            call("c1", "query_run", json!({"query_name":"batch_job_status","params":{"job_id":"BATCH001"},"target_db":"NOPE_DB"})),
+            call("c2", "query_run", json!({"query_name":"no_target_q"})),
+        ]),
+        calls(vec![call("c3", "query_run", json!({"query_name":"batch_job_status","params":{"job_id":"BATCH001"},"target_db":"ORDER_DB"}))]),
+        text("확인했습니다."),
+    ]);
+    let (app, _dir) = app(db.config(), llm.clone());
+    let (result, _) = ask(&app, "conv-target", "배치 상태 확인해줘", vec![]).await;
+    result.unwrap();
+    let requests = llm.requests();
+    let wrong = tool_result(&requests[1], "c1");
+    assert_eq!(wrong["recovery"]["code"], "target_db_required", "{wrong}");
+    assert_eq!(wrong["recovery"]["action"], "correct_arguments", "{wrong}");
+    assert!(wrong["error"].as_str().unwrap().contains("후보: ORDER_DB"), "{wrong}");
+    let none = tool_result(&requests[1], "c2");
+    assert_eq!(none["recovery"]["code"], "query_unrunnable", "{none}");
+    assert_eq!(tool_result(&requests[2], "c3")["status"], "ok");
+}
+
 #[tokio::test]
 async fn lost_conversations_restore_from_the_browser_history() {
     let Some(db) = TestDb::create("restore") else {

@@ -1239,8 +1239,16 @@ async fn query_run(cx: &Context<'_>, args: &Value) -> Run {
             if driver {
                 eprintln!("[query_run] {canonical} failed: {e:#}");
             }
+            // A target_db left out or not among the candidates was told as a
+            // query that cannot run (choose another query), though the same
+            // call with one of them runs.
+            let target = !driver
+                && resolved.is_none()
+                && crate::oracle::resolve_target_db(&row, chosen.as_deref()).is_err_and(|t| t.to_string() == e.to_string());
             let code = if driver {
                 "query_failed"
+            } else if target && !wasted {
+                "target_db_required"
             } else if wasted {
                 "query_unrunnable"
             } else {

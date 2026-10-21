@@ -8,7 +8,7 @@ use crate::{
     db::{self, Db, Row},
     execution::{BindType, Dir, Kind, MAX_RESULT_COLS, execution_spec},
     numbers::{number_from_text, number_json, valid_number_input},
-    sql::{SafeError, safe, wasted},
+    sql::{SafeError, safe, safe_hint, wasted},
     text::{TRUNC_MARK, clip_marked, clip_utf16, name_key, target_db_names, utf16_len},
 };
 use anyhow::{Result, bail};
@@ -433,7 +433,9 @@ fn bind_problem(value: Option<&Value>, is_clipped_copy: &(dyn Fn(&str) -> bool +
 }
 
 /// The registered target DB this run uses: the only candidate, or the one
-/// the model chose by its registered spelling.
+/// the model chose by its registered spelling. Only a query with no
+/// candidate cannot run; a target_db left out, too long or not among them is
+/// corrected by sending another.
 pub fn resolve_target_db(registry: &Row, chosen: Option<&str>) -> Result<String> {
     let names = target_db_names(&db::text(registry, "target_db_name"));
     let list = clip_utf16(&names.join(", "), MAX_DB_LIST_LEN).to_owned();
@@ -443,7 +445,7 @@ pub fn resolve_target_db(registry: &Row, chosen: Option<&str>) -> Result<String>
     if let Some(chosen) = chosen
         && crate::text::utf16_len(crate::text::js_trim(chosen)) > MAX_TARGET_DB_NAME_LEN
     {
-        return Err(wasted(
+        return Err(safe_hint(
             format!("조회대상 DB 이름이 너무 깁니다 (상한: {MAX_TARGET_DB_NAME_LEN}자, 후보: {list})."),
             "target_db는 후보 목록에 있는 이름이어야 한다 — 그중 하나를 골라 다시 실행하라",
         ));
@@ -453,7 +455,7 @@ pub fn resolve_target_db(registry: &Row, chosen: Option<&str>) -> Result<String>
         if names.len() == 1 {
             return Ok(names[0].clone());
         }
-        return Err(wasted(
+        return Err(safe_hint(
             format!("조회할 대상 DB를 고르지 않았습니다 (후보: {list})."),
             "target_db에 후보 중 하나를 등록된 철자 그대로 적어 같은 쿼리를 다시 실행하라",
         ));
@@ -463,7 +465,7 @@ pub fn resolve_target_db(registry: &Row, chosen: Option<&str>) -> Result<String>
         .find(|n| name_key(n) == want)
         .cloned()
         .ok_or_else(|| {
-            wasted(
+            safe_hint(
                 format!(
                     "등록되지 않은 대상 DB입니다: {} (후보: {list}).",
                     clip_utf16(chosen.unwrap_or_default(), MAX_TARGET_DB_NAME_LEN)
@@ -963,9 +965,12 @@ mod tests {
         assert_eq!(resolve_target_db(&registry("A;B"), Some(" b ")).unwrap(), "B");
         let e = resolve_target_db(&registry("A;B"), None).unwrap_err();
         assert!(e.to_string().contains("후보: A, B"));
+        // Another target_db runs it: not a query that cannot run.
+        assert!(!e.downcast_ref::<SafeError>().unwrap().wasted);
+        let e = resolve_target_db(&registry("A;B"), Some("C")).unwrap_err();
+        assert!(!e.downcast_ref::<SafeError>().unwrap().wasted);
+        let e = resolve_target_db(&registry(""), None).unwrap_err();
         assert!(e.downcast_ref::<SafeError>().unwrap().wasted);
-        assert!(resolve_target_db(&registry("A;B"), Some("C")).is_err());
-        assert!(resolve_target_db(&registry(""), None).is_err());
     }
 
     #[test]
