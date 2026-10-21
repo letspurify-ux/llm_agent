@@ -919,10 +919,22 @@ impl OpenAiClient {
                 }
                 if let Some(entries) = choice["delta"]["tool_calls"].as_array() {
                     for call in entries {
-                        let index = call["index"]
-                            .as_u64()
-                            .ok_or_else(|| anyhow::anyhow!("tool call missing index"))?
-                            as usize;
+                        // Some OpenAI-compatible servers leave `index` out and
+                        // send each call whole or its ID first: a new ID is a
+                        // new call, a part without one goes on the last call.
+                        // Refused, the whole response failed ("tool call
+                        // missing index") on every request.
+                        let index = match call["index"].as_u64() {
+                            Some(index) => index as usize,
+                            None => {
+                                let id = call["id"].as_str().filter(|id| !id.is_empty());
+                                match calls.last_key_value() {
+                                    Some((&last, known)) if id.is_some_and(|id| !known.id.is_empty() && known.id != id) => last + 1,
+                                    Some((&last, _)) => last,
+                                    None => 0,
+                                }
+                            }
+                        };
                         let target = calls.entry(index).or_insert(ToolCall {
                             id: String::new(),
                             name: String::new(),
@@ -934,8 +946,12 @@ impl OpenAiClient {
                         if let Some(name) = call["function"]["name"].as_str() {
                             target.name.push_str(name);
                         }
-                        if let Some(args) = call["function"]["arguments"].as_str() {
-                            target.arguments.push_str(args);
+                        match &call["function"]["arguments"] {
+                            Value::String(args) => target.arguments.push_str(args),
+                            // Arguments sent as the object itself, not as its
+                            // JSON text, were dropped: the call ran with none.
+                            args @ Value::Object(_) => target.arguments.push_str(&args.to_string()),
+                            _ => {}
                         }
                         if target.id.len() > MAX_TOOL_CALL_ID_BYTES
                             || target.name.len() > MAX_TOOL_NAME_BYTES
@@ -1613,6 +1629,9 @@ mod tool_choice_tests {
         /// Writes 500 tokens of which 450 are reasoning, as a provider whose
         /// limit bounds only the answer does.
         ReasonsPastTheLimit,
+        /// Streams tool calls without `index`, one with its arguments as an
+        /// object.
+        CallsWithoutIndex,
     }
 
     /// An OpenAI-compatible server on a fresh port (so the endpoint caches
@@ -1680,6 +1699,13 @@ mod tool_choice_tests {
                                 event(json!({"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":written,"completion_tokens_details":{"reasoning_tokens":reasoning}}}))
                             )
                         }
+                        Provider::CallsWithoutIndex => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}{}{}{}data: [DONE]\n\n",
+                            event(json!({"choices":[{"delta":{"tool_calls":[{"id":"a1","type":"function","function":{"name":"search","arguments":"{\"query\":"}}]},"finish_reason":null}]})),
+                            event(json!({"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"배치\"}"}}]},"finish_reason":null}]})),
+                            event(json!({"choices":[{"delta":{"tool_calls":[{"id":"a2","type":"function","function":{"name":"result_read","arguments":{"step":2}}}]},"finish_reason":null}]})),
+                            event(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}))
+                        ),
                         Provider::Drops => format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}",
                             event(json!({"choices":[{"delta":{"content":"쓰던 "},"finish_reason":null}]}))
@@ -1724,6 +1750,22 @@ mod tool_choice_tests {
 
     fn shapes(seen: &Arc<Mutex<Vec<Value>>>) -> Vec<(bool, bool)> {
         seen.lock().unwrap().iter().map(|r| (r.get("tools").is_some(), r.get("tool_choice").is_some())).collect()
+    }
+
+    /// Tool review, 2026-10-22 (seventh pass): a streamed call without
+    /// `index` failed the whole response, and arguments sent as an object
+    /// were dropped.
+    #[tokio::test]
+    async fn calls_streamed_without_an_index_or_with_object_arguments_arrive_whole() {
+        let (config, _) = serve(Provider::CallsWithoutIndex).await;
+        let request = json!({"model":"tool-choice-test","messages":[{"role":"user","content":"질문"}]});
+        let completion = complete(&config, request).await.unwrap();
+        let calls: Vec<(&str, &str, Value)> = completion
+            .calls
+            .iter()
+            .map(|c| (c.id.as_str(), c.name.as_str(), serde_json::from_str(&c.arguments).unwrap()))
+            .collect();
+        assert_eq!(calls, vec![("a1", "search", json!({"query":"배치"})), ("a2", "result_read", json!({"step":2}))]);
     }
 
     #[tokio::test]
