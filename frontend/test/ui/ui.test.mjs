@@ -2515,6 +2515,15 @@ it('창 크기를 거듭 바꿔도 렌더되지 않는 상태 업데이트가 �
   const got = await page.eval(queued);
   assert.ok(got.hooks > 20, `검사의 전제: React 트리에서 상태 훅을 찾는다 (${JSON.stringify(got)}) — React 내부 모양이 바뀌었으면 이 검사를 고칠 것`);
   assert.ok(got.worst <= 2, `창 크기를 40번 바꾼 뒤 한 훅의 대기열에 업데이트 ${got.worst}개가 남았다 (${JSON.stringify(got)})`);
+  // ⚡ 패널도 펼칠 때마다 '펼친 적 있다'를 다시 넣는다 — 두 번째 펼침부터 패널이 다시 그려지지 않아 펼친 횟수만큼 쌓였다.
+  // 사람이 누르는 길(summary 클릭 → toggle 이벤트)로 여닫는다.
+  for (let i = 0; i < 40; i++) {
+    await page.eval(`document.querySelector('details.trace > summary').click()`);
+    await sleep(20);
+  }
+  await sleep(200);
+  const toggled = await page.eval(queued);
+  assert.ok(toggled.worst <= 2, `⚡ 패널을 20번 펼친 뒤 한 훅의 대기열에 업데이트 ${toggled.worst}개가 남았다 (${JSON.stringify(toggled)})`);
 });
 
 // 경계가 잡은 렌더 오류는 React가 console.error(오류)로 찍고, 크롬은 개발자 도구가 닫혀 있어도 콘솔 메시지를 인자째

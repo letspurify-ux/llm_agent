@@ -399,7 +399,9 @@ function TraceTool({ step: t }) {
 // 검색 항목과 쿼리 항목은 서버가 준 순서 그대로다(그 번호가 모델이 본 스텝 번호다 — backend/src/agent.rs).
 function TracePanel({ trace }) {
   // 한 번이라도 펼쳤는가 — 그 뒤로는 접어도 표를 지우지 않는다(다시 펼칠 때 재생성 비용을 내지 않게).
-  const [opened, setOpened] = useState(false);
+  // 펼칠 때마다 true를 다시 넣으므로 바뀔 때만 넘긴다 — 두 번째 펼침부터는 이 패널이 다시 그려지지 않아,
+  // 그냥 넘기면 펼친 횟수만큼 렌더되지 않는 업데이트가 쌓인다 (changed-state.js).
+  const [opened, setOpened] = useChangedState(false);
   return (
     <details className="trace" onToggle={e => { if (e.currentTarget.open) setOpened(true); }}>
       <summary>⚡ {traceSummary(trace)}</summary>

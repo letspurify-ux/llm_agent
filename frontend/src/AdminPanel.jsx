@@ -4,6 +4,7 @@ import BindConfigEditor from './BindConfigEditor.jsx';
 import DirectoryPicker from './DirectoryPicker.jsx';
 import McpPanel from './McpPanel.jsx';
 import SettingsPanel from './SettingsPanel.jsx';
+import { useChangedState } from './changed-state.js';
 import { readBindings, serializeBindings } from './admin-bindings.js';
 
 const SECTIONS = {
@@ -69,9 +70,11 @@ export default function AdminPanel({ onStateChange }) {
   const [fieldErrors, setFieldErrors] = useState({});
   const [token, setToken] = useState('');
   const [keyInput, setKeyInput] = useState('');
-  const [authError, setAuthError] = useState('');
-  const [authAttempted, setAuthAttempted] = useState(false);
-  const [needsAuth, setNeedsAuth] = useState(false);
+  // 아래 셋은 요청이 끝날 때마다 다시 넣는다(api) — MCP 탭은 5초마다 읽는데 그 답은 자기 패널만 다시 그리고 이 패널은
+  // 그리지 않으므로, 같은 값을 그냥 넘기면 렌더되지 않는 업데이트가 탭을 연 내내 쌓인다(changed-state.js, 실측: 읽기마다 3개).
+  const [authError, setAuthError] = useChangedState('');
+  const [authAttempted, setAuthAttempted] = useChangedState(false);
+  const [needsAuth, setNeedsAuth] = useChangedState(false);
   const [settingsState, setSettingsState] = useState({ dirty: false, busy: false });
   const [picker, setPicker] = useState(null);
   const generation = useRef(0);

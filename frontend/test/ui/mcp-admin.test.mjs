@@ -118,6 +118,34 @@ test('MCP 탭 서버 목록·상태·허용 도구 저장·비밀값 지우기·
   await clickText('.admin-mcp-caption button', '↻');
   await page.until(`!document.querySelector('.admin-mcp .admin-feedback')?.innerText.includes('상태를 새로 읽지 못했습니다')`);
 
+  // 상태를 거듭 읽어도 관리자 화면의 훅 대기열이 자라지 않는다. 읽기마다 인증 상태 셋을 같은 값으로 다시 넣는데,
+  // 그 답은 MCP 패널만 다시 그리고 관리자 화면은 그리지 않아 렌더되지 않는 업데이트가 탭을 연 내내 쌓였다
+  // (실측: 5초 읽기마다 3개, src/changed-state.js). 새로고침 단추가 그 읽기와 같은 길이다.
+  const reads = await page.eval(`window.__requests.filter(r => r.path === 'mcp').length`);
+  for (let i = 0; i < 20; i++) await clickText('.admin-mcp-caption button', '↻');
+  await page.until(`window.__requests.filter(r => r.path === 'mcp').length >= ${reads + 20}`);
+  await sleep(200);
+  const queued = await page.eval(`(() => {
+    const root = document.getElementById('root');
+    const host = root[Object.keys(root).find(k => k.startsWith('__reactContainer$'))];
+    const ring = u => { let n = 0; for (let x = u; x && n < 1e6; x = x.next) { n++; if (x.next === u) break; } return n; };
+    let hooks = 0, worst = 0;
+    const stack = host ? [host.stateNode?.current ?? host] : [];
+    while (stack.length) {
+      const f = stack.pop();
+      for (let h = [0, 11, 15].includes(f.tag) ? f.memoizedState : null; h; h = h.next) {
+        const q = h.queue;
+        if (!q || typeof q !== 'object' || !('pending' in q)) continue;
+        hooks++; worst = Math.max(worst, ring(q.pending) + ring(q.interleaved));
+      }
+      if (f.sibling) stack.push(f.sibling);
+      if (f.child) stack.push(f.child);
+    }
+    return { hooks, worst };
+  })()`);
+  assert.ok(queued.hooks > 20, `검사의 전제: React 트리에서 상태 훅을 찾는다 (${JSON.stringify(queued)}) — React 내부 모양이 바뀌었으면 이 검사를 고칠 것`);
+  assert.ok(queued.worst <= 2, `상태를 20번 읽은 뒤 한 훅의 대기열에 업데이트 ${queued.worst}개가 남았다`);
+
   // 새 서버: 연결 확인으로 받은 도구를 골라 저장한다.
   await clickText('.admin-mcp-caption button', '＋');
   await page.until(`document.querySelector('#mcp-name')?.value === ''`);
