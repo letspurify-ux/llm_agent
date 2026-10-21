@@ -2390,7 +2390,7 @@ it('mermaid의 글자 크기 캐시는 상한 있는 캐시다 — 서로 다른
 // 컨텍스트를 잃었다 되찾는 길(GPU 리셋·절전 복귀)도 같은 부류다: three.js는 복구 때 내부 관리자를 모두 새로 만들지만, 옛
 // 관리자가 재질·지오메트리에 단 'dispose' 리스너가 남아 옛 프로그램·버퍼를 통째로 붙들었다(실측: 복구 15번에 프로그램
 // 161개, 한 번에 힙 ~230KB). 셰이더 프로그램도 FinalizationRegistry로 세어 복구 뒤에 늘지 않는지 본다.
-it('홈을 오가거나 WebGL 컨텍스트를 잃었다 되찾아도 로봇의 GPU 자원이 쌓이지 않는다', async t => {
+it('홈을 오가거나 WebGL 컨텍스트를 잃었다 되찾아도 로봇의 GPU 자원이 쌓이지 않고, 로봇은 그리는 만큼만 프레임을 청한다', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'ui-chrome-webgl-'));
   const proc = launchChrome({ bin: chromeBin, profile: dir, webgl: true });
   let p;
@@ -2440,6 +2440,22 @@ it('홈을 오가거나 WebGL 컨텍스트를 잃었다 되찾아도 로봇의 G
     assert.ok(gl.made >= 왕복 + 2, `검사의 전제: 홈마다 로봇이 새 컨텍스트를 만든다 (${JSON.stringify(gl)})`);
     // 살아 있는 것은 머리글과 빈 화면의 로봇 둘이다.
     assert.ok(gl.made - gl.gone <= 2, `홈을 ${왕복}번 오간 뒤 수거되지 않은 WebGL 캔버스가 ${gl.made - gl.gone}개다 (${JSON.stringify(gl)})`);
+    // 로봇은 그리는 만큼만(초당 30장) 페이지 프레임을 청한다. 화면 주사율마다 청하고 둘에 하나만 그리던 때는 가만히 둔
+    // 화면에서도 프레임마다 치르는 페이지의 일(관찰 중인 요소 재기·갱신·커밋 — 대화가 길수록 커진다)을 두 배(120 Hz면 네 배)로
+    // 치렀다. 바쁜 페이지에서는 청한 프레임이 지난 프레임의 시각을 달고 바로 오므로, 그 시각으로 간격을 재면 다시 매 프레임
+    // 그리게 된다 — 그래서 홈을 오간 지금 잰다 (robotScene.js).
+    await sleep(500);
+    await p.eval(`(() => {
+      window.__frames = 0; window.__draws = 0;
+      const raf = window.requestAnimationFrame;
+      window.requestAnimationFrame = cb => raf(t => { window.__frames++; return cb(t); });
+      const clear = WebGL2RenderingContext.prototype.clear;
+      WebGL2RenderingContext.prototype.clear = function (mask) { window.__draws++; return clear.call(this, mask); };
+    })()`);
+    await sleep(2000);
+    const pace = await p.eval(`({ frames: window.__frames, draws: window.__draws })`);
+    assert.ok(pace.frames <= 2 * 2 * 40, `로봇 둘이 2초에 페이지 프레임을 ${pace.frames}번 청했다 — 초당 30장을 그리는 데 필요한 것보다 많다 (${JSON.stringify(pace)})`);
+    assert.ok(pace.draws >= 2 * 2 * 10, `로봇이 멈췄다: 2초에 ${pace.draws}번 그렸다 (${JSON.stringify(pace)})`);
     // 살아 있는 셰이더 프로그램 수를 잰다 — 수거 알림이 따라올 때까지 GC를 거듭 부른다.
     const alivePrograms = async () => {
       let last = -1;

@@ -87,6 +87,35 @@ function launchChatty(t, prefix) {
   return { launcher, closed, started, logs, file };
 }
 
+// Killed outright, the launcher passes on nothing: a Node server it started
+// (the frontend's Vite) ran on, orphaned, holding its port. It follows the
+// launcher's end now (launcher-watch.cjs) with what the launcher would have
+// sent — SIGTERM, then SIGKILL past the deadline for one that ignores it.
+const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+for (const ignores of [false, true]) {
+  test(`a Node server ${ignores ? 'ignoring SIGTERM is killed' : 'stops'} when its launcher is killed outright`, { timeout: 10_000 }, async t => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'logged-process-orphan-'));
+    const file = path.join(dir, 'frontend.log');
+    const launcher = spawn(process.execPath, [path.join(__dirname, 'logged-process.cjs'), '-e', `
+      process.on('SIGTERM', () => { ${ignores ? '' : 'process.exit(0);'} });
+      console.log('ready pid=' + process.pid);
+      setInterval(() => {}, 1000);
+    `], { env: { ...process.env, APP_LOG_FILE: file, APP_LOG_STOP_MS: '300' }, stdio: 'ignore' });
+    const started = waitFor(() => read(file).match(/ready pid=(\d+)/), 'the server should start').then(m => Number(m[1]));
+    t.after(async () => {
+      if (launcher.exitCode === null) launcher.kill('SIGKILL');
+      try { process.kill(await started, 'SIGKILL'); } catch {}
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+    const server = await started;
+    // Past a look or so, the server runs on under a launcher that does.
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    assert.ok(alive(server), 'the server should run while its launcher does');
+    launcher.kill('SIGKILL');
+    await waitFor(() => !alive(server), 'the server should end with its launcher');
+  });
+}
+
 // A log write that failed (its folder removed) threw out of the launcher:
 // it ended and its server ran on unlogged, its output a broken pipe, with
 // nothing to stop it (stop.sh found no launcher, start.sh the port taken).

@@ -14,6 +14,32 @@ function containingBlock(element) {
 // 넘기면 렌더되지 않는 업데이트가 쌓인다(changed-state.js).
 const sameLayout = (a, b) => a.scroll === b.scroll && Math.abs(a.scale - b.scale) < 0.001;
 
+// 수식들은 관찰자 하나를 함께 쓰고, 같은 문단·셀은 한 번만 관찰한다. 브라우저는 그려지는 프레임마다 관찰 중인
+// 요소를 하나하나 다시 재 보는데(크기가 그대로여도), 수식마다 관찰자를 달면 그 일이 대화에 쌓인 수식 수만큼
+// 늘었다 — 머리글 로봇이 쉬지 않고 프레임을 그리므로 가만히 둔 화면에서도 매 프레임 치르는 값이다
+// (실측, headless Chrome: 답 160개 화면에서 관찰을 훑는 데만 프레임마다 0.5 ms, 관찰을 모두 끊으면 0.05 ms).
+// 한 문단에 수식이 여럿이면 관찰은 하나다.
+const watched = new Map(); // 문단·셀 → 그 안의 수식들이 다시 잴 함수
+let observer = null;
+function watch(block, measure) {
+  if (typeof ResizeObserver === 'undefined') return () => {};
+  observer ??= new ResizeObserver(entries => {
+    for (const entry of entries) watched.get(entry.target)?.forEach(m => m());
+  });
+  let measures = watched.get(block);
+  if (!measures) {
+    watched.set(block, measures = new Set());
+    observer.observe(block);
+  }
+  measures.add(measure);
+  return () => {
+    measures.delete(measure);
+    if (measures.size) return;
+    watched.delete(block);
+    observer.unobserve(block);
+  };
+}
+
 export default function InlineMath({ inLink, className, children, style, ...props }) {
   const ref = useRef(null);
   const [layout, setLayout] = useChangedState({ scroll: false, scale: 1 }, sameLayout);
@@ -39,8 +65,7 @@ export default function InlineMath({ inLink, className, children, style, ...prop
       setLayout({ scroll, scale });
     };
     measure();
-    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
-    observer?.observe(block);
+    const unwatch = watch(block, measure);
     document.fonts?.ready.then(measure);
     // 인쇄는 ResizeObserver의 다음 프레임을 기다리지 않는다. 인쇄용 CSS가
     // 적용된 폭에서 동기적으로 배치하고, 종이에서는 스크롤 대신 크기를 맞춘다.
@@ -50,7 +75,7 @@ export default function InlineMath({ inLink, className, children, style, ...prop
     window.addEventListener('resize', measure);
     return () => {
       alive = false;
-      observer?.disconnect();
+      unwatch();
       window.removeEventListener('beforeprint', print);
       window.removeEventListener('afterprint', measure);
       window.removeEventListener('resize', measure);

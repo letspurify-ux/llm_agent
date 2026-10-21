@@ -7,9 +7,12 @@ log.write(`===== ${new Date().toISOString()} start =====\n`);
 // `--exec <program> [args]` runs a program directly (the Rust backend binary);
 // otherwise the arguments are a Node script and its arguments (the frontend's Vite).
 const args = process.argv.slice(2);
-const [command, commandArgs] = args[0] === '--exec' ? [args[1], args.slice(2)] : [process.execPath, args];
+const [command, commandArgs] = args[0] === '--exec'
+  ? [args[1], args.slice(2)]
+  : [process.execPath, ['--require', path.join(__dirname, 'launcher-watch.cjs'), ...args]];
 // The server is told who started it (APP_LAUNCHER_PID): this launcher killed
-// outright, the Rust backend stops in order instead of running on, orphaned.
+// outright, the server stops in order instead of running on, orphaned — the
+// Rust backend by itself, a Node script through launcher-watch.cjs.
 const child = spawn(command, commandArgs, {
   stdio: ['ignore', 'pipe', 'pipe'],
   env: { ...process.env, APP_LAUNCHER_PID: String(process.pid) },

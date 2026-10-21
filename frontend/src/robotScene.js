@@ -174,9 +174,25 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
   let targetY = 0;
   let elapsed = 0;
   let last = null;
+  // The robot moves at 30 frames a second, and a page frame is asked for only when one is due.
+  // Every animation frame runs the page's own frame work — checking each element under a
+  // ResizeObserver, updating, committing — and that work grows with the conversation on the
+  // screen (measured, headless Chrome: 1.3 ms a frame with 160 answers, 0.3 ms with 3). Asking
+  // for every display frame (setAnimationLoop) and drawing one in two paid it twice per drawn
+  // frame at 60 Hz and four times at 120 Hz, for as long as the page stood open. The wait runs
+  // on a timer and the drawing in the next animation frame, in step with the display; the timer
+  // wakes a little early so that frame is the one due.
+  // The wait is counted from when the last frame was drawn, not from its frame time: when the
+  // page is busy, a frame asked for mid-interval comes at once, stamped with the display frame
+  // already past (measured: asked at 6421 ms, drawn at 6421 ms, stamped 6409 ms) — counted from
+  // the stamp, every wait came up short and the robot drew at the display's full rate.
+  const FRAME_MS = 1000 / 30;
+  const EARLY_MS = 6;
+  let wait = 0;
+  let pending = 0;
   function frame(now) {
-    if (last !== null && now - last < 1000 / 30) return;
-    const dt = last === null ? 0 : Math.min((now - last) / 1000, 0.1);
+    // A frame stamped before the last one drawn (see above) moves nothing rather than back.
+    const dt = last === null ? 0 : Math.min(Math.max(now - last, 0) / 1000, 0.1);
     last = now;
     elapsed += dt;
     const t = elapsed;
@@ -199,12 +215,30 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
       host.classList.add('robot-ready');
     }
   }
+  function schedule(drawn) {
+    wait = setTimeout(() => {
+      wait = 0;
+      pending = requestAnimationFrame(now => {
+        pending = 0;
+        const at = performance.now();
+        frame(now);
+        schedule(at);
+      });
+    }, Math.max(0, drawn + FRAME_MS - EARLY_MS - performance.now()));
+  }
+  function halt() {
+    clearTimeout(wait);
+    cancelAnimationFrame(pending);
+    wait = 0;
+    pending = 0;
+  }
   function sync() {
-    renderer.setAnimationLoop(null);
+    halt();
     last = null;
     if (disposed || lost || !visible || document.hidden) return;
-    frame(performance.now());
-    renderer.setAnimationLoop(frame);
+    const at = performance.now();
+    frame(at);
+    schedule(at);
   }
   function resize() {
     const { width, height } = host.getBoundingClientRect();
@@ -261,7 +295,7 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
   renderer.domElement.addEventListener('webglcontextrestored', contextRestored);
   return () => {
     disposed = true;
-    renderer.setAnimationLoop(null);
+    halt();
     observer.disconnect();
     intersection.disconnect();
     window.removeEventListener('pointermove', pointer);

@@ -293,6 +293,9 @@ Windows의 `start.bat`(`start_all.bat`도 이것을 부른다)은 같은 파일�
 SIGINT·SIGTERM처럼 정리하고 끝난다. 실행기는 자기 PID를 `APP_LAUNCHER_PID`로 서버에 알리고, backend는 그 실행기가
 끝나면(SIGKILL로 강제 종료돼 신호를 넘기지 못해도) SIGTERM처럼 정리하고 끝난다 — 전에는 포트·DB 연결·MCP 서버를 쥔 채 고아로 남아
 stop.sh가 멈추지 못하고 start.sh는 포트가 잡혀 실패했다. 시스템이 알려 주는 방식(macOS kqueue, Linux pidfd)이라 폴링하지 않는다.
+frontend의 Vite도 같다: 실행기가 함께 싣는 `scripts/launcher-watch.cjs`가 1초마다 부모를 보다가 실행기가 사라지면 SIGTERM을,
+그래도 남으면 정지 시한(`APP_LOG_STOP_MS`) 뒤 SIGKILL을 스스로 보낸다 — 전에는 포트를 쥔 채 고아로 남아 stop.sh는 멈출 것을 못 찾고
+start.sh는 다음 포트에 한 벌 더 띄웠다.
 이 값 없이 직접 띄운 서버(`nohup`, 터미널)는 띄운 프로세스가 끝나도 그대로 돈다.
 backend는 시작할 때 열린 파일 수 한도를 시스템이 허용하는 최대로 올린다(macOS 터미널에서 띄우면 256이라, 연결 수백 개가 한꺼번에
 열리면 관리 DB·모델·다음 요청 연결이 "too many open files"로 실패했다 — 전 Node backend는 Node가 올려 주었다). 진행 중인 요청이 없는

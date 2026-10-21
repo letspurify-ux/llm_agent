@@ -12,7 +12,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const VITE = join(ROOT, 'node_modules/vite/bin/vite.js');
 const LONG = String.raw`\frac{\text{ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ}}{\sqrt{x^2+y^2}}`;
 const TALL = String.raw`\dfrac{\overbrace{\text{ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ}}^{n}}{\dfrac{1}{\sqrt{x^2+y^2}}}`;
-const FORMULAS = ['x^2', LONG, LONG, LONG, LONG, TALL, `${LONG}+${LONG}`, 'a+b+c+d+e+f+g+h+i+j+k+l+m+n+o+p+q+r+s+t', LONG, LONG, LONG];
+const FORMULAS = ['x^2', LONG, LONG, LONG, LONG, TALL, `${LONG}+${LONG}`, 'a+b+c+d+e+f+g+h+i+j+k+l+m+n+o+p+q+r+s+t', LONG, 'a', 'b', 'c', LONG, LONG];
 const ANSWER = [
   '짧은 수식 $x^2$ 뒤.',
   `문단 $${LONG}$ 끝.`,
@@ -23,6 +23,7 @@ const ANSWER = [
   `여러 덩어리 $${LONG}+${LONG}$ 끝.`,
   `$${FORMULAS[7]}$`,
   `| 표 | 수식 |\n|---|---|\n| 왼쪽 | $${LONG}$ |`,
+  '한 문단의 여러 수식 $a$, $b$, $c$ 끝.',
   `별행\n\n$$\n${LONG}\n$$`,
   `각주[^math]\n\n[^math]: 수식 $${LONG}$`,
   '```chart\ntype: bar\n| 이름 | 값 |\n|---|---|\n| A | 7 |\n```',
@@ -85,6 +86,12 @@ for (const production of [false, true]) test(`${production ? 'production' : 'dev
   await page.until(`document.querySelector('.mermaid svg') && document.querySelector('figure.chart .recharts-surface') && !document.querySelector('.typing')`);
   assert.deepEqual(await page.eval(`[...document.querySelectorAll('.bubble.assistant .md annotation')].map(e => e.textContent)`), FORMULAS);
   assert.equal(await page.eval(`document.querySelectorAll('.mermaid math').length`), 1);
+  // 한 문단의 수식들은 그 문단을 한 번만 관찰한다. 브라우저는 그리는 프레임마다 관찰 중인 요소를 하나하나 다시 재 보므로
+  // (머리글 로봇이 쉬지 않고 프레임을 그린다), 수식마다 관찰하면 그 일이 대화에 쌓인 수식 수만큼 늘었다 (InlineMath.jsx).
+  assert.equal(await page.eval(`(() => {
+    const p = [...document.querySelectorAll('.bubble.assistant .md p')].find(e => e.querySelectorAll('.katex').length === 3);
+    return [...window.__observed.values()].filter(s => s.has(p)).length;
+  })()`), 1, '수식 셋이 든 문단을 관찰하는 곳이 하나가 아니다');
   for (const width of [320, 1000, 320]) {
     await page.viewport(width, 900);
     await page.eval('document.fonts.ready.then(() => true)');

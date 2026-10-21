@@ -16,7 +16,7 @@ async function projects(t) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'frontend-launchers-')));
   const dirs = [join(root, 'our app'), join(root, 'other app')];
   await mkdir(join(root, 'scripts'));
-  for (const script of ['logged-process.cjs', 'retained-log.cjs']) {
+  for (const script of ['logged-process.cjs', 'retained-log.cjs', 'launcher-watch.cjs']) {
     await copyFile(new URL(`../../scripts/${script}`, import.meta.url), join(root, 'scripts', script));
   }
   for (const dir of dirs) {
@@ -79,4 +79,21 @@ test('start.sh는 다른 프로젝트의 Vite가 살아 있어도 자기 서버�
   assert.equal(alive(pid), false);
   assert.equal(alive(childPid), false, '로그 수집기 종료 뒤 서버가 남았다');
   assert.ok(alive(p.pid));
+});
+
+// 로그 수집기가 신호를 넘기지 못하고 죽어도(SIGKILL: 강제 종료, 메모리 부족) 서버가 따라 끝난다. 전에는 서버가
+// 부모 없이 포트를 쥔 채 남아 stop.sh는 멈출 것을 못 찾고 start.sh는 다음 포트에 한 벌 더 띄웠다
+// (실측: 중단된 이 검사가 남긴 서버 열 개가 며칠째 돌고 있었다).
+test('로그 수집기가 강제 종료되면 서버도 끝난다', posix, async t => {
+  const [ours] = await projects(t);
+  await exec('bash', ['start.sh'], { cwd: ours });
+  const pid = Number(await readFile(join(ours, '.frontend.pid'), 'utf8'));
+  const childPid = Number((await readFile(join(ours, 'logs/frontend.log'), 'utf8')).match(/ready pid=(\d+)/)?.[1]);
+  assert.ok(childPid > 0 && alive(childPid));
+  t.after(() => { try { process.kill(childPid, 'SIGKILL'); } catch {} });
+  process.kill(pid, 'SIGKILL');
+  for (let i = 0; i < 50 && alive(childPid); i++) await sleep(100);
+  assert.equal(alive(childPid), false, '수집기가 죽은 뒤에도 서버가 남았다');
+  // stop.sh는 내려간 것을 알아보고 표지를 치운다.
+  await exec('bash', ['stop.sh'], { cwd: ours });
 });
