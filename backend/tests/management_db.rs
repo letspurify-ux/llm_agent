@@ -279,3 +279,23 @@ async fn a_connection_that_carried_a_large_row_is_not_pooled_again() {
     assert_eq!(open, "0");
     db.close().await;
 }
+
+/// Resource review, 39th pass: a host name is looked up ahead of the driver
+/// (`Db::addresses`), and the pool and a lock's connection still reach it.
+#[tokio::test]
+async fn a_host_name_reaches_the_db() {
+    let Some(test_db) = TestDb::create("host_name") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let mut cfg = test_db.config().mariadb;
+    cfg.host = "localhost".into();
+    let db = Db::default();
+    let row = db.query(&cfg, "SELECT 1 AS one", vec![]).await.unwrap().remove(0);
+    assert_eq!(db::int(&row, "one"), 1);
+    let lock = db.lock_conn(&cfg).await.unwrap();
+    db.close_conn(&cfg, lock).await;
+    let mut conn = db.conn(&cfg).await.unwrap();
+    assert_eq!(db::int(&db::query_on(&cfg, &mut conn, "SELECT 2 AS two", vec![]).await.unwrap()[0], "two"), 2);
+    drop(conn);
+    db.close().await;
+}

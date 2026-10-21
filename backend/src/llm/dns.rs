@@ -142,8 +142,18 @@ impl SystemDns {
     }
 
     fn system(&self, name: &str) -> Resolving {
-        self.resolve_with(name.to_owned(), |name| Ok((name, 0).to_socket_addrs()?.collect()))
+        self.resolve_with(name.to_owned(), lookup)
     }
+
+    /// The addresses of `name`, looked up as a client's are (the management
+    /// DB's host, which its driver would look up on Tokio's threads).
+    pub(crate) async fn addresses(&self, name: &str) -> io::Result<Vec<SocketAddr>> {
+        self.answer(name.to_owned(), lookup).await
+    }
+}
+
+fn lookup(name: &str) -> io::Result<Vec<SocketAddr>> {
+    Ok((name, 0).to_socket_addrs()?.collect())
 }
 
 /// Removes flight `id` of `name`, if it is still the one listed.

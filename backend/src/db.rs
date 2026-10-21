@@ -6,7 +6,12 @@ use crate::config::MariaDbConfig;
 use anyhow::{Result, bail};
 use mysql_async::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, prelude::Queryable};
 use serde_json::{Map, Value, json};
-use std::{collections::VecDeque, sync::Mutex, time::Duration};
+use std::{
+    collections::VecDeque,
+    net::IpAddr,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 pub type Row = Map<String, Value>;
 pub type Param = mysql_async::Value;
@@ -24,7 +29,23 @@ pub fn n(value: i64) -> Param {
 pub struct Db {
     /// Pools by the settings they connect with, the last used last.
     pools: Mutex<VecDeque<(String, Pool)>>,
+    /// Addresses of host names, the last used last (`Db::addresses`).
+    hosts: Arc<Mutex<VecDeque<Known>>>,
 }
+
+/// The addresses a host name was last found at.
+struct Known {
+    host: String,
+    addresses: Vec<IpAddr>,
+    at: Instant,
+    refreshing: bool,
+}
+
+/// How long a host name's addresses are used before they are looked up
+/// again — in the background, the ones known used meanwhile.
+const HOST_TTL: Duration = Duration::from_secs(60);
+/// Host names whose addresses are kept (settings changed back and forth).
+const HOSTS_KEPT: usize = 8;
 
 /// Pools kept for settings no longer the latest. A settings change made a
 /// new pool and disconnected the one before at once, which fails every
@@ -140,8 +161,51 @@ pub fn refuses_writes(error: &anyhow::Error) -> bool {
 }
 
 impl Db {
-    fn pool(&self, cfg: &MariaDbConfig) -> Result<Pool> {
-        let fingerprint = cfg.fingerprint();
+    /// The addresses to reach `cfg`'s host at, when it is a name (none for
+    /// an address). The driver looked a name up itself — the default host
+    /// is `localhost` — on Tokio's blocking threads, at each connection it
+    /// made, and a connection given up on (the DB time limit, a stopped
+    /// question) left its lookup running: a resolver that did not answer
+    /// held a thread for each (64 for 64 queries), threads the server keeps,
+    /// and every blocking task waited once 512 were taken. Looked up here,
+    /// as the other clients' names are (`SystemDns::waiting`), and known for
+    /// `HOST_TTL`: past it the name is looked up again in the background,
+    /// one lookup at a time, while the known addresses go on being used —
+    /// a resolver that stopped answering does not stop the DB.
+    async fn addresses(&self, cfg: &MariaDbConfig) -> Result<Option<Vec<IpAddr>>> {
+        let host = cfg.host.as_str();
+        if host.parse::<IpAddr>().is_ok() {
+            return Ok(None);
+        }
+        {
+            let mut hosts = self.hosts.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(known) = hosts.iter_mut().find(|known| known.host == host) {
+                if known.at.elapsed() >= HOST_TTL && !known.refreshing {
+                    known.refreshing = true;
+                    let (hosts, host) = (self.hosts.clone(), host.to_owned());
+                    tokio::spawn(async move {
+                        let found = look_up(&host).await;
+                        learn(&hosts, &host, found.ok());
+                    });
+                }
+                return Ok(Some(known.addresses.clone()));
+            }
+        }
+        let found = timed(cfg, look_up(host)).await?;
+        learn(&self.hosts, host, Some(found.clone()));
+        Ok(Some(found))
+    }
+
+    async fn pool(&self, cfg: &MariaDbConfig) -> Result<Pool> {
+        let addresses = self.addresses(cfg).await?;
+        let fingerprint = match &addresses {
+            Some(found) => {
+                let mut sorted = found.clone();
+                sorted.sort();
+                format!("{} {sorted:?}", cfg.fingerprint())
+            }
+            None => cfg.fingerprint(),
+        };
         let mut pools = self.pools.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(at) = pools.iter().position(|(known, _)| *known == fingerprint) {
             let entry = pools.remove(at).unwrap();
@@ -151,7 +215,7 @@ impl Db {
         }
         let constraints = PoolConstraints::new(0, cfg.pool_size.max(1))
             .ok_or_else(|| anyhow::anyhow!("invalid pool size"))?;
-        let opts = options(cfg).pool_opts(
+        let opts = options(cfg).resolved_ips(addresses).pool_opts(
             PoolOpts::default()
                 .with_constraints(constraints)
                 .with_inactive_connection_ttl(IDLE_CONNECTION_TTL),
@@ -166,7 +230,7 @@ impl Db {
 
     /// A connection of its own, for a transaction or a session lock.
     pub async fn conn(&self, cfg: &MariaDbConfig) -> Result<Conn> {
-        let pool = self.pool(cfg)?;
+        let pool = self.pool(cfg).await?;
         let conn = timed(cfg, async move { Ok(pool.get_conn().await?) }).await?;
         Ok(Conn::new(conn, cfg))
     }
@@ -177,7 +241,7 @@ impl Db {
     /// every embedding sync failed after twice the DB timeout, every other
     /// use of the DB waiting meanwhile. Closed with `close_conn`.
     pub async fn lock_conn(&self, cfg: &MariaDbConfig) -> Result<Conn> {
-        let opts = Opts::from(options(cfg));
+        let opts = Opts::from(options(cfg).resolved_ips(self.addresses(cfg).await?));
         let conn = timed(cfg, async move { Ok(mysql_async::Conn::new(opts).await?) }).await?;
         Ok(Conn::new(conn, cfg))
     }
@@ -202,7 +266,7 @@ impl Db {
     /// connection kept for them.
     pub async fn query_with(&self, cfg: &MariaDbConfig, settings: &str, sql: &str, params: Vec<Param>) -> Result<Vec<Row>> {
         let statement = limited(cfg, settings, sql);
-        to_the_end(self.pool(cfg)?, cfg.clone(), async move |cfg, mut conn| {
+        to_the_end(self.pool(cfg).await?, cfg.clone(), async move |cfg, mut conn| {
             rows(&cfg, &mut conn, &statement, params).await
         })
         .await
@@ -211,7 +275,7 @@ impl Db {
     /// Runs a statement; returns (affected rows, last insert id).
     pub async fn exec(&self, cfg: &MariaDbConfig, sql: &str, params: Vec<Param>) -> Result<(u64, u64)> {
         let statement = limited(cfg, "", sql);
-        to_the_end(self.pool(cfg)?, cfg.clone(), async move |cfg, mut conn| {
+        to_the_end(self.pool(cfg).await?, cfg.clone(), async move |cfg, mut conn| {
             affected(&cfg, &mut conn, &statement, params).await
         })
         .await
@@ -220,6 +284,36 @@ impl Db {
     pub async fn close(&self) {
         let pools = std::mem::take(&mut *self.pools.lock().unwrap_or_else(|p| p.into_inner()));
         futures_util::future::join_all(pools.into_iter().map(|(_, pool)| pool.disconnect())).await;
+    }
+}
+
+/// The addresses of a host name, in the order found.
+async fn look_up(host: &str) -> Result<Vec<IpAddr>> {
+    let mut found: Vec<IpAddr> = vec![];
+    for address in crate::llm::dns::SystemDns::waiting().addresses(host).await? {
+        if !found.contains(&address.ip()) {
+            found.push(address.ip());
+        }
+    }
+    if found.is_empty() {
+        bail!("failed to lookup address information: {host} has no address");
+    }
+    Ok(found)
+}
+
+/// What a lookup of `host` found: its addresses, or none (failed), when the
+/// known ones stay. Either way the next lookup is `HOST_TTL` away.
+fn learn(hosts: &Mutex<VecDeque<Known>>, host: &str, found: Option<Vec<IpAddr>>) {
+    let mut hosts = hosts.lock().unwrap_or_else(|p| p.into_inner());
+    let known = match hosts.iter().position(|known| known.host == host) {
+        Some(at) => hosts.remove(at).map(|known| Known { addresses: found.unwrap_or(known.addresses), ..known }),
+        None => found.map(|addresses| Known { host: host.to_owned(), addresses, at: Instant::now(), refreshing: false }),
+    };
+    if let Some(known) = known {
+        hosts.push_back(Known { at: Instant::now(), refreshing: false, ..known });
+        while hosts.len() > HOSTS_KEPT {
+            hosts.pop_front();
+        }
     }
 }
 
@@ -550,5 +644,66 @@ mod tests {
         assert_eq!(value_json(V::Int(-3)), json!(-3));
         assert_eq!(value_json(V::Date(2026, 9, 6, 1, 2, 3, 0)), json!("2026-09-06 01:02:03"));
         assert_eq!(value_json(V::NULL), Value::Null);
+    }
+
+    fn known(db: &Db, host: &str) -> Option<(Vec<IpAddr>, bool)> {
+        let hosts = db.hosts.lock().unwrap();
+        hosts.iter().find(|k| k.host == host).map(|k| (k.addresses.clone(), k.refreshing))
+    }
+
+    /// A host name's addresses are looked up once, used while known, and
+    /// past `HOST_TTL` looked up again in the background — the known ones
+    /// used meanwhile, and kept when the lookup fails.
+    #[tokio::test]
+    async fn host_names_are_looked_up_ahead_of_the_driver() {
+        let db = Db::default();
+        let cfg = MariaDbConfig { host: "127.0.0.1".into(), ..Default::default() };
+        assert_eq!(db.addresses(&cfg).await.unwrap(), None, "an address is not looked up");
+        let cfg = MariaDbConfig { host: "localhost".into(), ..Default::default() };
+        let found = db.addresses(&cfg).await.unwrap().unwrap();
+        assert!(found.iter().all(IpAddr::is_loopback) && !found.is_empty(), "{found:?}");
+
+        let old: IpAddr = "10.9.9.9".parse().unwrap();
+        let stale = |db: &Db, host: &str| {
+            let mut hosts = db.hosts.lock().unwrap();
+            let known = hosts.iter_mut().find(|k| k.host == host).unwrap();
+            known.addresses = vec![old];
+            known.at = Instant::now() - HOST_TTL;
+        };
+        stale(&db, "localhost");
+        assert_eq!(db.addresses(&cfg).await.unwrap().unwrap(), [old], "the known addresses serve meanwhile");
+        assert_eq!(known(&db, "localhost"), Some((vec![old], true)));
+        // One lookup at a time: asked again meanwhile, none more is begun.
+        assert_eq!(db.addresses(&cfg).await.unwrap().unwrap(), [old]);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while known(&db, "localhost").is_some_and(|(_, refreshing)| refreshing) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.addresses(&cfg).await.unwrap().unwrap(), found);
+
+        // A name that is no longer found keeps its addresses.
+        learn(&db.hosts, "gone.invalid", Some(vec![old]));
+        stale(&db, "gone.invalid");
+        let gone = MariaDbConfig { host: "gone.invalid".into(), ..Default::default() };
+        assert_eq!(db.addresses(&gone).await.unwrap().unwrap(), [old]);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while known(&db, "gone.invalid").is_some_and(|(_, refreshing)| refreshing) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(known(&db, "gone.invalid"), Some((vec![old], false)));
+        // Never found, it fails as the driver did.
+        let error = db.addresses(&MariaDbConfig { host: "never.invalid".into(), ..Default::default() }).await.unwrap_err();
+        assert!(known(&db, "never.invalid").is_none(), "{error:#}");
+
+        for i in 0..HOSTS_KEPT + 3 {
+            learn(&db.hosts, &format!("h{i}"), Some(vec![old]));
+        }
+        assert_eq!(db.hosts.lock().unwrap().len(), HOSTS_KEPT);
     }
 }
