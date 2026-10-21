@@ -207,9 +207,6 @@ async fn run(
         llm: vec![],
         tools: vec![],
     };
-    let question_bundle = c
-        .history
-        .push(vec![json!({"role":"user","content":message})], true);
     let model = config.llm.model.clone();
     // The MCP tools of this question: the same definitions and system prompt
     // in every request, so a provider's prefix cache keeps them. A request
@@ -217,11 +214,17 @@ async fn run(
     let mut mcp = app.mcp.snapshot_within(config, mcp::MAX_REQUEST_TOOLS.saturating_sub(most_agent_tools(config)));
     // Definitions past twice the context cannot fit, whatever the
     // calibration (at least half the local count): said before a request
-    // with them all is counted.
+    // with them all is counted, and before the question joins the
+    // conversation — it left before eviction, where only the input budget
+    // bounds the bundles in the context, and each question asked meanwhile
+    // stayed there for as long as the conversation went on.
     if mcp.tokens(&model) / 2 > config.llm.context_tokens {
         eprintln!("[mcp] the allowed MCP tools' definitions (~{} tokens) are past twice the context", mcp.tokens(&model));
         bail!(UserFacing(MCP_TOO_LARGE.into()));
     }
+    let question_bundle = c
+        .history
+        .push(vec![json!({"role":"user","content":message})], true);
     let mut system = context::system_prompt(&mcp.prompt());
     let deadline = timing.started + Duration::from_secs(config.agent.run_seconds);
     let mut trace: Vec<Value> = vec![];

@@ -129,6 +129,16 @@ pub fn server_code(error: &anyhow::Error) -> Option<u16> {
     }
 }
 
+/// A write the table refuses whatever the row: the account may not (a
+/// missing grant; REPLACE takes DELETE too), or the server or table is read
+/// only, or full. Tried row by row, each is refused the same way.
+pub fn refuses_writes(error: &anyhow::Error) -> bool {
+    // ER_DISK_FULL, ER_OPEN_AS_READONLY, ER_RECORD_FILE_FULL, table and
+    // column access denied, ER_SPECIFIC_ACCESS_DENIED, ER_OPTION_PREVENTS_STATEMENT
+    // (read_only), ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION, ER_INNODB_READ_ONLY.
+    matches!(server_code(error), Some(1021 | 1036 | 1114 | 1142 | 1143 | 1227 | 1290 | 1792 | 1874))
+}
+
 impl Db {
     fn pool(&self, cfg: &MariaDbConfig) -> Result<Pool> {
         let fingerprint = cfg.fingerprint();

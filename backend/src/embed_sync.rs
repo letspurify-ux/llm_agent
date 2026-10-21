@@ -343,6 +343,12 @@ async fn rebuild_chunks(db: &Db, config: &Config, stop: &CancellationToken, out:
             Err(e) => {
                 let _ = plain_on(cfg, &mut conn, "ROLLBACK").await;
                 out.chunks_failed += 1;
+                // Each document left would be read and split for the same
+                // refusal and line, at every sync.
+                if db::refuses_writes(&e) {
+                    eprintln!("[embed] knowledge_chunk takes no writes — the documents to split wait for the next sync: {e}");
+                    return Ok(());
+                }
                 eprintln!("[embed] knowledge#{seq} chunking failed — skipping this document only: {e}");
             }
         }
@@ -415,6 +421,7 @@ async fn sync(state: &EmbedSync, db: &Db, config: &Config, stop: &CancellationTo
                 .await?;
             out.deleted += deleted;
         }
+        let stale = if stale.is_empty() || takes_writes(db, config, table, stale.len()).await { stale } else { vec![] };
         // Read as many rows as one embedding call takes: a thousand rows of
         // three TEXT columns each were up to 190 MiB read at once, for
         // texts cut to MAX_EMBED_TEXT_LEN.
@@ -459,6 +466,7 @@ async fn sync(state: &EmbedSync, db: &Db, config: &Config, stop: &CancellationTo
                     out.skipped = Skipped::Stopped;
                     break;
                 }
+                Flow::Unwritable => break,
             }
         }
         if out.skipped == Skipped::Stopped {
@@ -557,10 +565,33 @@ async fn rebuild_index(
     Ok(())
 }
 
+/// Whether `table`'s vectors can be stored, tried with a REPLACE of no
+/// rows, which the server refuses as it would any (`db::refuses_writes`).
+/// Refused, every stale row was embedded at every sync for nothing, and
+/// each then refused with a line of its own: as many embeddings and lines a
+/// minute as rows, for good.
+async fn takes_writes(db: &Db, config: &Config, table: &str, waiting: usize) -> bool {
+    let vec = vec_table(table);
+    let sql = format!("REPLACE INTO {vec} (seq, embed_hash, embedding) SELECT seq, embed_hash, embedding FROM {vec} WHERE FALSE");
+    match db.exec(&config.mariadb, &sql, vec![]).await {
+        Err(e) if db::refuses_writes(&e) => {
+            unwritable(&vec, waiting, &e);
+            false
+        }
+        _ => true,
+    }
+}
+
+fn unwritable(vec: &str, waiting: usize, e: &anyhow::Error) {
+    eprintln!("[embed] {vec} takes no writes — {waiting} rows to embed wait for the next sync: {e}");
+}
+
 enum Flow {
     Continue,
     Unavailable,
     Stopped,
+    /// The table refused the vectors as it would any: the rest of its rows wait.
+    Unwritable,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -587,7 +618,9 @@ async fn embed_stale(
         match embed(&config.embedding, &texts, stop).await {
             Ok(vectors) => {
                 taken(batch);
-                store(db, config, table, batch, &vectors, out).await;
+                if store(db, config, table, batch, &vectors, out).await.is_err() {
+                    return Flow::Unwritable;
+                }
             }
             Err(_) if stop.is_cancelled() => return Flow::Stopped,
             Err(e) => {
@@ -612,7 +645,9 @@ async fn embed_stale(
                     match embed(&config.embedding, std::slice::from_ref(&row.1), stop).await {
                         Ok(vectors) => {
                             taken(std::slice::from_ref(row));
-                            store(db, config, table, std::slice::from_ref(row), &vectors, out).await;
+                            if store(db, config, table, std::slice::from_ref(row), &vectors, out).await.is_err() {
+                                return Flow::Unwritable;
+                            }
                         }
                         Err(_) if stop.is_cancelled() => return Flow::Stopped,
                         Err(e) if e.retriable => {
@@ -643,7 +678,10 @@ fn warn(e: &EmbedError) {
     eprintln!("[embedding] embedding call failed: {e}");
 }
 
-async fn store(db: &Db, config: &Config, table: &str, batch: &[(i64, String, String)], vectors: &[Vec<f32>], out: &mut Summary) {
+/// Stores the batch's vectors, row by row when the batch fails. Err when
+/// the table refuses writes as such (`db::refuses_writes`, said here): the
+/// rows after it wait for the next sync.
+async fn store(db: &Db, config: &Config, table: &str, batch: &[(i64, String, String)], vectors: &[Vec<f32>], out: &mut Summary) -> Result<(), ()> {
     let cfg = &config.mariadb;
     let vec = vec_table(table);
     let mut params = vec![];
@@ -654,11 +692,19 @@ async fn store(db: &Db, config: &Config, table: &str, batch: &[(i64, String, Str
         "REPLACE INTO {vec} (seq, embed_hash, embedding) VALUES {}",
         vec!["(?, ?, VEC_FromText(?))"; batch.len()].join(", ")
     );
-    if db.exec(cfg, &sql, params).await.is_ok() {
-        out.embedded += batch.len();
-        return;
+    match db.exec(cfg, &sql, params).await {
+        Ok(_) => {
+            out.embedded += batch.len();
+            return Ok(());
+        }
+        Err(e) if db::refuses_writes(&e) => {
+            out.failed += batch.len();
+            unwritable(&vec, batch.len(), &e);
+            return Err(());
+        }
+        Err(_) => {}
     }
-    for (row, vector) in batch.iter().zip(vectors) {
+    for (i, (row, vector)) in batch.iter().zip(vectors).enumerate() {
         match db
             .exec(
                 cfg,
@@ -668,10 +714,18 @@ async fn store(db: &Db, config: &Config, table: &str, batch: &[(i64, String, Str
             .await
         {
             Ok(_) => out.embedded += 1,
+            Err(e) if db::refuses_writes(&e) => {
+                out.failed += batch.len() - i;
+                unwritable(&vec, batch.len() - i, &e);
+                return Err(());
+            }
             Err(e) => {
                 out.failed += 1;
-                eprintln!("[embed] {table}#{} store failed: {e}", row.0);
+                if out.failed <= ROW_WARNINGS {
+                    eprintln!("[embed] {table}#{} store failed: {e}", row.0);
+                }
             }
         }
     }
+    Ok(())
 }

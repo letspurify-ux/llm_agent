@@ -1723,11 +1723,19 @@ async fn too_many_allowed_mcp_tools_are_named_as_what_does_not_fit() {
         ready(&app.mcp, "wide").await;
         let tokens: u64 = app.mcp.server_status("wide", MODEL).unwrap()["tools"].as_array().unwrap().iter().map(|t| t["tokens"].as_u64().unwrap()).sum();
         assert!(range.contains(&tokens), "the fixture is as wide as meant: {tokens}");
-        let (result, _) = ask(&app, "안녕").await;
-        let Err(error) = result else { panic!("the question was answered") };
-        let shown = error.downcast_ref::<agent::UserFacing>().map(|e| e.0.clone()).unwrap_or_else(|| error.to_string());
-        assert!(shown.contains("MCP 탭에서 허용 도구를 줄여주세요"), "{wide}: {shown}");
+        // Asked on and on meanwhile, the conversation keeps no more in its
+        // context than one question.
+        for _ in 0..3 {
+            let (result, _) = ask(&app, "안녕").await;
+            let Err(error) = result else { panic!("the question was answered") };
+            let shown = error.downcast_ref::<agent::UserFacing>().map(|e| e.0.clone()).unwrap_or_else(|| error.to_string());
+            assert!(shown.contains("MCP 탭에서 허용 도구를 줄여주세요"), "{wide}: {shown}");
+        }
         assert!(llm.requests().is_empty(), "nothing was sent");
+        let claim = app.sessions.open("mcp", Duration::from_secs(60), 10, CancellationToken::new());
+        let active = claim.conversation.lock().await.history.bundles.iter().filter(|b| b.active).count();
+        app.sessions.finish("mcp", claim.run);
+        assert!(active <= 1, "{wide}: {active} questions in the context");
         app.mcp.shutdown().await;
     }
 }

@@ -346,6 +346,53 @@ fn index_entries(test_db: &TestDb) -> u64 {
         .unwrap()
 }
 
+/// A management DB account as the README grants it, with `on_qa_vectors`
+/// on `vec_qa_method`; dropped (as each host has it) however a test ends.
+/// This server has an anonymous ''@'localhost', so `%` alone cannot log in.
+struct Users<'a> {
+    test_db: &'a TestDb,
+    user: String,
+}
+impl<'a> Users<'a> {
+    const HOSTS: [&'static str; 3] = ["localhost", "127.0.0.1", "%"];
+
+    fn create(test_db: &'a TestDb, on_qa_vectors: &str) -> Self {
+        let users = Users { test_db, user: format!("zz_sync_{}", std::process::id()) };
+        for host in Self::HOSTS {
+            let user = &users.user;
+            test_db.sql(&format!("DROP USER IF EXISTS '{user}'@'{host}'; CREATE USER '{user}'@'{host}' IDENTIFIED BY 'zz-sync';"));
+        }
+        users.grant("SELECT ON {db}.*");
+        users.grant("SELECT, INSERT, UPDATE, DELETE ON {db}.knowledge_chunk");
+        users.grant("SELECT, INSERT, UPDATE, DELETE ON {db}.vec_knowledge_chunk");
+        users.grant(&format!("{on_qa_vectors} ON {{db}}.vec_qa_method"));
+        users.grant("SELECT, INSERT, UPDATE, DELETE ON {db}.vec_query_registry");
+        users
+    }
+
+    /// Grants `what` (`{db}` the test database) on every host.
+    fn grant(&self, what: &str) {
+        let what = what.replace("{db}", &self.test_db.name);
+        for host in Self::HOSTS {
+            self.test_db.sql(&format!("GRANT {what} TO '{}'@'{host}';", self.user));
+        }
+    }
+
+    fn config(&self) -> llm_agent::config::Config {
+        let mut config = self.test_db.config();
+        config.mariadb.user = self.user.clone();
+        config.mariadb.password = Some(llm_agent::config::Secret("zz-sync".into()));
+        config
+    }
+}
+impl Drop for Users<'_> {
+    fn drop(&mut self) {
+        for host in Self::HOSTS {
+            self.test_db.sql(&format!("DROP USER IF EXISTS '{}'@'{host}';", self.user));
+        }
+    }
+}
+
 /// MariaDB's vector index keeps the entry of every row deleted or replaced
 /// until the table is rebuilt: the sync's deletes and re-embeddings grew it
 /// without end (60,856 entries, 180 MB, for 2 rows after an afternoon of
@@ -390,33 +437,9 @@ async fn an_account_without_alter_syncs_on_and_with_it_rebuilds_by_its_own_count
     let Some(test_db) = TestDb::create("sync_rebuild_grants") else {
         return skip("LLM_AGENT_TEST_MARIADB is not set");
     };
-    let user = format!("zz_sync_{}", std::process::id());
-    let hosts = ["localhost", "127.0.0.1", "%"];
-    let db_name = &test_db.name;
-    // Dropped however the test ends.
-    struct Users<'a>(&'a TestDb, &'a str, [&'a str; 3]);
-    impl Drop for Users<'_> {
-        fn drop(&mut self) {
-            for host in self.2 {
-                self.0.sql(&format!("DROP USER IF EXISTS '{}'@'{host}';", self.1));
-            }
-        }
-    }
-    let _users = Users(&test_db, &user, hosts);
-    for host in hosts {
-        test_db.sql(&format!(
-            "DROP USER IF EXISTS '{user}'@'{host}'; CREATE USER '{user}'@'{host}' IDENTIFIED BY 'zz-sync';
-             GRANT SELECT ON {db_name}.* TO '{user}'@'{host}';
-             GRANT SELECT, INSERT, UPDATE, DELETE ON {db_name}.knowledge_chunk TO '{user}'@'{host}';
-             GRANT SELECT, INSERT, UPDATE, DELETE ON {db_name}.vec_knowledge_chunk TO '{user}'@'{host}';
-             GRANT SELECT, INSERT, UPDATE, DELETE ON {db_name}.vec_qa_method TO '{user}'@'{host}';
-             GRANT SELECT, INSERT, UPDATE, DELETE ON {db_name}.vec_query_registry TO '{user}'@'{host}';"
-        ));
-    }
-    let mut config = test_db.config();
+    let users = Users::create(&test_db, "SELECT, INSERT, UPDATE, DELETE");
+    let mut config = users.config();
     config.embedding.url = String::new();
-    config.mariadb.user = user.clone();
-    config.mariadb.password = Some(llm_agent::config::Secret("zz-sync".into()));
     let rows: u64 = test_db.scalar("SELECT COUNT(*) FROM qa_method").parse().unwrap();
     add_vectors(&test_db, "qa_method");
     add_vectors(&test_db, "seq_1000_to_1299");
@@ -425,9 +448,7 @@ async fn an_account_without_alter_syncs_on_and_with_it_rebuilds_by_its_own_count
     assert_eq!((summary.deleted, summary.rebuilt, summary.chunks_failed), (300, 0, 0), "{summary}");
     assert!(index_entries(&test_db) > rows + 200);
 
-    for host in hosts {
-        test_db.sql(&format!("GRANT ALTER ON {db_name}.vec_qa_method TO '{user}'@'{host}';"));
-    }
+    users.grant("ALTER ON {db}.vec_qa_method");
     add_vectors(&test_db, "seq_2000_to_2299");
     // A new process: it counts only what it leaves behind.
     let summary = EmbedSync::default().run(&db, &config, &CancellationToken::new()).await.unwrap();
@@ -548,5 +569,85 @@ async fn rows_the_embedding_server_refused_wait_until_it_takes_one() {
     assert_eq!(embedded, rows);
     let after = sync.run(&db, &config, &stop).await.unwrap();
     assert_eq!((after.failed, after.held, after.embedded), (0, 0, 0), "{after}");
+    db.close().await;
+}
+
+/// A `vec_*` table that takes no writes (an account without DELETE, which
+/// REPLACE needs; a read-only server) had every row the sync found stale
+/// embedded again at every sync, each then refused with a log line of its
+/// own: as many embeddings and lines a minute as rows, for good. The table
+/// is now tried with a statement that writes nothing first, and its rows
+/// wait for a sync it takes them in.
+#[tokio::test]
+async fn rows_of_a_table_that_takes_no_writes_are_not_embedded() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let _turn = SYNCING.lock().await;
+    let Some(test_db) = TestDb::create("sync_unwritable") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    test_db.sql_in("INSERT INTO qa_method (title, method) SELECT CONCAT('저장 ', seq), CONCAT('절차 ', seq) FROM seq_1_to_80;");
+    let users = Users::create(&test_db, "SELECT, INSERT, UPDATE");
+    let (taking, asked) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicUsize::new(0)));
+    let port = refusing_embedding_server(taking, asked.clone()).await;
+    let mut config = users.config();
+    config.embedding.url = format!("http://127.0.0.1:{port}/v1");
+    let count = |table: &str| test_db.scalar(&format!("SELECT COUNT(*) FROM {table}")).parse::<usize>().unwrap();
+    let db = Db::default();
+    let sync = EmbedSync::default();
+    let stop = CancellationToken::new();
+
+    let first = sync.run(&db, &config, &stop).await.unwrap();
+    let (chunks, queries, methods) = (count("knowledge_chunk"), count("query_registry"), count("qa_method"));
+    assert_eq!(first.embedded, chunks + queries, "{first}");
+    assert_eq!(asked.load(Ordering::Acquire), chunks.div_ceil(32) + queries.div_ceil(32), "nothing embedded for vec_qa_method");
+    for _ in 0..2 {
+        asked.store(0, Ordering::Release);
+        let again = sync.run(&db, &config, &stop).await.unwrap();
+        assert_eq!((again.embedded, again.failed), (0, 0), "{again}");
+        assert_eq!(asked.load(Ordering::Acquire), 0);
+    }
+
+    users.grant("DELETE ON {db}.vec_qa_method");
+    let granted = sync.run(&db, &config, &stop).await.unwrap();
+    assert_eq!((granted.embedded, granted.failed), (methods, 0), "{granted}");
+    assert_eq!(count("vec_qa_method"), methods);
+    db.close().await;
+}
+
+/// A table that refuses its rows as it would any, past the write of no rows
+/// (full, say): the sync splits no more documents and embeds no more rows
+/// for it than the first refused, at every sync.
+#[tokio::test]
+async fn a_table_that_refuses_its_first_rows_waits_with_the_rest() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let _turn = SYNCING.lock().await;
+    let Some(test_db) = TestDb::create("sync_full") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    test_db.sql_in("INSERT INTO qa_method (title, method) SELECT CONCAT('가득 ', seq), CONCAT('절차 ', seq) FROM seq_1_to_80;");
+    let documents: usize = test_db.scalar("SELECT COUNT(*) FROM knowledge").parse().unwrap();
+    assert!(documents > 1);
+    // ER_RECORD_FILE_FULL, as InnoDB says it.
+    for table in ["knowledge_chunk", "vec_qa_method"] {
+        test_db.sql_in(&format!(
+            "CREATE TRIGGER zz_full_{table} BEFORE INSERT ON {table} FOR EACH ROW
+             SIGNAL SQLSTATE 'HY000' SET MYSQL_ERRNO = 1114, MESSAGE_TEXT = 'The table is full';"
+        ));
+    }
+    let (taking, asked) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicUsize::new(0)));
+    let port = refusing_embedding_server(taking, asked.clone()).await;
+    let mut config = test_db.config();
+    config.embedding.url = format!("http://127.0.0.1:{port}/v1");
+    let queries: usize = test_db.scalar("SELECT COUNT(*) FROM query_registry").parse().unwrap();
+    let db = Db::default();
+    let sync = EmbedSync::default();
+    let stop = CancellationToken::new();
+    // The query rows are embedded at the first sync, the others never.
+    for embedded in [queries, 0, 0] {
+        asked.store(0, Ordering::Release);
+        let summary = sync.run(&db, &config, &stop).await.unwrap();
+        assert_eq!((summary.chunks_failed, summary.failed, summary.embedded), (1, 32, embedded), "{summary}");
+        assert_eq!(asked.load(Ordering::Acquire), 1 + embedded.div_ceil(32), "one batch for vec_qa_method");
+    }
     db.close().await;
 }
