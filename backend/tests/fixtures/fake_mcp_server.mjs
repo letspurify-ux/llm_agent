@@ -254,7 +254,22 @@ async function handle(message, notify) {
         for (let i = 0; i < 17; i++) process.stdout.write(chunk);
         return new Promise(() => {});
       }
-      case 'stall_input': process.stdin.pause(); setInterval(() => {}, 1 << 30); return result(id, { content: [text('stalled')] });
+      case 'stall_input': {
+        process.stdin.pause();
+        setInterval(() => {}, 1 << 30);
+        // FAKE_MCP_ASK_FLOOD: then that many requests (pings) to the client,
+        // as fast as its end reads them, none of its answers read.
+        let left = Number(env.FAKE_MCP_ASK_FLOOD || 0);
+        const flood = () => {
+          while (left > 0) {
+            left--;
+            if (!process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: `flood-${left}`, method: 'ping' })}\n`)) return process.stdout.once('drain', flood);
+          }
+          log('flood sent');
+        };
+        if (left > 0) setImmediate(flood);
+        return result(id, { content: [text('stalled')] });
+      }
       default: return failure(id, -32601, `unknown tool ${params.name}`);
     }
   }

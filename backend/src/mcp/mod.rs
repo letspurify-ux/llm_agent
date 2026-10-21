@@ -52,6 +52,9 @@ const STABLE_SECS: u64 = 60;
 /// Lines of server output and connection events kept per server.
 const LOG_LINES: usize = 200;
 const LOG_LINE_CHARS: usize = 1_000;
+/// Answers to the server's own requests (a ping, a list of roots) that may
+/// wait at once to be written (`Answering`).
+const ANSWERS_WAITING: usize = 256;
 /// Seconds a closing connection is waited for (a stdio server is given
 /// `EXIT_GRACE_SECS` once its input closes, as long again once it is told to
 /// stop, then killed).
@@ -1829,9 +1832,11 @@ async fn connect(slot: &Arc<Slot>, server: &McpServer) -> Result<Connection> {
     let handler = Handler { slot: Arc::downgrade(slot), list_changed: list_changed.clone() };
     let close = CancellationToken::new();
     let mut sessions = Arc::default();
+    let calls = (!server.url.trim().is_empty()).then(|| tokio::sync::Semaphore::new(HTTP_CALLS));
+    let link = Arc::new(Link { calls, ..Default::default() });
     let service = if server.url.trim().is_empty() {
         let process = spawn(slot, server)?;
-        handler.serve_with_ct(process, close.clone()).await
+        handler.serve_with_ct(Answering::new(process, slot, &link), close.clone()).await
     } else {
         install_tls();
         // A session made anew in place of one the server forgot is read as
@@ -1839,7 +1844,7 @@ async fn connect(slot: &Arc<Slot>, server: &McpServer) -> Result<Connection> {
         let client = wire::Lenient::new(list_changed.clone(), server.disable_proxy).map_err(|e| anyhow!("HTTP 클라이언트를 만들지 못했습니다: {}", causes(&e)))?;
         sessions = client.sessions();
         handler
-            .serve_with_ct(StreamableHttpClientTransport::with_client(client, http_config(server)?), close.clone())
+            .serve_with_ct(Answering::new(StreamableHttpClientTransport::with_client(client, http_config(server)?), slot, &link), close.clone())
             .await
     }
     .map_err(|e| anyhow!("초기화하지 못했습니다: {}", explain(&e)))?;
@@ -1850,8 +1855,89 @@ async fn connect(slot: &Arc<Slot>, server: &McpServer) -> Result<Connection> {
         }
         .fuse(),
     );
-    let calls = (!server.url.trim().is_empty()).then(|| tokio::sync::Semaphore::new(HTTP_CALLS));
-    Ok(Connection { peer, ended, close, list_changed, sessions, link: Arc::new(Link { calls, ..Default::default() }) })
+    Ok(Connection { peer, ended, close, list_changed, sessions, link })
+}
+
+/// A connection's transport, its answers to the server's own requests
+/// written `ANSWERS_WAITING` at most at once. The SDK reads on while each
+/// answer waits to be written, on a task of its own: a server that stopped
+/// reading its input and went on asking (a ping, again and again) had every
+/// answer kept waiting, without end — 300,000 pings, 1 GiB, measured, held
+/// for as long as the server stayed connected and shown ready. Past the
+/// limit an answer is let go, and the connection made again: its server
+/// reads none of them.
+struct Answering<T> {
+    inner: T,
+    waiting: Arc<std::sync::atomic::AtomicUsize>,
+    slot: Weak<Slot>,
+    link: Arc<Link>,
+    told: bool,
+}
+
+impl<T> Answering<T> {
+    fn new(inner: T, slot: &Arc<Slot>, link: &Arc<Link>) -> Self {
+        Self { inner, waiting: Arc::default(), slot: Arc::downgrade(slot), link: link.clone(), told: false }
+    }
+
+    /// The server reads none of its answers: its connection is made again,
+    /// once (rung before it is ready, the ring waits for it).
+    fn unread(&mut self) {
+        if std::mem::replace(&mut self.told, true) {
+            return;
+        }
+        if let Some(slot) = self.slot.upgrade() {
+            let error = format!("서버가 입력을 읽지 않으면서 요청을 계속 보내 답 {ANSWERS_WAITING}개가 쓰이지 못하고 밀려 다시 연결합니다");
+            let mut state = slot.state();
+            if state.link.as_ref().is_none_or(|current| Arc::ptr_eq(current, &self.link)) {
+                state.transport_error = Some(error);
+            }
+        }
+        self.link.broken.notify_one();
+    }
+}
+
+/// An answer waiting to be written, counted until written or given up.
+struct Waiting(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl<T: Transport<RoleClient>> Transport<RoleClient> for Answering<T> {
+    type Error = T::Error;
+
+    fn send(&mut self, item: TxJsonRpcMessage<RoleClient>) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        use std::sync::atomic::Ordering;
+        let answer = matches!(item, rmcp::model::JsonRpcMessage::Response(_) | rmcp::model::JsonRpcMessage::Error(_));
+        let counted = answer.then(|| {
+            let waiting = self.waiting.fetch_add(1, Ordering::AcqRel);
+            (Waiting(self.waiting.clone()), waiting < ANSWERS_WAITING)
+        });
+        let send = match &counted {
+            Some((_, false)) => {
+                self.unread();
+                None
+            }
+            _ => Some(self.inner.send(item)),
+        };
+        async move {
+            let _counted = counted;
+            match send {
+                Some(send) => send.await,
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleClient>>> + Send {
+        self.inner.receive()
+    }
+
+    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.inner.close()
+    }
 }
 
 /// Closes the connection and waits for it (a stdio server is given its

@@ -384,8 +384,14 @@ async fn a_listener_that_says_nothing_does_not_keep_the_attempt() {
     let row = db::queries_by_names(&app.db, &config.mariadb, &["silent_probe".to_owned()]).await.unwrap().remove(0);
     let never = |_: &str| false;
     let run = app.oracle.run(&app.db, &config, &row, &Map::new(), None, &never, &CancellationToken::new()).await;
-    assert!(run.is_err(), "no session from a listener that says nothing");
-    let (ended, after) = tokio::task::spawn_blocking(move || told.recv().unwrap()).await.unwrap();
+    let Err(error) = run else {
+        panic!("a session from a listener that says nothing");
+    };
+    // Bounded too: a run that never reached the listener (a client that
+    // could not load) would leave it waiting for good.
+    let Ok((ended, after)) = tokio::task::spawn_blocking(move || told.recv_timeout(std::time::Duration::from_secs(60))).await.unwrap() else {
+        panic!("the run never reached the listener: {error:#}");
+    };
     if !ended {
         // Dropped, the pool would wait for the attempt, and the test with it.
         std::mem::forget(app);

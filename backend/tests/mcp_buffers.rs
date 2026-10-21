@@ -174,3 +174,37 @@ async fn a_large_event_read_leaves_no_buffer_behind() {
     hub.shutdown().await;
     assert!(grown < 16 << 20, "{} MiB more while 4 servers that sent a large event stay connected", grown >> 20);
 }
+
+/// Resource review, thirty-third pass: the SDK reads on while each answer
+/// to a server's own request waits to be written, on a task of its own. A
+/// stdio server that stopped reading its input and went on asking (pings)
+/// had every answer kept waiting, for as long as it stayed connected and
+/// shown ready: 300,000 pings held 1 GiB. Past `ANSWERS_WAITING` answers
+/// the server is reconnected instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_that_asks_without_reading_the_answers_is_reconnected() {
+    if node_missing() {
+        return;
+    }
+    if heap_in_use().is_none() {
+        return skip("the heap in use is not measured on this platform");
+    }
+    let _measuring = MEASURING.lock().await;
+    let mut server = fake("asker");
+    server.env = [("FAKE_MCP_ASK_FLOOD".to_owned(), "100000".to_owned())].into();
+    let config = config(vec![server]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    wait_for(&hub, &config, |s| s["state"] == "ready").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = heap_in_use().unwrap();
+    let snapshot = hub.snapshot(&config);
+    snapshot.find("asker__stall_input").unwrap().call(json!({}), &CancellationToken::new()).await.unwrap();
+    wait_for(&hub, &config, |s| s["restarts"].as_u64() >= Some(1) && s["state"] == "ready").await;
+    let grown = heap_in_use().unwrap().saturating_sub(before);
+    let status = hub.server_status("asker", MODEL).unwrap();
+    hub.shutdown().await;
+    let told = status["log"].as_array().unwrap().iter().any(|l| l["text"].as_str().unwrap_or("").contains("입력을 읽지 않으면서 요청을 계속 보내"));
+    assert!(told, "{status:#}");
+    assert!(grown < 16 << 20, "{} MiB more after a server asked without reading the answers", grown >> 20);
+}
