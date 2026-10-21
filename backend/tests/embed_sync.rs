@@ -435,3 +435,118 @@ async fn an_account_without_alter_syncs_on_and_with_it_rebuilds_by_its_own_count
     assert_eq!(index_entries(&test_db), rows);
     db.close().await;
 }
+
+/// An embedding server that refuses every request as a model not pulled
+/// (Ollama's 404) until `taking` is set, and then answers every input with
+/// a vector of its own; `asked` counts the requests.
+async fn refusing_embedding_server(taking: Arc<std::sync::atomic::AtomicBool>, asked: Arc<std::sync::atomic::AtomicUsize>) -> u16 {
+    use std::sync::atomic::Ordering;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let (taking, asked) = (taking.clone(), asked.clone());
+            tokio::spawn(async move {
+                let mut bytes = vec![];
+                let mut buffer = [0u8; 65536];
+                loop {
+                    // One request at a time on a kept connection.
+                    let body = loop {
+                        if let Some(at) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&bytes[..at]).to_ascii_lowercase();
+                            let length = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+                                .unwrap_or(0);
+                            if bytes.len() >= at + 4 + length {
+                                let body: serde_json::Value = serde_json::from_slice(&bytes[at + 4..at + 4 + length]).unwrap();
+                                bytes.drain(..at + 4 + length);
+                                break body;
+                            }
+                        }
+                        match socket.read(&mut buffer).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+                        }
+                    };
+                    asked.fetch_add(1, Ordering::AcqRel);
+                    let (status, answer) = if taking.load(Ordering::Acquire) {
+                        let inputs = body["input"].as_array().map_or(0, Vec::len);
+                        let data: Vec<serde_json::Value> = (0..inputs)
+                            .map(|i| serde_json::json!({"index":i,"embedding":(0..1024).map(|j| ((i + j) % 7 + 1) as f32).collect::<Vec<_>>()}))
+                            .collect();
+                        ("200 OK", serde_json::json!({"data":data}))
+                    } else {
+                        ("404 Not Found", serde_json::json!({"error":"model \"qwen3-embedding:0.6b\" not found, try pulling it first"}))
+                    };
+                    let answer = answer.to_string();
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{answer}",
+                        answer.len()
+                    );
+                    if socket.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+/// Each row the embedding server refused was sent again at every sync, one
+/// request and one log line each, for good: a model not pulled made 218
+/// rows 37 KB of log a minute. Refused rows are held back; each sync sends
+/// the one held longest alone, and once the server takes it, all of them.
+#[tokio::test]
+async fn rows_the_embedding_server_refused_wait_until_it_takes_one() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let _turn = SYNCING.lock().await;
+    let Some(test_db) = TestDb::create("sync_refused") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    test_db.sql_in("INSERT INTO qa_method (title, method) SELECT CONCAT('거절 ', seq), CONCAT('절차 ', seq) FROM seq_1_to_80;");
+    let (taking, asked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+    let port = refusing_embedding_server(taking.clone(), asked.clone()).await;
+    let mut config = test_db.config();
+    config.embedding.url = format!("http://127.0.0.1:{port}/v1");
+    let db = Db::default();
+    let sync = EmbedSync::default();
+    let stop = CancellationToken::new();
+
+    // The first sync tries every row (the documents' chunks made first).
+    let first = sync.run(&db, &config, &stop).await.unwrap();
+    let rows: usize = ["knowledge_chunk", "qa_method", "query_registry"]
+        .iter()
+        .map(|table| test_db.scalar(&format!("SELECT COUNT(*) FROM {table}")).parse::<usize>().unwrap())
+        .sum();
+    assert_eq!((first.failed, first.embedded), (rows, 0), "{first}");
+    assert!(asked.load(Ordering::Acquire) > rows, "{} requests", asked.load(Ordering::Acquire));
+
+    // The next ones send one held row a table, and have nothing to tell.
+    for _ in 0..3 {
+        asked.store(0, Ordering::Release);
+        let again = sync.run(&db, &config, &stop).await.unwrap();
+        assert_eq!((again.failed, again.held, again.changed()), (0, rows, false), "{again}");
+        assert_eq!(asked.load(Ordering::Acquire), 3, "one request a table");
+    }
+
+    // An edited row is sent as it is now.
+    test_db.sql_in("UPDATE qa_method SET method = '고친 절차' WHERE title = '거절 7';");
+    asked.store(0, Ordering::Release);
+    let edited = sync.run(&db, &config, &stop).await.unwrap();
+    assert_eq!((edited.failed, edited.held), (1, rows - 1), "{edited}");
+    // With the held row of its table: together, and refused, each alone.
+    assert_eq!(asked.load(Ordering::Acquire), 2 + 3);
+
+    // Put right, the server takes the held row sent, and then the rest.
+    taking.store(true, Ordering::Release);
+    let mut embedded = 0;
+    for _ in 0..3 {
+        embedded += sync.run(&db, &config, &stop).await.unwrap().embedded;
+    }
+    assert_eq!(embedded, rows);
+    let after = sync.run(&db, &config, &stop).await.unwrap();
+    assert_eq!((after.failed, after.held, after.embedded), (0, 0, 0), "{after}");
+    db.close().await;
+}

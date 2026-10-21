@@ -332,7 +332,22 @@ pub struct StoredResult {
     pub capped: bool,
     /// Key of the column-omission note in wide rows (see oracle).
     pub omitted_column_key: Option<String>,
+    /// Memory its rows hold; stored, the whole result's (`entry_bytes`).
     pub bytes: usize,
+}
+
+/// What a stored result holds besides its rows: its entry in the
+/// conversation's map, its names and parameters. Counted by its rows alone,
+/// a result of no rows weighed nothing against the limit, and a
+/// conversation kept every one of them for as long as it went on.
+fn entry_bytes(result: &StoredResult) -> usize {
+    // An entry and its share of a B-tree node of 11, and the rows' Arc.
+    let entry = (std::mem::size_of::<u64>() + std::mem::size_of::<StoredResult>()) * 12 / 11
+        + allocation(2 * std::mem::size_of::<usize>() + std::mem::size_of::<Vec<Map<String, Value>>>());
+    [Some(&result.query_name), result.target_db.as_ref(), result.omitted_column_key.as_ref()]
+        .into_iter()
+        .flatten()
+        .fold(entry.saturating_add(result.params.held()), |total, text| total.saturating_add(text.held()))
 }
 
 /// One conversation.
@@ -366,12 +381,13 @@ impl Conversation {
         }
     }
 
-    /// Stores rows under a new step; the oldest results' rows are dropped
-    /// once the conversation keeps more than `limit` bytes of them.
+    /// Stores rows under a new step; the oldest results are dropped once
+    /// the conversation's results hold more than `limit` bytes.
     pub fn store_result(&mut self, mut result: StoredResult, limit: usize) -> u64 {
         let step = self.next_step;
         self.next_step += 1;
         result.step = step;
+        result.bytes = result.bytes.saturating_add(entry_bytes(&result));
         self.results.insert(step, result);
         let mut total: usize = self.results.values().map(|r| r.bytes).sum();
         while total > limit && self.results.len() > 1 {
@@ -729,6 +745,33 @@ mod tests {
         assert_eq!(c.store_result(result(60), 100), 3);
         assert!(!c.results.contains_key(&1));
         assert!(c.results.contains_key(&3));
+    }
+
+    /// Results of no rows count too: a conversation that went on running
+    /// queries that found nothing kept every one.
+    #[test]
+    fn results_of_no_rows_count_against_the_limit() {
+        let mut c = Conversation::new("x".into());
+        let limit = 64 * 1024;
+        for _ in 0..10_000 {
+            c.store_result(
+                StoredResult {
+                    step: 0,
+                    query_name: "ORDER_STATUS_BY_CUSTOMER".into(),
+                    target_db: Some("ORDER_DB".into()),
+                    params: json!({"customer_id":"C-000123","from":"2026-10-01"}),
+                    rows: Arc::new(vec![]),
+                    capped: false,
+                    omitted_column_key: None,
+                    bytes: 0,
+                },
+                limit,
+            );
+        }
+        let kept: usize = c.results.values().map(|r| r.bytes).sum();
+        assert!(kept <= limit, "{kept} bytes kept");
+        assert!((32..1_000).contains(&c.results.len()), "{} results kept", c.results.len());
+        assert_eq!(c.next_step, 10_001);
     }
 
     #[test]

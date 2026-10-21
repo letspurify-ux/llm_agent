@@ -42,6 +42,8 @@ const STALE_ENTRIES_MIN: u64 = 100;
 const REBUILD_MS_PER_ROW: u64 = 10;
 /// How long a table whose rebuild failed waits before another try.
 const REBUILD_RETRY: Duration = Duration::from_secs(3600);
+/// Refused rows a sync names in the log; the summary counts the rest.
+const ROW_WARNINGS: usize = 5;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub enum Skipped {
@@ -67,6 +69,9 @@ pub struct Summary {
     pub chunks_failed: usize,
     /// `vec_*` tables rebuilt to drop the index entries of deleted rows.
     pub rebuilt: usize,
+    /// Rows not sent: the embedding server refused them as they are (see
+    /// `Refused`).
+    pub held: usize,
     pub skipped: Skipped,
 }
 impl Summary {
@@ -89,7 +94,11 @@ impl std::fmt::Display for Summary {
             write!(f, ", rebuilt the vector index of {} table(s)", self.rebuilt)?;
         }
         if self.failed > 0 {
-            write!(f, ", skipped {} (see the [embed] row warnings)", self.failed)?;
+            let shown = if self.failed > ROW_WARNINGS { format!("the first {ROW_WARNINGS} in") } else { "see".into() };
+            write!(f, ", skipped {} ({shown} the [embed] row warnings; sent again once edited or another row is taken)", self.failed)?;
+        }
+        if self.held > 0 {
+            write!(f, ", {} refused rows held back", self.held)?;
         }
         if self.chunks_failed > 0 {
             write!(f, ", chunk failures {}", self.chunks_failed)?;
@@ -112,6 +121,62 @@ pub struct EmbedSync {
     indexes: Mutex<HashMap<String, IndexState>>,
     /// The account may not rebuild a table (no ALTER privilege): told once.
     rebuild_denied: AtomicBool,
+    refused: Mutex<Refused>,
+}
+
+/// Rows the embedding server refused (an HTTP 4xx, a vector of the wrong
+/// width), held back from the syncs after. Sent again at every sync, each
+/// took a request of its own and a log line every minute, for good: a model
+/// not pulled yet (404) made 218 rows 37 KB of log a sync, 53 MB a day,
+/// measured, which the Windows log keeps. A row edited is sent again; and
+/// at each sync the row held longest goes alone, unlogged, so a server put
+/// right (the model pulled) is seen within a sync or so: once it takes a
+/// row, every row held is sent again.
+#[derive(Default)]
+struct Refused {
+    /// The embedding URL that refused them: another one clears them (the
+    /// model is in each row's hash).
+    url: String,
+    /// By table and seq: the row's hash when refused, and when.
+    rows: HashMap<(String, i64), (String, Instant)>,
+}
+
+impl EmbedSync {
+    /// `stale` without the rows held back as refused as they are now, the
+    /// number held back, and the held row sent again to see whether the
+    /// server takes it now. Refusals of rows no longer stale (embedded,
+    /// edited, deleted) are forgotten.
+    fn without_refused(&self, url: &str, table: &str, stale: Vec<(i64, String)>) -> (Vec<(i64, String)>, usize, Option<i64>) {
+        let mut refused = self.refused.lock().unwrap_or_else(|p| p.into_inner());
+        if refused.url != url {
+            *refused = Refused { url: url.to_owned(), rows: HashMap::new() };
+        }
+        let now: HashMap<i64, &String> = stale.iter().map(|(seq, hash)| (*seq, hash)).collect();
+        refused.rows.retain(|(t, seq), (hash, _)| t != table || now.get(seq).is_some_and(|h| *h == hash));
+        let probe = refused
+            .rows
+            .iter()
+            .filter(|((t, _), _)| t == table)
+            .min_by_key(|((_, seq), (_, at))| (*at, *seq))
+            .map(|((_, seq), _)| *seq);
+        let count = stale.len();
+        let sent: Vec<(i64, String)> = stale
+            .into_iter()
+            .filter(|(seq, _)| Some(*seq) == probe || !refused.rows.contains_key(&(table.to_owned(), *seq)))
+            .collect();
+        let held = count - sent.len();
+        (sent, held, probe)
+    }
+
+    fn refuse(&self, table: &str, seq: i64, hash: &str) {
+        let mut refused = self.refused.lock().unwrap_or_else(|p| p.into_inner());
+        refused.rows.insert((table.to_owned(), seq), (hash.to_owned(), Instant::now()));
+    }
+
+    /// The server took a row it refused: the next sync sends every row held.
+    fn take_refused_again(&self) {
+        self.refused.lock().unwrap_or_else(|p| p.into_inner()).rows.clear();
+    }
 }
 
 /// What this process knows of a `vec_*` table's vector index.
@@ -328,6 +393,13 @@ async fn sync(state: &EmbedSync, db: &Db, config: &Config, stop: &CancellationTo
             }
             stored.remove(&seq);
         }
+        let (stale, probe) = if check {
+            let (stale, held, probe) = state.without_refused(&config.embedding.url, table, stale);
+            out.held += held;
+            (stale, probe)
+        } else {
+            (stale, None)
+        };
         let deleted_before = out.deleted;
         let orphans: Vec<i64> = stored.into_keys().collect();
         for seqs in orphans.chunks(IN_CHUNK) {
@@ -376,7 +448,7 @@ async fn sync(state: &EmbedSync, db: &Db, config: &Config, stop: &CancellationTo
                     )
                 })
                 .collect();
-            match embed_stale(db, config, table, &batch, stop, &mut out).await {
+            match embed_stale(state, db, config, table, &batch, probe, stop, &mut out).await {
                 Flow::Continue => {}
                 Flow::Unavailable => {
                     unavailable = true;
@@ -491,26 +563,46 @@ enum Flow {
     Stopped,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn embed_stale(
+    state: &EmbedSync,
     db: &Db,
     config: &Config,
     table: &str,
     stale: &[(i64, String, String)],
+    probe: Option<i64>,
     stop: &CancellationToken,
     out: &mut Summary,
 ) -> Flow {
+    let taken = |batch: &[(i64, String, String)]| {
+        if batch.iter().any(|row| Some(row.0) == probe) {
+            state.take_refused_again();
+        }
+    };
     for batch in stale.chunks(BATCH) {
         if stop.is_cancelled() {
             return Flow::Stopped;
         }
         let texts: Vec<String> = batch.iter().map(|b| b.1.clone()).collect();
         match embed(&config.embedding, &texts, stop).await {
-            Ok(vectors) => store(db, config, table, batch, &vectors, out).await,
+            Ok(vectors) => {
+                taken(batch);
+                store(db, config, table, batch, &vectors, out).await;
+            }
             Err(_) if stop.is_cancelled() => return Flow::Stopped,
             Err(e) => {
-                warn(&e);
+                // A refusal of the held row alone was told when it was first refused.
+                let probing = batch.len() == 1 && Some(batch[0].0) == probe;
+                if e.retriable || (out.failed < ROW_WARNINGS && !probing) {
+                    warn(&e);
+                }
                 if e.retriable {
                     return Flow::Unavailable;
+                }
+                if probing {
+                    state.refuse(table, batch[0].0, &batch[0].2);
+                    out.held += 1;
+                    continue;
                 }
                 // One bad row must not fail its batch: embed them one by one.
                 for row in batch {
@@ -518,15 +610,26 @@ async fn embed_stale(
                         return Flow::Stopped;
                     }
                     match embed(&config.embedding, std::slice::from_ref(&row.1), stop).await {
-                        Ok(vectors) => store(db, config, table, std::slice::from_ref(row), &vectors, out).await,
+                        Ok(vectors) => {
+                            taken(std::slice::from_ref(row));
+                            store(db, config, table, std::slice::from_ref(row), &vectors, out).await;
+                        }
                         Err(_) if stop.is_cancelled() => return Flow::Stopped,
                         Err(e) if e.retriable => {
                             warn(&e);
                             return Flow::Unavailable;
                         }
                         Err(e) => {
+                            state.refuse(table, row.0, &row.2);
+                            // The held row sent again, refused again: no news.
+                            if Some(row.0) == probe {
+                                out.held += 1;
+                                continue;
+                            }
                             out.failed += 1;
-                            eprintln!("[embed] {table}#{} embedding failed — skipping this row only: {e}", row.0);
+                            if out.failed <= ROW_WARNINGS {
+                                eprintln!("[embed] {table}#{} embedding failed — skipping this row only: {e}", row.0);
+                            }
                         }
                     }
                 }
