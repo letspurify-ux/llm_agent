@@ -333,3 +333,64 @@ async fn a_query_keeps_no_rows_on_its_session_once_read() {
     let grown = heap_in_use().unwrap().saturating_sub(first.unwrap());
     assert!(grown < 20 << 20, "{} MiB more after {} more queries on one session", grown >> 20, queries - 1);
 }
+
+/// A target whose listener takes the connection and says nothing (a hung
+/// listener or host, a firewall keeping the connection): the pool's attempt
+/// to make a session ends at the query limit and hangs up. With no limit it
+/// waited for good, past the run that gave up on it, and closing the pool
+/// waited too: each pool closed for its idle minutes kept a thread and the
+/// attempt's socket for as long as the server ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listener_that_says_nothing_does_not_keep_the_attempt() {
+    use std::io::Read;
+    if std::env::var("LLM_AGENT_TEST_ORACLE").ok().as_deref() != Some("1") {
+        return skip("LLM_AGENT_TEST_ORACLE is not set");
+    }
+    let Some(test_db) = TestDb::create("oracle_silent") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (hung_up, told) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let accepted = std::time::Instant::now();
+        first.set_read_timeout(Some(std::time::Duration::from_secs(30))).unwrap();
+        let mut buffer = [0u8; 4096];
+        // The client's connect packet, then nothing back: read until it hangs up.
+        let ended = loop {
+            match first.read(&mut buffer) {
+                Ok(0) => break true,
+                Ok(_) => continue,
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break false,
+                Err(_) => break true,
+            }
+        };
+        let _ = hung_up.send((ended, accepted.elapsed()));
+        // Attempts after it are taken and kept silent too.
+        let held: Vec<_> = listener.incoming().collect();
+        drop(held);
+    });
+    test_db.sql_in(&format!(
+        "INSERT INTO target_db (db_name, db_type, connection_info, db_user, db_password) VALUES ('SILENT_DB', 'oracle', '127.0.0.1:{port}/FREEPDB1', 'u', 'p');
+         INSERT INTO query_registry (query_name, query_sql, target_db_name) VALUES ('silent_probe', 'SELECT 1 AS X FROM DUAL', 'SILENT_DB')"
+    ));
+    let mut config = test_db.config();
+    config.oracle.mock = false;
+    config.oracle.client_lib_dir = std::env::var("ORACLE_CLIENT_LIB_DIR").unwrap_or_default();
+    config.oracle.timeout_ms = 2000;
+    let (app, _dir) = app(config, Scripted::new(vec![]));
+    let config = app.config();
+    let row = db::queries_by_names(&app.db, &config.mariadb, &["silent_probe".to_owned()]).await.unwrap().remove(0);
+    let never = |_: &str| false;
+    let run = app.oracle.run(&app.db, &config, &row, &Map::new(), None, &never, &CancellationToken::new()).await;
+    assert!(run.is_err(), "no session from a listener that says nothing");
+    let (ended, after) = tokio::task::spawn_blocking(move || told.recv().unwrap()).await.unwrap();
+    if !ended {
+        // Dropped, the pool would wait for the attempt, and the test with it.
+        std::mem::forget(app);
+        panic!("the attempt was still waiting {after:?} after its connection was taken");
+    }
+    assert!(after < std::time::Duration::from_secs(10), "hung up after {after:?}");
+    assert_eq!(app.oracle.close_idle(std::time::Duration::ZERO), 1);
+}

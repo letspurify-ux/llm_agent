@@ -219,6 +219,11 @@ impl Oracle {
         let stopped = cancel.clone();
         let work = tokio::task::spawn_blocking(move || -> Result<Vec<Map<String, Value>>> {
             let mut conn = pool.get()?;
+            // First, so whatever the session sends from here has the limit:
+            // dropped below or pooled, its logoff too (a pool closing waited
+            // for good on the logoff of a session with none, its target
+            // frozen).
+            conn.set_call_timeout(Some(timeout))?;
             // A LOB cell's start comes with its row, all of a LOB that fits
             // a cell (`lob_start`): read as locators alone, each cell took a
             // round trip of its own (1,000 short CLOBs: 7 ms as values,
@@ -240,7 +245,6 @@ impl Oracle {
                 let _ = conn.close_with_mode(oracle::conn::CloseMode::Drop);
                 bail!("cancelled");
             }
-            conn.set_call_timeout(Some(timeout))?;
             if conn.is_new_connection()
                 && let Err(e) = conn.execute(NLS_SESSION_FORMATS, &[])
             {
@@ -282,8 +286,13 @@ impl Oracle {
 
     fn pool(&self, row: &Row, password: &str, cfg: &OracleConfig) -> Result<Arc<oracle::pool::Pool>> {
         let name = name_key(&db::text(row, "db_name"));
+        let connect = bounded_connect(
+            &db::text(row, "connection_info"),
+            cfg.timeout_ms.div_ceil(1000).max(1),
+            oracle::Version::client().map_or(0, |v| v.major()),
+        );
         let mut hash = Sha256::new();
-        for part in [db::text(row, "connection_info"), db::text(row, "db_user"), password.to_owned()] {
+        for part in [connect.clone(), db::text(row, "db_user"), password.to_owned()] {
             hash.update(part.len().to_le_bytes());
             hash.update(part.as_bytes());
         }
@@ -295,11 +304,7 @@ impl Oracle {
             entry.last_used = Instant::now();
             return Ok(entry.pool.clone());
         }
-        let pool = oracle::pool::PoolBuilder::new(
-            db::text(row, "db_user"),
-            password,
-            db::text(row, "connection_info"),
-        )
+        let pool = oracle::pool::PoolBuilder::new(db::text(row, "db_user"), password, connect)
         .min_connections(0)
         .max_connections(POOL_MAX)
         .connection_increment(1)
@@ -360,6 +365,47 @@ fn close_later(pools: Vec<Arc<oracle::pool::Pool>>) {
             }
         }
     });
+}
+
+/// `connect` with a limit of `secs` seconds on making a connection, where
+/// its form takes one and does not set its own: a descriptor's
+/// CONNECT_TIMEOUT, or an Easy Connect string's `connect_timeout` (Easy
+/// Connect Plus, from client 19). The pool makes its sessions on a thread of
+/// its own, and with no limit one whose listener took the connection and
+/// said nothing (a hung listener or host, a firewall keeping the
+/// connection) waited for good: a run gave up on its session at the query
+/// limit, while the pool, waiting, made no other, and closing it waited too.
+/// Each pool closed for its idle minutes kept a thread, the attempt's own
+/// and its socket for as long as the server ran, and the target's next use
+/// made a pool that did the same. A tnsnames alias is used as named (its
+/// entry, or sqlnet.ora's SQLNET.OUTBOUND_CONNECT_TIMEOUT, sets the limit).
+fn bounded_connect(connect: &str, secs: u64, client_major: i32) -> String {
+    static DESCRIPTION: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\(\s*DESCRIPTION\s*=").unwrap());
+    static OWN_LIMIT: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\(\s*CONNECT_TIMEOUT\s*=").unwrap());
+    let connect = connect.trim();
+    if connect.starts_with('(') {
+        if OWN_LIMIT.is_match(connect) {
+            return connect.to_owned();
+        }
+        return DESCRIPTION.replace_all(connect, format!("${{0}}(CONNECT_TIMEOUT={secs})")).into_owned();
+    }
+    let easy_connect = connect.contains(['/', ':']) && !connect.contains(char::is_whitespace);
+    if !easy_connect || client_major < 19 {
+        return connect.to_owned();
+    }
+    let Some((_, params)) = connect.split_once('?') else {
+        return format!("{connect}?connect_timeout={secs}");
+    };
+    if params
+        .split('&')
+        .any(|param| param.split('=').next().is_some_and(|key| key.trim().eq_ignore_ascii_case("connect_timeout")))
+    {
+        return connect.to_owned();
+    }
+    let joint = if connect.ends_with(['?', '&']) { "" } else { "&" };
+    format!("{connect}{joint}connect_timeout={secs}")
 }
 
 /// A bind value by exact key, then by Oracle's case-insensitive name.
@@ -914,6 +960,31 @@ mod tests {
         assert_eq!(out.rows.len(), MAX_ROWS);
         assert_eq!(out.rows[0].len(), MAX_RESULT_COLS + 1);
         assert_eq!(out.omitted_column_key.as_deref(), Some("…"));
+    }
+
+    #[test]
+    fn connections_are_made_within_a_limit_where_the_form_takes_one() {
+        assert_eq!(bounded_connect(" db:1521/SVC ", 30, 23), "db:1521/SVC?connect_timeout=30");
+        assert_eq!(bounded_connect("tcps://db:2484/SVC?wallet_location=/w", 5, 19), "tcps://db:2484/SVC?wallet_location=/w&connect_timeout=5");
+        assert_eq!(bounded_connect("db/SVC?", 5, 19), "db/SVC?connect_timeout=5");
+        assert_eq!(bounded_connect("db/SVC?Connect_Timeout=90", 5, 23), "db/SVC?Connect_Timeout=90", "its own limit stays");
+        assert_eq!(bounded_connect("db/SVC?transport_connect_timeout=3", 5, 23), "db/SVC?transport_connect_timeout=3&connect_timeout=5");
+        // Easy Connect Plus is a 19c client's; an alias is the tnsnames entry's.
+        assert_eq!(bounded_connect("db:1521/SVC", 30, 18), "db:1521/SVC");
+        assert_eq!(bounded_connect("ORDER_DB", 30, 23), "ORDER_DB");
+        assert_eq!(bounded_connect("orcl.world", 30, 23), "orcl.world");
+        let descriptor = "(DESCRIPTION = (ADDRESS=(PROTOCOL=TCP)(HOST=db)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=SVC)))";
+        assert_eq!(
+            bounded_connect(descriptor, 30, 11),
+            "(DESCRIPTION =(CONNECT_TIMEOUT=30) (ADDRESS=(PROTOCOL=TCP)(HOST=db)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=SVC)))"
+        );
+        let list = "(DESCRIPTION_LIST=(description=(ADDRESS=(HOST=a)))(DESCRIPTION=(ADDRESS=(HOST=b))))";
+        assert_eq!(
+            bounded_connect(list, 7, 23),
+            "(DESCRIPTION_LIST=(description=(CONNECT_TIMEOUT=7)(ADDRESS=(HOST=a)))(DESCRIPTION=(CONNECT_TIMEOUT=7)(ADDRESS=(HOST=b))))"
+        );
+        let own = "(DESCRIPTION=(TRANSPORT_CONNECT_TIMEOUT=3)( connect_timeout = 9)(ADDRESS=(HOST=a)))";
+        assert_eq!(bounded_connect(own, 7, 23), own);
     }
 
     #[test]
