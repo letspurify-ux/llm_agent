@@ -901,6 +901,46 @@ async fn a_reconnect_is_not_held_up_by_a_changed_list_never_answered() {
     hub.shutdown().await;
 }
 
+/// Resource leak review, 36th pass: a changed list not read within its
+/// limit was only logged. A server that stopped reading its input, and went
+/// on announcing changes, stayed ready for good and was read again at each
+/// announcement; once its input was full, each reading's request and its
+/// cancellation waited in the SDK to be written, two tasks more every half
+/// minute for as long as the backend ran. It is now asked whether it still
+/// answers, as after a call past its limit.
+#[tokio::test]
+async fn a_server_that_stops_reading_while_its_list_changes_is_reconnected() {
+    if node_missing() {
+        return;
+    }
+    let stalled = fake("stalled", &["*"], &[("FAKE_MCP_STALL_RELIST", "1"), ("FAKE_MCP_PAGE", "100")]);
+    // One that only takes as long to list stays as it is: it answers a ping.
+    let slow = fake("slowlist", &["*"], &[("FAKE_MCP_HANG_RELIST", "1"), ("FAKE_MCP_PAGE", "100")]);
+    let config = config(vec![stalled, slow]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "stalled").await;
+    ready(&hub, "slowlist").await;
+    call(&hub, &config, "stalled__add_tool", json!({})).await.unwrap();
+    call(&hub, &config, "slowlist__add_tool", json!({})).await.unwrap();
+    // Read again after a second, its limit 30 seconds, the ping's 5.
+    let started = Instant::now();
+    let back = loop {
+        let status = hub.server_status("stalled", MODEL).unwrap();
+        if status["state"] == "ready" && status["restarts"] == 1 {
+            break status;
+        }
+        assert!(started.elapsed() < Duration::from_secs(50), "not reconnected: {status:#}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let log = log_text(&back);
+    assert!(log.contains("바뀐 도구 목록 읽기가 30초 한도를 넘었고, 살아 있는지 묻는 ping에도"), "{log}");
+    let slow = hub.server_status("slowlist", MODEL).unwrap();
+    assert_eq!((slow["state"].clone(), slow["restarts"].clone()), (json!("ready"), json!(0)), "{slow:#}");
+    assert!(log_text(&slow).contains("바뀐 도구 목록을 제때 받지 못했습니다"), "{slow:#}");
+    hub.shutdown().await;
+}
+
 #[tokio::test]
 async fn commands_get_their_environment_but_not_the_backends_secrets() {
     if node_missing() {

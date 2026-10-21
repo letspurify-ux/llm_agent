@@ -148,6 +148,13 @@ async function handle(message, notify) {
     if (env.FAKE_MCP_HANG_LIST) return new Promise(() => {});
     // The first listing answered, a changed list is never read.
     if (env.FAKE_MCP_HANG_RELIST && listed > 1) return new Promise(() => {});
+    // The first listing answered, its input no longer read from the next
+    // (a hung server), while it goes on announcing list changes.
+    if (env.FAKE_MCP_STALL_RELIST && listed > 1) {
+      process.stdin.pause();
+      setInterval(() => notify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }), 500);
+      return new Promise(() => {});
+    }
     // A list read again in the other order (a server listing from a map):
     // a reading starts without a cursor, its later pages have one.
     if (!params.cursor) readings += 1;

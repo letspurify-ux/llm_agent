@@ -1469,7 +1469,16 @@ async fn serve(slot: &Arc<Slot>, server: &McpServer, connection: &mut Connection
                         slot.set_tools(tools);
                     }
                     Ok(Err(error)) => slot.log("event", &format!("바뀐 도구 목록을 받지 못했습니다: {error:#}")),
-                    Err(_) => slot.log("event", "바뀐 도구 목록을 제때 받지 못했습니다"),
+                    // Asked whether it still answers, as after a call past
+                    // its limit (`check_alive`). Only logged, a server that
+                    // stopped reading its input stayed ready for good, read
+                    // again at each notice it went on sending: once its
+                    // input was full, each reading's request and its
+                    // cancellation stayed in the SDK, waiting to be written.
+                    Err(_) => {
+                        slot.log("event", "바뀐 도구 목록을 제때 받지 못했습니다");
+                        check_alive(slot, &connection.peer, &connection.link, format!("바뀐 도구 목록 읽기가 {CONNECT_SECS}초 한도를 넘었고"));
+                    }
                 }
             }
         }
