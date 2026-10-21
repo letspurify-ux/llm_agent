@@ -954,3 +954,24 @@ TaskDuration, trace 이벤트(프레임당 BeginMainFrame·NotifyResizeObservers
   요소째 사라진다). MCP 탭의 5초 읽기는 숨은 탭에서 건너뛴다.
 - KaTeX `\gdef`: 렌더마다 새 macros 객체를 받아 전역에 쌓이지 않는다.
 - App의 `growRef.observe`가 답마다 다시 불리지만 같은 두 요소라 관찰은 늘지 않는다.
+
+## 자원 누수 정밀 검토 13차 — 2026-10-21 (실제 GPU, 결함 0)
+
+12차 뒤 frontend 코드 변경 없음. 지금까지 SwiftShader·`--disable-gpu`로만 재던 것을 실제 GPU(Apple M3, ANGLE Metal,
+headless Chrome `--use-angle=metal --enable-gpu`)와 프로덕션 번들로 쟀다. 렌더러는 V8 힙 밖까지 `footprint`와
+크롬 memory-infra 덤프(`Tracing.requestMemoryDump`, 할당자별)로 나눠 봤다.
+
+- 혼돈 소크(1,500단계 1회 + 2,400단계 2회, 답 최대 758개): JS 힙 22 MB 안팎에서 수렴, GPU 프로세스 footprint는
+  167~511 MB를 오르내릴 뿐 추세 없음, cc 타일·gpu·skia 글리프 캐시·partition_alloc 평탄.
+- GPU 프로세스 강제 종료(`Browser.crashGpuProcess`): 로봇의 옛 WebGL 프로그램·컨텍스트가 남지 않는다(프로그램 1~5,
+  컨텍스트 1~2). 복구가 안 오는 것은 크롬의 도메인 3D API 차단 정책(`--disable-domain-blocking-for-3d-apis`면 복구됨).
+
+### 확인해 결함이 아닌 것 (재조사 금지)
+
+- 렌더러 Oilpan(blink_gc) 힙이 답을 그릴수록 늘어난다(답 100개에 +5~12 MB) — 그러나 살아 있는 객체(blink_objects)는
+  2~4 MB 고정, critical 메모리 압박에도 줄지 않는 것은 비었지만 돌려주지 않은 일반 페이지(할당기 단편화)다. 답을 그리지
+  않는 동작(창 크기·펼침·hover·관리자·컨텍스트 소실·정지 300회씩)은 3~6 MB에서 멈추고, 같은 답만 반복해도 늘며 증가 폭이
+  줄어든다(평문 6.4→8.9→9.8). 앱이 쥔 것이 없어 앱에서 고칠 길이 없다.
+- 홈 뒤 DOM 노드가 질문마다 +2개: 힙 스냅샷 차분에서 `InsertNodeBeforeCommand`·`RemoveNodeCommand`·
+  `InsertIntoTextNodeCommand`·Text가 질문마다 하나씩 — 입력창에 넣은 글의 브라우저 실행 취소 기록이다(Blink 상한 1,000).
+- headless는 탭을 바꿔도 `document.hidden`이 안 바뀌어 숨은 탭은 못 잰다 — 코드상 visibilitychange에서 타이머·rAF를 멈춘다.
