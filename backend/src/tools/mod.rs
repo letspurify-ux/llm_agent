@@ -1216,13 +1216,13 @@ fn candidate_paths_bounded(
     limits: FileScanLimits,
 ) -> Result<(Vec<PathBuf>, usize)> {
     let check = || -> Result<()> {
-        if let Some(deadline) = deadline {
-            structure::check_budget(cancel, deadline)
-        } else if cancel.is_cancelled() {
+        if cancel.is_cancelled() {
             bail!("cancelled")
-        } else {
-            Ok(())
         }
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            bail!("cancelled_or_timeout: listing the files in scope ran past the tool time limit; narrow path or path_glob");
+        }
+        Ok(())
     };
     check()?;
     let root = p.root.canonicalize()?;
@@ -1299,6 +1299,16 @@ fn candidate_paths_bounded(
     check()?;
     Ok((entries, non_utf8))
 }
+/// The refusal of a source tool past its time limit (`tool_timeout_secs`,
+/// the settings' "소스 도구 한도"): file_list and source_search had none, and
+/// a search of a large project held the question until it ran out.
+pub(crate) fn past_deadline(deadline: std::time::Instant, tool: &str, done: usize, total: usize, secs: u64, narrower: &str) -> Result<()> {
+    if std::time::Instant::now() >= deadline {
+        bail!("scope_timeout: {tool} read {done} of {total} files within its {secs}s limit; {narrower}");
+    }
+    Ok(())
+}
+
 /// Largest ignore file a walk lets the walker read.
 const MAX_IGNORE_FILE_BYTES: u64 = 1024 * 1024;
 
@@ -1516,19 +1526,22 @@ fn execute_validated(
                 None
             };
             let mode = args["mode"].as_str().unwrap_or("text");
+            let deadline = crate::config::deadline_after(s.config.tool_timeout_secs)?;
             let mut files = candidate_paths_scoped(
                 &s.project,
                 path_glob(&args)?,
                 cancel,
                 directory.as_deref(),
-                None,
+                Some(deadline),
             )?;
             if mode != "paths" {
                 let mut searchable = Vec::new();
-                for path in files {
+                let total = files.len();
+                for (read, path) in files.into_iter().enumerate() {
                     if cancel.is_cancelled() {
                         bail!("cancelled");
                     }
+                    past_deadline(deadline, "file_list", read, total, s.config.tool_timeout_secs, "mode=paths lists without reading, or narrow path or path_glob")?;
                     if search_text(&path)?.is_some() {
                         searchable.push(path);
                     }
@@ -2595,6 +2608,24 @@ mod tests {
         assert_eq!(lines(json!({"query":"load","regex":true,"whole_word":true})), [1, 2]);
         assert_eq!(lines(json!({"query":"(re|un)load","regex":true,"whole_word":true})), [3]);
         assert_eq!(lines(json!({"query":"^load","regex":true,"whole_word":true})), [1]);
+    }
+
+    /// Tool review, 2026-10-22 (fifth pass): file_list and source_search had
+    /// no time limit (only the structure tools kept "소스 도구 한도"): a
+    /// search of a large project held the question until it ran out.
+    #[test]
+    fn file_tools_stop_at_the_source_tool_limit_and_say_to_narrow() {
+        let past = std::time::Instant::now();
+        let error = past_deadline(past, "source_search", 119, 400, 30, "narrow path or path_glob").unwrap_err().to_string();
+        assert!(error.starts_with("scope_timeout: source_search read 119 of 400 files within its 30s limit"), "{error}");
+        assert_eq!(recovery::describe(&error)["action"], "narrow_the_scope");
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert!(past_deadline(later, "file_list", 0, 1, 30, "").is_ok());
+        // A walk past its time names no syntax analysis.
+        let dir = tempfile::tempdir().unwrap();
+        let project = Project { root: dir.path().into(), ..Default::default() };
+        let walk = candidate_paths_scoped(&project, None, &tokio_util::sync::CancellationToken::new(), None, Some(past)).unwrap_err().to_string();
+        assert!(walk.starts_with("cancelled_or_timeout: listing the files") && !walk.contains("syntax"), "{walk}");
     }
 
     /// Fourth pass: on Windows the tools showed paths with `\`, and a glob

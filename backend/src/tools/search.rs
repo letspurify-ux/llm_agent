@@ -217,6 +217,7 @@ pub(super) fn execute(
         0
     };
     let requested_end = requested_offset.saturating_add(n(args, "limit", 20).clamp(1, 100));
+    let deadline = crate::config::deadline_after(s.config.tool_timeout_secs)?;
     let mut rows = Vec::new();
     let mut files = Vec::new();
     let mut matched_files = 0;
@@ -229,12 +230,15 @@ pub(super) fn execute(
             super::open_regular_file(&path)?;
             vec![path]
         }
-        None => candidate_paths_scoped(&s.project, scope_glob, cancel, directory.as_deref(), None)?,
+        None => candidate_paths_scoped(&s.project, scope_glob, cancel, directory.as_deref(), Some(deadline))?,
     };
-    for path in candidates {
+    let total = candidates.len();
+    let narrower = "narrow path or path_glob, or search fewer words";
+    for (read, path) in candidates.into_iter().enumerate() {
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
+        super::past_deadline(deadline, "source_search", read, total, s.config.tool_timeout_secs, narrower)?;
         let Some(contents) = search_text(&path)? else {
             continue;
         };
@@ -250,8 +254,11 @@ pub(super) fn execute(
                 .unwrap_or(chunk);
             let line_start = byte_offset;
             byte_offset += chunk.len();
-            if i % 256 == 0 && cancel.is_cancelled() {
-                bail!("cancelled");
+            if i % 256 == 0 {
+                if cancel.is_cancelled() {
+                    bail!("cancelled");
+                }
+                super::past_deadline(deadline, "source_search", read, total, s.config.tool_timeout_secs, narrower)?;
             }
             // A blank or whitespace-only line cannot provide the non-empty
             // excerpt required for source evidence, so do not expose it as a
