@@ -1,18 +1,5 @@
 //! Count live blocking operations, including ones whose async receiver was dropped.
-use std::sync::Arc;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
-
-pub(crate) fn spawn<T: Send + 'static>(
-    workers: Arc<Semaphore>,
-    name: &str,
-    capacity_error: &'static str,
-    operation: impl FnOnce() -> T + Send + 'static,
-) -> std::io::Result<oneshot::Receiver<T>> {
-    let permit = workers
-        .try_acquire_owned()
-        .map_err(|_| std::io::Error::other(capacity_error))?;
-    spawn_permitted(permit, name, operation)
-}
+use tokio::sync::{OwnedSemaphorePermit, oneshot};
 
 pub(crate) fn spawn_permitted<T: Send + 'static>(
     permit: OwnedSemaphorePermit,
