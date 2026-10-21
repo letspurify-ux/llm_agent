@@ -1,12 +1,14 @@
 // 차트 블록 하나를 그린다. 무엇을 그릴지는 chart.js parseChartBlock이 이미 정했고, 여기는 그 명세를
 // Recharts 요소로 옮기는 일만 한다. App.jsx가 React.lazy로 부르므로 이 파일과 recharts는 첫 차트가
 // 나올 때까지 내려받지 않는다 — 대부분의 답변은 글과 표뿐이다.
-import { useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useId, useLayoutEffect, useMemo, useRef } from 'react';
 import {
   ResponsiveContainer, ComposedChart, PieChart, ScatterChart,
   Bar, Line, Area, Pie, Scatter, Cell, XAxis, YAxis, CartesianGrid, Tooltip,
 } from 'recharts';
 import { pieData, fmtScaledNum, chartNotes, fmtNum, pieLabelsOverflow, fitText } from './chart.js';
+// 관찰자가 같은 값을 거듭 알려 와도 값이 바뀔 때만 넘긴다 — 렌더되지 않는 업데이트가 쌓이지 않게 (changed-state.js).
+import { useChangedState } from './changed-state.js';
 
 // 첫 색은 앱의 강조색(index.html --accent)을 따라가고, 나머지는 서로 구별되는 고정 팔레트다.
 // 강조색은 이 모듈이 처음 실행될 때 한 번 읽는다 — 차트가 나올 시점에는 문서가 이미 그려져 있다.
@@ -100,7 +102,7 @@ const labelOf = (label, payload) => payload?.[0]?.payload?.full ?? label;
 // 처방이다 — 관찰자는 실제로 그 값을 쓰는 그래프에만 단다.
 function useBoxWidth(enabled) {
   const ref = useRef(null);
-  const [width, setWidth] = useState(0);
+  const [width, setWidth] = useChangedState(0);
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el || !enabled) return;
@@ -267,7 +269,7 @@ function textMeasurer(el, px = LABEL_FONT_PX) {
 // 재는 자리는 원그래프뿐이다 — 막대·선·산점도는 이 값을 읽지 않으므로 관찰자도 달지 않는다.
 function useLabelsFit(data, total) {
   const ref = useRef(null);
-  const [inside, setInside] = useState(false);
+  const [inside, setInside] = useChangedState(false);
   const labels = useMemo(
     () => data.map(d => labelTextOf(d.name, total > 0 ? d.value / total : 0)), [data, total]);
   useLayoutEffect(() => {

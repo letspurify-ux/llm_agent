@@ -1,5 +1,6 @@
-import { useLayoutEffect, useRef, useState } from 'react';
+import { useLayoutEffect, useRef } from 'react';
 import { flushSync } from 'react-dom';
+import { useChangedState } from './changed-state.js';
 
 // Markdown의 인라인 서식은 폭을 제공하지 않는다. 실제 줄을 배치하는
 // 문단·목록 항목·제목·셀까지 올라가 사용 가능한 내용 폭을 읽는다.
@@ -9,9 +10,13 @@ function containingBlock(element) {
   return parent;
 }
 
+// 같은 배치로 다시 잰 것은 바뀐 것이 아니다 — 창 크기가 바뀔 때마다 수식마다 다시 재므로, 그것을 setState로
+// 넘기면 렌더되지 않는 업데이트가 쌓인다(changed-state.js).
+const sameLayout = (a, b) => a.scroll === b.scroll && Math.abs(a.scale - b.scale) < 0.001;
+
 export default function InlineMath({ inLink, className, children, style, ...props }) {
   const ref = useRef(null);
-  const [layout, setLayout] = useState({ scroll: false, scale: 1 });
+  const [layout, setLayout] = useChangedState({ scroll: false, scale: 1 }, sameLayout);
   useLayoutEffect(() => {
     const element = ref.current;
     if (!element || element.closest('.katex-display')) return;
@@ -31,8 +36,7 @@ export default function InlineMath({ inLink, className, children, style, ...prop
       // 가장 넓은 base만이 아니라 그 줄 전체의 폭이 필요하다.
       const lineWidth = bases.reduce((sum, base) => sum + base.offsetWidth, 0);
       const scale = scroll ? Math.min(1, available / (lineWidth + bases.length)) : 1;
-      setLayout(previous => previous.scroll === scroll && Math.abs(previous.scale - scale) < 0.001
-        ? previous : { scroll, scale });
+      setLayout({ scroll, scale });
     };
     measure();
     const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);

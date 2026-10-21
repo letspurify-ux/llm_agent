@@ -246,6 +246,20 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
     document.removeEventListener('visibilitychange', sync);
     renderer.domElement.removeEventListener('webglcontextlost', contextLost);
     renderer.domElement.removeEventListener('webglcontextrestored', contextRestored);
+    // three.js (r186) gives every standard material one lookup texture shared by all
+    // renderers in the page (DFG_LUT). Each renderer that uploads it hangs a 'dispose'
+    // listener on it, and renderer.dispose() leaves that listener behind, so the shared
+    // texture kept every renderer ever made, each with its WebGL context and canvas —
+    // one more for every return to the empty chat screen (measured: 20 contexts after
+    // 20 returns). Disposing the texture runs those listeners, which detach themselves;
+    // a renderer still drawing (the header robot) just uploads it again next frame.
+    // It must be read before renderer.dispose() clears the material properties.
+    const shared = new Set();
+    materials.forEach(value => {
+      const lut = renderer.properties.get(value).uniforms?.dfgLUT?.value;
+      if (lut) shared.add(lut);
+    });
+    shared.forEach(value => value.dispose());
     geometries.forEach(value => value.dispose());
     materials.forEach(value => value.dispose());
     renderer.dispose();

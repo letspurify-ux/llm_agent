@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import DirectoryPicker from './DirectoryPicker.jsx';
+import { useChangedState } from './changed-state.js';
 import { STATE_LABELS, allowedTokens, blankForm, bodyOf, formOf, isAllowed, toggleTool, toolChoices } from './mcp-fields.js';
 
 // MCP 도구 서버(backend/config.toml의 [[mcp_servers]]) 화면: 서버 목록과 상태, 편집기, 도구별 호출 현황, 최근 기록.
@@ -18,7 +19,8 @@ export default function McpPanel({ api, onStateChange }) {
   const [secretDraft, setSecretDraft] = useState({ name: '', value: '' });
   const [error, setError] = useState('');
   // 몇 초마다 다시 읽는 상태의 실패는 따로 둔다: 다음 읽기가 되면 지우고, 저장 오류를 덮지 않는다.
-  const [refreshError, setRefreshError] = useState('');
+  // 서버가 내려가 있으면 5초마다 같은 문구가 온다 — 바뀔 때만 넘긴다 (changed-state.js).
+  const [refreshError, setRefreshError] = useChangedState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
   const [checking, setChecking] = useState(false);

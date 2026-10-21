@@ -2380,3 +2380,104 @@ it('mermaid의 글자 크기 캐시는 상한 있는 캐시다 — 서로 다른
     `mermaid의 글자 크기 캐시 셋이 상한 있는 캐시가 아니다: ${JSON.stringify(caches)} — src/mermaid-memo.js가 mermaid보다 먼저 평가되는지 볼 것`);
   assert.ok(!caches.includes('Map'), `상한 없는 memoize 캐시(Map)가 남았다: ${JSON.stringify(caches)}`);
 });
+
+// 홈으로 돌아올 때마다 빈 화면의 로봇(robotScene.js)이 새로 붙어 WebGL 렌더러를 하나 만든다. three.js(r186)는
+// 표준 재질이 쓰는 조회 텍스처(DFG_LUT) 하나를 페이지의 모든 렌더러가 나눠 쓰게 하고, 렌더러는 그것에 'dispose'
+// 리스너를 단 채 renderer.dispose()로도 떼지 않는다 — 그 텍스처가 지금까지 만든 렌더러를 모두, 각자의 WebGL
+// 컨텍스트·캔버스째 붙들었다(실측: 홈 20번에 컨텍스트 20개). 오류도 화면의 차이도 없이 탭이 열려 있는 내내 는다.
+// 본체 브라우저는 --disable-gpu라 로봇이 아예 붙지 않으므로 WebGL을 켠 브라우저를 따로 띄운다. 그 브라우저에서도
+// WebGL2를 못 만들면(드라이버가 없는 CI) 잴 것이 없으므로 건너뛴다.
+it('홈을 오가도 로봇의 WebGL 캔버스가 쌓이지 않는다', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'ui-chrome-webgl-'));
+  const proc = launchChrome({ bin: chromeBin, profile: dir, webgl: true });
+  let p;
+  try {
+    p = await Page.open((await oneTab(await chromePort(dir))).webSocketDebuggerUrl);
+    await p.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+    // WebGL 컨텍스트를 얻은 캔버스를 세고, 수거되는 것은 FinalizationRegistry로 센다 — 캔버스를 붙들지 않는다.
+    await p.send('Page.addScriptToEvaluateOnNewDocument', { source: `
+      window.__gl = { made: 0, gone: 0 };
+      const registry = new FinalizationRegistry(() => { window.__gl.gone++; });
+      const getContext = HTMLCanvasElement.prototype.getContext;
+      HTMLCanvasElement.prototype.getContext = function (type, options) {
+        const context = getContext.call(this, type, options);
+        if (context && type === 'webgl2' && !registry.__seen?.has(this)) {
+          (registry.__seen ??= new WeakSet()).add(this);
+          window.__gl.made++;
+          registry.register(this, 0);
+        }
+        return context;
+      };` });
+    await p.goto(url('pieshort'), '.chip');
+    if (!await p.eval(`!!document.createElement('canvas').getContext('webgl2')`)) return t.skip('이 브라우저에서 WebGL2를 만들 수 없다');
+    await p.until(`document.querySelectorAll('.robot-ready').length === 2`, { what: '로봇 둘이 그려지기' });
+    const 왕복 = 8;
+    for (let i = 0; i < 왕복; i++) {
+      await p.eval(`document.querySelector('.chip').click()`);
+      await p.until(`document.querySelector('.bubble.assistant') && !document.querySelector('.typing')`, { what: '답이 도착하기' });
+      await p.eval(`document.querySelector('.home-btn').click()`);
+      await p.until(`document.querySelectorAll('.robot-ready').length === 2`, { what: '홈의 로봇이 다시 그려지기' });
+    }
+    // 수거와 그 알림(FinalizationRegistry)은 따로 온다 — GC를 거듭 부르며 잠깐 기다린다.
+    let gl;
+    for (let i = 0; i < 15; i++) {
+      await p.send('HeapProfiler.collectGarbage');
+      await sleep(200);
+      gl = await p.eval('window.__gl');
+      if (gl.made - gl.gone <= 2) break;
+    }
+    assert.ok(gl.made >= 왕복 + 2, `검사의 전제: 홈마다 로봇이 새 컨텍스트를 만든다 (${JSON.stringify(gl)})`);
+    // 살아 있는 것은 머리글과 빈 화면의 로봇 둘이다.
+    assert.ok(gl.made - gl.gone <= 2, `홈을 ${왕복}번 오간 뒤 수거되지 않은 WebGL 캔버스가 ${gl.made - gl.gone}개다 (${JSON.stringify(gl)})`);
+    assert.deepStrictEqual(p.logs, [], `콘솔에 오류가 올랐다: ${JSON.stringify(p.logs)}`);
+  } finally {
+    p?.ws?.close();
+    await stopProcess(proc, { group: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 3 }).catch(() => {});
+  }
+});
+
+// React 18은 같은 값이라 렌더를 건너뛴 setState도 버리지 않고 그 컴포넌트의 훅 대기열에 이어 두며, 그 컴포넌트가
+// 다음에 실제로 렌더될 때에야 비운다(enqueueConcurrentHookUpdateAndEagerlyBailout). 크기 관찰자·창 이벤트가
+// 같은 값을 거듭 알리는 자리(인라인 수식의 배치, 표의 잘림, 차트의 폭)에서 그대로 넘기면 대기열이 끝없이 자랐다
+// (실측: 수식이 많은 답에서 창 크기 150번에 업데이트 5천여 개). src/changed-state.js가 바뀔 때만 넘긴다.
+// React 트리를 훑어 훅 대기열에 남은 업데이트를 센다 — React 내부 모양이라 바뀌면 '훅을 찾지 못했다'로 알린다.
+it('창 크기를 거듭 바꿔도 렌더되지 않는 상태 업데이트가 쌓이지 않는다', async () => {
+  await answered(1000, 760, { c: 'mixed' });
+  // 두 번째 답: 눕힌 막대(폭 관찰)·원그래프(라벨 자리 관찰)·펼친 조회 표(잘림 관찰)까지 화면에 세운다.
+  const second = { answer: `${CASES.bars}\n\n${CASES.pieshort}`, trace: TRACE };
+  await page.eval(`window.fetch = async () => new Response(${JSON.stringify(JSON.stringify(second))}, { headers: { 'Content-Type': 'application/json' } })`);
+  await sendQuestion('막대와 원그래프', 2);
+  await page.until(`document.querySelectorAll('.row.assistant')[1].querySelectorAll('figure.chart .recharts-surface').length >= 3`, { what: '두 번째 답의 차트가 서기' });
+  await page.eval(`document.querySelectorAll('details.trace').forEach(d => { d.open = true; })`);
+  await page.until(`document.querySelector('.trace-grid')`, { what: '조회 표가 펼쳐지기' });
+  const queued = `(() => {
+    const root = document.getElementById('root');
+    const key = Object.keys(root).find(k => k.startsWith('__reactContainer$'));
+    const host = key && root[key];
+    const ring = u => { let n = 0; for (let x = u; x && n < 1e6; x = x.next) { n++; if (x.next === u) break; } return n; };
+    let hooks = 0, total = 0, worst = 0;
+    const stack = host ? [host.stateNode?.current ?? host] : [];
+    while (stack.length) {
+      const f = stack.pop();
+      for (let h = [0, 11, 15].includes(f.tag) ? f.memoizedState : null; h; h = h.next) {
+        const q = h.queue;
+        if (!q || typeof q !== 'object' || !('pending' in q)) continue;
+        const n = ring(q.pending) + ring(q.interleaved);
+        hooks++; total += n; worst = Math.max(worst, n);
+      }
+      if (f.sibling) stack.push(f.sibling);
+      if (f.child) stack.push(f.child);
+    }
+    return { hooks, total, worst };
+  })()`;
+  // 배치가 바뀌지 않을 만큼만 오간다 — 수식·표·차트는 매번 다시 재지만 값은 그대로다.
+  for (let i = 0; i < 40; i++) {
+    await page.send('Emulation.setDeviceMetricsOverride', { width: i % 2 ? 700 : 696, height: 760, deviceScaleFactor: 1, mobile: false });
+    await sleep(40);
+  }
+  await sleep(300);
+  const got = await page.eval(queued);
+  assert.ok(got.hooks > 20, `검사의 전제: React 트리에서 상태 훅을 찾는다 (${JSON.stringify(got)}) — React 내부 모양이 바뀌었으면 이 검사를 고칠 것`);
+  assert.ok(got.worst <= 2, `창 크기를 40번 바꾼 뒤 한 훅의 대기열에 업데이트 ${got.worst}개가 남았다 (${JSON.stringify(got)})`);
+});

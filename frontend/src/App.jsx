@@ -12,6 +12,7 @@ import { columnsOf, cellValue, cellText, toCsv, csvFileName, stepLabel, normaliz
 import { readEvents } from './stream.js';
 import { fillAnswer } from './answer-fill.js';
 import { openChat, closeChat, markChatOpen, saveChat, rememberTurn, HISTORY_TURNS } from './chat-store.js';
+import { useChangedState } from './changed-state.js';
 
 // 대화 번호. crypto.randomUUID가 없는 브라우저(구형·http 사내 주소)에서는 난수로 만든다.
 function newConversationId() {
@@ -312,7 +313,8 @@ function TraceGrid({ rows }) {
   const ref = useRef(null);
   // 이 표가 상자 밖으로 나가 있는가(세로든 가로든). 종이에는 스크롤이 없어 그만큼이 그냥 잘리므로,
   // 잘리는 표에만 인쇄용 안내를 붙인다 — 다 들어가는 표에까지 붙이면 거짓말이 된다.
-  const [clipped, setClipped] = useState(false);
+  // 크기가 바뀔 때마다 다시 재므로 값이 바뀔 때만 넘긴다 (changed-state.js).
+  const [clipped, setClipped] = useChangedState(false);
   // 세로 스크롤바가 실제로 생긴 표는 휠을 붙잡는다(overscroll-behavior: contain) — 표 위에서 굴린 휠은
   // 표만 움직이고, 끝에 닿아도 대화로 번지지 않는다. 그냥 두면 Chrome은 휠 제스처를 표에 걸어(latching)
   // 끝에 닿은 뒤로는 멈춘 듯하다가 잠깐 쉬면 그때부터 대화가 움직여, 같은 자리에서 굴려도 표가 움직일지

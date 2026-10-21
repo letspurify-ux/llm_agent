@@ -52,11 +52,14 @@ export const freePort = () => new Promise((res, rej) => {
 // 앞선 실행이 남긴 브라우저가 그 포트를 쥐고 있을 때 이번에 띄운 것이 아니라 그 남은 브라우저에
 // 붙는다 — 아무도 관리하지 않는 창을 상대로 검사가 초록불을 낸다. Chrome은 고른 번호를 프로필의
 // DevToolsActivePort 첫 줄에 적어 주므로, 그 파일이 '이번에 띄운 그 브라우저'라는 증거가 된다.
-export function launchChrome({ bin, profile }) {
+// webgl: GPU 대신 소프트웨어 렌더러(SwiftShader)로 WebGL을 켠다. 기본은 끈다(--disable-gpu) — 그러면 로봇
+// 장면(robotScene.js)이 아예 붙지 않으므로, WebGL 자원을 재는 검사만 이것을 켠다.
+export function launchChrome({ bin, profile, webgl = false }) {
   const p = spawn(bin, [
     '--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`,
     '--window-size=1200,900', '--force-device-scale-factor=1',
-    '--no-first-run', '--no-default-browser-check', '--disable-gpu', '--mute-audio',
+    '--no-first-run', '--no-default-browser-check', '--mute-audio',
+    ...(webgl ? ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] : ['--disable-gpu']),
     '--disable-features=Translate,BackForwardCache',
     'about:blank',
   ], { stdio: 'ignore', detached: true });
