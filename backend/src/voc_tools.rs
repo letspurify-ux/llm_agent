@@ -807,20 +807,15 @@ fn read_start(args: &Value) -> Result<(i64, i64, usize)> {
     Ok((doc, start.clamp(1, MAX_OFFSET as i64), skip))
 }
 
-/// The chunks a read takes, the first without the `skip` characters of it
-/// already read.
-fn after_skip(mut chunks: Vec<(i64, String)>, skip: usize) -> Result<Vec<(i64, String)>> {
-    if skip == 0 {
-        return Ok(chunks);
+/// Refuses a cursor whose `skip` characters already read reach past the end
+/// of the chunk it starts at.
+fn check_skip(chunks: &[(i64, String)], skip: usize) -> Result<()> {
+    match chunks.first() {
+        Some((_, first)) if skip > 0 && first.chars().nth(skip).is_none() => {
+            bail!("invalid_cursor: copy next_cursor exactly; it points past the end of its chunk")
+        }
+        _ => Ok(()),
     }
-    let Some((_, first)) = chunks.first_mut() else {
-        return Ok(chunks);
-    };
-    let Some((at, _)) = first.char_indices().nth(skip) else {
-        bail!("invalid_cursor: copy next_cursor exactly; it points past the end of its chunk");
-    };
-    *first = first[at..].to_owned();
-    Ok(chunks)
 }
 
 async fn knowledge_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
@@ -876,7 +871,8 @@ async fn knowledge_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
             .map(|(i, c)| (i as i64 + 1, c))
             .filter(|(no, _)| *no >= start && *no < start + max_chunks)
             .collect();
-        return Ok(fit_chunks(doc, &db::text(row, "title"), total, after_skip(chunks, skip)?, skip, budget, model));
+        check_skip(&chunks, skip)?;
+        return Ok(fit_chunks(doc, &db::text(row, "title"), total, chunks, skip, budget, model));
     }
     let total = db::int(&rows[0], "chunk_of");
     let title = db::text(&rows[0], "title");
@@ -884,12 +880,16 @@ async fn knowledge_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
         .iter()
         .map(|r| (db::int(r, "chunk_no"), db::text(r, "content")))
         .collect();
-    Ok(fit_chunks(doc, &title, total, after_skip(chunks, skip)?, skip, budget, model))
+    check_skip(&chunks, skip)?;
+    Ok(fit_chunks(doc, &title, total, chunks, skip, budget, model))
 }
 
 /// As many whole chunks as fit the result budget, measured as the tool
 /// message the model receives (at least one, cut when it alone is larger).
-/// `skip`: characters of the first chunk read before (and not in `chunks`).
+/// `skip`: characters of the first chunk read before, left out of the text.
+/// They are left out after the join: the rest of a chunk shorter than the
+/// overlap its next chunk repeats lost the seam, and the next chunk came
+/// whole after a line break, the overlap read twice.
 fn fit_chunks(doc: i64, title: &str, total: i64, chunks: Vec<(i64, String)>, skip: usize, budget: usize, model: &str) -> Value {
     let first = chunks.first().map_or(1, |c| c.0);
     // `ends`: where each chunk taken ends in `text`, so a cut beside other
@@ -918,7 +918,14 @@ fn fit_chunks(doc: i64, title: &str, total: i64, chunks: Vec<(i64, String)>, ski
         out
     };
     let size = |out: &Value| crate::tools::message_tokens(&crate::tools::envelope(Ok(out.clone())), model);
-    let join = |taken: usize| crate::chunk::join_chunks_with_ends(chunks[..taken].iter().map(|(no, c)| (*no, c.as_str())));
+    let join = |taken: usize| {
+        let (text, ends) = crate::chunk::join_chunks_with_ends(chunks[..taken].iter().map(|(no, c)| (*no, c.as_str())));
+        if skip == 0 {
+            return (text, ends);
+        }
+        let at = text.char_indices().nth(skip).map_or(text.len(), |(at, _)| at);
+        (text[at..].to_owned(), ends.into_iter().map(|end| end.saturating_sub(skip)).collect())
+    };
     // Each chunk counted once, without the overlap the join removes, to
     // choose how many; the joined message is then measured, and chunks leave
     // from the end until it fits.
@@ -933,6 +940,7 @@ fn fit_chunks(doc: i64, title: &str, total: i64, chunks: Vec<(i64, String)>, ski
             Some((before, previous)) if *before == no - 1 => {
                 crate::context::tokens(&crate::chunk::cut_seam(previous, content), model)
             }
+            _ if i == 0 && skip > 0 => crate::context::tokens(&content.chars().skip(skip).collect::<String>(), model),
             _ => crate::context::tokens(content, model),
         };
         if i > 0 && sum + added > budget {
@@ -1749,8 +1757,8 @@ mod tests {
             loop {
                 reads += 1;
                 assert!(reads < 50, "never ends");
-                let page = after_skip(rest.clone(), skip).unwrap();
-                let out = fit_chunks(7, "제목", 3, page, skip, 300, "gpt-4o");
+                check_skip(&rest, skip).unwrap();
+                let out = fit_chunks(7, "제목", 3, rest.clone(), skip, 300, "gpt-4o");
                 let text = out["text"].as_str().unwrap();
                 match text.strip_suffix(TRUNC_MARK) {
                     Some(head) => {
@@ -1771,7 +1779,7 @@ mod tests {
             assert!(read.starts_with(&rest[0].1), "start {start}");
             assert!(reads > 2, "start {start}: {reads}");
         }
-        assert!(after_skip(chunks[..1].to_vec(), 10_000).unwrap_err().to_string().starts_with("invalid_cursor"));
+        assert!(check_skip(&chunks[..1], 10_000).unwrap_err().to_string().starts_with("invalid_cursor"));
     }
 
     // Context management review, sixth pass (2026-10-16): results cut beside
@@ -1890,5 +1898,52 @@ mod tests {
             assert_eq!(cut["data"]["omitted_rows"], 1000 - shown, "{cut}");
             assert!(cut["data"].get("rows_omitted").is_none(), "one count of unseen rows: {cut}");
         }
+    }
+
+    /// A read going on inside a chunk whose rest is shorter than the overlap
+    /// the next chunk repeats: the next chunk came whole after a line break
+    /// (the seam was looked for in the rest alone), the overlap twice in one
+    /// text. Each read from inside a chunk is the joined text past `skip`.
+    #[test]
+    fn a_read_from_inside_a_chunk_keeps_its_seam_with_the_next() {
+        let mut seed: u64 = 7;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n.max(1)
+        };
+        let words = ["가상계측", "배치", "재시작", "memory", "문장이다.", "😀", "x"];
+        let mut inside = 0;
+        for _ in 0..120 {
+            let mut doc = String::new();
+            let length = 1500 + next(6000);
+            while doc.chars().count() < length {
+                doc.push_str(words[next(words.len())]);
+                doc.push(' ');
+            }
+            let parts = crate::chunk::split_content(&doc);
+            let budget = 200 + next(1200);
+            let (mut chunk, mut skip, mut reads) = (1usize, 0usize, 0);
+            loop {
+                reads += 1;
+                assert!(reads < 500, "never ends");
+                let chunks: Vec<(i64, String)> = parts.iter().cloned().enumerate().map(|(i, c)| (i as i64 + 1, c)).skip(chunk - 1).collect();
+                check_skip(&chunks, skip).unwrap();
+                let out = fit_chunks(9, "제목", parts.len() as i64, chunks.clone(), skip, budget, "gpt-4o");
+                let text = out["text"].as_str().unwrap();
+                let text = text.strip_suffix(TRUNC_MARK).unwrap_or(text);
+                if skip > 0 {
+                    inside += 1;
+                    let joined = crate::chunk::join_chunks(chunks.iter().map(|(no, c)| (*no, c.as_str())));
+                    let rest: String = joined.chars().skip(skip).collect();
+                    assert!(rest.starts_with(text), "chunk {chunk} @{skip}: {text:?}");
+                }
+                let Some(cursor) = out["next_cursor"].as_str() else {
+                    break;
+                };
+                let (_, at, from) = read_start(&json!({"cursor":cursor})).unwrap();
+                (chunk, skip) = (at as usize, from);
+            }
+        }
+        assert!(inside > 50, "{inside}");
     }
 }

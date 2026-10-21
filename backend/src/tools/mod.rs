@@ -1220,7 +1220,7 @@ fn candidate_paths_bounded(
             bail!("cancelled")
         }
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-            bail!("cancelled_or_timeout: listing the files in scope ran past the tool time limit; narrow path or path_glob");
+            bail!("scope_timeout: listing the files in scope ran past the source tool time limit; narrow path or path_glob");
         }
         Ok(())
     };
@@ -2625,7 +2625,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = Project { root: dir.path().into(), ..Default::default() };
         let walk = candidate_paths_scoped(&project, None, &tokio_util::sync::CancellationToken::new(), None, Some(past)).unwrap_err().to_string();
-        assert!(walk.starts_with("cancelled_or_timeout: listing the files") && !walk.contains("syntax"), "{walk}");
+        assert!(walk.starts_with("scope_timeout: listing the files") && !walk.contains("syntax"), "{walk}");
+        // Eighth pass: the walk and the syntax work past the same limit were
+        // told as transient (`cancelled_or_timeout`), to be sent again.
+        assert_eq!(recovery::describe(&walk)["action"], "narrow_the_scope");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let syntax = structure::check_budget(&cancel, past).unwrap_err().to_string();
+        assert_eq!(recovery::describe(&syntax)["action"], "narrow_the_scope", "{syntax}");
+        cancel.cancel();
+        assert_eq!(structure::interrupted(&cancel, "syntax parsing").to_string(), "cancelled");
     }
 
     /// Fourth pass: on Windows the tools showed paths with `\`, and a glob

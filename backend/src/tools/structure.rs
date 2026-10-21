@@ -492,9 +492,21 @@ pub(super) fn check_budget(
         bail!("cancelled");
     }
     if std::time::Instant::now() >= deadline {
-        bail!("cancelled_or_timeout: syntax analysis timed out; narrow path_glob");
+        return Err(interrupted(cancel, "syntax analysis"));
     }
     Ok(())
+}
+
+/// A stop of syntax work: the question's, or the source tool time limit's.
+/// Past the limit the same call stops again, so the recovery is a narrower
+/// scope, as file_list and source_search say (`tools::past_deadline`): told
+/// a transient `cancelled_or_timeout`, the model was led to send it again.
+pub(super) fn interrupted(cancel: &tokio_util::sync::CancellationToken, work: &str) -> anyhow::Error {
+    if cancel.is_cancelled() {
+        anyhow::anyhow!("cancelled")
+    } else {
+        anyhow::anyhow!("scope_timeout: {work} ran past the source tool time limit; narrow path or path_glob")
+    }
 }
 
 fn grammar(language: &str) -> tree_sitter::Language {
@@ -558,9 +570,7 @@ impl SyntaxFile {
                         None,
                         Some(tree_sitter::ParseOptions::new().progress_callback(&mut stop)),
                     )
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("cancelled_or_timeout: structure parsing interrupted")
-                    })?;
+                    .ok_or_else(|| interrupted(cancel, "syntax parsing"))?;
                 syntax_cache()
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -622,7 +632,7 @@ impl SyntaxFile {
         });
         while let Some((node, mut container, mut parent_kind, mut depth)) = stack.pop() {
             if cancel.is_cancelled() || std::time::Instant::now() >= deadline {
-                bail!("cancelled_or_timeout: structure traversal interrupted");
+                return Err(interrupted(cancel, "syntax traversal"));
             }
             if let Some((start, end)) = requested_span
                 && (node.end_byte() <= start || node.start_byte() >= end)

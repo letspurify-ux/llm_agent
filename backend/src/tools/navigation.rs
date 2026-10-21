@@ -377,7 +377,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            error.to_string().starts_with("cancelled_or_timeout"),
+            error.to_string().starts_with("scope_timeout"),
             "{error}"
         );
     }

@@ -571,7 +571,7 @@ async fn run(
                     }
                 }
                 // Tool calls that cannot be used (arguments that are not one
-                // JSON object, an empty or repeated call ID, too many calls):
+                // JSON object, an empty tool name, too many calls):
                 // nothing ran. The client asks again only while none of the
                 // response's text has gone out, so one that wrote first (a
                 // sentence before its calls) ended the question; it is asked

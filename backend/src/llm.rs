@@ -34,6 +34,16 @@ pub const MAX_COMPLETION_BYTES: usize = 8 * 1024 * 1024;
 /// as malformed.
 pub const MAX_TOOL_CALLS: usize = 256;
 
+/// A call ID for a call the server sent without a unique one: nine letters
+/// and digits, a shape every OpenAI-compatible server takes back (Mistral's
+/// is the narrowest).
+fn new_call_id() -> String {
+    use rand::Rng;
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut random = rand::thread_rng();
+    (0..9).map(|_| ALPHABET[random.gen_range(0..ALPHABET.len())] as char).collect()
+}
+
 pub fn validate_completion_bounds(completion: &Completion) -> Result<()> {
     if completion.calls.len() > MAX_TOOL_CALLS {
         bail!("tool_call_batch_limit: at most {MAX_TOOL_CALLS} calls");
@@ -424,7 +434,7 @@ fn remember_rejected_parameters(c: &Config, parameters: &[&str]) {
 }
 
 /// A response whose tool calls cannot be used (arguments that are not one
-/// JSON object, an empty or repeated call ID or name, too many calls):
+/// JSON object, an empty tool name, too many calls):
 /// nothing of it runs. The client sends the request again only while none
 /// of its text has gone out; the caller may take the text back and ask again.
 pub fn unusable_tool_calls(error: &str) -> bool {
@@ -924,12 +934,24 @@ impl OpenAiClient {
                         // new call, a part without one goes on the last call.
                         // Refused, the whole response failed ("tool call
                         // missing index") on every request.
+                        // A server sending neither sends each call whole:
+                        // a part naming a tool after the last call's
+                        // arguments are complete is the next call (joined,
+                        // the two made one call of broken JSON).
                         let index = match call["index"].as_u64() {
                             Some(index) => index as usize,
                             None => {
                                 let id = call["id"].as_str().filter(|id| !id.is_empty());
+                                let named = call["function"]["name"].as_str().is_some_and(|name| !name.is_empty());
                                 match calls.last_key_value() {
                                     Some((&last, known)) if id.is_some_and(|id| !known.id.is_empty() && known.id != id) => last + 1,
+                                    Some((&last, known))
+                                        if named
+                                            && !known.name.is_empty()
+                                            && serde_json::from_str::<serde_json::Map<String, Value>>(&known.arguments).is_ok() =>
+                                    {
+                                        last + 1
+                                    }
                                     Some((&last, _)) => last,
                                     None => 0,
                                 }
@@ -940,7 +962,8 @@ impl OpenAiClient {
                             name: String::new(),
                             arguments: String::new(),
                         });
-                        if let Some(id) = call["id"].as_str() {
+                        // A later part's empty ID does not undo the one sent.
+                        if let Some(id) = call["id"].as_str().filter(|id| !id.is_empty()) {
                             target.id = id.into();
                         }
                         if let Some(name) = call["function"]["name"].as_str() {
@@ -1001,6 +1024,11 @@ impl OpenAiClient {
         // response with `stop` instead of `tool_calls`. The calls are still
         // checked for IDs, names and complete JSON objects below before the
         // agent can use them.
+        // The server writes call IDs, not the model: one leaving them out,
+        // or giving two calls one ID, had every response with calls refused
+        // and the model told to fix what it could not. An ID only pairs a
+        // call with its result, so such a call gets one of its own.
+        let given: Vec<String> = calls.values().map(|call| call.id.clone()).collect();
         let mut ids = std::collections::BTreeSet::new();
         for call in calls.values_mut() {
             // Providers send "" for a call without arguments; that is an
@@ -1008,22 +1036,18 @@ impl OpenAiClient {
             if call.arguments.trim().is_empty() {
                 call.arguments = "{}".into();
             }
-            if call.id.is_empty() || call.name.is_empty() {
-                bail!(
-                    "malformed_tool_call: a tool call has an empty {}; every call needs a unique ID and an exact tool name",
-                    if call.id.is_empty() {
-                        "ID"
-                    } else {
-                        "tool name"
+            if call.name.is_empty() {
+                bail!("malformed_tool_call: a tool call has an empty tool name; every call needs an exact tool name");
+            }
+            if call.id.is_empty() || ids.contains(&call.id) {
+                call.id = loop {
+                    let id = new_call_id();
+                    if !given.contains(&id) && !ids.contains(&id) {
+                        break id;
                     }
-                );
+                };
             }
-            if !ids.insert(call.id.clone()) {
-                bail!(
-                    "malformed_tool_call: call ID {:?} is used by more than one call in this response; call IDs must be unique",
-                    call.id
-                );
-            }
+            ids.insert(call.id.clone());
             let _: serde_json::Map<String, Value> =
                 serde_json::from_str(&call.arguments).map_err(|e| {
                     anyhow::anyhow!(
@@ -1632,6 +1656,9 @@ mod tool_choice_tests {
         /// Streams tool calls without `index`, one with its arguments as an
         /// object.
         CallsWithoutIndex,
+        /// Streams tool calls without an ID, two with one ID, and two whole
+        /// with neither `index` nor ID.
+        CallsWithoutIds,
     }
 
     /// An OpenAI-compatible server on a fresh port (so the endpoint caches
@@ -1706,6 +1733,16 @@ mod tool_choice_tests {
                             event(json!({"choices":[{"delta":{"tool_calls":[{"id":"a2","type":"function","function":{"name":"result_read","arguments":{"step":2}}}]},"finish_reason":null}]})),
                             event(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}))
                         ),
+                        Provider::CallsWithoutIds => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}{}{}{}{}{}{}data: [DONE]\n\n",
+                            event(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"search","arguments":"{\"query\":\"a\"}"}}]},"finish_reason":null}]})),
+                            event(json!({"choices":[{"delta":{"tool_calls":[{"index":1,"id":"dup","type":"function","function":{"name":"search","arguments":"{\"query\":"}}]},"finish_reason":null}]})),
+                            event(json!({"choices":[{"delta":{"tool_calls":[{"index":1,"id":"","function":{"arguments":"\"b\"}"}}]},"finish_reason":null}]})),
+                            event(json!({"choices":[{"delta":{"tool_calls":[{"index":2,"id":"dup","type":"function","function":{"name":"result_read","arguments":"{\"step\":1}"}}]},"finish_reason":null}]})),
+                            event(json!({"choices":[{"delta":{"tool_calls":[{"type":"function","function":{"name":"method_read","arguments":"{\"ids\":[\"m1\"]}"}}]},"finish_reason":null}]})),
+                            event(json!({"choices":[{"delta":{"tool_calls":[{"type":"function","function":{"name":"knowledge_read","arguments":"{\"id\":\"k1\"}"}}]},"finish_reason":null}]})),
+                            event(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}))
+                        ),
                         Provider::Drops => format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}",
                             event(json!({"choices":[{"delta":{"content":"쓰던 "},"finish_reason":null}]}))
@@ -1766,6 +1803,34 @@ mod tool_choice_tests {
             .map(|c| (c.id.as_str(), c.name.as_str(), serde_json::from_str(&c.arguments).unwrap()))
             .collect();
         assert_eq!(calls, vec![("a1", "search", json!({"query":"배치"})), ("a2", "result_read", json!({"step":2}))]);
+    }
+
+    /// Tool review, 2026-10-22 (eighth pass): a call the server sent without
+    /// an ID, or with another call's ID, failed the whole response on every
+    /// request (the model was told to fix an ID it does not write), and
+    /// calls sent whole without `index` or ID were joined into one.
+    #[tokio::test]
+    async fn calls_without_their_own_id_get_one() {
+        let (config, _) = serve(Provider::CallsWithoutIds).await;
+        let request = json!({"model":"tool-choice-test","messages":[{"role":"user","content":"질문"}]});
+        let completion = complete(&config, request).await.unwrap();
+        let calls: Vec<(&str, Value)> = completion.calls.iter().map(|c| (c.name.as_str(), serde_json::from_str(&c.arguments).unwrap())).collect();
+        assert_eq!(
+            calls,
+            vec![
+                ("search", json!({"query":"a"})),
+                ("search", json!({"query":"b"})),
+                ("result_read", json!({"step":1})),
+                ("method_read", json!({"ids":["m1"]})),
+                ("knowledge_read", json!({"id":"k1"})),
+            ]
+        );
+        let ids: Vec<&str> = completion.calls.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids[1], "dup");
+        assert_eq!(ids.iter().collect::<std::collections::BTreeSet<_>>().len(), ids.len(), "{ids:?}");
+        for id in [ids[0], ids[2], ids[3], ids[4]] {
+            assert!(id.len() == 9 && id.bytes().all(|b| b.is_ascii_alphanumeric()), "{id}");
+        }
     }
 
     #[tokio::test]
