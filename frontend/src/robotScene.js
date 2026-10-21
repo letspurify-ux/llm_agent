@@ -222,7 +222,30 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
     targetY = THREE.MathUtils.clamp((event.clientY - rect.top - rect.height / 2) / 250, -1, 1);
   }
   function reset() { targetX = 0; targetY = 0; }
-  function contextLost(event) { event.preventDefault(); lost = true; revealed = false; host.classList.remove('robot-ready'); sync(); }
+  // Let go of what this renderer uploaded, through the objects it was uploaded from.
+  // three.js (r186) hangs a 'dispose' listener on every geometry, material and texture it
+  // uploads, and neither renderer.dispose() nor a context restore takes them off:
+  // - Standard materials share one lookup texture across all renderers in the page
+  //   (DFG_LUT), so it kept every renderer ever made, each with its WebGL context and
+  //   canvas — one more for every return to the empty chat screen (measured: 20 contexts
+  //   after 20 returns). A renderer still drawing (the header robot) uploads it again.
+  // - A restored context gets a fresh set of renderer internals, while the old set stays
+  //   reachable through those listeners with every program and buffer it made (measured:
+  //   about 230 KB more per lost-and-restored context, 161 programs after 15 rounds).
+  // Disposing runs the listeners, which detach themselves; on a lost context the GL deletes
+  // they make do nothing. The next frame uploads everything again. The lookup texture is
+  // reached through the material properties, so it is read before they are cleared.
+  function release() {
+    const shared = new Set();
+    materials.forEach(value => {
+      const lut = renderer.properties.get(value).uniforms?.dfgLUT?.value;
+      if (lut) shared.add(lut);
+    });
+    shared.forEach(value => value.dispose());
+    geometries.forEach(value => value.dispose());
+    materials.forEach(value => value.dispose());
+  }
+  function contextLost(event) { event.preventDefault(); lost = true; revealed = false; host.classList.remove('robot-ready'); sync(); release(); }
   function contextRestored() { lost = false; sync(); }
   const observer = new ResizeObserver(resize);
   const intersection = new IntersectionObserver(entries => { visible = entries[0].isIntersecting; sync(); });
@@ -246,22 +269,7 @@ export function mountRobot(host, { variant = 'portrait' } = {}) {
     document.removeEventListener('visibilitychange', sync);
     renderer.domElement.removeEventListener('webglcontextlost', contextLost);
     renderer.domElement.removeEventListener('webglcontextrestored', contextRestored);
-    // three.js (r186) gives every standard material one lookup texture shared by all
-    // renderers in the page (DFG_LUT). Each renderer that uploads it hangs a 'dispose'
-    // listener on it, and renderer.dispose() leaves that listener behind, so the shared
-    // texture kept every renderer ever made, each with its WebGL context and canvas —
-    // one more for every return to the empty chat screen (measured: 20 contexts after
-    // 20 returns). Disposing the texture runs those listeners, which detach themselves;
-    // a renderer still drawing (the header robot) just uploads it again next frame.
-    // It must be read before renderer.dispose() clears the material properties.
-    const shared = new Set();
-    materials.forEach(value => {
-      const lut = renderer.properties.get(value).uniforms?.dfgLUT?.value;
-      if (lut) shared.add(lut);
-    });
-    shared.forEach(value => value.dispose());
-    geometries.forEach(value => value.dispose());
-    materials.forEach(value => value.dispose());
+    release();
     renderer.dispose();
     renderer.forceContextLoss();
     renderer.domElement.remove();

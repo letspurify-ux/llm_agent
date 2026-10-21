@@ -2387,7 +2387,10 @@ it('mermaid의 글자 크기 캐시는 상한 있는 캐시다 — 서로 다른
 // 컨텍스트·캔버스째 붙들었다(실측: 홈 20번에 컨텍스트 20개). 오류도 화면의 차이도 없이 탭이 열려 있는 내내 는다.
 // 본체 브라우저는 --disable-gpu라 로봇이 아예 붙지 않으므로 WebGL을 켠 브라우저를 따로 띄운다. 그 브라우저에서도
 // WebGL2를 못 만들면(드라이버가 없는 CI) 잴 것이 없으므로 건너뛴다.
-it('홈을 오가도 로봇의 WebGL 캔버스가 쌓이지 않는다', async t => {
+// 컨텍스트를 잃었다 되찾는 길(GPU 리셋·절전 복귀)도 같은 부류다: three.js는 복구 때 내부 관리자를 모두 새로 만들지만, 옛
+// 관리자가 재질·지오메트리에 단 'dispose' 리스너가 남아 옛 프로그램·버퍼를 통째로 붙들었다(실측: 복구 15번에 프로그램
+// 161개, 한 번에 힙 ~230KB). 셰이더 프로그램도 FinalizationRegistry로 세어 복구 뒤에 늘지 않는지 본다.
+it('홈을 오가거나 WebGL 컨텍스트를 잃었다 되찾아도 로봇의 GPU 자원이 쌓이지 않는다', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'ui-chrome-webgl-'));
   const proc = launchChrome({ bin: chromeBin, profile: dir, webgl: true });
   let p;
@@ -2397,7 +2400,15 @@ it('홈을 오가도 로봇의 WebGL 캔버스가 쌓이지 않는다', async t 
     // WebGL 컨텍스트를 얻은 캔버스를 세고, 수거되는 것은 FinalizationRegistry로 센다 — 캔버스를 붙들지 않는다.
     await p.send('Page.addScriptToEvaluateOnNewDocument', { source: `
       window.__gl = { made: 0, gone: 0 };
+      window.__programs = { made: 0, gone: 0 };
       const registry = new FinalizationRegistry(() => { window.__gl.gone++; });
+      const programs = new FinalizationRegistry(() => { window.__programs.gone++; });
+      const createProgram = WebGL2RenderingContext.prototype.createProgram;
+      WebGL2RenderingContext.prototype.createProgram = function () {
+        const program = createProgram.call(this);
+        if (program) { window.__programs.made++; programs.register(program, 0); }
+        return program;
+      };
       const getContext = HTMLCanvasElement.prototype.getContext;
       HTMLCanvasElement.prototype.getContext = function (type, options) {
         const context = getContext.call(this, type, options);
@@ -2429,6 +2440,30 @@ it('홈을 오가도 로봇의 WebGL 캔버스가 쌓이지 않는다', async t 
     assert.ok(gl.made >= 왕복 + 2, `검사의 전제: 홈마다 로봇이 새 컨텍스트를 만든다 (${JSON.stringify(gl)})`);
     // 살아 있는 것은 머리글과 빈 화면의 로봇 둘이다.
     assert.ok(gl.made - gl.gone <= 2, `홈을 ${왕복}번 오간 뒤 수거되지 않은 WebGL 캔버스가 ${gl.made - gl.gone}개다 (${JSON.stringify(gl)})`);
+    // 살아 있는 셰이더 프로그램 수를 잰다 — 수거 알림이 따라올 때까지 GC를 거듭 부른다.
+    const alivePrograms = async () => {
+      let last = -1;
+      for (let i = 0; i < 15; i++) {
+        await p.send('HeapProfiler.collectGarbage');
+        await sleep(200);
+        const { made, gone } = await p.eval('window.__programs');
+        if (made - gone === last) return last;
+        last = made - gone;
+      }
+      return last;
+    };
+    const before = await alivePrograms();
+    await p.eval(`window.__lose = [...document.querySelectorAll('.robot-icon canvas')].map(c => c.getContext('webgl2').getExtension('WEBGL_lose_context'))`);
+    const 복구 = 6;
+    for (let i = 0; i < 복구; i++) {
+      await p.eval(`window.__lose.forEach(e => e.loseContext())`);
+      await p.until(`document.querySelectorAll('.robot-ready').length === 0`, { what: '컨텍스트를 잃은 로봇이 감춰지기' });
+      await p.eval(`window.__lose.forEach(e => e.restoreContext())`);
+      await p.until(`document.querySelectorAll('.robot-ready').length === 2`, { what: '되찾은 컨텍스트로 로봇이 다시 그려지기' });
+    }
+    const after = await alivePrograms();
+    assert.ok(before > 0, `검사의 전제: 로봇이 셰이더 프로그램을 만든다 (${before})`);
+    assert.ok(after <= before + 2, `컨텍스트를 ${복구}번 잃었다 되찾은 뒤 살아 있는 셰이더 프로그램이 ${before}개에서 ${after}개로 늘었다`);
     assert.deepStrictEqual(p.logs, [], `콘솔에 오류가 올랐다: ${JSON.stringify(p.logs)}`);
   } finally {
     p?.ws?.close();
