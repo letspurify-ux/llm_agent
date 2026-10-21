@@ -99,6 +99,11 @@ pub fn describe(message: &str) -> Value {
         (Class::Unavailable, "answer_with_gathered_evidence")
     } else if matches!(code, "query_not_found" | "unknown_item") {
         (Class::InvalidInput, "search_before_reading")
+    } else if code == "unknown_step" {
+        // The message lists the steps kept; a query run gives a new one.
+        (Class::InvalidInput, "correct_arguments")
+    } else if code == "project_root_unavailable" {
+        (Class::Unavailable, "answer_with_gathered_evidence")
     } else if code == "query_unrunnable" {
         (Class::Prerequisite, "choose_another_query_or_answer")
     } else if code == "bind_value_problem" || code == "target_db_required" {
@@ -202,6 +207,7 @@ mod tests {
         assert_eq!(describe("file_not_found: x")["action"], "resolve_path");
         assert_eq!(describe("cursor_expired: x")["class"], "stale_state");
         assert_eq!(describe("Something odd")["code"], "tool_error");
+        assert_eq!(describe("unknown_step: step 4의 결과가 없다")["class"], "invalid_input");
     }
 
     /// Context management review, eighth pass: a history id that was

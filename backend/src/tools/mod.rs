@@ -1140,6 +1140,23 @@ fn root_relative_glob<'a>(p: &Project, root: &Path, glob: &'a str) -> &'a str {
     glob
 }
 
+/// A path_glob as the tools describe it: `*` and `?` stay within one path
+/// component and `**` crosses directories, so `src/*.rs` is the files of
+/// `src` alone; a glob without `/` matches at any depth (`*.rs`, a basename),
+/// as in an ignore file. Compiled as globset's default, `*` crossed `/`:
+/// `src/tools/*.rs` listed and searched all of `src/tools` below too.
+/// `anchored`: the glob as sent named a directory (`./*.rs` is the root's).
+fn path_glob_matcher(glob: &str, anchored: bool) -> Result<globset::GlobMatcher> {
+    let anywhere;
+    let glob = if anchored {
+        glob
+    } else {
+        anywhere = format!("**/{glob}");
+        &anywhere
+    };
+    Ok(globset::GlobBuilder::new(glob).literal_separator(true).build()?.compile_matcher())
+}
+
 fn candidate_paths_bounded(
     p: &Project,
     pattern: Option<&str>,
@@ -1171,10 +1188,8 @@ fn candidate_paths_bounded(
     let mut non_utf8 = 0usize;
     let mut path_bytes = 0usize;
     let filter = pattern
-        .map(|glob| root_relative_glob(p, &root, glob))
-        .map(globset::Glob::new)
-        .transpose()?
-        .map(|g| g.compile_matcher());
+        .map(|glob| path_glob_matcher(root_relative_glob(p, &root, glob), glob.contains('/')))
+        .transpose()?;
     let rules = Rules::new(p)?;
     // The walker reads the root's and its parents' ignore files first.
     for dir in root.ancestors() {
@@ -2276,16 +2291,29 @@ pub fn relativize_paths(value: &mut Value, root: &Path) {
     let Some(root) = root.to_str().map(|r| r.trim_end_matches(['/', '\\']).to_owned()) else {
         return;
     };
+    fn below(path: &str, root: &str) -> Option<String> {
+        let rest = path.strip_prefix(root)?;
+        (rest.starts_with('/') || rest.starts_with('\\')).then(|| rest[1..].to_owned())
+    }
     fn walk(value: &mut Value, root: &str) {
         match value {
             Value::Object(fields) => {
                 for (key, value) in fields.iter_mut() {
                     if key == "path"
                         && let Some(text) = value.as_str()
-                        && let Some(rest) = text.strip_prefix(root)
-                        && (rest.starts_with('/') || rest.starts_with('\\'))
+                        && let Some(rest) = below(text, root)
                     {
-                        *value = json!(rest[1..].to_owned());
+                        *value = json!(rest);
+                    } else if key == "files"
+                        && let Some(files) = value.as_array_mut()
+                    {
+                        // source_search mode=files lists bare paths.
+                        for file in files {
+                            match file.as_str().and_then(|text| below(text, root)) {
+                                Some(rest) => *file = json!(rest),
+                                None => walk(file, root),
+                            }
+                        }
                     } else {
                         walk(value, root);
                     }
@@ -2424,6 +2452,63 @@ mod tests {
         assert_eq!(second["relations"].as_array().unwrap().len(), 1);
         assert_eq!(second["relations"][0]["enclosing_symbol"]["name"], "b");
         assert!(second["next_cursor"].is_null());
+    }
+
+    /// The model saw every source path relative to the project root but
+    /// those of source_search mode=files, a list of bare paths: absolute,
+    /// the root in front of each.
+    #[test]
+    fn searched_file_lists_are_shown_relative_to_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn a() {}\n").unwrap();
+        let mut ws = workspace(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let root = dir.path().canonicalize().unwrap().display().to_string();
+        for (mode, field) in [("files", "files"), ("count", "counts")] {
+            let data = execute(&mut ws, "source_search", json!({"query":"fn a","mode":mode}), &cancel).unwrap();
+            let mut result = envelope(Ok(data));
+            result["root"] = json!(root);
+            let shown = model_result(&result);
+            assert!(!shown.to_string().contains(&root), "{mode}: {shown}");
+            let paths: Vec<Value> = match mode {
+                "files" => shown["data"][field].as_array().unwrap().clone(),
+                _ => shown["data"][field].as_array().unwrap().iter().map(|c| c["path"].clone()).collect(),
+            };
+            assert_eq!(paths, [json!("b.rs"), json!("src/a.rs")], "{mode}");
+        }
+    }
+
+    /// The descriptions and hints say `**` crosses directories; `*` did
+    /// too, so `src/*.rs` was every Rust file below src.
+    #[test]
+    fn path_globs_cross_directories_only_with_double_stars() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["main.rs", "src/a.rs", "src/deep/b.rs", "src/deep/main.rs", "docs/c.md"] {
+            let path = dir.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "fn a() {}\n").unwrap();
+        }
+        let mut ws = workspace(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut list = |glob: &str| {
+            let data = execute(&mut ws, "file_list", json!({"path_glob":glob,"mode":"paths"}), &cancel).unwrap();
+            data["paths"].as_array().unwrap().iter().map(|p| p.as_str().unwrap().to_owned()).collect::<Vec<_>>()
+        };
+        assert_eq!(list("src/*.rs"), ["src/a.rs"]);
+        assert_eq!(list("./src/*.rs"), ["src/a.rs"]);
+        assert_eq!(list("src/**/*.rs"), ["src/a.rs", "src/deep/b.rs", "src/deep/main.rs"]);
+        assert_eq!(list("src/**"), ["src/a.rs", "src/deep/b.rs", "src/deep/main.rs"]);
+        assert_eq!(list("*/*.rs"), ["src/a.rs"]);
+        assert_eq!(list("./*.rs"), ["main.rs"]);
+        // Without a directory, at any depth.
+        assert_eq!(list("*.rs"), ["main.rs", "src/a.rs", "src/deep/b.rs", "src/deep/main.rs"]);
+        assert_eq!(list("main.rs"), ["main.rs", "src/deep/main.rs"]);
+        assert_eq!(list("**/b.rs"), ["src/deep/b.rs"]);
+        assert_eq!(list("**/*"), ["docs/c.md", "main.rs", "src/a.rs", "src/deep/b.rs", "src/deep/main.rs"]);
+        let found = execute(&mut ws, "source_search", json!({"query":"fn a","path_glob":"src/*.rs","mode":"files"}), &cancel).unwrap();
+        assert_eq!(found["matching_files"], 1, "{found}");
     }
 
     #[test]

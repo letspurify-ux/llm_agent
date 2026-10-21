@@ -25,7 +25,8 @@ async fn queries_routines_types_and_cancellation() {
     test_db.sql_in(
         "INSERT INTO query_registry (query_name, query_sql, target_db_name) VALUES
          ('type_probe', 'SELECT SYSDATE AS D, CAST(TIMESTAMP ''2026-09-06 12:34:56.789'' AS TIMESTAMP) AS TS, 1/4 AS QUARTER, 12345678901234567890 AS BIG, NUMTODSINTERVAL(1.5, ''DAY'') AS IV, ''x'' AS S FROM DUAL', 'ORDER_DB'),
-         ('slow_probe', 'SELECT COUNT(*) AS N FROM all_objects a, all_objects b, all_objects c', 'ORDER_DB')",
+         ('slow_probe', 'SELECT COUNT(*) AS N FROM all_objects a, all_objects b, all_objects c', 'ORDER_DB'),
+         ('same_names_probe', 'SELECT 1 AS X, 2 AS X, 3 AS X_1 FROM DUAL', 'ORDER_DB')",
     );
     let mut config = test_db.config();
     config.oracle.mock = false;
@@ -71,6 +72,10 @@ async fn queries_routines_types_and_cancellation() {
     assert_eq!(row["BIG"], "12345678901234567890", "big numbers stay exact text");
     assert_eq!(row["IV"], "1 12:00:00");
     assert_eq!(row["S"], "x");
+
+    // Columns of one name (a join's a.status, b.status) all stay.
+    let out = run(registry("same_names_probe").await, json!({}), CancellationToken::new()).await.unwrap();
+    assert_eq!(json!(out.rows[0]), json!({"X":1,"X_2":2,"X_1":3}));
 
     let missing = run(registry("batch_job_status").await, json!({}), CancellationToken::new()).await.unwrap_err();
     assert!(missing.to_string().contains("값 없음"), "{missing}");

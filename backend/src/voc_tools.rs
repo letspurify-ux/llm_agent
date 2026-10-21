@@ -458,7 +458,9 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
         .as_array()
         .map(|t| t.iter().filter_map(Value::as_str).map(str::to_owned).collect())
         .unwrap_or_default();
-    targets.retain(|t| matches!(t.as_str(), "knowledge" | "qa_method" | "query"));
+    // A target named twice ran its searches twice for one result.
+    let mut seen = BTreeSet::new();
+    targets.retain(|t| matches!(t.as_str(), "knowledge" | "qa_method" | "query") && seen.insert(t.clone()));
     if targets.is_empty() {
         targets = vec!["knowledge".into(), "qa_method".into(), "query".into()];
     }
@@ -730,35 +732,48 @@ fn item_number(id: &str, prefix: char) -> Option<i64> {
     digits.parse::<i64>().ok().filter(|n| *n > 0)
 }
 
-async fn knowledge_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
+/// The document and chunk a knowledge read starts at: the cursor's, or the
+/// ID's from its first chunk (start_chunk, given, comes first).
+fn read_start(args: &Value) -> Result<(i64, i64)> {
+    let named = |id: &str| {
+        item_number(id, 'k').ok_or_else(|| {
+            anyhow::anyhow!("unknown_item: {id:?} is not a knowledge ID; copy an id such as k12 from search results")
+        })
+    };
     let (doc, cursor_start) = match args["cursor"].as_str() {
         Some(cursor) => {
-            let (id, start) = cursor
-                .split_once(':')
-                .ok_or_else(|| anyhow::anyhow!("invalid_cursor: copy next_cursor exactly"))?;
-            (
-                item_number(id, 'k').ok_or_else(|| anyhow::anyhow!("invalid_cursor: copy next_cursor exactly"))?,
-                start.parse::<i64>().ok(),
-            )
+            // A cursor whose chunk number did not read went back to the
+            // document's start: the chunks already read, again.
+            let invalid = || anyhow::anyhow!("invalid_cursor: copy next_cursor exactly");
+            let (id, start) = cursor.split_once(':').ok_or_else(invalid)?;
+            let doc = item_number(id, 'k').ok_or_else(invalid)?;
+            let start = js_trim(start).parse::<i64>().ok().filter(|n| *n >= 1).ok_or_else(invalid)?;
+            // An id beside it naming another document was dropped unseen.
+            if let Some(id) = args["id"].as_str()
+                && named(id)? != doc
+            {
+                bail!("conflicting_arguments: cursor {cursor:?} continues k{doc}, not {id}; send the cursor alone, or id alone to read another document");
+            }
+            (doc, Some(start))
         }
         None => {
             let id = args["id"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("missing_argument: id (k<number> from search) or cursor"))?;
-            (
-                item_number(id, 'k').ok_or_else(|| {
-                    anyhow::anyhow!("unknown_item: {id:?} is not a knowledge ID; copy an id such as k12 from search results")
-                })?,
-                None,
-            )
+            (named(id)?, None)
         }
     };
-    let max_chunks = limit_arg(args, "max_chunks", CHUNKS_MAX, CHUNKS_MAX) as i64;
     let start = args["start_chunk"]
         .as_i64()
         .or(cursor_start)
         .unwrap_or(1)
         .clamp(1, MAX_OFFSET as i64);
+    Ok((doc, start))
+}
+
+async fn knowledge_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
+    let (doc, start) = read_start(args)?;
+    let max_chunks = limit_arg(args, "max_chunks", CHUNKS_MAX, CHUNKS_MAX) as i64;
     let cfg = &cx.config.mariadb;
     let rows = cx
         .app
@@ -909,7 +924,13 @@ async fn method_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
         .as_array()
         .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
         .unwrap_or_default();
-    let seqs: Vec<i64> = ids.iter().filter_map(|id| item_number(id, 'm')).collect();
+    // One method named twice (m3, M3) came twice, each with its queries.
+    let mut seqs: Vec<i64> = vec![];
+    for seq in ids.iter().filter_map(|id| item_number(id, 'm')) {
+        if !seqs.contains(&seq) {
+            seqs.push(seq);
+        }
+    }
     let missing: Vec<&String> = ids.iter().filter(|id| item_number(id, 'm').is_none()).collect();
     if seqs.is_empty() {
         bail!("unknown_item: ids must be Q&A method IDs such as m3 from search results");
@@ -1133,6 +1154,9 @@ pub fn columns_of(rows: &[Map<String, Value>]) -> Vec<String> {
 fn result_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
     let step = args["step"].as_u64().unwrap_or(0);
     let Some(stored) = cx.results.get(&step) else {
+        if cx.results.is_empty() {
+            bail!("unknown_step: step {step}의 결과가 없다. 보관된 조회 결과가 없다 — 행은 query_run으로 조회한다");
+        }
         bail!(
             "unknown_step: step {step}의 결과가 없다 (잘못된 번호이거나 오래되어 보관에서 빠졌다). 남아 있는 step: {}",
             cx.results.keys().map(u64::to_string).collect::<Vec<_>>().join(", ")
@@ -1190,6 +1214,22 @@ fn result_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn knowledge_reads_start_where_their_cursor_says_or_are_refused() {
+        let start = |args: Value| read_start(&args).map_err(|e| e.to_string());
+        assert_eq!(start(json!({"id":"k7"})), Ok((7, 1)));
+        assert_eq!(start(json!({"cursor":"k7:12"})), Ok((7, 12)));
+        assert_eq!(start(json!({"cursor":"k7:12","id":"K7"})), Ok((7, 12)));
+        assert_eq!(start(json!({"cursor":"k7:12","start_chunk":3})), Ok((7, 3)));
+        // These read from chunk 1 as if the cursor said so.
+        for cursor in ["k7:", "k7:x", "k7:0", "k7:-3", "k7:1.5"] {
+            let error = start(json!({"cursor":cursor})).unwrap_err();
+            assert!(error.starts_with("invalid_cursor"), "{cursor}: {error}");
+        }
+        let error = start(json!({"cursor":"k7:12","id":"k9"})).unwrap_err();
+        assert!(error.starts_with("conflicting_arguments"), "{error}");
+    }
 
     #[test]
     fn search_results_shrink_to_the_budget_as_the_model_receives_them() {

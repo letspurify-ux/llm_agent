@@ -613,10 +613,10 @@ fn execute(
 }
 
 fn collect(rows: oracle::ResultSet<'_, oracle::Row>) -> Result<Vec<Map<String, Value>>> {
-    let columns: Vec<(String, OracleType)> = rows
-        .column_info()
-        .iter()
-        .map(|c| (c.name().to_owned(), c.oracle_type().clone()))
+    let names = distinct_names(rows.column_info().iter().map(|c| c.name().to_owned()).collect());
+    let columns: Vec<(String, OracleType)> = names
+        .into_iter()
+        .zip(rows.column_info().iter().map(|c| c.oracle_type().clone()))
         .collect();
     let mut out = Vec::new();
     for row in rows {
@@ -631,6 +631,30 @@ fn collect(rows: oracle::ResultSet<'_, oracle::Row>) -> Result<Vec<Map<String, V
         }
     }
     Ok(out)
+}
+
+/// Column names a row can hold side by side. Oracle names the columns of a
+/// join `SELECT a.status, b.status` alike, and a row keyed by name kept the
+/// last of them alone: the first one's values were gone, without a word. A
+/// repeated name becomes `NAME_1`, `NAME_2`… (as node-oracledb named them),
+/// past any name the result already has.
+fn distinct_names(names: Vec<String>) -> Vec<String> {
+    let taken: std::collections::HashSet<String> = names.iter().cloned().collect();
+    let mut given: std::collections::HashSet<String> = std::collections::HashSet::new();
+    names
+        .into_iter()
+        .map(|name| {
+            if given.insert(name.clone()) {
+                return name;
+            }
+            let renamed = (1..)
+                .map(|n| format!("{name}_{n}"))
+                .find(|candidate| !taken.contains(candidate) && !given.contains(candidate))
+                .unwrap();
+            given.insert(renamed.clone());
+            renamed
+        })
+        .collect()
 }
 
 fn two(n: impl Into<i64>) -> String {
@@ -950,6 +974,15 @@ mod tests {
         let mut params = Map::new();
         params.insert("JOB_ID".into(), json!("x"));
         assert_eq!(bind_value(&params, "job_id"), Some(&json!("x")));
+    }
+
+    #[test]
+    fn repeated_column_names_keep_every_column() {
+        let names = |list: &[&str]| distinct_names(list.iter().map(|s| (*s).to_owned()).collect());
+        assert_eq!(names(&["X", "X", "Y"]), ["X", "X_1", "Y"]);
+        assert_eq!(names(&["X", "X", "X_1"]), ["X", "X_2", "X_1"]);
+        assert_eq!(names(&["X", "X_1", "X", "X"]), ["X", "X_1", "X_2", "X_3"]);
+        assert_eq!(names(&["A", "B"]), ["A", "B"]);
     }
 
     #[test]
