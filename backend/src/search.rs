@@ -285,11 +285,13 @@ pub const METHOD_TITLES: TitleSource = TitleSource {
     columns: "t.seq, t.title, LEFT(t.method, 1000) AS _head",
 };
 /// Query names are snake_case words; the description says in the words of
-/// a question what the query finds.
+/// a question what the query finds. The name is there as written too: with
+/// `_` alone made spaces, a part of a name as written (`batch_job`,
+/// `customer_order`) matched no query.
 pub const QUERY_TEXTS: TitleSource = TitleSource {
     table: "query_registry t",
     join: "",
-    text: "CONCAT_WS(' ', REPLACE(t.query_name, '_', ' '), t.query_desc)",
+    text: "CONCAT_WS(' ', t.query_name, REPLACE(t.query_name, '_', ' '), t.query_desc)",
     label: "t.query_name",
     columns: "t.*",
 };

@@ -169,6 +169,45 @@ async fn a_repeat_in_a_question_runs_again_once_its_rows_are_gone() {
     assert!(repeated["error"].as_str().unwrap().contains("(step 3)"), "{repeated}");
 }
 
+/// Tool review, 2026-10-21 (third pass): the calls of one response were
+/// compared as sent, so a call naming the only target DB and one leaving it
+/// out (or adding a value the query does not take) ran the same query twice,
+/// as two steps of the same rows.
+#[tokio::test]
+async fn one_response_runs_a_query_once_however_its_calls_spell_it() {
+    let Some(db) = TestDb::create("once") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let llm = Scripted::new(vec![
+        calls(vec![
+            call("c1", "query_run", json!({"query_name":"batch_job_status","params":{"job_id":"BATCH001"},"target_db":"order_db"})),
+            call("c2", "query_run", json!({"query_name":"BATCH_JOB_STATUS","params":{"JOB_ID":"BATCH001"}})),
+            call("c3", "query_run", json!({"query_name":"batch_job_status","params":{"job_id":"BATCH001","note":"x"}})),
+            call("c4", "query_run", json!({"query_name":"batch_job_status","params":{"job_id":"BATCH002"}})),
+        ]),
+        calls(vec![call("c5", "query_run", json!({"query_name":"batch_job_status","params":{"job_id":"BATCH002","extra":1}}))]),
+        text("확인했습니다."),
+    ]);
+    let (app, _dir) = app(db.config(), llm.clone());
+    let (result, events) = ask(&app, "conv-once", "배치 상태 확인해줘", vec![]).await;
+    let answer = result.unwrap();
+    let requests = llm.requests();
+    let results: Vec<Value> = ["c1", "c2", "c3", "c4"].iter().map(|id| tool_result(&requests[1], id)).collect();
+    let ran: Vec<&Value> = results[..3].iter().filter(|r| r["status"] == "ok").collect();
+    assert_eq!(ran.len(), 1, "{results:?}");
+    for refused in results[..3].iter().filter(|r| r["status"] != "ok") {
+        assert_eq!(refused["recovery"]["code"], "repeated_call", "{refused}");
+    }
+    assert_eq!(results[3]["status"], "ok", "another value is another run");
+    let steps: Vec<&Value> = answer.trace.iter().filter(|s| s["query_name"].is_string()).collect();
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    assert_eq!(ev(&events, "run_query_done").iter().filter(|e| e["error"] == "같은 조회를 이미 실행했습니다.").count(), 3);
+    // A value the query does not take makes no new run in a later response
+    // either.
+    let later = tool_result(&requests[2], "c5");
+    assert_eq!(later["recovery"]["code"], "repeated_call", "{later}");
+}
+
 #[tokio::test]
 async fn lost_conversations_restore_from_the_browser_history() {
     let Some(db) = TestDb::create("restore") else {

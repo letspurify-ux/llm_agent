@@ -94,6 +94,9 @@ async fn several_words_rank_by_how_rare_and_whole_they_are() {
         ("홍길동 주문 상태", "order_status_by_customer"),
         ("order status", "order_status_by_customer"),
         ("고객 등급", "find_customer_id"),
+        // A part of a name as written (tool review, 2026-10-21, third pass).
+        ("batch_job", "batch_job_status"),
+        ("customer_order 합계", "get_customer_order_total_fn"),
     ] {
         assert_eq!(titles(&db, &config, &QUERY_TEXTS, text, &[]).await, (vec![expected.into()], 1), "{text}");
     }

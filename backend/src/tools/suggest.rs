@@ -233,6 +233,18 @@ const FIELD_ALIASES: &[(&str, &[&str])] = &[
     ("items", &["verifications", "batch", "entries"]),
     ("texts", &["items", "todos", "tasks", "steps", "titles", "entries", "list", "subtasks"]),
     ("coverage_offset", &["coverage_page"]),
+    // This agent's knowledge and query tools.
+    ("query_name", &["name", "query", "query_id", "sql_name", "registered_query"]),
+    ("target_db", &[
+        "db", "database", "target", "db_name", "target_db_name", "target_database",
+        "datasource", "data_source",
+    ]),
+    ("cols", &["columns", "column", "fields", "column_names"]),
+    ("preview_rows", &["limit", "rows", "max_rows", "row_limit", "preview", "max_results"]),
+    ("start_chunk", &["chunk", "chunk_no", "chunk_number", "from_chunk", "start"]),
+    ("max_chunks", &["chunks", "chunk_count", "num_chunks", "limit"]),
+    ("targets", &["target", "sources", "source", "types", "collections", "scope"]),
+    ("id", &["doc_id", "knowledge_id", "document_id", "doc"]),
 ];
 
 /// A field that cannot simply be renamed: the tool has no such concept or
@@ -275,6 +287,9 @@ fn special_field(
                 ),
             )
         }
+        ("knowledge_read", "", "ids" | "doc_ids" | "documents") => note(
+            "; knowledge_read reads one document per call: send a separate knowledge_read with id for each (the calls of one response run together)".into(),
+        ),
         ("file_read", "", "paths" | "files" | "file_paths") => note(format!(
             "; {tool} reads one file per call: send a separate file_read call with path for each file"
         )),
@@ -472,6 +487,11 @@ const VALUE_ALIASES: &[(&str, &str, &[&str])] = &[
     ("return_type", "number", &["int", "integer", "float", "double", "numeric", "decimal"]),
     ("return_type", "boolean", &["bool"]),
     ("return_type", "cursor", &["refcursor", "sys_refcursor", "ref_cursor"]),
+    ("targets", "query", &["queries", "registered_queries", "query_registry", "sql"]),
+    ("targets", "qa_method", &["method", "methods", "qa_methods", "qa", "procedures", "howto", "how_to"]),
+    ("targets", "knowledge", &[
+        "docs", "documents", "document", "doc", "knowledges", "kb", "knowledge_base", "manuals",
+    ]),
 ];
 
 /// Document edit actions depend on which anchor arguments came with them.
@@ -615,6 +635,29 @@ pub(crate) fn value(
 /// document_edit in source-document work.
 #[rustfmt::skip]
 const TOOL_ALIASES: &[(&str, &[&str])] = &[
+    // This agent's knowledge and query tools first: read_result is result_read
+    // here, not a file read.
+    ("query_run", &[
+        "run_query", "execute_query", "exec_query", "query_execute", "run_sql", "execute_sql",
+        "sql", "run", "execute", "query",
+    ]),
+    ("result_read", &[
+        "read_result", "read_results", "get_result", "get_results", "result", "results",
+        "read_rows", "fetch_rows",
+    ]),
+    ("knowledge_read", &[
+        "read_knowledge", "get_knowledge", "knowledge", "expand", "read_document", "get_document",
+        "read_doc", "open_document",
+    ]),
+    ("method_read", &["read_method", "read_methods", "get_method", "qa_method", "method"]),
+    ("query_describe", &[
+        "describe_query", "get_query", "query_info", "show_query", "describe", "query_detail",
+        "query_details", "read_query",
+    ]),
+    ("search", &[
+        "search_knowledge", "knowledge_search", "semantic_search", "search_queries",
+        "search_methods", "find_query", "vector_search", "lookup",
+    ]),
     ("file_read", &[
         "read", "read_file", "readfile", "open", "open_file", "cat", "view", "view_file",
         "get_file", "read_lines", "file_view", "read_result",
@@ -750,6 +793,29 @@ mod tests {
         assert!(leaked.text.contains("call markup"), "{}", leaked.text);
         let state = tool("run_guidance", &offered).unwrap();
         assert!(state.target.is_none() && state.text.contains("program state"));
+    }
+
+    /// Tool review, 2026-10-21 (third pass): the alias tables named the
+    /// fields of the tools this agent was ported from, not its own.
+    #[test]
+    fn the_knowledge_and_query_tools_fields_are_named() {
+        let run = ["query_name", "params", "target_db", "preview_rows"];
+        let target = |tool: &str, key: &str, allowed: &[&str]| field(tool, "", key, allowed, &json!({})).and_then(|s| s.target);
+        assert_eq!(target("query_run", "name", &run).as_deref(), Some("query_name"));
+        assert_eq!(target("query_run", "db", &run).as_deref(), Some("target_db"));
+        assert_eq!(target("query_run", "parameters", &run).as_deref(), Some("params"));
+        assert_eq!(target("query_run", "limit", &run).as_deref(), Some("preview_rows"));
+        assert_eq!(target("result_read", "columns", &["step", "offset", "limit", "cols"]).as_deref(), Some("cols"));
+        let read = ["id", "start_chunk", "max_chunks", "cursor"];
+        assert_eq!(target("knowledge_read", "doc_id", &read).as_deref(), Some("id"));
+        assert_eq!(target("knowledge_read", "chunk", &read).as_deref(), Some("start_chunk"));
+        assert_eq!(target("knowledge_read", "limit", &read).as_deref(), Some("max_chunks"));
+        assert!(field("knowledge_read", "", "ids", &read, &json!({})).unwrap().text.contains("one document per call"));
+        let targets = [json!("knowledge"), json!("qa_method"), json!("query")];
+        let value = |sent: &str| value("search", "targets", &json!(sent), &targets, &json!({})).and_then(|s| s.target);
+        assert_eq!(value("queries").as_deref(), Some("query"));
+        assert_eq!(value("methods").as_deref(), Some("qa_method"));
+        assert_eq!(value("documents").as_deref(), Some("knowledge"));
     }
 
     #[test]

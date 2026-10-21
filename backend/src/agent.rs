@@ -1247,7 +1247,7 @@ async fn execute_batch(
                 return Err(if known {
                     format!("unsupported_tool: {} is not offered now; use the offered tools", call.name)
                 } else {
-                    app.mcp.unoffered(&call.name).unwrap_or_else(|| format!("unsupported_tool: {} does not exist", call.name))
+                    app.mcp.unoffered(&call.name).unwrap_or_else(|| tools::unknown_tool(&call.name, offered))
                 });
             }
             let mut args = parsed.clone()?;
@@ -1458,6 +1458,7 @@ async fn execute_batch(
         }
         (outputs, cursors, scopes, history)
     });
+    let started = std::sync::Mutex::new(BTreeSet::new());
     {
         let cx = voc_tools::Context {
             app,
@@ -1465,6 +1466,7 @@ async fn execute_batch(
             cancel,
             results: &c.results,
             executed,
+            started: &started,
             clipped: &clipped,
             result_tokens: share,
         };

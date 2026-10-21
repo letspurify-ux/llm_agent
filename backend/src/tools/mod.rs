@@ -355,6 +355,16 @@ impl ToolRegistry {
     }
 }
 
+/// The refusal of a call to a tool that does not exist, naming the offered
+/// tool it most likely meant (`run_query` for query_run). Only offered names
+/// reach `ToolRegistry::validate`, so its hint never met a name that does
+/// not exist: such a call was refused without one.
+pub fn unknown_tool(name: &str, offered: &[String]) -> String {
+    let offered: Vec<&str> = offered.iter().map(String::as_str).collect();
+    let hint = suggest::tool(name, &offered).map(|s| s.text).unwrap_or_default();
+    format!("unsupported_tool: {name} does not exist{hint}")
+}
+
 /// Fields a tool accepts from old callers without advertising them.
 fn unadvertised_fields(_tool: &str) -> &'static [&'static str] {
     &[]
@@ -520,12 +530,18 @@ pub fn normalize_arguments(name: &str, args: &mut Value) -> Vec<String> {
     }
     fields.retain(|key, value| {
         let declared = properties.get(key).is_some();
-        let blank_navigation = value.as_str() == Some("")
-            && matches!(
+        // "" names nothing where a field navigates, and is no value of a
+        // number, flag, list, object or choice: sent for an optional one, it
+        // was refused (a blank id beside a knowledge cursor, kind:"" beside a
+        // path) and cost a request. A plain text field keeps it (container ""
+        // selects top-level symbols).
+        let blank = value.as_str() == Some("")
+            && (matches!(
                 key.as_str(),
-                "path" | "path_glob" | "pattern" | "cursor" | "project" | "target_db"
-            );
-        !declared || required.contains(key) || !(value.is_null() || blank_navigation)
+                "path" | "path_glob" | "pattern" | "cursor" | "project" | "target_db" | "id"
+            ) || properties[key]["type"] != "string"
+                || properties[key]["enum"].is_array());
+        !declared || required.contains(key) || !(value.is_null() || blank)
     });
     for (key, value) in fields.iter_mut() {
         let schema = &properties[key];
@@ -537,6 +553,18 @@ pub fn normalize_arguments(name: &str, args: &mut Value) -> Vec<String> {
             && let Ok(number) = raw.parse::<u64>()
         {
             *value = json!(number);
+        }
+        // A whole number written as a float (`10.0`): providers that keep
+        // every number as a double send integers so, and each was refused as
+        // "must be integer, got number".
+        if *kind == "integer"
+            && let Some(number) = value.as_f64()
+            && !value.is_i64()
+            && !value.is_u64()
+            && number.fract() == 0.0
+            && number.abs() <= 9_007_199_254_740_992.0
+        {
+            *value = if number < 0.0 { json!(number as i64) } else { json!(number as u64) };
         }
         if *kind == "boolean"
             && let Some(raw @ ("true" | "false")) = value.as_str()
@@ -1150,15 +1178,25 @@ fn root_relative_glob<'a>(p: &Project, root: &Path, glob: &'a str) -> &'a str {
 /// as in an ignore file. Compiled as globset's default, `*` crossed `/`:
 /// `src/tools/*.rs` listed and searched all of `src/tools` below too.
 /// `anchored`: the glob as sent named a directory (`./*.rs` is the root's).
+/// It is matched as the project's include/exclude globs are (`Rules`):
+/// without case, on the decomposed (NFD) path. Matched as sent, a Korean name
+/// typed composed (`**/문서.md`) missed the file a Mac had named decomposed,
+/// and `**/readme.md` missed README.md, which file_read opens all the same.
 fn path_glob_matcher(glob: &str, anchored: bool) -> Result<globset::GlobMatcher> {
-    let anywhere;
-    let glob = if anchored {
-        glob
-    } else {
-        anywhere = format!("**/{glob}");
-        &anywhere
-    };
-    Ok(globset::GlobBuilder::new(glob).literal_separator(true).build()?.compile_matcher())
+    use unicode_normalization::UnicodeNormalization;
+    let glob: String = glob.nfd().collect();
+    let glob = if anchored { glob } else { format!("**/{glob}") };
+    Ok(globset::GlobBuilder::new(&glob)
+        .literal_separator(true)
+        .case_insensitive(true)
+        .build()?
+        .compile_matcher())
+}
+
+/// A relative path as `path_glob_matcher` matches it.
+fn glob_path(relative: &Path) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    relative.to_string_lossy().nfd().collect()
 }
 
 fn candidate_paths_bounded(
@@ -1228,7 +1266,7 @@ fn candidate_paths_bounded(
         let rel = entry.path().strip_prefix(&root)?;
         if directory.is_some_and(|scope| !entry.path().starts_with(scope))
             || excluded_by(p, &rules, rel)
-            || filter.as_ref().is_some_and(|f| !f.is_match(rel))
+            || filter.as_ref().is_some_and(|f| !f.is_match(glob_path(rel)))
         {
             continue;
         }
@@ -2526,6 +2564,34 @@ mod tests {
         assert_eq!(found["matching_files"], 1, "{found}");
     }
 
+    /// Tool review, 2026-10-21 (third pass): path_glob matched as sent,
+    /// unlike the project's include/exclude globs: a Korean name typed
+    /// composed missed a file named decomposed (as a Mac names it), and a
+    /// name in other case missed the file.
+    #[test]
+    fn path_globs_match_without_case_or_unicode_form() {
+        use unicode_normalization::UnicodeNormalization;
+        let dir = tempfile::tempdir().unwrap();
+        let decomposed: String = "docs/회의록.md".nfd().collect();
+        for file in ["README.md", decomposed.as_str(), "src/Main.RS"] {
+            let path = dir.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x\n").unwrap();
+        }
+        let mut ws = workspace(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut list = |glob: &str| {
+            let data = execute(&mut ws, "file_list", json!({"path_glob":glob,"mode":"paths"}), &cancel).unwrap();
+            data["paths"].as_array().unwrap().len()
+        };
+        assert_eq!(list("**/readme.md"), 1);
+        assert_eq!(list("**/회의록.md"), 1);
+        assert_eq!(list("docs/회의*"), 1);
+        assert_eq!(list("src/*.rs"), 1);
+        assert_eq!(list("*.MD"), 2);
+        assert_eq!(list("src/*.md"), 0);
+    }
+
     #[test]
     fn reads_stay_inside_the_root_except_listed_documents() {
         let dir = tempfile::tempdir().unwrap();
@@ -3092,6 +3158,50 @@ mod tests {
         let adjusted = normalize_arguments("source_search", &mut args);
         assert_eq!(args, json!({"query":"x","limit":100,"case_sensitive":false}));
         assert_eq!(adjusted.len(), 1);
+    }
+
+    /// Tool review, 2026-10-21 (third pass): a whole number sent as a float
+    /// and a blank optional choice, number, flag or knowledge id were
+    /// refused, each costing the request a resend.
+    #[test]
+    fn whole_floats_and_blank_optional_fields_are_repaired() {
+        let repaired = |name: &str, mut args: Value| {
+            normalize_arguments(name, &mut args);
+            ToolRegistry::validate(name, &args).map(|_| args).map_err(|e| e.to_string())
+        };
+        assert_eq!(
+            repaired("file_read", json!({"path":"a.rs","start_line":10.0,"max_lines":50.0})),
+            Ok(json!({"path":"a.rs","start_line":10,"max_lines":50}))
+        );
+        assert_eq!(repaired("result_read", json!({"step":2.0})), Ok(json!({"step":2})));
+        // A fraction is no integer, and stays refused.
+        assert!(repaired("query_run", json!({"query_name":"q","preview_rows":20.5})).is_err());
+        assert!(repaired("file_read", json!({"path":"a.rs","start_line":-3.0})).unwrap_err().contains("minimum=1"));
+        // Bind values are numbers of any kind, as sent.
+        assert_eq!(repaired("query_run", json!({"query_name":"q","params":{"a":1.5}})).unwrap()["params"]["a"], 1.5);
+        assert_eq!(
+            repaired("code_outline", json!({"path":"a.rs","kind":"","match":"","view":"","max_depth":"","container":""})),
+            Ok(json!({"path":"a.rs","container":""}))
+        );
+        assert_eq!(
+            repaired("source_search", json!({"query":"x","mode":"","before":"","regex":"","path_glob":""})),
+            Ok(json!({"query":"x"}))
+        );
+        assert_eq!(repaired("search", json!({"query":"x","targets":""})), Ok(json!({"query":"x"})));
+        assert_eq!(repaired("knowledge_read", json!({"id":"","cursor":"k3:2"})), Ok(json!({"cursor":"k3:2"})));
+        // A required field keeps what was sent, and its error says so.
+        assert!(repaired("search", json!({"query":""})).is_ok());
+        assert!(repaired("history", json!({"action":""})).unwrap_err().contains("action"));
+    }
+
+    #[test]
+    fn a_tool_that_does_not_exist_is_told_the_offered_one_it_meant() {
+        let offered: Vec<String> = ["search", "knowledge_read", "query_run", "result_read", "file_read"].map(String::from).to_vec();
+        assert!(unknown_tool("run_query", &offered).ends_with("did you mean query_run? send the same arguments to query_run if they match its parameters"));
+        // Here a result is a query's rows, not a file.
+        assert!(unknown_tool("read_result", &offered).contains("did you mean result_read?"));
+        assert!(unknown_tool("expand", &offered).contains("did you mean knowledge_read?"));
+        assert_eq!(unknown_tool("zebra", &offered), "unsupported_tool: zebra does not exist");
     }
 
     #[test]

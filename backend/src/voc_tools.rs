@@ -239,6 +239,10 @@ pub struct Context<'a> {
     pub results: &'a BTreeMap<u64, StoredResult>,
     /// This question's query runs (query, target, params) → step.
     pub executed: &'a HashMap<String, u64>,
+    /// The runs this response's calls have started, by the same identity:
+    /// the response's own check compares the calls as sent, so a call naming
+    /// the only target DB and one leaving it out ran the same query twice.
+    pub started: &'a std::sync::Mutex<BTreeSet<String>>,
     pub clipped: &'a Clipped,
     pub result_tokens: usize,
 }
@@ -795,6 +799,13 @@ fn read_start(args: &Value) -> Result<(i64, i64)> {
 
 async fn knowledge_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
     let (doc, start) = read_start(args)?;
+    // What named the chunk past the end: a cursor sent alone was told it
+    // was a start_chunk it never sent.
+    let named = if args["start_chunk"].is_i64() || args["cursor"].as_str().is_none() {
+        format!("start_chunk {start}")
+    } else {
+        format!("cursor {:?}", args["cursor"].as_str().unwrap_or_default())
+    };
     let max_chunks = limit_arg(args, "max_chunks", CHUNKS_MAX, CHUNKS_MAX) as i64;
     let cfg = &cx.config.mariadb;
     let rows = cx
@@ -826,12 +837,12 @@ async fn knowledge_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
             .first()
             .map_or(0, |r| db::int(r, "n"));
         if chunk_count > 0 {
-            bail!("invalid_argument_value: start_chunk {start} is past the end of k{doc} ({chunk_count} chunks)");
+            bail!("invalid_argument_value: {named} is past the end of k{doc} ({chunk_count} chunks); read from chunk 1 to {chunk_count}");
         }
         let parts = crate::chunk::split_content(&db::text(row, "content"));
         let total = parts.len() as i64;
         if start > total {
-            bail!("invalid_argument_value: start_chunk {start} is past the end of k{doc} ({total} chunks)");
+            bail!("invalid_argument_value: {named} is past the end of k{doc} ({total} chunks); read from chunk 1 to {total}");
         }
         let chunks: Vec<(i64, String)> = parts
             .into_iter()
@@ -1019,7 +1030,14 @@ async fn query_describe(cx: &Context<'_>, args: &Value) -> Result<Value> {
         .collect();
     let found: BTreeSet<String> = rows.iter().map(|r| name_key(&db::text(r, "query_name"))).collect();
     let mut out = json!({"items":items});
-    let missing: Vec<&String> = names.iter().filter(|n| !found.contains(&name_key(n))).collect();
+    // Each name not found once, as it is compared (" nope" and "nope" were
+    // two names not found).
+    let mut reported = BTreeSet::new();
+    let missing: Vec<&str> = names
+        .iter()
+        .map(|n| js_trim(n))
+        .filter(|n| !found.contains(&name_key(n)) && reported.insert(name_key(n)))
+        .collect();
     if !missing.is_empty() {
         out["not_found"] = json!(missing);
         out["guidance"] = json!("등록되지 않은 이름이다. search(targets:[\"query\"])로 등록된 쿼리를 찾아라.");
@@ -1084,13 +1102,34 @@ async fn query_run(cx: &Context<'_>, args: &Value) -> Run {
     };
     let canonical = db::text(&row, "query_name");
     let resolved = crate::oracle::resolve_target_db(&row, chosen.as_deref()).ok();
-    let signature = run_signature(&canonical, resolved.as_deref().or(chosen.as_deref()), &params);
+    // The run is the binds the query takes: a value it does not take beside
+    // them changes nothing it runs.
+    let inputs: BTreeSet<String> = input_bind_names(&db::text(&row, "query_type"), &db::text(&row, "query_sql"), &db::text(&row, "bind_config"))
+        .iter()
+        .map(|name| name_key(name))
+        .collect();
+    let taken: Map<String, Value> = params
+        .iter()
+        .filter(|(key, _)| inputs.contains(&name_key(key)))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let signature = run_signature(&canonical, resolved.as_deref().or(chosen.as_deref()), &taken);
     // A repeat in this question is refused for result_read on its step,
     // unless that step's rows are no longer kept.
     if let Some(step) = cx.executed.get(&signature).filter(|step| cx.results.contains_key(step)) {
         return Run {
             result: Err(anyhow::anyhow!(
                 "repeated_call: 이번 질문에서 같은 쿼리를 같은 값과 대상으로 이미 실행했다 (step {step}). 그 결과를 result_read로 읽어라"
+            )),
+            effect: Effect::Refused,
+            hits: None,
+            public_error: Some("같은 조회를 이미 실행했습니다.".into()),
+        };
+    }
+    if !cx.started.lock().unwrap_or_else(|p| p.into_inner()).insert(signature.clone()) {
+        return Run {
+            result: Err(anyhow::anyhow!(
+                "repeated_call: 이 응답 안에서 같은 쿼리를 같은 값과 대상으로 두 번 실행하려 했다. 하나만 실행된다 — 그 결과를 써라"
             )),
             effect: Effect::Refused,
             hits: None,
