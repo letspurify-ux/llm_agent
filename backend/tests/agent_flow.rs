@@ -185,7 +185,10 @@ async fn one_response_runs_a_query_once_however_its_calls_spell_it() {
             call("c3", "query_run", json!({"query_name":"batch_job_status","params":{"job_id":"BATCH001","note":"x"}})),
             call("c4", "query_run", json!({"query_name":"batch_job_status","params":{"job_id":"BATCH002"}})),
         ]),
-        calls(vec![call("c5", "query_run", json!({"query_name":"batch_job_status","params":{"job_id":"BATCH002","extra":1}}))]),
+        calls(vec![
+            call("c5", "query_run", json!({"query_name":"batch_job_status","params":{"job_id":"BATCH002","extra":1}})),
+            call("c6", "result_read", json!({"step":1,"cols":["NOPE"]})),
+        ]),
         text("확인했습니다."),
     ]);
     let (app, _dir) = app(db.config(), llm.clone());
@@ -206,6 +209,11 @@ async fn one_response_runs_a_query_once_however_its_calls_spell_it() {
     // either.
     let later = tool_result(&requests[2], "c5");
     assert_eq!(later["recovery"]["code"], "repeated_call", "{later}");
+    // Fourth pass: columns that are none of the result's were a page of
+    // empty rows.
+    let unknown = tool_result(&requests[2], "c6");
+    assert_eq!(unknown["status"], "error", "{unknown}");
+    assert!(unknown["error"].as_str().unwrap().contains("\"STATUS\""), "{unknown}");
 }
 
 #[tokio::test]
@@ -2237,10 +2245,28 @@ async fn random_knowledge_and_query_reads_keep_their_shape_and_continuations() {
                         let chunks = data["chunks"].as_str().unwrap();
                         let (a, b) = chunks.split_once('-').map_or((chunks, chunks), |(a, b)| (a, b));
                         let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
-                        let joined = llm_agent::chunk::join_chunks((a..=b).map(|n| (n as i64, parts[doc][n - 1].as_str())));
+                        // A read from inside a chunk (`k7:3@120`) leaves out what
+                        // was read of it before.
+                        let args: Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+                        let skip = args["cursor"]
+                            .as_str()
+                            .filter(|_| args["start_chunk"].is_null())
+                            .and_then(|c| c.split_once('@'))
+                            .and_then(|(_, at)| at.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let first: String = parts[doc][a - 1].chars().skip(skip).collect();
+                        let joined = llm_agent::chunk::join_chunks(
+                            std::iter::once((a as i64, first.as_str())).chain((a + 1..=b).map(|n| (n as i64, parts[doc][n - 1].as_str()))),
+                        );
                         let mark = llm_agent::text::TRUNC_MARK;
                         assert!(text == joined || (a == b && text.ends_with(mark) && joined.starts_with(text.strip_suffix(mark).unwrap())), "run {run} request {i}: {doc} {chunks} text is not those chunks: {result}");
-                        if b < total {
+                        if let Some(head) = text.strip_suffix(mark) {
+                            // The rest of a chunk larger than one result is read on
+                            // from inside it.
+                            *stats.entry("knowledge chunk cut inside".into()).or_default() += 1;
+                            assert_eq!(data["next_cursor"], format!("{doc}:{a}@{}", skip + head.chars().count()), "run {run} request {i}: {result}");
+                            assert!(data.get("complete_to_end").is_none(), "run {run} request {i}: {result}");
+                        } else if b < total {
                             assert_eq!(data["next_cursor"], format!("{doc}:{}", b + 1), "run {run} request {i}: {result}");
                         } else {
                             assert_eq!(data["complete_to_end"], true, "run {run} request {i}: {result}");

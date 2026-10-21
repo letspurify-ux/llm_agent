@@ -857,7 +857,7 @@ pub(super) fn execute(
     }
     let root = s.project.root.canonicalize()?;
     for symbol in &mut page {
-        let relative = path.strip_prefix(&root).unwrap_or(&path).display();
+        let relative = super::separated(&path.strip_prefix(&root).unwrap_or(&path).display().to_string());
         symbol["location"] = json!(format!(
             "{}:{}-{}",
             relative, symbol["start_line"], symbol["end_line"]

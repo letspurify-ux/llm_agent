@@ -309,6 +309,10 @@ fn query_summary(row: &Row) -> Value {
 /// page began with results the model had been shown.
 pub(crate) const RANK: &str = "_rank";
 
+/// Where a knowledge read that began inside a chunk began (`k7:3@120`): a
+/// cut that delivers none of it goes on from there. Not shown to the model.
+pub(crate) const READ_FROM: &str = "read_from";
+
 /// One target's vector results as listed, with each one's seq and distance.
 struct VectorList {
     items: Vec<Value>,
@@ -758,9 +762,11 @@ fn item_number(id: &str, prefix: char) -> Option<i64> {
     digits.parse::<i64>().ok().filter(|n| *n > 0)
 }
 
-/// The document and chunk a knowledge read starts at: the cursor's, or the
-/// ID's from its first chunk (start_chunk, given, comes first).
-fn read_start(args: &Value) -> Result<(i64, i64)> {
+/// The document and chunk a knowledge read starts at, and the characters of
+/// that chunk already read: the cursor's (`k7:3`, or `k7:3@120` within a chunk
+/// larger than one result), or the ID's from its first chunk (start_chunk,
+/// given, comes first and starts the chunk whole).
+fn read_start(args: &Value) -> Result<(i64, i64, usize)> {
     let named = |id: &str| {
         item_number(id, 'k').ok_or_else(|| {
             anyhow::anyhow!("unknown_item: {id:?} is not a knowledge ID; copy an id such as k12 from search results")
@@ -773,14 +779,18 @@ fn read_start(args: &Value) -> Result<(i64, i64)> {
             let invalid = || anyhow::anyhow!("invalid_cursor: copy next_cursor exactly");
             let (id, start) = cursor.split_once(':').ok_or_else(invalid)?;
             let doc = item_number(id, 'k').ok_or_else(invalid)?;
-            let start = js_trim(start).parse::<i64>().ok().filter(|n| *n >= 1).ok_or_else(invalid)?;
+            let (start, skip) = match js_trim(start).split_once('@') {
+                Some((start, skip)) => (start, Some(skip.parse::<usize>().ok().filter(|n| *n >= 1).ok_or_else(invalid)?)),
+                None => (js_trim(start), None),
+            };
+            let start = start.parse::<i64>().ok().filter(|n| *n >= 1).ok_or_else(invalid)?;
             // An id beside it naming another document was dropped unseen.
             if let Some(id) = args["id"].as_str()
                 && named(id)? != doc
             {
                 bail!("conflicting_arguments: cursor {cursor:?} continues k{doc}, not {id}; send the cursor alone, or id alone to read another document");
             }
-            (doc, Some(start))
+            (doc, Some((start, skip.unwrap_or(0))))
         }
         None => {
             let id = args["id"]
@@ -789,16 +799,32 @@ fn read_start(args: &Value) -> Result<(i64, i64)> {
             (named(id)?, None)
         }
     };
-    let start = args["start_chunk"]
-        .as_i64()
-        .or(cursor_start)
-        .unwrap_or(1)
-        .clamp(1, MAX_OFFSET as i64);
-    Ok((doc, start))
+    let (start, skip) = match (args["start_chunk"].as_i64(), cursor_start) {
+        (Some(start), _) => (start, 0),
+        (None, Some(cursor)) => cursor,
+        (None, None) => (1, 0),
+    };
+    Ok((doc, start.clamp(1, MAX_OFFSET as i64), skip))
+}
+
+/// The chunks a read takes, the first without the `skip` characters of it
+/// already read.
+fn after_skip(mut chunks: Vec<(i64, String)>, skip: usize) -> Result<Vec<(i64, String)>> {
+    if skip == 0 {
+        return Ok(chunks);
+    }
+    let Some((_, first)) = chunks.first_mut() else {
+        return Ok(chunks);
+    };
+    let Some((at, _)) = first.char_indices().nth(skip) else {
+        bail!("invalid_cursor: copy next_cursor exactly; it points past the end of its chunk");
+    };
+    *first = first[at..].to_owned();
+    Ok(chunks)
 }
 
 async fn knowledge_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
-    let (doc, start) = read_start(args)?;
+    let (doc, start, skip) = read_start(args)?;
     // What named the chunk past the end: a cursor sent alone was told it
     // was a start_chunk it never sent.
     let named = if args["start_chunk"].is_i64() || args["cursor"].as_str().is_none() {
@@ -850,7 +876,7 @@ async fn knowledge_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
             .map(|(i, c)| (i as i64 + 1, c))
             .filter(|(no, _)| *no >= start && *no < start + max_chunks)
             .collect();
-        return Ok(fit_chunks(doc, &db::text(row, "title"), total, chunks, budget, model));
+        return Ok(fit_chunks(doc, &db::text(row, "title"), total, after_skip(chunks, skip)?, skip, budget, model));
     }
     let total = db::int(&rows[0], "chunk_of");
     let title = db::text(&rows[0], "title");
@@ -858,12 +884,13 @@ async fn knowledge_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
         .iter()
         .map(|r| (db::int(r, "chunk_no"), db::text(r, "content")))
         .collect();
-    Ok(fit_chunks(doc, &title, total, chunks, budget, model))
+    Ok(fit_chunks(doc, &title, total, after_skip(chunks, skip)?, skip, budget, model))
 }
 
 /// As many whole chunks as fit the result budget, measured as the tool
 /// message the model receives (at least one, cut when it alone is larger).
-fn fit_chunks(doc: i64, title: &str, total: i64, chunks: Vec<(i64, String)>, budget: usize, model: &str) -> Value {
+/// `skip`: characters of the first chunk read before (and not in `chunks`).
+fn fit_chunks(doc: i64, title: &str, total: i64, chunks: Vec<(i64, String)>, skip: usize, budget: usize, model: &str) -> Value {
     let first = chunks.first().map_or(1, |c| c.0);
     // `ends`: where each chunk taken ends in `text`, so a cut beside other
     // results keeps whole chunks (`tools::bound_result`); the model does not
@@ -882,6 +909,11 @@ fn fit_chunks(doc: i64, title: &str, total: i64, chunks: Vec<(i64, String)>, bud
             out["next_cursor"] = json!(format!("k{doc}:{}", last + 1));
         } else {
             out["complete_to_end"] = json!(true);
+        }
+        // Where this read began, for a cut that delivers none of it
+        // (`tools::knowledge_page`); the model does not see it.
+        if skip > 0 {
+            out[READ_FROM] = json!(format!("k{doc}:{first}@{skip}"));
         }
         out
     };
@@ -937,14 +969,26 @@ fn fit_chunks(doc: i64, title: &str, total: i64, chunks: Vec<(i64, String)>, bud
         }
         return out;
     }
-    // One chunk larger than the budget: its start.
+    // One chunk larger than the budget: its start, and a cursor to the rest
+    // of it. Going on at the next chunk, the rest of this one could never be
+    // read (an 8k-context model's result holds less than some chunks), and
+    // the document's last chunk said it was read to its end.
     let (whole, _) = join(1);
-    let mut room = budget.saturating_sub(size(&build(1, Default::default())));
-    loop {
-        let (head, _) = crate::context::truncate(&whole, room, model);
+    let cut = |head: String| {
+        let read = skip + head.chars().count();
         let text = head + TRUNC_MARK;
         let end = text.chars().count();
-        let out = build(1, (text, vec![end]));
+        let mut out = build(1, (text, vec![end]));
+        if let Some(fields) = out.as_object_mut() {
+            fields.remove("complete_to_end");
+        }
+        out["next_cursor"] = json!(format!("k{doc}:{first}@{read}"));
+        out
+    };
+    let mut room = budget.saturating_sub(size(&cut(String::new())));
+    loop {
+        let (head, _) = crate::context::truncate(&whole, room, model);
+        let out = cut(head);
         if room == 0 || size(&out) <= budget {
             return out;
         }
@@ -1246,6 +1290,15 @@ fn result_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
         }
         (found, unknown)
     };
+    // Not one column asked for exists: a page of empty rows said nothing
+    // of the result.
+    if columns.is_empty() && !unknown.is_empty() && !all_columns.is_empty() {
+        bail!(
+            "invalid_argument_value: cols {} name no column of step {step}; its columns are {}",
+            json!(unknown),
+            json!(all_columns)
+        );
+    }
     let rows: Vec<Map<String, Value>> = stored
         .rows
         .iter()
@@ -1281,12 +1334,13 @@ mod tests {
     #[test]
     fn knowledge_reads_start_where_their_cursor_says_or_are_refused() {
         let start = |args: Value| read_start(&args).map_err(|e| e.to_string());
-        assert_eq!(start(json!({"id":"k7"})), Ok((7, 1)));
-        assert_eq!(start(json!({"cursor":"k7:12"})), Ok((7, 12)));
-        assert_eq!(start(json!({"cursor":"k7:12","id":"K7"})), Ok((7, 12)));
-        assert_eq!(start(json!({"cursor":"k7:12","start_chunk":3})), Ok((7, 3)));
+        assert_eq!(start(json!({"id":"k7"})), Ok((7, 1, 0)));
+        assert_eq!(start(json!({"cursor":"k7:12"})), Ok((7, 12, 0)));
+        assert_eq!(start(json!({"cursor":"k7:12","id":"K7"})), Ok((7, 12, 0)));
+        assert_eq!(start(json!({"cursor":"k7:12@340"})), Ok((7, 12, 340)));
+        assert_eq!(start(json!({"cursor":"k7:12@340","start_chunk":3})), Ok((7, 3, 0)));
         // These read from chunk 1 as if the cursor said so.
-        for cursor in ["k7:", "k7:x", "k7:0", "k7:-3", "k7:1.5"] {
+        for cursor in ["k7:", "k7:x", "k7:0", "k7:-3", "k7:1.5", "k7:2@", "k7:2@0", "k7:2@x", "k7:@3"] {
             let error = start(json!({"cursor":cursor})).unwrap_err();
             assert!(error.starts_with("invalid_cursor"), "{cursor}: {error}");
         }
@@ -1350,7 +1404,7 @@ mod tests {
             let start = 1 + next(parts.len());
             let chunks: Vec<(i64, String)> = parts.iter().cloned().enumerate().map(|(i, c)| (i as i64 + 1, c)).skip(start - 1).collect();
             let budget = 300 + next(12_000);
-            let out = fit_chunks(9, "제목", total, chunks.clone(), budget, "gpt-4o");
+            let out = fit_chunks(9, "제목", total, chunks.clone(), 0, budget, "gpt-4o");
             assert!(message(&out) <= budget, "budget {budget}: {}", message(&out));
             let text = out["text"].as_str().unwrap();
             let range = out["chunks"].as_str().unwrap();
@@ -1364,7 +1418,11 @@ mod tests {
             } else {
                 assert_eq!(text, joined);
             }
-            if last < total {
+            if let Some(head) = text.strip_suffix(TRUNC_MARK) {
+                // The rest of a cut chunk is read on from inside it.
+                assert_eq!(out["next_cursor"], format!("k9:{start}@{}", head.chars().count()));
+                assert!(out.get("complete_to_end").is_none());
+            } else if last < total {
                 assert_eq!(out["next_cursor"], format!("k9:{}", last + 1));
             } else {
                 assert_eq!(out["complete_to_end"], true);
@@ -1663,17 +1721,57 @@ mod tests {
     fn documents_arrive_whole_or_in_whole_chunks_within_the_budget() {
         let chunks = |n: i64| (1..=n).map(|i| (i, format!("{i}번 ").repeat(200))).collect::<Vec<_>>();
         let message = |v: &Value| crate::tools::message_tokens(&crate::tools::envelope(Ok(v.clone())), "gpt-4o");
-        let whole = fit_chunks(7, "제목", 4, chunks(4), 25_000, "gpt-4o");
+        let whole = fit_chunks(7, "제목", 4, chunks(4), 0, 25_000, "gpt-4o");
         assert_eq!((whole["chunks"].clone(), whole["complete_to_end"].clone()), (json!("1-4"), json!(true)));
-        let part = fit_chunks(7, "제목", 9, chunks(9), 1_500, "gpt-4o");
+        let part = fit_chunks(7, "제목", 9, chunks(9), 0, 1_500, "gpt-4o");
         assert!(part["next_cursor"].as_str().unwrap().starts_with("k7:"), "{part}");
         assert!(message(&part) <= 1_500, "{}", message(&part));
         assert!(!part["text"].as_str().unwrap().ends_with(TRUNC_MARK));
         // One chunk larger than the budget shows its start.
-        let cut = fit_chunks(7, "제목", 9, chunks(9), 400, "gpt-4o");
+        let cut = fit_chunks(7, "제목", 9, chunks(9), 0, 400, "gpt-4o");
         assert_eq!(cut["chunks"], "1");
         assert!(cut["text"].as_str().unwrap().ends_with(TRUNC_MARK));
         assert!(message(&cut) <= 400, "{}", message(&cut));
+    }
+
+    /// Tool review, 2026-10-21 (fourth pass): a chunk larger than one result
+    /// (a small model's result budget) was cut, and its cursor went on at the
+    /// next chunk — the rest of it could never be read; the last chunk said
+    /// it was read to its end.
+    #[test]
+    fn a_chunk_larger_than_a_result_is_read_on_from_inside_it() {
+        let chunks: Vec<(i64, String)> = (1..=3).map(|i| (i, format!("{i}번째 조각의 문장이다. ").repeat(60))).collect();
+        for start in [1usize, 3] {
+            let mut read = String::new();
+            let mut skip = 0;
+            let mut reads = 0;
+            let rest: Vec<(i64, String)> = chunks[start - 1..].to_vec();
+            loop {
+                reads += 1;
+                assert!(reads < 50, "never ends");
+                let page = after_skip(rest.clone(), skip).unwrap();
+                let out = fit_chunks(7, "제목", 3, page, skip, 300, "gpt-4o");
+                let text = out["text"].as_str().unwrap();
+                match text.strip_suffix(TRUNC_MARK) {
+                    Some(head) => {
+                        read.push_str(head);
+                        assert!(out.get("complete_to_end").is_none(), "{out}");
+                        let cursor = out["next_cursor"].as_str().unwrap().to_owned();
+                        let (_, chunk, at) = read_start(&json!({"cursor":cursor})).unwrap();
+                        assert_eq!(chunk, start as i64);
+                        skip = at;
+                    }
+                    None => {
+                        read.push_str(text);
+                        break;
+                    }
+                }
+            }
+            // Read piece by piece, the first chunk arrives whole and once.
+            assert!(read.starts_with(&rest[0].1), "start {start}");
+            assert!(reads > 2, "start {start}: {reads}");
+        }
+        assert!(after_skip(chunks[..1].to_vec(), 10_000).unwrap_err().to_string().starts_with("invalid_cursor"));
     }
 
     // Context management review, sixth pass (2026-10-16): results cut beside
@@ -1699,7 +1797,7 @@ mod tests {
     #[test]
     fn a_document_cut_beside_other_results_keeps_whole_chunks_and_its_cursor() {
         let chunks: Vec<(i64, String)> = (1..=9).map(|i| (i, format!("{i}번 문단 ").repeat(120))).collect();
-        let read = crate::tools::envelope(Ok(fit_chunks(7, "제목", 9, chunks.clone(), 25_000, "gpt-4o")));
+        let read = crate::tools::envelope(Ok(fit_chunks(7, "제목", 9, chunks.clone(), 0, 25_000, "gpt-4o")));
         assert_eq!(read["data"]["complete_to_end"], true);
         let call = tool_call("knowledge_read");
         let args = json!({"id":"k7"});

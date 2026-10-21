@@ -1193,6 +1193,14 @@ fn path_glob_matcher(glob: &str, anchored: bool) -> Result<globset::GlobMatcher>
         .compile_matcher())
 }
 
+/// A path or path glob with `/` between its parts. On Windows the tools
+/// showed `src\main.rs`, and a glob written so (`src\*.rs`) matched nothing:
+/// globset matches paths there with `/`, and takes `\` in a glob as itself.
+/// Elsewhere `\` stays what it is (a glob's escape).
+pub(crate) fn separated(path: &str) -> String {
+    if cfg!(windows) { path.replace('\\', "/") } else { path.to_owned() }
+}
+
 /// A relative path as `path_glob_matcher` matches it.
 fn glob_path(relative: &Path) -> String {
     use unicode_normalization::UnicodeNormalization;
@@ -1230,7 +1238,10 @@ fn candidate_paths_bounded(
     let mut non_utf8 = 0usize;
     let mut path_bytes = 0usize;
     let filter = pattern
-        .map(|glob| path_glob_matcher(root_relative_glob(p, &root, glob), glob.contains('/')))
+        .map(|glob| {
+            let glob = separated(glob);
+            path_glob_matcher(root_relative_glob(p, &root, &glob), glob.contains('/'))
+        })
         .transpose()?;
     let rules = Rules::new(p)?;
     // The walker reads the root's and its parents' ignore files first.
@@ -1527,7 +1538,7 @@ fn execute_validated(
             let root = s.project.root.canonicalize()?;
             let names = files
                 .iter()
-                .map(|p| p.strip_prefix(&root).unwrap_or(p).display().to_string())
+                .map(|p| separated(&p.strip_prefix(&root).unwrap_or(p).display().to_string()))
                 .collect::<Vec<_>>();
             let fingerprint = hash(
                 serde_json::to_string(&(mode, path_glob(&args)?, &directory, &names))?.as_bytes(),
@@ -1800,6 +1811,7 @@ pub fn model_result(result: &Value) -> Value {
     if let Some(data) = shown.get_mut("data").and_then(Value::as_object_mut) {
         data.remove("source");
         data.remove("chunk_ends");
+        data.remove(crate::voc_tools::READ_FROM);
         // A search result's place in its list drives the next offset only.
         for target in data.get_mut("results").and_then(Value::as_object_mut).into_iter().flat_map(|t| t.values_mut()) {
             for item in target.get_mut("items").and_then(Value::as_array_mut).into_iter().flatten() {
@@ -2215,7 +2227,8 @@ fn knowledge_page(call: &crate::llm::ToolCall, result: &Value, limit: usize, mod
             fields.remove("chunks");
             fields.remove("chunk_ends");
             fields.insert("text".into(), json!(""));
-            fields.insert("next_cursor".into(), json!(format!("{doc}:{first}")));
+            let from = data[crate::voc_tools::READ_FROM].as_str().map_or_else(|| format!("{doc}:{first}"), str::to_owned);
+            fields.insert("next_cursor".into(), json!(from));
             fields.insert(
                 "not_delivered".into(),
                 json!("Not one chunk fitted beside the other results of this response; read it with next_cursor."),
@@ -2343,7 +2356,7 @@ pub fn relativize_paths(value: &mut Value, root: &Path) {
     };
     fn below(path: &str, root: &str) -> Option<String> {
         let rest = path.strip_prefix(root)?;
-        (rest.starts_with('/') || rest.starts_with('\\')).then(|| rest[1..].to_owned())
+        (rest.starts_with('/') || rest.starts_with('\\')).then(|| separated(&rest[1..]))
     }
     fn walk(value: &mut Value, root: &str) {
         match value {
@@ -2562,6 +2575,37 @@ mod tests {
         assert_eq!(list("**/*"), ["docs/c.md", "main.rs", "src/a.rs", "src/deep/b.rs", "src/deep/main.rs"]);
         let found = execute(&mut ws, "source_search", json!({"query":"fn a","path_glob":"src/*.rs","mode":"files"}), &cancel).unwrap();
         assert_eq!(found["matching_files"], 1, "{found}");
+    }
+
+    /// Tool review, 2026-10-21 (fourth pass): a whole-word regular
+    /// expression was wrapped in `\b`, which needs a word character beyond
+    /// a pattern ending in punctuation: `load\(\)` matched no call.
+    #[test]
+    fn whole_words_stand_apart_as_literals_and_as_expressions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "load();\nx = load() + 1\nreload()\nunload_all()\nload_more()\n").unwrap();
+        let mut ws = workspace(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut lines = |args: Value| {
+            let data = execute(&mut ws, "source_search", args, &cancel).unwrap();
+            data["matches"].as_array().unwrap().iter().map(|m| m["line"].as_u64().unwrap()).collect::<Vec<_>>()
+        };
+        assert_eq!(lines(json!({"query":"load()","whole_word":true})), [1, 2]);
+        assert_eq!(lines(json!({"query":r"load\(\)","regex":true,"whole_word":true})), [1, 2]);
+        assert_eq!(lines(json!({"query":"load","regex":true,"whole_word":true})), [1, 2]);
+        assert_eq!(lines(json!({"query":"(re|un)load","regex":true,"whole_word":true})), [3]);
+        assert_eq!(lines(json!({"query":"^load","regex":true,"whole_word":true})), [1]);
+    }
+
+    /// Fourth pass: on Windows the tools showed paths with `\`, and a glob
+    /// written so matched nothing; elsewhere `\` stays a glob's escape.
+    #[test]
+    fn tool_paths_are_separated_by_slashes() {
+        if cfg!(windows) {
+            assert_eq!(separated(r"src\sub\a.rs"), "src/sub/a.rs");
+        } else {
+            assert_eq!(separated(r"src/\[x\].rs"), r"src/\[x\].rs");
+        }
     }
 
     /// Tool review, 2026-10-21 (third pass): path_glob matched as sent,

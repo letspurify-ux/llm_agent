@@ -182,7 +182,12 @@ pub(super) fn execute(
         )
     } else if args["regex"].as_bool().unwrap_or(false) {
         if whole_word {
-            format!(r"\b(?:{query})\b")
+            // A whole-word match has no word character beside it, as grep -w
+            // reads it. `\b` around a pattern that ends in punctuation needs
+            // a word character on its far side, so `load\(\)` never matched
+            // `load();`. Only whether a line matches is used, so the
+            // neighbours may be taken into the match.
+            format!(r"(?:^|\W)(?:{query})(?:$|\W)")
         } else {
             query.to_owned()
         }

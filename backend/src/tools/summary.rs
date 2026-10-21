@@ -74,7 +74,9 @@ pub fn call_summary(root: &Path, name: &str, arguments: &str) -> String {
         "search" => quoted(&args["query"]),
         "knowledge_read" => match args["cursor"].as_str().and_then(|c| c.split_once(':')) {
             // A continuation carries its document and chunk in the cursor.
-            Some((doc, chunk)) if args["id"].is_null() => format!("{doc} {chunk}번째 조각부터 이어 읽기"),
+            Some((doc, chunk)) if args["id"].is_null() => {
+                format!("{doc} {}번째 조각부터 이어 읽기", chunk.split('@').next().unwrap_or(chunk))
+            }
             _ => join([
                 args["id"].as_str().unwrap_or("").to_owned(),
                 args["start_chunk"]
