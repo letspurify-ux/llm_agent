@@ -13,6 +13,7 @@ import { readEvents } from './stream.js';
 import { fillAnswer } from './answer-fill.js';
 import { openChat, closeChat, markChatOpen, saveChat, rememberTurn, HISTORY_TURNS } from './chat-store.js';
 import { useChangedState } from './changed-state.js';
+import { released } from './logged-error.js';
 
 // 대화 번호. crypto.randomUUID가 없는 브라우저(구형·http 사내 주소)에서는 난수로 만든다.
 function newConversationId() {
@@ -112,7 +113,8 @@ function ChartTable({ text, block, withTitle = false }) {
 // what은 콘솔에 남길 이름이다 — 어느 자리가 걸렸는지 모르면 고칠 수도 없다.
 class Boundary extends Component {
   state = { failed: false };
-  static getDerivedStateFromError() { return { failed: true }; }
+  // React가 이 오류를 console.error로 찍기 전에 스택을 문자열로 만들어 던진 자리의 데이터를 놓게 한다 (logged-error.js).
+  static getDerivedStateFromError(e) { released(e); return { failed: true }; }
   componentDidCatch(e) { console.warn(`[${this.props.what}] render failed:`, e?.message ?? e); }
   render() { return this.state.failed ? this.props.fallback : this.props.children; }
 }
@@ -1197,7 +1199,7 @@ export default function App() {
       // 렌더러와 같아야 블록 판정이 어긋나지 않아 여기서 한다. 채우다 던지면 원문을 그대로 보인다.
       if (answered) {
         try { answer = fillAnswer(answer, data.trace, data.refs); }
-        catch (e) { console.error('[chat] 표·차트 참조를 채우지 못했습니다:', e); }
+        catch (e) { console.error('[chat] 표·차트 참조를 채우지 못했습니다:', released(e)); }
       }
     } catch (e) {
       // answer는 통신 오류 기본값 유지. 콘솔에는 남긴다 —
@@ -1213,7 +1215,7 @@ export default function App() {
         answer = stoppedPartial;
         console.info('[chat] 사용자가 응답 생성을 중지했습니다');
       } else if (e?.name === 'AbortError') console.info('[chat] 요청을 끊었습니다 (홈으로 돌아갔거나 시간이 다 됐습니다)');
-      else console.error('[chat] request failed:', e);
+      else console.error('[chat] request failed:', released(e));
     } finally {
       clearTimeout(timer);
       // 화면에는 항상 남기지만, 서버로 되돌려 보내는 이력에는 서버가 준 답만 넣는다 —
@@ -1239,7 +1241,7 @@ export default function App() {
           // 답하지 못한 경우는 그 짧은 문구가 곧 상태다 — '도착했습니다'로 뭉개면 실패가 성공으로 읽힌다.
           setStatus(stopped ? '응답 생성을 중지했습니다.' : answered ? '답변이 도착했습니다.' : answer);
         } catch (e) {
-          console.error('[chat] 답을 화면에 얹지 못했습니다:', e);
+          console.error('[chat] 답을 화면에 얹지 못했습니다:', released(e));
         } finally {
           setLoading(false);
           setProgress([]);

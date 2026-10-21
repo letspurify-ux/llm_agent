@@ -7,6 +7,9 @@
 // type이 없는 객체는 예전 응답(JSON 하나)이다 — 그것도 '마지막'으로 본다. 그래서 App.jsx는 스트림이든
 // 아니든 같은 값을 받는다: 마지막 객체 하나.
 
+// 콘솔로 넘기는 오류는 스택을 문자열로 만들어 던진 자리의 데이터를 놓게 한다 (logged-error.js).
+import { released } from './logged-error.js';
+
 // 한 줄 → 이벤트 객체. 객체가 아니면(배열·문자열·숫자·null) 없는 것으로 본다 — 화면이 그릴 수 있는 것은 객체뿐이다.
 export function eventOf(line) {
   try {
@@ -34,7 +37,7 @@ export async function readEvents(res, onEvent) {
     for (const e of events) {
       if (final) return;
       if (isFinal(e)) { final = e; return; }
-      try { onEvent?.(e); } catch (err) { console.warn('[stream] 진행 표시에 실패했습니다:', err); }
+      try { onEvent?.(e); } catch (err) { console.warn('[stream] 진행 표시에 실패했습니다:', released(err)); }
     }
   };
 

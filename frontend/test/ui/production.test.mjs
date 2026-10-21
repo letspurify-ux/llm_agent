@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { findChrome, launchChrome, chromePort, stopProcess, killOnExit, freePort, oneTab, Page, sleep } from './driver.mjs';
-import { CASES, TRACE } from './fixtures.js';
+import { CASES, TRACE, BROKEN_RESPONSES } from './fixtures.js';
 import { TABLE_FORMULAS, INCOMPLETE_TABLE_FORMULAS } from '../table-math-corpus.js';
 import { checkLatex200 } from './latex-table-200-checks.mjs';
 import { checkMixedContent } from './mixed-content-checks.mjs';
@@ -142,6 +142,34 @@ test('production 빌드에서도 대화·수식·차트·흐름도·조회 표�
   await page.until(`document.querySelectorAll('.mermaid svg').length === 4 && document.querySelectorAll('.rich-cell figure.chart .recharts-surface').length === 2 && !document.querySelector('.typing')`);
   for (const width of [1000, 320]) { await page.viewport(width, 760); await checkRichTables(page); }
   assert.deepEqual(page.logs, [], 'production 표 셀 시각화 검사 콘솔에 오류가 남았다');
+  // 경계가 잡은 렌더 오류는 React가 console.error(오류)로 찍고 크롬은 그 인자를 보관한다 — 스택을 읽지 않은 오류는
+  // 던진 순간의 프레임까지 붙들어, 마크다운 파서가 스택 넘침으로 던진 답 하나에 그 구문 트리 약 4MB가 남았다(답 40개에
+  // 164MB). 배포 번들의 React는 개발 빌드와 달리 이 오류를 잡지 못한 오류로 다시 던지지 않으므로, 막는 자리(App.jsx
+  // Boundary의 released)는 여기서만 잰다. 콘솔 수집을 켜 두면 크롬이 보고하며 스택을 읽어 결함이 가려지므로 끈다.
+  await page.eval(`document.querySelector('.home-btn').click()`);
+  await page.until(`document.querySelector('.chip')`);
+  const bomb = BROKEN_RESPONSES.find(r => typeof r?.answer === 'string' && r.answer.startsWith('>>>'));
+  await page.eval(`window.fetch = async () => new Response(${JSON.stringify(JSON.stringify(bomb))}, { headers: { 'Content-Type': 'application/json' } })`);
+  const heap = async () => {
+    for (let i = 0; i < 3; i++) await page.send('HeapProfiler.collectGarbage');
+    return (await page.send('Runtime.getHeapUsage')).usedSize / 1048576;
+  };
+  const ask = async n => {
+    await page.eval(`document.querySelector('textarea').focus()`);
+    await page.send('Input.insertText', { text: `던지는 답 ${n}` });
+    await page.key('Enter', 'Enter', 13);
+    await page.until(`document.querySelectorAll('.row.assistant').length === ${n + 1} && !document.querySelector('.typing')`);
+  };
+  await page.send('Runtime.disable');
+  await page.send('Log.disable');
+  await ask(0);
+  const before = await heap();
+  for (let n = 1; n <= 4; n++) await ask(n);
+  assert.strictEqual(await page.eval(`document.querySelectorAll('.bubble.assistant pre code').length`), 5, '던진 답은 원문으로 남는다');
+  await page.eval(`document.querySelector('.home-btn').click()`);
+  await page.until(`document.querySelector('.chip')`);
+  const grown = await heap() - before;
+  assert.ok(grown < 4, `production: 던지는 답 4개를 받고 홈으로 돌아온 뒤에도 힙이 ${grown.toFixed(1)}MB 늘어 있다`);
 });
 
 // 그림을 부르지 못하게 막는 정책(index.html의 CSP meta)은 브라우저가 그 줄을 읽은 '뒤에' 시작되는

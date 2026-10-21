@@ -2516,3 +2516,37 @@ it('창 크기를 거듭 바꿔도 렌더되지 않는 상태 업데이트가 �
   assert.ok(got.hooks > 20, `검사의 전제: React 트리에서 상태 훅을 찾는다 (${JSON.stringify(got)}) — React 내부 모양이 바뀌었으면 이 검사를 고칠 것`);
   assert.ok(got.worst <= 2, `창 크기를 40번 바꾼 뒤 한 훅의 대기열에 업데이트 ${got.worst}개가 남았다 (${JSON.stringify(got)})`);
 });
+
+// 경계가 잡은 렌더 오류는 React가 console.error(오류)로 찍고, 크롬은 개발자 도구가 닫혀 있어도 콘솔 메시지를 인자째
+// 보관한다. V8은 스택을 읽기 전까지 던진 순간의 프레임을 오류에 매다므로, 마크다운 파서가 스택 넘침으로 던진 답 하나에
+// 그 구문 트리가 통째로 남았다(실측: 프로덕션 번들에서 답 하나에 약 4MB, 40개에 164MB, 홈으로도 풀리지 않음).
+// Boundary가 React보다 먼저 스택을 읽어 둔다(src/logged-error.js). 검사의 콘솔 수집(Runtime.enable)이 켜져 있으면
+// 크롬이 오류를 보고하며 스택을 읽어 버려 결함이 가려지므로, 사용자의 브라우저처럼 그것을 끄고 잰다.
+it('렌더가 던진 답의 데이터가 콘솔 보관 때문에 남지 않는다', async () => {
+  await page.touchMode(false);
+  await page.viewport(1000, 760);
+  await page.goto(url(), '.chip');
+  const bomb = BROKEN_RESPONSES.find(r => typeof r?.answer === 'string' && r.answer.startsWith('>>>'));
+  assert.ok(bomb, '검사의 전제: 렌더가 스택 넘침으로 던지는 응답이 픽스처에 있다');
+  await page.eval(`window.fetch = async () => new Response(${JSON.stringify(JSON.stringify(bomb))}, { headers: { 'Content-Type': 'application/json' } })`);
+  const heap = async () => {
+    for (let i = 0; i < 3; i++) await page.send('HeapProfiler.collectGarbage');
+    return (await page.send('Runtime.getHeapUsage')).usedSize / 1048576;
+  };
+  일부러_낸_줄 = /Maximum call stack|error occurred|render failed/;
+  await page.send('Runtime.disable');
+  await page.send('Log.disable');
+  try {
+    await sendQuestion('던지는 답 0', 1);
+    const before = await heap();
+    for (let i = 1; i <= 4; i++) await sendQuestion(`던지는 답 ${i}`, i + 1);
+    assert.strictEqual(await page.eval(`document.querySelectorAll('.bubble.assistant pre code').length`), 5, '던진 답은 원문으로 남는다');
+    await page.eval(`document.querySelector('.home-btn').click()`);
+    await page.until(`document.querySelector('.chip')`);
+    const grown = await heap() - before;
+    assert.ok(grown < 4, `던지는 답 4개를 받고 홈으로 돌아온 뒤에도 힙이 ${grown.toFixed(1)}MB 늘어 있다`);
+  } finally {
+    await page.send('Runtime.enable');
+    await page.send('Log.enable');
+  }
+});
