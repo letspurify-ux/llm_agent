@@ -314,6 +314,39 @@ async fn a_backend_whose_launcher_is_killed_stops_in_order() {
     assert_eq!(std::fs::read_to_string(&term).ok().as_deref(), Some("SIGTERM"), "the MCP server was not asked to stop");
 }
 
+/// The backend itself killed outright (SIGKILL, the out-of-memory killer, a
+/// crash) ended nothing in order: an MCP server that outlives its input ran
+/// on, orphaned, and each restart added another. A guardian of its own
+/// (`mcp::guardian`) ends the server then: SIGTERM after the grace a closed
+/// server gets, then SIGKILL.
+#[tokio::test]
+async fn a_killed_backend_leaves_no_mcp_server_running() {
+    if node_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let term = dir.path().join("term");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_mcp_server.mjs");
+    let command = format!("exec node '{}' 2>/dev/null", fixture.display());
+    let mcp = format!(
+        "\n[[mcp_servers]]\nname = \"linger\"\ncommand = \"sh\"\nargs = [\"-c\", {}]\ntools = [\"*\"]\n\n\
+         [mcp_servers.env]\nFAKE_MCP_LINGER = \"1\"\nFAKE_MCP_TERM_FILE = {}\n",
+        toml_string(&command),
+        toml_string(&term.display().to_string())
+    );
+    let port = free_port();
+    let path = settings(dir.path(), port, 9, &mcp);
+    let mut child = backend(dir.path(), &path, Stdio::null);
+    let server = ready_mcp(port).await;
+    let pid = server["pid"].as_u64().unwrap() as u32;
+    signal(&child, libc::SIGKILL);
+    let _ = child.wait().await;
+    let ended = ends_within(pid, Duration::from_secs(15)).await;
+    kill(pid, libc::SIGKILL);
+    assert!(ended, "the MCP server outlived the killed backend");
+    assert_eq!(std::fs::read_to_string(&term).ok().as_deref(), Some("SIGTERM"), "the MCP server was not asked to stop");
+}
+
 /// Started without the launcher (`nohup`, a shell of its own), the backend
 /// still outlives the process that started it.
 #[tokio::test]

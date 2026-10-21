@@ -322,6 +322,53 @@ mod tests {
         assert!(dns.flights.lock().unwrap().is_empty());
     }
 
+    /// Asks for a few names at random times, given up on at random, with
+    /// lookups that take random times and fail at random: every ask not
+    /// given up on is answered, and once all are done no flight is left and
+    /// every worker is free.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flights_end_whatever_their_asks_do() {
+        use rand::Rng;
+        for wait in [true, false] {
+            for round in 0..20 {
+                let workers = 1 + round % 4;
+                let (dns, semaphore) = resolver(workers, wait);
+                let asks: Vec<_> = (0..200)
+                    .map(|_| {
+                        let mut rng = rand::thread_rng();
+                        let name = format!("n{}", rng.gen_range(0..4));
+                        let (sleep, fails, give_up, start) = (
+                            rng.gen_range(0..3u64),
+                            rng.gen_bool(0.2),
+                            rng.gen_bool(0.3).then(|| rng.gen_range(0..4u64)),
+                            rng.gen_range(0..5u64),
+                        );
+                        let dns = dns.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(start)).await;
+                            let ask = dns.resolve_with(name, move |_| {
+                                std::thread::sleep(Duration::from_millis(sleep));
+                                if fails { Err(io::Error::other("refused")) } else { Ok(vec![]) }
+                            });
+                            match give_up {
+                                Some(ms) => {
+                                    let _ = tokio::time::timeout(Duration::from_millis(ms), ask).await;
+                                    true
+                                }
+                                None => tokio::time::timeout(Duration::from_secs(10), ask).await.is_ok(),
+                            }
+                        })
+                    })
+                    .collect();
+                for ask in asks {
+                    assert!(ask.await.unwrap(), "an ask kept waiting");
+                }
+                all_free(&semaphore, workers).await;
+                assert!(dns.flights.lock().unwrap().is_empty(), "flights left: {:?}", dns.flights.lock().unwrap().keys().collect::<Vec<_>>());
+            }
+        }
+    }
+
     /// A refused lookup (no free worker) refuses those who joined it, and
     /// leaves no flight behind.
     #[tokio::test]

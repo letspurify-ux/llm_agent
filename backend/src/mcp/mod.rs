@@ -5,6 +5,8 @@
 //! the other tools.
 
 mod convert;
+#[cfg(unix)]
+mod guardian;
 mod schema;
 mod wire;
 
@@ -2128,14 +2130,18 @@ fn spawn(slot: &Arc<Slot>, server: &McpServer) -> Result<ChildTransport> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     #[cfg(unix)]
-    own_descriptors_only(&mut command);
+    own_descriptors_only(command.as_std_mut());
     let mut wrapped = CommandWrap::from(command);
     #[cfg(unix)]
     wrapped.wrap(process_wrap::tokio::ProcessGroup::leader());
     #[cfg(windows)]
     wrapped.wrap(process_wrap::tokio::JobObject);
     wrapped.wrap(KillOnDrop);
-    let mut child = wrapped.spawn().map_err(|e| anyhow!("{program}을(를) 실행하지 못했습니다: {e}"))?;
+    let child = wrapped.spawn().map_err(|e| anyhow!("{program}을(를) 실행하지 못했습니다: {e}"))?;
+    // Ended with the backend however it ends (`guardian`).
+    #[cfg(unix)]
+    let child = guardian::watched(child);
+    let mut child = child;
     slot.state().pid = child.id();
     let (Some(stdin), Some(stdout)) = (child.stdin().take(), child.stdout().take()) else {
         let _ = child.start_kill();
@@ -2170,7 +2176,8 @@ const MAX_INHERITED_FD: libc::c_int = 65_536;
 /// waited out its timeout. So the starting process closes, before its
 /// program runs, every descriptor past stderr that exec would not close.
 #[cfg(unix)]
-fn own_descriptors_only(command: &mut tokio::process::Command) {
+fn own_descriptors_only(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
     // SAFETY: getrlimit is read here, before the fork; the child only calls
     // fcntl and close, which are async-signal-safe.
     let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
