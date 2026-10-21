@@ -188,4 +188,7 @@ CREATE TABLE vec_query_registry (
 --   GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_knowledge_chunk TO 'agent'@'localhost';
 --   GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_qa_method TO 'agent'@'localhost';
 --   GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_query_registry TO 'agent'@'localhost';
+--   GRANT ALTER ON llm_agent.vec_knowledge_chunk TO 'agent'@'localhost';  -- 지운 행의 벡터 인덱스 항목을 걷어내는 재구성용
+--   GRANT ALTER ON llm_agent.vec_qa_method TO 'agent'@'localhost';        -- (embed_sync.rs STALE_ENTRIES_MIN, README 참고)
+--   GRANT ALTER ON llm_agent.vec_query_registry TO 'agent'@'localhost';
 --   GRANT SELECT, INSERT, DELETE ON llm_agent.chat_log TO 'agent'@'localhost';

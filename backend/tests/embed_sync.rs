@@ -323,3 +323,115 @@ async fn a_sync_run_by_hand_and_stopped_ends_its_connections_in_order() {
     assert!(said.contains("stopped early for shutdown"), "the sync ends and says so:\n{said}");
     assert!(taken >= 2 && ended.len() == taken && ended.iter().all(|quit| *quit), "{taken} connections, closed with a goodbye: {ended:?}");
 }
+
+/// Vectors for `vec_qa_method` rows `seqs` (a `seq_<from>_to_<to>` table, or
+/// `qa_method`), whatever rows `qa_method` has.
+fn add_vectors(test_db: &TestDb, seqs: &str) {
+    test_db.sql_in(&format!(
+        "INSERT INTO vec_qa_method (seq, embed_hash, embedding)
+         SELECT seq, MD5(seq), VEC_FromText(CONCAT('[', REPEAT(CONCAT(seq % 7 + 1, ','), 1023), '1]')) FROM {seqs};"
+    ));
+}
+
+/// Entries `vec_qa_method`'s vector index holds, by the server's count (an
+/// estimate from sampled pages, exact for a few pages).
+fn index_entries(test_db: &TestDb) -> u64 {
+    test_db.sql_in("ANALYZE TABLE vec_qa_method;");
+    test_db
+        .scalar(&format!(
+            "SELECT SUM(num_rows) FROM information_schema.INNODB_SYS_TABLESTATS WHERE name LIKE '{}/vec\\_qa\\_method#i#%'",
+            test_db.name
+        ))
+        .parse()
+        .unwrap()
+}
+
+/// MariaDB's vector index keeps the entry of every row deleted or replaced
+/// until the table is rebuilt: the sync's deletes and re-embeddings grew it
+/// without end (60,856 entries, 180 MB, for 2 rows after an afternoon of
+/// edits), and searches over it missed rows it had. Once it holds as many
+/// such entries as rows (100 at least), the sync rebuilds the table.
+#[tokio::test]
+async fn a_vector_index_holding_deleted_rows_is_rebuilt() {
+    let _turn = SYNCING.lock().await;
+    let Some(test_db) = TestDb::create("sync_rebuild") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let mut config = test_db.config();
+    // Vectors of deleted rows are cleaned up without the server.
+    config.embedding.url = String::new();
+    let rows: u64 = test_db.scalar("SELECT COUNT(*) FROM qa_method").parse().unwrap();
+    add_vectors(&test_db, "qa_method");
+    add_vectors(&test_db, "seq_1000_to_1049");
+    let db = Db::default();
+    let sync = EmbedSync::default();
+    // 50 left behind: fewer than the least worth a rebuild.
+    let summary = sync.run(&db, &config, &CancellationToken::new()).await.unwrap();
+    assert_eq!((summary.deleted, summary.rebuilt), (50, 0), "{summary}");
+    assert!(index_entries(&test_db) > rows + 25);
+
+    add_vectors(&test_db, "seq_2000_to_2299");
+    let summary = sync.run(&db, &config, &CancellationToken::new()).await.unwrap();
+    assert_eq!((summary.deleted, summary.rebuilt), (300, 1), "{summary}");
+    assert_eq!(index_entries(&test_db), rows, "the index holds the table's rows alone");
+    assert_eq!(test_db.scalar("SELECT COUNT(*) FROM vec_qa_method").parse::<u64>().unwrap(), rows);
+    // Nothing left behind since: no rebuild.
+    let summary = sync.run(&db, &config, &CancellationToken::new()).await.unwrap();
+    assert_eq!(summary.rebuilt, 0, "{summary}");
+    db.close().await;
+}
+
+/// An account as the README grants it reads no server counts (PROCESS) and
+/// may not rebuild a table (ALTER): the sync goes on, and once granted
+/// ALTER, rebuilds by the entries it left behind itself.
+#[tokio::test]
+async fn an_account_without_alter_syncs_on_and_with_it_rebuilds_by_its_own_count() {
+    let _turn = SYNCING.lock().await;
+    let Some(test_db) = TestDb::create("sync_rebuild_grants") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let user = format!("zz_sync_{}", std::process::id());
+    let hosts = ["localhost", "127.0.0.1", "%"];
+    let db_name = &test_db.name;
+    // Dropped however the test ends.
+    struct Users<'a>(&'a TestDb, &'a str, [&'a str; 3]);
+    impl Drop for Users<'_> {
+        fn drop(&mut self) {
+            for host in self.2 {
+                self.0.sql(&format!("DROP USER IF EXISTS '{}'@'{host}';", self.1));
+            }
+        }
+    }
+    let _users = Users(&test_db, &user, hosts);
+    for host in hosts {
+        test_db.sql(&format!(
+            "DROP USER IF EXISTS '{user}'@'{host}'; CREATE USER '{user}'@'{host}' IDENTIFIED BY 'zz-sync';
+             GRANT SELECT ON {db_name}.* TO '{user}'@'{host}';
+             GRANT SELECT, INSERT, UPDATE, DELETE ON {db_name}.knowledge_chunk TO '{user}'@'{host}';
+             GRANT SELECT, INSERT, UPDATE, DELETE ON {db_name}.vec_knowledge_chunk TO '{user}'@'{host}';
+             GRANT SELECT, INSERT, UPDATE, DELETE ON {db_name}.vec_qa_method TO '{user}'@'{host}';
+             GRANT SELECT, INSERT, UPDATE, DELETE ON {db_name}.vec_query_registry TO '{user}'@'{host}';"
+        ));
+    }
+    let mut config = test_db.config();
+    config.embedding.url = String::new();
+    config.mariadb.user = user.clone();
+    config.mariadb.password = Some(llm_agent::config::Secret("zz-sync".into()));
+    let rows: u64 = test_db.scalar("SELECT COUNT(*) FROM qa_method").parse().unwrap();
+    add_vectors(&test_db, "qa_method");
+    add_vectors(&test_db, "seq_1000_to_1299");
+    let db = Db::default();
+    let summary = EmbedSync::default().run(&db, &config, &CancellationToken::new()).await.expect("the sync goes on");
+    assert_eq!((summary.deleted, summary.rebuilt, summary.chunks_failed), (300, 0, 0), "{summary}");
+    assert!(index_entries(&test_db) > rows + 200);
+
+    for host in hosts {
+        test_db.sql(&format!("GRANT ALTER ON {db_name}.vec_qa_method TO '{user}'@'{host}';"));
+    }
+    add_vectors(&test_db, "seq_2000_to_2299");
+    // A new process: it counts only what it leaves behind.
+    let summary = EmbedSync::default().run(&db, &config, &CancellationToken::new()).await.unwrap();
+    assert_eq!((summary.deleted, summary.rebuilt), (300, 1), "{summary}");
+    assert_eq!(index_entries(&test_db), rows);
+    db.close().await;
+}

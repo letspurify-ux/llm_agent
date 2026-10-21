@@ -157,11 +157,23 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.knowledge_chunk     TO 'agent'
 GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_knowledge_chunk TO 'agent'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_qa_method       TO 'agent'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE ON llm_agent.vec_query_registry  TO 'agent'@'localhost';
+GRANT ALTER ON llm_agent.vec_knowledge_chunk TO 'agent'@'localhost';
+GRANT ALTER ON llm_agent.vec_qa_method       TO 'agent'@'localhost';
+GRANT ALTER ON llm_agent.vec_query_registry  TO 'agent'@'localhost';
 GRANT SELECT, INSERT, DELETE ON llm_agent.chat_log TO 'agent'@'localhost';"
 
 `knowledge_chunk`에 쓰기 권한이 필요한 이유: 청크는 `embed-sync`가 원문에서 만들어 넣는 파생
 테이블이다(`context.md` 4절). 읽기만 주면 동기화가 매 주기 실패하는데, 증상은 '지식이 하나도
 검색되지 않는다'로만 보인다.
+
+`vec_*`에 `ALTER` 권한이 필요한 이유: MariaDB의 벡터 인덱스는 지우거나 바꾼 행의 항목을 테이블을
+다시 만들기 전까지 영원히 들고 있다. 지식을 고치고 지울 때마다 인덱스가 커지고(행 2개에 항목
+60,856개·180 MB까지 실측), 그런 인덱스는 있는 행도 검색에서 놓친다. 동기화는 지운·바꾼 행의 항목이
+남은 행 수(최소 100)만큼 쌓이면 그 테이블을 `ALTER TABLE … ALGORITHM=COPY, FORCE`로 다시 만든다
+(행 1만 개에 약 5초, 그동안 검색은 그대로 된다). 권한이 없으면 로그에 한 번 알리고 동기화는 계속한다.
+쌓인 양은 서버 통계(`PROCESS` 권한)로 세고, 그 권한이 없으면 이 프로세스가 남긴 만큼만 센다 —
+기존 설치에서 이미 쌓인 것은 한 번 `ALTER TABLE vec_knowledge_chunk ALGORITHM=COPY, FORCE;`
+(나머지 두 테이블도)로 걷어낸다.
 ```
 
 SPACE 시스템 지식 데이터도 함께 등록:

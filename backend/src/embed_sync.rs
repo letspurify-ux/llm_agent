@@ -16,7 +16,11 @@ use futures_util::FutureExt;
 use std::{
     collections::HashMap,
     panic::AssertUnwindSafe,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -24,6 +28,20 @@ const BATCH: usize = 32;
 const IN_CHUNK: usize = 1000;
 const LOCK_NAME: &str = "space_voc_embed_sync";
 const DOC_HASH_EXPR: &str = "MD5(JSON_ARRAY(?, title, content))";
+
+/// Entries a `vec_*` table's vector index may hold for rows it no longer has
+/// (at least) before the table is rebuilt. MariaDB's vector index keeps the
+/// entry of every row deleted or replaced for good, and only a table copy
+/// leaves it out: a vector index of 60,856 entries (180 MB) held 2 rows
+/// after an afternoon of edits, measured, and searches over such an index
+/// missed rows it had (6 of 10 found). Rebuilt once it holds as many such
+/// entries as rows, a rebuild costs as much as the edits before it.
+const STALE_ENTRIES_MIN: u64 = 100;
+/// Time a rebuild may take for each row it keeps, past the DB time limit
+/// (0.5 ms measured on a laptop; 10,000 rows of 1,024 dimensions in 5 s).
+const REBUILD_MS_PER_ROW: u64 = 10;
+/// How long a table whose rebuild failed waits before another try.
+const REBUILD_RETRY: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub enum Skipped {
@@ -47,11 +65,18 @@ pub struct Summary {
     pub chunks: usize,
     pub chunks_dropped: u64,
     pub chunks_failed: usize,
+    /// `vec_*` tables rebuilt to drop the index entries of deleted rows.
+    pub rebuilt: usize,
     pub skipped: Skipped,
 }
 impl Summary {
     pub fn changed(&self) -> bool {
-        self.embedded > 0 || self.deleted > 0 || self.failed > 0 || self.chunks_failed > 0 || self.chunks > 0
+        self.embedded > 0
+            || self.deleted > 0
+            || self.failed > 0
+            || self.chunks_failed > 0
+            || self.chunks > 0
+            || self.rebuilt > 0
     }
 }
 impl std::fmt::Display for Summary {
@@ -59,6 +84,9 @@ impl std::fmt::Display for Summary {
         write!(f, "created/updated {}, cleaned up {}", self.embedded, self.deleted)?;
         if self.chunks > 0 {
             write!(f, ", rechunked {} (replacing {})", self.chunks, self.chunks_dropped)?;
+        }
+        if self.rebuilt > 0 {
+            write!(f, ", rebuilt the vector index of {} table(s)", self.rebuilt)?;
         }
         if self.failed > 0 {
             write!(f, ", skipped {} (see the [embed] row warnings)", self.failed)?;
@@ -80,6 +108,21 @@ impl std::fmt::Display for Summary {
 #[derive(Default)]
 pub struct EmbedSync {
     running: AtomicBool,
+    /// By `vec_*` table, since this process last looked at its index.
+    indexes: Mutex<HashMap<String, IndexState>>,
+    /// The account may not rebuild a table (no ALTER privilege): told once.
+    rebuild_denied: AtomicBool,
+}
+
+/// What this process knows of a `vec_*` table's vector index.
+#[derive(Default)]
+struct IndexState {
+    /// Entries of rows this process deleted or replaced since the index was
+    /// last rebuilt or counted: the count when the server's own cannot be
+    /// read (it takes the PROCESS privilege).
+    stale: u64,
+    /// When a rebuild last failed.
+    failed_at: Option<Instant>,
 }
 
 impl EmbedSync {
@@ -102,7 +145,7 @@ impl EmbedSync {
                         ..Default::default()
                     });
                 }
-                let summary = sync(db, config, stop).await;
+                let summary = sync(self, db, config, stop).await;
                 let _ = plain_on(cfg, &mut lock, &format!("SELECT RELEASE_LOCK('{LOCK_NAME}')")).await;
                 summary
             }
@@ -242,7 +285,7 @@ async fn rebuild_chunks(db: &Db, config: &Config, stop: &CancellationToken, out:
     Ok(())
 }
 
-async fn sync(db: &Db, config: &Config, stop: &CancellationToken) -> Result<Summary> {
+async fn sync(state: &EmbedSync, db: &Db, config: &Config, stop: &CancellationToken) -> Result<Summary> {
     let cfg = &config.mariadb;
     let enabled = config.embedding.enabled();
     let mut out = Summary {
@@ -274,14 +317,18 @@ async fn sync(db: &Db, config: &Config, stop: &CancellationToken) -> Result<Summ
             .map(|r| (db::int(&r, "seq"), db::text(&r, "embed_hash")))
             .collect();
         let mut stale: Vec<(i64, String)> = vec![];
+        // Rows whose vector is replaced: each leaves its old index entry.
+        let mut replaced = 0u64;
         for r in &rows {
             let seq = db::int(r, "seq");
             let h = db::text(r, "h");
             if check && stored.get(&seq) != Some(&h) {
+                replaced += u64::from(stored.contains_key(&seq));
                 stale.push((seq, h));
             }
             stored.remove(&seq);
         }
+        let deleted_before = out.deleted;
         let orphans: Vec<i64> = stored.into_keys().collect();
         for seqs in orphans.chunks(IN_CHUNK) {
             if stop.is_cancelled() {
@@ -345,8 +392,97 @@ async fn sync(db: &Db, config: &Config, stop: &CancellationToken) -> Result<Summ
         if out.skipped == Skipped::Stopped {
             break;
         }
+        let left = replaced + (out.deleted - deleted_before);
+        if let Err(e) = rebuild_index(state, db, config, table, left, stop, &mut out).await {
+            eprintln!("[embed] could not check the vector index of {} — trying again at a later sync: {e:#}", vec_table(table));
+        }
     }
     Ok(out)
+}
+
+/// Rebuilds `table`'s vector table when its index holds as many entries of
+/// deleted or replaced rows as rows (`STALE_ENTRIES_MIN`), counted by the
+/// server where the account may read it, else as this process left them
+/// (`left` more now). Looked at once a process, then after changes.
+async fn rebuild_index(
+    state: &EmbedSync,
+    db: &Db,
+    config: &Config,
+    table: &str,
+    left: u64,
+    stop: &CancellationToken,
+    out: &mut Summary,
+) -> Result<()> {
+    let cfg = &config.mariadb;
+    let vec = vec_table(table);
+    let counted = {
+        let mut indexes = state.indexes.lock().unwrap_or_else(|p| p.into_inner());
+        let seen = indexes.contains_key(&vec);
+        let index = indexes.entry(vec.clone()).or_default();
+        index.stale += left;
+        if (seen && left == 0)
+            || stop.is_cancelled()
+            || state.rebuild_denied.load(Ordering::Acquire)
+            || index.failed_at.is_some_and(|at| at.elapsed() < REBUILD_RETRY)
+        {
+            return Ok(());
+        }
+        index.stale
+    };
+    let rows = db.query(cfg, &format!("SELECT COUNT(*) AS n FROM {vec}"), vec![]).await?;
+    let rows = u64::try_from(rows.first().map_or(0, |r| db::int(r, "n"))).unwrap_or(0);
+    // InnoDB keeps the index in a table of its own, `<table>#i#<n>`.
+    let entries = db
+        .query(
+            cfg,
+            "SELECT SUM(num_rows) AS n FROM information_schema.INNODB_SYS_TABLESTATS WHERE name LIKE CONCAT(DATABASE(), '/', ?, '#i#%')",
+            vec![p(vec.replace('_', "\\_"))],
+        )
+        .await
+        .ok()
+        .and_then(|r| r.into_iter().next())
+        .filter(|r| r.get("n").is_some_and(|n| !n.is_null()))
+        .map(|r| db::int(&r, "n"));
+    let stale = match entries {
+        Some(entries) => u64::try_from(entries).unwrap_or(0).saturating_sub(rows),
+        None => counted,
+    };
+    let update = |change: &dyn Fn(&mut IndexState)| {
+        let mut indexes = state.indexes.lock().unwrap_or_else(|p| p.into_inner());
+        change(indexes.entry(vec.clone()).or_default());
+    };
+    if stale < rows.max(STALE_ENTRIES_MIN) {
+        if entries.is_some() {
+            update(&|index| index.stale = 0);
+        }
+        return Ok(());
+    }
+    // Searches read the table meanwhile; its writes wait (this sync's alone).
+    let mut long = cfg.clone();
+    long.timeout_ms = cfg.timeout_ms.saturating_add(rows.saturating_mul(REBUILD_MS_PER_ROW));
+    let started = Instant::now();
+    match db.exec(&long, &format!("ALTER TABLE {vec} ALGORITHM=COPY, FORCE"), vec![]).await {
+        Ok(_) => {
+            update(&|index| *index = IndexState::default());
+            out.rebuilt += 1;
+            eprintln!(
+                "[embed] rebuilt {vec}: its vector index dropped about {stale} entries of deleted or replaced rows, {rows} rows kept ({} ms)",
+                started.elapsed().as_millis()
+            );
+        }
+        Err(e) if db::server_code(&e) == Some(db::ER_TABLEACCESS_DENIED) => {
+            if !state.rebuild_denied.swap(true, Ordering::AcqRel) {
+                eprintln!(
+                    "[embed] the vector index of {vec} holds about {stale} entries of deleted or replaced rows ({rows} rows): MariaDB drops them only when the table is rebuilt, which the management DB account may not do — grant it ALTER on the vec_* tables (README, MariaDB schema), or run `ALTER TABLE {vec} ALGORITHM=COPY, FORCE` now and then"
+                );
+            }
+        }
+        Err(e) => {
+            update(&|index| index.failed_at = Some(Instant::now()));
+            eprintln!("[embed] rebuilding {vec} failed — trying again in an hour: {e:#}");
+        }
+    }
+    Ok(())
 }
 
 enum Flow {
