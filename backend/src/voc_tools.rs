@@ -297,6 +297,14 @@ fn query_summary(row: &Row) -> Value {
     item
 }
 
+/// Where a vector result stands in its target's list (the offset a page
+/// from it takes): the model is not shown it (`tools::model_result`). A
+/// result shown first as a title match or an exact query name still takes
+/// its place there, and a list cut for size goes on from the first result
+/// it left out — counted without those, it went on short of it, and the next
+/// page began with results the model had been shown.
+pub(crate) const RANK: &str = "_rank";
+
 /// One target's vector results as listed, with each one's seq and distance.
 struct VectorList {
     items: Vec<Value>,
@@ -313,11 +321,12 @@ async fn vector_list(cx: &Context<'_>, target: &str, vector: &[f32], offset: usi
             items: page
                 .items
                 .iter()
-                .map(|d| {
+                .enumerate()
+                .map(|(i, d)| {
                     json!({
                         "id":format!("k{}", d.doc_seq),"title":d.title,"chunk_of":d.chunk_of,
                         "matched_chunks":chunk_list(&d.chunks),"best_chunk":d.best_chunk,
-                        "distance":round(d.distance),"excerpt":excerpt(&d.excerpt, 300)
+                        "distance":round(d.distance),"excerpt":excerpt(&d.excerpt, 300),RANK:offset + i
                     })
                 })
                 .collect(),
@@ -332,16 +341,18 @@ async fn vector_list(cx: &Context<'_>, target: &str, vector: &[f32], offset: usi
         items: page
             .items
             .iter()
-            .map(|r| {
+            .enumerate()
+            .map(|(i, r)| {
                 let distance = round(db::float(r, "_dist"));
                 if target == "qa_method" {
                     json!({
                         "id":format!("m{}", db::int(r, "seq")),"title":db::text(r, "title"),
-                        "distance":distance,"excerpt":excerpt(&db::text(r, "method"), 300)
+                        "distance":distance,"excerpt":excerpt(&db::text(r, "method"), 300),RANK:offset + i
                     })
                 } else {
                     let mut item = query_summary(r);
                     item["distance"] = json!(distance);
+                    item[RANK] = json!(offset + i);
                     item
                 }
             })
@@ -404,9 +415,18 @@ fn title_slots(offset: usize, limit: usize, vector_runs: bool) -> usize {
 /// result's fields when the vector search found them too), then the vector
 /// results not among them in the places left. `next_offset` goes on after
 /// the last vector result looked at; one shown as a title match counts as
-/// looked at. A last page has no place to keep for the vector results: the
+/// looked at, as does one shown before the page (`before`: an exact query
+/// name). A last page has no place to keep for the vector results: the
 /// title matches held back fill it.
-fn merge_page(mut titles: Vec<Value>, slots: usize, vector: &[Value], offset: usize, limit: usize, more: bool) -> (Vec<Value>, Option<usize>) {
+fn merge_page(
+    mut titles: Vec<Value>,
+    slots: usize,
+    vector: &[Value],
+    offset: usize,
+    limit: usize,
+    more: bool,
+    before: &BTreeSet<String>,
+) -> (Vec<Value>, Option<usize>) {
     let as_title = |title: Value| match vector.iter().find(|v| item_key(v) == item_key(&title)) {
         Some(found) => {
             let mut item = found.clone();
@@ -418,7 +438,7 @@ fn merge_page(mut titles: Vec<Value>, slots: usize, vector: &[Value], offset: us
     };
     let held = titles.split_off(slots.min(titles.len()));
     let mut items: Vec<Value> = titles.into_iter().map(as_title).collect();
-    let shown: BTreeSet<String> = items.iter().map(item_key).collect();
+    let shown: BTreeSet<String> = items.iter().map(item_key).chain(before.iter().cloned()).collect();
     let room = limit.saturating_sub(items.len());
     let (mut looked, mut taken) = (0, 0);
     while let Some(item) = vector.get(looked) {
@@ -529,8 +549,7 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
         title_items.truncate(title_slots(offset, limit, false));
         let outcome: std::result::Result<Value, String> = match listed {
             Ok(list) => {
-                let vector_items: Vec<Value> = list.items.into_iter().filter(|i| !exact_keys.contains(&item_key(i))).collect();
-                let (page, next) = merge_page(title_items, slots, &vector_items, offset, limit, list.more);
+                let (page, next) = merge_page(title_items, slots, &list.items, offset, limit, list.more, &exact_keys);
                 let mut items = exact;
                 items.extend(page);
                 let mut out = json!({"next_offset":next,"beyond_threshold":list.beyond});
@@ -643,7 +662,7 @@ pub(crate) fn fit_search(data: &mut Value, budget: usize, model: &str) {
     for max in [150usize, 60, 0] {
         if let Some(targets) = data["results"].as_object_mut() {
             for target in targets.values_mut() {
-                for item in target["items"].as_array_mut().into_iter().flatten() {
+                for item in target.get_mut("items").and_then(Value::as_array_mut).into_iter().flatten() {
                     let shortened = item["excerpt"].as_str().map(|e| {
                         let e = e.strip_suffix(TRUNC_MARK).unwrap_or(e);
                         clip_marked(e, max)
@@ -690,11 +709,14 @@ pub(crate) fn fit_search(data: &mut Value, budget: usize, model: &str) {
             let item = items.remove(at);
             freed += crate::context::tokens(&item.to_string(), model).max(1);
             if paged(&item) {
-                // An exact query name or a title match comes before the page
-                // and is none of its positions: counted, the page would go
-                // on past a result unseen.
+                // The page goes on from the result left out (the last one
+                // kept, cut again). An exact query name or a title match
+                // comes before the page and is none of its positions, but it
+                // may stand in the vector list too (`RANK`): counted, the
+                // page would go on past a result unseen; left out, short of
+                // the results shown.
                 let kept = items.iter().filter(|item| paged(item)).count() as u64;
-                target["next_offset"] = json!(offset + kept);
+                target["next_offset"] = json!(item[RANK].as_u64().unwrap_or(offset + kept));
             } else {
                 // No page repeats it: the page goes on where it did (or
                 // nowhere), and the note says how many title matches are left.
@@ -1005,7 +1027,10 @@ async fn query_describe(cx: &Context<'_>, args: &Value) -> Result<Value> {
     Ok(out)
 }
 
-/// The params as executed: keys without a leading colon, at most 20.
+/// The params as executed: keys without a leading colon, every one. A
+/// QUERY takes any number of binds (twenty is the limit of a routine's), and
+/// the binds past the first twenty sent were dropped: a query of 21 binds
+/// could never run, its last bind refused as having no value.
 pub fn clean_params(args: &Value) -> Map<String, Value> {
     args["params"]
         .as_object()
@@ -1014,7 +1039,6 @@ pub fn clean_params(args: &Value) -> Map<String, Value> {
                 .iter()
                 .map(|(k, v)| (k.trim().trim_start_matches(':').to_owned(), v.clone()))
                 .filter(|(k, _)| !k.is_empty() && k.chars().count() <= crate::sql::MAX_BIND_NAME_LEN)
-                .take(20)
                 .collect()
         })
         .unwrap_or_default()
@@ -1392,29 +1416,73 @@ mod tests {
         let vector: Vec<Value> = ["k1", "k2", "k3", "k4", "k5"].map(doc).to_vec();
         // k3 was found both ways: shown once, first, with its distance; the
         // page goes on past it.
-        let (items, next) = merge_page(vec![title_hit("k3"), title_hit("k9")], 3, &vector, 0, 4, true);
+        let (items, next) = merge_page(vec![title_hit("k3"), title_hit("k9")], 3, &vector, 0, 4, true, &BTreeSet::new());
         assert_eq!(ids(&items), ["k3", "k9", "k1", "k2"]);
         assert_eq!((items[0]["distance"].clone(), items[0]["title_match"].clone()), (json!(0.3), json!(true)));
         assert_eq!(next, Some(3));
         // One further down the vector list is not reached yet.
-        let (items, next) = merge_page(vec![title_hit("k5")], 2, &vector, 0, 3, true);
+        let (items, next) = merge_page(vec![title_hit("k5")], 2, &vector, 0, 3, true, &BTreeSet::new());
         assert_eq!(ids(&items), ["k5", "k1", "k2"]);
         assert_eq!(next, Some(2));
-        let (items, next) = merge_page(vec![title_hit("k2")], 1, &vector[..2], 0, 2, false);
+        let (items, next) = merge_page(vec![title_hit("k2")], 1, &vector[..2], 0, 2, false, &BTreeSet::new());
         assert_eq!(ids(&items), ["k2", "k1"]);
         assert_eq!(next, None);
         // Without title matches the page is the vector page.
-        let (items, next) = merge_page(vec![], 0, &vector, 10, 5, true);
+        let (items, next) = merge_page(vec![], 0, &vector, 10, 5, true, &BTreeSet::new());
         assert_eq!((ids(&items).len(), next), (5, Some(15)));
         // On a last page the matches held back fill the places left, and
         // mark the vector results they repeat.
         let titles: Vec<Value> = ["k1", "k2", "k3", "k4", "k8"].map(title_hit).to_vec();
-        let (items, next) = merge_page(titles.clone(), 4, &vector[..3], 0, 5, false);
+        let (items, next) = merge_page(titles.clone(), 4, &vector[..3], 0, 5, false, &BTreeSet::new());
         assert_eq!((ids(&items), next), (vec!["k1", "k2", "k3", "k4", "k8"], None));
-        let (items, _) = merge_page(titles[3..].to_vec(), 1, &vector[..3], 0, 5, false);
+        let (items, _) = merge_page(titles[3..].to_vec(), 1, &vector[..3], 0, 5, false, &BTreeSet::new());
         assert_eq!(ids(&items), ["k4", "k1", "k2", "k3", "k8"]);
-        let (items, next) = merge_page(titles, 4, &vector, 0, 5, true);
+        let (items, next) = merge_page(titles, 4, &vector, 0, 5, true, &BTreeSet::new());
         assert_eq!((ids(&items), next), (vec!["k1", "k2", "k3", "k4", "k5"], Some(5)));
+    }
+
+    /// Tool review, 2026-10-21 (second pass): an exact query name or a title
+    /// match that is also a vector result takes its place in the vector list,
+    /// but the next page was counted without it — and began with a result the
+    /// model had just been shown.
+    #[test]
+    fn a_page_goes_on_past_the_results_shown_before_it() {
+        let ranked = |id: &str, rank: usize| {
+            let mut item = doc(id);
+            item[RANK] = json!(rank);
+            item
+        };
+        // The exact name is the vector list's second result.
+        let vector: Vec<Value> = [("k1", 0), ("exact", 1), ("k2", 2), ("k3", 3), ("k4", 4)].map(|(id, r)| ranked(id, r)).to_vec();
+        let exact: BTreeSet<String> = ["exact".to_owned()].into();
+        let (items, next) = merge_page(vec![title_hit("t1")], 1, &vector, 0, 3, true, &exact);
+        assert_eq!(ids(&items), ["t1", "k1", "k2"]);
+        assert_eq!(next, Some(3), "the page after it starts at k3, not at k2 again");
+
+        // Cut for size, the list goes on from the first vector result it
+        // leaves out, past the title match standing in the vector list.
+        let long = |mut item: Value| {
+            item["title"] = json!(format!("{} {}", item["title"].as_str().unwrap(), "제목 ".repeat(100)));
+            item
+        };
+        let mut items = vec![json!({"id":"exact","title":"exact","exact":true})];
+        let mut both = long(ranked("k1", 1));
+        both["title_match"] = json!(true);
+        items.push(both);
+        items.extend([0, 2, 3, 4, 5, 6].map(|r| long(ranked(&format!("v{r}"), r))));
+        let mut data = json!({"text":"낱말","limit":7,"offset":0,"results":{"knowledge":{"status":"ok","next_offset":7,"items":items}}});
+        let whole = crate::tools::message_tokens(&crate::tools::envelope(Ok(data.clone())), "gpt-4o");
+        fit_search(&mut data, whole * 2 / 3, "gpt-4o");
+        let target = &data["results"]["knowledge"];
+        let shown: Vec<u64> = target["items"].as_array().unwrap().iter().filter(|i| paged(i)).map(|i| i[RANK].as_u64().unwrap()).collect();
+        assert!(target["items_cut_for_size"] == true && !shown.is_empty() && shown.len() < 6, "{target}");
+        let first_left = [0, 2, 3, 4, 5, 6].into_iter().find(|r| !shown.contains(r)).unwrap();
+        assert!(first_left > 1, "{shown:?}");
+        assert_eq!(target["next_offset"], first_left, "{shown:?}");
+        // The model is not shown the places.
+        let delivered = crate::tools::model_result(&crate::tools::envelope(Ok(data.clone())));
+        assert!(!delivered.to_string().contains(RANK), "{delivered}");
+        assert_eq!(delivered["data"]["results"]["knowledge"]["items"][1]["title_match"], true);
     }
 
     #[test]
@@ -1431,7 +1499,7 @@ mod tests {
             let titles: Vec<Value> = (0..title_slots(0, limit, true)).map(|i| title_hit(&format!("t{i}"))).collect();
             let vector: Vec<Value> = (0..limit).map(|i| doc(&format!("k{i}"))).collect();
             let slots = titles.len();
-            let (_, next) = merge_page(titles, slots, &vector, 0, limit, true);
+            let (_, next) = merge_page(titles, slots, &vector, 0, limit, true, &BTreeSet::new());
             assert!(next.is_some_and(|n| n > 0), "limit {limit}: {next:?}");
         }
     }
@@ -1516,6 +1584,18 @@ mod tests {
         let b = clean_params(&json!({"params":{"x":1,"job_id":"B1"}}));
         assert_eq!(run_signature("Q", Some("DB"), &a), run_signature("q", Some("db"), &b));
         assert_ne!(run_signature("q", Some("A"), &a), run_signature("q", Some("B"), &a));
+    }
+
+    /// Tool review, 2026-10-21 (second pass): a registered QUERY may have
+    /// any number of binds, but only the first twenty params sent were kept.
+    #[test]
+    fn a_query_gets_every_bind_it_names() {
+        let sql = format!("SELECT * FROM t WHERE c IN ({})", (1..=25).map(|i| format!(":p{i}")).collect::<Vec<_>>().join(", "));
+        let spec = crate::execution::execution_spec("QUERY", &sql, "").unwrap();
+        assert_eq!(spec.inputs.len(), 25);
+        let params: Map<String, Value> = spec.inputs.iter().map(|name| (name.clone(), json!(1))).collect();
+        let kept = clean_params(&json!({ "params": params }));
+        assert!(spec.inputs.iter().all(|name| kept.contains_key(name)), "{kept:?}");
     }
 
     #[test]

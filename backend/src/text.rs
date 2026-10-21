@@ -64,7 +64,11 @@ pub fn name_key(s: &str) -> String {
 /// Byte position of the first place `name` is written in `text`, compared by
 /// `name_key`. Lowercasing the whole body first would change characters whose
 /// case mapping depends on neighbours (final sigma), so every candidate span is
-/// checked again with `name_key`.
+/// checked again with `name_key`. A name is written where it stands apart:
+/// an end of it that is a letter, digit or `_` has none of those beside it,
+/// so `batch_job` is not written in `batch_job_status` (a method naming that
+/// query listed `batch_job` too, and deleting `batch_job` was refused as in
+/// use), while a Korean particle may follow (`find_customer_id를`).
 pub fn name_index_of(text: &str, name: &str) -> Option<usize> {
     let key = name_key(name);
     if key.is_empty() {
@@ -75,10 +79,15 @@ pub fn name_index_of(text: &str, name: &str) -> Option<usize> {
         .unicode(true)
         .build()
         .ok()?;
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let starts_word = key.chars().next().is_some_and(word);
+    let ends_word = key.chars().next_back().is_some_and(word);
     let mut start = 0;
     while start <= text.len() {
         let found = pattern.find_at(text, start)?;
-        if name_key(found.as_str()) == key {
+        let joined_before = starts_word && text[..found.start()].chars().next_back().is_some_and(word);
+        let joined_after = ends_word && text[found.end()..].chars().next().is_some_and(word);
+        if name_key(found.as_str()) == key && !joined_before && !joined_after {
             return Some(found.start());
         }
         // Advance one character past the candidate's start.
@@ -222,6 +231,20 @@ mod tests {
         assert_eq!(name_index_of("먼저 Find_Customer_ID를 실행", "find_customer_id"), Some(7));
         assert_eq!(name_index_of("nothing here", "find"), None);
         assert_eq!(name_index_of("x", "  "), None);
+    }
+
+    #[test]
+    fn a_name_inside_a_longer_name_is_not_written_there() {
+        let method = "1. batch_job_status로 상태를 본다. 2. 실패면 batch_job 재실행을 안내한다.";
+        assert_eq!(name_index_of(method, "batch_job_status"), Some(3));
+        // Found where it stands alone, past the longer name holding it.
+        assert_eq!(name_index_of(method, "batch_job"), method.find("batch_job 재"));
+        assert_eq!(name_index_of("batch_job_status만 본다", "batch_job"), None);
+        assert_eq!(name_index_of("old_batch_job", "batch_job"), None);
+        assert_eq!(name_index_of("query10", "query1"), None);
+        // Punctuation, spaces and Korean are not part of a name.
+        assert_eq!(name_index_of("`batch_job`(재실행)", "batch_job"), Some(1));
+        assert_eq!(name_index_of("주문조회하기", "주문조회"), Some(0));
     }
 
     #[test]

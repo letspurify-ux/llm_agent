@@ -1125,7 +1125,9 @@ const SKIPPED_DIRECTORIES: [&str; 10] = [
 ];
 
 /// A path glob as matched, relative to the project root, also when written
-/// from the root (`./src/**`) or with the root's absolute path in front.
+/// from the root (`./src/**`, or `/src/**` as in an ignore file) or with the
+/// root's absolute path in front. Matched as sent, `/src/*.rs` named no
+/// relative path, and the walk found nothing.
 fn root_relative_glob<'a>(p: &Project, root: &Path, glob: &'a str) -> &'a str {
     let mut glob = [root, p.root.as_path()]
         .iter()
@@ -1134,10 +1136,12 @@ fn root_relative_glob<'a>(p: &Project, root: &Path, glob: &'a str) -> &'a str {
         .filter(|prefix| !prefix.is_empty())
         .find_map(|prefix| glob.strip_prefix(prefix)?.strip_prefix('/'))
         .unwrap_or(glob);
-    while let Some(rest) = glob.strip_prefix("./") {
-        glob = rest;
+    loop {
+        match glob.strip_prefix("./").or_else(|| glob.strip_prefix('/')) {
+            Some(rest) => glob = rest,
+            None => return glob,
+        }
     }
-    glob
 }
 
 /// A path_glob as the tools describe it: `*` and `?` stay within one path
@@ -1758,6 +1762,14 @@ pub fn model_result(result: &Value) -> Value {
     if let Some(data) = shown.get_mut("data").and_then(Value::as_object_mut) {
         data.remove("source");
         data.remove("chunk_ends");
+        // A search result's place in its list drives the next offset only.
+        for target in data.get_mut("results").and_then(Value::as_object_mut).into_iter().flat_map(|t| t.values_mut()) {
+            for item in target.get_mut("items").and_then(Value::as_array_mut).into_iter().flatten() {
+                if let Some(item) = item.as_object_mut() {
+                    item.remove(crate::voc_tools::RANK);
+                }
+            }
+        }
         for rows in ["matches", "symbols"] {
             if let Some(rows) = data.get_mut(rows).and_then(Value::as_array_mut) {
                 for row in rows {
@@ -2502,6 +2514,9 @@ mod tests {
         assert_eq!(list("src/**"), ["src/a.rs", "src/deep/b.rs", "src/deep/main.rs"]);
         assert_eq!(list("*/*.rs"), ["src/a.rs"]);
         assert_eq!(list("./*.rs"), ["main.rs"]);
+        // Written from the root, as in an ignore file.
+        assert_eq!(list("/src/*.rs"), ["src/a.rs"]);
+        assert_eq!(list("/*.rs"), ["main.rs"]);
         // Without a directory, at any depth.
         assert_eq!(list("*.rs"), ["main.rs", "src/a.rs", "src/deep/b.rs", "src/deep/main.rs"]);
         assert_eq!(list("main.rs"), ["main.rs", "src/deep/main.rs"]);

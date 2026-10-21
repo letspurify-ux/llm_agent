@@ -80,7 +80,10 @@ pub fn describe(message: &str) -> Value {
         (Class::InvalidInput, "choose_allowed_path")
     } else if matches!(
         code,
-        "cursor_arguments_conflict" | "conflicting_arguments" | "ambiguous_file_read_range"
+        "cursor_arguments_conflict"
+            | "conflicting_arguments"
+            | "conflicting_path_filters"
+            | "ambiguous_file_read_range"
     ) {
         (Class::InvalidInput, "correct_arguments")
     } else if code == "unknown_symbol" || code == "invalid_symbol_id" {
@@ -208,6 +211,12 @@ mod tests {
         assert_eq!(describe("cursor_expired: x")["class"], "stale_state");
         assert_eq!(describe("Something odd")["code"], "tool_error");
         assert_eq!(describe("unknown_step: step 4의 결과가 없다")["class"], "invalid_input");
+        // path and path_glob (or a symbol name sent as pattern) sent together
+        // are arguments to correct, not state that changed: "conflict" in the
+        // code read as stale state, told to refresh, and the field diagnosis
+        // invalid input gets was skipped.
+        let filters = describe("conflicting_path_filters: pass path or path_glob, not both");
+        assert_eq!((filters["class"].as_str(), filters["action"].as_str()), (Some("invalid_input"), Some("correct_arguments")));
     }
 
     /// Context management review, eighth pass: a history id that was

@@ -52,14 +52,13 @@ pub fn call_summary(root: &Path, name: &str, arguments: &str) -> String {
                     .filter(|query| !query.is_empty())
                     .collect::<Vec<_>>()
                     .join(" | "),
-                // pattern is a legacy name for query that the runtime accepts.
-                _ => match quoted(&args["query"]) {
-                    query if query.is_empty() => quoted(&args["pattern"]),
-                    query => query,
-                },
+                _ => quoted(&args["query"]),
             };
+            // pattern is the legacy name of path_glob, a file glob: shown as
+            // the search words, it hid the scope the call searched.
             let scope = args["path_glob"]
                 .as_str()
+                .or(args["pattern"].as_str())
                 .map(str::to_owned)
                 .unwrap_or_else(|| path("path"));
             join([query, scope])
@@ -221,6 +220,10 @@ mod tests {
         assert_eq!(
             call_summary(root, "source_search", r#"{"queries":["a","b"],"path_glob":"src/**"}"#),
             "소스 검색 \"a\" | \"b\" src/**"
+        );
+        assert_eq!(
+            call_summary(root, "source_search", r#"{"query":"fn run","pattern":"src/**/*.rs"}"#),
+            "소스 검색 \"fn run\" src/**/*.rs"
         );
         assert_eq!(call_summary(root, "result_read", r#"{"step":3}"#), "조회 결과 읽기 실행 3");
         assert_eq!(call_summary(root, "knowledge_read", r#"{"id":"k8"}"#), "지식 읽기 k8");
