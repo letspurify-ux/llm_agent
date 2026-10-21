@@ -2262,7 +2262,7 @@ async fn random_knowledge_and_query_reads_keep_their_shape_and_continuations() {
                         *stats.entry(format!("archived {name}")).or_default() += 1;
                     }
                     if let Some(what) = followed.get(call_id) {
-                        assert_eq!(result["status"], "ok", "run {run} request {i}: following {what} failed: {result}");
+                        assert_eq!(result["status"], "ok", "run {run} request {i}: following {what} failed: {result} ARGS {}", call["function"]["arguments"]);
                     }
                     if name == "knowledge_read" && result["status"] == "ok" {
                         let data = &result["data"];
@@ -2285,10 +2285,13 @@ async fn random_knowledge_and_query_reads_keep_their_shape_and_continuations() {
                             .and_then(|c| c.split_once('@'))
                             .and_then(|(_, at)| at.parse::<usize>().ok())
                             .unwrap_or(0);
-                        let first: String = parts[doc][a - 1].chars().skip(skip).collect();
-                        let joined = llm_agent::chunk::join_chunks(
-                            std::iter::once((a as i64, first.as_str())).chain((a + 1..=b).map(|n| (n as i64, parts[doc][n - 1].as_str()))),
-                        );
+                        // Left out after the whole chunks are joined: the rest
+                        // of a chunk shorter than the overlap the next repeats
+                        // keeps its seam (tool review, 2026-10-22, eighth pass).
+                        let joined: String = llm_agent::chunk::join_chunks((a..=b).map(|n| (n as i64, parts[doc][n - 1].as_str())))
+                            .chars()
+                            .skip(skip)
+                            .collect();
                         let mark = llm_agent::text::TRUNC_MARK;
                         assert!(text == joined || (a == b && text.ends_with(mark) && joined.starts_with(text.strip_suffix(mark).unwrap())), "run {run} request {i}: {doc} {chunks} text is not those chunks: {result}");
                         if let Some(head) = text.strip_suffix(mark) {

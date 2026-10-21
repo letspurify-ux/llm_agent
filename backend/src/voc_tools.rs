@@ -993,15 +993,46 @@ fn fit_chunks(doc: i64, title: &str, total: i64, chunks: Vec<(i64, String)>, ski
         out["next_cursor"] = json!(format!("k{doc}:{first}@{read}"));
         out
     };
-    let mut room = budget.saturating_sub(size(&cut(String::new())));
-    loop {
-        let (head, _) = crate::context::truncate(&whole, room, model);
-        let out = cut(head);
-        if room == 0 || size(&out) <= budget {
-            return out;
+    // The longest start that fits, with the title or without it (search
+    // showed it): None when not a character does.
+    let fit = |titled: bool| -> Option<Value> {
+        let shaped = |head: String| {
+            let mut out = cut(head);
+            if !titled && let Some(fields) = out.as_object_mut() {
+                fields.remove("title");
+            }
+            out
+        };
+        let mut room = budget.saturating_sub(size(&shaped(String::new())));
+        loop {
+            let (head, _) = crate::context::truncate(&whole, room, model);
+            if head.is_empty() {
+                return None;
+            }
+            let out = shaped(head);
+            if size(&out) <= budget {
+                return Some(out);
+            }
+            room = room * 9 / 10;
         }
-        room = room * 9 / 10;
+    };
+    if let Some(out) = fit(true).or_else(|| fit(false)) {
+        return out;
     }
+    // Not a character fits beside the fields, as with a long title and the
+    // smallest result budget: the read said nothing and its cursor did not
+    // move (`k7:1@0`, refused as invalid; `k7:3@120` again, read for good).
+    // A few tokens all the same, past the room kept for the call ID and
+    // argument notes (`tools::MESSAGE_MARGIN`) but within the result.
+    let (mut head, _) = crate::context::truncate(&whole, 16, model);
+    if head.is_empty() {
+        head = whole.chars().next().map(String::from).unwrap_or_default();
+    }
+    let mut out = cut(head);
+    if let Some(fields) = out.as_object_mut() {
+        fields.remove("title");
+    }
+    out
 }
 
 async fn method_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
@@ -1953,5 +1984,34 @@ mod tests {
             }
         }
         assert!(inside > 50, "{inside}");
+    }
+
+    /// Tool review, 2026-10-22 (tenth pass): with a long title and the
+    /// smallest result budget, not a character of a large chunk fitted
+    /// beside the fields: the read said nothing and handed out `k13:1@0`
+    /// (refused as invalid) or, inside a chunk, the cursor it was read with.
+    #[test]
+    fn a_read_cut_inside_a_chunk_always_moves_on() {
+        let body: String = (0..60).map(|p| format!("문서 문단{p}: {} 끝{p}.\n", "점검 절차와 \"따옴표\" 설명 ".repeat(5 + (p % 7)))).collect();
+        let parts = crate::chunk::split_content(&body);
+        let chunks: Vec<(i64, String)> = parts.iter().cloned().enumerate().map(|(i, c)| (i as i64 + 1, c)).collect();
+        let long_title = "긴제목".repeat(66);
+        for model in ["gpt-4o", "unknown-tokenizer"] {
+            for title in ["짧은 제목", long_title.as_str()] {
+                for budget in (crate::config::MIN_RESULT_TOKENS..600).step_by(7) {
+                    for skip in [0, 300] {
+                        let out = fit_chunks(13, title, parts.len() as i64, chunks.clone(), skip, budget, model);
+                        let text = out["text"].as_str().unwrap();
+                        let cursor = out["next_cursor"].as_str().unwrap_or_default().to_owned();
+                        let (_, chunk, at) = read_start(&json!({"cursor":cursor})).unwrap_or_else(|e| panic!("{model} {budget} @{skip}: {cursor}: {e}"));
+                        assert!(chunk > 1 || at > skip, "{model} {budget} @{skip}: {cursor} does not move on: {out}");
+                        assert!(!text.is_empty() && text != TRUNC_MARK, "{model} {budget}: {out}");
+                        // Within the result, the call ID's room aside.
+                        let shown = crate::tools::message_tokens(&crate::tools::envelope(Ok(out.clone())), model);
+                        assert!(shown <= budget + crate::tools::MESSAGE_MARGIN, "{model} {budget}: {shown}");
+                    }
+                }
+            }
+        }
     }
 }
