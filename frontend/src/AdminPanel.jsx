@@ -38,7 +38,7 @@ const SECTIONS = {
       ['root', '프로젝트 폴더', 'folder', null, true, '서버 PC의 절대 경로'],
       ['docs', '참고 문서 (md)', 'textarea', null, false, '한 줄에 하나 — 프로젝트 폴더 기준 상대 경로 또는 절대 경로 (예: docs/architecture.md)'],
       ['include', '포함 패턴', 'textarea', null, false, '한 줄에 하나. 비우면 전체 (예: src/**)'],
-      ['exclude', '제외 패턴', 'textarea', null, false, '한 줄에 하나 (예: **/*.log). .git·node_modules·target·dist·build는 항상 제외됩니다.'],
+      ['exclude', '제외 패턴', 'textarea', null, false, '한 줄에 하나 (예: **/*.log, secrets/, .env — 폴더는 그 아래 전부, / 없는 이름은 어느 깊이에서나). .git·node_modules·target·dist·build는 항상 제외됩니다.'],
     ] },
   mcp: { label: 'MCP', title: 'MCP 도구 서버', description: '외부 시스템의 도구를 MCP 서버로 연결해 에이전트가 쓰게 합니다. 서버마다 허용한 도구만 모델에 보이며, 저장하면 다음 질문부터 적용됩니다.', singleton: true, fields: [] },
   settings: { label: '설정', title: '서버 설정', description: '모델 연결, 임베딩, 관리 DB, Oracle 클라이언트, 실행 한도를 관리합니다. 저장하면 다음 질문부터 적용됩니다.', singleton: true, fields: [] },

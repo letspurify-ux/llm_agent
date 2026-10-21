@@ -645,20 +645,24 @@ pub(crate) struct Rules {
 struct Rule {
     normalized: globset::GlobMatcher,
     folded: Option<globset::GlobMatcher>,
+    /// No `/` in the pattern: it names a file or directory at any depth.
+    anywhere: bool,
 }
 impl Rules {
     pub(crate) fn new(project: &Project) -> Result<Self> {
         use unicode_normalization::UnicodeNormalization;
         let compile = |pattern: &String| -> Result<Rule> {
+            let pattern = rule_pattern(pattern);
             let normalized_pattern: String = pattern.nfd().collect();
             Ok(Rule {
                 normalized: globset::GlobBuilder::new(&normalized_pattern)
                     .case_insensitive(true)
                     .build()?
                     .compile_matcher(),
-                folded: globset::Glob::new(&folded_alias_key(pattern))
+                folded: globset::Glob::new(&folded_alias_key(&pattern))
                     .ok()
                     .map(|glob| glob.compile_matcher()),
+                anywhere: !pattern.contains('/'),
             })
         };
         Ok(Self {
@@ -666,6 +670,19 @@ impl Rules {
             exclude: project.exclude.iter().map(compile).collect::<Result<_>>()?,
         })
     }
+}
+
+/// An include/exclude pattern as written in an ignore file: `secrets/` names
+/// the directory, `/secrets` and `./secrets` the root's. Matched as sent, a
+/// pattern ending in `/` matched no path, and the folder the README says to
+/// exclude for its secrets stayed readable.
+fn rule_pattern(pattern: &str) -> String {
+    let mut pattern = pattern.trim();
+    while let Some(rest) = pattern.strip_prefix("./").or_else(|| pattern.strip_prefix('/')) {
+        pattern = rest;
+    }
+    let pattern = pattern.trim_end_matches('/');
+    if pattern.is_empty() { "**".to_owned() } else { pattern.to_owned() }
 }
 
 /// Version control, dependency and build output, and the project's
@@ -703,11 +720,27 @@ pub(crate) fn excluded_by(project: &Project, rules: &Rules, relative: &Path) -> 
     }) {
         return true;
     }
-    let normalized_path: String = relative.to_string_lossy().nfd().collect();
-    let folded_path = folded_alias_key(&relative.to_string_lossy());
+    // A rule holds for a path when it matches the path or a directory the
+    // path is in, as in an ignore file: `secrets` excluded the directory
+    // listed by name, while `secrets/key.pem` was read all the same. A
+    // pattern without `/` also names a file or directory at any depth: `.env`
+    // excluded the root's alone, though `*.log` matched at every depth.
+    let names: Vec<String> = relative.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect();
+    let mut within: Vec<(String, String)> = Vec::with_capacity(names.len());
+    let mut prefix = String::new();
+    for name in &names {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(name);
+        within.push((prefix.nfd().collect(), folded_alias_key(&prefix)));
+    }
+    let named: Vec<(String, String)> = names.iter().map(|name| (name.nfd().collect(), folded_alias_key(name))).collect();
     let matches = |rule: &Rule| {
-        rule.normalized.is_match(&normalized_path)
-            || rule.folded.as_ref().is_some_and(|glob| glob.is_match(&folded_path))
+        let hit = |(normalized, folded): &(String, String)| {
+            rule.normalized.is_match(normalized) || rule.folded.as_ref().is_some_and(|glob| glob.is_match(folded))
+        };
+        within.iter().any(hit) || (rule.anywhere && named.iter().any(hit))
     };
     (!rules.include.is_empty() && !rules.include.iter().any(matches)) || rules.exclude.iter().any(matches)
 }
@@ -1182,9 +1215,14 @@ fn root_relative_glob<'a>(p: &Project, root: &Path, glob: &'a str) -> &'a str {
 /// without case, on the decomposed (NFD) path. Matched as sent, a Korean name
 /// typed composed (`**/문서.md`) missed the file a Mac had named decomposed,
 /// and `**/readme.md` missed README.md, which file_read opens all the same.
+/// A glob naming a directory (`src/`, or `./` for the root) is everything
+/// below it: no file path ends in `/`, so it matched nothing, without a word.
 fn path_glob_matcher(glob: &str, anchored: bool) -> Result<globset::GlobMatcher> {
     use unicode_normalization::UnicodeNormalization;
-    let glob: String = glob.nfd().collect();
+    let mut glob: String = glob.nfd().collect();
+    if glob.is_empty() || glob.ends_with('/') {
+        glob.push_str("**");
+    }
     let glob = if anchored { glob } else { format!("**/{glob}") };
     Ok(globset::GlobBuilder::new(&glob)
         .literal_separator(true)
@@ -2586,6 +2624,12 @@ mod tests {
         assert_eq!(list("main.rs"), ["main.rs", "src/deep/main.rs"]);
         assert_eq!(list("**/b.rs"), ["src/deep/b.rs"]);
         assert_eq!(list("**/*"), ["docs/c.md", "main.rs", "src/a.rs", "src/deep/b.rs", "src/deep/main.rs"]);
+        // Tool review, 2026-10-22 (ninth pass): a glob naming a
+        // directory matched no file, without a word.
+        assert_eq!(list("src/deep/"), ["src/deep/b.rs", "src/deep/main.rs"]);
+        assert_eq!(list("./src/"), ["src/a.rs", "src/deep/b.rs", "src/deep/main.rs"]);
+        assert_eq!(list("/").len(), 5);
+        assert_eq!(list("./").len(), 5);
         let found = execute(&mut ws, "source_search", json!({"query":"fn a","path_glob":"src/*.rs","mode":"files"}), &cancel).unwrap();
         assert_eq!(found["matching_files"], 1, "{found}");
     }
@@ -2673,6 +2717,46 @@ mod tests {
         assert_eq!(list("src/*.rs"), 1);
         assert_eq!(list("*.MD"), 2);
         assert_eq!(list("src/*.md"), 0);
+    }
+
+    /// Tool review, 2026-10-22 (ninth pass): the README says to exclude a
+    /// folder holding secrets; written as in an ignore file (`secrets/`, or
+    /// `secrets`), its files stayed readable, `secrets` refused the folder
+    /// alone, and `.env` excluded the root's but not `config/.env`. Includes
+    /// written so selected nothing.
+    #[test]
+    fn project_rules_read_as_an_ignore_file_does() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["secrets/key.pem", "config/.env", ".env", "src/a.rs", "src/sub/b.rs", "README.md"] {
+            let path = dir.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x\n").unwrap();
+        }
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let visible = |include: &[&str], exclude: &[&str]| {
+            let mut ws = workspace(dir.path());
+            ws.project.include = include.iter().map(|p| p.to_string()).collect();
+            ws.project.exclude = exclude.iter().map(|p| p.to_string()).collect();
+            let listed = execute(&mut ws, "file_list", json!({"mode":"paths"}), &cancel).unwrap();
+            let listed: Vec<String> = listed["paths"].as_array().unwrap().iter().map(|p| p.as_str().unwrap().to_owned()).collect();
+            for file in ["secrets/key.pem", "config/.env", ".env", "src/a.rs", "README.md"] {
+                let read = execute(&mut ws, "file_read", json!({"path":file}), &cancel);
+                assert_eq!(read.is_ok(), listed.iter().any(|p| p == file), "{file}: {include:?} {exclude:?}");
+            }
+            listed
+        };
+        for exclude in [["secrets/", ".env"], ["secrets", ".ENV"], ["/secrets/", "**/.env"], ["secrets/**", "config/.env"]] {
+            let listed = visible(&[], &exclude);
+            let hidden: &[&str] = if exclude[1] == "config/.env" { &["secrets/key.pem", "config/.env"] } else { &["secrets/key.pem", "config/.env", ".env"] };
+            assert!(listed.iter().all(|p| !hidden.contains(&p.as_str())), "{exclude:?}: {listed:?}");
+            assert!(listed.contains(&"src/a.rs".to_owned()), "{exclude:?}: {listed:?}");
+        }
+        for include in ["src", "src/", "./src", "src/**"] {
+            assert_eq!(visible(&[include], &[]), ["src/a.rs", "src/sub/b.rs"], "{include}");
+        }
+        assert_eq!(visible(&["/src/sub/"], &[]), ["src/sub/b.rs"]);
+        assert_eq!(visible(&["*.rs"], &[]), ["src/a.rs", "src/sub/b.rs"]);
+        assert_eq!(visible(&["**/*.log"], &[]), Vec::<String>::new());
     }
 
     #[test]
