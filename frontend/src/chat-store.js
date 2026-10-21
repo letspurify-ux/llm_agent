@@ -40,7 +40,8 @@ export function loadChat(storage) {
 }
 
 // 대화를 저장한다. 용량(브라우저마다 5MB 안팎)을 넘으면 앞 답변의 실행 결과(trace — 조회 행이 대부분)부터
-// 덜어 내고, 그래도 넘으면 오래된 말풍선부터 덜어 낸다. 서버로 보낼 이력은 최근 HISTORY_TURNS턴만 둔다.
+// 덜어 내고, 그래도 넘으면 오래된 말풍선부터 덜어 낸다. 마지막 답의 실행 결과는 그것 하나만으로 넘칠 때에만
+// 덜어 낸다. 서버로 보낼 이력은 최근 HISTORY_TURNS턴만 둔다.
 // 끝내 못 넣으면 지난 저장본을 지운다 — 옛 대화가 되살아나 지금 대화인 척하면 안 된다.
 export function saveChat({ conversationId, messages, history }, storage) {
   const store = storageOf(storage);
@@ -57,11 +58,31 @@ export function saveChat({ conversationId, messages, history }, storage) {
   if (attempt(messages)) return true;
   const slim = messages.map((m, i) => (i === messages.length - 1 || !m.trace ? m : { ...m, trace: undefined }));
   if (attempt(slim)) return true;
-  for (let start = 1; start < slim.length; start += 1) {
-    if (attempt(slim.slice(start))) return true;
-  }
+  if (fitNewest(slim, attempt)) return true;
+  // 마지막 답 하나의 행만으로 넘친다(조회 1,000행에 긴 칸이면 그렇다). 그 행 때문에 말풍선을 모두 버리지 않는다 —
+  // 행은 CSV로 받아 둘 수 있지만 말풍선은 새로고침하면 다시 볼 길이 없다.
+  const bare = slim.map(m => (m.trace ? { ...m, trace: undefined } : m));
+  if (bare.length && bare[bare.length - 1] !== slim[slim.length - 1] && (attempt(bare) || fitNewest(bare, attempt))) return true;
   try { store.removeItem(KEY); } catch { /* 지울 수도 없으면 그대로 둔다 */ }
   return false;
+}
+
+// 들어가는 가장 긴 뒤쪽 말풍선들을 저장한다 — 앞에서 덜어 낼 수를 반씩 좁혀 찾는다. 하나씩 덜어 가며 다시 넣으면
+// 시도마다 대화 전체를 글자로 만드는데, 용량을 넘긴 대화는 답이 올 때마다 그것을 말풍선 수만큼 되풀이한다 —
+// 실측(Chrome): 마지막 답의 행이 용량을 넘긴 대화에서 말풍선 300개면 답 하나에 1초씩 화면이 멎었고, 대화가
+// 길어질수록 끝없이 늘었다. 덜어 낸 수가 많을수록 글자가 짧으므로 '들어간다'는 덜어 낸 수에 대해 단조롭다.
+// list 전체(덜어 낸 수 0)는 부르는 쪽이 이미 못 넣은 것이다. 저장본을 바꾸는 것은 성공한 시도뿐이고 성공할
+// 때마다 덜어 낸 수가 줄어 마지막 성공이 곧 찾은 답이므로, 끝났을 때 저장본이 그것이다.
+function fitNewest(list, attempt) {
+  let lo = 1;
+  let hi = list.length - 1;
+  if (hi < 1 || !attempt(list.slice(hi))) return false;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (attempt(list.slice(mid))) hi = mid;
+    else lo = mid + 1;
+  }
+  return true;
 }
 
 // 이 탭이 대화를 연다: 저장해 둔 대화(없으면 null)를 돌려주고 '열림' 표시를 세운다. 표시가 이미 있으면
