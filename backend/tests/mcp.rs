@@ -941,6 +941,65 @@ async fn a_server_that_stops_reading_while_its_list_changes_is_reconnected() {
     hub.shutdown().await;
 }
 
+/// Resource leak review, 36th pass: a call stopped before its answer (a
+/// stop, the question's final reserve) asked nothing of its server. One that
+/// stopped reading its input stayed ready for good, and each stopped call's
+/// request and cancellation waited in the SDK to be written, its arguments
+/// with them (40 stopped calls: 3 tasks to 69, measured) — for good where
+/// the server's timeout outlasts a question. The check its timeout would
+/// have made is now made when it would have made it.
+#[tokio::test]
+async fn a_stopped_call_checks_its_server_when_its_timeout_would_have() {
+    if node_missing() {
+        return;
+    }
+    let mut stuck = fake("stuck", &["stall_input", "echo"], &[]);
+    stuck.timeout_secs = Some(2);
+    // One only slow answers the ping: it stays as it is.
+    let mut slow = fake("slow", &["slow"], &[]);
+    slow.timeout_secs = Some(2);
+    let config = config(vec![stuck, slow]);
+    let hub = McpHub::default();
+    hub.apply(&config.mcp_servers);
+    ready(&hub, "stuck").await;
+    ready(&hub, "slow").await;
+    call(&hub, &config, "stuck__stall_input", json!({})).await.unwrap();
+    let snapshot = hub.snapshot(&config);
+    let stopped = |name: &str, args: Value| {
+        let tool = snapshot.find(name).unwrap();
+        async move {
+            let cancel = CancellationToken::new();
+            let stop = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                stop.cancel();
+            });
+            tool.call(args, &cancel).await.unwrap_err().to_string()
+        }
+    };
+    let (stuck, slowed) = tokio::join!(stopped("stuck__echo", json!({"text":"x"})), stopped("slow__slow", json!({"ms":4_000})));
+    for error in [stuck, slowed] {
+        assert!(error.starts_with("cancelled:"), "{error}");
+    }
+    // Not before its timeout (2 s and a second), then the ping's 5 seconds.
+    let stopped_at = Instant::now();
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(hub.server_status("stuck", MODEL).unwrap()["restarts"], 0, "checked before its timeout");
+    let back = loop {
+        let status = hub.server_status("stuck", MODEL).unwrap();
+        if status["state"] == "ready" && status["restarts"] == 1 {
+            break status;
+        }
+        assert!(stopped_at.elapsed() < Duration::from_secs(20), "not reconnected: {status:#}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(log_text(&back).contains("멈춘 호출의 2초 한도가 지나도록 서버가 아무 답도 하지 않았고, 살아 있는지 묻는 ping에도"), "{back:#}");
+    assert_eq!(call(&hub, &config, "stuck__echo", json!({"text":"다시"})).await.unwrap()["text"], "echo: 다시");
+    let slow = hub.server_status("slow", MODEL).unwrap();
+    assert_eq!((slow["state"].clone(), slow["restarts"].clone()), (json!("ready"), json!(0)), "{slow:#}");
+    hub.shutdown().await;
+}
+
 #[tokio::test]
 async fn commands_get_their_environment_but_not_the_backends_secrets() {
     if node_missing() {

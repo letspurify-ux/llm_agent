@@ -604,6 +604,30 @@ fn check_alive(slot: &Arc<Slot>, peer: &Peer<RoleClient>, link: &Arc<Link>, why:
     });
 }
 
+/// For a call stopped before its answer (a stop, the question's final
+/// reserve): the check its timeout would have made, when it would have made
+/// it, unless the server answered anything meanwhile or the connection is
+/// another by then. Stopped calls asked nothing of a server that stopped
+/// reading its input: it stayed ready for good, and each one's request and
+/// cancellation waited in the SDK to be written, its arguments with them —
+/// for good where the server's timeout outlasts a question, every call then
+/// stopped at the final reserve.
+fn check_alive_at(at: tokio::time::Instant, slot: &Arc<Slot>, peer: &Peer<RoleClient>, link: &Arc<Link>, why: String) {
+    use std::sync::atomic::Ordering;
+    let answers = link.answers.load(Ordering::Acquire);
+    let (slot, peer, link) = (slot.clone(), peer.clone(), link.clone());
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tokio::time::sleep_until(at) => {}
+            _ = slot.stop.cancelled() => return,
+        }
+        let current = slot.state().link.as_ref().is_some_and(|current| Arc::ptr_eq(current, &link));
+        if current && link.answers.load(Ordering::Acquire) == answers {
+            check_alive(&slot, &peer, &link, why);
+        }
+    });
+}
+
 /// Everything the connection is made from: command or URL with their
 /// arguments, folder, environment and headers, secrets included — and the
 /// name, which starts the tool names (a server renamed "Jira" → "jira" is
@@ -845,6 +869,13 @@ impl Offered {
             // it waited to be sent was not sent.)
             _ = cancel.cancelled() => {
                 tell(&peer, id, "cancelled");
+                check_alive_at(
+                    deadline + Duration::from_secs(1),
+                    slot,
+                    &peer,
+                    &link,
+                    format!("멈춘 호출의 {}초 한도가 지나도록 서버가 아무 답도 하지 않았고", self.timeout.as_secs()),
+                );
                 bail!("cancelled: {} was sent and the server told to stop; it may still have taken effect on the server", self.exposed)
             }
             _ = overdue => {
