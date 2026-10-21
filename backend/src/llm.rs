@@ -18,7 +18,7 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-mod dns;
+pub(crate) mod dns;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolCall {

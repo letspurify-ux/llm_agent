@@ -387,7 +387,8 @@ impl Lenient {
     pub fn new(renewed: Arc<Notify>, direct: bool) -> Result<Self, reqwest13::Error> {
         let mut builder = reqwest13::Client::builder()
             .pool_max_idle_per_host(0)
-            .redirect(reqwest13::redirect::Policy::none());
+            .redirect(reqwest13::redirect::Policy::none())
+            .dns_resolver(crate::llm::dns::SystemDns::waiting());
         if direct {
             builder = builder.no_proxy();
         }

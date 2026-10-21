@@ -89,6 +89,7 @@ fn client() -> reqwest::Result<reqwest::Client> {
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .pool_idle_timeout(crate::llm::IDLE_CONNECTION_TTL)
+            .dns_resolver(std::sync::Arc::new(crate::llm::dns::SystemDns::waiting()))
             .build()
     })
 }
