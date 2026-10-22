@@ -770,6 +770,37 @@ fn unknown_symbol_hint(
     hint
 }
 
+/// A symbol_id listed for another file than `path` (its path part, a hash of
+/// the file's path, is not this one's), named with that file when the
+/// project holds it. Told "source changed; call code_outline again", the
+/// model outlined the file it had named, which never held the symbol.
+pub(super) fn foreign_symbol_id(project: &Project, path: &Path, id: &str) -> Option<anyhow::Error> {
+    let listed = id.split(':').nth(1)?;
+    if listed.len() != 64 || !listed.bytes().all(|b| b.is_ascii_hexdigit()) || listed == hash(path.to_string_lossy().as_bytes()) {
+        return None;
+    }
+    let root = project.root.canonicalize().ok()?;
+    let owner = candidate_paths_scoped(
+        project,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+        None,
+        Some(std::time::Instant::now() + HINT_WALK),
+    )
+    .ok()
+    .and_then(|paths| paths.into_iter().find(|candidate| hash(candidate.to_string_lossy().as_bytes()) == listed))
+    .and_then(|owner| Some(separated(&owner.strip_prefix(&root).ok()?.display().to_string())));
+    let shown = path.strip_prefix(&root).map_or_else(|_| path.display().to_string(), |relative| separated(&relative.display().to_string()));
+    Some(match owner {
+        Some(owner) => anyhow::anyhow!(
+            "invalid_symbol_id: this symbol_id was listed for {owner}, not {shown}; send it with path {owner:?}, or copy an ID from code_outline for {shown}"
+        ),
+        None => anyhow::anyhow!(
+            "invalid_symbol_id: this symbol_id was listed for another file, not {shown}; send it with the path it was listed with, or copy an ID from code_outline for {shown}"
+        ),
+    })
+}
+
 pub(super) fn execute(
     s: &mut Workspace,
     tool: &str,
@@ -779,6 +810,11 @@ pub(super) fn execute(
     let deadline = crate::config::deadline_after(s.config.tool_timeout_secs)?;
     let path = read_path(&s.project, text(args, "path")?)?;
     let source = read_text(&path)?;
+    if tool == "symbol_read"
+        && let Some(error) = args["symbol_id"].as_str().and_then(|id| foreign_symbol_id(&s.project, &path, id))
+    {
+        return Err(error);
+    }
     let file = SyntaxFile::parse(path, source, cancel, deadline)?;
     let requested = (tool == "symbol_read").then(|| args["symbol_id"].as_str().unwrap());
     let (symbols, containers) = file.symbols(args, requested, cancel, deadline)?;

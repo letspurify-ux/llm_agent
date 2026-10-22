@@ -586,7 +586,11 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
                     value["title_matches"] = json!(title_total);
                     note_titles_shown(target, &mut value);
                 }
-                if count == 0 {
+                // A page past the last one is no sign of nothing related:
+                // told so, the results of the pages before seemed void.
+                if count == 0 && offset > 0 {
+                    value["note"] = json!(format!("offset {offset}부터는 결과가 없다. 이 검색의 결과는 그 앞쪽이 전부다."));
+                } else if count == 0 {
                     value["note"] = json!("관련 항목이 없다. 검색어를 바꿔 볼 수 있다.");
                 }
                 results.insert(target.clone(), value);

@@ -1282,7 +1282,8 @@ async fn execute_batch(
                 let known = ToolRegistry::specs().iter().any(|s| s.name == call.name);
                 match if known { Ok(None) } else { mcp.find_raw(&call.name) } {
                     Ok(Some(tool)) => {
-                        let args = parsed.clone()?;
+                        let mut args = parsed.clone()?;
+                        tool.mend(&mut args);
                         tool.check(&args).map_err(|e| format!("{e:#}"))?;
                         once(&tool, &args)?;
                         let renamed = Some(format!("tool name {} was taken as {}; call it {}", call.name, tool.exposed, tool.exposed));
@@ -1303,6 +1304,7 @@ async fn execute_batch(
             }
             let mut args = parsed.clone()?;
             if let Some(tool) = mcp.find(&call.name) {
+                tool.mend(&mut args);
                 tool.check(&args).map_err(|e| format!("{e:#}"))?;
                 once(&tool, &args)?;
                 return Ok(Prepared::Mcp { args, tool, renamed: None });

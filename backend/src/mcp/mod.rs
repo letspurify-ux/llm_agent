@@ -763,6 +763,15 @@ impl Snapshot {
 }
 
 impl Offered {
+    /// The arguments with the slips the agent's own tools are forgiven (an
+    /// optional field sent as null or "", a value sent as JSON text) mended
+    /// where this tool's schema does not take them so (`schema::mend_arguments`).
+    pub fn mend(&self, args: &mut Value) {
+        if let Some(object) = args.as_object_mut() {
+            schema::mend_arguments(&self.remote.parameters, object);
+        }
+    }
+
     /// The required fields the arguments leave out, refused before the call.
     pub fn check(&self, args: &Value) -> Result<()> {
         let Some(object) = args.as_object() else {

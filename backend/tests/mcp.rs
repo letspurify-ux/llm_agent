@@ -1746,6 +1746,36 @@ async fn the_model_calls_mcp_tools_like_its_own() {
     app.mcp.shutdown().await;
 }
 
+/// Tool and MCP review, 2026-10-22 (second session): a number sent as text
+/// and an optional field sent as null reached the server as they came — the
+/// agent's own tools are forgiven both — and a server that does not check
+/// its input added "2" and 3 as "23".
+#[tokio::test]
+async fn an_mcp_call_is_mended_as_the_agents_own_calls_are() {
+    if node_missing() {
+        return;
+    }
+    let config = config(vec![fake("fake", &["add", "big"], &[])]);
+    let llm = Scripted::new(vec![
+        calls(vec![
+            support::call("m1", "fake__add", json!({"a":"2","b":3})),
+            support::call("m2", "fake__big", json!({"chars":null})),
+            support::call("m3", "add", json!({"a":" 4 ","b":"0.5"})),
+        ]),
+        text("끝"),
+    ]);
+    let (app, _dir) = app(config.clone(), llm.clone());
+    app.mcp.apply(&config.mcp_servers);
+    ready(&app.mcp, "fake").await;
+    let (result, _) = ask(&app, "더해줘").await;
+    assert_eq!(result.unwrap().answer, "끝");
+    let second = &llm.requests()[1];
+    assert_eq!(tool_result(second, "m1")["data"]["text"], "{\"sum\":5}");
+    assert_eq!(tool_result(second, "m2")["status"], "ok", "{}", tool_result(second, "m2"));
+    assert_eq!(tool_result(second, "m3")["data"]["text"], "{\"sum\":4.5}");
+    app.mcp.shutdown().await;
+}
+
 #[tokio::test]
 async fn many_large_mcp_results_are_cut_to_fit_and_read_back_from_history() {
     if node_missing() {

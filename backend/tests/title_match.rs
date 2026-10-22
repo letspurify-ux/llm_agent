@@ -193,6 +193,7 @@ async fn title_matches_share_the_first_page_with_vector_results() {
             call("s2", "search", json!({"query":"SPACE","targets":["knowledge"],"limit":10})),
         ]),
         calls(vec![call("s3", "search", json!({"query":"SPACE","targets":["knowledge"],"limit":10,"offset":1}))]),
+        calls(vec![call("s4", "search", json!({"query":"SPACE","targets":["knowledge"],"limit":10,"offset":5000}))]),
         text("끝"),
     ]);
     let (app, _dir) = app(config, llm.clone());
@@ -225,4 +226,9 @@ async fn title_matches_share_the_first_page_with_vector_results() {
     let next_items = next["items"].as_array().unwrap();
     assert!(!next_items.is_empty() && next_items.iter().all(|i| i.get("title_match").is_none()), "{next}");
     assert!(next.get("title_matches").is_none(), "{next}");
+    // A page past the last says so, not that nothing is related (tool and
+    // MCP review, 2026-10-22, second session).
+    let past = &tool_result(&requests[3], "s4")["data"]["results"]["knowledge"];
+    assert_eq!(past["items"], json!([]), "{past}");
+    assert_eq!(past["note"], "offset 5000부터는 결과가 없다. 이 검색의 결과는 그 앞쪽이 전부다.", "{past}");
 }

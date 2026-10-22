@@ -375,6 +375,82 @@ pub fn missing_required(parameters: &Value, args: &Map<String, Value>) -> Vec<St
         .collect()
 }
 
+/// The slips the agent's own tools are forgiven (`tools::normalize_arguments`)
+/// mended in a call's top-level arguments, where the tool's schema does not
+/// take them as sent: an optional field sent as null or "" (providers fill
+/// every field so) is left out, a number, flag, list or object sent as JSON
+/// text is sent as itself, and one text where a list of texts is taken is
+/// sent as a list of one. Sent as they came, a server that checks its input (zod's
+/// `.optional()`, `z.number()`) refused the whole call, and the model's next
+/// request went to sending it again. Returns the fields mended.
+pub fn mend_arguments(parameters: &Value, args: &mut Map<String, Value>) -> Vec<String> {
+    let required: Vec<&str> = parameters["required"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let mut mended = vec![];
+    args.retain(|key, value| {
+        let schema = &parameters["properties"][key];
+        let unset = (value.is_null() || *value == "") && !required.contains(&key.as_str()) && schema.is_object() && !takes(schema, value);
+        if unset {
+            mended.push(key.clone());
+        }
+        !unset
+    });
+    for (key, value) in args.iter_mut() {
+        let schema = &parameters["properties"][key];
+        let Some(text) = value.as_str().filter(|_| schema.is_object() && !takes(schema, value)) else {
+            continue;
+        };
+        let typed = match serde_json::from_str::<Value>(text.trim()) {
+            Ok(Value::String(_) | Value::Null) => None,
+            Ok(typed) => Some(typed),
+            // One item where a list of them is taken.
+            Err(_) => Some(json!([text])),
+        };
+        if let Some(typed) = typed.filter(|typed| takes(schema, typed)) {
+            *value = typed;
+            mended.push(key.clone());
+        }
+    }
+    mended
+}
+
+/// Whether `schema` takes `value`, as far as its type, enum and const and
+/// the members of `anyOf`/`oneOf`/`allOf` tell (a schema that says nothing
+/// of them takes anything).
+fn takes(schema: &Value, value: &Value) -> bool {
+    let Some(fields) = schema.as_object() else {
+        return schema != &Value::Bool(false);
+    };
+    if value.is_null() && fields.get("nullable") == Some(&Value::Bool(true)) {
+        return true;
+    }
+    let kind = |name: &str| match name {
+        "null" => value.is_null(),
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "number" => value.is_number(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        _ => true,
+    };
+    let typed = match fields.get("type") {
+        Some(Value::String(name)) => kind(name),
+        Some(Value::Array(names)) => names.iter().filter_map(Value::as_str).any(kind),
+        _ => true,
+    };
+    let members = |key: &str| fields.get(key).and_then(Value::as_array);
+    let items = match (value.as_array(), fields.get("items")) {
+        (Some(list), Some(items)) if items.is_object() || items.is_boolean() => list.iter().all(|item| takes(items, item)),
+        _ => true,
+    };
+    typed
+        && items
+        && fields.get("enum").and_then(Value::as_array).is_none_or(|values| values.contains(value))
+        && fields.get("const").is_none_or(|constant| constant == value)
+        && ["anyOf", "oneOf"].iter().all(|key| members(key).is_none_or(|members| members.iter().any(|member| takes(member, value))))
+        && members("allOf").is_none_or(|members| members.iter().all(|member| takes(member, value)))
+}
+
 pub fn definition(name: &str, description: &str, parameters: &Value) -> Value {
     json!({"type":"function","function":{"name":name,"description":description,"parameters":parameters}})
 }
@@ -853,6 +929,43 @@ mod tests {
             assert!(renamed.starts_with("see srv__tool_name_0 here"));
         }
         assert!(started.elapsed() < std::time::Duration::from_millis(800), "{:?}", started.elapsed());
+    }
+
+    /// Tool and MCP review, 2026-10-22 (second session): the agent's own
+    /// tools forgive an optional field sent as null or "" and a number sent
+    /// as text (`tools::normalize_arguments`); an MCP tool's call went as it
+    /// came, and a server checking its input refused all of it.
+    #[test]
+    fn slips_the_schema_does_not_take_are_mended() {
+        let p = json!({"type":"object","required":["query","need"],"properties":{
+            "query":{"type":"string"},"need":{"type":"integer"},"limit":{"type":"integer"},"ratio":{"type":"number"},
+            "exact":{"type":"boolean"},"label":{"type":"string"},"mode":{"type":"string","enum":["a","b"]},
+            "maybe":{"anyOf":[{"type":"string"},{"type":"null"}]},"open":{"nullable":true,"type":"string"},
+            "loose":{},"either":{"type":["string","integer"]},"tags":{"type":"array","items":{"type":"string"}}
+        }});
+        let mut args = json!({"query":"x","need":null,"limit":"10","ratio":" 0.5 ","exact":"false","label":"","mode":"",
+            "maybe":null,"open":null,"loose":null,"either":"7","tags":null,"unknown":null}).as_object().unwrap().clone();
+        let mut mended = mend_arguments(&p, &mut args);
+        mended.sort();
+        assert_eq!(mended, ["exact", "limit", "mode", "ratio", "tags"]);
+        assert_eq!(
+            Value::Object(args),
+            json!({"query":"x","need":null,"limit":10,"ratio":0.5,"exact":false,"label":"","maybe":null,"open":null,"loose":null,"either":"7","unknown":null})
+        );
+        // Text that is no number of the field's type stays (the server says why).
+        let mut args = json!({"limit":"ten","need":"1.5"}).as_object().unwrap().clone();
+        assert!(mend_arguments(&p, &mut args).is_empty());
+        assert_eq!(Value::Object(args), json!({"limit":"ten","need":"1.5"}));
+        // A list or object sent as JSON text, and one text for a list of them.
+        let p = json!({"type":"object","properties":{
+            "tags":{"type":"array","items":{"type":"string"}},"ids":{"type":"array","items":{"type":"integer"}},
+            "filter":{"type":"object","properties":{}},"note":{"type":"string"}
+        }});
+        let mut args = json!({"tags":"bug","ids":"[1, 2]","filter":"{\"a\":1}","note":"[1]"}).as_object().unwrap().clone();
+        mend_arguments(&p, &mut args);
+        assert_eq!(Value::Object(args), json!({"tags":["bug"],"ids":[1,2],"filter":{"a":1},"note":"[1]"}));
+        let mut args = json!({"ids":"7x","tags":"[1]"}).as_object().unwrap().clone();
+        assert!(mend_arguments(&p, &mut args).is_empty(), "{args:?}");
     }
 
     #[test]

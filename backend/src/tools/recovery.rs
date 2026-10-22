@@ -43,12 +43,14 @@ enum Class {
 }
 
 /// The leading snake_case code of an error message. A code may end at ':'
-/// or at ';'.
+/// or at ';'. It starts with a letter and may hold digits: without them,
+/// `unsupported_non_utf8_file` was no code, and its recovery said
+/// `tool_error`, an error to inspect, rather than to choose another file.
 pub fn error_code(message: &str) -> &str {
     let prefix = message.split([':', ';']).next().unwrap_or("");
-    if !prefix.is_empty()
+    if prefix.starts_with(|c: char| c.is_ascii_lowercase())
         && prefix.len() <= 80
-        && prefix.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+        && prefix.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
     {
         prefix
     } else {
@@ -73,7 +75,11 @@ pub fn describe(message: &str) -> Value {
         (Class::InvalidInput, "select_file_from_directory")
     } else if matches!(
         code,
-        "unsupported_binary_file" | "unsupported_large_file" | "unsupported_file_type"
+        "unsupported_binary_file"
+            | "unsupported_large_file"
+            | "unsupported_file_type"
+            | "unsupported_non_utf8_file"
+            | "unsupported_non_utf8_path"
     ) {
         (Class::Unavailable, "choose_allowed_path")
     } else if matches!(code, "path_outside_project" | "path_excluded") {
@@ -217,6 +223,12 @@ mod tests {
         // invalid input gets was skipped.
         let filters = describe("conflicting_path_filters: pass path or path_glob, not both");
         assert_eq!((filters["class"].as_str(), filters["action"].as_str()), (Some("invalid_input"), Some("correct_arguments")));
+        // A code holding a digit is a code (it was "tool_error", to inspect).
+        for code in ["unsupported_non_utf8_file", "unsupported_non_utf8_path"] {
+            let described = describe(&format!("{code}: x is not valid UTF-8"));
+            assert_eq!((described["code"].as_str(), described["action"].as_str()), (Some(code), Some("choose_allowed_path")));
+        }
+        assert_eq!(error_code("8bit: x"), "tool_error", "a code starts with a letter");
     }
 
     /// Context management review, eighth pass: a history id that was

@@ -2645,6 +2645,62 @@ mod tests {
         assert!(second["next_cursor"].is_null());
     }
 
+    /// Tool and MCP review, 2026-10-22 (second session): symbol_relations
+    /// named a directory, a file that is not UTF-8 or one without a grammar
+    /// "unsupported_language: use source_search/file_read" alike, where
+    /// symbol_read says what each is; the model was told to give up on a
+    /// supported language.
+    #[test]
+    fn relations_say_what_the_path_is_as_symbol_read_does() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "fn x() {}\nfn a() { x(); }\n").unwrap();
+        std::fs::write(dir.path().join("src/latin1.rs"), b"fn caf\xe9() {}\n").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "x\n").unwrap();
+        let mut ws = workspace(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let found = execute(&mut ws, "symbol_search", json!({"query":"x","match":"exact"}), &cancel).unwrap();
+        let id = found["symbols"][0]["symbol_id"].clone();
+        for (path, code) in [("src", "path_is_directory"), ("src/latin1.rs", "unsupported_non_utf8_file"), ("notes.txt", "unsupported_language")] {
+            let relations = execute(&mut ws, "symbol_relations", json!({"path":path,"symbol_id":id}), &cancel).unwrap_err().to_string();
+            assert!(relations.starts_with(code), "{path}: {relations}");
+            if path != "notes.txt" {
+                let read = execute(&mut ws, "symbol_read", json!({"path":path,"symbol_id":id}), &cancel).unwrap_err().to_string();
+                assert_eq!(recovery::error_code(&read), recovery::error_code(&relations), "{path}");
+            }
+            assert_eq!(recovery::describe(&relations)["code"], code, "{path}");
+        }
+        assert!(execute(&mut ws, "symbol_relations", json!({"path":"notes.txt","symbol_id":id}), &cancel).unwrap_err().to_string().contains("supported extensions are rs"));
+        let calls = execute(&mut ws, "symbol_relations", json!({"path":"src/lib.rs","symbol_id":id,"relation":"callers"}), &cancel).unwrap();
+        assert_eq!(calls["total_results"], 1, "{calls}");
+    }
+
+    /// Tool and MCP review, 2026-10-22 (second session): a symbol_id sent
+    /// with another file's path was told "source changed; call code_outline
+    /// again", and the model outlined the file it had named, which never
+    /// held the symbol. Its path part says which file it was listed for.
+    #[test]
+    fn a_symbol_id_of_another_file_names_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "fn x() {}\nfn a() { x(); }\n").unwrap();
+        std::fs::write(dir.path().join("src/other.rs"), "fn y() {}\n").unwrap();
+        let mut ws = workspace(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let found = execute(&mut ws, "symbol_search", json!({"query":"x","match":"exact"}), &cancel).unwrap();
+        let id = found["symbols"][0]["symbol_id"].clone();
+        for tool in ["symbol_read", "symbol_relations"] {
+            let error = execute(&mut ws, tool, json!({"path":"src/other.rs","symbol_id":id}), &cancel).unwrap_err().to_string();
+            assert!(error.starts_with("invalid_symbol_id: this symbol_id was listed for src/lib.rs, not src/other.rs"), "{tool}: {error}");
+            assert_eq!(recovery::describe(&error)["action"], "copy_observed_symbol_id");
+        }
+        // Its own file still reads it, and a changed file is still a revision.
+        assert!(execute(&mut ws, "symbol_read", json!({"path":"src/lib.rs","symbol_id":id}), &cancel).is_ok());
+        std::fs::write(dir.path().join("src/lib.rs"), "fn x() { }\nfn a() { x(); }\n").unwrap();
+        let changed = execute(&mut ws, "symbol_read", json!({"path":"src/lib.rs","symbol_id":id}), &cancel).unwrap_err().to_string();
+        assert!(changed.starts_with("symbol_revision_conflict"), "{changed}");
+    }
+
     /// A module named with a dot (./string.utils, ./app.service) was taken
     /// for a file with that extension, so its .ts/.js file was never tried
     /// and the calls of what it exports were lost to callers.
