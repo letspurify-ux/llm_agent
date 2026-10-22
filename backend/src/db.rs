@@ -620,11 +620,12 @@ pub async fn queries_mentioned_in(db: &Db, cfg: &MariaDbConfig, body: &str, limi
         return Ok(vec![]);
     }
     let all = db.query(cfg, "SELECT seq, query_name FROM query_registry", vec![]).await?;
+    let search = crate::text::NameSearch::new(body);
     let mut named: Vec<(usize, i64, String)> = all
         .iter()
         .filter_map(|r| {
             let name = text(r, "query_name");
-            crate::text::name_index_of(body, &name).map(|at| (at, int(r, "seq"), name))
+            search.index_of(&name).map(|at| (at, int(r, "seq"), name))
         })
         .collect();
     named.sort();

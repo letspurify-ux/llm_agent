@@ -70,38 +70,61 @@ pub fn name_key(s: &str) -> String {
 /// query listed `batch_job` too, and deleting `batch_job` was refused as in
 /// use), while a Korean particle may follow (`find_customer_id를`).
 pub fn name_index_of(text: &str, name: &str) -> Option<usize> {
-    let key = name_key(name);
-    if key.is_empty() {
-        return None;
+    NameSearch::new(text).index_of(name)
+}
+
+/// Lowercased per character, final sigma read as sigma: this keeps every span
+/// `name_key` takes, so a name whose folding is not in the folded text is not
+/// written in it.
+fn folded(s: &str) -> String {
+    s.chars().flat_map(char::to_lowercase).map(|c| if c == 'ς' { 'σ' } else { c }).collect()
+}
+
+/// A text to find many names in (`name_index_of` for each), folded once:
+/// folding the text again for each of thousands of registered names cost
+/// more than finding them.
+pub struct NameSearch<'a> {
+    text: &'a str,
+    folded: String,
+}
+
+impl<'a> NameSearch<'a> {
+    pub fn new(text: &'a str) -> Self {
+        Self { text, folded: folded(text) }
     }
-    // Most names are not in the text: told by lowercasing each character
-    // (final sigma read as sigma), which keeps every span `name_key` takes,
-    // before a pattern is built. Building one for each of a thousand
-    // registered names took 0.15 s a method.
-    let folded = |s: &str| -> String { s.chars().flat_map(char::to_lowercase).map(|c| if c == 'ς' { 'σ' } else { c }).collect() };
-    if !folded(text).contains(&folded(&key)) {
-        return None;
-    }
-    let pattern = regex::RegexBuilder::new(&regex::escape(&key))
-        .case_insensitive(true)
-        .unicode(true)
-        .build()
-        .ok()?;
-    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
-    let starts_word = key.chars().next().is_some_and(word);
-    let ends_word = key.chars().next_back().is_some_and(word);
-    let mut start = 0;
-    while start <= text.len() {
-        let found = pattern.find_at(text, start)?;
-        let joined_before = starts_word && text[..found.start()].chars().next_back().is_some_and(word);
-        let joined_after = ends_word && text[found.end()..].chars().next().is_some_and(word);
-        if name_key(found.as_str()) == key && !joined_before && !joined_after {
-            return Some(found.start());
+    pub fn index_of(&self, name: &str) -> Option<usize> {
+        let text = self.text;
+        let key = name_key(name);
+        if key.is_empty() {
+            return None;
         }
-        // Advance one character past the candidate's start.
-        start = found.start() + text[found.start()..].chars().next().map_or(1, char::len_utf8);
+        // Most names are not in the text: told before a pattern is built.
+        // Building one for each of a thousand registered names took 0.15 s a
+        // method.
+        if !self.folded.contains(&folded(&key)) {
+            return None;
+        }
+        let pattern = regex::RegexBuilder::new(&regex::escape(&key))
+            .case_insensitive(true)
+            .unicode(true)
+            .build()
+            .ok()?;
+        let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let starts_word = key.chars().next().is_some_and(word);
+        let ends_word = key.chars().next_back().is_some_and(word);
+        let mut start = 0;
+        while start <= text.len() {
+            let found = pattern.find_at(text, start)?;
+            let joined_before = starts_word && text[..found.start()].chars().next_back().is_some_and(word);
+            let joined_after = ends_word && text[found.end()..].chars().next().is_some_and(word);
+            if name_key(found.as_str()) == key && !joined_before && !joined_after {
+                return Some(found.start());
+            }
+            // Advance one character past the candidate's start.
+            start = found.start() + text[found.start()..].chars().next().map_or(1, char::len_utf8);
+        }
+        None
     }
-    None
 }
 
 /// `;`-separated target DB names, trimmed and deduplicated by `name_key`,
