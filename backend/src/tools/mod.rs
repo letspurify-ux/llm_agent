@@ -691,10 +691,10 @@ pub(crate) fn excluded(project: &Project, relative: &Path) -> Result<bool> {
     Ok(excluded_by(project, &Rules::new(project)?, relative))
 }
 
-/// `excluded` with the project's rules already compiled.
-pub(crate) fn excluded_by(project: &Project, rules: &Rules, relative: &Path) -> bool {
+/// The build or tool folder (`.git`, `node_modules`, `target`...) a path is
+/// in, which source tools always leave out whatever the project's rules say.
+fn tool_folder(project: &Project, relative: &Path) -> Option<String> {
     use std::path::Component;
-    use unicode_normalization::UnicodeNormalization;
     // Version-control metadata is excluded as a file too: a `.git` file
     // points a worktree or submodule at its repository.
     let version_control = [".git", ".hg", ".svn"];
@@ -714,10 +714,20 @@ pub(crate) fn excluded_by(project: &Project, rules: &Rules, relative: &Path) -> 
         names.iter().any(|name| part.eq_ignore_ascii_case(name))
     };
     let last = relative.components().count().saturating_sub(1);
-    if relative.components().enumerate().any(|(index, part)| {
-        named(part, &version_control)
-            || (named(part, &directories) && (index < last || project.root.join(relative).is_dir()))
-    }) {
+    relative
+        .components()
+        .enumerate()
+        .find(|(index, part)| {
+            named(*part, &version_control)
+                || (named(*part, &directories) && (*index < last || project.root.join(relative).is_dir()))
+        })
+        .map(|(_, part)| part.as_os_str().to_string_lossy().into_owned())
+}
+
+/// `excluded` with the project's rules already compiled.
+pub(crate) fn excluded_by(project: &Project, rules: &Rules, relative: &Path) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+    if tool_folder(project, relative).is_some() {
         return true;
     }
     // A rule holds for a path when it matches the path or a directory the
@@ -863,10 +873,17 @@ fn resolve_path(p: &Project, path: &str, hints: bool) -> Result<PathBuf> {
     } else {
         p
     };
-    if excluded(rules, canonical.strip_prefix(&root)?)? {
+    let relative = canonical.strip_prefix(&root)?;
+    if let Some(folder) = tool_folder(p, relative) {
+        bail!(
+            "path_excluded: {} is in {folder}, a version-control, dependency or build-output folder that source tools always leave out (project settings cannot add it back); read the source it was made from instead",
+            relative.display()
+        );
+    }
+    if excluded(rules, relative)? {
         bail!(
             "path_excluded: {} is excluded by the project's include/exclude settings and cannot be read; choose a listed file from file_list",
-            canonical.strip_prefix(&root)?.display()
+            relative.display()
         );
     }
     Ok(canonical)
@@ -2866,6 +2883,18 @@ mod tests {
         std::fs::write(root.join(".git/config"), "x").unwrap();
         let error = read_path(&ws.project, ".git/config").unwrap_err().to_string();
         assert!(error.starts_with("path_excluded"), "{error}");
+        // An always-skipped folder is named as such, not blamed on the
+        // project's include/exclude settings, which cannot add it back.
+        assert!(error.contains("is in .git,") && !error.contains("settings and"), "{error}");
+        std::fs::create_dir_all(root.join("src/build")).unwrap();
+        std::fs::write(root.join("src/build/out.rs"), "fn b() {}\n").unwrap();
+        let mut included = ws.project.clone();
+        included.include = vec!["src/build/**".into()];
+        let error = read_path(&included, "src/build/out.rs").unwrap_err().to_string();
+        assert!(error.contains("is in build, a version-control, dependency or build-output folder"), "{error}");
+        included.exclude = vec!["src/a.rs".into()];
+        let error = read_path(&included, "src/a.rs").unwrap_err().to_string();
+        assert!(error.contains("include/exclude settings"), "{error}");
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(dir.path().join("secret.txt"), root.join("link.txt")).unwrap();
