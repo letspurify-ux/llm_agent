@@ -1585,15 +1585,24 @@ fn module_files(workspace: &Workspace, site: &Site, module: &str) -> Vec<usize> 
     match origin.language {
         "javascript" | "typescript" | "typescriptreact" if module.starts_with('.') => {
             if let Some(base) = normalized(origin.path.parent().unwrap(), module, &workspace.root) {
+                const MODULES: [&str; 8] = ["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"];
                 paths.push(base.clone());
-                if base.extension().is_none() {
-                    for ext in ["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"] {
-                        paths.push(base.with_extension(ext));
-                        paths.push(base.join(format!("index.{ext}")));
+                // A dot inside a module name (./app.service) is not an
+                // extension: only a module extension names the file itself.
+                match base.extension().and_then(|ext| ext.to_str()).filter(|ext| MODULES.contains(ext)) {
+                    Some("js") => paths.extend(["ts", "tsx"].map(|ext| base.with_extension(ext))),
+                    Some("jsx") => paths.push(base.with_extension("tsx")),
+                    Some("mjs") => paths.push(base.with_extension("mts")),
+                    Some("cjs") => paths.push(base.with_extension("cts")),
+                    Some(_) => {}
+                    None => {
+                        for ext in MODULES {
+                            let mut file = base.clone().into_os_string();
+                            file.push(format!(".{ext}"));
+                            paths.push(file.into());
+                            paths.push(base.join(format!("index.{ext}")));
+                        }
                     }
-                } else if base.extension().is_some_and(|ext| ext == "js") {
-                    paths.push(base.with_extension("ts"));
-                    paths.push(base.with_extension("tsx"));
                 }
             }
         }

@@ -2628,6 +2628,35 @@ mod tests {
         assert!(second["next_cursor"].is_null());
     }
 
+    /// A module named with a dot (./string.utils, ./app.service) was taken
+    /// for a file with that extension, so its .ts/.js file was never tried
+    /// and the calls of what it exports were lost to callers.
+    #[test]
+    fn a_dotted_module_name_finds_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("web/lib/app.service")).unwrap();
+        std::fs::write(dir.path().join("web/string.utils.ts"), "export function helper() { return 1; }\n").unwrap();
+        std::fs::write(dir.path().join("web/lib/app.service/index.js"), "export function serve() {}\n").unwrap();
+        std::fs::write(dir.path().join("web/view.tsx"), "export function draw() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("web/main.ts"),
+            "import { helper } from './string.utils';\nimport { serve } from './lib/app.service';\nimport { draw } from './view.jsx';\nexport function run() { helper(); serve(); draw(); }\n",
+        )
+        .unwrap();
+        let mut ws = workspace(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        for (name, file) in [("helper", "web/string.utils.ts"), ("serve", "web/lib/app.service/index.js"), ("draw", "web/view.tsx")] {
+            let found = execute(&mut ws, "symbol_search", json!({"query":name,"match":"exact"}), &cancel).unwrap();
+            let symbol = &found["symbols"][0];
+            assert_eq!(symbol["path"], file);
+            let args = json!({"path":file,"symbol_id":symbol["symbol_id"],"relation":"callers"});
+            let callers = execute(&mut ws, "symbol_relations", args, &cancel).unwrap();
+            let rows = callers["relations"].as_array().unwrap();
+            assert_eq!(rows.len(), 1, "{name}: {callers}");
+            assert_eq!((rows[0]["path"].as_str(), rows[0]["line"].as_u64()), (Some("web/main.ts"), Some(4)));
+        }
+    }
+
     /// The model saw every source path relative to the project root but
     /// those of source_search mode=files, a list of bare paths: absolute,
     /// the root in front of each.
