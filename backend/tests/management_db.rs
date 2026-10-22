@@ -39,6 +39,20 @@ async fn queries_take_the_pools_connections_again_as_new() {
         db::plain_on(cfg, &mut used, statement).await.unwrap();
     }
     drop(used);
+    // The pool resets a returned connection on a task of its own: a query
+    // meanwhile may take another connection and see the lock still held
+    // (the server's, not the session's), as it did under a full test run.
+    // The lock goes once the reset has run; a pool that never reset kept it.
+    let mut free = false;
+    for _ in 0..100 {
+        let row = db.query(cfg, "SELECT IS_FREE_LOCK('pool_reuse') AS free", vec![]).await.unwrap().remove(0);
+        free = db::int(&row, "free") == 1;
+        if free {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(free, "the lock of a returned connection is released within 5 s");
     let mut ids = BTreeSet::new();
     for _ in 0..20 {
         let row = db.query(cfg, STATE, vec![]).await.unwrap().remove(0);
