@@ -768,7 +768,14 @@ async fn save_project(app: &App, body: &Value, id: Option<&str>, revision: Optio
     project.include = split_lines(object.get("include").unwrap_or(&Value::Null));
     project.exclude = split_lines(object.get("exclude").unwrap_or(&Value::Null));
     crate::projects::validate(&project).map_err(|e| ApiError::new(400, e.to_string()))?;
-    crate::projects::check_paths(&project).map_err(|e| ApiError::new(400, e.to_string()))?;
+    // The folders are looked at on a blocking thread, as the folder browser
+    // reads them: one that did not answer (a network drive gone) held a
+    // thread serving every request, questions' too.
+    let checked = project.clone();
+    tokio::task::spawn_blocking(move || crate::projects::check_paths(&checked))
+        .await
+        .map_err(|_| ApiError::new(500, "프로젝트 폴더를 확인하지 못했습니다."))?
+        .map_err(|e| ApiError::new(400, e.to_string()))?;
     if config
         .projects
         .iter()

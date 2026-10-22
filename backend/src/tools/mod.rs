@@ -768,7 +768,8 @@ pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
 
 /// Whether `path` names a file or directory the project may read. Unlike
 /// `read_path` it never walks the project for similar names, so it is cheap
-/// enough for the async runtime.
+/// enough to try in every project for a call that names none (on a
+/// blocking thread: it reads the file system).
 pub fn path_in_project(p: &Project, path: &str) -> bool {
     resolve_path(p, path, false).is_ok()
 }

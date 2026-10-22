@@ -1179,6 +1179,56 @@ fn resolve_project(
     }
 }
 
+/// Where a source call runs: its project, the note on how it was chosen,
+/// and the project's root as shown (none for the history tool).
+struct Located {
+    project: Project,
+    note: Option<String>,
+    root: Option<String>,
+}
+
+/// How a source call's project is found (`resolve_project`).
+type Resolver = fn(&Config, &str, &Value, &BTreeMap<String, FileCursor>) -> std::result::Result<(Project, Option<String>), String>;
+
+/// The project of each source call (index, tool, arguments), found on a
+/// blocking thread: it reads the file system (a path found in one project,
+/// the root resolved), and on the runtime's own threads a project folder
+/// that stopped answering (a network drive gone) held a thread that serves
+/// every request — the other questions', the screen's — and not this
+/// question alone. A stop leaves the calls cancelled without waiting.
+async fn locate(
+    config: &Arc<Config>,
+    calls: Vec<(usize, String, Value)>,
+    cursors: &BTreeMap<String, FileCursor>,
+    cancel: &CancellationToken,
+    resolve: Resolver,
+) -> Vec<(usize, std::result::Result<Located, String>)> {
+    if calls.is_empty() {
+        return vec![];
+    }
+    let indices: Vec<usize> = calls.iter().map(|(index, ..)| *index).collect();
+    let (config, cursors) = (config.clone(), cursors.clone());
+    let found = tokio::task::spawn_blocking(move || {
+        calls
+            .into_iter()
+            .map(|(index, name, args)| {
+                let found = resolve(&config, &name, &args, &cursors).map(|(project, note)| {
+                    let root = (name != "history")
+                        .then(|| project.root.canonicalize().unwrap_or_else(|_| project.root.clone()).display().to_string());
+                    Located { project, note, root }
+                });
+                (index, found)
+            })
+            .collect::<Vec<_>>()
+    });
+    let unfound = |reason: &str| indices.iter().map(|index| (*index, Err(reason.to_owned()))).collect();
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => unfound("cancelled"),
+        found = found => found.unwrap_or_else(|_| unfound("tool_worker_panic: the tool stopped unexpectedly")),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_batch(
     app: &Arc<App>,
@@ -1205,8 +1255,9 @@ async fn execute_batch(
     // MCP calls of this response (tool, arguments): a repeat is refused, as
     // a repeated query is — an MCP tool may file an issue or send a message.
     let mut mcp_runs: Vec<(String, Value)> = vec![];
-    let root = |p: &Project| p.root.canonicalize().unwrap_or_else(|_| p.root.clone());
     let mut roots: BTreeMap<usize, String> = BTreeMap::new();
+    // Source calls whose project is found below (`locate`): index, tool, arguments.
+    let mut unlocated: Vec<(usize, String, Value)> = vec![];
     for (index, call) in calls.iter().enumerate() {
         *event_id += 1;
         ids.push(*event_id);
@@ -1272,16 +1323,8 @@ async fn execute_batch(
                 }
             }
             if ToolRegistry::source_specs().iter().any(|s| s.name == call.name) {
-                let (project, note) = resolve_project(config, &call.name, &args, &c.file_cursors)?;
-                if let Some(note) = note {
-                    let mut notes = args["__adjusted"].as_array().cloned().unwrap_or_default();
-                    notes.push(json!(note));
-                    args["__adjusted"] = json!(notes);
-                }
-                if call.name != "history" {
-                    roots.insert(index, root(&project).display().to_string());
-                }
-                Ok(Prepared::Source { args, project })
+                unlocated.push((index, call.name.clone(), args.clone()));
+                Ok(Prepared::Source { args, project: Project::default() })
             } else {
                 Ok(Prepared::Voc { args })
             }
@@ -1290,6 +1333,24 @@ async fn execute_batch(
             Ok(p) => p,
             Err(message) => Prepared::Done(tools::envelope(Err(anyhow::anyhow!(message)))),
         });
+    }
+    for (index, found) in locate(config, unlocated, &c.file_cursors, cancel, resolve_project).await {
+        match found {
+            Ok(Located { project, note, root }) => {
+                if let Prepared::Source { args, project: slot } = &mut prepared[index] {
+                    if let Some(note) = note {
+                        let mut notes = args["__adjusted"].as_array().cloned().unwrap_or_default();
+                        notes.push(json!(note));
+                        args["__adjusted"] = json!(notes);
+                    }
+                    *slot = project;
+                }
+                if let Some(root) = root {
+                    roots.insert(index, root);
+                }
+            }
+            Err(message) => prepared[index] = Prepared::Done(tools::envelope(Err(anyhow::anyhow!(message)))),
+        }
     }
     // The MCP tool of each call, a call refused before it ran (an argument
     // missing) too, by either name: its progress line and trace name its
@@ -1923,11 +1984,47 @@ mod tests {
         assert_eq!((project.name, note), ("a".into(), None));
     }
 
+    /// Full review, 2026-10-22: a source call's project was found, and its
+    /// root resolved, on the runtime's thread — a project folder that did
+    /// not answer held the thread serving every other request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_project_folder_holds_no_runtime_thread() {
+        fn slow(config: &Config, name: &str, args: &Value, cursors: &BTreeMap<String, FileCursor>) -> std::result::Result<(Project, Option<String>), String> {
+            std::thread::sleep(Duration::from_millis(600));
+            resolve_project(config, name, args, cursors)
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+        let mut config = Config::default();
+        config.projects.push(Project { name: "a".into(), root: dir.path().into(), ..Default::default() });
+        let config = Arc::new(config);
+        let started = Instant::now();
+        let ticked = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            started.elapsed()
+        });
+        let calls = vec![(0, "file_read".to_owned(), json!({"path":"a.txt"})), (2, "history".to_owned(), json!({"action":"search","query":"x"}))];
+        let found = locate(&config, calls.clone(), &BTreeMap::new(), &CancellationToken::new(), slow).await;
+        let ticked = ticked.await.unwrap();
+        assert!(ticked < Duration::from_millis(400), "the runtime's thread waited for the folder: {ticked:?}");
+        let [(0, Ok(read)), (2, Ok(history))] = &found[..] else { panic!("both calls are located") };
+        assert_eq!(read.project.name, "a");
+        assert_eq!(read.root.as_deref(), Some(dir.path().canonicalize().unwrap().display().to_string().as_str()));
+        assert!(history.root.is_none(), "the history tool is shown with no root");
+        // A stop leaves the calls cancelled without waiting for the folder.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let started = Instant::now();
+        let found = locate(&config, calls, &BTreeMap::new(), &cancel, slow).await;
+        assert!(started.elapsed() < Duration::from_millis(300), "{:?}", started.elapsed());
+        assert!(found.iter().all(|(_, found)| found.as_ref().err().is_some_and(|e| e == "cancelled")));
+    }
+
     #[test]
     fn an_omitted_project_is_found_without_walking_the_projects() {
-        // The check runs on the async runtime: a missing path used to walk
-        // every project to suggest similar names, compiling each include and
-        // exclude glob again for every file.
+        // The check runs before the call does, the question waiting: a
+        // missing path used to walk every project to suggest similar names,
+        // compiling each include and exclude glob again for every file.
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         for name in ["a", "b"] {
