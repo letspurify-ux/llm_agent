@@ -19,7 +19,7 @@ pub const MIN_RESULTS: usize = 3;
 /// document often match together).
 pub const CHUNK_OVERFETCH: usize = 3;
 /// Largest candidate list one search reads.
-const MAX_CANDIDATES: usize = 600;
+pub const MAX_CANDIDATES: usize = 600;
 /// Candidate lists one knowledge search reads at most.
 const KNOWLEDGE_ROUNDS: usize = 6;
 const MIN_SAFE_NORM: &str = "1.0842021724855044e-19";
@@ -163,6 +163,9 @@ pub struct Page<T> {
     pub more: bool,
     /// Results dropped for their distance.
     pub beyond_threshold: usize,
+    /// The results end because one search reads at most `MAX_CANDIDATES`
+    /// candidates, not because none are left within the threshold.
+    pub capped: bool,
 }
 
 fn excerpt(text: &str) -> String {
@@ -175,6 +178,9 @@ pub async fn knowledge(db: &Db, config: &Config, vector: &[f32], offset: usize, 
     let wanted = offset + limit;
     let max = config.embedding.max_distance;
     let mut docs: Vec<DocHit> = vec![];
+    // Whether the last list ended within the threshold, and whether the
+    // rounds stopped at the candidate limit rather than at the last list.
+    let (mut past_threshold, mut at_limit) = (false, true);
     // One long document can hold every candidate chunk, and a page from
     // fewer documents than it asks for would end there: the documents found
     // are left out of the next candidate list until the page and one more
@@ -203,7 +209,9 @@ pub async fn knowledge(db: &Db, config: &Config, vector: &[f32], offset: usize, 
             }
         }
         let rest_past_threshold = docs.len() >= MIN_RESULTS && farthest.is_some_and(|d| d > max);
+        past_threshold = rest_past_threshold;
         if docs.len() > wanted || !full || rest_past_threshold || docs.len() >= MAX_CANDIDATES {
+            at_limit = docs.len() >= MAX_CANDIDATES || (!full && fetch >= MAX_CANDIDATES);
             break;
         }
     }
@@ -215,10 +223,17 @@ pub async fn knowledge(db: &Db, config: &Config, vector: &[f32], offset: usize, 
     docs.sort_by(|a, b| a.distance.total_cmp(&b.distance));
     // The rounds read on until more documents would be found or none can
     // be: the documents found tell whether more follow.
-    page(docs, |d| d.distance, offset, limit, false, max)
+    // Rounds that stopped at the candidate limit, short of the page and one
+    // more document, may leave documents unread: told by the documents that
+    // have vectors at all.
+    let cut = at_limit
+        && !past_threshold
+        && docs.len() <= wanted
+        && unread(db, config, "SELECT COUNT(DISTINCT c.doc_seq) AS n FROM vec_knowledge_chunk v JOIN knowledge_chunk c ON c.seq = v.seq", docs.len()).await;
+    page(docs, |d| d.distance, offset, limit, false, cut, max)
 }
 
-fn page<T>(rows: Vec<T>, distance: impl Fn(&T) -> f64, offset: usize, limit: usize, full: bool, max: f64) -> Result<Page<T>> {
+fn page<T>(rows: Vec<T>, distance: impl Fn(&T) -> f64, offset: usize, limit: usize, full: bool, cut: bool, max: f64) -> Result<Page<T>> {
     let total = rows.len();
     let kept_rows: Vec<T> = rows
         .into_iter()
@@ -235,7 +250,20 @@ fn page<T>(rows: Vec<T>, distance: impl Fn(&T) -> f64, offset: usize, limit: usi
         items,
         more,
         beyond_threshold,
+        capped: cut && !more && beyond_threshold == 0,
     })
+}
+
+/// Whether `count_sql` counts more than the `read` rows a search read; a
+/// count that fails says nothing is left.
+async fn unread(db: &Db, config: &Config, count_sql: &str, read: usize) -> bool {
+    match db.query(&config.mariadb, count_sql, vec![]).await {
+        Ok(rows) => rows.first().is_some_and(|r| db::int(r, "n") > read as i64),
+        Err(e) => {
+            eprintln!("[search] counting the rows a search left unread failed: {e}");
+            false
+        }
+    }
 }
 
 /// Q&A methods or queries nearest to the vector.
@@ -243,7 +271,10 @@ pub async fn rows(db: &Db, config: &Config, table: &str, vector: &[f32], offset:
     let fetch = (offset + limit).max(MIN_RESULTS);
     let rows = vector_rows(db, config, table, vector, fetch).await?;
     let full = rows.len() >= fetch;
-    page(rows, |r| db::float(r, "_dist"), offset, limit, full, config.embedding.max_distance)
+    // The approximate index may return a few less than the limit, so rows
+    // left unread are counted.
+    let cut = fetch >= MAX_CANDIDATES && unread(db, config, &format!("SELECT COUNT(*) AS n FROM {}", vec_table(table)), rows.len()).await;
+    page(rows, |r| db::float(r, "_dist"), offset, limit, full, cut, config.embedding.max_distance)
 }
 
 /// Title matches shown on a first page at most.
@@ -596,12 +627,26 @@ mod tests {
     #[test]
     fn pages_keep_the_nearest_few_and_the_threshold() {
         let rows = vec![0.9, 0.8, 0.7, 0.3, 0.6];
-        let p = page(rows.clone(), |d| *d, 0, 10, false, 0.4).unwrap();
+        let p = page(rows.clone(), |d| *d, 0, 10, false, false, 0.4).unwrap();
         assert_eq!(p.items, vec![0.9, 0.8, 0.7, 0.3]);
         assert_eq!(p.beyond_threshold, 1);
         assert!(!p.more);
-        let p = page(rows, |d| *d, 1, 2, false, 0.4).unwrap();
+        let p = page(rows, |d| *d, 1, 2, false, false, 0.4).unwrap();
         assert_eq!(p.items, vec![0.8, 0.7]);
         assert!(p.more);
+    }
+
+    #[test]
+    fn a_list_cut_at_the_candidate_limit_says_so() {
+        // Every candidate read is within the threshold: nearer ones are unread.
+        let rows = vec![0.1, 0.2, 0.3];
+        let p = page(rows.clone(), |d| *d, 3, 10, false, true, 0.4).unwrap();
+        assert!(p.items.is_empty() && !p.more && p.capped);
+        // One past the threshold: the list ended within what was read.
+        let p = page(vec![0.1, 0.2, 0.3, 0.5], |d| *d, 3, 10, false, true, 0.4).unwrap();
+        assert!(!p.capped);
+        // A page that still has more is not cut.
+        let p = page(rows, |d| *d, 0, 1, false, true, 0.4).unwrap();
+        assert!(p.more && !p.capped);
     }
 }

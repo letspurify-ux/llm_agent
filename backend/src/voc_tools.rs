@@ -319,6 +319,8 @@ struct VectorList {
     near: Vec<(i64, f64)>,
     more: bool,
     beyond: usize,
+    /// The list stopped at the candidates one search reads.
+    capped: bool,
 }
 
 async fn vector_list(cx: &Context<'_>, target: &str, vector: &[f32], offset: usize, limit: usize) -> Result<VectorList> {
@@ -341,6 +343,7 @@ async fn vector_list(cx: &Context<'_>, target: &str, vector: &[f32], offset: usi
             near: page.items.iter().map(|d| (d.doc_seq, d.distance)).collect(),
             more: page.more,
             beyond: page.beyond_threshold,
+            capped: page.capped,
         });
     }
     let table = if target == "qa_method" { "qa_method" } else { "query_registry" };
@@ -368,6 +371,7 @@ async fn vector_list(cx: &Context<'_>, target: &str, vector: &[f32], offset: usi
         near: page.items.iter().map(|r| (db::int(r, "seq"), db::float(r, "_dist"))).collect(),
         more: page.more,
         beyond: page.beyond_threshold,
+        capped: page.capped,
     })
 }
 
@@ -555,9 +559,11 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
         title_items.retain(|i| !exact_keys.contains(&item_key(i)));
         let title_total = titles.total.saturating_sub(found_titles - title_items.len());
         title_items.truncate(title_slots(offset, limit, false));
+        let mut cut_short = false;
         let outcome: std::result::Result<Value, String> = match listed {
             Ok(list) => {
                 let (page, next) = merge_page(title_items, slots, &list.items, offset, limit, list.more, &exact_keys);
+                cut_short = next.is_none() && list.capped;
                 let mut items = exact;
                 items.extend(page);
                 let mut out = json!({"next_offset":next,"beyond_threshold":list.beyond});
@@ -588,7 +594,18 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
                 }
                 // A page past the last one is no sign of nothing related:
                 // told so, the results of the pages before seemed void.
-                if count == 0 && offset > 0 {
+                // Results that end at the candidates one search reads are not
+                // all there are: told they were, nearer ones went unsought.
+                if cut_short {
+                    let cut = format!(
+                        "의미 검색은 가까운 후보 {}건까지만 읽어, 그 너머의 결과는 이어 볼 수 없다. 더 찾으려면 검색어를 더 구체적으로 바꿔라.",
+                        search::MAX_CANDIDATES
+                    );
+                    value["note"] = json!(match value["note"].as_str() {
+                        Some(before) => format!("{cut} {before}"),
+                        None => cut,
+                    });
+                } else if count == 0 && offset > 0 {
                     value["note"] = json!(format!("offset {offset}부터는 결과가 없다. 이 검색의 결과는 그 앞쪽이 전부다."));
                 } else if count == 0 {
                     value["note"] = json!("관련 항목이 없다. 검색어를 바꿔 볼 수 있다.");

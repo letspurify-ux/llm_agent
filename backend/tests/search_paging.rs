@@ -66,5 +66,5 @@ async fn pages_reach_every_document_past_a_long_one() {
     }
     // A page past the end is empty and says so.
     let past = search::knowledge(&app.db, &config, &vector, all, 5).await.unwrap();
-    assert!(past.items.is_empty() && !past.more);
+    assert!(past.items.is_empty() && !past.more && !past.capped, "every document was read: the list truly ends");
 }
