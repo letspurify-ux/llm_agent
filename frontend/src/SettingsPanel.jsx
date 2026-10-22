@@ -94,7 +94,7 @@ export default function SettingsPanel({ api, onStateChange }) {
                 <input id={id} value={form[key]} spellCheck={false} onChange={e => update(key, e.target.value)} />
                 <button type="button" className="admin-secondary" onClick={() => setPicker(key)}>폴더 선택</button>
               </div>
-                : type !== 'boolean' && <input id={id} value={form[key]} spellCheck={false} inputMode={['text', 'url', 'optionalText'].includes(type) ? undefined : 'decimal'}
+                : type !== 'boolean' && <input id={id} value={form[key]} spellCheck={false} inputMode={['text', 'url', 'optionalText', 'list'].includes(type) ? undefined : 'decimal'}
                   onChange={e => update(key, e.target.value)} />}
             {help && <small>{help}</small>}
           </div>;

@@ -550,15 +550,15 @@ async fn shutdown_does_not_wait_for_a_half_sent_request() {
     let server = tokio::spawn(web::serve(listener, app, async move { trigger.cancelled().await }));
 
     let mut served = tokio::net::TcpStream::connect(address).await.unwrap();
-    served.write_all(b"GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+    served.write_all(b"GET /api/health HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
     let mut reply = [0u8; 256];
     let n = served.read(&mut reply).await.unwrap();
     assert!(String::from_utf8_lossy(&reply[..n]).starts_with("HTTP/1.1 200"));
     let mut half_head = tokio::net::TcpStream::connect(address).await.unwrap();
-    half_head.write_all(b"GET /api/health HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+    half_head.write_all(b"GET /api/health HTTP/1.1\r\nHost: localhost\r\n").await.unwrap();
     let mut half_body = tokio::net::TcpStream::connect(address).await.unwrap();
     half_body
-        .write_all(b"POST /api/chat HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"message\":")
+        .write_all(b"POST /api/chat HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"message\":")
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -648,16 +648,16 @@ async fn connections_without_a_request_under_way_are_closed() {
 
     let mut silent = tokio::net::TcpStream::connect(address).await.unwrap();
     let mut half_head = tokio::net::TcpStream::connect(address).await.unwrap();
-    half_head.write_all(b"GET /api/health HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+    half_head.write_all(b"GET /api/health HTTP/1.1\r\nHost: localhost\r\n").await.unwrap();
     let mut half_body = tokio::net::TcpStream::connect(address).await.unwrap();
     half_body
-        .write_all(b"POST /api/chat HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"message\":")
+        .write_all(b"POST /api/chat HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"message\":")
         .await
         .unwrap();
     // Kept alive between requests while the next comes soon enough.
     let mut kept = tokio::net::TcpStream::connect(address).await.unwrap();
     for _ in 0..2 {
-        kept.write_all(b"GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        kept.write_all(b"GET /api/health HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
         let mut reply = [0u8; 512];
         let n = tokio::io::AsyncReadExt::read(&mut kept, &mut reply).await.unwrap();
         assert!(String::from_utf8_lossy(&reply[..n]).starts_with("HTTP/1.1 200"), "{}", String::from_utf8_lossy(&reply[..n]));
@@ -737,7 +737,7 @@ async fn a_client_that_stops_reading_its_answer_is_let_go() {
     let request = |id: &str| {
         let body = json!({"message":"질문","conversation_id":id}).to_string();
         format!(
-            "POST /api/chat HTTP/1.1\r\nHost: x\r\nAccept: application/x-ndjson\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST /api/chat HTTP/1.1\r\nHost: localhost\r\nAccept: application/x-ndjson\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
     };
@@ -764,4 +764,27 @@ async fn a_client_that_stops_reading_its_answer_is_let_go() {
     server.abort();
     assert!(stalled.starts_with("HTTP/1.1 200") && !done(&stalled), "the stalled client got {} bytes, the end among them", stalled.len());
     assert!(done(&reading) && reading.len() > answer.len(), "the reading client got {} bytes", reading.len());
+}
+
+/// Full review, 2026-10-22: a page whose name its DNS points at this
+/// machine (DNS rebinding) reached every route as the same origin. A name
+/// the server does not know is refused before any route; an address,
+/// `localhost` and the names the settings list are served.
+#[tokio::test]
+async fn requests_by_a_name_the_server_does_not_know_are_refused() {
+    let mut config = llm_agent::config::Config::default();
+    config.mariadb.port = 9;
+    config.server.allowed_hosts = vec!["voc.corp.local".into()];
+    let (app, _dir) = app(config, Scripted::new(vec![]));
+    let send = |host: &'static str, path: &'static str| {
+        let router = web::router(app.clone());
+        let request = Request::builder().uri(path).header(header::HOST, host).body(Body::empty()).unwrap();
+        async move { router.oneshot(request).await.unwrap().status() }
+    };
+    for path in ["/api/health", "/api/admin/settings", "/"] {
+        assert_eq!(send("rebound.example:5173", path).await, StatusCode::FORBIDDEN, "{path}");
+    }
+    for host in ["127.0.0.1:5173", "localhost:5173", "[::1]:5173", "voc.corp.local:5173"] {
+        assert_eq!(send(host, "/api/health").await, StatusCode::OK, "{host}");
+    }
 }

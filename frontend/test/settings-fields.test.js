@@ -12,7 +12,7 @@ const SERVER = {
   oracle: { client_lib_dir: '', client_config_dir: '', timeout_ms: 30000, routine_read_only: true, mock: false },
   agent: { run_seconds: 400, high_water: 0.9, low_water: 0.5, history_bytes: 16777216, result_tokens: null,
     tool_timeout_secs: 30, session_idle_minutes: 60, max_sessions: 200, result_store_bytes: 33554432 },
-  server: { port: 3001, chat_log_retention_days: 3 },
+  server: { port: 3001, chat_log_retention_days: 3, allowed_hosts: ['voc.corp.local', 'agent.local'] },
 };
 
 test('설정 값은 화면 글자로 갔다가 같은 값으로 돌아온다', () => {
@@ -24,6 +24,13 @@ test('설정 값은 화면 글자로 갔다가 같은 값으로 돌아온다', (
   const { config, problems } = configOf(form);
   assert.deepEqual(problems, []);
   assert.deepEqual(config, SERVER);
+});
+
+test('목록 칸은 쉼표로 나눈 이름들이고 비우면 빈 목록이다', () => {
+  const form = formOf(SERVER);
+  assert.equal(form['server.allowed_hosts'], 'voc.corp.local, agent.local');
+  assert.deepEqual(configOf({ ...form, 'server.allowed_hosts': ' a.local ,, b ' }).config.server.allowed_hosts, ['a.local', 'b']);
+  assert.deepEqual(configOf({ ...form, 'server.allowed_hosts': '' }).config.server.allowed_hosts, []);
 });
 
 test('숫자 칸의 잘못된 글자는 저장 전에 알린다', () => {

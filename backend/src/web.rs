@@ -199,7 +199,57 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/chat", post(chat).layer(DefaultBodyLimit::max(CHAT_BODY_LIMIT)))
         .nest("/api/admin", crate::admin::router(app.clone()))
         .fallback(fallback)
+        .layer(axum::middleware::from_fn_with_state(app.clone(), known_host))
         .with_state(app)
+}
+
+/// Requests addressed to this server by a name it knows. A page of another
+/// site whose name its DNS then points at this machine (DNS rebinding) is
+/// the same origin to the browser: past the cross-site checks (the admin
+/// header, JSON chat bodies), it could ask questions and read their answers,
+/// and, with no admin key set, read and change the settings. As the screen's
+/// development server does, an IP address and `localhost` are known; any
+/// other name is one the settings list (`server.allowed_hosts`).
+async fn known_host(State(app): State<Arc<App>>, request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| request.uri().authority().map(|a| a.to_string()));
+    match host {
+        Some(host) if !host_allowed(&host, &app.config().server.allowed_hosts) => {
+            let name = host_name(&host).unwrap_or_default();
+            error(
+                StatusCode::FORBIDDEN,
+                &format!(
+                    "이 주소({})로는 접속할 수 없습니다. IP 주소나 localhost로 접속하거나, 설정의 서버 → 허용 호스트 이름(server.allowed_hosts)에 이 이름을 넣어주세요.",
+                    crate::text::clip_utf16(&name, 200)
+                ),
+            )
+        }
+        _ => next.run(request).await,
+    }
+}
+
+/// The name of a Host value, without its port, lower case and without a
+/// final dot; an IPv6 address without its brackets.
+fn host_name(host: &str) -> Option<String> {
+    let authority: axum::http::uri::Authority = host.trim().parse().ok()?;
+    let name = authority.host().trim_start_matches('[').trim_end_matches(']').trim_end_matches('.');
+    Some(name.to_ascii_lowercase())
+}
+
+/// Whether a request's Host names this server: an IP address, `localhost`
+/// (and names below it), or a name `allowed` lists.
+pub fn host_allowed(host: &str, allowed: &[String]) -> bool {
+    let Some(name) = host_name(host) else {
+        return false;
+    };
+    name.parse::<std::net::IpAddr>().is_ok()
+        || name == "localhost"
+        || name.ends_with(".localhost")
+        || allowed.iter().any(|known| known.trim().trim_end_matches('.').eq_ignore_ascii_case(&name))
 }
 
 /// Unknown API paths answer JSON; any other GET is the built-in screen.
@@ -215,6 +265,47 @@ fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({"error":message}))).into_response()
 }
 
+/// Bytes of a chat_log trace, and of its answer, at most. The row goes to
+/// MariaDB as one statement, refused whole past `max_allowed_packet` (16 MiB
+/// by default): a question whose queries returned wide rows (20 a step, of
+/// 30 cells up to 4,000 characters) lost its whole log row, the answer with
+/// it, and the connection it was sent on.
+const TRACE_BYTES: usize = 4 * 1024 * 1024;
+const ANSWER_BYTES: usize = 8 * 1024 * 1024;
+
+/// `trace` within `TRACE_BYTES`: the largest steps' rows leave first (their
+/// count stays, `rowsOmitted` marks them), then the steps themselves.
+pub fn fit_trace(mut trace: Value) -> Value {
+    let size = |trace: &Value| trace.to_string().len();
+    if size(&trace) <= TRACE_BYTES {
+        return trace;
+    }
+    if let Some(steps) = trace["steps"].as_array_mut() {
+        let mut order: Vec<(usize, usize)> = steps.iter().enumerate().map(|(i, step)| (step["rows"].to_string().len(), i)).collect();
+        order.sort_unstable_by(|a, b| b.cmp(a));
+        for (_, index) in order {
+            let step = &mut steps[index];
+            if step["rows"].as_array().is_some_and(|rows| !rows.is_empty()) {
+                step["rows"] = json!([]);
+                step["rowsOmitted"] = json!(true);
+            }
+        }
+    }
+    // Rows left out one step at a time would measure the trace once a
+    // step; it is measured again only now.
+    if size(&trace) <= TRACE_BYTES {
+        return trace;
+    }
+    let steps = trace["steps"].as_array().map_or(0, Vec::len);
+    trace["steps"] = json!([]);
+    trace["stepsOmitted"] = json!(steps);
+    if size(&trace) <= TRACE_BYTES {
+        return trace;
+    }
+    // Nothing else of a trace grows with the question: kept as its outcome.
+    json!({"v":trace["v"],"outcome":trace["outcome"],"traceOmitted":true})
+}
+
 /// Saves a chat_log row in the background; when the management DB falls
 /// behind, new rows are skipped rather than queued without bound.
 pub fn record_chat_log(app: &Arc<App>, question: &str, answer: Option<String>, trace: Value) {
@@ -225,6 +316,17 @@ pub fn record_chat_log(app: &Arc<App>, question: &str, answer: Option<String>, t
     }
     let app = app.clone();
     let question = crate::text::clip_utf16(question, MAX_QUESTION_LEN).to_owned();
+    let answer = answer.map(|answer| {
+        if answer.len() <= ANSWER_BYTES {
+            return answer;
+        }
+        let mut end = ANSWER_BYTES;
+        while !answer.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}{}", &answer[..end], crate::text::TRUNC_MARK)
+    });
+    let trace = fit_trace(trace);
     tokio::spawn(async move {
         let config = app.config();
         if let Err(e) =
@@ -435,6 +537,41 @@ fn finish(app: &Arc<App>, message: &str, result: anyhow::Result<Answer>, cancel:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Full review, 2026-10-22: a name another site's DNS points at this
+    /// machine reached it as the same origin (DNS rebinding).
+    #[test]
+    fn requests_name_this_server_by_an_address_or_a_known_name() {
+        let allowed = vec!["voc.corp.local".to_owned()];
+        for host in ["127.0.0.1:5173", "192.168.0.12", "[::1]:5173", "localhost:5173", "LOCALHOST", "app.localhost", "voc.corp.local:5173", "VOC.corp.local."] {
+            assert!(host_allowed(host, &allowed), "{host}");
+        }
+        for host in ["evil.example", "evil.example:5173", "localhost.evil.example", "voc.corp.local.evil.example", "", "a b"] {
+            assert!(!host_allowed(host, &allowed), "{host}");
+        }
+    }
+
+    /// Full review, 2026-10-22: a trace past MariaDB's packet limit lost
+    /// the question's whole log row.
+    #[test]
+    fn a_trace_fits_the_row_its_question_is_logged_in() {
+        let wide = |cells: usize| json!((0..20).map(|_| (0..cells).map(|c| (format!("C{c}"), json!("가".repeat(4000)))).collect::<serde_json::Map<_, _>>()).collect::<Vec<_>>());
+        let steps: Vec<Value> = (0..12).map(|i| json!({"step":i,"query_name":"q","rows":wide(if i == 3 { 2 } else { 30 }),"totalRows":20})).collect();
+        let trace = json!({"v":5,"outcome":"answered","steps":steps,"timing":{"total":1}});
+        assert!(trace.to_string().len() > 16 * 1024 * 1024);
+        let fitted = fit_trace(trace.clone());
+        assert!(fitted.to_string().len() <= TRACE_BYTES);
+        assert_eq!(fitted["steps"].as_array().unwrap().len(), 12, "the steps stay, their rows go");
+        assert!(fitted["steps"][0]["rowsOmitted"] == true && fitted["steps"][0]["totalRows"] == 20);
+        assert_eq!(fitted["outcome"], "answered");
+        // A small trace is kept as it is.
+        let small = json!({"v":5,"outcome":"answered","steps":[{"step":1,"rows":[{"A":1}]}]});
+        assert_eq!(fit_trace(small.clone()), small);
+        // Many steps past the limit with no rows: the steps go, counted.
+        let many = json!({"v":5,"outcome":"error","steps":(0..3000).map(|i| json!({"step":i,"error":"x".repeat(2000)})).collect::<Vec<_>>()});
+        let fitted = fit_trace(many);
+        assert!(fitted.to_string().len() <= TRACE_BYTES && fitted["stepsOmitted"] == 3000, "{}", fitted.to_string().len());
+    }
 
     #[tokio::test]
     async fn accepted_connections_probe_their_peer() {

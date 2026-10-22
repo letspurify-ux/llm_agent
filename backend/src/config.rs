@@ -387,12 +387,16 @@ pub struct ServerConfig {
     /// Applied at the next start.
     pub port: u16,
     pub chat_log_retention_days: u32,
+    /// Names besides IP addresses and `localhost` the server answers to
+    /// (`web::known_host`): the intranet names its users open it by.
+    pub allowed_hosts: Vec<String>,
 }
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             port: 5173,
             chat_log_retention_days: 3,
+            allowed_hosts: vec![],
         }
     }
 }
@@ -602,6 +606,12 @@ impl Config {
         }
         if self.server.port == 0 || self.server.chat_log_retention_days == 0 {
             bail!("서버 포트와 대화 로그 보관 일수는 0보다 커야 합니다.");
+        }
+        if let Some(name) = self.server.allowed_hosts.iter().find(|name| {
+            let name = name.trim();
+            name.is_empty() || name.len() > 253 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+        }) {
+            bail!("허용 호스트 이름은 포트 없이 영문·숫자·-·.·_로 써주세요: {name:?}");
         }
         let mut names = std::collections::BTreeSet::new();
         let mut seqs = std::collections::BTreeSet::new();

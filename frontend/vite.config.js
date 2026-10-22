@@ -34,7 +34,9 @@ const server = {
   // (브라우저가 아니라 이 PC가 백엔드를 부른다 — 그래서 백엔드는 외부에 열 필요도, CORS도 없다).
   // localhost가 아니라 127.0.0.1로 적는다: backend(Rust)는 IPv4로 열고, localhost를 ::1로 먼저 푸는
   // 환경에서는 프록시가 IPv6로 붙으려다 실패한다.
-  proxy: { '/api': `http://127.0.0.1:${process.env.BACKEND_PORT || 5173}` },
+  // changeOrigin: 백엔드는 IP·localhost와 설정에 등록한 이름의 Host만 받는다(DNS 리바인딩 방지). 브라우저가 연
+  // 이름(agent.corp.local 등)은 위 allowedHosts가 이미 검사했으니, 백엔드에는 그 목적지 주소를 Host로 보낸다.
+  proxy: { '/api': { target: `http://127.0.0.1:${process.env.BACKEND_PORT || 5173}`, changeOrigin: true } },
 };
 
 export default defineConfig({

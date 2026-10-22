@@ -1,7 +1,7 @@
 // 설정 화면의 항목 정의와 값 변환. 화면은 입력 글자를 다루고, 서버는 backend/src/config.rs의 타입을 받는다 —
 // 두 모양 사이의 변환을 여기 한 곳에 둔다(순수 함수라 회귀 테스트가 붙는다).
 //   [키 (구역.이름), 이름표, 종류, 도움말]
-//   종류: text · url · optionalText(비우면 없음) · number(0 이상 정수) · optionalNumber(비우면 기본값)
+//   종류: text · url · list(쉼표로 구분한 목록) · optionalText(비우면 없음) · number(0 이상 정수) · optionalNumber(비우면 기본값)
 //         · decimal(소수) · percent(화면 %, 서버 0~1) · mib(화면 MiB, 서버 바이트) · boolean · effort · folder
 export const SETTING_GROUPS = [
   { id: 'llm', title: '모델 연결 (LLM)', check: 'llm',
@@ -67,6 +67,7 @@ export const SETTING_GROUPS = [
     fields: [
       ['server.port', '포트', 'number', '서버를 다시 시작해야 적용됩니다.'],
       ['server.chat_log_retention_days', '대화 로그 보관 (일)', 'number'],
+      ['server.allowed_hosts', '허용 호스트 이름', 'list', 'IP 주소와 localhost 말고 이 화면을 여는 이름(예: voc.corp.local), 쉼표로 구분. 없는 이름으로 온 요청은 거절합니다(DNS 리바인딩 방지).'],
     ] },
 ];
 
@@ -89,7 +90,8 @@ export function formOf(config) {
       : value == null ? ''
         : type === 'percent' ? String(Math.round(Number(value) * 1000) / 10)
           : type === 'mib' ? String(Math.round((Number(value) / MIB) * 100) / 100)
-            : String(value);
+            : type === 'list' ? (Array.isArray(value) ? value.join(', ') : '')
+              : String(value);
   }
   return form;
 }
@@ -105,6 +107,7 @@ export function configOf(form) {
     if (type === 'boolean') value = !!raw;
     else if (type === 'optionalText') value = text ? text : (key === 'embedding.url' ? '' : null);
     else if (type === 'text' || type === 'url' || type === 'folder' || type === 'effort') value = key === 'embedding.query_prefix' ? raw : text;
+    else if (type === 'list') value = String(raw ?? '').split(',').map(v => v.trim()).filter(Boolean);
     else if (type === 'optionalNumber' && text === '') value = null;
     else {
       const n = Number(text);

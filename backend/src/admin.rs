@@ -1140,6 +1140,7 @@ async fn mcp_read(State(app): State<Arc<App>>, Path(name): Path<String>) -> ApiR
 fn mcp_draft(body: &Value, mut server: McpServer) -> ApiResult<McpServer> {
     let object = body.as_object().ok_or_else(|| ApiError::new(400, "입력 내용을 확인해주세요."))?;
     let (before_url, before_secrets): (String, Vec<String>) = (server.url.clone(), server.secret_headers.keys().cloned().collect());
+    let before_headers = server.headers.clone();
     let before_name = server.name.clone();
     let bad = |key: &str| ApiError::new(400, format!("MCP 서버 설정의 {key} 값 형식이 올바르지 않습니다."));
     let text = |key: &str| -> ApiResult<Option<String>> {
@@ -1299,6 +1300,30 @@ fn mcp_draft(body: &Value, mut server: McpServer) -> ApiResult<McpServer> {
             ));
         }
     }
+    // A visible header that reads a secret from the backend's environment
+    // (`ENV:WIKI_TOKEN`, as a file-managed server keeps its token) is a
+    // stored secret too: kept as it was beside a new host, the token went
+    // there. It is removed, and entered again once the address is saved.
+    if !server.url.is_empty() && origin(&before_url) != origin(&server.url) {
+        let kept: Vec<&str> = server
+            .headers
+            .iter()
+            .filter(|(key, value)| {
+                crate::text::password_env_reference(value).is_some()
+                    && before_headers.iter().any(|(k, v)| k.eq_ignore_ascii_case(key) && v == *value)
+            })
+            .map(|(key, _)| key.as_str())
+            .collect();
+        if !kept.is_empty() {
+            return Err(ApiError::new(
+                400,
+                format!(
+                    "서버 주소의 호스트가 바뀌어 환경변수에서 읽는 헤더({})를 새 주소로 보내지 않습니다. 그 헤더를 지우고 주소를 저장한 뒤 다시 넣어주세요.",
+                    kept.join(", ")
+                ),
+            ));
+        }
+    }
     if server.url.is_empty() {
         server.headers.clear();
         server.secret_headers.clear();
@@ -1418,6 +1443,29 @@ mod tests {
         let toml = |server: &McpServer| toml::to_string(server).unwrap();
         assert!(!toml(&McpServer::default()).contains("disable_proxy"));
         assert!(toml(&McpServer { disable_proxy: true, ..Default::default() }).contains("disable_proxy = true"));
+    }
+
+    /// Full review, 2026-10-22: a header read from the environment
+    /// (`ENV:NAME`) went on to a new host with the address alone changed,
+    /// where a secret header was refused.
+    #[test]
+    fn a_header_read_from_the_environment_stays_with_its_host() {
+        let mut base = McpServer { name: "wiki".into(), url: "https://wiki.example.com/mcp".into(), tools: vec!["*".into()], ..Default::default() };
+        base.headers.insert("Authorization".into(), "ENV:WIKI_TOKEN".into());
+        base.headers.insert("X-Team".into(), "voc".into());
+        let moved = json!({"url":"https://wiki.elsewhere.com/mcp","headers":{"Authorization":"ENV:WIKI_TOKEN","X-Team":"voc"}});
+        let refused = mcp_draft(&moved, base.clone()).unwrap_err().message;
+        assert!(refused.contains("Authorization") && !refused.contains("X-Team"), "{refused}");
+        // The body leaving headers out keeps them, and so is refused too.
+        assert!(mcp_draft(&json!({"url":"https://wiki.elsewhere.com/mcp"}), base.clone()).is_err());
+        // Removed first, the address saves; the header goes in again after.
+        let saved = mcp_draft(&json!({"url":"https://wiki.elsewhere.com/mcp","headers":{"X-Team":"voc"}}), base.clone()).unwrap();
+        let again = mcp_draft(&json!({"headers":{"Authorization":"ENV:WIKI_TOKEN","X-Team":"voc"}}), saved).unwrap();
+        assert_eq!(again.headers["Authorization"], "ENV:WIKI_TOKEN");
+        // A new reference beside the new address is entered now, as is the
+        // same host on another path.
+        assert!(mcp_draft(&json!({"url":"https://wiki.elsewhere.com/mcp","headers":{"Authorization":"ENV:OTHER_TOKEN"}}), base.clone()).is_ok());
+        assert!(mcp_draft(&json!({"url":"https://wiki.example.com/v2/mcp"}), base).is_ok());
     }
 
     #[test]
