@@ -231,6 +231,9 @@ impl SessionHistory {
                 let needle = needles.iter().copied().find(|needle| lowered.contains(needle))?;
                 Some((b, text, needle, whole))
             })
+            // One past the page tells that more follow; the rest of the
+            // history is not turned into text for nothing.
+            .take(limit.clamp(1, 50) + 1)
             .collect();
         let items: Vec<_> = rows
             .iter()

@@ -141,7 +141,11 @@ fn split_with(text: &str, target: usize, max: usize, overlap: usize) -> Vec<Stri
 
 /// `next` without the overlap it repeats from the end of `text`.
 pub fn cut_seam(text: &str, next: &str) -> String {
-    let text: Vec<u16> = text.encode_utf16().collect();
+    // An overlap is at most CHUNK_OVERLAP + 1 units, so the characters before
+    // the last that many are never compared. Encoding all of `text` made
+    // joining a document's chunks quadratic (1.2 s for 1,348 chunks).
+    let tail = text.char_indices().rev().nth(CHUNK_OVERLAP).map_or(0, |(at, _)| at);
+    let text: Vec<u16> = text[tail..].encode_utf16().collect();
     let next: Vec<u16> = next.encode_utf16().collect();
     let floor = MIN_SEAM.min(CHUNK_OVERLAP);
     let aligned = usize::from(is_high(next.first()) && is_low(next.get(1)));
@@ -202,6 +206,40 @@ pub fn join_chunks_with_ends<'a>(chunks: impl IntoIterator<Item = (i64, &'a str)
 mod tests {
     use super::*;
     use serde::Deserialize;
+
+    /// Only the end of the text a seam is cut against is read: the result
+    /// is that of comparing against the whole text.
+    #[test]
+    fn a_seam_is_cut_as_against_the_whole_text() {
+        fn against_whole(text: &str, next: &str) -> String {
+            let text: Vec<u16> = text.encode_utf16().collect();
+            let next: Vec<u16> = next.encode_utf16().collect();
+            let aligned = usize::from(is_high(next.first()) && is_low(next.get(1)));
+            let mut n = (CHUNK_OVERLAP + aligned).min(text.len()).min(next.len());
+            while n >= MIN_SEAM.min(CHUNK_OVERLAP) && n > 0 {
+                if text.ends_with(&next[..n]) {
+                    return String::from_utf16_lossy(&next[n..]);
+                }
+                n -= 1;
+            }
+            String::from_utf16_lossy(&next)
+        }
+        let letters: Vec<char> = "ab😀가 \n.".chars().collect();
+        let mut seed = 7u64;
+        let mut next = |below: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % below
+        };
+        for _ in 0..5000 {
+            let text: String = (0..next(400)).map(|_| letters[next(letters.len())]).collect();
+            let kept = next(200);
+            let chars: Vec<char> = text.chars().collect();
+            let repeated: String = chars[chars.len().saturating_sub(kept)..].iter().collect();
+            let rest: String = (0..next(300)).map(|_| letters[next(letters.len())]).collect();
+            let following = repeated + &rest;
+            assert_eq!(cut_seam(&text, &following), against_whole(&text, &following), "{text:?} {following:?}");
+        }
+    }
 
     #[derive(Deserialize)]
     struct Case {

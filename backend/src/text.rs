@@ -74,6 +74,14 @@ pub fn name_index_of(text: &str, name: &str) -> Option<usize> {
     if key.is_empty() {
         return None;
     }
+    // Most names are not in the text: told by lowercasing each character
+    // (final sigma read as sigma), which keeps every span `name_key` takes,
+    // before a pattern is built. Building one for each of a thousand
+    // registered names took 0.15 s a method.
+    let folded = |s: &str| -> String { s.chars().flat_map(char::to_lowercase).map(|c| if c == 'ς' { 'σ' } else { c }).collect() };
+    if !folded(text).contains(&folded(&key)) {
+        return None;
+    }
     let pattern = regex::RegexBuilder::new(&regex::escape(&key))
         .case_insensitive(true)
         .unicode(true)

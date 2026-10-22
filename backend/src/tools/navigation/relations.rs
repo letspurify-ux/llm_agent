@@ -1,6 +1,11 @@
 //! Conservative syntax links. No type checker, package loader, macro expansion
 //! or runtime dispatch is implied by a link, including a local resolved link.
 use super::*;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 use tree_sitter::Node;
 
 type Key = (usize, usize);
@@ -102,6 +107,235 @@ struct FileFacts {
     module_scopes: Vec<Span>,
     uncertain_bindings: Vec<UncertainBinding>,
     python_scopes: BTreeMap<(usize, usize), PythonScope>,
+    /// The Python scopes in key order, and which of them hold a place.
+    python_keys: Vec<(usize, usize)>,
+    python_holding: Scoped,
+    module_holding: Scoped,
+    named: Named,
+}
+
+/// Positions of a file's facts by name, so that resolving each reference
+/// looks at the facts of its name whose scope holds it, not every fact of the
+/// file: scanning all of them took 6.6 s for a 48,000-line file.
+#[derive(Default)]
+struct Named {
+    declarations: HashMap<String, Scoped>,
+    bindings: HashMap<String, Scoped>,
+    type_parameters: HashMap<String, Scoped>,
+    imports: HashMap<String, Scoped>,
+    binding_spans: HashMap<(usize, usize), usize>,
+    keys: HashMap<Key, usize>,
+    containers: Scoped,
+    modules: Scoped,
+    uncertain: HashMap<String, Uncertain>,
+    /// Declarations by their container and name, in order.
+    members: HashMap<(String, String), Vec<usize>>,
+}
+
+/// One name's `global`/`nonlocal` directives: by the function each is in, and
+/// grouped by the scope each binds, which is where most of them agree.
+#[derive(Default)]
+struct Uncertain {
+    own: Scoped,
+    scopes: Vec<(Span, Vec<usize>)>,
+    scope_holding: Scoped,
+}
+
+/// The facts of one name: their positions in order, and their scopes by start
+/// with the furthest end in each power-of-two block above them, so that the
+/// scopes holding a place are found without looking at the others.
+#[derive(Default)]
+struct Scoped {
+    all: Vec<usize>,
+    by_start: Vec<(usize, usize, usize)>,
+    reach: Vec<usize>,
+    width: usize,
+}
+
+impl Scoped {
+    fn new(scopes: Vec<(usize, &Span)>) -> Self {
+        let all = scopes.iter().map(|(at, _)| *at).collect();
+        let mut by_start: Vec<_> = scopes.into_iter().map(|(at, scope)| (scope.start, scope.end, at)).collect();
+        by_start.sort_unstable();
+        let width = by_start.len().next_power_of_two();
+        let mut reach = vec![0; 2 * width];
+        for (leaf, &(_, end, _)) in by_start.iter().enumerate() {
+            reach[width + leaf] = end;
+        }
+        for node in (1..width).rev() {
+            reach[node] = reach[2 * node].max(reach[2 * node + 1]);
+        }
+        Self { all, by_start, reach, width }
+    }
+    /// The positions, in order, of the facts whose scope holds `at`.
+    fn holding(&self, at: usize) -> Vec<usize> {
+        let started = self.by_start.partition_point(|&(start, _, _)| start <= at);
+        let mut found = Vec::new();
+        let mut stack = vec![(1, 0, self.width)];
+        while let Some((node, low, high)) = stack.pop() {
+            if low >= started || self.reach[node] <= at {
+                continue;
+            }
+            if high - low == 1 {
+                found.push(self.by_start[low].2);
+                continue;
+            }
+            let middle = (low + high) / 2;
+            stack.push((2 * node, low, middle));
+            stack.push((2 * node + 1, middle, high));
+        }
+        found.sort_unstable();
+        found
+    }
+}
+
+fn every<'a, T>(items: &'a [T], index: &'a HashMap<String, Scoped>, name: &str) -> impl Iterator<Item = &'a T> + 'a {
+    index.get(name).into_iter().flat_map(|scoped| &scoped.all).map(move |&at| &items[at])
+}
+
+fn holding<'a, T>(items: &'a [T], index: &HashMap<String, Scoped>, name: &str, at: usize) -> impl Iterator<Item = &'a T> + 'a {
+    index.get(name).map(|scoped| scoped.holding(at)).unwrap_or_default().into_iter().map(move |at| &items[at])
+}
+
+impl FileFacts {
+    /// Called once the walk has found every Python scope and Rust module,
+    /// before `visible` is asked.
+    fn index_scopes(&mut self) {
+        self.python_keys = self.python_scopes.keys().copied().collect();
+        let spans: Vec<Span> = self.python_keys.iter().map(|&(start, end)| start..end).collect();
+        self.python_holding = Scoped::new(spans.iter().enumerate().collect());
+        self.module_holding = Scoped::new(self.module_scopes.iter().enumerate().collect());
+    }
+    /// Called once the names and scopes are final.
+    fn index(&mut self) {
+        fn by_name<T>(items: &[T], fact: impl Fn(&T) -> (&str, &Span)) -> HashMap<String, Scoped> {
+            let mut scopes: HashMap<&str, Vec<(usize, &Span)>> = HashMap::new();
+            for (at, item) in items.iter().enumerate() {
+                let (name, scope) = fact(item);
+                scopes.entry(name).or_default().push((at, scope));
+            }
+            scopes.into_iter().map(|(name, scopes)| (name.to_owned(), Scoped::new(scopes))).collect()
+        }
+        let mut binding_spans = HashMap::new();
+        for (at, binding) in self.bindings.iter().enumerate() {
+            binding_spans.entry((binding.span.start, binding.span.end)).or_insert(at);
+        }
+        self.named = Named {
+            declarations: by_name(&self.declarations, |d| (&d.name, &d.scope)),
+            bindings: by_name(&self.bindings, |b| (&b.name, &b.scope)),
+            type_parameters: by_name(&self.type_parameters, |b| (&b.name, &b.scope)),
+            imports: by_name(&self.imports, |i| (&i.alias, &i.scope)),
+            binding_spans,
+            keys: self.declarations.iter().enumerate().map(|(at, d)| (d.key, at)).collect(),
+            containers: self.kinds(&["class", "struct", "record", "impl", "trait", "interface"]),
+            modules: self.kinds(&["module"]),
+            uncertain: self.uncertain(),
+            members: {
+                let mut members: HashMap<(String, String), Vec<usize>> = HashMap::new();
+                for (at, d) in self.declarations.iter().enumerate() {
+                    members.entry((d.container.clone(), d.name.clone())).or_default().push(at);
+                }
+                members
+            },
+        };
+    }
+    /// The declarations named `name` directly in `container`, in order.
+    fn members_of(&self, container: &str, name: &str) -> impl Iterator<Item = &Declaration> {
+        self.named
+            .members
+            .get(&(container.to_owned(), name.to_owned()))
+            .into_iter()
+            .flatten()
+            .map(|&at| &self.declarations[at])
+    }
+    fn uncertain(&self) -> HashMap<String, Uncertain> {
+        let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (at, binding) in self.uncertain_bindings.iter().enumerate() {
+            by_name.entry(&binding.name).or_default().push(at);
+        }
+        by_name
+            .into_iter()
+            .map(|(name, positions)| {
+                let own = Scoped::new(positions.iter().map(|&at| (at, &self.uncertain_bindings[at].own_scope)).collect());
+                let mut scopes: Vec<(Span, Vec<usize>)> = Vec::new();
+                let mut grouped: HashMap<(usize, usize), usize> = HashMap::new();
+                for &at in &positions {
+                    let scope = &self.uncertain_bindings[at].scope;
+                    let group = *grouped.entry((scope.start, scope.end)).or_insert_with(|| {
+                        scopes.push((scope.clone(), Vec::new()));
+                        scopes.len() - 1
+                    });
+                    scopes[group].1.push(at);
+                }
+                let scope_holding = Scoped::new(scopes.iter().enumerate().map(|(group, (scope, _))| (group, scope)).collect());
+                (name.to_owned(), Uncertain { own, scopes, scope_holding })
+            })
+            .collect()
+    }
+    /// Whether a `global`/`nonlocal` directive for `name` visible at `at` is
+    /// not shadowed there: a directive's own function shadows by its own
+    /// scope, any other by the scope it binds; `unshadowed` tells for a scope.
+    fn uncertain_at(&self, name: &str, at: usize, unshadowed: impl Fn(&Span) -> bool) -> bool {
+        let Some(uncertain) = self.named.uncertain.get(name) else {
+            return false;
+        };
+        let own = uncertain.own.holding(at);
+        own.iter().any(|&position| {
+            let binding = &self.uncertain_bindings[position];
+            visible(self, &binding.scope, at) && unshadowed(&binding.own_scope)
+        }) || uncertain.scope_holding.holding(at).into_iter().any(|group| {
+            let (scope, members) = &uncertain.scopes[group];
+            let in_own = own.iter().filter(|&&position| self.uncertain_bindings[position].scope == *scope).count();
+            members.len() > in_own && visible(self, scope, at) && unshadowed(scope)
+        })
+    }
+    /// The declarations of these kinds, by the span each declares.
+    fn kinds(&self, kinds: &[&str]) -> Scoped {
+        Scoped::new(
+            self.declarations
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| kinds.contains(&d.kind.as_str()))
+                .map(|(at, d)| (at, &d.span))
+                .collect(),
+        )
+    }
+    fn declarations_named(&self, name: &str) -> impl Iterator<Item = &Declaration> {
+        every(&self.declarations, &self.named.declarations, name)
+    }
+    /// The declarations of `name` whose scope holds `at`, in order.
+    fn declarations_at(&self, name: &str, at: usize) -> impl Iterator<Item = &Declaration> {
+        holding(&self.declarations, &self.named.declarations, name, at)
+    }
+    fn bindings_at(&self, name: &str, at: usize) -> impl Iterator<Item = &Binding> {
+        holding(&self.bindings, &self.named.bindings, name, at)
+    }
+    fn type_parameters_at(&self, name: &str, at: usize) -> impl Iterator<Item = &Binding> {
+        holding(&self.type_parameters, &self.named.type_parameters, name, at)
+    }
+    fn imports_at(&self, alias: &str, at: usize) -> impl Iterator<Item = &Import> {
+        holding(&self.imports, &self.named.imports, alias, at)
+    }
+    fn declaration(&self, key: Key) -> Option<&Declaration> {
+        self.named.keys.get(&key).map(|&at| &self.declarations[at])
+    }
+    fn binding_at(&self, span: Span) -> Option<&Binding> {
+        self.named.binding_spans.get(&(span.start, span.end)).map(|&at| &self.bindings[at])
+    }
+    /// The classes, structs, records, impls, traits and interfaces whose
+    /// declaration holds `at`, in order.
+    fn containers_at(&self, at: usize) -> impl Iterator<Item = &Declaration> {
+        self.named.containers.holding(at).into_iter().map(|at| &self.declarations[at])
+    }
+    fn modules_at(&self, at: usize) -> impl Iterator<Item = &Declaration> {
+        self.named.modules.holding(at).into_iter().map(|at| &self.declarations[at])
+    }
+}
+
+/// A node of the walk and the nodes above it.
+struct Up<'tree> {
+    node: Node<'tree>,
+    up: Option<Rc<Up<'tree>>>,
 }
 
 struct PythonScope {
@@ -379,8 +613,9 @@ fn declaration_scope(node: Node<'_>, language: &str) -> Span {
 // Rust modules do not inherit the lexical names of their parent module.
 fn visible(facts: &FileFacts, scope: &Span, at: usize) -> bool {
     if !scope.contains(&at)
-        || facts.module_scopes.iter().any(|module| {
-            module.contains(&at) && scope.start < module.start && scope.end >= module.end
+        || facts.module_holding.holding(at).into_iter().any(|position| {
+            let module = &facts.module_scopes[position];
+            scope.start < module.start && scope.end >= module.end
         })
     {
         return false;
@@ -396,11 +631,11 @@ fn visible(facts: &FileFacts, scope: &Span, at: usize) -> bool {
         // Python class namespaces are used by their body and method defaults,
         // but skipped by nested functions, classes and comprehension bodies.
         if python.class
-            && facts.python_scopes.iter().any(|(&(start, end), inner)| {
+            && facts.python_holding.holding(at).into_iter().any(|position| {
+                let (start, end) = facts.python_keys[position];
                 start > scope.start
                     && end <= scope.end
-                    && (start..end).contains(&at)
-                    && !inner
+                    && !facts.python_scopes[&(start, end)]
                         .outer_expression
                         .as_ref()
                         .is_some_and(|span| span.contains(&at))
@@ -493,9 +728,12 @@ fn imports(
     cancel: &CancellationToken,
     deadline: Instant,
 ) -> Result<bool> {
-    let span = scope(node, language == "python", language);
+    // Walked only for an import: `scope` climbs the ancestors, and every
+    // node of the file comes through here.
+    let scope_of = || scope(node, language == "python", language);
     Ok(match (language, node.kind()) {
         ("javascript" | "typescript" | "typescriptreact", "import_statement") => {
+            let span = scope_of();
             let Some(module) = node.child_by_field_name("source") else {
                 return Ok(true);
             };
@@ -550,6 +788,7 @@ fn imports(
             true
         }
         ("python", "import_statement" | "import_from_statement") => {
+            let span = scope_of();
             let from = node.child_by_field_name("module_name");
             facts.wildcard_import |= named(node).iter().any(|n| n.kind() == "wildcard_import");
             let mut cursor = node.walk();
@@ -581,6 +820,7 @@ fn imports(
             true
         }
         ("rust", "use_declaration") => {
+            let span = scope_of();
             if let Some(arg) = node.child_by_field_name("argument") {
                 rust_import(
                     arg,
@@ -595,6 +835,7 @@ fn imports(
             true
         }
         ("java", "import_declaration") => {
+            let span = scope_of();
             let value = text_of(node, source)
                 .trim()
                 .trim_start_matches("import")
@@ -627,6 +868,7 @@ fn imports(
             true
         }
         ("csharp", "using_directive") => {
+            let span = scope_of();
             let value = text_of(node, source)
                 .trim()
                 .trim_start_matches("global ")
@@ -793,11 +1035,11 @@ fn is_call(node: Node<'_>) -> bool {
     )
 }
 
-fn is_nonreference_identifier(node: Node<'_>, language: &str) -> bool {
+fn is_nonreference_identifier(node: Node<'_>, parent: Option<Node<'_>>, language: &str) -> bool {
     if node.kind() != "identifier" {
         return false;
     }
-    let Some(parent) = node.parent() else {
+    let Some(parent) = parent else {
         return false;
     };
     if language == "rust" && matches!(parent.kind(), "lifetime" | "label") {
@@ -847,11 +1089,11 @@ fn is_nonreference_identifier(node: Node<'_>, language: &str) -> bool {
     false
 }
 
-fn type_only_export_name(node: Node<'_>, language: &str) -> bool {
+fn type_only_export_name(node: Node<'_>, parent: Option<Node<'_>>, language: &str) -> bool {
     if !matches!(language, "typescript" | "typescriptreact") {
         return false;
     }
-    let Some(specifier) = node.parent().filter(|parent| {
+    let Some(specifier) = parent.filter(|parent| {
         parent.kind() == "export_specifier" && parent.child_by_field_name("name") == Some(node)
     }) else {
         return false;
@@ -869,9 +1111,9 @@ fn type_only_export_name(node: Node<'_>, language: &str) -> bool {
     false
 }
 
-fn annotation_type_name(node: Node<'_>, language: &str) -> bool {
+fn annotation_type_name(node: Node<'_>, parent: Option<Node<'_>>, language: &str) -> bool {
     matches!(language, "java" | "csharp")
-        && node.parent().is_some_and(|parent| {
+        && parent.is_some_and(|parent| {
             matches!(
                 parent.kind(),
                 "marker_annotation" | "annotation" | "attribute"
@@ -879,7 +1121,7 @@ fn annotation_type_name(node: Node<'_>, language: &str) -> bool {
         })
 }
 
-fn add_binding(node: Node<'_>, facts: &mut FileFacts, source: &str, language: &str) {
+fn add_binding(node: Node<'_>, parent: Option<Node<'_>>, facts: &mut FileFacts, source: &str, language: &str) {
     if language == "csharp"
         && node.kind() == "accessor_declaration"
         && node
@@ -931,7 +1173,7 @@ fn add_binding(node: Node<'_>, facts: &mut FileFacts, source: &str, language: &s
                 | "implicit_parameter_list"
         )
     };
-    let direct_parameter = node.parent().is_some_and(|p| {
+    let direct_parameter = parent.is_some_and(|p| {
         parameter_container(p.kind())
             || (matches!(p.kind(), "arrow_function" | "lambda_expression")
                 && (p.child_by_field_name("parameter") == Some(node)
@@ -990,10 +1232,7 @@ fn add_binding(node: Node<'_>, facts: &mut FileFacts, source: &str, language: &s
         let function_scoped = parameter
             || language == "python"
             || loop_kind == Some("var")
-            || (javascript
-                && node
-                    .parent()
-                    .is_some_and(|p| p.kind() == "variable_declaration"));
+            || (javascript && parent.is_some_and(|p| p.kind() == "variable_declaration"));
         let mut binding_scope = scope(node, function_scoped, language);
         if node.kind() == "const_parameter" {
             if let Some(owner) = node.parent().and_then(|list| list.parent()) {
@@ -1089,13 +1328,21 @@ fn assign_write_scopes(
     for import in &facts.imports {
         scopes.entry(&import.alias).or_default().push(&import.scope);
     }
+    // Only the scopes holding a write are looked at, not every scope of its name.
+    let holding: BTreeMap<&str, Scoped> = scopes
+        .iter()
+        .map(|(name, spans)| (*name, Scoped::new(spans.iter().copied().enumerate().collect())))
+        .collect();
     let mut updates = Vec::new();
     for (i, binding) in facts.bindings.iter().enumerate().filter(|(_, b)| b.write) {
         check_budget(cancel, deadline)?;
-        if let Some(scope) = scopes
-            .get(binding.name.as_str())
+        let name = binding.name.as_str();
+        if let Some(scope) = holding
+            .get(name)
+            .map(|scoped| scoped.holding(binding.span.start))
+            .unwrap_or_default()
             .into_iter()
-            .flatten()
+            .map(|position| scopes[name][position])
             .filter(|scope| visible(facts, scope, binding.span.start))
             .min_by_key(|scope| scope.len())
         {
@@ -1129,6 +1376,10 @@ fn collect(
             module_scopes: Vec::new(),
             uncertain_bindings: Vec::new(),
             python_scopes: BTreeMap::new(),
+            python_keys: Vec::new(),
+            python_holding: Scoped::default(),
+            module_holding: Scoped::default(),
+            named: Named::default(),
         };
         for (index, symbol) in file.symbols.iter().enumerate() {
             let span = symbol_span(symbol);
@@ -1194,10 +1445,13 @@ fn collect(
             })
             .collect();
         let site_start = sites.len();
-        let mut stack = vec![root];
+        // Each node with its ancestors: `Node::parent` searches down from the
+        // root every time, and asked for every node it cost most of the walk.
+        let mut stack: Vec<(Node<'_>, Option<Rc<Up<'_>>>)> = vec![(root, None)];
         let mut seen = BTreeSet::new();
-        while let Some(node) = stack.pop() {
+        while let Some((node, up)) = stack.pop() {
             check_budget(cancel, deadline)?;
+            let parent = up.as_ref().map(|link| link.node);
             if file.syntax.language == "python" {
                 let comprehension = matches!(
                     node.kind(),
@@ -1272,10 +1526,10 @@ fn collect(
             ) {
                 continue;
             }
-            if is_nonreference_identifier(node, file.syntax.language) {
+            if is_nonreference_identifier(node, parent, file.syntax.language) {
                 continue;
             }
-            add_binding(node, &mut facts, source, file.syntax.language);
+            add_binding(node, parent, &mut facts, source, file.syntax.language);
             if matches!(
                 file.syntax.language,
                 "rust" | "java" | "csharp" | "typescript" | "typescriptreact"
@@ -1302,11 +1556,12 @@ fn collect(
                     .map(|callee| (callee, None));
             }
             if let Some((name, qualifier)) = value {
+                let name_parent = if name == node { parent } else { name.parent() };
                 // Outer expressions are visited first, so call/member sites
                 // retain their receiver and are not repeated as bare names.
                 if seen.insert((name.start_byte(), name.end_byte()))
                     && !declaration_names.contains(&(name.start_byte(), name.end_byte()))
-                    && !name.parent().is_some_and(|p| {
+                    && !name_parent.is_some_and(|p| {
                         (matches!(p.kind(), "pair" | "pair_pattern")
                             && p.child_by_field_name("key") == Some(name))
                             || (p.kind() == "keyword_pattern" && p.named_child(0) == Some(name))
@@ -1317,10 +1572,11 @@ fn collect(
                                 && p.child_by_field_name("pattern").is_some())
                     })
                 {
-                    let mut parent = node.parent();
+                    let mut ancestors = up.clone();
                     let mut callable = None;
                     let mut initializer_owner = None;
-                    while let Some(ancestor) = parent {
+                    while let Some(link) = ancestors {
+                        let ancestor = link.node;
                         if is_function(ancestor)
                             && (file.syntax.language != "python"
                                 || ancestor.child_by_field_name("body").is_some_and(|body| {
@@ -1337,7 +1593,7 @@ fn collect(
                             initializer_owner = Some(*key);
                             break;
                         }
-                        parent = ancestor.parent();
+                        ancestors = link.up.clone();
                     }
                     let owner = initializer_owner.or_else(|| {
                         callable.and_then(|n| {
@@ -1354,7 +1610,7 @@ fn collect(
                     let verbatim_receiver = file.syntax.language == "csharp"
                         && qualifier.as_deref().is_some_and(|q| q.starts_with('@'));
                     let scoped_path = file.syntax.language == "rust"
-                        && name.parent().is_some_and(|parent| {
+                        && name_parent.is_some_and(|parent| {
                             matches!(
                                 parent.kind(),
                                 "scoped_identifier" | "scoped_type_identifier"
@@ -1381,18 +1637,18 @@ fn collect(
                         name_line: pos.row + 1,
                         call,
                         dynamic_callee,
-                        attribute_type_name: annotation_type_name(node, file.syntax.language),
+                        attribute_type_name: annotation_type_name(node, parent, file.syntax.language),
                         verbatim_name,
                         verbatim_receiver,
                         scoped_path,
                         name_lookup: match (file.syntax.language, node.kind()) {
                             ("java" | "csharp", _)
-                                if annotation_type_name(node, file.syntax.language) =>
+                                if annotation_type_name(node, parent, file.syntax.language) =>
                             {
                                 Some(NameLookup::Type)
                             }
                             ("typescript" | "typescriptreact", "identifier")
-                                if type_only_export_name(node, file.syntax.language) =>
+                                if type_only_export_name(node, parent, file.syntax.language) =>
                             {
                                 Some(NameLookup::Type)
                             }
@@ -1412,7 +1668,7 @@ fn collect(
                                 "type_identifier",
                             ) => Some(NameLookup::Type),
                             ("csharp", "identifier")
-                                if name.parent().is_some_and(|parent| {
+                                if name_parent.is_some_and(|parent| {
                                     parent.child_by_field_name("type") == Some(name)
                                 }) =>
                             {
@@ -1433,8 +1689,10 @@ fn collect(
                     }
                 }
             }
-            stack.extend(named(node).into_iter().rev());
+            let link = Some(Rc::new(Up { node, up }));
+            stack.extend(named(node).into_iter().rev().map(|child| (child, link.clone())));
         }
+        facts.index_scopes();
         if matches!(file.syntax.language, "csharp" | "rust") {
             for declaration in &mut facts.declarations {
                 declaration.name = identifier(file.syntax.language, &declaration.name).to_owned();
@@ -1455,20 +1713,18 @@ fn collect(
         // A global/nonlocal directive affects only its function until that
         // function actually writes the name. After a write, calls in other
         // scopes can no longer be linked to the old declaration either.
+        // The names each scope binds, looked up instead of scanned for each
+        // directive: a `global` in each of 8,000 functions took 24 s.
+        let bound: HashSet<(&str, (usize, usize))> = facts
+            .bindings
+            .iter()
+            .map(|other| (other.name.as_str(), (other.scope.start, other.scope.end)))
+            .chain(facts.declarations.iter().map(|other| (other.name.as_str(), (other.scope.start, other.scope.end))))
+            .chain(facts.imports.iter().map(|other| (other.alias.as_str(), (other.scope.start, other.scope.end))))
+            .collect();
         for binding in &mut facts.uncertain_bindings {
             check_budget(cancel, deadline)?;
-            let written = facts
-                .bindings
-                .iter()
-                .any(|other| other.name == binding.name && other.scope == binding.scope)
-                || facts
-                    .declarations
-                    .iter()
-                    .any(|other| other.name == binding.name && other.scope == binding.scope)
-                || facts
-                    .imports
-                    .iter()
-                    .any(|other| other.alias == binding.name && other.scope == binding.scope);
+            let written = bound.contains(&(binding.name.as_str(), (binding.scope.start, binding.scope.end)));
             if !written {
                 continue;
             }
@@ -1488,13 +1744,7 @@ fn collect(
                                 .child_by_field_name("body")
                                 .unwrap_or(ancestor)
                                 .byte_range();
-                            if facts.bindings.iter().any(|other| {
-                                other.name == binding.name && other.scope == outer_scope
-                            }) || facts.declarations.iter().any(|other| {
-                                other.name == binding.name && other.scope == outer_scope
-                            }) || facts.imports.iter().any(|other| {
-                                other.alias == binding.name && other.scope == outer_scope
-                            }) {
+                            if bound.contains(&(binding.name.as_str(), (outer_scope.start, outer_scope.end))) {
                                 binding.scope = outer_scope;
                                 break;
                             }
@@ -1520,6 +1770,7 @@ fn collect(
                 !binding_names.contains(&(site.name_span.start, site.name_span.end))
             }),
         );
+        facts.index();
         all_facts.push(facts);
     }
     Ok((all_facts, sites, unsupported_calls))
@@ -1557,9 +1808,8 @@ impl Resolution {
 }
 
 fn shadowed(facts: &FileFacts, name: &str, at: usize, declaration: Option<&Declaration>) -> bool {
-    facts.bindings.iter().any(|b| {
-        b.name == name
-            && visible(facts, &b.scope, at)
+    facts.bindings_at(name, at).any(|b| {
+        visible(facts, &b.scope, at)
             && declaration.is_none_or(|d| b.span != d.name_span && b.scope.len() <= d.scope.len())
     })
 }
@@ -1636,8 +1886,51 @@ fn module_files(workspace: &Workspace, site: &Site, module: &str) -> Vec<usize> 
         .collect()
 }
 
+/// A module's export lists (`export { a as b }`, `export default a`).
+#[derive(Default)]
+struct ExportList {
+    /// By exported name: the local name and whether only its type is exported.
+    specifiers: HashMap<String, Vec<(String, bool)>>,
+    defaults: HashSet<String>,
+}
+
+fn export_list(file: &IndexedFile) -> ExportList {
+    let mut list = ExportList::default();
+    let root = file.syntax.tree.root_node();
+    for export in named(root)
+        .into_iter()
+        .filter(|n| n.kind() == "export_statement" && n.child_by_field_name("source").is_none())
+    {
+        let statement_type_only = has_type_modifier(export);
+        if let Some(value) = export.child_by_field_name("value")
+            && value.kind() == "identifier"
+        {
+            list.defaults.insert(text_of(value, &file.syntax.source).to_owned());
+        }
+        let mut stack = named(export);
+        while let Some(node) = stack.pop() {
+            if node.kind() == "export_specifier" {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let alias = node.child_by_field_name("alias").unwrap_or(name);
+                    list.specifiers
+                        .entry(unquote(text_of(alias, &file.syntax.source)).to_owned())
+                        .or_default()
+                        .push((
+                            text_of(name, &file.syntax.source).to_owned(),
+                            statement_type_only || has_type_modifier(node),
+                        ));
+                }
+            } else {
+                stack.extend(named(node));
+            }
+        }
+    }
+    list
+}
+
 fn exported(
     file: &IndexedFile,
+    list: &ExportList,
     declaration: &Declaration,
     wanted: &str,
     type_position: bool,
@@ -1683,37 +1976,13 @@ fn exported(
         }
         parent = node.parent();
     }
-    for export in named(root)
-        .into_iter()
-        .filter(|n| n.kind() == "export_statement" && n.child_by_field_name("source").is_none())
-    {
-        let statement_type_only = has_type_modifier(export);
-        if wanted == "default"
-            && let Some(value) = export.child_by_field_name("value")
-            && value.kind() == "identifier"
-            && text_of(value, &file.syntax.source) == declaration.name
-        {
-            return true;
-        }
-        let mut stack = named(export);
-        while let Some(node) = stack.pop() {
-            if node.kind() == "export_specifier" {
-                if let Some(name) = node.child_by_field_name("name") {
-                    let alias = node.child_by_field_name("alias").unwrap_or(name);
-                    if text_of(name, &file.syntax.source) == declaration.name
-                        && unquote(text_of(alias, &file.syntax.source)) == wanted
-                        && (!(statement_type_only || has_type_modifier(node))
-                            || type_position && NameLookup::Type.accepts(&declaration.kind))
-                    {
-                        return true;
-                    }
-                }
-            } else {
-                stack.extend(named(node));
-            }
-        }
+    if wanted == "default" && list.defaults.contains(&declaration.name) {
+        return true;
     }
-    false
+    list.specifiers.get(wanted).into_iter().flatten().any(|(name, type_only)| {
+        *name == declaration.name
+            && (!type_only || type_position && NameLookup::Type.accepts(&declaration.kind))
+    })
 }
 
 fn rust_module(workspace: &Workspace, file: usize) -> (PathBuf, Vec<String>) {
@@ -1745,8 +2014,47 @@ struct LinkIndex {
     rust_modules: Vec<(PathBuf, Vec<String>)>,
     rust: BTreeMap<(PathBuf, String), Vec<Key>>,
     types: BTreeMap<(String, String), Vec<Key>>,
+    // Found once per call, not once per reference: 3,000 references to an
+    // import of a 3,000-function module ran past the time limit.
+    module_files: Found<(usize, String)>,
+    export_lists: RefCell<HashMap<usize, Rc<ExportList>>>,
+    exported: Found<(usize, String, bool)>,
 }
+
+/// Positions found for a key, kept for the rest of the call.
+type Found<K> = RefCell<HashMap<K, Rc<[usize]>>>;
 impl LinkIndex {
+    /// The files `module` names from the file of `site`.
+    fn module_files(&self, workspace: &Workspace, site: &Site, module: &str) -> Rc<[usize]> {
+        let key = (site.file, module.to_owned());
+        if let Some(files) = self.module_files.borrow().get(&key) {
+            return files.clone();
+        }
+        let files: Rc<[usize]> = module_files(workspace, site, module).into();
+        self.module_files.borrow_mut().insert(key, files.clone());
+        files
+    }
+    /// The positions of the top-level declarations of `file` exported as `wanted`.
+    fn exported(&self, workspace: &Workspace, facts: &[FileFacts], file: usize, wanted: &str, type_position: bool) -> Rc<[usize]> {
+        let key = (file, wanted.to_owned(), type_position);
+        if let Some(found) = self.exported.borrow().get(&key) {
+            return found.clone();
+        }
+        let list = self
+            .export_lists
+            .borrow_mut()
+            .entry(file)
+            .or_insert_with(|| Rc::new(export_list(&workspace.files[file])))
+            .clone();
+        let found: Rc<[usize]> = (0..facts[file].declarations.len())
+            .filter(|&at| {
+                let d = &facts[file].declarations[at];
+                d.container.is_empty() && exported(&workspace.files[file], &list, d, wanted, type_position)
+            })
+            .collect();
+        self.exported.borrow_mut().insert(key, found.clone());
+        found
+    }
     fn new(
         workspace: &Workspace,
         facts: &[FileFacts],
@@ -1757,6 +2065,9 @@ impl LinkIndex {
             rust_modules: Vec::new(),
             rust: BTreeMap::new(),
             types: BTreeMap::new(),
+            module_files: RefCell::default(),
+            export_lists: RefCell::default(),
+            exported: RefCell::default(),
         };
         for (file, items) in facts.iter().enumerate() {
             check_budget(cancel, deadline)?;
@@ -1812,11 +2123,7 @@ impl LinkIndex {
 
 fn rust_targets(index: &LinkIndex, facts: &[FileFacts], site: &Site, path: &str) -> Vec<Key> {
     let (root, prefix) = &index.rust_modules[site.file];
-    let mut inline_modules: Vec<_> = facts[site.file]
-        .declarations
-        .iter()
-        .filter(|d| d.kind == "module" && d.span.contains(&site.span.start))
-        .collect();
+    let mut inline_modules: Vec<_> = facts[site.file].modules_at(site.span.start).collect();
     inline_modules.sort_by_key(|d| std::cmp::Reverse(d.span.len()));
     let mut parents = vec![(prefix.clone(), None)];
     for declaration in inline_modules {
@@ -1861,9 +2168,7 @@ fn rust_targets(index: &LinkIndex, facts: &[FileFacts], site: &Site, path: &str)
             key.0 != site.file
                 || owner.is_none_or(|module| {
                     facts[site.file]
-                        .declarations
-                        .iter()
-                        .find(|d| d.key == key)
+                        .declaration(key)
                         .is_some_and(|target| module.span.contains(&target.span.start))
                 })
         })
@@ -1877,9 +2182,8 @@ fn container_contains(facts: &FileFacts, container: &Declaration, member: &Decla
     }
     // Rust impls can be separate from their type declaration. A display path
     // alone cannot distinguish same-named local types in sibling blocks.
-    facts.declarations.iter().any(|implementation| {
+    facts.declarations_named(&container.name).any(|implementation| {
         implementation.kind == "impl"
-            && implementation.name == container.name
             && implementation.container == container.container
             && implementation.scope == container.scope
             && implementation.span.contains(&member.span.start)
@@ -1892,15 +2196,12 @@ fn container_members(
     container: &Declaration,
     name: &str,
 ) -> Vec<Key> {
-    let qualified = &workspace.files[container.key.0].symbols[container.key.1]["qualified_name"];
+    let Some(qualified) = workspace.files[container.key.0].symbols[container.key.1]["qualified_name"].as_str() else {
+        return Vec::new();
+    };
     facts
-        .declarations
-        .iter()
-        .filter(|member| {
-            member.name == name
-                && *qualified == member.container
-                && container_contains(facts, container, member)
-        })
+        .members_of(qualified, name)
+        .filter(|member| container_contains(facts, container, member))
         .map(|member| member.key)
         .collect()
 }
@@ -1917,11 +2218,9 @@ fn rust_lexical_targets(
         return None;
     }
     let declarations: Vec<_> = facts
-        .declarations
-        .iter()
+        .declarations_at(first, site.span.start)
         .filter(|d| {
-            d.name == first
-                && visible(facts, &d.scope, site.span.start)
+            visible(facts, &d.scope, site.span.start)
                 && (NameLookup::Type.accepts(&d.kind) || d.kind == "module")
         })
         .collect();
@@ -1953,9 +2252,7 @@ fn rust_lexical_targets(
                         return declaration.kind == "module";
                     }
                     facts
-                        .declarations
-                        .iter()
-                        .find(|d| d.key == key)
+                        .declaration(key)
                         .is_some_and(|member| container_contains(facts, declaration, member))
                 })
                 .copied(),
@@ -1971,21 +2268,12 @@ fn receiver_container<'a>(
     site: &Site,
 ) -> Option<&'a Declaration> {
     let qualifier = site.qualifier.as_deref()?;
-    let owner = facts
-        .declarations
-        .iter()
-        .find(|d| Some(d.key) == site.owner)?;
+    let owner = facts.declaration(site.owner?)?;
     let container = facts
-        .declarations
-        .iter()
+        .containers_at(owner.span.start)
         .filter(|d| {
-            matches!(
-                d.kind.as_str(),
-                "class" | "struct" | "record" | "impl" | "trait" | "interface"
-            ) && d.span.contains(&owner.span.start)
-                && (workspace.files[site.file].symbols[d.key.1]["qualified_name"]
-                    == owner.container
-                    || owner.kind == "accessor")
+            workspace.files[site.file].symbols[d.key.1]["qualified_name"] == owner.container
+                || owner.kind == "accessor"
         })
         .min_by_key(|d| d.span.len())?;
     let file = &workspace.files[site.file];
@@ -2037,26 +2325,20 @@ fn receiver_container<'a>(
     if identifier(language, text_of(receiver, &file.syntax.source)) != qualifier {
         return None;
     }
-    let binding = facts
-        .bindings
-        .iter()
-        .find(|b| b.span == receiver.byte_range())?;
+    let binding = facts.binding_at(receiver.byte_range())?;
     let at = site.span.start;
     if !visible(facts, &binding.scope, at)
-        || facts.bindings.iter().any(|other| {
-            other.name == qualifier
-                && other.span != binding.span
+        || facts.bindings_at(qualifier, at).any(|other| {
+            other.span != binding.span
                 && other.scope.len() <= binding.scope.len()
                 && visible(facts, &other.scope, at)
         })
-        || facts.declarations.iter().any(|d| {
-            d.name == qualifier
-                && d.scope.len() <= binding.scope.len()
+        || facts.declarations_at(qualifier, at).any(|d| {
+            d.scope.len() <= binding.scope.len()
                 && visible(facts, &d.scope, at)
         })
-        || facts.imports.iter().any(|i| {
-            i.alias == qualifier
-                && i.scope.len() <= binding.scope.len()
+        || facts.imports_at(qualifier, at).any(|i| {
+            i.scope.len() <= binding.scope.len()
                 && visible(facts, &i.scope, at)
         })
     {
@@ -2083,12 +2365,8 @@ fn csharp_namespace(facts: &FileFacts, at: usize) -> String {
     // The outermost containing type has the namespace as its container. An
     // inner type's container also includes enclosing type names.
     facts
-        .declarations
-        .iter()
-        .filter(|d| {
-            d.span.contains(&at)
-                && matches!(d.kind.as_str(), "class" | "struct" | "record" | "interface")
-        })
+        .containers_at(at)
+        .filter(|d| matches!(d.kind.as_str(), "class" | "struct" | "record" | "interface"))
         .max_by_key(|d| d.span.len())
         .map(|d| csharp_path(&d.container.replace("::", ".")))
         .unwrap_or_default()
@@ -2130,22 +2408,17 @@ fn import_targets(
     }
     if let (Some(member), Some(imported)) = (member, import.member.as_deref()) {
         let mut targets = Vec::new();
-        for file in module_files(workspace, site, &import.module) {
-            for parent in facts[file].declarations.iter().filter(|d| {
-                d.container.is_empty()
-                    && matches!(d.kind.as_str(), "class" | "struct" | "record" | "enum")
-                    && exported(&workspace.files[file], d, imported, type_position)
-            }) {
+        for &file in index.module_files(workspace, site, &import.module).iter() {
+            let exported = index.exported(workspace, facts, file, imported, type_position);
+            for parent in exported
+                .iter()
+                .map(|&at| &facts[file].declarations[at])
+                .filter(|d| matches!(d.kind.as_str(), "class" | "struct" | "record" | "enum"))
+            {
                 let container = workspace.files[file].symbols[parent.key.1]["qualified_name"]
                     .as_str()
                     .unwrap();
-                targets.extend(
-                    facts[file]
-                        .declarations
-                        .iter()
-                        .filter(|d| d.container == container && d.name == member)
-                        .map(|d| d.key),
-                );
+                targets.extend(facts[file].members_of(container, member).map(|d| d.key));
             }
         }
         // Python `from pkg import mod` can import a submodule as well as a
@@ -2156,14 +2429,8 @@ fn import_targets(
             } else {
                 format!("{}.{imported}", import.module)
             };
-            for file in module_files(workspace, site, &module) {
-                targets.extend(
-                    facts[file]
-                        .declarations
-                        .iter()
-                        .filter(|d| d.container.is_empty() && d.name == member)
-                        .map(|d| d.key),
-                );
+            for &file in index.module_files(workspace, site, &module).iter() {
+                targets.extend(facts[file].members_of("", member).map(|d| d.key));
             }
         }
         return targets;
@@ -2172,17 +2439,15 @@ fn import_targets(
     let Some(wanted) = wanted else {
         return Vec::new();
     };
-    module_files(workspace, site, &import.module)
-        .into_iter()
-        .flat_map(|file| {
-            facts[file]
-                .declarations
+    index
+        .module_files(workspace, site, &import.module)
+        .iter()
+        .flat_map(|&file| {
+            index
+                .exported(workspace, facts, file, wanted, type_position)
                 .iter()
-                .filter(move |d| {
-                    d.container.is_empty()
-                        && exported(&workspace.files[file], d, wanted, type_position)
-                })
-                .map(|d| d.key)
+                .map(|&at| facts[file].declarations[at].key)
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -2241,35 +2506,21 @@ fn resolve_exact(
     if (matches!(lookup, Some(NameLookup::Type))
         || (site.qualifier.is_some() && matches!(language, "rust" | "java" | "csharp")))
         && facts
-            .type_parameters
-            .iter()
-            .any(|binding| binding.name == binding_name && visible(facts, &binding.scope, at))
+            .type_parameters_at(binding_name, at)
+            .any(|binding| visible(facts, &binding.scope, at))
     {
         return Resolution::unresolved("type_parameter_without_symbol");
     }
-    if facts.uncertain_bindings.iter().any(|binding| {
-        if binding.name != binding_name || !visible(facts, &binding.scope, at) {
-            return false;
-        }
-        let shadow_scope = if binding.own_scope.contains(&at) {
-            &binding.own_scope
-        } else {
-            &binding.scope
-        };
-        !facts.declarations.iter().any(|other| {
-            other.name == binding_name
-                && other.scope.len() < shadow_scope.len()
-                && visible(facts, &other.scope, at)
-        }) && !facts.bindings.iter().any(|other| {
-            other.name == binding_name
-                && other.scope.len() < shadow_scope.len()
-                && visible(facts, &other.scope, at)
-        }) && !facts.imports.iter().any(|other| {
-            other.alias == binding_name
-                && other.scope.len() < shadow_scope.len()
-                && visible(facts, &other.scope, at)
+    let unshadowed = |shadow_scope: &Span| {
+        !facts.declarations_at(binding_name, at).any(|other| {
+            other.scope.len() < shadow_scope.len() && visible(facts, &other.scope, at)
+        }) && !facts.bindings_at(binding_name, at).any(|other| {
+            other.scope.len() < shadow_scope.len() && visible(facts, &other.scope, at)
+        }) && !facts.imports_at(binding_name, at).any(|other| {
+            other.scope.len() < shadow_scope.len() && visible(facts, &other.scope, at)
         })
-    }) {
+    };
+    if facts.uncertain_at(binding_name, at, unshadowed) {
         return Resolution::unresolved("global_or_nonlocal_binding_not_resolved");
     }
     // A validated method receiver is a closer binding than a module import.
@@ -2280,29 +2531,24 @@ fn resolve_exact(
         );
     }
     let mut imports: Vec<_> = facts
-        .imports
-        .iter()
+        .imports_at(binding_name, at)
         .filter(|i| {
-            i.alias == binding_name
-                && visible(facts, &i.scope, at)
+            visible(facts, &i.scope, at)
                 && (!matches!(lookup, Some(NameLookup::Method)) || i.member.is_some())
         })
         .collect();
     imports.sort_by_key(|i| i.scope.len());
     if let Some(first) = imports.first() {
-        if facts.declarations.iter().any(|d| {
-            d.name == binding_name
-                && d.scope == first.scope
-                && lookup.is_none_or(|lookup| lookup.accepts(&d.kind))
+        if facts.declarations_at(binding_name, at).any(|d| {
+            d.scope == first.scope && lookup.is_none_or(|lookup| lookup.accepts(&d.kind))
         }) {
             return Resolution::unresolved("conflicting_import_and_declaration");
         }
         // A closer lexical declaration shadows an outer import even when it
         // is a function/class (and therefore absent from the variable bindings).
         imports.retain(|import| {
-            !facts.declarations.iter().any(|d| {
-                d.name == binding_name
-                    && lookup.is_none_or(|lookup| lookup.accepts(&d.kind))
+            !facts.declarations_at(binding_name, at).any(|d| {
+                lookup.is_none_or(|lookup| lookup.accepts(&d.kind))
                     && visible(facts, &d.scope, at)
                     && d.scope.len() < import.scope.len()
             })
@@ -2356,11 +2602,9 @@ fn resolve_exact(
             return Resolution::unresolved("receiver_type_unknown");
         }
         let types: Vec<_> = facts
-            .declarations
-            .iter()
+            .declarations_at(qualifier, at)
             .filter(|d| {
-                d.name == *qualifier
-                    && visible(facts, &d.scope, at)
+                visible(facts, &d.scope, at)
                     && matches!(
                         d.kind.as_str(),
                         "class" | "struct" | "record" | "module" | "enum"
@@ -2400,9 +2644,8 @@ fn resolve_exact(
                 targets = type_targets(index, language, qualifier, Some(&site.name));
             }
             for import in facts
-                .imports
-                .iter()
-                .filter(|i| i.alias == "*namespace" && i.scope.contains(&at))
+                .imports_at("*namespace", at)
+                .filter(|i| i.scope.contains(&at))
             {
                 targets.extend(type_targets(
                     index,
@@ -2416,11 +2659,9 @@ fn resolve_exact(
         return Resolution::unresolved("receiver_type_or_module_unknown");
     }
     let candidates: Vec<_> = facts
-        .declarations
-        .iter()
+        .declarations_at(&site.name, at)
         .filter(|d| {
-            d.name == site.name
-                && visible(facts, &d.scope, at)
+            visible(facts, &d.scope, at)
                 && lookup.is_none_or(|lookup| lookup.accepts(&d.kind))
                 && !(language == "rust" && matches!(d.kind.as_str(), "macro" | "impl"))
                 // A Rust module is named only as a path segment, so `mod x;`
@@ -2459,9 +2700,8 @@ fn resolve_exact(
                 return Resolution::candidates(local, "same_namespace_type_candidate");
             }
             let targets = facts
-                .imports
-                .iter()
-                .filter(|i| i.alias == "*namespace" && visible(facts, &i.scope, at))
+                .imports_at("*namespace", at)
+                .filter(|i| visible(facts, &i.scope, at))
                 .flat_map(|i| type_targets(index, language, &i.module, Some(&site.name)))
                 .collect::<Vec<_>>();
             if !targets.is_empty() {
@@ -2470,9 +2710,8 @@ fn resolve_exact(
         }
         if language == "csharp" && !shadowed(facts, &site.name, at, None) {
             let targets = facts
-                .imports
-                .iter()
-                .filter(|i| i.alias == "*static" && i.scope.contains(&at))
+                .imports_at("*static", at)
+                .filter(|i| i.scope.contains(&at))
                 .flat_map(|i| type_targets(index, language, &i.module, Some(&site.name)))
                 .collect::<Vec<_>>();
             if !targets.is_empty() {
@@ -2658,4 +2897,34 @@ pub(super) fn execute(s: &crate::tools::Workspace, args: &Value, cancel: &Cancel
     page_with(metadata, args, &fingerprint, "relations", kept.len(), |range| {
         kept[range].iter().map(|(site, resolution)| row(site, resolution)).collect()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scopes holding a place, found by the reach of each block, are
+    /// those a scan of every scope finds, in the same order.
+    #[test]
+    fn scoped_facts_holding_a_place_are_those_a_scan_finds() {
+        let mut seed = 11u64;
+        let mut next = |below: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % below
+        };
+        for size in [0, 1, 2, 3, 7, 8, 9, 50, 300] {
+            let scopes: Vec<Span> = (0..size)
+                .map(|_| {
+                    let start = next(1000);
+                    start..start + next(200)
+                })
+                .collect();
+            let scoped = Scoped::new(scopes.iter().enumerate().collect());
+            for at in (0..1300).step_by(7) {
+                let scanned: Vec<usize> = (0..size).filter(|&i| scopes[i].contains(&at)).collect();
+                assert_eq!(scoped.holding(at), scanned, "{size} scopes at {at}");
+            }
+            assert_eq!(scoped.all, (0..size).collect::<Vec<_>>());
+        }
+    }
 }

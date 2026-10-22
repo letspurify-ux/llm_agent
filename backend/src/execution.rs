@@ -7,6 +7,7 @@ use crate::{
 };
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
 use serde_json::{Map, Value};
 
 /// Columns kept per result row; also the routine output limit.
@@ -89,19 +90,11 @@ pub fn execution_spec(query_type_raw: &str, query_sql: &str, bind_config: &str) 
         });
     }
     // Only one call of a registered routine with binds: no free PL/SQL.
-    let ident = "[A-Za-z][A-Za-z0-9_$#]{0,127}";
-    let target = format!(r"{ident}(?:\s*\.\s*{ident}){{0,2}}");
-    let arg = format!(r"(?:{ident}\s*=>\s*)?:{ident}");
-    let args = format!(r"(?:{arg}(?:\s*,\s*{arg})*)?");
-    let assignment = if kind == Kind::Function {
-        format!(r":({ident})\s*:=\s*")
-    } else {
-        String::new()
-    };
-    let pattern = Regex::new(&format!(
-        r"(?i)^\s*BEGIN\s+{assignment}{target}\s*\(\s*{args}\s*\)\s*;\s*END\s*;\s*$"
-    ))
-    .expect("routine pattern");
+    // Built once: compiling it took about 1 ms, for every routine a search
+    // result lists.
+    static PROCEDURE: LazyLock<Regex> = LazyLock::new(|| routine_pattern(false));
+    static FUNCTION: LazyLock<Regex> = LazyLock::new(|| routine_pattern(true));
+    let pattern = if kind == Kind::Function { &FUNCTION } else { &PROCEDURE };
     let Some(captures) = pattern.captures(query_sql) else {
         return Err(safe(if kind == Kind::Function {
             "함수는 BEGIN :result := schema.function_name(:input); END; 형식으로 등록해주세요."
@@ -206,6 +199,22 @@ pub fn execution_spec(query_type_raw: &str, query_sql: &str, bind_config: &str) 
 /// NUMBER binds travel as strings (a driver double rounds large integers);
 /// the routine call gets NUMBER locals so overload choice and INOUT types
 /// are kept.
+fn routine_pattern(function: bool) -> Regex {
+    let ident = "[A-Za-z][A-Za-z0-9_$#]{0,127}";
+    let target = format!(r"{ident}(?:\s*\.\s*{ident}){{0,2}}");
+    let arg = format!(r"(?:{ident}\s*=>\s*)?:{ident}");
+    let args = format!(r"(?:{arg}(?:\s*,\s*{arg})*)?");
+    let assignment = if function {
+        format!(r":({ident})\s*:=\s*")
+    } else {
+        String::new()
+    };
+    Regex::new(&format!(
+        r"(?i)^\s*BEGIN\s+{assignment}{target}\s*\(\s*{args}\s*\)\s*;\s*END\s*;\s*$"
+    ))
+    .expect("routine pattern")
+}
+
 fn numeric_locals(sql: &str, bindings: &[Binding]) -> String {
     let numbers: Vec<&Binding> = bindings.iter().filter(|b| b.kind == BindType::Number).collect();
     if numbers.is_empty() {
@@ -220,11 +229,12 @@ fn numeric_locals(sql: &str, bindings: &[Binding]) -> String {
         .enumerate()
         .map(|(i, b)| (*b, format!("{prefix}{i}")))
         .collect();
-    let begin = Regex::new(r"(?i)^BEGIN\s+").unwrap();
-    let end = Regex::new(r"(?i)END\s*;$").unwrap();
+    static BEGIN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^BEGIN\s+").unwrap());
+    static END: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)END\s*;$").unwrap());
+    static BIND: LazyLock<Regex> = LazyLock::new(|| Regex::new(r":([A-Za-z][A-Za-z0-9_$#]*)").unwrap());
+    let (begin, end, bind) = (&*BEGIN, &*END, &*BIND);
     let body = begin.replace(sql, "");
     let body = end.replace(&body, "");
-    let bind = Regex::new(r":([A-Za-z][A-Za-z0-9_$#]*)").unwrap();
     let body = bind.replace_all(&body, |c: &regex::Captures| {
         locals
             .iter()

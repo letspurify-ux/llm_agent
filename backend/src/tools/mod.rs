@@ -2730,6 +2730,56 @@ mod tests {
         }
     }
 
+    /// What a module exports by a list (`export { b as bee }`) or as its
+    /// default is found from the module's export lists, read once per call.
+    #[test]
+    fn listed_and_default_exports_reach_their_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.js"), "function a() {}\nfunction b() {}\nexport { a, b as bee };\nexport default a;\n").unwrap();
+        std::fs::write(dir.path().join("main.js"), "import d, { a, bee } from './lib.js';\nexport function run() {\n  a();\n  bee();\n  d();\n}\n").unwrap();
+        let mut ws = workspace(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        for (name, lines) in [("a", vec![3, 5]), ("b", vec![4])] {
+            let found = execute(&mut ws, "symbol_search", json!({"query":name,"match":"exact","path_glob":"lib.js"}), &cancel).unwrap();
+            let args = json!({"path":"lib.js","symbol_id":found["symbols"][0]["symbol_id"],"relation":"callers"});
+            let callers = execute(&mut ws, "symbol_relations", args, &cancel).unwrap();
+            let rows: Vec<u64> = callers["relations"].as_array().unwrap().iter().filter_map(|row| row["line"].as_u64()).collect();
+            assert_eq!(rows, lines, "{name}: {callers}");
+        }
+    }
+
+    /// Resolving each reference looked at every fact of its file and every
+    /// export of an imported module: 48,000 lines of Python took 6.6 s, and
+    /// 3,000 references to an import of a 3,000-function module ran past the
+    /// time limit. Each assignment, each name in a Python class body and each
+    /// `global` directive also looked at every scope or directive of the file.
+    #[test]
+    fn relations_of_large_files_stay_within_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let python: String = (0..3000).map(|i| format!("def f{i}(a, b):\n    y = helper(a, b)\n    return y\n")).collect();
+        std::fs::write(dir.path().join("big.py"), python + "def helper(p, q):\n    return p\n").unwrap();
+        let exports: String = (0..3000).map(|i| format!("export function e{i}(x) {{ return x; }}\n")).collect();
+        std::fs::write(dir.path().join("lib.js"), exports).unwrap();
+        let uses: String = (0..3000).map(|i| format!("export function g{i}(y) {{ return e1(y) + e2(y); }}\n")).collect();
+        std::fs::write(dir.path().join("main.js"), format!("import {{ e1, e2 }} from './lib.js';\n{uses}")).unwrap();
+        let writes: String = (0..3000).map(|i| format!("export function w{i}(a) {{ let y = a; y += 1; return pass(y); }}\n")).collect();
+        std::fs::write(dir.path().join("writes.js"), writes + "export function pass(p) { return p; }\n").unwrap();
+        let methods: String = (0..3000).map(|i| format!("    def m{i}(self):\n        return x + lift(x)\n")).collect();
+        std::fs::write(dir.path().join("class.py"), format!("class K:\n    x = 1\n{methods}def lift(p):\n    return p\nx = 2\n")).unwrap();
+        let globals: String = (0..3000).map(|i| format!("def g{i}(a):\n    global count\n    count = count + a\n    return keep(count)\n")).collect();
+        std::fs::write(dir.path().join("globals.py"), format!("count = 0\n{globals}def keep(p):\n    return p\n")).unwrap();
+        let mut ws = workspace(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        for (name, path, total) in [("helper", "big.py", 3000), ("e1", "lib.js", 3000), ("pass", "writes.js", 3000), ("lift", "class.py", 3000), ("keep", "globals.py", 3000)] {
+            let found = execute(&mut ws, "symbol_search", json!({"query":name,"match":"exact","path_glob":path}), &cancel).unwrap();
+            let started = std::time::Instant::now();
+            let args = json!({"path":path,"symbol_id":found["symbols"][0]["symbol_id"],"relation":"references"});
+            let references = execute(&mut ws, "symbol_relations", args, &cancel).unwrap();
+            assert_eq!(references["total_results"], total, "{name}");
+            assert!(started.elapsed() < std::time::Duration::from_secs(30), "{name}: {:?}", started.elapsed());
+        }
+    }
+
     /// The model saw every source path relative to the project root but
     /// those of source_search mode=files, a list of bare paths: absolute,
     /// the root in front of each.

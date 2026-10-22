@@ -85,14 +85,16 @@ impl Workspace {
                 skipped_files += 1;
                 continue;
             }
-            let Some(path_text) = path.to_str() else {
+            if path.to_str().is_none() {
                 // Tool paths are UTF-8. A lossy conversion could reopen a
                 // different file or fail the entire workspace search.
                 skipped_files += 1;
                 continue;
-            };
-            // Recheck access on every call; an old syntax cache never grants access.
-            let path = read_path(&s.project, path_text)?;
+            }
+            // Access is checked on every call (an old syntax cache never grants
+            // it): this call's walk listed the path under the project's rules,
+            // without following links. Resolving it again with `read_path`
+            // compiled those rules anew for every file.
             let Some(source) = search_text(&path)? else {
                 skipped_files += 1;
                 continue;
@@ -190,17 +192,7 @@ fn request_fingerprint(workspace: &Workspace, name: &str, args: &Value) -> Strin
     )
 }
 
-fn page(
-    metadata: Value,
-    args: &Value,
-    fingerprint: &str,
-    field: &str,
-    rows: Vec<Value>,
-) -> Result<Value> {
-    page_with(metadata, args, fingerprint, field, rows.len(), |range| rows[range].to_vec())
-}
-
-/// `page` over `total` rows that `rows` builds for the page's range only.
+/// A page of `total` rows that `rows` builds for the page's range only.
 fn page_with(
     mut metadata: Value,
     args: &Value,
@@ -254,17 +246,16 @@ pub(super) fn search(s: &mut crate::tools::Workspace, args: &Value, cancel: &Can
     // Declaration lines are read from the source.
     let workspace = Workspace::load(s, args, None, cancel, deadline, &mut |_, _| false)?;
     let fingerprint = request_fingerprint(&workspace, "symbol_search", args);
-    let mut rows = Vec::new();
+    // Only the page's symbols are shaped and given their declaration line,
+    // read in one pass per file: looking each line up from the start of its
+    // file read a 15 MB file a hundred times for a page.
+    let mut located = Vec::new();
     for (index, file) in workspace.files.iter().enumerate() {
         check_budget(cancel, deadline)?;
-        rows.extend(
-            file.symbols
-                .iter()
-                .map(|symbol| workspace.symbol(index, symbol)),
-        );
+        located.extend(file.symbols.iter().map(|symbol| (index, symbol)));
     }
     let mut metadata = workspace.metadata();
-    if rows.is_empty() {
+    if located.is_empty() {
         metadata["empty_reason"] = json!(if workspace.matched_files == 0 {
             "no_matching_files"
         } else if workspace.files.is_empty() {
@@ -273,17 +264,30 @@ pub(super) fn search(s: &mut crate::tools::Workspace, args: &Value, cancel: &Can
             "no_matching_symbols"
         });
     }
-    let mut result = page(metadata, args, &fingerprint, "symbols", rows)?;
+    let mut result = page_with(metadata, args, &fingerprint, "symbols", located.len(), |range| {
+        located[range].iter().map(|&(index, symbol)| workspace.symbol(index, symbol)).collect()
+    })?;
+    let start = result["page_start"].as_u64().unwrap_or(0) as usize;
+    let shown = result["symbols"].as_array().map_or(0, Vec::len);
+    let mut wanted: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    for &(index, symbol) in &located[start..start + shown] {
+        wanted.entry(index).or_default().insert(symbol["name_line"].as_u64().unwrap() as usize - 1);
+    }
+    let mut lines = std::collections::HashMap::new();
+    for (&index, numbers) in &wanted {
+        let last = numbers.last().copied().unwrap_or(0);
+        for (at, text) in workspace.files[index].syntax.source.lines().enumerate().take(last + 1) {
+            if numbers.contains(&at) {
+                lines.insert((index, at), text);
+            }
+        }
+    }
     // Preserve declaration excerpts/source IDs for existing consumers. Like an
     // outline, this is navigation; it does not attest a complete source line.
-    for symbol in result["symbols"].as_array_mut().unwrap() {
-        let file = workspace
-            .files
-            .iter()
-            .find(|f| workspace.relative(&f.syntax.path) == symbol["path"].as_str().unwrap())
-            .unwrap();
+    for (symbol, &(index, _)) in result["symbols"].as_array_mut().unwrap().iter_mut().zip(&located[start..]) {
+        let file = &workspace.files[index];
         let line = symbol["name_line"].as_u64().unwrap() as usize;
-        let source_line = file.syntax.source.lines().nth(line - 1).unwrap_or("");
+        let source_line = lines.get(&(index, line - 1)).copied().unwrap_or("");
         let declaration: String = source_line.chars().take(500).collect();
         symbol["line"] = json!(line);
         symbol["declaration"] = json!(declaration);
