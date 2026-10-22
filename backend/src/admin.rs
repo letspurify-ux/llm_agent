@@ -950,9 +950,12 @@ fn moved<T: PartialEq>(before: Option<T>, after: Option<T>) -> bool {
     after.is_some() && before != after
 }
 
+/// Scheme, host, port, and the proxy a plain-HTTP request goes through.
+type Destination = (String, Option<String>, Option<u16>, Option<String>);
+
 /// Where the LLM API key is sent: the base URL's scheme, host and port, and
 /// the proxy a plain-HTTP request goes through (it reads the key there).
-fn llm_destination(llm: &crate::config::LlmConfig) -> Option<(String, Option<String>, Option<u16>, Option<String>)> {
+fn llm_destination(llm: &crate::config::LlmConfig) -> Option<Destination> {
     let url = reqwest::Url::parse(llm.base_url.trim()).ok()?;
     let proxy = (url.scheme() == "http" && !llm.disable_proxy)
         .then(|| llm.proxy.as_deref().map(str::trim).filter(|p| !p.is_empty()).map(str::to_owned))
