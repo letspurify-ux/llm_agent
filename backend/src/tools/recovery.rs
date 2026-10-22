@@ -92,8 +92,6 @@ pub fn describe(message: &str) -> Value {
             | "ambiguous_file_read_range"
     ) {
         (Class::InvalidInput, "correct_arguments")
-    } else if code == "unknown_symbol" || code == "invalid_symbol_id" {
-        (Class::InvalidInput, "copy_observed_symbol_id")
     } else if code == "history_unavailable" {
         (Class::StaleState, "repeat_the_original_call")
     } else if matches!(
@@ -156,9 +154,6 @@ pub fn attach(offered: &[String], result: &mut Value) {
     let hints: &[&str] = match code {
         "file_not_found" | "path_excluded" | "path_outside_project" | "path_is_directory" => {
             &["file_list", "source_search"]
-        }
-        "unknown_symbol" | "invalid_symbol_id" | "symbol_revision_conflict" => {
-            &["code_outline", "symbol_search"]
         }
         "query_not_found" | "unknown_item" => &["search"],
         // A dropped bundle held any tool's result, or a question and its

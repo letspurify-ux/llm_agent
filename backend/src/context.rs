@@ -72,7 +72,7 @@ const FRAGMENTS: &[Fragment] = &[
     ),
     fragment(
         "프로젝트 소스",
-        "읽기 전에 찾아라. source_search, code_outline, symbol_search로 식별자·경로·분기 위치를 찾은 뒤 그 범위를 start_line과 max_lines로 file_read하거나 symbol_read로 읽어라. 위치를 찾았으면 다시 검색하지 말고 읽어라. 검색 결과의 문맥과 심볼 요약은 탐색용이지 근거가 아니다. 설명하기 전에 코드를 읽어라.",
+        "읽기 전에 찾아라. source_search로 식별자·정의·호출·분기 위치를 찾은 뒤 그 범위를 start_line과 max_lines로 file_read하라. 위치를 찾았으면 다시 검색하지 말고 읽어라. 검색 결과의 문맥은 탐색용이지 근거가 아니다. 설명하기 전에 코드를 읽어라.",
     ),
     fragment(
         "프로젝트 소스",

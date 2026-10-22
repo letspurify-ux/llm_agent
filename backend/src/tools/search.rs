@@ -234,6 +234,12 @@ pub(super) fn execute(
     };
     let total = candidates.len();
     let narrower = "narrow path or path_glob, or search fewer words";
+    // A literal search (anything but a regular expression) matches a line
+    // only where it matches in the whole file, so a file without a match is
+    // passed over in one scan instead of line by line. A regular expression
+    // may hold anchors (`\A`, `^` without multi-line) that a whole file reads
+    // differently, and keeps the scan by lines.
+    let literal_search = terms.is_some() || !args["regex"].as_bool().unwrap_or(false);
     for (read, path) in candidates.into_iter().enumerate() {
         if cancel.is_cancelled() {
             bail!("cancelled");
@@ -243,8 +249,14 @@ pub(super) fn execute(
             continue;
         };
         matched_files += 1;
-        let digest = hash(contents.as_bytes());
-        fingerprint.update(serde_json::to_vec(&(path.to_string_lossy(), &digest))?);
+        if literal_search && !regex.is_match(&contents) {
+            continue;
+        }
+        // Only files with a match make the results, so only they are hashed
+        // into the cursor's identity: a file without one changing changes
+        // nothing a cursor points at. Hashing every file took as long as the
+        // search itself.
+        let mut digest = None;
         let mut matching_lines = 0usize;
         let mut byte_offset = 0;
         for (i, chunk) in contents.split_inclusive('\n').enumerate() {
@@ -268,6 +280,7 @@ pub(super) fn execute(
             }
             matching_lines += 1;
             total_matching_lines += 1;
+            let digest = digest.get_or_insert_with(|| hash(contents.as_bytes()));
             let index = total_matching_lines - 1;
             if mode != "matches" || index < requested_offset || index >= requested_end {
                 continue;
@@ -294,7 +307,8 @@ pub(super) fn execute(
                 context,
             });
         }
-        if matching_lines > 0 {
+        if let Some(digest) = digest {
+            fingerprint.update(serde_json::to_vec(&(path.to_string_lossy(), &digest))?);
             if mode != "matches" {
                 let index = matching_file_count;
                 if index >= requested_offset && index < requested_end {

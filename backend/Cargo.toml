@@ -56,13 +56,6 @@ axum = "0.8"
 # The server's connections, served with a timer (web::serve_within).
 hyper-util = { version = "0.1", features = ["tokio", "server", "service", "http1"] }
 tower-http = { version = "0.6", features = ["limit", "timeout"] }
-tree-sitter = "0.27.0"
-tree-sitter-rust = "0.24.2"
-tree-sitter-javascript = "0.25.0"
-tree-sitter-typescript = "0.23.2"
-tree-sitter-python = "0.25.0"
-tree-sitter-java = "0.23.5"
-tree-sitter-c-sharp = "0.23.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

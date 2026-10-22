@@ -223,7 +223,6 @@ fn background_jobs(app: &Arc<App>) -> Vec<tokio::task::JoinHandle<()>> {
             let idle = housekeeping.config().agent.session_idle_minutes.saturating_mul(60);
             housekeeping.sessions.sweep(Duration::from_secs(idle));
             housekeeping.oracle.close_idle(llm_agent::oracle::POOL_IDLE);
-            let _ = tokio::task::spawn_blocking(|| llm_agent::tools::release_idle_syntax(llm_agent::tools::SYNTAX_IDLE)).await;
         }
     });
     let warm = app.clone();

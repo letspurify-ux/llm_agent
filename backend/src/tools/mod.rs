@@ -6,10 +6,8 @@
 //! configured projects and runs the tool against that project's root.
 
 mod arguments;
-mod navigation;
 pub mod recovery;
 mod search;
-mod structure;
 mod suggest;
 pub mod summary;
 
@@ -23,17 +21,6 @@ use std::{
     path::{Path, PathBuf},
 };
 pub use summary::call_summary;
-
-/// How long a syntax tree the structure tools keep for the next look at the
-/// same file stays unused before it is freed (checked every minute): the
-/// calls of a question and the next question's, not the life of the process.
-pub const SYNTAX_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// Frees the syntax trees unused for `idle` (see `SYNTAX_IDLE`); returns how
-/// many. Run on a blocking thread: freeing a large tree takes a while.
-pub fn release_idle_syntax(idle: std::time::Duration) -> usize {
-    structure::release_idle_syntax(idle)
-}
 
 #[derive(Clone, Debug)]
 pub struct ToolSpec {
@@ -57,12 +44,6 @@ fn legacy_pattern(instead: &str) -> Value {
 }
 pub(crate) fn number() -> Value {
     json!({"type":"integer","minimum":0})
-}
-/// A field schema with a description: guidance that would push a tool's
-/// own description past OpenAI's 1,024 characters goes on its fields.
-fn described(mut field: Value, description: &str) -> Value {
-    field["description"] = json!(description);
-    field
 }
 pub(crate) fn action(values: &[&str]) -> Value {
     json!({"type":"string","enum":values})
@@ -181,42 +162,6 @@ impl ToolRegistry {
                 ),
             },
             ToolSpec {
-                name: "symbol_search",
-                description: "Search Tree-sitter declarations across Rust, JS/JSX, TS/TSX, Python, Java and C# files. query matches symbol names (case-insensitive substring by default); use match=exact for an exact name. path scopes one file/directory; path_glob filters files; do not combine them. kind, container and max_depth follow code_outline. File changes expire cursors/IDs.",
-                source: true,
-                parameters: schema(
-                    json!({"project":project_field(),"query":string(),"path_glob":string(),"pattern":legacy_pattern("a symbol name (send that as query)"),"cursor":string(),"limit":{"type":"integer","minimum":1,"maximum":100}}),
-                    &[],
-                ),
-            },
-            ToolSpec {
-                name: "symbol_relations",
-                description: "Trace syntax calls/references without external language servers. Copy path and symbol_id from symbol_search/code_outline. relation=calls lists outgoing call sites in the symbol (nested functions have their own calls); callers finds incoming calls; references includes call and non-call uses. Optional path_glob limits scanned files; the target file is always included. resolved means a unique local syntax binding, NOT guaranteed runtime execution. Explicit imports/module paths and member access return candidate/ambiguous targets; unknown receivers or shadowed bindings remain unresolved. Never infer links from matching names alone. Inbound results omit unresolved targets: an empty page is not proof of no callers. Source changes expire cursors/IDs.",
-                source: true,
-                parameters: schema(
-                    json!({"project":project_field(),"path":string(),"symbol_id":string(),"relation":action(&["calls","callers","references"]),"path_glob":string(),"cursor":string(),"limit":{"type":"integer","minimum":1,"maximum":100}}),
-                    &["path", "symbol_id"],
-                ),
-            },
-            ToolSpec {
-                name: "code_outline",
-                description: "Explore one Rust, JS/JSX, TS/TSX, Python, Java or C# file. For a function list use {path,view:\"compact\",max_depth:0,kind:\"function\"}; use kind:\"method\" with container and without max_depth:0 for class methods. Omit kind only for a mixed overview. Find a name with {path,query:\"handleQuestion\",match:\"exact\",kind:\"function\"}. query defaults to case-insensitive substring matching. qualified_name is navigation, not a unique ID for overloaded methods. Defaults: all kinds/depths, view=detailed. Compact returns names, kinds, containers, positions, a ready-to-copy location and symbol IDs. For parameters, defaults and declared return types use view=detailed with query and match=exact; an untruncated signature often answers without a body read. When signature_context_start_line is present, shared declaration modifiers were omitted; use file_read there for the common prefix. Edits expire cursors/IDs.",
-                source: true,
-                parameters: schema(
-                    json!({"project":project_field(),"path":string(),"query":string(),"match":action(&["contains","exact"]),"case_sensitive":{"type":"boolean"},"kind":described(action(&["function","method","constructor","class","struct","interface","trait","impl","enum","enum_member","record","annotation","field","variable","constant","type","module","macro","property","accessor","event","delegate","operator","destructor"]), "Filters normalized symbol_kind."),"container":{"type":"string","description":"Exact enclosing symbol path, case-sensitive: copy the parent class qualified_name, e.g. Store or Outer::Inner, never converting :: to Java or C# member dots. Empty string selects top-level symbols."},"max_depth":{"type":"integer","minimum":0,"description":"Maximum symbol nesting depth: 0 top level, 1 direct members (not AST depth)."},"view":described(action(&["compact","detailed"]), "Detailed includes signature_source and signature_truncated; if truncated, read only the missing signature lines."),"cursor":string(),"limit":{"type":"integer","minimum":1,"maximum":100}}),
-                    &["path"],
-                ),
-            },
-            ToolSpec {
-                name: "symbol_read",
-                description: "Read a symbol's lines, e.g. {path,symbol_id,max_lines:30} for the start of a function. A range is capped at the symbol end; omit start_line and max_lines to read the whole symbol subject to file_read limits. Copy exact symbol_id from code_outline or symbol_search; stale IDs are rejected. If text is truncated, finish that requested range with file_read cursor before starting another range at next_line, at most symbol.end_line. Shared declaration lines can include neighboring declarations.",
-                source: true,
-                parameters: schema(
-                    json!({"project":project_field(),"path":string(),"symbol_id":string(),"start_line":{"type":"integer","minimum":1,"description":"Absolute file line inside the symbol, NOT a relative offset. Omit to start at the symbol's first line."},"max_lines":{"type":"integer","minimum":1,"maximum":2000,"description":"Requested line count."},"force_read":{"type":"boolean"}}),
-                    &["path", "symbol_id"],
-                ),
-            },
-            ToolSpec {
                 name: "file_read",
                 description: "Read a project file or one of the project's reference documents: path (relative to the project root, or the reference document path exactly as listed), 1-based start_line and max_lines (line count, default and most 2000; one result holds at most the result limit). Example: {project:\"app\",path:\"src/agent.rs\",start_line:160,max_lines:140}. If truncated, continue ONLY with {cursor: next_cursor.cursor}; never combine cursor with path/start_line/max_lines. A cursor completes the original requested range and expires if the file changes. Once that range is complete, next_line indicates where a NEW range can start. Text arrives as N|line labels where N is the absolute line number. Use force_read=true only to re-read the same unchanged range on purpose.",
                 source: true,
@@ -226,29 +171,6 @@ impl ToolRegistry {
                 ),
             },
         ];
-        let outline_fields = specs
-            .iter()
-            .find(|spec| spec.name == "code_outline")
-            .unwrap()
-            .parameters["properties"]
-            .clone();
-        let search_fields = specs
-            .iter_mut()
-            .find(|spec| spec.name == "symbol_search")
-            .unwrap()
-            .parameters["properties"]
-            .as_object_mut()
-            .unwrap();
-        for field in [
-            "path",
-            "match",
-            "case_sensitive",
-            "kind",
-            "container",
-            "max_depth",
-        ] {
-            search_fields.insert(field.into(), outline_fields[field].clone());
-        }
         specs.push(ToolSpec {
             name: "history",
             description: "Search this conversation's earlier questions, answers, tool calls and tool results, including those that left the active context (this tool is offered once part of the conversation has left it); continue a search with after: next_cursor. Read one by ID and character offset (read requires id; a search item's offset reads from its match). A result archived because it was too large is read on here from the id and offset its next_cursor names.",
@@ -533,8 +455,7 @@ pub fn normalize_arguments(name: &str, args: &mut Value) -> Vec<String> {
         // "" names nothing where a field navigates, and is no value of a
         // number, flag, list, object or choice: sent for an optional one, it
         // was refused (a blank id beside a knowledge cursor, kind:"" beside a
-        // path) and cost a request. A plain text field keeps it (container ""
-        // selects top-level symbols).
+        // path) and cost a request. A plain text field keeps it.
         let blank = value.as_str() == Some("")
             && (matches!(
                 key.as_str(),
@@ -935,7 +856,7 @@ fn path_shape_hint(root: &Path, path: &str) -> Option<String> {
         ));
     }
     path.contains(['*', '?', '[', '{']).then(|| format!(
-        " path takes one exact file or directory and does not expand globs; to match files by pattern send path_glob:{path:?} instead (file_list, source_search and symbol_search accept path_glob)."
+        " path takes one exact file or directory and does not expand globs; to match files by pattern send path_glob:{path:?} instead (file_list and source_search accept path_glob)."
     ))
 }
 
@@ -1092,7 +1013,7 @@ fn directory_error(p: &Project, directory: &DirectoryPath, tool: &str) -> anyhow
             },
         );
     let next = match tool {
-        "code_outline" | "symbol_read" | "symbol_relations" | "file_read" => format!(
+        "file_read" => format!(
             "{tool} reads one file: find it with file_list and path_glob (e.g. {glob}), then call {tool} with that file path"
         ),
         _ => format!("use file_list with path_glob (e.g. {glob}), then file_read with a file path"),
@@ -1434,7 +1355,7 @@ fn search_text(path: &Path) -> Result<Option<String>> {
     }
 }
 
-/// The line range a read, search match or outline symbol delivered. MnemoArc
+/// The line range a read or search match delivered. MnemoArc
 /// kept these as evidence IDs for memories and citation audits; here only the
 /// range remains, and the model view drops it (the content carries it).
 #[derive(Clone, Copy)]
@@ -1549,9 +1470,6 @@ fn execute_validated(
         }
     }
     match name {
-        "code_outline" | "symbol_read" => structure::execute(s, name, &args, cancel),
-        "symbol_search" => navigation::search(s, &args, cancel),
-        "symbol_relations" => navigation::relations(s, &args, cancel),
         "history" => match text(&args, "action")? {
             "search" => Ok(s.history.search(
                 args["query"].as_str().unwrap_or(""),
@@ -1735,7 +1653,7 @@ fn file_read_metadata(message: &Value) -> Option<FileReadMetadata> {
     })
 }
 
-/// Shared line reader for explicit file reads and Tree-sitter symbol bodies.
+/// The line reader of file_read.
 fn read_file(
     s: &mut Workspace,
     args: &mut Value,
@@ -1919,12 +1837,10 @@ pub fn model_result(result: &Value) -> Value {
                 }
             }
         }
-        for rows in ["matches", "symbols"] {
-            if let Some(rows) = data.get_mut(rows).and_then(Value::as_array_mut) {
-                for row in rows {
-                    if let Some(row) = row.as_object_mut() {
-                        row.remove("source");
-                    }
+        if let Some(rows) = data.get_mut("matches").and_then(Value::as_array_mut) {
+            for row in rows {
+                if let Some(row) = row.as_object_mut() {
+                    row.remove("source");
                 }
             }
         }
@@ -2017,22 +1933,7 @@ pub fn limit_result(
     mut result: Value,
     limit: usize,
 ) -> Value {
-    if call.name == "code_outline"
-        && result["status"] == "ok"
-        && let (Some(path), Some(cursor)) = (
-            result["data"]["path"].as_str(),
-            result["data"]["next_cursor"].as_str(),
-        )
-    {
-        result["next_cursor"] = structure::continuation(args, path, cursor);
-    }
-    if matches!(call.name.as_str(), "symbol_search" | "symbol_relations")
-        && result["status"] == "ok"
-        && let Some(cursor) = result["data"]["next_cursor"].as_str()
-    {
-        result["next_cursor"] = navigation::continuation(&call.name, args, cursor);
-    }
-    if matches!(call.name.as_str(), "file_read" | "symbol_read")
+    if call.name == "file_read"
         && result["status"] == "ok"
         && result["data"]["content"]["truncated"] == true
         && !result["next_cursor"]["cursor"].is_string()
@@ -2070,17 +1971,6 @@ pub fn bound_result(
         return result;
     }
     let mut output = result.clone();
-    if call.name == "code_outline"
-        && let Some(page) = structure::limit_outline(call, args, &output, limit, &model)
-    {
-        return page;
-    }
-    if matches!(call.name.as_str(), "symbol_search" | "symbol_relations")
-        && result["status"] == "ok"
-        && let Some(page) = navigation::limit_page(call, args, &output, limit, &model)
-    {
-        return page;
-    }
     // A document goes on from the knowledge by chunk number (no archive): it
     // is cut at whole chunks, with the cursor to the first one left out.
     if call.name == "knowledge_read"
@@ -2100,7 +1990,7 @@ pub fn bound_result(
     }
     // A file read continues from the file with its cursor: it is archived
     // only when its text cannot be narrowed to the limit.
-    let reads_file = matches!(call.name.as_str(), "file_read" | "symbol_read")
+    let reads_file = call.name == "file_read"
         && output["data"]["content"]["text"].is_string();
     // A history search pages by itself (after: next_cursor): it is archived
     // only when not one match fits. An archive would also hold the search's
@@ -2132,7 +2022,7 @@ pub fn bound_result(
         }
         let chars: Vec<_> = text.chars().collect();
         let template = output.clone();
-        let reading = matches!(call.name.as_str(), "file_read" | "symbol_read")
+        let reading = call.name == "file_read"
             && pointer == "/data/content/text";
         let narrowed_cursor = reading.then(new_file_cursor_id);
         let candidate = |length: usize, s: &Workspace| {
@@ -2194,7 +2084,7 @@ pub fn bound_result(
     }
     // Collections stay structured: a shortened native page resumes at the
     // first omitted item, other collections continue in the archive.
-    for field in ["paths", "matches", "items", "rows", "hits", "outline", "files", "counts"] {
+    for field in ["paths", "matches", "items", "rows", "hits", "files", "counts"] {
         let Some(items) = output["data"][field].as_array().cloned() else {
             continue;
         };
@@ -2624,162 +2514,6 @@ mod tests {
         assert!(error.starts_with("unsafe_ignore_file"), "{error}");
     }
 
-    #[test]
-    fn relations_pages_build_only_their_rows_and_continue_with_a_cursor() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("lib.rs"), "fn x() {}\nfn a() { x(); }\nfn b() { x(); x(); }\n").unwrap();
-        let mut ws = workspace(dir.path());
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let found = execute(&mut ws, "symbol_search", json!({"query":"x","match":"exact"}), &cancel).unwrap();
-        let symbol = &found["symbols"][0];
-        let args = json!({"path":symbol["path"],"symbol_id":symbol["symbol_id"],"relation":"callers","limit":2});
-        let first = execute(&mut ws, "symbol_relations", args.clone(), &cancel).unwrap();
-        assert_eq!((first["total_results"].clone(), first["relations"].as_array().unwrap().len()), (json!(3), 2));
-        let lines: Vec<_> = first["relations"].as_array().unwrap().iter().map(|r| r["line"].clone()).collect();
-        assert_eq!(lines, [json!(2), json!(3)]);
-        let mut next = args;
-        next["cursor"] = first["next_cursor"].clone();
-        let second = execute(&mut ws, "symbol_relations", next, &cancel).unwrap();
-        assert_eq!(second["relations"].as_array().unwrap().len(), 1);
-        assert_eq!(second["relations"][0]["enclosing_symbol"]["name"], "b");
-        assert!(second["next_cursor"].is_null());
-    }
-
-    /// Tool and MCP review, 2026-10-22 (second session): symbol_relations
-    /// named a directory, a file that is not UTF-8 or one without a grammar
-    /// "unsupported_language: use source_search/file_read" alike, where
-    /// symbol_read says what each is; the model was told to give up on a
-    /// supported language.
-    #[test]
-    fn relations_say_what_the_path_is_as_symbol_read_does() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/lib.rs"), "fn x() {}\nfn a() { x(); }\n").unwrap();
-        std::fs::write(dir.path().join("src/latin1.rs"), b"fn caf\xe9() {}\n").unwrap();
-        std::fs::write(dir.path().join("notes.txt"), "x\n").unwrap();
-        let mut ws = workspace(dir.path());
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let found = execute(&mut ws, "symbol_search", json!({"query":"x","match":"exact"}), &cancel).unwrap();
-        let id = found["symbols"][0]["symbol_id"].clone();
-        for (path, code) in [("src", "path_is_directory"), ("src/latin1.rs", "unsupported_non_utf8_file"), ("notes.txt", "unsupported_language")] {
-            let relations = execute(&mut ws, "symbol_relations", json!({"path":path,"symbol_id":id}), &cancel).unwrap_err().to_string();
-            assert!(relations.starts_with(code), "{path}: {relations}");
-            if path != "notes.txt" {
-                let read = execute(&mut ws, "symbol_read", json!({"path":path,"symbol_id":id}), &cancel).unwrap_err().to_string();
-                assert_eq!(recovery::error_code(&read), recovery::error_code(&relations), "{path}");
-            }
-            assert_eq!(recovery::describe(&relations)["code"], code, "{path}");
-        }
-        assert!(execute(&mut ws, "symbol_relations", json!({"path":"notes.txt","symbol_id":id}), &cancel).unwrap_err().to_string().contains("supported extensions are rs"));
-        let calls = execute(&mut ws, "symbol_relations", json!({"path":"src/lib.rs","symbol_id":id,"relation":"callers"}), &cancel).unwrap();
-        assert_eq!(calls["total_results"], 1, "{calls}");
-    }
-
-    /// Tool and MCP review, 2026-10-22 (second session): a symbol_id sent
-    /// with another file's path was told "source changed; call code_outline
-    /// again", and the model outlined the file it had named, which never
-    /// held the symbol. Its path part says which file it was listed for.
-    #[test]
-    fn a_symbol_id_of_another_file_names_its_file() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/lib.rs"), "fn x() {}\nfn a() { x(); }\n").unwrap();
-        std::fs::write(dir.path().join("src/other.rs"), "fn y() {}\n").unwrap();
-        let mut ws = workspace(dir.path());
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let found = execute(&mut ws, "symbol_search", json!({"query":"x","match":"exact"}), &cancel).unwrap();
-        let id = found["symbols"][0]["symbol_id"].clone();
-        for tool in ["symbol_read", "symbol_relations"] {
-            let error = execute(&mut ws, tool, json!({"path":"src/other.rs","symbol_id":id}), &cancel).unwrap_err().to_string();
-            assert!(error.starts_with("invalid_symbol_id: this symbol_id was listed for src/lib.rs, not src/other.rs"), "{tool}: {error}");
-            assert_eq!(recovery::describe(&error)["action"], "copy_observed_symbol_id");
-        }
-        // Its own file still reads it, and a changed file is still a revision.
-        assert!(execute(&mut ws, "symbol_read", json!({"path":"src/lib.rs","symbol_id":id}), &cancel).is_ok());
-        std::fs::write(dir.path().join("src/lib.rs"), "fn x() { }\nfn a() { x(); }\n").unwrap();
-        let changed = execute(&mut ws, "symbol_read", json!({"path":"src/lib.rs","symbol_id":id}), &cancel).unwrap_err().to_string();
-        assert!(changed.starts_with("symbol_revision_conflict"), "{changed}");
-    }
-
-    /// A module named with a dot (./string.utils, ./app.service) was taken
-    /// for a file with that extension, so its .ts/.js file was never tried
-    /// and the calls of what it exports were lost to callers.
-    #[test]
-    fn a_dotted_module_name_finds_its_file() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("web/lib/app.service")).unwrap();
-        std::fs::write(dir.path().join("web/string.utils.ts"), "export function helper() { return 1; }\n").unwrap();
-        std::fs::write(dir.path().join("web/lib/app.service/index.js"), "export function serve() {}\n").unwrap();
-        std::fs::write(dir.path().join("web/view.tsx"), "export function draw() {}\n").unwrap();
-        std::fs::write(
-            dir.path().join("web/main.ts"),
-            "import { helper } from './string.utils';\nimport { serve } from './lib/app.service';\nimport { draw } from './view.jsx';\nexport function run() { helper(); serve(); draw(); }\n",
-        )
-        .unwrap();
-        let mut ws = workspace(dir.path());
-        let cancel = tokio_util::sync::CancellationToken::new();
-        for (name, file) in [("helper", "web/string.utils.ts"), ("serve", "web/lib/app.service/index.js"), ("draw", "web/view.tsx")] {
-            let found = execute(&mut ws, "symbol_search", json!({"query":name,"match":"exact"}), &cancel).unwrap();
-            let symbol = &found["symbols"][0];
-            assert_eq!(symbol["path"], file);
-            let args = json!({"path":file,"symbol_id":symbol["symbol_id"],"relation":"callers"});
-            let callers = execute(&mut ws, "symbol_relations", args, &cancel).unwrap();
-            let rows = callers["relations"].as_array().unwrap();
-            assert_eq!(rows.len(), 1, "{name}: {callers}");
-            assert_eq!((rows[0]["path"].as_str(), rows[0]["line"].as_u64()), (Some("web/main.ts"), Some(4)));
-        }
-    }
-
-    /// What a module exports by a list (`export { b as bee }`) or as its
-    /// default is found from the module's export lists, read once per call.
-    #[test]
-    fn listed_and_default_exports_reach_their_callers() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("lib.js"), "function a() {}\nfunction b() {}\nexport { a, b as bee };\nexport default a;\n").unwrap();
-        std::fs::write(dir.path().join("main.js"), "import d, { a, bee } from './lib.js';\nexport function run() {\n  a();\n  bee();\n  d();\n}\n").unwrap();
-        let mut ws = workspace(dir.path());
-        let cancel = tokio_util::sync::CancellationToken::new();
-        for (name, lines) in [("a", vec![3, 5]), ("b", vec![4])] {
-            let found = execute(&mut ws, "symbol_search", json!({"query":name,"match":"exact","path_glob":"lib.js"}), &cancel).unwrap();
-            let args = json!({"path":"lib.js","symbol_id":found["symbols"][0]["symbol_id"],"relation":"callers"});
-            let callers = execute(&mut ws, "symbol_relations", args, &cancel).unwrap();
-            let rows: Vec<u64> = callers["relations"].as_array().unwrap().iter().filter_map(|row| row["line"].as_u64()).collect();
-            assert_eq!(rows, lines, "{name}: {callers}");
-        }
-    }
-
-    /// Resolving each reference looked at every fact of its file and every
-    /// export of an imported module: 48,000 lines of Python took 6.6 s, and
-    /// 3,000 references to an import of a 3,000-function module ran past the
-    /// time limit. Each assignment, each name in a Python class body and each
-    /// `global` directive also looked at every scope or directive of the file.
-    #[test]
-    fn relations_of_large_files_stay_within_seconds() {
-        let dir = tempfile::tempdir().unwrap();
-        let python: String = (0..3000).map(|i| format!("def f{i}(a, b):\n    y = helper(a, b)\n    return y\n")).collect();
-        std::fs::write(dir.path().join("big.py"), python + "def helper(p, q):\n    return p\n").unwrap();
-        let exports: String = (0..3000).map(|i| format!("export function e{i}(x) {{ return x; }}\n")).collect();
-        std::fs::write(dir.path().join("lib.js"), exports).unwrap();
-        let uses: String = (0..3000).map(|i| format!("export function g{i}(y) {{ return e1(y) + e2(y); }}\n")).collect();
-        std::fs::write(dir.path().join("main.js"), format!("import {{ e1, e2 }} from './lib.js';\n{uses}")).unwrap();
-        let writes: String = (0..3000).map(|i| format!("export function w{i}(a) {{ let y = a; y += 1; return pass(y); }}\n")).collect();
-        std::fs::write(dir.path().join("writes.js"), writes + "export function pass(p) { return p; }\n").unwrap();
-        let methods: String = (0..3000).map(|i| format!("    def m{i}(self):\n        return x + lift(x)\n")).collect();
-        std::fs::write(dir.path().join("class.py"), format!("class K:\n    x = 1\n{methods}def lift(p):\n    return p\nx = 2\n")).unwrap();
-        let globals: String = (0..3000).map(|i| format!("def g{i}(a):\n    global count\n    count = count + a\n    return keep(count)\n")).collect();
-        std::fs::write(dir.path().join("globals.py"), format!("count = 0\n{globals}def keep(p):\n    return p\n")).unwrap();
-        let mut ws = workspace(dir.path());
-        let cancel = tokio_util::sync::CancellationToken::new();
-        for (name, path, total) in [("helper", "big.py", 3000), ("e1", "lib.js", 3000), ("pass", "writes.js", 3000), ("lift", "class.py", 3000), ("keep", "globals.py", 3000)] {
-            let found = execute(&mut ws, "symbol_search", json!({"query":name,"match":"exact","path_glob":path}), &cancel).unwrap();
-            let started = std::time::Instant::now();
-            let args = json!({"path":path,"symbol_id":found["symbols"][0]["symbol_id"],"relation":"references"});
-            let references = execute(&mut ws, "symbol_relations", args, &cancel).unwrap();
-            assert_eq!(references["total_results"], total, "{name}");
-            assert!(started.elapsed() < std::time::Duration::from_secs(30), "{name}: {:?}", started.elapsed());
-        }
-    }
-
     /// The model saw every source path relative to the project root but
     /// those of source_search mode=files, a list of bare paths: absolute,
     /// the root in front of each.
@@ -2804,6 +2538,38 @@ mod tests {
             };
             assert_eq!(paths, [json!("b.rs"), json!("src/a.rs")], "{mode}");
         }
+    }
+
+    /// Performance review, 2026-10-23: source_search hashed every file in
+    /// scope into its cursor and matched each line on its own, 1.35s for
+    /// 20,000 files (313 MB) with one match among them. Files without a
+    /// match are passed over in one scan and left out of the cursor, which
+    /// still expires when a file with a match changes.
+    #[test]
+    fn a_search_cursor_follows_only_the_files_that_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let hits: String = (0..5).map(|i| format!("let Hit_{i} = load();\nlet other = 1;\n")).collect();
+        std::fs::write(dir.path().join("a.rs"), &hits).unwrap();
+        std::fs::write(dir.path().join("b.rs"), "nothing here\n").unwrap();
+        let mut ws = workspace(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let args = json!({"query":"load()","whole_word":true,"limit":2});
+        let first = execute(&mut ws, "source_search", args.clone(), &cancel).unwrap();
+        assert_eq!(first["total_matching_lines"], 5);
+        let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+        let next = |ws: &mut Workspace| {
+            let mut args = args.clone();
+            args["cursor"] = json!(cursor);
+            execute(ws, "source_search", args, &cancel)
+        };
+        std::fs::write(dir.path().join("b.rs"), "still nothing\n").unwrap();
+        let second = next(&mut ws).unwrap();
+        assert_eq!(second["matches"][0]["line"], 5, "{second}");
+        // Case-insensitive OR finds the same lines as by lines alone.
+        let either = execute(&mut ws, "source_search", json!({"queries":["hit_3","absent"],"case_sensitive":false}), &cancel).unwrap();
+        assert_eq!(either["matches"][0]["line"], 7, "{either}");
+        std::fs::write(dir.path().join("a.rs"), format!("// moved\n{hits}")).unwrap();
+        assert!(next(&mut ws).unwrap_err().to_string().starts_with("cursor_expired"));
     }
 
     /// The descriptions and hints say `**` crosses directories; `*` did
@@ -2867,7 +2633,7 @@ mod tests {
     }
 
     /// Tool review, 2026-10-22 (fifth pass): file_list and source_search had
-    /// no time limit (only the structure tools kept "소스 도구 한도"): a
+    /// no time limit (only the symbol tools kept "소스 도구 한도"): a
     /// search of a large project held the question until it ran out.
     #[test]
     fn file_tools_stop_at_the_source_tool_limit_and_say_to_narrow() {
@@ -2877,19 +2643,13 @@ mod tests {
         assert_eq!(recovery::describe(&error)["action"], "narrow_the_scope");
         let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
         assert!(past_deadline(later, "file_list", 0, 1, 30, "").is_ok());
-        // A walk past its time names no syntax analysis.
         let dir = tempfile::tempdir().unwrap();
         let project = Project { root: dir.path().into(), ..Default::default() };
         let walk = candidate_paths_scoped(&project, None, &tokio_util::sync::CancellationToken::new(), None, Some(past)).unwrap_err().to_string();
-        assert!(walk.starts_with("scope_timeout: listing the files") && !walk.contains("syntax"), "{walk}");
-        // Eighth pass: the walk and the syntax work past the same limit were
-        // told as transient (`cancelled_or_timeout`), to be sent again.
+        assert!(walk.starts_with("scope_timeout: listing the files"), "{walk}");
+        // Eighth pass: a walk past the limit was told as transient
+        // (`cancelled_or_timeout`), to be sent again.
         assert_eq!(recovery::describe(&walk)["action"], "narrow_the_scope");
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let syntax = structure::check_budget(&cancel, past).unwrap_err().to_string();
-        assert_eq!(recovery::describe(&syntax)["action"], "narrow_the_scope", "{syntax}");
-        cancel.cancel();
-        assert_eq!(structure::interrupted(&cancel, "syntax parsing").to_string(), "cancelled");
     }
 
     /// Fourth pass: on Windows the tools showed paths with `\`, and a glob
@@ -3570,10 +3330,9 @@ mod tests {
         assert!(repaired("file_read", json!({"path":"a.rs","start_line":-3.0})).unwrap_err().contains("minimum=1"));
         // Bind values are numbers of any kind, as sent.
         assert_eq!(repaired("query_run", json!({"query_name":"q","params":{"a":1.5}})).unwrap()["params"]["a"], 1.5);
-        assert_eq!(
-            repaired("code_outline", json!({"path":"a.rs","kind":"","match":"","view":"","max_depth":"","container":""})),
-            Ok(json!({"path":"a.rs","container":""}))
-        );
+        assert_eq!(repaired("file_list", json!({"path":"","mode":"","limit":""})), Ok(json!({})));
+        // A plain text field keeps it.
+        assert_eq!(repaired("source_search", json!({"query":"","path":""})), Ok(json!({"query":""})));
         assert_eq!(
             repaired("source_search", json!({"query":"x","mode":"","before":"","regex":"","path_glob":""})),
             Ok(json!({"query":"x"}))

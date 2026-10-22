@@ -47,6 +47,9 @@ pub const ONE_SHOT_PREFIX: &str = "once:";
 /// before them stops at them: a request that has not begun its answer, and
 /// tool calls.
 const FINAL_RESERVE_SECS: u64 = 45;
+/// How long a stopped batch waits for its source calls to end as cancelled
+/// (they check between files and lines) before going on without them.
+const SOURCE_STOP_GRACE: Duration = Duration::from_secs(2);
 const TIME_OVER: &str = "답변 시간이 다 되어 마무리하지 못했습니다. 질문을 좁혀 다시 시도해주세요.";
 /// A short question the model server refused as longer than its context.
 const SERVED_SMALLER: &str = "모델 서버가 받을 수 있는 컨텍스트가 설정보다 작아 답할 수 없습니다. 설정의 컨텍스트와 출력 한도를 모델 서버에 맞춰주세요.";
@@ -1452,6 +1455,7 @@ async fn execute_batch(
             _ => None,
         })
         .collect();
+    let source_indices: Vec<usize> = source_calls.iter().map(|(index, ..)| *index).collect();
     let tool_config = ToolConfig {
         model: config.llm.model.clone(),
         result_tokens: config.result_budget(),
@@ -1508,8 +1512,7 @@ async fn execute_batch(
             if call.name != "history" {
                 result["root"] = json!(root_text.display().to_string());
             }
-            let continued = continuation_args(&call.name, &clean, &workspace.project);
-            let mut result = tools::limit_result(&mut workspace, &call, &continued, result, share);
+            let mut result = tools::limit_result(&mut workspace, &call, &clean, result, share);
             if call.name != "history" && result.get("root").is_none() {
                 result["root"] = json!(root_text.display().to_string());
             }
@@ -1596,9 +1599,25 @@ async fn execute_batch(
             runs[index] = Some(run);
         }
     }
-    let (outputs, cursors, scopes, history) = match source_task.await {
-        Ok(done) => done,
-        Err(_) => (vec![], backup.0, backup.1, backup.2),
+    // A source call stuck in the file system (a network drive gone silent)
+    // sees `cancel` only once its read returns, which may be never: a
+    // stopped question, or one at its deadline, waited for it for good. Past
+    // a moment's grace the batch goes on without it, its calls cancelled;
+    // its thread ends on its own, with copies the conversation no longer
+    // uses.
+    let mut source_task = source_task;
+    let joined = tokio::select! {
+        joined = &mut source_task => Some(joined),
+        _ = cancel.cancelled() => tokio::time::timeout(SOURCE_STOP_GRACE, &mut source_task).await.ok(),
+    };
+    let (outputs, cursors, scopes, history) = match joined {
+        Some(Ok(done)) => done,
+        _ => {
+            for &index in &source_indices {
+                events.send(json!({"type":"tool_done","id":ids[index],"name":calls[index].name,"status":"cancelled"}));
+            }
+            (vec![], backup.0, backup.1, backup.2)
+        }
     };
     c.file_cursors = cursors;
     c.list_cursor_scopes = scopes;
@@ -1812,9 +1831,6 @@ fn fit_batch(ws: &mut Workspace, calls: &[ToolCall], prepared: &[Prepared], resu
             fields.remove("project");
             fields.remove("__adjusted");
         }
-        if let Prepared::Source { project, .. } = &prepared[index] {
-            args = continuation_args(&calls[index].name, &args, project);
-        }
         let limit = size.saturating_sub(total - room).max(crate::config::MIN_RESULT_TOKENS);
         let result = std::mem::take(&mut results[index]);
         let cut = tools::bound_result(ws, &calls[index], &args, result, limit);
@@ -1823,19 +1839,6 @@ fn fit_batch(ws: &mut Workspace, calls: &[ToolCall], prepared: &[Prepared], resu
         sizes[index] = cut_size;
         results[index] = cut;
     }
-}
-
-/// The arguments a cut result's continuation repeats (a page of
-/// code_outline, symbol_search or symbol_relations): with the project the
-/// call ran in, which the call may have left out (a path found in one
-/// project, the only project). Copied as given, a continuation without it is
-/// refused where several projects are.
-fn continuation_args(name: &str, args: &Value, project: &Project) -> Value {
-    let mut args = args.clone();
-    if name != "history" && args.is_object() {
-        args["project"] = json!(project.name);
-    }
-    args
 }
 
 fn search_targets(args: &Value) -> Value {
@@ -1958,7 +1961,7 @@ mod tests {
         assert_eq!(project, "b");
         assert!(note.unwrap().contains("only project where"));
         let absolute = dir.path().join("a/only_a.txt").display().to_string();
-        assert_eq!(resolve("code_outline", json!({"path":absolute}), &none).unwrap().0, "a");
+        assert_eq!(resolve("file_list", json!({"path":absolute}), &none).unwrap().0, "a");
         assert_eq!(resolve("file_list", json!({"path":"."}), &none).unwrap_err(), "project_required: \".\" exists in a, b; name the project");
         let both = resolve("file_read", json!({"path":"README.md"}), &none).unwrap_err();
         assert!(both.starts_with("project_required") && both.contains("exists in a, b"), "{both}");

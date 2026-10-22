@@ -15,9 +15,7 @@ pub fn call_summary(root: &Path, name: &str, arguments: &str) -> String {
     let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
     let path = |key: &str| relative(root, args[key].as_str().unwrap_or(""));
     let detail = match name {
-        // symbol_read also carries a symbol_id, an opaque hash of about 140
-        // characters; its path says where the symbol is.
-        "file_read" | "symbol_read" => {
+        "file_read" => {
             let target = path("path");
             // A continuation may carry only its cursor.
             if target.is_empty() {
@@ -27,15 +25,7 @@ pub fn call_summary(root: &Path, name: &str, arguments: &str) -> String {
                     String::new()
                 }
             } else {
-                // Without start_line, symbol_read starts at the symbol's first
-                // line, not line 1 of the file.
-                let from_symbol = name == "symbol_read" && args["start_line"].is_null();
-                let range = if from_symbol {
-                    String::new()
-                } else {
-                    range(&args)
-                };
-                format!("{target}{range}")
+                format!("{target}{}", range(&args))
             }
         }
         "file_list" => args["path_glob"]
@@ -43,8 +33,7 @@ pub fn call_summary(root: &Path, name: &str, arguments: &str) -> String {
             .or(args["pattern"].as_str())
             .map(str::to_owned)
             .unwrap_or_else(|| path("path")),
-        "code_outline" => join([path("path"), quoted(&args["query"])]),
-        "source_search" | "symbol_search" => {
+        "source_search" => {
             let query = match &args["queries"] {
                 Value::Array(queries) => queries
                     .iter()
@@ -63,10 +52,6 @@ pub fn call_summary(root: &Path, name: &str, arguments: &str) -> String {
                 .unwrap_or_else(|| path("path"));
             join([query, scope])
         }
-        "symbol_relations" => join([
-            args["relation"].as_str().unwrap_or("").to_owned(),
-            path("path"),
-        ]),
         "history" => match args["action"].as_str() {
             Some("search") => quoted(&args["query"]),
             _ => args["id"].as_u64().map_or_else(String::new, |id| format!("#{id}")),
@@ -113,10 +98,6 @@ pub fn call_summary(root: &Path, name: &str, arguments: &str) -> String {
 /// Korean names of the tools, as the progress lines show them.
 pub fn label(name: &str) -> &str {
     match name {
-        "symbol_search" => "심볼 검색",
-        "symbol_relations" => "호출·참조 추적",
-        "code_outline" => "코드 구조 조회",
-        "symbol_read" => "심볼 본문 읽기",
         "file_list" => "파일 목록",
         "file_read" => "파일 읽기",
         "source_search" => "소스 검색",

@@ -11,7 +11,7 @@
       query_describe  — 등록 쿼리의 바인드·입력/출력 설명·대상 DB·SQL
       query_run       — 등록 쿼리 실행 (미리보기 행 + step 번호, 독립 조회는 한 응답에 여럿)
       result_read     — 보관된 조회 결과의 다른 행·열 읽기 (DB 재실행 없음)
-      file_read · source_search · code_outline · symbol_* · file_list — 프로젝트 소스 읽기 (쓰기 도구 없음)
+      file_read · source_search · file_list — 프로젝트 소스 읽기 (쓰기 도구 없음)
   → 도구 없이 낸 응답이 최종 답변. 조회 표·차트는 참조(```table step: N)로 적고 화면이 채운다
 ```
 
@@ -61,7 +61,7 @@ backend/                     # Rust (cargo) — 실행 파일 target/release/llm
   src/session.rs             # 대화(이력 묶음·조회 결과 보관)와 대화 저장소
   src/llm.rs                 # OpenAI 호환 SSE 클라이언트 (MnemoArc)
   src/voc_tools.rs           # search·knowledge_read·method_read·query_describe·query_run·result_read
-  src/tools/                 # 프로젝트 소스 도구 (MnemoArc: 검색·tree-sitter 구조·심볼 탐색·결과 한도)
+  src/tools/                 # 프로젝트 소스 도구 (MnemoArc: 목록·검색·읽기·결과 한도)
   src/mcp/                   # MCP 도구 서버 연결·재연결·호출·결과 변환 (docs/mcp-design.md)
   tests/fixtures/fake_mcp_server.mjs  # 시험용 가짜 MCP 서버 (stdio·HTTP, Node)
   src/search.rs, embed_sync.rs, embedding.rs, chunk.rs   # 벡터 검색·동기화
@@ -677,7 +677,7 @@ Claude Code·opencode처럼 결과마다 따로 받고 호출 수로 나누지 �
 | `query_describe` | 쿼리의 실행 유형·바인드·입력/출력 설명·대상 DB·SQL | 한 번에 10건 |
 | `query_run` | 등록 쿼리 실행. 결과는 `step` 번호와 미리보기 행. 대상 DB가 여럿이면 `target_db`로 고른다 | 미리보기 20 / 100행 |
 | `result_read` | 보관된 조회 결과의 다른 행·열을 읽는다(DB 재실행 없음) | 50 / 200행 |
-| `file_list`·`source_search`·`code_outline`·`symbol_search`·`symbol_relations`·`symbol_read`·`file_read` | 프로젝트 소스 읽기(아래) | MnemoArc 기본값, `file_read`는 2,000줄 |
+| `file_list`·`source_search`·`file_read` | 프로젝트 소스 읽기(아래) | MnemoArc 기본값, `file_read`는 2,000줄 |
 | `history` | 지난 질문·답·도구 결과(맥락에서 빠진 것 포함)를 찾고 다시 읽기. 무언가 맥락에서 빠진 뒤에 생긴다 | — |
 | `서버__도구` | 연결된 MCP 서버의 도구 중 허용한 것(아래 'MCP 도구 서버로 도구 붙이기') | 서버가 정한다, 결과는 같은 한도 |
 
@@ -699,11 +699,9 @@ Claude Code·opencode처럼 결과마다 따로 받고 호출 수로 나누지 �
 | 참고 문서 | 먼저 읽을 md 문서(한 줄에 하나, 폴더 기준 상대 경로 또는 절대 경로 — 폴더 밖 문서도 여기 적은 것만 읽힌다) |
 | 포함 / 제외 | glob 패턴(한 줄에 하나, `.gitignore`처럼 읽는다 — 폴더에 맞는 패턴은 그 아래 전부, `secrets/`의 끝 `/`는 폴더 표기, `/` 없는 이름(`.env`)은 어느 깊이에서나). 비우면 전부 / 없음. `.git`·`node_modules`·`target` 같은 빌드·도구 폴더는 늘 뺀다 |
 
-모델은 실행 상태에 실린 프로젝트 목록(이름·설명·참고 문서)을 보고 프로젝트를 고른 뒤, 참고 문서 → `source_search`·`symbol_search`
-→ `file_read`·`symbol_read` 순으로 좁혀 읽고 `경로:시작-끝` 줄 번호로 근거를 단다. 프로젝트가 하나면 이름을 생략해도 된다. 둘 이상이면 도구 정의가 `project`를 필수로 요구하고(설정된 이름 중 선택),
+모델은 실행 상태에 실린 프로젝트 목록(이름·설명·참고 문서)을 보고 프로젝트를 고른 뒤, 참고 문서 → `source_search`(식별자·정의·호출 위치)
+→ `file_read` 순으로 좁혀 읽고 `경로:시작-끝` 줄 번호로 근거를 단다. 프로젝트가 하나면 이름을 생략해도 된다. 둘 이상이면 도구 정의가 `project`를 필수로 요구하고(설정된 이름 중 선택),
 그래도 빠진 호출은 경로가 한 프로젝트에만 있을 때 그 프로젝트로 실행한다.
-구조 도구(`code_outline`·`symbol_*`)는 같은 파일을 다시 볼 때를 위해 최근 구문 트리 몇 개(원본 합계 4MiB까지)를 남기고,
-5분 동안 쓰이지 않은 트리는 버린다(1분마다 확인) — 트리는 원본 1바이트에 40~130바이트라 4MiB 파일 하나가 170~520MiB다.
 도구는 전부 읽기 전용이다 — 파일 쓰기·명령 실행·DB 쓰기 도구는 없다. 경로는 정규화한 뒤 소스 폴더 안이어야 하고
 (심볼릭 링크·`..`로 밖에 나가면 거절), 예외는 그 프로젝트의 참고 문서로 적은 정확한 파일뿐이다. 서버 프로세스가 읽을 수 있는
 폴더만 등록할 수 있으므로, 비밀이 든 폴더(`.env`·키 파일)는 제외 패턴에 적거나 등록하지 않는다.
