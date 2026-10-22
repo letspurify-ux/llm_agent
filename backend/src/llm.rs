@@ -363,6 +363,17 @@ fn record_attempt_failure(
     diagnostics.push(diagnostic);
 }
 
+/// `error` with the API key taken out of its text, as the attempt
+/// diagnostics have it. A provider that echoes the credential in its refusal
+/// had it reach the chat log's trace, the console and the settings screen's
+/// connection check, which never show a stored secret back.
+fn without_key(error: anyhow::Error, c: &Config) -> anyhow::Error {
+    match OpenAiClient::key(c) {
+        Some(key) if format!("{error:#}").contains(&key) => anyhow::anyhow!(format!("{error:#}").replace(&key, "[redacted]")),
+        _ => error,
+    }
+}
+
 fn apply_thinking_settings(request: &mut Value, c: &Config) {
     if c.enable_thinking {
         if let Some(effort) = &c.reasoning_effort {
@@ -1070,6 +1081,7 @@ impl OpenAiClient {
             .map_err(|_| {
                 anyhow::anyhow!("connection_probe_timeout: check exceeded {timeout_secs}s")
             })?
+            .map_err(|e| without_key(e, c))
     }
     /// The body of a plain (non-streaming) answer as JSON.
     async fn read_plain_answer(response: reqwest::Response, c: &Config) -> Result<Value> {
@@ -1485,7 +1497,7 @@ impl LlmClient for OpenAiClient {
                             c,
                         );
                         let mut failure = CompletionError::new(
-                            e,
+                            without_key(e, c),
                             attempt.saturating_add(1),
                             transient,
                         )
@@ -2059,6 +2071,39 @@ mod probe_tests {
         assert!(problem(r#"{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"id":"c"}]}}]}"#).unwrap().contains("tool call"));
         assert!(problem(r#"{"choices":[{"message":{"content":"OK"}}]}"#).unwrap().contains("finish_reason=missing"));
         assert!(problem(r#"{"choices":[]}"#).unwrap().starts_with("no choices"));
+    }
+
+    /// Settings review, 2026-10-22: a refusal echoing the API key reached
+    /// the connection check's message (and a question's error, the chat log
+    /// and the console) whole, though the attempt diagnostics hid it.
+    #[tokio::test]
+    async fn a_refusal_that_echoes_the_key_is_told_without_it() {
+        let key = "sk-echoed-0123456789";
+        let (config, _) = serve(vec![r#"{"error":{"message":"Invalid API key sk-echoed-0123456789","code":401}}"#]).await;
+        let config = Config { api_key: Some(crate::config::Secret(key.into())), ..config };
+        let error = format!("{:#}", OpenAiClient.probe(&config).await.unwrap_err());
+        assert!(!error.contains(key) && error.contains("[redacted]"), "{error}");
+        // A streamed request refused with the key in its body.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = [0u8; 65536];
+                let _ = socket.read(&mut buffer).await;
+                let body = r#"{"error":{"message":"Incorrect API key provided: sk-echoed-0123456789"}}"#;
+                let reply = format!("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        let config = Config { base_url: format!("http://127.0.0.1:{port}/v1"), ..config };
+        let (tx, _rx) = mpsc::channel(8);
+        let error = OpenAiClient
+            .complete(json!({"model":"m","messages":[{"role":"user","content":"hi"}]}), &config, CancellationToken::new(), tx)
+            .await
+            .unwrap_err();
+        let shown = format!("{error:#}");
+        assert!(!shown.contains(key) && shown.starts_with("http_401: "), "{shown}");
+        assert!(error.downcast_ref::<CompletionError>().is_some(), "still told as a completion failure");
     }
 
     #[tokio::test]
