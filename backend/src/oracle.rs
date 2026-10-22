@@ -494,6 +494,10 @@ pub fn resolve_target_db(registry: &Row, chosen: Option<&str>) -> Result<String>
 /// anything else is the password itself.
 fn resolve_password(stored: &str) -> Result<String> {
     match crate::text::password_env_reference(stored) {
+        Some((name, true)) if crate::text::backend_secret(&name) => {
+            eprintln!("[oracle] the target DB password refers to {name}, a secret of the backend itself — not sent; enter another variable");
+            Err(wasted("조회대상 DB 접속 정보가 서버에 설정되어 있지 않습니다.", SETUP_HINT))
+        }
         Some((name, true)) => match std::env::var(&name) {
             Ok(value) if !value.is_empty() => Ok(value),
             _ => {
@@ -966,6 +970,17 @@ pub fn public_error(error: &anyhow::Error) -> (String, Option<String>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row written before the admin screen refused it (or by hand) is not
+    /// resolved either: the backend's own password stays home.
+    #[test]
+    fn a_target_password_naming_the_backends_own_secret_is_not_read() {
+        let refused = resolve_password("ENV:MARIADB_PASSWORD").unwrap_err();
+        let (_, _, wasted) = public_error(&refused);
+        assert!(wasted, "{refused}");
+        assert!(resolve_password("ENV:Llm_Api_Key").is_err());
+        assert_eq!(resolve_password("plain").unwrap(), "plain");
+    }
 
     /// Full review, 2026-10-22 (second session): a query and the settings
     /// screen's check loaded the client library on the runtime's thread.

@@ -314,8 +314,12 @@ pub fn validate_record(kind: &str, body: &Value, editing: bool) -> Result<Vec<(S
         if get(&values, "db_name").contains(';') {
             return Err(ApiError::new(400, "DB 이름에는 세미콜론을 사용할 수 없습니다."));
         }
-        if password_env_reference(&get(&values, "db_password")).is_some_and(|(_, valid)| !valid) {
-            return Err(ApiError::new(400, "환경변수 참조는 ENV:변수명 형식으로 입력해주세요."));
+        match password_env_reference(&get(&values, "db_password")) {
+            Some((_, false)) => return Err(ApiError::new(400, "환경변수 참조는 ENV:변수명 형식으로 입력해주세요.")),
+            Some((name, true)) if crate::text::backend_secret(&name) => {
+                return Err(ApiError::new(400, format!("{name}은(는) backend 자신의 비밀값이라 조회 대상 DB 비밀번호로 쓸 수 없습니다. 다른 환경변수 이름을 써주세요.")));
+            }
+            _ => {}
         }
     }
     if kind == "queries" {
@@ -844,6 +848,15 @@ async fn directories(Query(query): Query<DirectoryQuery>) -> ApiResult<Json<Valu
 
 // ===== Settings =====
 
+/// The settings' revision as the screen sees it. `Config::revision` hashes
+/// the stored secrets in, so it goes out keyed like every other revision:
+/// bare, it let a reader of the settings test guesses of a weak management
+/// DB password offline, the password this screen never shows nor sends to
+/// another host.
+fn settings_revision(app: &App, config: &Config) -> String {
+    hmac_revision(app, "settings", &config.revision())
+}
+
 fn settings_view(app: &App, config: &Config) -> Value {
     let mut sections = serde_json::to_value(config).unwrap_or_default();
     if let Some(fields) = sections.as_object_mut() {
@@ -873,7 +886,7 @@ fn settings_view(app: &App, config: &Config) -> Value {
             "mariadb_password":config.mariadb.password.is_some(),
             "admin_token":config.admin_token.is_some()
         },
-        "revision":config.revision(),
+        "revision":settings_revision(app, config),
         "restart_required":restart,
         "status":{"oracle_client":client}
     })
@@ -980,7 +993,7 @@ async fn settings_put(State(app): State<Arc<App>>, headers: HeaderMap, body: Byt
     let revision = require_revision(&if_match(&headers))?;
     let _guard = app.config_write.lock().await;
     let current = app.config();
-    if current.revision() != revision {
+    if settings_revision(&app, &current) != revision {
         return Err(ApiError::new(409, "설정이 다른 화면에서 변경되었습니다. 다시 열어 확인해주세요."));
     }
     let config = draft(&current, &body)?;
@@ -1351,6 +1364,15 @@ fn mcp_draft(body: &Value, mut server: McpServer) -> ApiResult<McpServer> {
         server.env.clear();
         server.secret_env.clear();
     }
+    let plain = server.env.values().chain(server.headers.values()).map(String::as_str);
+    let secret = server.secret_env.values().chain(server.secret_headers.values()).map(|s| s.0.as_str());
+    for value in plain.chain(secret) {
+        if let Some((name, true)) = password_env_reference(value)
+            && crate::text::backend_secret(&name)
+        {
+            return Err(ApiError::new(400, format!("{name}은(는) backend 자신의 비밀값이라 MCP 서버에 넘길 수 없습니다. 다른 환경변수 이름을 써주세요.")));
+        }
+    }
     crate::mcp::validate_server(&server).map_err(|e| ApiError::new(400, e.to_string()))?;
     Ok(server)
 }
@@ -1448,6 +1470,25 @@ async fn mcp_check(State(app): State<Arc<App>>, body: Bytes) -> ApiResult<Json<V
 mod tests {
     use super::*;
 
+    /// Full review, 2026-10-22 (fourth session): the settings revision was
+    /// the bare hash of the configuration with its secrets, so anyone who
+    /// could read the settings (everyone, without an admin key) could test
+    /// password guesses against it offline.
+    #[test]
+    fn the_settings_revision_does_not_carry_a_bare_hash_of_the_secrets() {
+        let mut config = Config::default();
+        config.mariadb.password = Some(Secret("1234".into()));
+        let app = App::new("config.toml".into(), config.clone(), Arc::new(crate::llm::OpenAiClient));
+        let shown = settings_view(&app, &config)["revision"].as_str().unwrap().to_owned();
+        assert_ne!(shown, config.revision(), "the bare hash went out");
+        assert_eq!(shown, settings_revision(&app, &config), "the screen's If-Match is what it was given");
+        let mut changed = config.clone();
+        changed.mariadb.password = Some(Secret("12345".into()));
+        assert_ne!(settings_revision(&app, &changed), shown, "a changed secret still changes the revision");
+        let other = App::new("config.toml".into(), config.clone(), Arc::new(crate::llm::OpenAiClient));
+        assert_ne!(settings_revision(&other, &config), shown, "keyed by the server's own random key");
+    }
+
     #[test]
     fn mcp_draft_reads_disable_proxy() {
         let base = McpServer { name: "web".into(), command: "node".into(), ..Default::default() };
@@ -1484,6 +1525,32 @@ mod tests {
         // same host on another path.
         assert!(mcp_draft(&json!({"url":"https://wiki.elsewhere.com/mcp","headers":{"Authorization":"ENV:OTHER_TOKEN"}}), base.clone()).is_ok());
         assert!(mcp_draft(&json!({"url":"https://wiki.example.com/v2/mcp"}), base).is_ok());
+    }
+
+    /// Full review, 2026-10-22 (fourth session): `ENV:` read the backend's
+    /// whole environment, `.env` included, so a target DB entered with
+    /// `ENV:MARIADB_PASSWORD` (anyone could, without an admin key) sent the
+    /// management DB password to the address beside it, and an MCP header
+    /// `ENV:LLM_API_KEY` the API key to its server.
+    #[test]
+    fn a_reference_to_the_backends_own_secret_is_refused() {
+        let db = |password: &str| json!({"db_name":"A","db_type":"oracle","connection_info":"evil:1521/x","db_user":"u","db_password":password});
+        for own in ["ENV:MARIADB_PASSWORD", "ENV:llm_api_key", " env: ADMIN_TOKEN "] {
+            let refused = validate_record("databases", &db(own), false).unwrap_err();
+            assert_eq!(refused.status, 400, "{own}");
+            assert!(refused.message.contains("backend"), "{}", refused.message);
+        }
+        assert!(validate_record("databases", &db("ENV:ORDER_DB_PASSWORD"), false).is_ok());
+        let base = McpServer { name: "wiki".into(), url: "https://wiki.example.com/mcp".into(), ..Default::default() };
+        assert!(mcp_draft(&json!({"headers":{"Authorization":"ENV:LLM_API_KEY"}}), base.clone()).is_err());
+        assert!(mcp_draft(&json!({"secrets":{"headers":{"Authorization":"ENV:ADMIN_TOKEN"}}}), base.clone()).is_err());
+        let stdio = McpServer { name: "tool".into(), command: "node".into(), ..Default::default() };
+        assert!(mcp_draft(&json!({"env":{"DB":"ENV:MARIADB_PASSWORD"}}), stdio).is_err());
+        assert!(mcp_draft(&json!({"secrets":{"headers":{"Authorization":"ENV:WIKI_TOKEN"}}}), base.clone()).is_ok());
+        // A file edited by hand still loads; the connection refuses to read it.
+        let mut hand = base;
+        hand.headers.insert("Authorization".into(), "ENV:LLM_API_KEY".into());
+        assert!(crate::mcp::validate_server(&hand).is_ok());
     }
 
     #[test]

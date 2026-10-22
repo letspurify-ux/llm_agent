@@ -37,7 +37,9 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     // `.env` values (ENV:NAME target DB passwords, first-start import) join
     // the process environment without overriding it.
-    let _ = dotenvy::dotenv();
+    if let Ok(env) = dotenvy::dotenv() {
+        llm_agent::tools::keep_out(&env);
+    }
     let path = config_path(&args);
     let config = match Config::load(&path) {
         Ok(config) => config,

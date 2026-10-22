@@ -2044,6 +2044,9 @@ async fn end_process(mut child: Box<dyn process_wrap::tokio::ChildWrapper>) {
 /// `ENV:NAME` value names.
 fn resolve(server: &str, key: &str, value: &str) -> Result<String> {
     match crate::text::password_env_reference(value) {
+        Some((name, true)) if crate::text::backend_secret(&name) => {
+            bail!("MCP 서버 {server}: {key}이(가) backend 자신의 비밀값 {name}을(를) 가리켜 보내지 않습니다")
+        }
         Some((name, true)) => match std::env::var(&name) {
             Ok(value) if !value.is_empty() => Ok(value),
             _ => bail!("{key}이(가) 가리키는 환경변수 {name}이(가) backend에 설정되어 있지 않습니다"),
@@ -2716,6 +2719,16 @@ async fn check(server: &McpServer, model: &str, given_up: &CancellationToken) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Full review, 2026-10-22 (fourth session): a reference to the
+    /// backend's own secret, saved by hand, is not read at connection time.
+    #[test]
+    fn a_value_naming_the_backends_own_secret_is_not_resolved() {
+        let refused = resolve("wiki", "Authorization", "ENV:LLM_API_KEY").unwrap_err().to_string();
+        assert!(refused.contains("LLM_API_KEY"), "{refused}");
+        assert!(resolve("wiki", "DB", "env:mariadb_password").is_err());
+        assert_eq!(resolve("wiki", "X-Team", "voc").unwrap(), "voc");
+    }
 
     fn server(name: &str) -> McpServer {
         McpServer { name: name.into(), command: "node".into(), ..Default::default() }

@@ -989,7 +989,7 @@ INSERT INTO query_registry (query_name, query_desc, input_desc, query_sql, outpu
 - 그래도 조회 계정(`target_db.db_user`)은 **read-only 권한 계정**을 사용할 것 (심층 방어).
   Oracle 12c+라면 `GRANT SELECT`가 아니라 `GRANT READ`를 준다 — 차이는 딱 하나, READ에는 `LOCK TABLE`과 `SELECT … FOR UPDATE`가 빠져 있어
   위 가드와 같은 규칙이 계정 차원에서도 강제된다 (`sql/oracle-init.sql`이 그렇게 부여한다)
-- `db_password`는 `ENV:변수명` 형식으로 환경변수 참조 권장. 평문 저장은 개발용만
+- `db_password`는 `ENV:변수명` 형식으로 환경변수 참조 권장. 평문 저장은 개발용만. backend 자신의 비밀값 이름(`LLM_API_KEY`·`MARIADB_PASSWORD`·`ADMIN_TOKEN`)은 `ENV:`로 가리킬 수 없다(조회 대상 DB·MCP 헤더 모두)
 - **프로젝트 소스 도구는 읽기 전용**이고 등록한 폴더 밖(심볼릭 링크·`..` 포함)은 읽지 않는다. 파일 쓰기·명령 실행 도구는 아예 없다
 - **MCP 도구는 등록한 서버가 하는 일을 그대로 한다** — 쓰기·삭제를 하는 도구도 있고, 모델은 사람 승인 없이 부른다. 허용 목록(`tools`)이
   유일한 통제다. 서버가 붙인 '읽기 전용' 힌트는 믿지 말고 도구가 실제로 하는 일을 보고 허용한다. 도구 결과에 섞인 지시문은 근거 자료로만

@@ -195,6 +195,15 @@ pub fn password_env_reference(value: &str) -> Option<(String, bool)> {
     Some((name, valid))
 }
 
+/// Whether an `ENV:` reference names one of the backend's own secrets as
+/// `.env` holds them (`Config::import_env`). `.env` is loaded into the
+/// environment a reference reads, so such a reference sent the backend's
+/// key or password to the target DB or MCP server it was entered for, which
+/// the MCP children's environment withholds on purpose.
+pub fn backend_secret(name: &str) -> bool {
+    ["LLM_API_KEY", "MARIADB_PASSWORD", "ADMIN_TOKEN"].iter().any(|own| own.eq_ignore_ascii_case(name))
+}
+
 /// Normalizes a question as the former server did: surrounding JavaScript
 /// whitespace removed.
 pub fn normalize_question(raw: &str) -> String {

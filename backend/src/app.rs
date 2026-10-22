@@ -100,6 +100,9 @@ pub struct App {
 
 impl App {
     pub fn new(config_path: PathBuf, config: Config, llm: Arc<dyn LlmClient>) -> Arc<Self> {
+        // The proxy address in the settings may carry its password too.
+        crate::tools::keep_out(&config_path);
+        crate::tools::keep_out(&crate::config::credentials_path(&config_path));
         let config = Arc::new(config);
         Arc::new(Self {
             config_path,

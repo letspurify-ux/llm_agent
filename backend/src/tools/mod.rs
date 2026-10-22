@@ -762,6 +762,28 @@ pub fn doc_paths(p: &Project) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The backend's own secret files (its settings, its credentials file and
+/// the `.env` it loaded), which no project reads though one may hold them: a project
+/// registered at the backend's own folder let file_read hand the API key
+/// and passwords to the model and to whoever asked (an explicit path does
+/// not go by `.gitignore`).
+static KEPT_OUT: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Keeps `path` out of every project's reach from now on.
+pub fn keep_out(path: &Path) {
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    let mut kept = KEPT_OUT.lock().unwrap_or_else(|p| p.into_inner());
+    if !kept.contains(&path) {
+        kept.push(path);
+    }
+}
+
+/// The kept-out files as they resolve now (a file made later is found then).
+fn kept_out() -> Vec<PathBuf> {
+    let kept = KEPT_OUT.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    kept.iter().filter_map(|path| path.canonicalize().ok()).collect()
+}
+
 pub fn read_path(p: &Project, path: &str) -> Result<PathBuf> {
     resolve_path(p, path, true)
 }
@@ -812,6 +834,12 @@ fn resolve_path(p: &Project, path: &str, hints: bool) -> Result<PathBuf> {
         )
     })?;
     utf8_path(&canonical)?;
+    if kept_out().contains(&canonical) {
+        bail!(
+            "path_excluded: {} holds the agent server's own secrets and cannot be read; choose another file",
+            candidate.display()
+        );
+    }
     // A configured reference document may live outside the root.
     if doc_paths(p).contains(&canonical) {
         return Ok(canonical);
@@ -1283,6 +1311,7 @@ fn candidate_paths_bounded(
         })
         .transpose()?;
     let rules = Rules::new(p)?;
+    let secrets = kept_out();
     // The walker reads the root's and its parents' ignore files first.
     for dir in root.ancestors() {
         if let Some(file) = unsafe_ignore_file(dir) {
@@ -1317,6 +1346,7 @@ fn candidate_paths_bounded(
         if directory.is_some_and(|scope| !entry.path().starts_with(scope))
             || excluded_by(p, &rules, rel)
             || filter.as_ref().is_some_and(|f| !f.is_match(glob_path(rel)))
+            || secrets.iter().any(|secret| secret == entry.path())
         {
             continue;
         }
@@ -2481,6 +2511,35 @@ mod tests {
                 _ => assert!(parameters["properties"].get("project").is_none()),
             }
         }
+    }
+
+    /// Full review, 2026-10-22 (fourth session): a project registered at
+    /// the backend's own folder let file_read open the backend's credentials
+    /// file (an explicit path does not go by `.gitignore`), and handed the
+    /// keys in it to the model and the asker.
+    #[test]
+    fn the_backends_own_secret_files_stay_out_of_every_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = dir.path().join("backend");
+        std::fs::create_dir(&backend).unwrap();
+        std::fs::write(backend.join("config.credentials.json"), "{\"llm_api_key\":\"sk-kept-out\"}\n").unwrap();
+        std::fs::write(backend.join("main.rs"), "fn main() {} // sk-kept-out is a word here\n").unwrap();
+        keep_out(&crate::config::credentials_path(&backend.join("config.toml")));
+        let mut s = workspace(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        for path in ["backend/config.credentials.json", "backend/./CONFIG.credentials.json"] {
+            let read = execute(&mut s, "file_read", json!({"path":path}), &cancel);
+            if cfg!(target_os = "linux") && path.contains("CONFIG") {
+                continue;
+            }
+            let error = read.unwrap_err().to_string();
+            assert!(error.starts_with("path_excluded"), "{path}: {error}");
+        }
+        let listed = execute(&mut s, "file_list", json!({"mode":"paths"}), &cancel).unwrap();
+        assert_eq!(listed["paths"], json!(["backend/main.rs"]));
+        let found = execute(&mut s, "source_search", json!({"query":"sk-kept-out"}), &cancel).unwrap();
+        assert_eq!(found["matching_files"], 1, "{found}");
+        assert_eq!(found["matches"][0]["path"].as_str().unwrap(), backend.join("main.rs").canonicalize().unwrap().to_str().unwrap());
     }
 
     fn workspace(root: &Path) -> Workspace {
