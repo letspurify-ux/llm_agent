@@ -14,7 +14,7 @@ use crate::{
 use anyhow::Result;
 use futures_util::FutureExt;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     panic::AssertUnwindSafe,
     sync::{
         Mutex,
@@ -388,13 +388,14 @@ async fn sync(state: &EmbedSync, db: &Db, config: &Config, stop: &CancellationTo
             .map(|r| (db::int(&r, "seq"), db::text(&r, "embed_hash")))
             .collect();
         let mut stale: Vec<(i64, String)> = vec![];
-        // Rows whose vector is replaced: each leaves its old index entry.
-        let mut replaced = 0u64;
+        let mut replacing = Replacing::default();
         for r in &rows {
             let seq = db::int(r, "seq");
             let h = db::text(r, "h");
             if check && stored.get(&seq) != Some(&h) {
-                replaced += u64::from(stored.contains_key(&seq));
+                if stored.contains_key(&seq) {
+                    replacing.had.insert(seq);
+                }
                 stale.push((seq, h));
             }
             stored.remove(&seq);
@@ -455,7 +456,7 @@ async fn sync(state: &EmbedSync, db: &Db, config: &Config, stop: &CancellationTo
                     )
                 })
                 .collect();
-            match embed_stale(state, db, config, table, &batch, probe, stop, &mut out).await {
+            match embed_stale(state, db, config, table, &batch, probe, stop, &mut replacing, &mut out).await {
                 Flow::Continue => {}
                 Flow::Unavailable => {
                     unavailable = true;
@@ -472,7 +473,7 @@ async fn sync(state: &EmbedSync, db: &Db, config: &Config, stop: &CancellationTo
         if out.skipped == Skipped::Stopped {
             break;
         }
-        let left = replaced + (out.deleted - deleted_before);
+        let left = replacing.replaced + (out.deleted - deleted_before);
         if let Err(e) = rebuild_index(state, db, config, table, left, stop, &mut out).await {
             eprintln!("[embed] could not check the vector index of {} — trying again at a later sync: {e:#}", vec_table(table));
         }
@@ -586,6 +587,25 @@ fn unwritable(vec: &str, waiting: usize, e: &anyhow::Error) {
     eprintln!("[embed] {vec} takes no writes — {waiting} rows to embed wait for the next sync: {e}");
 }
 
+/// Rows of one table whose stored vector a new one replaces: each leaves
+/// its old index entry behind, once the new vector is stored. Counted when
+/// found out of date instead, a row the embedding server refused or could
+/// not be reached for counted again at every sync, and the table was
+/// rebuilt for entries never left.
+#[derive(Default)]
+struct Replacing {
+    /// Out-of-date rows that have a vector.
+    had: HashSet<i64>,
+    /// Of them, the ones given a new vector.
+    replaced: u64,
+}
+
+impl Replacing {
+    fn stored(&mut self, batch: &[(i64, String, String)]) {
+        self.replaced += batch.iter().filter(|row| self.had.contains(&row.0)).count() as u64;
+    }
+}
+
 enum Flow {
     Continue,
     Unavailable,
@@ -603,6 +623,7 @@ async fn embed_stale(
     stale: &[(i64, String, String)],
     probe: Option<i64>,
     stop: &CancellationToken,
+    replacing: &mut Replacing,
     out: &mut Summary,
 ) -> Flow {
     let taken = |batch: &[(i64, String, String)]| {
@@ -618,7 +639,7 @@ async fn embed_stale(
         match embed(&config.embedding, &texts, stop).await {
             Ok(vectors) => {
                 taken(batch);
-                if store(db, config, table, batch, &vectors, out).await.is_err() {
+                if store(db, config, table, batch, &vectors, replacing, out).await.is_err() {
                     return Flow::Unwritable;
                 }
             }
@@ -645,7 +666,7 @@ async fn embed_stale(
                     match embed(&config.embedding, std::slice::from_ref(&row.1), stop).await {
                         Ok(vectors) => {
                             taken(std::slice::from_ref(row));
-                            if store(db, config, table, std::slice::from_ref(row), &vectors, out).await.is_err() {
+                            if store(db, config, table, std::slice::from_ref(row), &vectors, replacing, out).await.is_err() {
                                 return Flow::Unwritable;
                             }
                         }
@@ -681,7 +702,15 @@ fn warn(e: &EmbedError) {
 /// Stores the batch's vectors, row by row when the batch fails. Err when
 /// the table refuses writes as such (`db::refuses_writes`, said here): the
 /// rows after it wait for the next sync.
-async fn store(db: &Db, config: &Config, table: &str, batch: &[(i64, String, String)], vectors: &[Vec<f32>], out: &mut Summary) -> Result<(), ()> {
+async fn store(
+    db: &Db,
+    config: &Config,
+    table: &str,
+    batch: &[(i64, String, String)],
+    vectors: &[Vec<f32>],
+    replacing: &mut Replacing,
+    out: &mut Summary,
+) -> Result<(), ()> {
     let cfg = &config.mariadb;
     let vec = vec_table(table);
     let mut params = vec![];
@@ -695,6 +724,7 @@ async fn store(db: &Db, config: &Config, table: &str, batch: &[(i64, String, Str
     match db.exec(cfg, &sql, params).await {
         Ok(_) => {
             out.embedded += batch.len();
+            replacing.stored(batch);
             return Ok(());
         }
         Err(e) if db::refuses_writes(&e) => {
@@ -713,7 +743,10 @@ async fn store(db: &Db, config: &Config, table: &str, batch: &[(i64, String, Str
             )
             .await
         {
-            Ok(_) => out.embedded += 1,
+            Ok(_) => {
+                out.embedded += 1;
+                replacing.stored(std::slice::from_ref(row));
+            }
             Err(e) if db::refuses_writes(&e) => {
                 out.failed += batch.len() - i;
                 unwritable(&vec, batch.len() - i, &e);

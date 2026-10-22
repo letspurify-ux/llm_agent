@@ -595,8 +595,10 @@ impl Config {
                 self.input_budget() / 2
             );
         }
-        if self.oracle.timeout_ms == 0 {
-            bail!("Oracle 시간 한도는 0보다 커야 합니다.");
+        // The Oracle client takes its limits as 32-bit milliseconds: past
+        // them every query failed, the pool or session refusing the limit.
+        if self.oracle.timeout_ms == 0 || self.oracle.timeout_ms > MAX_TIMEOUT_SECS * 1000 {
+            bail!("Oracle 시간 한도는 0보다 크고 {} ms(하루) 이하여야 합니다.", MAX_TIMEOUT_SECS * 1000);
         }
         if self.server.port == 0 || self.server.chat_log_retention_days == 0 {
             bail!("서버 포트와 대화 로그 보관 일수는 0보다 커야 합니다.");
@@ -947,6 +949,12 @@ mod tests {
             set(&mut wrong);
             assert!(wrong.validate().unwrap_err().to_string().contains("이하여야"));
         }
+        // Past 2^32 ms the Oracle client refuses the limit itself.
+        let mut config = Config::default();
+        config.oracle.timeout_ms = MAX_TIMEOUT_SECS * 1000;
+        config.validate().unwrap();
+        config.oracle.timeout_ms = u64::from(u32::MAX) + 1;
+        assert!(config.validate().unwrap_err().to_string().contains("Oracle"));
     }
 
     #[test]

@@ -457,6 +457,42 @@ async fn an_account_without_alter_syncs_on_and_with_it_rebuilds_by_its_own_count
     db.close().await;
 }
 
+/// Rows whose vector is out of date leave an index entry behind only once
+/// a new vector replaces the old. Counted as replaced whether or not they
+/// were, rows the embedding server refused (or could not be reached for)
+/// were counted again at every sync, and an account without PROCESS, which
+/// goes by its own count, rebuilt the table at every sync for nothing.
+#[tokio::test]
+async fn rows_not_embedded_again_are_not_counted_as_left_behind() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    let _turn = SYNCING.lock().await;
+    let Some(test_db) = TestDb::create("sync_rebuild_refused") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    test_db.sql_in("INSERT INTO qa_method (title, method) SELECT CONCAT('거절 ', seq), CONCAT('절차 ', seq) FROM seq_1_to_150;");
+    // Every row has a vector, none of them current.
+    add_vectors(&test_db, "qa_method");
+    let users = Users::create(&test_db, "SELECT, INSERT, UPDATE, DELETE, ALTER");
+    let (taking, asked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+    let port = refusing_embedding_server(taking.clone(), asked).await;
+    let mut config = users.config();
+    config.embedding.url = format!("http://127.0.0.1:{port}/v1");
+    let db = Db::default();
+    let sync = EmbedSync::default();
+    for _ in 0..3 {
+        let summary = sync.run(&db, &config, &CancellationToken::new()).await.unwrap();
+        assert_eq!((summary.embedded, summary.rebuilt), (0, 0), "{summary}");
+    }
+    // Taken now, every row's vector is replaced: as many entries left as rows.
+    taking.store(true, std::sync::atomic::Ordering::Release);
+    let mut rebuilt = 0;
+    for _ in 0..2 {
+        rebuilt += sync.run(&db, &config, &CancellationToken::new()).await.unwrap().rebuilt;
+    }
+    assert_eq!(rebuilt, 1, "the replaced vectors' entries are rebuilt away once");
+    db.close().await;
+}
+
 /// An embedding server that refuses every request as a model not pulled
 /// (Ollama's 404) until `taking` is set, and then answers every input with
 /// a vector of its own; `asked` counts the requests.
