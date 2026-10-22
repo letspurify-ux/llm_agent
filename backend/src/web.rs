@@ -277,22 +277,43 @@ const ANSWER_BYTES: usize = 8 * 1024 * 1024;
 /// count stays, `rowsOmitted` marks them), then the steps themselves.
 pub fn fit_trace(mut trace: Value) -> Value {
     let size = |trace: &Value| trace.to_string().len();
+    let total = size(&trace);
+    if total <= TRACE_BYTES {
+        return trace;
+    }
+    // Rows leave until the trace fits, its size kept by what each removal
+    // takes away and adds (`[]` and `,"rowsOmitted":true` in place of the
+    // rows), not measured again a step at a time. All of them left out,
+    // a question with one wide query lost the rows of every other step too.
+    let emptied = |step: &mut Value| {
+        let had = step["rows"].as_array().is_some_and(|rows| !rows.is_empty());
+        if had {
+            step["rows"] = json!([]);
+            step["rowsOmitted"] = json!(true);
+        }
+        had
+    };
+    if let Some(steps) = trace["steps"].as_array_mut() {
+        let mut order: Vec<(usize, usize)> = steps.iter().enumerate().map(|(i, step)| (step["rows"].to_string().len(), i)).collect();
+        order.sort_unstable_by(|a, b| b.cmp(a));
+        let mut left = total;
+        for (bytes, index) in order {
+            if left <= TRACE_BYTES {
+                break;
+            }
+            if emptied(&mut steps[index]) {
+                left = left.saturating_sub(bytes).saturating_add(r#"[],"rowsOmitted":true"#.len());
+            }
+        }
+    }
     if size(&trace) <= TRACE_BYTES {
         return trace;
     }
     if let Some(steps) = trace["steps"].as_array_mut() {
-        let mut order: Vec<(usize, usize)> = steps.iter().enumerate().map(|(i, step)| (step["rows"].to_string().len(), i)).collect();
-        order.sort_unstable_by(|a, b| b.cmp(a));
-        for (_, index) in order {
-            let step = &mut steps[index];
-            if step["rows"].as_array().is_some_and(|rows| !rows.is_empty()) {
-                step["rows"] = json!([]);
-                step["rowsOmitted"] = json!(true);
-            }
+        for step in steps {
+            emptied(step);
         }
     }
-    // Rows left out one step at a time would measure the trace once a
-    // step; it is measured again only now.
     if size(&trace) <= TRACE_BYTES {
         return trace;
     }
@@ -564,6 +585,16 @@ mod tests {
         assert_eq!(fitted["steps"].as_array().unwrap().len(), 12, "the steps stay, their rows go");
         assert!(fitted["steps"][0]["rowsOmitted"] == true && fitted["steps"][0]["totalRows"] == 20);
         assert_eq!(fitted["outcome"], "answered");
+        // Full review, 2026-10-22 (second session): the narrow step's rows,
+        // which fit once the wide ones are out, were dropped as well.
+        assert_eq!(fitted["steps"][3]["rows"].as_array().map(Vec::len), Some(20), "the narrow step keeps its rows");
+        assert!(fitted["steps"][3].get("rowsOmitted").is_none());
+        // Only as many as needed leave, the widest first.
+        let mixed: Vec<Value> = (0..3).map(|i| json!({"step":i,"rows":wide([30, 8, 2][i]),"totalRows":20})).collect();
+        let fitted = fit_trace(json!({"v":5,"outcome":"answered","steps":mixed}));
+        assert!(fitted.to_string().len() <= TRACE_BYTES);
+        let omitted: Vec<bool> = (0..3).map(|i| fitted["steps"][i]["rowsOmitted"] == true).collect();
+        assert_eq!(omitted, [true, false, false], "{}", fitted.to_string().len());
         // A small trace is kept as it is.
         let small = json!({"v":5,"outcome":"answered","steps":[{"step":1,"rows":[{"A":1}]}]});
         assert_eq!(fit_trace(small.clone()), small);

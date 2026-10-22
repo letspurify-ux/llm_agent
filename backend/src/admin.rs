@@ -1043,7 +1043,7 @@ async fn settings_check(State(app): State<Arc<App>>, body: Bytes) -> ApiResult<J
             ))
         }
         .await,
-        "oracle_client" => match app.oracle.init_client(&app.started.oracle) {
+        "oracle_client" => match app.oracle.load_client(&app.started.oracle).await {
             Ok(version) => Ok(format!("Oracle 클라이언트 {version}을(를) 불러왔습니다.")),
             Err(e) => Err(anyhow::anyhow!(
                 "Oracle 클라이언트를 불러오지 못했습니다: {e} (폴더 설정은 서버를 다시 시작해야 적용됩니다)"
@@ -1136,9 +1136,20 @@ async fn mcp_list(State(app): State<Arc<App>>) -> ApiResult<Json<Value>> {
     .map_err(|_| ApiError::new(500, "MCP 서버 상태를 만들지 못했습니다."))
 }
 
+/// One server as `mcp_view` shows it, its definitions' tokens counted on a
+/// blocking thread as the listing's are: a server just connected (or
+/// reconnected by a save) counts all of its definitions, up to a thousand.
+async fn mcp_record(app: &Arc<App>, server: McpServer, status: StatusCode) -> ApiResult<Response> {
+    let app = app.clone();
+    let view = tokio::task::spawn_blocking(move || mcp_view(&app, &server))
+        .await
+        .map_err(|_| ApiError::new(500, "MCP 서버 상태를 만들지 못했습니다."))?;
+    Ok(record(view, status))
+}
+
 async fn mcp_read(State(app): State<Arc<App>>, Path(name): Path<String>) -> ApiResult<Response> {
     let server = find_mcp(&app, &name)?;
-    Ok(record(mcp_view(&app, &server), StatusCode::OK))
+    mcp_record(&app, server, StatusCode::OK).await
 }
 
 /// The server `body` describes over `server`: fields present replace it,
@@ -1363,7 +1374,7 @@ async fn mcp_create(State(app): State<Arc<App>>, body: Bytes) -> ApiResult<Respo
     }
     config.mcp_servers.push(server.clone());
     store_mcp(&app, config)?;
-    Ok(record(mcp_view(&app, &server), StatusCode::CREATED))
+    mcp_record(&app, server, StatusCode::CREATED).await
 }
 
 const MCP_CHANGED: &str = "이 MCP 서버는 다른 화면에서 변경되었습니다. 입력 내용을 보관한 뒤 다시 열어 확인해주세요.";
@@ -1392,7 +1403,7 @@ async fn mcp_update(State(app): State<Arc<App>>, Path(name): Path<String>, heade
         }
     }
     store_mcp(&app, config)?;
-    Ok(record(mcp_view(&app, &server), StatusCode::OK))
+    mcp_record(&app, server, StatusCode::OK).await
 }
 
 async fn mcp_remove(State(app): State<Arc<App>>, Path(name): Path<String>, headers: HeaderMap) -> ApiResult<StatusCode> {
@@ -1415,7 +1426,7 @@ async fn mcp_restart(State(app): State<Arc<App>>, Path(name): Path<String>) -> A
     if !app.mcp.restart(&server.name) {
         return Err(ApiError::new(409, "꺼진 서버는 다시 연결할 수 없습니다. 먼저 사용으로 바꿔 저장해주세요."));
     }
-    Ok(record(mcp_view(&app, &server), StatusCode::OK))
+    mcp_record(&app, server, StatusCode::OK).await
 }
 
 /// Connects with the draft settings (over the stored ones of `original`,

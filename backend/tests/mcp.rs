@@ -2479,6 +2479,37 @@ async fn the_status_counts_tokens_without_holding_up_questions() {
     hub.shutdown().await;
 }
 
+/// Full review, 2026-10-22 (second session): one server read from the admin
+/// screen (and the answer to its save) counted its definitions' tokens on
+/// the thread serving requests, the listing alone on a blocking thread.
+#[tokio::test(flavor = "current_thread")]
+async fn one_server_on_the_admin_screen_counts_without_holding_up_requests() {
+    if node_missing() {
+        return;
+    }
+    let mut keyed = config(vec![fake("fat", &["*"], &[("FAKE_MCP_FAT", "300"), ("FAKE_MCP_PAGE", "100")])]);
+    keyed.admin_token = Some(Secret("key".into()));
+    // Not the model `ready` counts for: the screen counts every definition.
+    keyed.llm.model = "another-model".into();
+    let (app, _dir) = app(keyed, Scripted::new(vec![]));
+    app.mcp.apply(&app.config().mcp_servers);
+    ready(&app.mcp, "fat").await;
+    let admin = Admin { router: llm_agent::web::router(app.clone()), token: Some("key".into()) };
+    let started = Instant::now();
+    let ticked = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        started.elapsed()
+    });
+    let (status, server, _) = admin.send("GET", "mcp/fat", None, None).await;
+    let counted = started.elapsed();
+    let ticked = ticked.await.unwrap();
+    assert_eq!(status, 200);
+    assert!(server["status"]["tools"].as_array().unwrap().iter().all(|t| t["tokens"].as_u64().is_some_and(|n| n > 0)));
+    assert!(counted > Duration::from_millis(200), "the count takes a while: {counted:?}");
+    assert!(ticked < counted / 2, "the request thread waited {ticked:?} for a count of {counted:?}");
+    app.mcp.shutdown().await;
+}
+
 /// Text a JavaScript server cut inside an emoji holds half a surrogate pair
 /// (a `\ud83d` escape), which JSON parsers refuse: the result comes with
 /// U+FFFD in its place, over stdio, SSE and plain JSON (so does a byte that

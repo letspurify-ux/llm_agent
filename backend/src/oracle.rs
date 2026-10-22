@@ -96,6 +96,21 @@ impl Oracle {
         self.client.get().cloned()
     }
 
+    /// `init_client` from async code: the library is loaded (its files read
+    /// from its folder, a network drive's too), or a load under way waited
+    /// for, on a blocking thread. Loaded on the runtime's own, as a query
+    /// and the settings screen's check did, a folder that did not answer
+    /// held a thread serving every request.
+    pub async fn load_client(self: &Arc<Self>, cfg: &OracleConfig) -> std::result::Result<String, String> {
+        if let Some(state) = self.client_state() {
+            return state;
+        }
+        let (oracle, cfg) = (self.clone(), cfg.clone());
+        tokio::task::spawn_blocking(move || oracle.init_client(&cfg))
+            .await
+            .unwrap_or_else(|_| Err("the Oracle client library could not be loaded: its loading stopped unexpectedly".into()))
+    }
+
     /// Runs a registry row with the model's params.
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
@@ -199,7 +214,7 @@ impl Oracle {
             return Err(wasted("조회대상 DB 접속 정보가 서버에 설정되어 있지 않습니다.", SETUP_HINT));
         }
         let password = resolve_password(&db::text(&row, "db_password"))?;
-        if let Err(e) = self.init_client(&config.oracle) {
+        if let Err(e) = self.load_client(&config.oracle).await {
             eprintln!("[oracle] the Oracle client library could not be loaded — install the Instant Client or set its folder in the settings: {e}");
             return Err(wasted(
                 "조회대상 DB 드라이버를 초기화하지 못했습니다.",
@@ -951,6 +966,20 @@ pub fn public_error(error: &anyhow::Error) -> (String, Option<String>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Full review, 2026-10-22 (second session): a query and the settings
+    /// screen's check loaded the client library on the runtime's thread.
+    /// Loaded once, its state answers without a thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_loaded_client_state_answers_without_loading_again() {
+        let oracle = Arc::new(Oracle::default());
+        oracle.client.set(Err("no client".into())).unwrap();
+        let cfg = OracleConfig { client_lib_dir: "/nonexistent/instantclient".into(), ..OracleConfig::default() };
+        assert_eq!(oracle.load_client(&cfg).await, Err("no client".into()));
+        let loaded = Arc::new(Oracle::default());
+        loaded.client.set(Ok("23.0.0.0.0".into())).unwrap();
+        assert_eq!(loaded.load_client(&cfg).await, Ok("23.0.0.0.0".into()));
+    }
 
     fn registry(targets: &str) -> Row {
         let mut r = Map::new();
