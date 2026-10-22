@@ -270,6 +270,15 @@ fn history(body: &Value) -> Vec<(String, String)> {
 }
 
 async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Result<Bytes, axum::extract::rejection::BytesRejection>) -> Response {
+    // JSON as JSON: another site's page can make the browser send a form or
+    // text/plain POST here without asking first (a JSON one it must ask
+    // about, and is refused), and read as JSON whatever its type, that ran a
+    // question of its words — the model, registered queries, MCP tools that
+    // file or send. The former server read only application/json bodies.
+    if !is_json(&headers) {
+        rejected(&app, "", "bad_content_type", None);
+        return error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "잘못된 요청입니다.");
+    }
     let bytes = match body {
         Ok(bytes) => bytes,
         Err(rejection) => {
@@ -368,6 +377,16 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Result<Byte
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-transform"));
     headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
     response
+}
+
+/// Whether a request says its body is JSON (`application/json`, any
+/// parameters after it).
+fn is_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("application/json"))
 }
 
 /// A run that panics ends as an error: the stream then still gets its error

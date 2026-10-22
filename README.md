@@ -585,6 +585,9 @@ Oracle은 설정 탭의 mock을 켜면 데모 쿼리 5개가 고정된 행을 �
 curl -s localhost:5173/api/chat -H 'Content-Type: application/json' -d '{"message":"홍길동 고객 주문 상태 알려줘"}'
 ```
 
+`Content-Type: application/json`이 아닌 요청은 415로 거절한다 — 다른 사이트의 페이지가 브라우저로 사전 확인 없이 보낼 수 있는
+폼·text/plain 요청이 질문을 실행해 모델·등록 쿼리·MCP 도구를 쓰지 못하게 한다(예전 Node 서버도 JSON 본문만 읽었다).
+
 ### 답변 안의 표 — 참조로 적고 화면이 채운다
 
 조회 결과를 표로 보일 때 모델은 값을 옮겨 적지 않는다. 20행 × 6열이면 수백에서 천 토큰을 한 글자씩 생성해야 하고

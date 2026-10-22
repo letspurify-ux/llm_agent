@@ -319,6 +319,17 @@ async fn chat_streams_ndjson_and_logs_each_outcome() {
         .unwrap();
     let response = client.router.clone().oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // A question another site's page could send without asking (a form or
+    // text/plain POST, or no type) is not run.
+    for content_type in [Some("text/plain;charset=UTF-8"), Some("application/x-www-form-urlencoded"), None] {
+        let mut request = Request::builder().method("POST").uri("/api/chat");
+        if let Some(content_type) = content_type {
+            request = request.header(header::CONTENT_TYPE, content_type);
+        }
+        let request = request.body(Body::from(json!({"message":"홍길동 고객 ID?"}).to_string())).unwrap();
+        let response = client.router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{content_type:?}");
+    }
 
     let request = Request::builder()
         .method("POST")
@@ -352,7 +363,7 @@ async fn chat_streams_ndjson_and_logs_each_outcome() {
 
     tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     assert_eq!(db.scalar("SELECT COUNT(*) FROM chat_log WHERE JSON_VALUE(trace, '$.outcome') = 'answered'"), "2");
-    assert_eq!(db.scalar("SELECT COUNT(*) FROM chat_log WHERE JSON_VALUE(trace, '$.outcome') = 'rejected'"), "3");
+    assert_eq!(db.scalar("SELECT COUNT(*) FROM chat_log WHERE JSON_VALUE(trace, '$.outcome') = 'rejected'"), "6");
     assert_eq!(db.scalar("SELECT JSON_VALUE(trace, '$.v') FROM chat_log ORDER BY seq DESC LIMIT 1"), "5");
 }
 
