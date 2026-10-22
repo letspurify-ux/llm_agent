@@ -146,6 +146,10 @@ impl Clipped {
         let units: Vec<u16> = text.encode_utf16().collect();
         let mark: Vec<u16> = TRUNC_MARK.encode_utf16().collect();
         let mut at = 0;
+        // Where the cell being read starts (after the last unescaped '|' or
+        // line break), kept while reading on rather than looked for back
+        // from each mark: many marks on one long line made that quadratic.
+        let (mut cell, mut seen) = (0, 0);
         while at + mark.len() <= units.len() {
             if units[at..at + mark.len()] != mark[..] {
                 at += 1;
@@ -157,19 +161,22 @@ impl Clipped {
                 }
             }
             // The table cell the mark ends: from the previous unescaped '|'.
-            let mut start = at;
-            while start > 0 && !(units[start - 1] == b'|' as u16 && (start < 2 || units[start - 2] != b'\\' as u16)) {
-                if units[start - 1] == b'\n' as u16 {
-                    break;
+            for i in seen..at {
+                if units[i] == b'\n' as u16 || (units[i] == b'|' as u16 && (i == 0 || units[i - 1] != b'\\' as u16)) {
+                    cell = i + 1;
                 }
-                start -= 1;
             }
-            let shown = String::from_utf16_lossy(&units[start..at]);
-            let shown = shown.strip_prefix(' ').unwrap_or(&shown).to_owned();
-            let raw = unescape_cell(&shown);
-            if Self::LENGTHS.contains(&utf16_len(&raw)) {
-                self.0.insert(raw);
-                self.0.insert(shown);
+            seen = at;
+            // Unescaping at most halves a cell, so a longer one is cut at no
+            // known length.
+            if at - cell <= 2 * crate::oracle::MAX_CELL_LEN + 1 {
+                let shown = String::from_utf16_lossy(&units[cell..at]);
+                let shown = shown.strip_prefix(' ').unwrap_or(&shown).to_owned();
+                let raw = unescape_cell(&shown);
+                if Self::LENGTHS.contains(&utf16_len(&raw)) {
+                    self.0.insert(raw);
+                    self.0.insert(shown);
+                }
             }
             at += mark.len();
         }
@@ -1783,6 +1790,63 @@ mod tests {
         clipped.learn_text(&format!("| ID | {cell}{TRUNC_MARK} |"));
         assert!(clipped.contains(&("a|b".to_owned() + &"c".repeat(116))));
         assert!(!clipped.contains("BATCH001"));
+    }
+
+    /// Cells are told from where the last '|' or line break was read, not
+    /// looked for back from each mark: the values learned are those a look
+    /// back from each mark finds.
+    #[test]
+    fn cut_cells_are_learned_as_a_look_back_from_each_mark_finds() {
+        fn looking_back(text: &str) -> BTreeSet<String> {
+            let mut set = BTreeSet::new();
+            let units: Vec<u16> = text.encode_utf16().collect();
+            let mark: Vec<u16> = TRUNC_MARK.encode_utf16().collect();
+            let mut at = 0;
+            while at + mark.len() <= units.len() {
+                if units[at..at + mark.len()] != mark[..] {
+                    at += 1;
+                    continue;
+                }
+                for len in Clipped::LENGTHS {
+                    if at >= len {
+                        set.insert(String::from_utf16_lossy(&units[at - len..at]));
+                    }
+                }
+                let mut start = at;
+                while start > 0 && !(units[start - 1] == b'|' as u16 && (start < 2 || units[start - 2] != b'\\' as u16)) {
+                    if units[start - 1] == b'\n' as u16 {
+                        break;
+                    }
+                    start -= 1;
+                }
+                let shown = String::from_utf16_lossy(&units[start..at]);
+                let shown = shown.strip_prefix(' ').unwrap_or(&shown).to_owned();
+                let raw = unescape_cell(&shown);
+                if Clipped::LENGTHS.contains(&utf16_len(&raw)) {
+                    set.insert(raw);
+                    set.insert(shown);
+                }
+                at += mark.len();
+            }
+            set
+        }
+        let (x, y) = ("x".repeat(55), "y".repeat(113));
+        let pieces = ["a", "가", "😀", "|", "\\", "\\|", "\n", " ", x.as_str(), y.as_str(), TRUNC_MARK];
+        let mut seed = 5u64;
+        let mut next = |below: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % below
+        };
+        for _ in 0..3000 {
+            let text: String = (0..next(40)).map(|_| pieces[next(pieces.len())]).collect();
+            let mut learned = Clipped::default();
+            learned.learn_text(&text);
+            assert_eq!(learned.0, looking_back(&text), "{text:?}");
+        }
+        let long = format!("{}{TRUNC_MARK}", "q".repeat(crate::oracle::MAX_CELL_LEN * 2 + 3));
+        let mut learned = Clipped::default();
+        learned.learn_text(&long);
+        assert_eq!(learned.0, looking_back(&long));
     }
 
     #[test]
