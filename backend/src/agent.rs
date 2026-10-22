@@ -323,7 +323,7 @@ async fn run(
             + context::bundle_tokens(&c.history, question_bundle, &model);
         let kept = alone + 512;
         let ratio = context::token_ratio(c, &model);
-        let fits = |tokens: usize| (tokens as f64 * ratio).ceil() as usize + config.llm.output_tokens + 512 <= config.llm.context_tokens;
+        let fits = |tokens: usize| ((tokens as f64 * ratio).ceil() as usize).saturating_add(config.llm.output_tokens + 512) <= config.llm.context_tokens;
         if !fits(estimate) {
             // A cut answer that can no longer be continued stands as written.
             if continuing {
@@ -515,7 +515,7 @@ async fn run(
                         context::record_usage(c, &model, sent, counted);
                     }
                     let calibrated = (estimate as f64 * context::token_ratio(c, &model)).ceil() as usize;
-                    if undercounted && calibrated + config.llm.output_tokens + 512 > config.llm.context_tokens {
+                    if undercounted && calibrated.saturating_add(config.llm.output_tokens + 512) > config.llm.context_tokens {
                         eprintln!("[context] the provider counted {} tokens for ~{estimate}; asking again calibrated", counted.unwrap_or_default());
                         discard();
                         rounds -= 1;

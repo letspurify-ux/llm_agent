@@ -120,24 +120,46 @@ async fn admin_records_keep_the_former_contract() {
     let record = client.admin("GET", &format!("databases/{order_db}"), None, None).await;
     assert!(record.body.get("db_password").is_none());
     assert_eq!(record.body["has_password"], 1);
+    let address = record.body["connection_info"].as_str().unwrap().to_owned();
     let renamed = client
         .admin(
             "PUT",
             &format!("databases/{order_db}"),
-            Some(json!({"db_name":"RENAMED","db_type":"oracle","connection_info":"h:1/s","db_user":"u","db_password":""})),
+            Some(json!({"db_name":"RENAMED","db_type":"oracle","connection_info":address,"db_user":"u","db_password":""})),
             record.etag.as_deref(),
         )
         .await;
     assert_eq!(renamed.status, StatusCode::CONFLICT, "a DB used by queries cannot be renamed: {}", renamed.text);
+    // A new address with the password left empty would log in there with
+    // the stored one: it is entered again instead.
+    let moved = client
+        .admin(
+            "PUT",
+            &format!("databases/{order_db}"),
+            Some(json!({"db_name":"ORDER_DB","db_type":"oracle","connection_info":"elsewhere:1/s","db_user":"u","db_password":""})),
+            record.etag.as_deref(),
+        )
+        .await;
+    assert_eq!(moved.status, StatusCode::BAD_REQUEST, "{}", moved.text);
+    assert!(moved.body["error"].as_str().unwrap().contains("비밀번호를 다시"), "{}", moved.text);
     let kept = client
         .admin(
             "PUT",
             &format!("databases/{order_db}"),
-            Some(json!({"db_name":"ORDER_DB","db_type":"oracle","connection_info":"h:1/s","db_user":"u","db_password":""})),
+            Some(json!({"db_name":"ORDER_DB","db_type":"oracle","connection_info":address,"db_user":"u","db_password":""})),
             record.etag.as_deref(),
         )
         .await;
     assert_eq!(kept.status, StatusCode::OK, "{}", kept.text);
+    let entered = client
+        .admin(
+            "PUT",
+            &format!("databases/{order_db}"),
+            Some(json!({"db_name":"ORDER_DB","db_type":"oracle","connection_info":"elsewhere:1/s","db_user":"u","db_password":"ENV:ORDER_DB_PASSWORD"})),
+            kept.etag.as_deref(),
+        )
+        .await;
+    assert_eq!(entered.status, StatusCode::OK, "the password entered again goes to the new address: {}", entered.text);
     assert_eq!(db.scalar("SELECT db_password FROM target_db WHERE db_name = 'ORDER_DB'"), "ENV:ORDER_DB_PASSWORD");
 
     // Queries: the target list is canonicalized; unknown targets and
@@ -246,6 +268,21 @@ async fn projects_settings_and_folders_are_editable() {
     assert!(too_large.body["error"].as_str().unwrap().contains("절반"), "{}", too_large.text);
     let checked = client.admin("POST", "settings/check", Some(json!({"target":"mariadb"})), None).await;
     assert_eq!(checked.body["ok"], true, "{}", checked.text);
+    // The stored API key is not sent to another host: neither saved nor
+    // checked there until it is entered again or removed.
+    let elsewhere = json!({"config":{"llm":{"base_url":"https://elsewhere.example/v1"}}});
+    let refused = client.admin("PUT", "settings", Some(elsewhere.clone()), saved.etag.as_deref()).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.text);
+    assert!(refused.body["error"].as_str().unwrap().contains("API 키를 다시"), "{}", refused.text);
+    let mut check = elsewhere.clone();
+    check["target"] = json!("llm");
+    let refused = client.admin("POST", "settings/check", Some(check), None).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.text);
+    let mut cleared = elsewhere;
+    cleared["secrets"] = json!({"llm_api_key":null});
+    let moved = client.admin("PUT", "settings", Some(cleared), saved.etag.as_deref()).await;
+    assert_eq!(moved.status, StatusCode::OK, "{}", moved.text);
+    assert!(app.config().llm.api_key.is_none());
 
     let folders = client
         .admin("GET", &format!("directories?path={}", root.display()), None, None)

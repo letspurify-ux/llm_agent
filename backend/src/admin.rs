@@ -471,6 +471,20 @@ async fn save_record(app: &App, kind: &str, body: &Value, id: Option<i64>, revis
                     "이 항목은 다른 화면에서 변경되었습니다. 입력 내용을 보관한 뒤 항목을 다시 열어 확인해주세요.",
                 ));
             }
+            // The stored password goes only to the address it was entered
+            // for: kept (left empty) beside a new address, the next query
+            // logged in there with it.
+            let value = |key: &str| values.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+            if kind == "databases"
+                && old["has_password"] == json!(1)
+                && value("db_password").is_none()
+                && old["connection_info"].as_str() != value("connection_info")
+            {
+                return Err(problem(
+                    400,
+                    "접속 주소가 바뀌어 저장된 비밀번호를 새 주소로 보내지 않습니다. 조회 대상 DB 비밀번호를 다시 입력해주세요.",
+                ));
+            }
             let new_name = values.iter().find(|(k, _)| k == config.name).map(|(_, v)| v.as_str());
             if matches!(kind, "databases" | "queries") && old[config.name].as_str() != new_name {
                 check_references(app, kind, &old, conn).await?;
@@ -909,7 +923,46 @@ fn draft(current: &Config, body: &Value) -> ApiResult<Config> {
             }
         }
     }
+    // A stored secret goes only where it was entered for, as an MCP
+    // server's secret headers do: with the address alone changed, the API
+    // key went to the new host as a bearer token (a connection check sent it
+    // without a save), and the management DB password to a server that asks
+    // for it encrypted with a key of its own (caching_sha2 without TLS).
+    let answered = |key: &str| body["secrets"].get(key).is_some_and(|v| v.is_null() || v.as_str().is_some_and(|v| !v.is_empty()));
+    if current.llm.api_key.is_some() && !answered("llm_api_key") && moved(llm_destination(&current.llm), llm_destination(&config.llm)) {
+        return Err(ApiError::new(
+            400,
+            "LLM 주소의 호스트가 바뀌어 저장된 API 키를 새 주소로 보내지 않습니다. API 키를 다시 넣거나 지운 뒤 저장하거나 확인해주세요.",
+        ));
+    }
+    if current.mariadb.password.is_some() && !answered("mariadb_password") && moved(mariadb_destination(&current.mariadb), mariadb_destination(&config.mariadb)) {
+        return Err(ApiError::new(
+            400,
+            "관리 DB 호스트·포트가 바뀌어 저장된 비밀번호를 새 주소로 보내지 않습니다. 비밀번호를 다시 넣거나 지운 뒤 저장하거나 확인해주세요.",
+        ));
+    }
     Ok(config)
+}
+
+/// Whether a secret's destination changed: an address that does not read
+/// is refused by the settings check, not here.
+fn moved<T: PartialEq>(before: Option<T>, after: Option<T>) -> bool {
+    after.is_some() && before != after
+}
+
+/// Where the LLM API key is sent: the base URL's scheme, host and port, and
+/// the proxy a plain-HTTP request goes through (it reads the key there).
+fn llm_destination(llm: &crate::config::LlmConfig) -> Option<(String, Option<String>, Option<u16>, Option<String>)> {
+    let url = reqwest::Url::parse(llm.base_url.trim()).ok()?;
+    let proxy = (url.scheme() == "http" && !llm.disable_proxy)
+        .then(|| llm.proxy.as_deref().map(str::trim).filter(|p| !p.is_empty()).map(str::to_owned))
+        .flatten();
+    Some((url.scheme().to_owned(), url.host_str().map(str::to_ascii_lowercase), url.port_or_known_default(), proxy))
+}
+
+/// Where the management DB password is sent.
+fn mariadb_destination(cfg: &crate::config::MariaDbConfig) -> Option<(String, u16)> {
+    Some((cfg.host.trim().to_ascii_lowercase(), cfg.port))
 }
 
 async fn settings_put(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> ApiResult<Response> {
@@ -1415,5 +1468,46 @@ mod tests {
         let config = draft(&current, &json!({"secrets":{"llm_api_key":null}})).unwrap();
         assert!(config.llm.api_key.is_none());
         assert!(draft(&current, &json!({"config":{"nope":{}}})).is_err());
+    }
+
+    /// Settings review, 2026-10-22: with the address alone changed, the
+    /// stored API key went to the new host (a connection check sent it at
+    /// once), and the management DB password to the new server.
+    #[test]
+    fn stored_secrets_stay_with_the_address_they_were_entered_for() {
+        let mut current = Config::default();
+        current.llm.api_key = Some(Secret("sk".into()));
+        current.llm.base_url = "http://llm.local:8000/v1".into();
+        current.mariadb.password = Some(Secret("pw".into()));
+        let refused_by = |current: &Config, body: Value| draft(current, &body).err().map(|e| e.message);
+        for body in [
+            json!({"config":{"llm":{"base_url":"http://other.local:8000/v1"}}}),
+            json!({"config":{"llm":{"base_url":"https://llm.local:8000/v1"}}}),
+            json!({"config":{"llm":{"base_url":"http://llm.local:9000/v1"}}}),
+            json!({"config":{"llm":{"proxy":"http://proxy.local:3128"}}}),
+            json!({"config":{"llm":{"base_url":"http://other.local:8000/v1"}},"secrets":{"llm_api_key":""}}),
+        ] {
+            assert!(refused_by(&current, body.clone()).is_some_and(|m| m.contains("API 키")), "{body}");
+        }
+        for body in [
+            json!({"config":{"llm":{"base_url":"HTTP://LLM.local:8000/v2"}}}),
+            json!({"config":{"llm":{"base_url":"http://other.local:8000/v1"}},"secrets":{"llm_api_key":"sk2"}}),
+            json!({"config":{"llm":{"base_url":"http://other.local:8000/v1"}},"secrets":{"llm_api_key":null}}),
+            json!({"config":{"llm":{"model":"m","base_url":"not a url"}}}),
+        ] {
+            assert!(refused_by(&current, body.clone()).is_none(), "{body}");
+        }
+        // Over HTTPS a proxy carries the request encrypted.
+        current.llm.base_url = "https://llm.local/v1".into();
+        assert!(refused_by(&current, json!({"config":{"llm":{"proxy":"http://proxy.local:3128"}}})).is_none());
+        for body in [json!({"config":{"mariadb":{"host":"db.elsewhere"}}}), json!({"config":{"mariadb":{"port":3307}}})] {
+            assert!(refused_by(&current, body.clone()).is_some_and(|m| m.contains("비밀번호")), "{body}");
+        }
+        assert!(refused_by(&current, json!({"config":{"mariadb":{"host":"db.elsewhere"}},"secrets":{"mariadb_password":"pw2"}})).is_none());
+        assert!(refused_by(&current, json!({"config":{"mariadb":{"user":"other","pool_size":5}}})).is_none());
+        // Nothing stored, nothing to keep.
+        current.llm.api_key = None;
+        current.mariadb.password = None;
+        assert!(refused_by(&current, json!({"config":{"llm":{"base_url":"http://x/v1"},"mariadb":{"host":"h"}}})).is_none());
     }
 }
