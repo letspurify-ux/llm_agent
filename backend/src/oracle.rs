@@ -185,7 +185,7 @@ impl Oracle {
                 .iter()
                 .filter_map(|n| value(n).map(|v| (name_key(n), v.clone())))
                 .collect();
-            return Ok(cap(mock_rows(&query_name, &inputs)?, target));
+            return Ok(cap(mock_rows(&query_name, &inputs)?, target, None));
         }
         // The management DB waits for its time limit alone; the statement's
         // own stop is below.
@@ -232,7 +232,7 @@ impl Oracle {
         let connection: Arc<Mutex<Option<Arc<oracle::Connection>>>> = Arc::new(Mutex::new(None));
         let slot = connection.clone();
         let stopped = cancel.clone();
-        let work = tokio::task::spawn_blocking(move || -> Result<Vec<Map<String, Value>>> {
+        let work = tokio::task::spawn_blocking(move || -> Result<Read> {
             let mut conn = pool.get()?;
             // First, so whatever the session sends from here has the limit:
             // dropped below or pooled, its logoff too (a pool closing waited
@@ -286,7 +286,7 @@ impl Oracle {
             result
         });
         let mut work = std::pin::pin!(work);
-        let rows = tokio::select! {
+        let read = tokio::select! {
             joined = &mut work => joined??,
             _ = cancel.cancelled() => {
                 if let Some(conn) = connection.lock().unwrap_or_else(|p| p.into_inner()).clone() {
@@ -296,7 +296,7 @@ impl Oracle {
                 bail!("cancelled");
             }
         };
-        Ok(cap(rows, target))
+        Ok(cap(read.rows, target, read.columns.as_deref()))
     }
 
     fn pool(&self, row: &Row, password: &str, cfg: &OracleConfig) -> Result<Arc<oracle::pool::Pool>> {
@@ -543,12 +543,19 @@ impl BindArg {
     }
 }
 
+/// Rows as read: when the result has more than MAX_RESULT_COLS columns, only
+/// the first MAX_RESULT_COLS of each row, `columns` naming them all.
+struct Read {
+    rows: Vec<Map<String, Value>>,
+    columns: Option<Vec<String>>,
+}
+
 fn execute(
     conn: &oracle::Connection,
     spec: &crate::execution::Spec,
     inputs: &[(String, Value)],
     read_only: bool,
-) -> Result<Vec<Map<String, Value>>> {
+) -> Result<Read> {
     if spec.kind != Kind::Query && read_only {
         conn.execute("SET TRANSACTION READ ONLY", &[])?;
     }
@@ -634,14 +641,19 @@ fn execute(
         };
         row.insert(b.name.clone(), value);
     }
-    Ok(vec![row])
+    Ok(Read { rows: vec![row], columns: None })
 }
 
-fn collect(rows: oracle::ResultSet<'_, oracle::Row>) -> Result<Vec<Map<String, Value>>> {
+fn collect(rows: oracle::ResultSet<'_, oracle::Row>) -> Result<Read> {
     let names = distinct_names(rows.column_info().iter().map(|c| c.name().to_owned()).collect());
+    // Only the columns a row keeps are made into values: the rest were,
+    // CLOBs read out to 4,000 characters each, to be cut (up to 200 MB held
+    // for 1,000 rows of 80 such columns).
     let columns: Vec<(String, OracleType)> = names
-        .into_iter()
+        .iter()
+        .cloned()
         .zip(rows.column_info().iter().map(|c| c.oracle_type().clone()))
+        .take(MAX_RESULT_COLS)
         .collect();
     let mut out = Vec::new();
     for row in rows {
@@ -655,7 +667,7 @@ fn collect(rows: oracle::ResultSet<'_, oracle::Row>) -> Result<Vec<Map<String, V
             break;
         }
     }
-    Ok(out)
+    Ok(Read { rows: out, columns: (names.len() > MAX_RESULT_COLS).then_some(names) })
 }
 
 /// Column names a row can hold side by side. Oracle names the columns of a
@@ -865,20 +877,21 @@ fn lob_cell(start: Result<Option<String>>, ty: &OracleType) -> Value {
 }
 
 /// At most MAX_ROWS rows (`capped` tells more existed) and MAX_RESULT_COLS
-/// columns, the cut columns named in a note column.
-fn cap(mut rows: Vec<Map<String, Value>>, target_db: String) -> Outcome {
+/// columns, the cut columns named in a note column. `columns` names every
+/// column of rows read only as far as they are kept.
+fn cap(mut rows: Vec<Map<String, Value>>, target_db: String, columns: Option<&[String]>) -> Outcome {
     let capped = rows.len() > MAX_ROWS;
     rows.truncate(MAX_ROWS);
     let mut omitted_column_key = None;
     let rows = rows
         .into_iter()
         .map(|row| {
-            if row.len() <= MAX_RESULT_COLS {
+            let total = columns.map_or(row.len(), <[String]>::len);
+            if total <= MAX_RESULT_COLS {
                 return row;
             }
-            let total = row.len();
             let mut key = "…".to_owned();
-            while row.contains_key(&key) {
+            while columns.map_or_else(|| row.contains_key(&key), |names| names.contains(&key)) {
                 key.push('…');
             }
             let mut kept: Map<String, Value> = row.into_iter().take(MAX_RESULT_COLS).collect();
@@ -1072,7 +1085,7 @@ mod tests {
     #[test]
     fn wide_and_long_results_are_capped() {
         let wide: Map<String, Value> = (0..35).map(|i| (format!("C{i}"), json!(i))).collect();
-        let out = cap(vec![wide; 1001], "A".into());
+        let out = cap(vec![wide; 1001], "A".into(), None);
         assert!(out.capped);
         assert_eq!(out.rows.len(), MAX_ROWS);
         assert_eq!(out.rows[0].len(), MAX_RESULT_COLS + 1);

@@ -405,3 +405,39 @@ async fn a_listener_that_says_nothing_does_not_keep_the_attempt() {
     assert!(after < std::time::Duration::from_secs(10), "hung up after {after:?}");
     assert_eq!(app.oracle.close_idle(std::time::Duration::ZERO), 1);
 }
+
+/// A result wider than a row keeps is made into values only as far as it is
+/// kept; the note still counts and avoids every column of the result.
+#[tokio::test]
+async fn wide_results_keep_their_first_columns_and_count_the_rest() {
+    if std::env::var("LLM_AGENT_TEST_ORACLE").ok().as_deref() != Some("1") {
+        return skip("LLM_AGENT_TEST_ORACLE is not set");
+    }
+    let Some(test_db) = TestDb::create("oracle_wide") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let columns: Vec<String> = (0..40).map(|i| format!("TO_CLOB(''c{i}-'' || LEVEL) AS C{i}")).collect();
+    test_db.sql_in(&format!(
+        "INSERT INTO query_registry (query_name, query_sql, target_db_name) VALUES
+         ('wide_rows', 'SELECT LEVEL AS N, {}, LEVEL AS \"…\" FROM DUAL CONNECT BY LEVEL <= 3', 'ORDER_DB')",
+        columns.join(", ")
+    ));
+    let mut config = test_db.config();
+    config.oracle.mock = false;
+    config.oracle.client_lib_dir = std::env::var("ORACLE_CLIENT_LIB_DIR").unwrap_or_default();
+    let (app, _dir) = app(config, Scripted::new(vec![]));
+    let config = app.config();
+    let row = db::queries_by_names(&app.db, &config.mariadb, &["wide_rows".into()]).await.unwrap().remove(0);
+    let never = |_: &str| false;
+    let out = app.oracle.run(&app.db, &config, &row, &Map::new(), None, &never, &CancellationToken::new()).await.unwrap();
+    assert_eq!(out.rows.len(), 3);
+    assert_eq!(out.omitted_column_key.as_deref(), Some("……"));
+    let first = &out.rows[0];
+    let names: Vec<&str> = first.keys().map(String::as_str).collect();
+    let mut kept = vec!["N".to_owned()];
+    kept.extend((0..29).map(|i| format!("C{i}")));
+    kept.push("……".into());
+    assert_eq!(names, kept);
+    assert_eq!(first["C28"], "c28-1");
+    assert_eq!(first["……"], "외 12개 컬럼 생략 (컬럼 수 상한 30개)");
+}
