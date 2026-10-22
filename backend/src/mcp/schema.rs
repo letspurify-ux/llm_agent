@@ -399,13 +399,13 @@ pub fn mend_arguments(parameters: &Value, args: &mut Map<String, Value>) -> Vec<
         let Some(text) = value.as_str().filter(|_| schema.is_object() && !takes(schema, value)) else {
             continue;
         };
-        let typed = match serde_json::from_str::<Value>(text.trim()) {
-            Ok(Value::String(_) | Value::Null) => None,
-            Ok(typed) => Some(typed),
-            // One item where a list of them is taken.
-            Err(_) => Some(json!([text])),
-        };
-        if let Some(typed) = typed.filter(|typed| takes(schema, typed)) {
+        let decoded = serde_json::from_str::<Value>(text.trim()).ok().filter(|typed| !typed.is_string() && !typed.is_null());
+        // One item where a list of them is taken — "123" or "true" too, which
+        // read as a number or flag the list does not take; a list or object
+        // sent as text is not wrapped.
+        let structured = decoded.as_ref().is_some_and(|typed| typed.is_array() || typed.is_object());
+        let wrapped = (!structured).then(|| json!([text]));
+        if let Some(typed) = decoded.into_iter().chain(wrapped).find(|typed| takes(schema, typed)) {
             *value = typed;
             mended.push(key.clone());
         }
@@ -966,6 +966,12 @@ mod tests {
         assert_eq!(Value::Object(args), json!({"tags":["bug"],"ids":[1,2],"filter":{"a":1},"note":"[1]"}));
         let mut args = json!({"ids":"7x","tags":"[1]"}).as_object().unwrap().clone();
         assert!(mend_arguments(&p, &mut args).is_empty(), "{args:?}");
+        // A text that reads as a number or flag is still one text of a list.
+        let mut args = json!({"tags":"123","ids":"7","note":"true"}).as_object().unwrap().clone();
+        let mut mended = mend_arguments(&p, &mut args);
+        mended.sort();
+        assert_eq!(mended, ["tags"]);
+        assert_eq!(Value::Object(args), json!({"tags":["123"],"ids":"7","note":"true"}));
     }
 
     #[test]
