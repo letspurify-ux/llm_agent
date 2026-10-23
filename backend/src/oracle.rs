@@ -413,14 +413,52 @@ impl Oracle {
 /// Closes pools on a thread of their own (closing waits on the network). A
 /// pool a run still holds closes when the run lets go of it: the client
 /// library destroys a pool when its last reference goes.
+///
+/// A thread the system cannot start now (at its thread limit) leaves the
+/// pools for the next call: `std::thread::spawn` panicked then, and from the
+/// housekeeping job that ended the job for good — idle conversations and
+/// pools were not let go of again for as long as the server ran. The pools
+/// go to the thread once it runs, so a failed start does not drop (and close)
+/// them on the caller's thread.
 fn close_later(pools: Vec<Arc<oracle::pool::Pool>>) {
-    std::thread::spawn(move || {
-        for pool in pools {
+    static WAITING: Mutex<Vec<Arc<oracle::pool::Pool>>> = Mutex::new(Vec::new());
+    close_later_with(
+        &WAITING,
+        pools,
+        |work| std::thread::Builder::new().name("oracle-close".into()).spawn(work).map(drop),
+        |pool| {
+            let _ = pool.close(&oracle::pool::CloseMode::Default);
+        },
+    );
+}
+
+/// `close_later` with the thread `start` and the `close` of one pool given;
+/// `waiting` holds the pools a thread could not be started for.
+fn close_later_with<T: Send + Sync + 'static>(
+    waiting: &Mutex<Vec<Arc<T>>>,
+    pools: Vec<Arc<T>>,
+    start: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    close: fn(T),
+) {
+    let mut pools = pools;
+    pools.append(&mut waiting.lock().unwrap_or_else(|p| p.into_inner()));
+    let (give, take) = std::sync::mpsc::channel::<Vec<Arc<T>>>();
+    let started = start(Box::new(move || {
+        for pool in take.recv().unwrap_or_default() {
             if let Ok(pool) = Arc::try_unwrap(pool) {
-                let _ = pool.close(&oracle::pool::CloseMode::Default);
+                close(pool);
             }
         }
-    });
+    }));
+    match started {
+        Ok(()) => {
+            let _ = give.send(pools);
+        }
+        Err(e) => {
+            eprintln!("[oracle] could not start a thread to close {} pool(s) — trying again at the next close: {e}", pools.len());
+            waiting.lock().unwrap_or_else(|p| p.into_inner()).extend(pools);
+        }
+    }
 }
 
 /// `connect` with a limit of `secs` seconds on making a connection, where
@@ -1030,6 +1068,34 @@ pub fn public_error(error: &anyhow::Error) -> (String, Option<String>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backend review, 2026-10-23: a thread that could not be started
+    /// panicked (`std::thread::spawn`), ending the housekeeping job for good.
+    /// Its pools now wait, unclosed, for the next close.
+    #[test]
+    fn pools_a_thread_cannot_be_started_for_are_closed_at_the_next_close() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CLOSED: AtomicUsize = AtomicUsize::new(0);
+        struct Pool;
+        let waiting: Mutex<Vec<Arc<Pool>>> = Mutex::new(vec![]);
+        let close = |_: Pool| {
+            CLOSED.fetch_add(1, Ordering::AcqRel);
+        };
+        close_later_with(&waiting, vec![Arc::new(Pool), Arc::new(Pool)], |_| Err(std::io::Error::other("no threads")), close);
+        assert_eq!((CLOSED.load(Ordering::Acquire), waiting.lock().unwrap().len()), (0, 2));
+        let mut thread = None;
+        close_later_with(
+            &waiting,
+            vec![Arc::new(Pool)],
+            |work| {
+                thread = Some(std::thread::spawn(work));
+                Ok(())
+            },
+            close,
+        );
+        thread.unwrap().join().unwrap();
+        assert_eq!((CLOSED.load(Ordering::Acquire), waiting.lock().unwrap().len()), (3, 0));
+    }
 
     /// A row written before the admin screen refused it (or by hand) is not
     /// resolved either: the backend's own password stays home.

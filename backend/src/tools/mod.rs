@@ -596,6 +596,18 @@ pub fn normalize_arguments(name: &str, args: &mut Value) -> Vec<String> {
                 "{key} {sent} is above its maximum {maximum}; {maximum} was used"
             ));
         }
+        // A start position counted from 0 means the first: the read takes it
+        // so (knowledge_read clamps its start to 1 itself), but the call was
+        // refused before it ran, and a small model sent 0 again and again
+        // until it gave the read up.
+        if *kind == "integer"
+            && key.starts_with("start_")
+            && schema["minimum"] == 1
+            && *value == 0
+        {
+            *value = json!(1);
+            adjusted.push(format!("{key} 0 was taken as 1, the first (positions count from 1)"));
+        }
     }
     adjusted
 }
@@ -3810,6 +3822,24 @@ mod tests {
         // A required field keeps what was sent, and its error says so.
         assert!(repaired("search", json!({"query":""})).is_ok());
         assert!(repaired("history", json!({"action":""})).unwrap_err().contains("action"));
+    }
+
+    /// Backend review, 2026-10-23: a start counted from 0 was refused before
+    /// the read, which takes it as the first (knowledge_read clamps its start
+    /// to 1), and a small model sent 0 again until it gave the read up.
+    #[test]
+    fn a_start_counted_from_zero_is_the_first() {
+        let repaired = |name: &str, mut args: Value| {
+            let adjusted = normalize_arguments(name, &mut args);
+            ToolRegistry::validate(name, &args).map(|_| (args, adjusted)).map_err(|e| e.to_string())
+        };
+        let (args, adjusted) = repaired("knowledge_read", json!({"id":"k3","start_chunk":0})).unwrap();
+        assert_eq!(args, json!({"id":"k3","start_chunk":1}));
+        assert_eq!(adjusted, ["start_chunk 0 was taken as 1, the first (positions count from 1)"]);
+        assert_eq!(repaired("file_read", json!({"path":"a.rs","start_line":0})).unwrap().0["start_line"], 1);
+        // Not a position: a step 0 names none, and stays refused.
+        assert!(repaired("result_read", json!({"step":0})).is_err());
+        assert!(repaired("file_read", json!({"path":"a.rs","start_line":-1})).is_err());
     }
 
     #[test]

@@ -5,7 +5,7 @@ mod support;
 
 use llm_agent::{
     db::{self, Db},
-    embed_sync::{EmbedSync, Skipped},
+    embed_sync::{EmbedSync, LOCK_NAME, Skipped},
 };
 use std::{
     sync::{Arc, Mutex},
@@ -15,9 +15,34 @@ use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-/// The sync's lock is one per server, not per database: the tests that sync
-/// take turns, or one finds the lock held by another and skips.
+/// The tests that sync take turns: several syncs at once load the server
+/// under the times some of them check.
 static SYNCING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Backend review, 2026-10-23: the sync's lock was one name for the whole
+/// server, so a sync of another database on it (another installation, a
+/// test database) skipped this one's as busy for as long as it ran.
+#[tokio::test]
+async fn another_databases_sync_does_not_hold_this_ones_lock() {
+    let _turn = SYNCING.lock().await;
+    let (Some(one), Some(other)) = (TestDb::create("sync_lock_one"), TestDb::create("sync_lock_other")) else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let db = Db::default();
+    let (mut one_config, mut other_config) = (one.config(), other.config());
+    one_config.embedding.url = String::new();
+    other_config.embedding.url = String::new();
+    // The other database's lock held, as its sync holds it.
+    let mut held = db.lock_conn(&other_config.mariadb).await.unwrap();
+    db::plain_on(&other_config.mariadb, &mut held, &format!("DO GET_LOCK({LOCK_NAME}, 0)")).await.unwrap();
+    let summary = EmbedSync::default().run(&db, &one_config, &CancellationToken::new()).await.unwrap();
+    assert_eq!(summary.skipped, Skipped::Unconfigured, "{summary}");
+    // Its own sync still waits for it.
+    let summary = EmbedSync::default().run(&db, &other_config, &CancellationToken::new()).await.unwrap();
+    assert_eq!(summary.skipped, Skipped::Busy);
+    db.close_conn(&other_config.mariadb, held).await;
+    db.close().await;
+}
 
 /// The sync's lock held the pool's only connection while the sync waited
 /// for another: with `pool_size` 1 every sync failed after twice the DB
@@ -41,12 +66,12 @@ async fn a_pool_of_one_connection_syncs_under_the_lock() {
     assert!(started.elapsed() < Duration::from_millis(config.mariadb.timeout_ms), "waited {:?}", started.elapsed());
     assert_eq!((&summary.skipped, summary.chunks_failed), (&Skipped::Unconfigured, 0));
     assert!(summary.chunks > 0, "{summary}");
-    let free = db.query(&config.mariadb, "SELECT IS_FREE_LOCK('space_voc_embed_sync') AS free", vec![]).await.unwrap();
+    let free = db.query(&config.mariadb, &format!("SELECT IS_FREE_LOCK({LOCK_NAME}) AS free"), vec![]).await.unwrap();
     assert_eq!(db::int(&free[0], "free"), 1, "the lock is released");
 
     // Held elsewhere, the lock skips the sync.
     let mut other = db.lock_conn(&config.mariadb).await.unwrap();
-    db::plain_on(&config.mariadb, &mut other, "DO GET_LOCK('space_voc_embed_sync', 0)").await.unwrap();
+    db::plain_on(&config.mariadb, &mut other, &format!("DO GET_LOCK({LOCK_NAME}, 0)")).await.unwrap();
     let summary = EmbedSync::default().run(&db, &config, &CancellationToken::new()).await.unwrap();
     assert_eq!(summary.skipped, Skipped::Busy);
     db.close_conn(&config.mariadb, other).await;
@@ -115,7 +140,7 @@ async fn the_locks_connection_says_goodbye() {
     assert_eq!(summary.skipped, Skipped::Unconfigured);
     // A sync the lock held elsewhere skips closes its connection too.
     let mut other = db.lock_conn(&direct).await.unwrap();
-    db::plain_on(&direct, &mut other, "DO GET_LOCK('space_voc_embed_sync', 0)").await.unwrap();
+    db::plain_on(&direct, &mut other, &format!("DO GET_LOCK({LOCK_NAME}, 0)")).await.unwrap();
     let summary = EmbedSync::default().run(&db, &config, &CancellationToken::new()).await.unwrap();
     assert_eq!(summary.skipped, Skipped::Busy);
     db.close_conn(&direct, other).await;

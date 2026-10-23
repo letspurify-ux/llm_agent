@@ -26,7 +26,11 @@ use tokio_util::sync::CancellationToken;
 
 const BATCH: usize = 32;
 const IN_CHUNK: usize = 1000;
-const LOCK_NAME: &str = "space_voc_embed_sync";
+/// The sync's session lock, one per database. User locks are the server's,
+/// across its databases: named alike for all of them, another database's
+/// sync on the same server (another installation, a test database) skipped
+/// this one as busy, a hand-run `embed-sync` too, for as long as it ran.
+pub const LOCK_NAME: &str = "CONCAT(DATABASE(), ':space_voc_embed_sync')";
 const DOC_HASH_EXPR: &str = "MD5(JSON_ARRAY(?, title, content))";
 
 /// Entries a `vec_*` table's vector index may hold for rows it no longer has
@@ -206,7 +210,7 @@ impl EmbedSync {
             // Not one of the pool's, which the sync uses meanwhile.
             let mut lock = db.lock_conn(cfg).await?;
             let locked = async {
-                let got = query_on(cfg, &mut lock, &format!("SELECT GET_LOCK('{LOCK_NAME}', 0) AS l"), vec![]).await?;
+                let got = query_on(cfg, &mut lock, &format!("SELECT GET_LOCK({LOCK_NAME}, 0) AS l"), vec![]).await?;
                 if got.first().map_or(0, |r| db::int(r, "l")) != 1 {
                     return Ok(Summary {
                         skipped: Skipped::Busy,
@@ -214,7 +218,7 @@ impl EmbedSync {
                     });
                 }
                 let summary = sync(self, db, config, stop).await;
-                let _ = plain_on(cfg, &mut lock, &format!("SELECT RELEASE_LOCK('{LOCK_NAME}')")).await;
+                let _ = plain_on(cfg, &mut lock, &format!("SELECT RELEASE_LOCK({LOCK_NAME})")).await;
                 summary
             }
             .await;
