@@ -2733,6 +2733,62 @@ mod tests {
         assert!(next(&mut ws).unwrap_err().to_string().starts_with("cursor_expired"));
     }
 
+    /// File tools review, 2026-10-23 (fifth round): a regular expression was
+    /// tested on every line of every file, three times as long as a literal
+    /// search of the same files. Blocks of lines without a match are now
+    /// passed over; every search finds the lines that testing each line
+    /// alone does, anchors and line numbers past the first block too.
+    #[test]
+    fn a_regular_expression_finds_by_blocks_the_lines_it_finds_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut text = String::new();
+        for line in 1..=12_000 {
+            text.push_str(&match line % 1_000 {
+                7 => format!("fn target_{line}() {{}}\n"),
+                500 => format!("    let target_{line} = 1; // 값\n"),
+                _ => format!("    let other_{line} = compute(input, {line});\n"),
+            });
+        }
+        assert!(text.len() > 4 * search::BLOCK_BYTES);
+        std::fs::write(dir.path().join("a.rs"), &text).unwrap();
+        std::fs::write(dir.path().join("crlf.rs"), text.replace('\n', "\r\n")).unwrap();
+        std::fs::write(dir.path().join("one.rs"), "fn target_1() {}").unwrap();
+        let mut ws = workspace(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        for (query, case_sensitive, whole_word) in [
+            (r"^fn target_\d+\(\) \{\}$", true, false),
+            (r"target_\d+ = 1; // 값$", true, false),
+            (r"\Afn target", true, false),
+            (r"(?-m)^fn target", true, false),
+            (r"(?i:FN) TARGET_\d+", false, false),
+            (r"target_\d+", true, true),
+            (r"^$", true, false),
+        ] {
+            let lines = regex::RegexBuilder::new(query).case_insensitive(!case_sensitive).build().unwrap();
+            let lines = if whole_word { regex::Regex::new(&format!(r"(?:^|\W)(?:{query})(?:$|\W)")).unwrap() } else { lines };
+            for file in ["a.rs", "crlf.rs", "one.rs"] {
+                let contents = std::fs::read_to_string(dir.path().join(file)).unwrap();
+                let expected: Vec<usize> = contents
+                    .split('\n')
+                    .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                    .enumerate()
+                    .filter(|(_, line)| !line.trim().is_empty() && lines.is_match(line))
+                    .map(|(index, _)| index + 1)
+                    .collect();
+                let found = execute(
+                    &mut ws,
+                    "source_search",
+                    json!({"query":query,"regex":true,"case_sensitive":case_sensitive,"whole_word":whole_word,"path":file,"limit":100}),
+                    &cancel,
+                )
+                .unwrap();
+                let shown: Vec<usize> = found["matches"].as_array().unwrap().iter().map(|m| m["line"].as_u64().unwrap() as usize).collect();
+                assert_eq!(shown, expected, "{query} in {file}");
+                assert_eq!(found["total_matching_lines"], expected.len(), "{query} in {file}");
+            }
+        }
+    }
+
     /// The descriptions and hints say `**` crosses directories; `*` did
     /// too, so `src/*.rs` was every Rust file below src.
     #[test]

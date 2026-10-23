@@ -31,6 +31,36 @@ fn pattern_hint(args: &Value) -> String {
     )
 }
 
+/// Bytes of whole lines `source_search` tests at once (a block holds one
+/// longer line whole).
+pub(super) const BLOCK_BYTES: usize = 64 * 1024;
+
+/// The end of the block of whole lines that starts at `start`: past the line
+/// break at or after BLOCK_BYTES, or the end of the text.
+fn lines_block_end(text: &str, start: usize) -> usize {
+    let from = start.saturating_add(BLOCK_BYTES).min(text.len());
+    text.as_bytes()[from..]
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .map_or(text.len(), |at| from + at + 1)
+}
+
+/// Whether a regular expression matches a block of whole lines, `^` and `$`
+/// at each line (multi-line), exactly where it matches one of the lines read
+/// alone. `\A` and `\z` match at the ends of each line tested alone but only
+/// at the ends of a block, and a flag turned off (`(?-m)`) can undo the
+/// multi-line one: such a regular expression is tested line by line. Text
+/// that merely looks so (an escaped `\\A`) is tested by lines too, which
+/// costs only time.
+fn regex_reads_lines_as_blocks(query: &str) -> bool {
+    !query.contains("\\A")
+        && !query.contains("\\z")
+        && !query
+            .split("(?")
+            .skip(1)
+            .any(|flags| flags.split([')', ':']).next().is_some_and(|flags| flags.contains('-')))
+}
+
 pub(super) fn execute(
     s: &mut Workspace,
     args: &Value,
@@ -234,12 +264,26 @@ pub(super) fn execute(
     };
     let total = candidates.len();
     let narrower = "narrow path or path_glob, or search fewer words";
-    // A literal search (anything but a regular expression) matches a line
-    // only where it matches in the whole file, so a file without a match is
-    // passed over in one scan instead of line by line. A regular expression
-    // may hold anchors (`\A`, `^` without multi-line) that a whole file reads
-    // differently, and keeps the scan by lines.
+    // Whole lines are scanned a block at a time, and a block without a match
+    // is passed over at once instead of line by line. A literal search
+    // (anything but a regular expression) matches a line only where it
+    // matches in the block. A regular expression does so with `^` and `$`
+    // at every line, unless it asks otherwise (`regex_reads_lines_as_blocks`);
+    // scanned by lines, a regular expression took three times as long as
+    // the literal search of the same files.
     let literal_search = terms.is_some() || !args["regex"].as_bool().unwrap_or(false);
+    let block_regex = if literal_search {
+        Some(regex.clone())
+    } else if regex_reads_lines_as_blocks(query) {
+        regex::RegexBuilder::new(&expression)
+            .case_insensitive(!case_sensitive)
+            .multi_line(true)
+            .size_limit(1024 * 1024)
+            .build()
+            .ok()
+    } else {
+        None
+    };
     for (read, path) in candidates.into_iter().enumerate() {
         if cancel.is_cancelled() {
             bail!("cancelled");
@@ -249,9 +293,10 @@ pub(super) fn execute(
             continue;
         };
         matched_files += 1;
-        if literal_search && !regex.is_match(&contents) {
-            continue;
-        }
+        // A line read alone ends before its `\r\n`, where a block's `$` does
+        // not match: a file with `\r` is scanned by lines for a regular
+        // expression.
+        let blocks = block_regex.as_ref().filter(|_| literal_search || !contents.contains('\r'));
         // Only files with a match make the results, so only they are hashed
         // into the cursor's identity: a file without one changing changes
         // nothing a cursor points at. Hashing every file took as long as the
@@ -259,53 +304,62 @@ pub(super) fn execute(
         let mut digest = None;
         let mut matching_lines = 0usize;
         let mut byte_offset = 0;
-        for (i, chunk) in contents.split_inclusive('\n').enumerate() {
-            let line = chunk
-                .strip_suffix('\n')
-                .map(|line| line.strip_suffix('\r').unwrap_or(line))
-                .unwrap_or(chunk);
-            let line_start = byte_offset;
-            byte_offset += chunk.len();
-            if i % 256 == 0 {
-                if cancel.is_cancelled() {
-                    bail!("cancelled");
+        let mut next_line = 0;
+        while byte_offset < contents.len() {
+            if cancel.is_cancelled() {
+                bail!("cancelled");
+            }
+            super::past_deadline(deadline, "source_search", read, total, s.config.tool_timeout_secs, narrower)?;
+            let block = &contents[byte_offset..lines_block_end(&contents, byte_offset)];
+            if blocks.is_some_and(|blocks| !blocks.is_match(block)) {
+                next_line += block.matches('\n').count() + usize::from(!block.ends_with('\n'));
+                byte_offset += block.len();
+                continue;
+            }
+            for chunk in block.split_inclusive('\n') {
+                let line = chunk
+                    .strip_suffix('\n')
+                    .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                    .unwrap_or(chunk);
+                let line_start = byte_offset;
+                byte_offset += chunk.len();
+                let i = next_line;
+                next_line += 1;
+                // A blank or whitespace-only line cannot provide the non-empty
+                // excerpt required for source evidence, so do not expose it as a
+                // searchable match even when a regex can match an empty string.
+                if line.trim().is_empty() || !regex.is_match(line) {
+                    continue;
                 }
-                super::past_deadline(deadline, "source_search", read, total, s.config.tool_timeout_secs, narrower)?;
+                matching_lines += 1;
+                total_matching_lines += 1;
+                let digest = digest.get_or_insert_with(|| hash(contents.as_bytes()));
+                let index = total_matching_lines - 1;
+                if mode != "matches" || index < requested_offset || index >= requested_end {
+                    continue;
+                }
+                let mut context = Vec::new();
+                for (distance, text) in contents[..line_start]
+                    .lines()
+                    .rev()
+                    .take(before)
+                    .enumerate()
+                {
+                    context.push(displayed_line(i - distance, text));
+                }
+                context.reverse();
+                for (distance, text) in contents[byte_offset..].lines().take(after).enumerate() {
+                    context.push(displayed_line(i + distance + 2, text));
+                }
+                rows.push(Match {
+                    path: path.clone(),
+                    hash: digest.clone(),
+                    line: i + 1,
+                    text: line.chars().take(500).collect(),
+                    truncated: line.chars().count() > 500,
+                    context,
+                });
             }
-            // A blank or whitespace-only line cannot provide the non-empty
-            // excerpt required for source evidence, so do not expose it as a
-            // searchable match even when a regex can match an empty string.
-            if line.trim().is_empty() || !regex.is_match(line) {
-                continue;
-            }
-            matching_lines += 1;
-            total_matching_lines += 1;
-            let digest = digest.get_or_insert_with(|| hash(contents.as_bytes()));
-            let index = total_matching_lines - 1;
-            if mode != "matches" || index < requested_offset || index >= requested_end {
-                continue;
-            }
-            let mut context = Vec::new();
-            for (distance, text) in contents[..line_start]
-                .lines()
-                .rev()
-                .take(before)
-                .enumerate()
-            {
-                context.push(displayed_line(i - distance, text));
-            }
-            context.reverse();
-            for (distance, text) in contents[byte_offset..].lines().take(after).enumerate() {
-                context.push(displayed_line(i + distance + 2, text));
-            }
-            rows.push(Match {
-                path: path.clone(),
-                hash: digest.clone(),
-                line: i + 1,
-                text: line.chars().take(500).collect(),
-                truncated: line.chars().count() > 500,
-                context,
-            });
         }
         if let Some(digest) = digest {
             fingerprint.update(serde_json::to_vec(&(path.to_string_lossy(), &digest))?);

@@ -1529,7 +1529,13 @@ async fn execute_batch(
             if call.name != "history" {
                 result["root"] = json!(root_text.display().to_string());
             }
-            let mut result = tools::limit_result(&mut workspace, &call, &clean, result, share);
+            // Guarded as the call is: a panic while bounding a result ended the
+            // thread, and every source call of the batch, those done before
+            // too, came back cancelled.
+            let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tools::limit_result(&mut workspace, &call, &clean, result, share)
+            }))
+            .unwrap_or_else(|_| tools::envelope(Err(anyhow::anyhow!("tool_worker_panic: the tool stopped unexpectedly"))));
             if call.name != "history" && result.get("root").is_none() {
                 result["root"] = json!(root_text.display().to_string());
             }
