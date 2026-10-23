@@ -1211,10 +1211,16 @@ async fn locate(
     }
     let indices: Vec<usize> = calls.iter().map(|(index, ..)| *index).collect();
     let (config, cursors) = (config.clone(), cursors.clone());
+    let work = tools::SourceWork::default();
+    let ending = work.ending();
     let found = tokio::task::spawn_blocking(move || {
+        let _ending = ending;
         calls
             .into_iter()
             .map(|(index, name, args)| {
+                if name != "history" && tools::source_stuck() {
+                    return (index, Err(tools::SOURCE_STUCK.to_owned()));
+                }
                 let found = resolve(&config, &name, &args, &cursors).map(|(project, note)| {
                     let root = (name != "history")
                         .then(|| project.root.canonicalize().unwrap_or_else(|_| project.root.clone()).display().to_string());
@@ -1227,7 +1233,10 @@ async fn locate(
     let unfound = |reason: &str| indices.iter().map(|index| (*index, Err(reason.to_owned()))).collect();
     tokio::select! {
         biased;
-        _ = cancel.cancelled() => unfound("cancelled"),
+        _ = cancel.cancelled() => {
+            work.abandon();
+            unfound("cancelled")
+        }
         found = found => found.unwrap_or_else(|_| unfound("tool_worker_panic: the tool stopped unexpectedly")),
     }
 }
@@ -1480,9 +1489,17 @@ async fn execute_batch(
     let source_events = events.clone();
     let source_cancel = cancel.clone();
     let source_ids = ids.clone();
+    let source_work = tools::SourceWork::default();
+    let source_ending = source_work.ending();
     let source_task = tokio::task::spawn_blocking(move || {
+        let _ending = source_ending;
         let mut outputs = vec![];
         for (index, call, args, project) in source_calls {
+            if call.name != "history" && tools::source_stuck() {
+                source_events.send(json!({"type":"tool_done","id":source_ids[index],"name":call.name,"status":"error"}));
+                outputs.push((index, tools::envelope(Err(anyhow::anyhow!(tools::SOURCE_STUCK)))));
+                continue;
+            }
             let started = Instant::now();
             let root_text = project.root.canonicalize().unwrap_or_else(|_| project.root.clone());
             let mut workspace = Workspace {
@@ -1610,6 +1627,9 @@ async fn execute_batch(
         joined = &mut source_task => Some(joined),
         _ = cancel.cancelled() => tokio::time::timeout(SOURCE_STOP_GRACE, &mut source_task).await.ok(),
     };
+    if joined.is_none() {
+        source_work.abandon();
+    }
     let (outputs, cursors, scopes, history) = match joined {
         Some(Ok(done)) => done,
         _ => {

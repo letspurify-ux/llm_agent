@@ -25,7 +25,9 @@ impl Drop for Unblock {
 
 /// Performance, deadlock and panic review, 2026-10-23: the batch waited for
 /// its source thread with no end, so a stopped question stayed running for
-/// as long as a read did not return.
+/// as long as a read did not return. Then each question asked during the
+/// hang left one more stuck thread of the blocking pool: source calls now
+/// wait for the stuck one to return.
 #[tokio::test]
 async fn a_stopped_question_does_not_wait_for_a_stuck_source_call() {
     let home = tempfile::tempdir().unwrap();
@@ -45,8 +47,9 @@ async fn a_stopped_question_does_not_wait_for_a_stuck_source_call() {
     config.llm.base_url = "http://127.0.0.1:9/v1".into();
     config.llm.model = "gpt-4o".into();
     config.projects.push(llm_agent::config::Project { name: "app".into(), root: project.path().into(), ..Default::default() });
-    let llm = Scripted::new(vec![calls(vec![call("s", "source_search", json!({"query":"fn a"}))]), text("답")]);
-    let (app, _dir) = app(config, llm);
+    let search = |id: &str| calls(vec![call(id, "source_search", json!({"query":"fn a"}))]);
+    let llm = Scripted::new(vec![search("s1"), search("s2"), text("답2"), search("s3"), text("답3")]);
+    let (app, _dir) = app(config, llm.clone());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     let stop = cancel.clone();
@@ -66,4 +69,30 @@ async fn a_stopped_question_does_not_wait_for_a_stuck_source_call() {
         events.push(event);
     }
     assert!(ev(&events, "tool_done").iter().any(|e| e["status"] == "cancelled"), "{events:?}");
+    assert!(llm_agent::tools::source_stuck());
+
+    // Asked again during the hang: refused at once, without another thread.
+    let ask = |id: &str| Question { conversation_id: id.into(), message: "a 함수는?".into(), history: vec![] };
+    let started = Instant::now();
+    let answer = tokio::time::timeout(Duration::from_secs(20), agent::answer(&app, ask("again"), Events::new(None), CancellationToken::new()))
+        .await
+        .expect("the question during the hang ended");
+    assert_eq!(answer.unwrap().answer, "답2");
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    let refused = tool_result(&llm.requests().last().unwrap().clone(), "s2");
+    assert!(refused["error"].as_str().unwrap().starts_with("source_unavailable"), "{refused}");
+
+    // The read returns: source tools go on.
+    drop(_unblock);
+    let returned = Instant::now();
+    while llm_agent::tools::source_stuck() {
+        assert!(returned.elapsed() < Duration::from_secs(10), "the stuck thread ended");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    std::fs::remove_file(&gitconfig).unwrap();
+    std::fs::write(&gitconfig, "").unwrap();
+    let answer = agent::answer(&app, ask("after"), Events::new(None), CancellationToken::new()).await;
+    assert_eq!(answer.unwrap().answer, "답3");
+    let searched = tool_result(&llm.requests().last().unwrap().clone(), "s3");
+    assert_eq!(searched["status"], "ok", "{searched}");
 }

@@ -85,6 +85,57 @@ pub struct ToolConfig {
 /// Identical unchanged reads already in context before another is
 /// suppressed (force_read reads anyway).
 pub const REPEATED_READ_LIMIT: usize = 2;
+
+/// Blocking source work (a batch's calls, the search for their projects)
+/// that a stopped question gave up waiting for and that has not returned:
+/// a read stuck in a file system that stopped answering. While any is out,
+/// source calls are refused before they touch the file system, so a hang
+/// leaves one stuck thread, not one more for every question asked during
+/// it (each held a thread of the blocking pool that other work shares).
+static STUCK_SOURCE_WORK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The refusal of a source call while earlier source work is stuck.
+pub const SOURCE_STUCK: &str = "source_unavailable: an earlier source tool call is still waiting on a project's file system (a network drive not answering?); source tools are paused until it returns. Answer without them, or ask again later";
+
+/// Whether source calls are paused (see `STUCK_SOURCE_WORK`).
+pub fn source_stuck() -> bool {
+    STUCK_SOURCE_WORK.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
+/// One piece of blocking source work, as its waiter and its thread share
+/// it: the thread ends it (`Ending`, on unwind too), the waiter may give up
+/// on it first (`abandon`); work given up on counts as stuck until it ends.
+#[derive(Clone, Default)]
+pub struct SourceWork(std::sync::Arc<std::sync::atomic::AtomicU8>);
+const WORK_RUNNING: u8 = 0;
+const WORK_DONE: u8 = 1;
+const WORK_ABANDONED: u8 = 2;
+impl SourceWork {
+    /// Called when the waiter stops waiting. Counted first, so the thread's
+    /// release always follows its count.
+    pub fn abandon(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        STUCK_SOURCE_WORK.fetch_add(1, SeqCst);
+        if self.0.compare_exchange(WORK_RUNNING, WORK_ABANDONED, SeqCst, SeqCst).is_err() {
+            // It ended meanwhile.
+            STUCK_SOURCE_WORK.fetch_sub(1, SeqCst);
+        }
+    }
+    /// Held by the thread for as long as it works.
+    pub fn ending(&self) -> SourceWorkEnding {
+        SourceWorkEnding(self.clone())
+    }
+}
+/// Ends its work when dropped.
+pub struct SourceWorkEnding(SourceWork);
+impl Drop for SourceWorkEnding {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.0.0.swap(WORK_DONE, SeqCst) == WORK_ABANDONED {
+            STUCK_SOURCE_WORK.fetch_sub(1, SeqCst);
+        }
+    }
+}
 impl ToolConfig {
     pub fn result_budget(&self) -> usize {
         self.result_tokens
@@ -1657,7 +1708,7 @@ fn file_read_metadata(message: &Value) -> Option<FileReadMetadata> {
 fn read_file(
     s: &mut Workspace,
     args: &mut Value,
-    _cancel: &tokio_util::sync::CancellationToken,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value> {
     if let Some(id) = args["cursor"].as_str() {
         let cursor = s.file_cursors.get(id).cloned().ok_or_else(|| anyhow::anyhow!("invalid_file_cursor: copy next_cursor.cursor exactly from this conversation, or start a new read with path/start_line/max_lines"))?;
@@ -1686,7 +1737,14 @@ fn read_file(
         );
     };
     let path = read_path(&s.project, path)?;
+    // A stopped call returns before and after its one read (16 MiB at most).
+    if cancel.is_cancelled() {
+        bail!("cancelled");
+    }
     let contents = read_text(&path)?;
+    if cancel.is_cancelled() {
+        bail!("cancelled");
+    }
     let digest = hash(contents.as_bytes());
     if args["__cursor_hash"]
         .as_str()
