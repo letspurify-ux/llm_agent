@@ -702,22 +702,32 @@ pub(crate) fn excluded_by(project: &Project, rules: &Rules, relative: &Path) -> 
     if tool_folder(project, relative).is_some() {
         return true;
     }
+    // Normalizing every path's names for rules there are none of took more
+    // than half of a large project's walk.
+    if rules.include.is_empty() && rules.exclude.is_empty() {
+        return false;
+    }
     // A rule holds for a path when it matches the path or a directory the
     // path is in, as in an ignore file: `secrets` excluded the directory
     // listed by name, while `secrets/key.pem` was read all the same. A
     // pattern without `/` also names a file or directory at any depth: `.env`
     // excluded the root's alone, though `*.log` matched at every depth.
-    let names: Vec<String> = relative.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect();
-    let mut within: Vec<(String, String)> = Vec::with_capacity(names.len());
-    let mut prefix = String::new();
-    for name in &names {
-        if !prefix.is_empty() {
-            prefix.push('/');
-        }
-        prefix.push_str(name);
-        within.push((prefix.nfd().collect(), folded_alias_key(&prefix)));
+    // Each name is normalized once: both forms of `a/b` are those of `a`
+    // and `b` joined by `/`, which neither form changes or reorders across.
+    let named: Vec<(String, String)> = relative
+        .components()
+        .map(|part| {
+            let name = part.as_os_str().to_string_lossy();
+            (name.nfd().collect(), folded_alias_key(&name))
+        })
+        .collect();
+    let mut within: Vec<(String, String)> = Vec::with_capacity(named.len());
+    for (normalized, folded) in &named {
+        within.push(match within.last() {
+            Some((above, above_folded)) => (format!("{above}/{normalized}"), format!("{above_folded}/{folded}")),
+            None => (normalized.clone(), folded.clone()),
+        });
     }
-    let named: Vec<(String, String)> = names.iter().map(|name| (name.nfd().collect(), folded_alias_key(name))).collect();
     let matches = |rule: &Rule| {
         let hit = |(normalized, folded): &(String, String)| {
             rule.normalized.is_match(normalized) || rule.folded.as_ref().is_some_and(|glob| glob.is_match(folded))
@@ -1854,6 +1864,17 @@ pub fn result_tokens(call: &crate::llm::ToolCall, result: &Value, model: &str) -
     )
 }
 
+/// Whether `result_tokens` stays within `limit`, counted only until it
+/// crosses it: a source search with context around 100 matches (2 MB) took
+/// 200 ms to count whole, to learn only that it did not fit.
+pub fn result_within(call: &crate::llm::ToolCall, result: &Value, model: &str, limit: usize) -> bool {
+    context::within(
+        &json!({"role":"tool","tool_call_id":call.id,"content":model_result(result).to_string()}).to_string(),
+        limit,
+        model,
+    )
+}
+
 /// Room left for the call ID and an `adjusted_arguments` note when a result
 /// is fitted before they are known.
 pub const MESSAGE_MARGIN: usize = 120;
@@ -2025,7 +2046,7 @@ pub fn bound_result(
     limit: usize,
 ) -> Value {
     let model = s.config.model.clone();
-    if result_tokens(call, &result, &model) <= limit {
+    if result_within(call, &result, &model, limit) {
         return result;
     }
     let mut output = result.clone();
@@ -2042,7 +2063,7 @@ pub fn bound_result(
     if call.name == "search" && result["status"] == "ok" && output["data"]["results"].is_object() {
         let mut fitted = output.clone();
         crate::voc_tools::fit_search(&mut fitted["data"], limit, &model);
-        if result_tokens(call, &fitted, &model) <= limit {
+        if result_within(call, &fitted, &model, limit) {
             return fitted;
         }
     }
@@ -2130,7 +2151,7 @@ pub fn bound_result(
             result_tokens(call, &candidate(length, s), &model)
         });
         output = candidate(low, s);
-        if low > 0 && result_tokens(call, &output, &model) <= limit {
+        if low > 0 && result_within(call, &output, &model, limit) {
             if narrowed_cursor.is_some()
                 && let Some(id) = output["next_cursor"]["cursor"].as_str().map(str::to_owned)
             {
@@ -2156,9 +2177,22 @@ pub fn bound_result(
         }
         let mut fits = |keep: usize| {
             output["data"][field] = Value::Array(items[..keep].to_vec());
-            result_tokens(call, &output, &model) <= limit
+            result_within(call, &output, &model, limit)
         };
+        // Measured from the front, doubling, before halving: a measure costs
+        // as much as the items it keeps, and halving from all of them (a
+        // source search's 100 matches with 40 lines of context each, 2 MB)
+        // measured mostly what could never fit, half a second for one call.
         let (mut low, mut high) = (0, items.len());
+        let mut probe = 1;
+        while probe < high {
+            if fits(probe) {
+                low = probe;
+                probe *= 2;
+            } else {
+                high = probe - 1;
+            }
+        }
         while low < high {
             let mid = (low + high).div_ceil(2);
             if fits(mid) {
@@ -2235,7 +2269,7 @@ pub fn bound_result(
         while room > 0 {
             let mut candidate = compact.clone();
             candidate["data"]["preview"] = json!(context::truncate(&shown, room, &model).0);
-            if result_tokens(call, &candidate, &model) <= limit {
+            if result_within(call, &candidate, &model, limit) {
                 compact = candidate;
                 break;
             }
@@ -2248,7 +2282,7 @@ pub fn bound_result(
     if let Some(error) = result["error"].as_str() {
         compact["error"] = json!(context::truncate(error, (limit / 3).clamp(8, 128), &model).0);
     }
-    if result_tokens(call, &compact, &model) > limit {
+    if !result_within(call, &compact, &model, limit) {
         compact["data"] = Value::Null;
     }
     compact
@@ -2294,7 +2328,7 @@ fn knowledge_page(call: &crate::llm::ToolCall, result: &Value, limit: usize, mod
     let (mut low, mut high) = (0, ends.len() - 1);
     while low < high {
         let mid = (low + high).div_ceil(2);
-        if result_tokens(call, &page(mid), model) <= limit {
+        if result_within(call, &page(mid), model, limit) {
             low = mid;
         } else {
             high = mid - 1;
@@ -3419,5 +3453,44 @@ mod tests {
         assert_eq!(value["data"]["path"], "src/a.rs");
         assert_eq!(value["data"]["matches"][0]["path"], "b.rs");
         assert_eq!(value["data"]["matches"][1]["path"], "/w/other.md");
+    }
+
+    /// `excluded_by` normalizes each name of a path once and joins them with
+    /// `/`: that must be what normalizing the joined path gives, with marks
+    /// that start a name, Hangul, and folds that grow a character.
+    #[test]
+    fn names_normalized_apart_join_as_their_path_does() {
+        use unicode_normalization::UnicodeNormalization;
+        let nfd = |s: &str| s.nfd().collect::<String>();
+        let names = ["\u{301}a", "한글", "Straße", "İx", "e\u{323}\u{301}", "ﬁle", "Ω.RS"];
+        for a in names {
+            for b in names {
+                let path = format!("{a}/{b}");
+                assert_eq!(nfd(&path), format!("{}/{}", nfd(a), nfd(b)), "{path}");
+                assert_eq!(folded_alias_key(&path), format!("{}/{}", folded_alias_key(a), folded_alias_key(b)), "{path}");
+            }
+        }
+    }
+
+    /// A search far over the result budget (40 lines of context around 100
+    /// matches, 2 MB) keeps as many whole matches as fit, and not one more.
+    #[test]
+    fn a_search_far_over_the_budget_keeps_the_matches_that_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("let handler_value = \"{}\";\n", "word ".repeat(115));
+        std::fs::write(dir.path().join("a.rs"), line.repeat(3000)).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut ws = workspace(dir.path());
+        let args = json!({"query":"handler_value","before":20,"after":20,"limit":100});
+        let call = crate::llm::ToolCall { id: "c1".into(), name: "source_search".into(), arguments: args.to_string() };
+        let result = envelope(execute(&mut ws, "source_search", args.clone(), &cancel));
+        let limit = 25_000;
+        let cut = limit_result(&mut ws, &call, &args, result.clone(), limit);
+        let kept = cut["data"]["matches"].as_array().unwrap().len();
+        assert!(kept > 0 && result_tokens(&call, &cut, "gpt-4o") <= limit, "{kept}");
+        assert_eq!(cut["data"]["matches_omitted"], 100 - kept);
+        let mut more = cut.clone();
+        more["data"]["matches"] = json!(result["data"]["matches"].as_array().unwrap()[..kept + 1]);
+        assert!(result_tokens(&call, &more, "gpt-4o") > limit);
     }
 }

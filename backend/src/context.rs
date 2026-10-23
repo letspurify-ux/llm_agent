@@ -205,6 +205,16 @@ pub fn tokens(text: &str, model: &str) -> usize {
     let bpe = tokenizer(model);
     scaled(segments(text).map(|s| bpe.encode_with_special_tokens(s).len()).sum(), model)
 }
+/// Whether `tokens(text, model) <= limit`, counted only until the count
+/// crosses `limit`: a text many times the limit costs about the limit.
+pub fn within(text: &str, limit: usize, model: &str) -> bool {
+    let bpe = tokenizer(model);
+    let mut counted = 0usize;
+    segments(text).all(|segment| {
+        counted += bpe.encode_with_special_tokens(segment).len();
+        scaled(counted, model) <= limit
+    })
+}
 pub fn is_estimated(model: &str) -> bool {
     tiktoken_rs::tokenizer::get_tokenizer(model).is_none()
 }
@@ -550,6 +560,10 @@ mod tests {
                 assert!(text.starts_with(&cut) && tokens(&cut, model) <= limit);
                 assert_eq!(truncated, cut.len() < text.len());
                 assert_eq!(cut, reference(&text, limit, model), "limit {limit}");
+                let whole = tokens(&text, model);
+                for limit in [limit, whole, whole.saturating_sub(1)] {
+                    assert_eq!(within(&text, limit, model), whole <= limit, "within {limit} of {whole}");
+                }
             }
         }
     }
