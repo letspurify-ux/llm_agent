@@ -1463,11 +1463,37 @@ fn unsafe_ignore_file(dir: &Path) -> Option<PathBuf> {
     let mut files = vec![dir.join(".ignore"), dir.join(".gitignore")];
     match git.metadata() {
         Ok(metadata) if metadata.is_dir() => files.push(git.join("info/exclude")),
-        // A `.git` file (worktree, submodule) is read for its gitdir line.
-        Ok(metadata) if metadata.is_file() => files.push(git),
+        // A `.git` file (worktree, submodule) is read for its gitdir line,
+        // and the walker goes on from there as git does: it reads the first
+        // line of that directory's `commondir`, then the `info/exclude` of
+        // the directory it names. Unchecked, a `commondir` linked to
+        // /dev/zero took 1.3 GB in a second of one file_list, and grew on.
+        Ok(metadata) if metadata.is_file() => {
+            if !safe(&git) {
+                return Some(git);
+            }
+            if let Some(gitdir) = first_line(&git).and_then(|line| line.strip_prefix("gitdir: ").map(PathBuf::from)) {
+                let commondir = gitdir.join("commondir");
+                if !safe(&commondir) {
+                    return Some(commondir);
+                }
+                if let Some(common) = first_line(&commondir) {
+                    let common = if common.starts_with('.') { gitdir.join(common) } else { PathBuf::from(common) };
+                    files.push(common.join("info/exclude"));
+                }
+            }
+        }
         _ => {}
     }
     files.into_iter().find(|file| !safe(file))
+}
+
+/// The first line of a file already found safe to read, as the walker reads
+/// it (without its line break), or None where the walker reads none.
+fn first_line(path: &Path) -> Option<String> {
+    use std::io::{BufRead, Read};
+    let file = std::fs::File::open(path).ok()?;
+    std::io::BufReader::new(file.take(MAX_IGNORE_FILE_BYTES)).lines().next()?.ok()
 }
 
 fn search_text(path: &Path) -> Result<Option<String>> {
@@ -2653,7 +2679,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("app");
-        for sub in ["src", "piped", "piped_link", "endless", "huge", "src/kept"] {
+        for sub in ["src", "piped", "piped_link", "endless", "huge", "src/kept", "endless_common", "piped_exclude", "linked"] {
             std::fs::create_dir_all(root.join(sub)).unwrap();
             std::fs::write(root.join(sub).join("a.rs"), "fn a() {}\n").unwrap();
         }
@@ -2662,6 +2688,21 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("outside_pipe"), root.join("piped_link/.ignore")).unwrap();
         std::os::unix::fs::symlink("/dev/zero", root.join("endless/.gitignore")).unwrap();
         std::fs::write(root.join("huge/.gitignore"), "x\n".repeat(600_000)).unwrap();
+        // Worktrees: the walker follows a `.git` file to its git directory's
+        // `commondir`, and that to an `info/exclude`.
+        let worktree = |sub: &str| {
+            let gitdir = dir.path().join("gitdirs").join(sub);
+            std::fs::create_dir_all(gitdir.join("info")).unwrap();
+            std::fs::write(root.join(sub).join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+            gitdir
+        };
+        std::os::unix::fs::symlink("/dev/zero", worktree("endless_common").join("commondir")).unwrap();
+        let piped = worktree("piped_exclude");
+        std::fs::write(piped.join("commondir"), ".\n").unwrap();
+        fifo(&piped.join("info/exclude"));
+        let linked = worktree("linked");
+        std::fs::write(linked.join("commondir"), ".\n").unwrap();
+        std::fs::write(linked.join("info/exclude"), "a.rs\n").unwrap();
         // Ordinary ignore files still apply.
         std::fs::write(root.join("src/kept/.gitignore"), "a.rs\n").unwrap();
         std::fs::create_dir_all(root.join(".git")).unwrap();
