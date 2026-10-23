@@ -64,51 +64,85 @@ struct PoolEntry {
 pub struct Oracle {
     pools: Mutex<HashMap<String, PoolEntry>>,
     client: OnceLock<std::result::Result<String, String>>,
+    /// A load of the client library is under way (`load_by`).
+    loading: std::sync::atomic::AtomicBool,
+    /// Told when a load ends, with a state or not (it panicked).
+    loaded: tokio::sync::Notify,
+}
+
+/// Loads the Oracle client library (it cannot be reloaded in a process).
+/// Returns the client version or why it is unavailable.
+fn load_library(cfg: &OracleConfig) -> std::result::Result<String, String> {
+    let mut params = oracle::InitParams::new();
+    if !cfg.client_lib_dir.trim().is_empty() {
+        params
+            .oracle_client_lib_dir(cfg.client_lib_dir.trim())
+            .map_err(|e| e.to_string())?;
+    }
+    if !cfg.client_config_dir.trim().is_empty() {
+        params
+            .oracle_client_config_dir(cfg.client_config_dir.trim())
+            .map_err(|e| e.to_string())?;
+    }
+    params.init().map_err(|e| e.to_string())?;
+    oracle::Version::client()
+        .map(|v| v.to_string())
+        .map_err(|e| e.to_string())
 }
 
 impl Oracle {
-    /// Loads the Oracle client library once per process (it cannot be
-    /// reloaded). Returns the client version or why it is unavailable.
-    pub fn init_client(&self, cfg: &OracleConfig) -> std::result::Result<String, String> {
-        self.client
-            .get_or_init(|| {
-                let mut params = oracle::InitParams::new();
-                if !cfg.client_lib_dir.trim().is_empty() {
-                    params
-                        .oracle_client_lib_dir(cfg.client_lib_dir.trim())
-                        .map_err(|e| e.to_string())?;
-                }
-                if !cfg.client_config_dir.trim().is_empty() {
-                    params
-                        .oracle_client_config_dir(cfg.client_config_dir.trim())
-                        .map_err(|e| e.to_string())?;
-                }
-                params.init().map_err(|e| e.to_string())?;
-                oracle::Version::client()
-                    .map(|v| v.to_string())
-                    .map_err(|e| e.to_string())
-            })
-            .clone()
-    }
-
     /// The client state without loading it.
     pub fn client_state(&self) -> Option<std::result::Result<String, String>> {
         self.client.get().cloned()
     }
 
-    /// `init_client` from async code: the library is loaded (its files read
-    /// from its folder, a network drive's too), or a load under way waited
-    /// for, on a blocking thread. Loaded on the runtime's own, as a query
-    /// and the settings screen's check did, a folder that did not answer
-    /// held a thread serving every request.
+    /// The client library, loaded once per process on a blocking thread
+    /// (its files read from its folder, a network drive's too), or the load
+    /// under way waited for. Loaded on the runtime's own, as a query and the
+    /// settings screen's check did, a folder that did not answer held a
+    /// thread serving every request.
     pub async fn load_client(self: &Arc<Self>, cfg: &OracleConfig) -> std::result::Result<String, String> {
+        let cfg = cfg.clone();
+        self.load_by(move || load_library(&cfg)).await
+    }
+
+    /// `load_client` with the loading given. One load runs at a time and the
+    /// rest wait to be told it ended, holding no thread: each waited on a
+    /// blocking thread of its own, in `get_or_init`, so while a folder did
+    /// not answer every query run, and every check on the settings screen,
+    /// kept one more thread of the pool other work shares — and a stopped
+    /// question waited on, with its conversation, until the folder answered.
+    /// Dropped, a waiter leaves nothing behind.
+    async fn load_by(
+        self: &Arc<Self>,
+        load: impl FnOnce() -> std::result::Result<String, String> + Send + 'static,
+    ) -> std::result::Result<String, String> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let ended = self.loaded.notified();
+        tokio::pin!(ended);
+        // Listening before the state is read, a load ending in between is heard.
+        ended.as_mut().enable();
         if let Some(state) = self.client_state() {
             return state;
         }
-        let (oracle, cfg) = (self.clone(), cfg.clone());
-        tokio::task::spawn_blocking(move || oracle.init_client(&cfg))
-            .await
-            .unwrap_or_else(|_| Err("the Oracle client library could not be loaded: its loading stopped unexpectedly".into()))
+        if !self.loading.swap(true, SeqCst) {
+            /// Ends the load on unwind too, or its waiters waited for good.
+            struct Ending(Arc<Oracle>);
+            impl Drop for Ending {
+                fn drop(&mut self) {
+                    self.0.loading.store(false, SeqCst);
+                    self.0.loaded.notify_waiters();
+                }
+            }
+            let ending = Ending(self.clone());
+            tokio::task::spawn_blocking(move || {
+                let ending = ending;
+                ending.0.client.get_or_init(load);
+            });
+        }
+        ended.await;
+        self.client_state()
+            .unwrap_or_else(|| Err("the Oracle client library could not be loaded: its loading stopped unexpectedly".into()))
     }
 
     /// Runs a registry row with the model's params.
@@ -214,7 +248,14 @@ impl Oracle {
             return Err(wasted("조회대상 DB 접속 정보가 서버에 설정되어 있지 않습니다.", SETUP_HINT));
         }
         let password = resolve_password(&db::text(&row, "db_password"))?;
-        if let Err(e) = self.load_client(&config.oracle).await {
+        // A load that does not end (its folder on a network drive gone
+        // silent) is no reason to keep a stopped question.
+        let loaded = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("cancelled"),
+            loaded = self.load_client(&config.oracle) => loaded,
+        };
+        if let Err(e) = loaded {
             eprintln!("[oracle] the Oracle client library could not be loaded — install the Instant Client or set its folder in the settings: {e}");
             return Err(wasted(
                 "조회대상 DB 드라이버를 초기화하지 못했습니다.",
@@ -678,16 +719,22 @@ fn collect(rows: oracle::ResultSet<'_, oracle::Row>) -> Result<Read> {
 fn distinct_names(names: Vec<String>) -> Vec<String> {
     let taken: std::collections::HashSet<String> = names.iter().cloned().collect();
     let mut given: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Each name's next number to try: a number passed over stays taken, and
+    // counted from 1 for each repeat, 1,000 columns of one name (Oracle's
+    // most) made half a million names to try.
+    let mut next: HashMap<String, usize> = HashMap::new();
     names
         .into_iter()
         .map(|name| {
             if given.insert(name.clone()) {
                 return name;
             }
-            let renamed = (1..)
-                .map(|n| format!("{name}_{n}"))
-                .find(|candidate| !taken.contains(candidate) && !given.contains(candidate))
+            let from = next.get(&name).copied().unwrap_or(1);
+            let (n, renamed) = (from..)
+                .map(|n| (n, format!("{name}_{n}")))
+                .find(|(_, candidate)| !taken.contains(candidate) && !given.contains(candidate))
                 .unwrap();
+            next.insert(name, n + 1);
             given.insert(renamed.clone());
             renamed
         })
@@ -1009,6 +1056,60 @@ mod tests {
         assert_eq!(loaded.load_client(&cfg).await, Ok("23.0.0.0.0".into()));
     }
 
+    /// Tool review, 2026-10-23: while the client library's load did not
+    /// end (its folder on a network drive gone silent), each query run and
+    /// settings check held a blocking thread waiting in `get_or_init`, and a
+    /// stopped question waited too. One load runs; the rest hold no thread.
+    #[test]
+    fn a_load_that_does_not_end_holds_one_thread_alone() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let oracle = Arc::new(Oracle::default());
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let first = {
+                let oracle = oracle.clone();
+                tokio::spawn(async move {
+                    oracle
+                        .load_by(move || {
+                            let _ = held.recv();
+                            Ok("23.0.0.0.0".into())
+                        })
+                        .await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Waiters given up on, as a stopped question's are.
+            for _ in 0..4 {
+                let waited = tokio::time::timeout(Duration::from_millis(20), oracle.load_by(|| Ok("other".into()))).await;
+                assert!(waited.is_err(), "the load is still under way");
+            }
+            let other = tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(|| 7)).await;
+            assert_eq!(other.expect("other blocking work waited behind the load's waiters").unwrap(), 7);
+            let waiting = tokio::spawn({
+                let oracle = oracle.clone();
+                async move { oracle.load_by(|| Ok("other".into())).await }
+            });
+            release.send(()).unwrap();
+            assert_eq!(first.await.unwrap(), Ok("23.0.0.0.0".into()));
+            assert_eq!(waiting.await.unwrap(), Ok("23.0.0.0.0".into()));
+            assert_eq!(oracle.load_by(|| Ok("other".into())).await, Ok("23.0.0.0.0".into()));
+        });
+    }
+
+    /// A load that panicked tells its waiters, and the next one loads again.
+    #[tokio::test]
+    async fn a_load_that_panicked_is_told_and_tried_again() {
+        let oracle = Arc::new(Oracle::default());
+        let failed = oracle.load_by(|| panic!("the library's load broke")).await;
+        assert!(failed.unwrap_err().contains("stopped unexpectedly"));
+        assert_eq!(oracle.load_by(|| Ok("23.0.0.0.0".into())).await, Ok("23.0.0.0.0".into()));
+    }
+
     fn registry(targets: &str) -> Row {
         let mut r = Map::new();
         r.insert("query_name".into(), json!("q"));
@@ -1080,6 +1181,37 @@ mod tests {
         assert_eq!(names(&["X", "X", "X_1"]), ["X", "X_2", "X_1"]);
         assert_eq!(names(&["X", "X_1", "X", "X"]), ["X", "X_1", "X_2", "X_3"]);
         assert_eq!(names(&["A", "B"]), ["A", "B"]);
+        // Each name goes on from its last number, as trying from 1 names it.
+        let from_one = |list: &[String]| -> Vec<String> {
+            let taken: std::collections::HashSet<&String> = list.iter().collect();
+            let mut given = std::collections::HashSet::new();
+            list.iter()
+                .map(|name| {
+                    if given.insert(name.clone()) {
+                        return name.clone();
+                    }
+                    let renamed = (1..).map(|n| format!("{name}_{n}")).find(|c| !taken.contains(c) && !given.contains(c)).unwrap();
+                    given.insert(renamed.clone());
+                    renamed
+                })
+                .collect()
+        };
+        let pool = ["X", "X_1", "X_2", "X_1_1", "Y", "Y_3"];
+        let mut seed = 7u64;
+        for _ in 0..2_000 {
+            let list: Vec<String> = (0..(seed % 12) as usize)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    pool[(seed >> 33) as usize % pool.len()].to_owned()
+                })
+                .collect();
+            seed = seed.wrapping_add(1);
+            assert_eq!(distinct_names(list.clone()), from_one(&list), "{list:?}");
+        }
+        let started = Instant::now();
+        let many = distinct_names(vec!["X".to_owned(); 1000]);
+        assert_eq!((many[1].as_str(), many[999].as_str()), ("X_1", "X_999"));
+        assert!(started.elapsed() < Duration::from_millis(50), "{:?}", started.elapsed());
     }
 
     #[test]

@@ -274,7 +274,9 @@ pub fn password_env_reference(value: &str) -> Option<(String, bool)> {
         return None;
     }
     let name = trimmed[4..].trim().to_owned();
-    let valid = regex::Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").unwrap().is_match(&name);
+    static NAME: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").unwrap());
+    let valid = NAME.is_match(&name);
     Some((name, valid))
 }
 

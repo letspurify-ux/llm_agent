@@ -107,8 +107,11 @@ pub fn valid_number_input(value: &Value) -> bool {
         }
         _ => return false,
     };
-    let shape = regex::Regex::new(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$").unwrap();
-    shape.is_match(&text)
+    // Built once: compiled for each NUMBER bind of every run.
+    static SHAPE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$").unwrap()
+    });
+    SHAPE.is_match(&text)
         && text.parse::<f64>().is_ok_and(f64::is_finite)
         && in_oracle_number_range(&text)
 }

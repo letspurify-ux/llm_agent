@@ -107,11 +107,13 @@ async fn serve(path: PathBuf, config: Config) -> i32 {
         let cfg = app.config().oracle.clone();
         // Loading the client library can take a moment; report it at start
         // rather than on the first question.
-        tokio::task::spawn_blocking(move || match oracle.init_client(&cfg) {
-            Ok(version) => eprintln!("[oracle] Oracle client {version} loaded"),
-            Err(e) => eprintln!(
-                "[setup] the Oracle client library could not be loaded — registered queries will fail until the Instant Client is installed (or its folder set in the settings and the server restarted): {e}"
-            ),
+        tokio::spawn(async move {
+            match oracle.load_client(&cfg).await {
+                Ok(version) => eprintln!("[oracle] Oracle client {version} loaded"),
+                Err(e) => eprintln!(
+                    "[setup] the Oracle client library could not be loaded — registered queries will fail until the Instant Client is installed (or its folder set in the settings and the server restarted): {e}"
+                ),
+            }
         });
     }
     let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
