@@ -164,6 +164,33 @@ async fn statements_given_up_on_end_at_the_limit_on_the_server() {
     db.close().await;
 }
 
+/// Tool review, 2026-10-23: the server ends a statement at the caller's
+/// own limit, and under load (the runtime busy when both came due) its
+/// "execution time limit exceeded" was the error, not the timeout — this
+/// file's given-up test failed so, one full run in many.
+#[tokio::test]
+async fn a_statement_the_server_ends_at_the_limit_times_out() {
+    let Some(test_db) = TestDb::create("server_first") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let mut config = test_db.config();
+    config.mariadb.timeout_ms = 1000;
+    let cfg = &config.mariadb;
+    let db = Db::default();
+    assert_eq!(db.query(cfg, "SELECT 1 AS one", vec![]).await.unwrap()[0]["one"], 1);
+    // The runtime's one thread held from before the limit to well past it:
+    // the server's error and the timeout are both there when it goes on.
+    let busy = tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    });
+    let sql = "SELECT COUNT(*) AS n FROM seq_1_to_100000000000 WHERE MD5(seq) = 'server_first'";
+    let error = db.query(cfg, sql, vec![]).await.unwrap_err();
+    busy.await.unwrap();
+    assert!(error.to_string().starts_with("database_timeout"), "{error}");
+    db.close().await;
+}
+
 /// Resource review, thirteenth pass: a caller that stopped waiting (a
 /// stopped question) cut its statement mid-way or its connection mid-login.
 /// The server ran the statement on anyway, the pool opened a new connection

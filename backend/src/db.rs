@@ -364,10 +364,18 @@ where
         .unwrap_or_else(|_| Err(anyhow::anyhow!("database_task_ended: the management DB query stopped unexpectedly")))
 }
 
+/// The server's own end of a statement at its `max_statement_time` (`limited`).
+const ER_STATEMENT_TIMEOUT: u16 = 1969;
+
 async fn timed<T>(cfg: &MariaDbConfig, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    let timeout = || anyhow::anyhow!("database_timeout: the management DB did not answer within {} ms", cfg.timeout_ms);
     match tokio::time::timeout(Duration::from_millis(cfg.timeout_ms), work).await {
+        // The server's limit is the same as this one, and under load it can
+        // end the statement first: the same timeout, not the server's
+        // "Query execution was interrupted" one time in a few.
+        Ok(Err(error)) if server_code(&error) == Some(ER_STATEMENT_TIMEOUT) => Err(timeout()),
         Ok(result) => result,
-        Err(_) => bail!("database_timeout: the management DB did not answer within {} ms", cfg.timeout_ms),
+        Err(_) => Err(timeout()),
     }
 }
 
@@ -391,7 +399,8 @@ const MAX_STATEMENT_SECS: f64 = 31_536_000.0;
 /// 16 s after a 1 s limit, measured). It now ends at the limit: an error,
 /// not a part of its rows. The caller's limit counts from before the
 /// statement is sent, so it still comes first; the prefix costs no round
-/// trip.
+/// trip. (Under load the server can come first; `timed` reads its error
+/// as the same timeout.)
 /// `settings` are more `name=value` settings for the statement alone.
 fn limited(cfg: &MariaDbConfig, settings: &str, sql: &str) -> String {
     let secs = (cfg.timeout_ms as f64 / 1000.0).min(MAX_STATEMENT_SECS);
@@ -675,6 +684,27 @@ mod tests {
         assert_eq!(value_json(V::Int(-3)), json!(-3));
         assert_eq!(value_json(V::Date(2026, 9, 6, 1, 2, 3, 0)), json!("2026-09-06 01:02:03"));
         assert_eq!(value_json(V::NULL), Value::Null);
+    }
+
+    /// Tool review, 2026-10-23: the server's `max_statement_time` is the
+    /// caller's limit, and under load it ended a statement first, which then
+    /// failed with the server's "Query execution was interrupted" instead of
+    /// the timeout (management_db's given-up test failed so, one run in many).
+    #[tokio::test]
+    async fn the_servers_end_at_the_limit_is_the_same_timeout() {
+        let cfg = MariaDbConfig { timeout_ms: 1000, ..Default::default() };
+        let server = |code: u16| async move {
+            Err::<(), _>(anyhow::Error::from(mysql_async::Error::Server(mysql_async::ServerError {
+                code,
+                message: "Query execution was interrupted (max_statement_time exceeded)".into(),
+                state: "70100".into(),
+            })))
+        };
+        let error = timed(&cfg, server(ER_STATEMENT_TIMEOUT)).await.unwrap_err();
+        assert!(error.to_string().starts_with("database_timeout"), "{error}");
+        // Another server error is its own.
+        let error = timed(&cfg, server(ER_DUP_ENTRY)).await.unwrap_err();
+        assert_eq!(server_code(&error), Some(ER_DUP_ENTRY));
     }
 
     fn known(db: &Db, host: &str) -> Option<(Vec<IpAddr>, bool)> {

@@ -1517,19 +1517,13 @@ fn first_line(path: &Path) -> Option<String> {
     std::io::BufReader::new(file.take(MAX_IGNORE_FILE_BYTES)).lines().next()?.ok()
 }
 
-fn search_text(path: &Path) -> Result<Option<String>> {
-    match read_text(path) {
-        Ok(text) => Ok(Some(text)),
-        // A file the walk found but cannot read is skipped like a binary one.
-        Err(error)
-            if ["unsupported_", "file_permission_denied", "file_not_found"]
-                .iter()
-                .any(|code| error.to_string().starts_with(code)) =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
+/// A walked file's text, or none for a file that cannot be read as text.
+/// A file the walk found but cannot read is skipped like a binary one,
+/// whatever kept it from being read: only some errors were, and one file
+/// replaced by a directory after the walk, or failing to read (EIO, a
+/// network drive's timeout), failed the whole file_list or source_search.
+fn search_text(path: &Path) -> Option<String> {
+    read_text(path).ok()
 }
 
 /// The line range a read or search match delivered. MnemoArc
@@ -1722,7 +1716,7 @@ fn execute_validated(
                         bail!("cancelled");
                     }
                     past_deadline(deadline, "file_list", read, total, s.config.tool_timeout_secs, "mode=paths lists without reading, or narrow path or path_glob")?;
-                    if search_text(&path)?.is_some() {
+                    if search_text(&path).is_some() {
                         searchable.push(path);
                     }
                 }
@@ -2673,6 +2667,21 @@ mod tests {
             list_cursor_scopes: VecDeque::new(),
             history: Default::default(),
         }
+    }
+
+    /// Tool review, 2026-10-23: a walked file the search could not read
+    /// failed file_list and source_search whole unless its error was one of
+    /// a few (binary, not found, denied): one replaced by a directory after
+    /// the walk, or failing to read (EIO), stopped every search of the scope.
+    #[test]
+    fn a_walked_file_that_cannot_be_read_is_passed_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let replaced = dir.path().join("a.rs");
+        std::fs::create_dir(&replaced).unwrap();
+        assert!(read_text(&replaced).is_err());
+        assert_eq!(search_text(&replaced), None);
+        std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+        assert_eq!(search_text(&dir.path().join("b.rs")).as_deref(), Some("fn b() {}\n"));
     }
 
     /// The walker opens every directory's ignore files itself, before any

@@ -263,6 +263,7 @@ pub(super) fn execute(
     let mut matched_files = 0;
     let mut matching_file_count = 0;
     let mut total_matching_lines = 0usize;
+    let named = exact_path.is_some();
     let candidates = match exact_path {
         // A named file that cannot be read is an error, not an empty
         // result: only walked files are skipped when unreadable.
@@ -299,7 +300,18 @@ pub(super) fn execute(
             bail!("cancelled");
         }
         super::past_deadline(deadline, "source_search", read, total, s.config.tool_timeout_secs, narrower)?;
-        let Some(contents) = search_text(&path)? else {
+        // A file named by path that cannot be read says why; a walked one is
+        // passed over, as a binary one is.
+        let contents = if named {
+            match read_text(&path) {
+                Ok(text) => Some(text),
+                Err(error) if error.to_string().starts_with("unsupported_") => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            search_text(&path)
+        };
+        let Some(contents) = contents else {
             continue;
         };
         matched_files += 1;
