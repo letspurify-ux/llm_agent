@@ -394,9 +394,37 @@ fn path_glob(args: &Value) -> Result<Option<&str>> {
         );
     }
     if let Some(value) = value {
+        nested_glob(value).map_err(|error| anyhow::anyhow!("invalid_path_glob: {error}"))?;
         globset::Glob::new(value).map_err(|error| anyhow::anyhow!("invalid_path_glob: {error}"))?;
     }
     Ok(value)
+}
+
+/// Deepest `{}` a glob may nest. globset turns nested alternates into a
+/// regular expression by recursion and compiles that with a panic for an
+/// error: a path_glob of `{a,` nested 200 deep panicked the call, and 20,000
+/// deep overflowed the stack, which aborted the whole server.
+const MAX_GLOB_NESTING: usize = 16;
+
+/// Refuses a glob that nests `{}` deeper than MAX_GLOB_NESTING, before
+/// globset sees it. Every `{` counts, escaped or not (`\` is a separator on
+/// Windows): a real glob nests two or three.
+pub(crate) fn nested_glob(glob: &str) -> Result<()> {
+    let (mut depth, mut deepest) = (0usize, 0usize);
+    for c in glob.chars() {
+        match c {
+            '{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    if deepest > MAX_GLOB_NESTING {
+        bail!("{{}} alternates nest {deepest} deep, past the {MAX_GLOB_NESTING} a glob may nest");
+    }
+    Ok(())
 }
 /// path is literal (a directory may be named `[slug]`), so it is never
 /// joined with path_glob silently. Name the one glob that means both.
@@ -625,6 +653,7 @@ impl Rules {
         use unicode_normalization::UnicodeNormalization;
         let compile = |pattern: &String| -> Result<Rule> {
             let pattern = rule_pattern(pattern);
+            nested_glob(&pattern)?;
             let normalized_pattern: String = pattern.nfd().collect();
             Ok(Rule {
                 normalized: globset::GlobBuilder::new(&normalized_pattern)
@@ -3492,5 +3521,29 @@ mod tests {
         let mut more = cut.clone();
         more["data"]["matches"] = json!(result["data"]["matches"].as_array().unwrap()[..kept + 1]);
         assert!(result_tokens(&call, &more, "gpt-4o") > limit);
+    }
+
+    /// globset nests alternates by recursion and compiles them with a panic
+    /// for an error: `{a,` nested 200 deep panicked the call, 20,000 deep
+    /// overflowed the stack and aborted the server (and this test).
+    #[test]
+    fn deeply_nested_globs_are_refused_before_globset_sees_them() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut ws = workspace(dir.path());
+        let nested = |depth: usize| format!("{}a.rs{}", "{b,".repeat(depth), "}".repeat(depth));
+        for depth in [MAX_GLOB_NESTING + 1, 200, 20_000] {
+            let listed = execute(&mut ws, "file_list", json!({"mode":"paths","path_glob":nested(depth)}), &cancel);
+            assert!(listed.unwrap_err().to_string().starts_with("invalid_path_glob"), "{depth}");
+            let found = execute(&mut ws, "source_search", json!({"query":"fn a","path_glob":nested(depth)}), &cancel);
+            assert!(found.unwrap_err().to_string().starts_with("invalid_path_glob"), "{depth}");
+            ws.project.exclude = vec![nested(depth)];
+            assert!(crate::projects::validate(&ws.project).is_err(), "{depth}");
+            assert!(execute(&mut ws, "file_list", json!({"mode":"paths"}), &cancel).is_err(), "{depth}");
+            ws.project.exclude.clear();
+        }
+        let listed = execute(&mut ws, "file_list", json!({"mode":"paths","path_glob":nested(MAX_GLOB_NESTING)}), &cancel).unwrap();
+        assert_eq!(listed["total_files"], 1);
     }
 }

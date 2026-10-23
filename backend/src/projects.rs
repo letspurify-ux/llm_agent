@@ -29,6 +29,8 @@ pub fn validate(p: &Project) -> Result<()> {
         }
     }
     for pattern in p.include.iter().chain(&p.exclude) {
+        crate::tools::nested_glob(pattern)
+            .map_err(|e| anyhow::anyhow!("파일 패턴 {pattern:?}이 올바르지 않습니다: {e}"))?;
         globset::Glob::new(pattern)
             .map_err(|e| anyhow::anyhow!("파일 패턴 {pattern:?}이 올바르지 않습니다: {e}"))?;
     }
