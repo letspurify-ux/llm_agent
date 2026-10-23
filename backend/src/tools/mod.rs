@@ -448,7 +448,9 @@ fn path_glob_conflict_hint(s: &Workspace, args: &Value) -> String {
     let (Some(path), Ok(root)) = (args["path"].as_str(), s.project.root.canonicalize()) else {
         return String::new();
     };
-    let Ok(resolved) = read_path(&s.project, path) else {
+    // Without the hints of a missing path: they walked the whole project
+    // for similar names (up to HINT_WALK), only for this hint to drop them.
+    let Ok(resolved) = resolve_path(&s.project, path, false) else {
         return String::new();
     };
     if resolved.is_file() {
@@ -1352,6 +1354,13 @@ fn glob_path(relative: &Path) -> String {
     relative.to_string_lossy().nfc().collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Project walks begun on this thread, for tests of a walk whose result
+    /// no output shows.
+    static WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn candidate_paths_bounded(
     p: &Project,
     pattern: Option<&str>,
@@ -1360,6 +1369,8 @@ fn candidate_paths_bounded(
     deadline: Option<std::time::Instant>,
     limits: FileScanLimits,
 ) -> Result<(Vec<PathBuf>, usize)> {
+    #[cfg(test)]
+    WALKS.with(|walks| walks.set(walks.get() + 1));
     let check = || -> Result<()> {
         if cancel.is_cancelled() {
             bail!("cancelled")
@@ -2741,6 +2752,33 @@ mod tests {
         }
         assert!(!skipped_directory(std::ffi::OsStr::new("targets")));
         assert!(!skipped_directory(std::ffi::OsStr::new("src")));
+    }
+
+    /// Performance review, 2026-10-23: a call sending both path and
+    /// path_glob resolved its path for the hint with the hints of a missing
+    /// path, which walked the whole project for similar names (48 ms for
+    /// 30,000 files, up to two seconds) that the conflict error dropped.
+    #[test]
+    fn a_path_and_glob_conflict_does_not_walk_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+        let mut ws = workspace(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        for (tool, args, hint) in [
+            ("file_list", json!({"path":"nope/src","path_glob":"*.rs"}), None),
+            ("source_search", json!({"query":"a","path":"nope/src","path_glob":"*.rs"}), None),
+            ("file_list", json!({"path":"src","path_glob":"*.rs"}), Some("path_glob:\"src/**/*.rs\"")),
+        ] {
+            let walks = WALKS.with(std::cell::Cell::get);
+            let error = execute(&mut ws, tool, args.clone(), &cancel).unwrap_err().to_string();
+            assert!(error.starts_with("conflicting_arguments"), "{tool} {args}: {error}");
+            assert_eq!(WALKS.with(std::cell::Cell::get), walks, "{tool} {args}: {error}");
+            assert!(hint.is_none_or(|hint| error.contains(hint)), "{tool} {args}: {error}");
+        }
+        // A missing path read alone still names the similar ones.
+        let error = execute(&mut ws, "file_read", json!({"path":"nope/a.rs"}), &cancel).unwrap_err().to_string();
+        assert!(error.contains("src/a.rs"), "{error}");
     }
 
     /// The model saw every source path relative to the project root but
