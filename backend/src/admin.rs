@@ -752,6 +752,27 @@ async fn save_project(app: &App, body: &Value, id: Option<&str>, revision: Optio
         }
     }
     let text = |key: &str| object.get(key).and_then(Value::as_str).map(js_trim).unwrap_or_default().to_owned();
+    // The project as sent, every field of it the body's: checked, its
+    // folders too, before the settings lock is taken.
+    let sent = Project {
+        name: text("name"),
+        description: text("description"),
+        root: std::path::PathBuf::from(text("root")),
+        docs: split_lines(object.get("docs").unwrap_or(&Value::Null)),
+        include: split_lines(object.get("include").unwrap_or(&Value::Null)),
+        exclude: split_lines(object.get("exclude").unwrap_or(&Value::Null)),
+        ..Project::default()
+    };
+    crate::projects::validate(&sent).map_err(|e| ApiError::new(400, e.to_string()))?;
+    // The folders are looked at on a blocking thread, as the folder browser
+    // reads them: one that did not answer (a network drive gone) held a
+    // thread serving every request, questions' too. Looked at under the
+    // settings lock, such a folder held the lock for good, and every later
+    // settings, MCP or project save waited behind it until a restart.
+    let checked = sent.clone();
+    folder_work(move || crate::projects::check_paths(&checked), "프로젝트 폴더를 확인하지 못했습니다.")
+        .await?
+        .map_err(|e| ApiError::new(400, e.to_string()))?;
     let _guard = app.config_write.lock().await;
     let mut config = (*app.config()).clone();
     let mut project = match id {
@@ -765,21 +786,12 @@ async fn save_project(app: &App, body: &Value, id: Option<&str>, revision: Optio
         }
         None => Project::default(),
     };
-    project.name = text("name");
-    project.description = text("description");
-    project.root = std::path::PathBuf::from(text("root"));
-    project.docs = split_lines(object.get("docs").unwrap_or(&Value::Null));
-    project.include = split_lines(object.get("include").unwrap_or(&Value::Null));
-    project.exclude = split_lines(object.get("exclude").unwrap_or(&Value::Null));
-    crate::projects::validate(&project).map_err(|e| ApiError::new(400, e.to_string()))?;
-    // The folders are looked at on a blocking thread, as the folder browser
-    // reads them: one that did not answer (a network drive gone) held a
-    // thread serving every request, questions' too.
-    let checked = project.clone();
-    tokio::task::spawn_blocking(move || crate::projects::check_paths(&checked))
-        .await
-        .map_err(|_| ApiError::new(500, "프로젝트 폴더를 확인하지 못했습니다."))?
-        .map_err(|e| ApiError::new(400, e.to_string()))?;
+    project.name = sent.name;
+    project.description = sent.description;
+    project.root = sent.root;
+    project.docs = sent.docs;
+    project.include = sent.include;
+    project.exclude = sent.exclude;
     if config
         .projects
         .iter()
@@ -811,8 +823,34 @@ struct DirectoryQuery {
 }
 const MAX_DIRECTORY_ENTRIES: usize = 10_000;
 
+/// How long a look at folders (a project's, the folder browser's) is waited
+/// for: one on a network drive that stopped answering never returns.
+const FOLDER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `work` on folders, on a blocking thread, waited for `FOLDER_WAIT` at
+/// most: past it the request is answered, the thread left to end when the
+/// folder answers. `failed` is said when the thread ends unexpectedly.
+async fn folder_work<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static, failed: &str) -> ApiResult<T> {
+    folder_work_within(FOLDER_WAIT, work, failed).await
+}
+
+async fn folder_work_within<T: Send + 'static>(
+    wait: std::time::Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+    failed: &str,
+) -> ApiResult<T> {
+    match tokio::time::timeout(wait, tokio::task::spawn_blocking(work)).await {
+        Ok(Ok(done)) => Ok(done),
+        Ok(Err(_)) => Err(ApiError::new(500, failed)),
+        Err(_) => Err(ApiError::new(
+            504,
+            format!("폴더가 {}초 안에 응답하지 않았습니다(연결이 끊긴 네트워크 드라이브일 수 있습니다).", wait.as_secs()),
+        )),
+    }
+}
+
 async fn directories(Query(query): Query<DirectoryQuery>) -> ApiResult<Json<Value>> {
-    let listing = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+    let listing = folder_work(move || -> anyhow::Result<Value> {
         let start = match query.path.filter(|p| !p.trim().is_empty()) {
             Some(path) => std::path::PathBuf::from(path),
             None => std::env::var_os("HOME")
@@ -839,9 +877,8 @@ async fn directories(Query(query): Query<DirectoryQuery>) -> ApiResult<Json<Valu
         }
         entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
         Ok(json!({"path":path,"parent":path.parent(),"directories":entries}))
-    })
-    .await
-    .map_err(|_| ApiError::new(500, "폴더를 읽지 못했습니다."))?
+    }, "폴더를 읽지 못했습니다.")
+    .await?
     .map_err(|e| ApiError::new(400, format!("폴더를 열 수 없습니다: {e}")))?;
     Ok(Json(listing))
 }
@@ -1469,6 +1506,22 @@ async fn mcp_check(State(app): State<Arc<App>>, body: Bytes) -> ApiResult<Json<V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backend review, 2026-10-23: a project's folders were looked at under
+    /// the settings lock, and the folder browser's too without a limit: a
+    /// folder on a network drive that stopped answering held the request,
+    /// and the lock every settings save takes, for good. A look at folders
+    /// is now answered within its limit (and done before the lock).
+    #[tokio::test]
+    async fn a_folder_that_does_not_answer_is_answered_within_the_limit() {
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+        let error = folder_work_within(std::time::Duration::from_millis(200), move || stuck.recv().ok(), "x").await.unwrap_err();
+        assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        drop(release);
+        assert_eq!(folder_work_within(std::time::Duration::from_secs(5), || 7, "x").await.unwrap(), 7);
+    }
 
     /// Full review, 2026-10-22 (fourth session): the settings revision was
     /// the bare hash of the configuration with its secrets, so anyone who
