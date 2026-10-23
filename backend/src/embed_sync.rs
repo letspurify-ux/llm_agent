@@ -44,6 +44,9 @@ const REBUILD_MS_PER_ROW: u64 = 10;
 const REBUILD_RETRY: Duration = Duration::from_secs(3600);
 /// Refused rows a sync names in the log; the summary counts the rest.
 const ROW_WARNINGS: usize = 5;
+/// Rows of a batch failed with a 5xx, none taken, after which the server is
+/// taken as down for the sync (`embed_stale`).
+const SERVER_ERRORS_DOWN: usize = 4;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub enum Skipped {
@@ -125,7 +128,7 @@ pub struct EmbedSync {
 }
 
 /// Rows the embedding server refused (an HTTP 4xx, a vector of the wrong
-/// width), held back from the syncs after. Sent again at every sync, each
+/// width, a 5xx for the row alone), held back from the syncs after. Sent again at every sync, each
 /// took a request of its own and a log line every minute, for good: a model
 /// not pulled yet (404) made 218 rows 37 KB of log a sync, 53 MB a day,
 /// measured, which the Windows log keeps. A row edited is sent again; and
@@ -647,10 +650,16 @@ async fn embed_stale(
             Err(e) => {
                 // A refusal of the held row alone was told when it was first refused.
                 let probing = batch.len() == 1 && Some(batch[0].0) == probe;
-                if e.retriable || (out.failed < ROW_WARNINGS && !probing) {
+                // A server that does not answer (or asks to slow down) waits
+                // for the next sync. One that answers 5xx is up, and may be
+                // failing some rows alone: taken as a server down, such a row
+                // stopped every sync at its batch for good, the rows after it
+                // and the tables after its own never embedded.
+                let down = e.retriable && !e.answered;
+                if down || (out.failed < ROW_WARNINGS && !probing) {
                     warn(&e);
                 }
-                if e.retriable {
+                if down {
                     return Flow::Unavailable;
                 }
                 if probing {
@@ -659,23 +668,30 @@ async fn embed_stale(
                     continue;
                 }
                 // One bad row must not fail its batch: embed them one by one.
+                // Rows failed with a 5xx before the server took one.
+                let mut took = false;
+                let mut failing = 0;
                 for row in batch {
                     if stop.is_cancelled() {
                         return Flow::Stopped;
                     }
                     match embed(&config.embedding, std::slice::from_ref(&row.1), stop).await {
                         Ok(vectors) => {
+                            took = true;
                             taken(std::slice::from_ref(row));
                             if store(db, config, table, std::slice::from_ref(row), &vectors, replacing, out).await.is_err() {
                                 return Flow::Unwritable;
                             }
                         }
                         Err(_) if stop.is_cancelled() => return Flow::Stopped,
-                        Err(e) if e.retriable => {
+                        Err(e) if e.retriable && !e.answered => {
                             warn(&e);
                             return Flow::Unavailable;
                         }
                         Err(e) => {
+                            // Held back as a refused row is: sent alone again
+                            // at a later sync, and with every row held once
+                            // the server takes one.
                             state.refuse(table, row.0, &row.2);
                             // The held row sent again, refused again: no news.
                             if Some(row.0) == probe {
@@ -685,6 +701,16 @@ async fn embed_stale(
                             out.failed += 1;
                             if out.failed <= ROW_WARNINGS {
                                 eprintln!("[embed] {table}#{} embedding failed — skipping this row only: {e}", row.0);
+                            }
+                            // A server failing every row (a model that does
+                            // not load) is down for this sync: the rest of the
+                            // batch is not sent one by one. The rows it failed
+                            // wait, so a sync after it goes on past them.
+                            if e.answered && !took {
+                                failing += 1;
+                                if failing == SERVER_ERRORS_DOWN {
+                                    return Flow::Unavailable;
+                                }
                             }
                         }
                     }

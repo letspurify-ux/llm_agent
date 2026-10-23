@@ -493,16 +493,28 @@ async fn rows_not_embedded_again_are_not_counted_as_left_behind() {
     db.close().await;
 }
 
-/// An embedding server that refuses every request as a model not pulled
-/// (Ollama's 404) until `taking` is set, and then answers every input with
-/// a vector of its own; `asked` counts the requests.
-async fn refusing_embedding_server(taking: Arc<std::sync::atomic::AtomicBool>, asked: Arc<std::sync::atomic::AtomicUsize>) -> u16 {
+/// The answer of an embedding server to a request body: its status line
+/// and JSON.
+type Answer = Arc<dyn Fn(&serde_json::Value) -> (&'static str, serde_json::Value) + Send + Sync>;
+
+/// A vector for each input of a request body.
+fn vectors(body: &serde_json::Value) -> serde_json::Value {
+    let inputs = body["input"].as_array().map_or(0, Vec::len);
+    let data: Vec<serde_json::Value> = (0..inputs)
+        .map(|i| serde_json::json!({"index":i,"embedding":(0..1024).map(|j| ((i + j) % 7 + 1) as f32).collect::<Vec<_>>()}))
+        .collect();
+    serde_json::json!({"data":data})
+}
+
+/// An embedding server that answers each request as `answer` does; `asked`
+/// counts the requests.
+async fn embedding_server(answer: Answer, asked: Arc<std::sync::atomic::AtomicUsize>) -> u16 {
     use std::sync::atomic::Ordering;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
-            let (taking, asked) = (taking.clone(), asked.clone());
+            let (answer, asked) = (answer.clone(), asked.clone());
             tokio::spawn(async move {
                 let mut bytes = vec![];
                 let mut buffer = [0u8; 65536];
@@ -527,15 +539,7 @@ async fn refusing_embedding_server(taking: Arc<std::sync::atomic::AtomicBool>, a
                         }
                     };
                     asked.fetch_add(1, Ordering::AcqRel);
-                    let (status, answer) = if taking.load(Ordering::Acquire) {
-                        let inputs = body["input"].as_array().map_or(0, Vec::len);
-                        let data: Vec<serde_json::Value> = (0..inputs)
-                            .map(|i| serde_json::json!({"index":i,"embedding":(0..1024).map(|j| ((i + j) % 7 + 1) as f32).collect::<Vec<_>>()}))
-                            .collect();
-                        ("200 OK", serde_json::json!({"data":data}))
-                    } else {
-                        ("404 Not Found", serde_json::json!({"error":"model \"qwen3-embedding:0.6b\" not found, try pulling it first"}))
-                    };
+                    let (status, answer) = answer(&body);
                     let answer = answer.to_string();
                     let response = format!(
                         "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{answer}",
@@ -549,6 +553,21 @@ async fn refusing_embedding_server(taking: Arc<std::sync::atomic::AtomicBool>, a
         }
     });
     port
+}
+
+/// An embedding server that refuses every request as a model not pulled
+/// (Ollama's 404) until `taking` is set, and then answers every input with
+/// a vector of its own; `asked` counts the requests.
+async fn refusing_embedding_server(taking: Arc<std::sync::atomic::AtomicBool>, asked: Arc<std::sync::atomic::AtomicUsize>) -> u16 {
+    use std::sync::atomic::Ordering;
+    let answer: Answer = Arc::new(move |body| {
+        if taking.load(Ordering::Acquire) {
+            ("200 OK", vectors(body))
+        } else {
+            ("404 Not Found", serde_json::json!({"error":"model \"qwen3-embedding:0.6b\" not found, try pulling it first"}))
+        }
+    });
+    embedding_server(answer, asked).await
 }
 
 /// Each row the embedding server refused was sent again at every sync, one
@@ -605,6 +624,72 @@ async fn rows_the_embedding_server_refused_wait_until_it_takes_one() {
     assert_eq!(embedded, rows);
     let after = sync.run(&db, &config, &stop).await.unwrap();
     assert_eq!((after.failed, after.held, after.embedded), (0, 0, 0), "{after}");
+    db.close().await;
+}
+
+/// Backend review, 2026-10-23: a 5xx was taken as the server down, also one
+/// the server answered for a row alone (llama.cpp's 500 "input is too
+/// large"): every sync stopped at that row's batch, and the rows after it,
+/// and the tables after its own, were never embedded. Such a row is now held
+/// back as a refused one is; a server failing every row still stops the
+/// sync after a few of them.
+#[tokio::test]
+async fn a_row_the_embedding_server_fails_alone_does_not_stop_the_sync() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let _turn = SYNCING.lock().await;
+    let Some(test_db) = TestDb::create("sync_poisoned") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    test_db.sql_in(
+        "INSERT INTO qa_method (title, method) VALUES ('긴 방법', '너무 긴 입력');
+         INSERT INTO qa_method (title, method) SELECT CONCAT('방법 ', seq), CONCAT('절차 ', seq) FROM seq_1_to_80;",
+    );
+    let (broken, asked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+    let failing = broken.clone();
+    let answer: Answer = Arc::new(move |body| {
+        let poisoned = body["input"].as_array().into_iter().flatten().any(|input| input.as_str().is_some_and(|text| text.contains("너무 긴")));
+        if poisoned || failing.load(Ordering::Acquire) {
+            ("500 Internal Server Error", serde_json::json!({"error":{"code":500,"message":"input is too large to process. increase the physical batch size"}}))
+        } else {
+            ("200 OK", vectors(body))
+        }
+    });
+    let port = embedding_server(answer, asked.clone()).await;
+    let mut config = test_db.config();
+    config.embedding.url = format!("http://127.0.0.1:{port}/v1");
+    let db = Db::default();
+    let sync = EmbedSync::default();
+    let stop = CancellationToken::new();
+    let count = |table: &str| test_db.scalar(&format!("SELECT COUNT(*) FROM {table}")).parse::<usize>().unwrap();
+
+    // Every row but the one the server fails, the tables after it too.
+    let first = sync.run(&db, &config, &stop).await.unwrap();
+    assert_eq!((first.failed, first.skipped.clone()), (1, Skipped::None), "{first}");
+    assert_eq!(count("vec_qa_method"), count("qa_method") - 1);
+    assert_eq!(count("vec_query_registry"), count("query_registry"));
+    assert_eq!(count("vec_knowledge_chunk"), count("knowledge_chunk"));
+    // Then it alone, tried once a sync.
+    asked.store(0, Ordering::Release);
+    let again = sync.run(&db, &config, &stop).await.unwrap();
+    assert_eq!((again.failed, again.held, again.changed()), (0, 1, false), "{again}");
+    assert_eq!(asked.load(Ordering::Acquire), 1);
+
+    // A server failing every row stops the sync after a few rows.
+    test_db.sql_in("INSERT INTO qa_method (title, method) SELECT CONCAT('새 방법 ', seq), CONCAT('새 절차 ', seq) FROM seq_1_to_40;");
+    broken.store(true, Ordering::Release);
+    asked.store(0, Ordering::Release);
+    let down = sync.run(&db, &config, &stop).await.unwrap();
+    assert_eq!(down.skipped, Skipped::Unavailable, "{down}");
+    assert!(asked.load(Ordering::Acquire) <= 1 + 1 + 4, "{} requests", asked.load(Ordering::Acquire));
+
+    // Put right, every row but the failing one is embedded within a few syncs.
+    broken.store(false, Ordering::Release);
+    for _ in 0..4 {
+        sync.run(&db, &config, &stop).await.unwrap();
+    }
+    assert_eq!(count("vec_qa_method"), count("qa_method") - 1);
+    let after = sync.run(&db, &config, &stop).await.unwrap();
+    assert_eq!((after.failed, after.held, after.embedded), (0, 1, 0), "{after}");
     db.close().await;
 }
 

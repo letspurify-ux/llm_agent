@@ -212,7 +212,7 @@ async fn wait_for_signal() {
 
 /// Embedding warm-up, the embedding sync (at start and every interval), the
 /// chat log retention cleanup (at start and hourly), and every minute the
-/// release of idle conversations, Oracle pools and kept syntax trees. Each
+/// release of idle conversations and Oracle pools. Each
 /// ends soon after shutdown begins; the handles are waited for then.
 fn background_jobs(app: &Arc<App>) -> Vec<tokio::task::JoinHandle<()>> {
     let housekeeping = app.clone();

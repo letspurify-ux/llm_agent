@@ -28,6 +28,10 @@ pub struct EmbedError {
     pub message: String,
     /// The server may answer later (5xx, 429, network, timeout).
     pub retriable: bool,
+    /// The server answered with a 5xx status: it is up, and may be failing
+    /// these inputs alone (llama.cpp answers a text too long for its batch
+    /// with 500 "input is too large").
+    pub answered: bool,
 }
 impl std::fmt::Display for EmbedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -40,6 +44,7 @@ fn error(message: impl Into<String>, retriable: bool) -> EmbedError {
     EmbedError {
         message: message.into(),
         retriable,
+        answered: false,
     }
 }
 
@@ -128,7 +133,10 @@ pub async fn embed(
         if !status.is_success() {
             let retriable = status.is_server_error() || status.as_u16() == 429;
             let body: String = String::from_utf8_lossy(&bytes).chars().take(200).collect();
-            return Err(error(format!("embeddings API {}: {body}", status.as_u16()), retriable));
+            return Err(EmbedError {
+                answered: status.is_server_error(),
+                ..error(format!("embeddings API {}: {body}", status.as_u16()), retriable)
+            });
         }
         let data: Value = serde_json::from_slice(&bytes)
             .map_err(|e| error(format!("임베딩 응답이 JSON이 아닙니다: {e}"), false))?;
