@@ -1225,7 +1225,7 @@ struct FileScanLimits {
 }
 
 /// Directories no project walk enters: version control, dependencies and
-/// build output.
+/// build output (`skipped_directory`).
 const SKIPPED_DIRECTORIES: [&str; 10] = [
     ".git",
     ".hg",
@@ -1238,6 +1238,16 @@ const SKIPPED_DIRECTORIES: [&str; 10] = [
     ".venv",
     "__pycache__",
 ];
+
+/// Whether a walk passes over a directory of this name, without case, as
+/// `tool_folder` leaves out every file below it. Matched with case, a walk
+/// went through all of a `Target` or `Node_Modules` folder only to leave
+/// out each file it found there: 60,000 such files made each walk 80 ms
+/// instead of under one.
+fn skipped_directory(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    SKIPPED_DIRECTORIES.iter().any(|skipped| name.eq_ignore_ascii_case(skipped))
+}
 
 /// A path glob as matched, relative to the project root, also when written
 /// from the root (`./src/**`, or `/src/**` as in an ignore file) or with the
@@ -1395,7 +1405,7 @@ fn candidate_paths_bounded(
         .follow_links(false)
         .filter_entry(move |entry| {
             !entry.file_type().is_some_and(|t| t.is_dir())
-                || (!SKIPPED_DIRECTORIES.contains(&entry.file_name().to_string_lossy().as_ref())
+                || (!skipped_directory(entry.file_name())
                     && scope.as_ref().is_none_or(|scope| {
                         entry.path().starts_with(scope) || scope.starts_with(entry.path())
                     })
@@ -2716,6 +2726,23 @@ mod tests {
         assert!(error.starts_with("unsafe_ignore_file"), "{error}");
     }
 
+    /// Every directory whose files `tool_folder` leaves out, whatever its
+    /// case, is one the walk does not enter: matched with case, a walk read
+    /// all of a `Target` folder only to leave out each file in it.
+    #[test]
+    fn walks_pass_over_the_tool_folders_they_leave_out_in_any_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = Project { name: "app".into(), root: dir.path().to_path_buf(), ..Default::default() };
+        for name in SKIPPED_DIRECTORIES {
+            for name in [name.to_owned(), name.to_uppercase(), format!("{}{}", name[..1].to_uppercase(), &name[1..])] {
+                assert!(tool_folder(&project, &Path::new(&name).join("a.rs")).is_some(), "{name}");
+                assert!(skipped_directory(std::ffi::OsStr::new(&name)), "{name}");
+            }
+        }
+        assert!(!skipped_directory(std::ffi::OsStr::new("targets")));
+        assert!(!skipped_directory(std::ffi::OsStr::new("src")));
+    }
+
     /// The model saw every source path relative to the project root but
     /// those of source_search mode=files, a list of bare paths: absolute,
     /// the root in front of each.
@@ -3715,3 +3742,4 @@ mod tests {
         assert_eq!(list(&mut ws, "*.md"), ["notes.md", "ärger.md", "éa.md"]);
     }
 }
+
