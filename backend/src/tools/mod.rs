@@ -1552,7 +1552,6 @@ pub struct Source {
 fn observe_hashed_quality(
     _s: &mut Workspace,
     _path: &Path,
-    _content_hash: String,
     start: usize,
     end: usize,
     _excerpt: &str,
@@ -2839,6 +2838,40 @@ mod tests {
         assert!(next(&mut ws).unwrap_err().to_string().starts_with("cursor_expired"));
     }
 
+    /// File tools review, 2026-10-23 (tenth round): each file with a match
+    /// was hashed whole (SHA-256) into the cursor, most of a search's time
+    /// when a name was met once in a large file. The cursor is now where the
+    /// lines found are, what its offset counts: it holds while the rest of a
+    /// file changes, a line found too if it still matches, and expires when
+    /// a line found moves or no longer matches. A count still names each
+    /// file's hash.
+    #[test]
+    fn a_search_cursor_is_the_lines_it_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |other: &str, hit: &str| format!("let a = load();\nlet other = {other};\nlet b = {hit}();\nlet c = load();\n");
+        std::fs::write(dir.path().join("a.rs"), file("1", "load")).unwrap();
+        let mut ws = workspace(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let args = json!({"query":"load()","limit":1});
+        let first = execute(&mut ws, "source_search", args.clone(), &cancel).unwrap();
+        let mut next = args.clone();
+        next["cursor"] = first["next_cursor"].clone();
+        for unmoved in [file("2", "load"), file("2", "reload")] {
+            std::fs::write(dir.path().join("a.rs"), &unmoved).unwrap();
+            let second = execute(&mut ws, "source_search", next.clone(), &cancel).unwrap();
+            assert_eq!(second["matches"][0]["line"], 3, "{second}");
+            assert_eq!(second["matches"][0]["text"], unmoved.lines().nth(2).unwrap(), "{second}");
+        }
+        for changed in [file("1", "skip"), format!("\n{}", file("1", "load"))] {
+            std::fs::write(dir.path().join("a.rs"), &changed).unwrap();
+            let error = execute(&mut ws, "source_search", next.clone(), &cancel).unwrap_err().to_string();
+            assert!(error.starts_with("cursor_expired"), "{changed:?}: {error}");
+        }
+        let counted = execute(&mut ws, "source_search", json!({"query":"load()","mode":"count"}), &cancel).unwrap();
+        let contents = std::fs::read(dir.path().join("a.rs")).unwrap();
+        assert_eq!(counted["counts"][0]["hash"], hash(&contents), "{counted}");
+    }
+
     /// File tools review, 2026-10-23 (fifth round): a regular expression was
     /// tested on every line of every file, three times as long as a literal
     /// search of the same files. Blocks of lines without a match are now
@@ -2869,6 +2902,10 @@ mod tests {
             (r"(?i:FN) TARGET_\d+", false, false),
             (r"target_\d+", true, true),
             (r"^$", true, false),
+            // Empty at the end of each block (after its last line break),
+            // where no line of it is: counted as a line, it moved the
+            // numbers of the matches after it.
+            (r"^$|fn target_\d+", true, false),
         ] {
             let lines = regex::RegexBuilder::new(query).case_insensitive(!case_sensitive).build().unwrap();
             let lines = if whole_word { regex::Regex::new(&format!(r"(?:^|\W)(?:{query})(?:$|\W)")).unwrap() } else { lines };
@@ -2893,6 +2930,94 @@ mod tests {
                 assert_eq!(found["total_matching_lines"], expected.len(), "{query} in {file}");
             }
         }
+    }
+
+    /// File tools review, 2026-10-23 (tenth round): a block with a match was
+    /// tested line by line, all of it: a name met once in 64 KiB of short
+    /// lines took a search three times as long as one finding nothing, as
+    /// long as one matching every line. The lines tested now are those the
+    /// block's matches start in; a search finds and numbers the same lines,
+    /// with the same context, as one that tests every line alone.
+    #[test]
+    fn a_search_tests_only_the_lines_a_blocks_matches_start_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut text = String::new();
+        for line in 1..=40_000 {
+            text.push_str(&match line % 3_001 {
+                7 => format!("fn target_{line}() {{}} // 값\n"),
+                8 => "\n".to_owned(),
+                9 => "   \n".to_owned(),
+                _ => format!("x{line}\n"),
+            });
+        }
+        assert!(text.len() > 4 * search::BLOCK_BYTES);
+        std::fs::write(dir.path().join("a.rs"), &text).unwrap();
+        std::fs::write(dir.path().join("crlf.rs"), text.replace('\n', "\r\n")).unwrap();
+        std::fs::write(dir.path().join("end.rs"), text.trim_end()).unwrap();
+        let mut ws = workspace(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let literal = |term: &str, whole_word: bool| {
+            let term = regex::escape(term);
+            if whole_word { format!(r"\b{term}\b") } else { term }
+        };
+        for (args, expected) in [
+            (json!({"query":"target_"}), literal("target_", false)),
+            (json!({"query":"TARGET_3008","case_sensitive":false}), format!("(?i){}", literal("TARGET_3008", false))),
+            (json!({"query":"x1","whole_word":true}), literal("x1", true)),
+            (json!({"queries":["값","x39999"]}), format!("{}|{}", literal("값", false), literal("x39999", false))),
+            (json!({"query":r"^x\d*7$","regex":true}), r"^x\d*7$".to_owned()),
+            (json!({"query":r"\s*","regex":true}), r"\s*".to_owned()),
+        ] {
+            let lines = regex::Regex::new(&expected).unwrap();
+            for file in ["a.rs", "crlf.rs", "end.rs"] {
+                let contents = std::fs::read_to_string(dir.path().join(file)).unwrap();
+                let all: Vec<&str> = contents.split('\n').map(|line| line.strip_suffix('\r').unwrap_or(line)).collect();
+                let expected: Vec<usize> = all
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| !line.trim().is_empty() && lines.is_match(line))
+                    .map(|(index, _)| index + 1)
+                    .collect();
+                let mut call = args.clone();
+                call["path"] = json!(file);
+                call["limit"] = json!(100);
+                call["before"] = json!(2);
+                call["after"] = json!(2);
+                let found = execute(&mut ws, "source_search", call.clone(), &cancel).unwrap();
+                assert_eq!(found["total_matching_lines"], expected.len(), "{call} in {file}");
+                let shown = found["matches"].as_array().unwrap();
+                assert_eq!(shown.len(), expected.len().min(100), "{call}");
+                for (row, line) in shown.iter().zip(&expected) {
+                    assert_eq!(row["line"], *line, "{call}");
+                    assert_eq!(row["text"], all[line - 1], "{call}");
+                    for context in row["context"].as_array().unwrap() {
+                        let number = context["line"].as_u64().unwrap() as usize;
+                        assert_eq!(context["text"], all[number - 1], "{call} at {line}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// File tools review, 2026-10-23 (tenth round): a whole-word regular
+    /// expression is wrapped in a group, which an unbalanced query closed
+    /// early: `a)|(b` ran as another expression and matched every line with
+    /// a character other than a letter, a digit or `_`.
+    #[test]
+    fn a_whole_word_regular_expression_is_checked_as_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "let x = 1;\nfn main() {}\n").unwrap();
+        let mut ws = workspace(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        for query in ["a)|(b", "x)|(y", "(main"] {
+            let error = execute(&mut ws, "source_search", json!({"query":query,"regex":true,"whole_word":true}), &cancel)
+                .unwrap_err()
+                .to_string();
+            assert!(error.starts_with("invalid_search_regex"), "{query}: {error}");
+            assert!(!error.contains(r"(?:^|\W)"), "the error shows the wrapping: {error}");
+        }
+        let found = execute(&mut ws, "source_search", json!({"query":"main|x","regex":true,"whole_word":true}), &cancel).unwrap();
+        assert_eq!(found["total_matching_lines"], 2, "{found}");
     }
 
     /// The descriptions and hints say `**` crosses directories; `*` did

@@ -2,7 +2,6 @@ use super::*;
 
 struct Match {
     path: PathBuf,
-    hash: String,
     line: usize,
     text: String,
     truncated: bool,
@@ -225,10 +224,20 @@ pub(super) fn execute(
         literal(query)
     };
     let case_sensitive = args["case_sensitive"].as_bool().unwrap_or(true);
-    let regex = regex::RegexBuilder::new(&expression)
-        .case_insensitive(!case_sensitive)
-        .size_limit(1024 * 1024)
-        .build().map_err(|e| anyhow::anyhow!("invalid_search_regex: {e}; no search executed. For literal code such as .on(, retry with regex:false; for literal alternatives use queries. Keep the same file scope."))?;
+    let compile = |expression: &str| {
+        regex::RegexBuilder::new(expression)
+            .case_insensitive(!case_sensitive)
+            .size_limit(1024 * 1024)
+            .build().map_err(|e| anyhow::anyhow!("invalid_search_regex: {e}; no search executed. For literal code such as .on(, retry with regex:false; for literal alternatives use queries. Keep the same file scope."))
+    };
+    // A whole-word regular expression is checked as sent before it is
+    // wrapped: an unbalanced `a)|(b` closed the wrapping group early, and
+    // the search ran an expression of another meaning (every line with a
+    // non-word character), and an error showed the wrapping, not the query.
+    if whole_word && args["regex"].as_bool().unwrap_or(false) && terms.is_none() {
+        compile(query)?;
+    }
+    let regex = compile(&expression)?;
     let mut fingerprint = Sha256::new();
     // Presentation options are part of the cursor identity too: an offset into
     // matching lines cannot be reused as an offset into matching files.
@@ -236,6 +245,7 @@ pub(super) fn execute(
         "expression":expression,"case_sensitive":case_sensitive,
         "mode":mode,"before":before,"after":after,"path_glob":scope_glob,"path":exact_path,"directory":directory
     }))?);
+    let mut seen = Vec::new();
     let requested_offset = if let Some(cursor) = args["cursor"].as_str() {
         cursor
             .split_once(':')
@@ -297,12 +307,9 @@ pub(super) fn execute(
         // not match: a file with `\r` is scanned by lines for a regular
         // expression.
         let blocks = block_regex.as_ref().filter(|_| literal_search || !contents.contains('\r'));
-        // Only files with a match make the results, so only they are hashed
-        // into the cursor's identity: a file without one changing changes
-        // nothing a cursor points at. Hashing every file took as long as the
-        // search itself.
-        let mut digest = None;
         let mut matching_lines = 0usize;
+        // The number of this file's last matching line (0 before its first).
+        let mut last_match = 0usize;
         let mut byte_offset = 0;
         let mut next_line = 0;
         while byte_offset < contents.len() {
@@ -310,30 +317,80 @@ pub(super) fn execute(
                 bail!("cancelled");
             }
             super::past_deadline(deadline, "source_search", read, total, s.config.tool_timeout_secs, narrower)?;
-            let block = &contents[byte_offset..lines_block_end(&contents, byte_offset)];
-            if blocks.is_some_and(|blocks| !blocks.is_match(block)) {
-                next_line += block.matches('\n').count() + usize::from(!block.ends_with('\n'));
-                byte_offset += block.len();
-                continue;
-            }
-            for chunk in block.split_inclusive('\n') {
+            let block_start = byte_offset;
+            let block = &contents[block_start..lines_block_end(&contents, block_start)];
+            byte_offset += block.len();
+            let mut at = 0;
+            // After a line that did not match, the next line to test is the
+            // one the block's next match starts in: a line before it matching
+            // alone would match in the block too, and further left. Tested
+            // line by line, a block with one match cost as much as one
+            // matching on every line, which still goes line by line.
+            let mut jump = true;
+            while at < block.len() {
+                let found = match blocks.filter(|_| jump) {
+                    Some(blocks) => match blocks.find_at(block, at) {
+                        Some(found) => found.start(),
+                        None => {
+                            next_line += block[at..].matches('\n').count();
+                            break;
+                        }
+                    },
+                    None => at,
+                };
+                let from = if found == at { at } else { block[at..found].rfind('\n').map_or(at, |end| at + end + 1) };
+                if from > at {
+                    next_line += block[at..from].matches('\n').count();
+                }
+                // An empty match past the block's last line break (`^$`)
+                // is in no line of it.
+                if from == block.len() {
+                    break;
+                }
+                let to = block[found..].find('\n').map_or(block.len(), |end| found + end + 1);
+                let chunk = &block[from..to];
+                at = to;
                 let line = chunk
                     .strip_suffix('\n')
                     .map(|line| line.strip_suffix('\r').unwrap_or(line))
                     .unwrap_or(chunk);
-                let line_start = byte_offset;
-                byte_offset += chunk.len();
+                let line_start = block_start + from;
+                let line_end = block_start + to;
                 let i = next_line;
                 next_line += 1;
                 // A blank or whitespace-only line cannot provide the non-empty
                 // excerpt required for source evidence, so do not expose it as a
                 // searchable match even when a regex can match an empty string.
-                if line.trim().is_empty() || !regex.is_match(line) {
+                jump = line.trim().is_empty() || !regex.is_match(line);
+                if jump {
                     continue;
                 }
                 matching_lines += 1;
                 total_matching_lines += 1;
-                let digest = digest.get_or_insert_with(|| hash(contents.as_bytes()));
+                // The cursor's identity is where a search finds its lines,
+                // what an offset into them counts: each file with one
+                // (`\0path\0`), then each line by its distance from the one
+                // before (LEB128, never a 0 byte). A cursor goes on while the
+                // rest of a file changes, and while a line found still
+                // matches. Each file with a match was hashed whole, longer
+                // than the search took (SHA-256 of 60 MB, 140 ms, for one
+                // name met once in 64 KiB).
+                if matching_lines == 1 {
+                    seen.push(0);
+                    seen.extend_from_slice(path.to_string_lossy().as_bytes());
+                    seen.push(0);
+                }
+                let mut distance = i + 1 - last_match;
+                while distance >= 0x80 {
+                    seen.push(0x80 | (distance & 0x7f) as u8);
+                    distance >>= 7;
+                }
+                seen.push(distance as u8);
+                if seen.len() >= BLOCK_BYTES {
+                    fingerprint.update(&seen);
+                    seen.clear();
+                }
+                last_match = i + 1;
                 let index = total_matching_lines - 1;
                 if mode != "matches" || index < requested_offset || index >= requested_end {
                     continue;
@@ -348,12 +405,11 @@ pub(super) fn execute(
                     context.push(displayed_line(i - distance, text));
                 }
                 context.reverse();
-                for (distance, text) in contents[byte_offset..].lines().take(after).enumerate() {
+                for (distance, text) in contents[line_end..].lines().take(after).enumerate() {
                     context.push(displayed_line(i + distance + 2, text));
                 }
                 rows.push(Match {
                     path: path.clone(),
-                    hash: digest.clone(),
                     line: i + 1,
                     text: line.chars().take(500).collect(),
                     truncated: line.chars().count() > 500,
@@ -361,17 +417,23 @@ pub(super) fn execute(
                 });
             }
         }
-        if let Some(digest) = digest {
-            fingerprint.update(serde_json::to_vec(&(path.to_string_lossy(), &digest))?);
+        if matching_lines > 0 {
             if mode != "matches" {
                 let index = matching_file_count;
+                // A count names each file's hash, hashed for the page alone;
+                // a list of files shows their paths only.
                 if index >= requested_offset && index < requested_end {
-                    files.push(json!({"path":path,"hash":digest,"matching_lines":matching_lines}));
+                    files.push(if mode == "count" {
+                        json!({"path":path,"hash":hash(contents.as_bytes()),"matching_lines":matching_lines})
+                    } else {
+                        json!({"path":path})
+                    });
                 }
             }
             matching_file_count += 1;
         }
     }
+    fingerprint.update(&seen);
     let fingerprint = format!("{:x}", fingerprint.finalize());
     let offset = page_cursor(args, &fingerprint)?;
     let total = if mode == "matches" {
@@ -418,7 +480,6 @@ pub(super) fn execute(
             let source = super::observe_hashed_quality(
                 s,
                 &row.path,
-                row.hash.clone(),
                 row.line,
                 row.line,
                 &row.text,
