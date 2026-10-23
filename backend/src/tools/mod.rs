@@ -631,7 +631,7 @@ pub(crate) fn utf8_path(path: &Path) -> Result<&str> {
 fn folded_alias_key(value: &str) -> String {
     use caseless::Caseless;
     use unicode_normalization::UnicodeNormalization;
-    value.nfd().default_case_fold().nfd().collect()
+    value.nfd().default_case_fold().nfc().collect()
 }
 
 /// A project's include/exclude globs, compiled once for a walk: compiled
@@ -640,11 +640,11 @@ pub(crate) struct Rules {
     include: Vec<Rule>,
     exclude: Vec<Rule>,
 }
-/// A glob matched case-insensitively on the NFD path, and its case-folded
-/// form on the folded path.
+/// A glob matched case-insensitively on the NFC path, and its case-folded
+/// form on the folded path (`glob_regex`).
 struct Rule {
-    normalized: globset::GlobMatcher,
-    folded: Option<globset::GlobMatcher>,
+    normalized: regex::Regex,
+    folded: Option<regex::Regex>,
     /// No `/` in the pattern: it names a file or directory at any depth.
     anywhere: bool,
 }
@@ -654,15 +654,12 @@ impl Rules {
         let compile = |pattern: &String| -> Result<Rule> {
             let pattern = rule_pattern(pattern);
             nested_glob(&pattern)?;
-            let normalized_pattern: String = pattern.nfd().collect();
+            let normalized_pattern: String = pattern.nfc().collect();
             Ok(Rule {
-                normalized: globset::GlobBuilder::new(&normalized_pattern)
-                    .case_insensitive(true)
-                    .build()?
-                    .compile_matcher(),
+                normalized: glob_regex(&globset::GlobBuilder::new(&normalized_pattern).case_insensitive(true).build()?)?,
                 folded: globset::Glob::new(&folded_alias_key(&pattern))
                     .ok()
-                    .map(|glob| glob.compile_matcher()),
+                    .and_then(|glob| glob_regex(&glob).ok()),
                 anywhere: !pattern.contains('/'),
             })
         };
@@ -747,7 +744,7 @@ pub(crate) fn excluded_by(project: &Project, rules: &Rules, relative: &Path) -> 
         .components()
         .map(|part| {
             let name = part.as_os_str().to_string_lossy();
-            (name.nfd().collect(), folded_alias_key(&name))
+            (name.nfc().collect(), folded_alias_key(&name))
         })
         .collect();
     let mut within: Vec<(String, String)> = Vec::with_capacity(named.len());
@@ -1269,23 +1266,66 @@ fn root_relative_glob<'a>(p: &Project, root: &Path, glob: &'a str) -> &'a str {
 /// `src/tools/*.rs` listed and searched all of `src/tools` below too.
 /// `anchored`: the glob as sent named a directory (`./*.rs` is the root's).
 /// It is matched as the project's include/exclude globs are (`Rules`):
-/// without case, on the decomposed (NFD) path. Matched as sent, a Korean name
+/// without case, on the composed (NFC) path. Matched as sent, a Korean name
 /// typed composed (`**/문서.md`) missed the file a Mac had named decomposed,
 /// and `**/readme.md` missed README.md, which file_read opens all the same.
+/// Decomposed (NFD) instead, a class range broke apart (`[가-힣]` became the
+/// jamo range ᅡ-ᄒ, refused as invalid) and `?` met three jamo for `한`.
 /// A glob naming a directory (`src/`, or `./` for the root) is everything
 /// below it: no file path ends in `/`, so it matched nothing, without a word.
-fn path_glob_matcher(glob: &str, anchored: bool) -> Result<globset::GlobMatcher> {
+fn path_glob_matcher(glob: &str, anchored: bool) -> Result<regex::Regex> {
     use unicode_normalization::UnicodeNormalization;
-    let mut glob: String = glob.nfd().collect();
+    let mut glob: String = glob.nfc().collect();
     if glob.is_empty() || glob.ends_with('/') {
         glob.push_str("**");
     }
     let glob = if anchored { glob } else { format!("**/{glob}") };
-    Ok(globset::GlobBuilder::new(&glob)
+    globset::GlobBuilder::new(&glob)
         .literal_separator(true)
         .case_insensitive(true)
-        .build()?
-        .compile_matcher())
+        .build()
+        .map_err(anyhow::Error::from)
+        .and_then(|glob| glob_regex(&glob))
+        .map_err(|error| anyhow::anyhow!("invalid_path_glob: {error}; send a shorter or simpler path_glob"))
+}
+
+/// A glob as globset reads it, matched by character rather than by byte.
+/// globset matches bytes: `?` took one byte (`?.md` missed `한.md`), and a
+/// class one byte too (`[é]x` missed `éx`, and `[가-힣]*` took any name whose
+/// first byte fell in 0x80..=0xED, `é...` too). Its regular expression is
+/// ASCII, with each non-ASCII character as escaped UTF-8 bytes (`\xea\xb0\x80`);
+/// read back as the characters and compiled with Unicode on, it matches
+/// what the glob says, and its case-insensitive flag takes in letters past
+/// ASCII too.
+fn glob_regex(glob: &globset::Glob) -> Result<regex::Regex> {
+    let source = glob.regex();
+    let source = source.strip_prefix("(?-u)").unwrap_or(source);
+    let mut pattern = String::with_capacity(source.len());
+    let mut bytes = Vec::new();
+    let flush = |bytes: &mut Vec<u8>, pattern: &mut String| -> Result<()> {
+        pattern.push_str(std::str::from_utf8(bytes)?);
+        bytes.clear();
+        Ok(())
+    };
+    let mut rest = source;
+    while let Some(c) = rest.chars().next() {
+        if let Some(hex) = rest.strip_prefix("\\x").and_then(|hex| hex.get(..2)) {
+            bytes.push(u8::from_str_radix(hex, 16)?);
+            rest = &rest[4..];
+            continue;
+        }
+        flush(&mut bytes, &mut pattern)?;
+        // An escaped ASCII character (`\.`, `\\`) is copied whole, so its
+        // second half is never read as the start of a byte escape.
+        let length = if c == '\\' { 1 + rest[1..].chars().next().map_or(0, char::len_utf8) } else { c.len_utf8() };
+        pattern.push_str(&rest[..length]);
+        rest = &rest[length..];
+    }
+    flush(&mut bytes, &mut pattern)?;
+    Ok(regex::RegexBuilder::new(&pattern)
+        .dot_matches_new_line(true)
+        .size_limit(10 * (1 << 20))
+        .build()?)
 }
 
 /// A path or path glob with `/` between its parts. On Windows the tools
@@ -1299,7 +1339,7 @@ pub(crate) fn separated(path: &str) -> String {
 /// A relative path as `path_glob_matcher` matches it.
 fn glob_path(relative: &Path) -> String {
     use unicode_normalization::UnicodeNormalization;
-    relative.to_string_lossy().nfd().collect()
+    relative.to_string_lossy().nfc().collect()
 }
 
 fn candidate_paths_bounded(
@@ -1373,7 +1413,7 @@ fn candidate_paths_bounded(
         let rel = entry.path().strip_prefix(&root)?;
         if directory.is_some_and(|scope| !entry.path().starts_with(scope))
             || excluded_by(p, &rules, rel)
-            || filter.as_ref().is_some_and(|f| !f.is_match(glob_path(rel)))
+            || filter.as_ref().is_some_and(|f| !f.is_match(&glob_path(rel)))
             || secrets.iter().any(|secret| secret == entry.path())
         {
             continue;
@@ -3490,12 +3530,12 @@ mod tests {
     #[test]
     fn names_normalized_apart_join_as_their_path_does() {
         use unicode_normalization::UnicodeNormalization;
-        let nfd = |s: &str| s.nfd().collect::<String>();
+        let nfc = |s: &str| s.nfc().collect::<String>();
         let names = ["\u{301}a", "한글", "Straße", "İx", "e\u{323}\u{301}", "ﬁle", "Ω.RS"];
         for a in names {
             for b in names {
                 let path = format!("{a}/{b}");
-                assert_eq!(nfd(&path), format!("{}/{}", nfd(a), nfd(b)), "{path}");
+                assert_eq!(nfc(&path), format!("{}/{}", nfc(a), nfc(b)), "{path}");
                 assert_eq!(folded_alias_key(&path), format!("{}/{}", folded_alias_key(a), folded_alias_key(b)), "{path}");
             }
         }
@@ -3545,5 +3585,36 @@ mod tests {
         }
         let listed = execute(&mut ws, "file_list", json!({"mode":"paths","path_glob":nested(MAX_GLOB_NESTING)}), &cancel).unwrap();
         assert_eq!(listed["total_files"], 1);
+    }
+
+    /// globset matches bytes: `?` took one byte of `한`, a class one byte
+    /// (`[é]x` missed `éx`, `[가-힣]*` took names starting with `é`), and
+    /// decomposed, `[가-힣]` was refused as the invalid jamo range ᅡ-ᄒ, in a
+    /// path_glob and in the project's exclude rules alike (every call failed).
+    #[test]
+    fn globs_match_characters_past_ascii() {
+        use unicode_normalization::UnicodeNormalization;
+        let dir = tempfile::tempdir().unwrap();
+        let decomposed: String = "문서.md".nfd().collect();
+        for file in ["한글.md", "한.md", decomposed.as_str(), "éa.md", "éx.rs", "ex.rs", "ö.txt", "ärger.md", "a*b.txt", "axb.txt", "notes.md"] {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut ws = workspace(dir.path());
+        let list = |ws: &mut Workspace, glob: &str| -> Vec<String> {
+            let data = execute(ws, "file_list", json!({"path_glob":glob,"mode":"paths"}), &cancel).unwrap();
+            let mut paths: Vec<String> = data["paths"].as_array().unwrap().iter().map(|p| p.as_str().unwrap().nfc().collect()).collect();
+            paths.sort();
+            paths
+        };
+        assert_eq!(list(&mut ws, "[가-힣]*.md"), ["문서.md", "한.md", "한글.md"]);
+        assert_eq!(list(&mut ws, "?.md"), ["한.md"]);
+        assert_eq!(list(&mut ws, "??.md"), ["éa.md", "문서.md", "한글.md"]);
+        assert_eq!(list(&mut ws, "[é]x.rs"), ["éx.rs"]);
+        assert_eq!(list(&mut ws, "[ä-ü].txt"), ["ö.txt"]);
+        assert_eq!(list(&mut ws, "ÄRGER.md"), ["ärger.md"]);
+        assert_eq!(list(&mut ws, "a\\*b.txt"), ["a*b.txt"]);
+        ws.project.exclude = vec!["[가-힣]*".into()];
+        assert_eq!(list(&mut ws, "*.md"), ["notes.md", "ärger.md", "éa.md"]);
     }
 }
