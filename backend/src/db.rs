@@ -616,22 +616,52 @@ pub async fn queries_by_names(db: &Db, cfg: &MariaDbConfig, names: &[String]) ->
 
 /// Registered queries a text names, in order of first mention.
 pub async fn queries_mentioned_in(db: &Db, cfg: &MariaDbConfig, body: &str, limit: usize) -> Result<Vec<Row>> {
-    if body.trim().is_empty() || limit == 0 {
-        return Ok(vec![]);
+    Ok(queries_mentioned_in_each(db, cfg, &[body], limit).await?.pop().unwrap_or_default())
+}
+
+/// `queries_mentioned_in` for each of several texts, reading the registry's
+/// names once: read again for each text, a method_read of ten methods read
+/// every registered name ten times.
+pub async fn queries_mentioned_in_each(db: &Db, cfg: &MariaDbConfig, bodies: &[&str], limit: usize) -> Result<Vec<Vec<Row>>> {
+    if limit == 0 || bodies.iter().all(|body| body.trim().is_empty()) {
+        return Ok(vec![vec![]; bodies.len()]);
     }
     let all = db.query(cfg, "SELECT seq, query_name FROM query_registry", vec![]).await?;
-    let search = crate::text::NameSearch::new(body);
-    let mut named: Vec<(usize, i64, String)> = all
+    let names: Vec<String> = all.iter().map(|r| text(r, "query_name")).collect();
+    let finder = crate::text::NameFinder::new(&names);
+    let named: Vec<Vec<String>> = bodies
         .iter()
-        .filter_map(|r| {
-            let name = text(r, "query_name");
-            search.index_of(&name).map(|at| (at, int(r, "seq"), name))
+        .map(|body| {
+            if body.trim().is_empty() {
+                return vec![];
+            }
+            let mut named: Vec<(usize, i64, String)> = finder
+                .find_in(body)
+                .into_iter()
+                .map(|(at, i)| (at, int(&all[i], "seq"), names[i].clone()))
+                .collect();
+            named.sort();
+            named.truncate(limit);
+            named.into_iter().map(|(_, _, name)| name).collect()
         })
         .collect();
-    named.sort();
-    named.truncate(limit);
-    let names: Vec<String> = named.into_iter().map(|(_, _, name)| name).collect();
-    queries_by_names(db, cfg, &names).await
+    let mut every: Vec<String> = vec![];
+    for name in named.iter().flatten() {
+        if !every.contains(name) {
+            every.push(name.clone());
+        }
+    }
+    let rows = queries_by_names(db, cfg, &every).await?;
+    let key = |name: &str| crate::text::name_key(name);
+    Ok(named
+        .iter()
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|name| rows.iter().find(|r| key(&text(r, "query_name")) == key(name)).cloned())
+                .collect()
+        })
+        .collect())
 }
 
 #[cfg(test)]

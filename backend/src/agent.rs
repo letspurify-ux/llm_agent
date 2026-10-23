@@ -1237,7 +1237,7 @@ async fn locate(
             work.abandon();
             unfound("cancelled")
         }
-        found = found => found.unwrap_or_else(|_| unfound("tool_worker_panic: the tool stopped unexpectedly")),
+        found = found => found.unwrap_or_else(|_| unfound(TOOL_PANIC)),
     }
 }
 
@@ -1517,7 +1517,7 @@ async fn execute_batch(
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 tools::execute(&mut workspace, &call.name, clean.clone(), &source_cancel)
             }))
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("tool_worker_panic: the tool stopped unexpectedly")));
+            .unwrap_or_else(|_| Err(anyhow::anyhow!(TOOL_PANIC)));
             let mut result = tools::envelope(outcome);
             if let Some(adjusted) = adjusted
                 && result["data"].is_object()
@@ -1535,7 +1535,7 @@ async fn execute_batch(
             let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 tools::limit_result(&mut workspace, &call, &clean, result, share)
             }))
-            .unwrap_or_else(|_| tools::envelope(Err(anyhow::anyhow!("tool_worker_panic: the tool stopped unexpectedly"))));
+            .unwrap_or_else(|_| tools::envelope(Err(anyhow::anyhow!(TOOL_PANIC))));
             if call.name != "history" && result.get("root").is_none() {
                 result["root"] = json!(root_text.display().to_string());
             }
@@ -1572,7 +1572,16 @@ async fn execute_batch(
                         if let Some(o) = clean.as_object_mut() {
                             o.remove("__adjusted");
                         }
-                        let run = voc_tools::run(cx, &name, &clean).await;
+                        // A panic here ended the question with the conversation's
+                        // history on the source thread, and it went on without it.
+                        let run = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(voc_tools::run(cx, &name, &clean)))
+                            .await
+                            .unwrap_or_else(|_| voc_tools::Run {
+                                result: Err(anyhow::anyhow!(TOOL_PANIC)),
+                                effect: voc_tools::Effect::None,
+                                hits: None,
+                                public_error: None,
+                            });
                         (i, run, started.elapsed().as_millis() as u64)
                     })
                 }
@@ -1737,14 +1746,14 @@ async fn execute_batch(
         {
             result["data"]["adjusted_arguments"] = adjusted.clone();
         }
-        let bounded = tools::bound_result(&mut workspace, call, &args, result, share);
+        let bounded = guarded_bound(&mut workspace, call, &args, result, share);
         results[index] = Some(bounded);
     }
     for (index, task) in mcp_tasks {
         // A task that panicked never closed its progress line.
         let outcome = task.await.unwrap_or_else(|_| {
             events.send(json!({"type":"tool_done","id":ids[index],"name":names[index],"status":"error"}));
-            Err(anyhow::anyhow!("tool_worker_panic: the tool stopped unexpectedly"))
+            Err(anyhow::anyhow!(TOOL_PANIC))
         });
         let (args, renamed) = match &prepared[index] {
             Prepared::Mcp { args, renamed, .. } => (args.clone(), renamed.clone()),
@@ -1758,7 +1767,7 @@ async fn execute_batch(
                 result["adjusted_arguments"] = json!([note]);
             }
         }
-        results[index] = Some(tools::bound_result(&mut workspace, &calls[index], &args, result, share));
+        results[index] = Some(guarded_bound(&mut workspace, &calls[index], &args, result, share));
     }
     // Every result as the model receives it (repeat warnings and recovery
     // hints attached), fitted beside the response's own calls.
@@ -1859,12 +1868,24 @@ fn fit_batch(ws: &mut Workspace, calls: &[ToolCall], prepared: &[Prepared], resu
         }
         let limit = size.saturating_sub(total - room).max(crate::config::MIN_RESULT_TOKENS);
         let result = std::mem::take(&mut results[index]);
-        let cut = tools::bound_result(ws, &calls[index], &args, result, limit);
+        let cut = guarded_bound(ws, &calls[index], &args, result, limit);
         let cut_size = tools::result_tokens(&calls[index], &cut, &model);
         settled[index] = cut_size >= size || cut_size <= limit;
         sizes[index] = cut_size;
         results[index] = cut;
     }
+}
+
+/// What a tool call that panicked returns.
+const TOOL_PANIC: &str = "tool_worker_panic: the tool stopped unexpectedly";
+
+/// `tools::bound_result`, guarded as the source thread guards it: the
+/// workspace holds the conversation's history meanwhile, and a panic while
+/// bounding a result ended the question with it, the conversation going on
+/// with none.
+fn guarded_bound(ws: &mut Workspace, call: &ToolCall, args: &Value, result: Value, limit: usize) -> Value {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tools::bound_result(ws, call, args, result, limit)))
+        .unwrap_or_else(|_| tools::envelope(Err(anyhow::anyhow!(TOOL_PANIC))))
 }
 
 fn search_targets(args: &Value) -> Value {

@@ -517,106 +517,23 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
     } else {
         Err("임베딩 주소가 설정되지 않아 의미 검색을 쓸 수 없음".into())
     };
+    // The targets are searched at once, each on connections of its own: one
+    // after another, a search waited for the sum of their lookups (title
+    // matches scan their tables) rather than the longest.
+    let outcomes =
+        futures_util::future::join_all(targets.iter().map(|target| search_target(cx, target, &text, &vector, offset, limit))).await;
     let mut results = Map::new();
     let mut hits = json!({});
     let mut failed = vec![];
-    for target in &targets {
-        // An exact query name comes before the page, outside its places.
-        let mut exact: Vec<Value> = vec![];
-        if target == "query" && offset == 0 && utf16_len(&text) <= 200 {
-            match db::queries_by_names(&cx.app.db, &config.mariadb, std::slice::from_ref(&text)).await {
-                Ok(rows) => {
-                    for row in rows {
-                        let mut item = query_summary(&row);
-                        item["exact"] = json!(true);
-                        exact.push(item);
-                    }
-                }
-                Err(e) => eprintln!("[search] exact query lookup failed: {e}"),
-            }
-        }
-        let listed: std::result::Result<VectorList, String> = match &vector {
-            Err(reason) => Err(reason.clone()),
-            Ok(v) => vector_list(cx, target, v, offset, limit)
-                .await
-                .map_err(|e| format!("벡터 검색 실패: {}", clip_utf16(&e.to_string(), 200))),
-        };
-        let slots = title_slots(offset, limit, listed.is_ok());
-        let source = match target.as_str() {
-            "knowledge" => &search::KNOWLEDGE_TITLES,
-            "qa_method" => &search::METHOD_TITLES,
-            _ => &search::QUERY_TEXTS,
-        };
-        let near = listed.as_ref().map(|l| l.near.clone()).unwrap_or_default();
-        let titles = if slots == 0 {
-            search::TitleMatches::default()
-        } else {
-            let wanted = title_slots(offset, limit, false) + exact.len();
-            match search::title_matches(&cx.app.db, &config.mariadb, source, &text, &near, wanted).await {
-                Ok(found) => found,
-                Err(e) => {
-                    eprintln!("[search] title match failed on {target}: {e}");
-                    search::TitleMatches::default()
-                }
-            }
-        };
-        let exact_keys: BTreeSet<String> = exact.iter().map(item_key).collect();
-        let mut title_items: Vec<Value> = titles.rows.iter().map(|r| title_item(target, r)).collect();
-        let found_titles = title_items.len();
-        title_items.retain(|i| !exact_keys.contains(&item_key(i)));
-        let title_total = titles.total.saturating_sub(found_titles - title_items.len());
-        title_items.truncate(title_slots(offset, limit, false));
-        let mut cut_short = false;
-        let outcome: std::result::Result<Value, String> = match listed {
-            Ok(list) => {
-                let (page, next) = merge_page(title_items, slots, &list.items, offset, limit, list.more, &exact_keys);
-                cut_short = next.is_none() && list.capped;
-                let mut items = exact;
-                items.extend(page);
-                let mut out = json!({"next_offset":next,"beyond_threshold":list.beyond});
-                out["items"] = json!(items);
-                Ok(out)
-            }
-            Err(reason) if exact.is_empty() && title_items.is_empty() => Err(reason),
-            Err(reason) => {
-                let found = if target == "query" { "이름이 정확히 맞거나 이름·설명에 낱말이 든 쿼리만" } else { "제목에 낱말이 든 항목만" };
-                let mut items = exact;
-                items.extend(title_items);
-                Ok(json!({"items":items,"note":format!("{found} 찾았다 ({reason})")}))
-            }
-        };
+    for (target, outcome) in targets.iter().zip(outcomes) {
         let hit_key = match target.as_str() {
             "knowledge" => "knowledge",
             "qa_method" => "qaMethods",
             _ => "queries",
         };
         match outcome {
-            Ok(mut value) => {
-                let count = value["items"].as_array().map_or(0, Vec::len);
-                hits[hit_key] = json!(count);
-                value["status"] = json!("ok");
-                if title_total > 0 {
-                    value["title_matches"] = json!(title_total);
-                    note_titles_shown(target, &mut value);
-                }
-                // A page past the last one is no sign of nothing related:
-                // told so, the results of the pages before seemed void.
-                // Results that end at the candidates one search reads are not
-                // all there are: told they were, nearer ones went unsought.
-                if cut_short {
-                    let cut = format!(
-                        "의미 검색은 가까운 후보 {}건까지만 읽어, 그 너머의 결과는 이어 볼 수 없다. 더 찾으려면 검색어를 더 구체적으로 바꿔라.",
-                        search::MAX_CANDIDATES
-                    );
-                    value["note"] = json!(match value["note"].as_str() {
-                        Some(before) => format!("{cut} {before}"),
-                        None => cut,
-                    });
-                } else if count == 0 && offset > 0 {
-                    value["note"] = json!(format!("offset {offset}부터는 결과가 없다. 이 검색의 결과는 그 앞쪽이 전부다."));
-                } else if count == 0 {
-                    value["note"] = json!("관련 항목이 없다. 검색어를 바꿔 볼 수 있다.");
-                }
+            Ok(value) => {
+                hits[hit_key] = json!(value["items"].as_array().map_or(0, Vec::len));
                 results.insert(target.clone(), value);
             }
             Err(reason) => {
@@ -634,6 +551,115 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
         hits: Some((hits, failed)),
         public_error: None,
     }
+}
+
+/// One target's part of a search: its list, or why it could not run.
+async fn search_target(
+    cx: &Context<'_>,
+    target: &str,
+    text: &str,
+    vector: &std::result::Result<Arc<Vec<f32>>, String>,
+    offset: usize,
+    limit: usize,
+) -> std::result::Result<Value, String> {
+    let config = cx.config;
+    // An exact query name comes before the page, outside its places. Looked
+    // up beside the vector search, which does not depend on it.
+    let exact_lookup = async {
+        let mut exact: Vec<Value> = vec![];
+        if target == "query" && offset == 0 && utf16_len(text) <= 200 {
+            match db::queries_by_names(&cx.app.db, &config.mariadb, &[text.to_owned()]).await {
+                Ok(rows) => {
+                    for row in rows {
+                        let mut item = query_summary(&row);
+                        item["exact"] = json!(true);
+                        exact.push(item);
+                    }
+                }
+                Err(e) => eprintln!("[search] exact query lookup failed: {e}"),
+            }
+        }
+        exact
+    };
+    let vector_lookup = async {
+        match vector {
+            Err(reason) => Err(reason.clone()),
+            Ok(v) => vector_list(cx, target, v, offset, limit)
+                .await
+                .map_err(|e| format!("벡터 검색 실패: {}", clip_utf16(&e.to_string(), 200))),
+        }
+    };
+    let (exact, listed): (Vec<Value>, std::result::Result<VectorList, String>) = futures_util::join!(exact_lookup, vector_lookup);
+    let slots = title_slots(offset, limit, listed.is_ok());
+    let source = match target {
+        "knowledge" => &search::KNOWLEDGE_TITLES,
+        "qa_method" => &search::METHOD_TITLES,
+        _ => &search::QUERY_TEXTS,
+    };
+    let near = listed.as_ref().map(|l| l.near.clone()).unwrap_or_default();
+    let titles = if slots == 0 {
+        search::TitleMatches::default()
+    } else {
+        let wanted = title_slots(offset, limit, false) + exact.len();
+        match search::title_matches(&cx.app.db, &config.mariadb, source, text, &near, wanted).await {
+            Ok(found) => found,
+            Err(e) => {
+                eprintln!("[search] title match failed on {target}: {e}");
+                search::TitleMatches::default()
+            }
+        }
+    };
+    let exact_keys: BTreeSet<String> = exact.iter().map(item_key).collect();
+    let mut title_items: Vec<Value> = titles.rows.iter().map(|r| title_item(target, r)).collect();
+    let found_titles = title_items.len();
+    title_items.retain(|i| !exact_keys.contains(&item_key(i)));
+    let title_total = titles.total.saturating_sub(found_titles - title_items.len());
+    title_items.truncate(title_slots(offset, limit, false));
+    let mut cut_short = false;
+    let outcome: std::result::Result<Value, String> = match listed {
+        Ok(list) => {
+            let (page, next) = merge_page(title_items, slots, &list.items, offset, limit, list.more, &exact_keys);
+            cut_short = next.is_none() && list.capped;
+            let mut items = exact;
+            items.extend(page);
+            let mut out = json!({"next_offset":next,"beyond_threshold":list.beyond});
+            out["items"] = json!(items);
+            Ok(out)
+        }
+        Err(reason) if exact.is_empty() && title_items.is_empty() => Err(reason),
+        Err(reason) => {
+            let found = if target == "query" { "이름이 정확히 맞거나 이름·설명에 낱말이 든 쿼리만" } else { "제목에 낱말이 든 항목만" };
+            let mut items = exact;
+            items.extend(title_items);
+            Ok(json!({"items":items,"note":format!("{found} 찾았다 ({reason})")}))
+        }
+    };
+    let mut value = outcome?;
+    let count = value["items"].as_array().map_or(0, Vec::len);
+    value["status"] = json!("ok");
+    if title_total > 0 {
+        value["title_matches"] = json!(title_total);
+        note_titles_shown(target, &mut value);
+    }
+    // A page past the last one is no sign of nothing related:
+    // told so, the results of the pages before seemed void.
+    // Results that end at the candidates one search reads are not
+    // all there are: told they were, nearer ones went unsought.
+    if cut_short {
+        let cut = format!(
+            "의미 검색은 가까운 후보 {}건까지만 읽어, 그 너머의 결과는 이어 볼 수 없다. 더 찾으려면 검색어를 더 구체적으로 바꿔라.",
+            search::MAX_CANDIDATES
+        );
+        value["note"] = json!(match value["note"].as_str() {
+            Some(before) => format!("{cut} {before}"),
+            None => cut,
+        });
+    } else if count == 0 && offset > 0 {
+        value["note"] = json!(format!("offset {offset}부터는 결과가 없다. 이 검색의 결과는 그 앞쪽이 전부다."));
+    } else if count == 0 {
+        value["note"] = json!("관련 항목이 없다. 검색어를 바꿔 볼 수 있다.");
+    }
+    Ok(value)
 }
 
 /// Says in a target's note how many of its `title_matches` the list shows
@@ -1089,15 +1115,17 @@ async fn method_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
             seqs.iter().map(|s| n(*s)).collect(),
         )
         .await?;
+    let methods: Vec<(i64, &Row)> = seqs
+        .iter()
+        .filter_map(|seq| rows.iter().find(|r| db::int(r, "seq") == *seq).map(|row| (*seq, row)))
+        .collect();
+    let bodies: Vec<String> = methods.iter().map(|(_, row)| db::text(row, "method")).collect();
+    let mentioned =
+        db::queries_mentioned_in_each(&cx.app.db, cfg, &bodies.iter().map(String::as_str).collect::<Vec<_>>(), 20).await?;
     let mut items = vec![];
     let mut found = BTreeSet::new();
-    for seq in &seqs {
-        let Some(row) = rows.iter().find(|r| db::int(r, "seq") == *seq) else {
-            continue;
-        };
-        found.insert(*seq);
-        let method = db::text(row, "method");
-        let queries = db::queries_mentioned_in(&cx.app.db, cfg, &method, 20).await?;
+    for (((seq, row), method), queries) in methods.into_iter().zip(bodies).zip(mentioned) {
+        found.insert(seq);
         items.push(json!({
             "id":format!("m{seq}"),"title":db::text(row, "title"),
             "method":method,

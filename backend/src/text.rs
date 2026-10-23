@@ -127,6 +127,58 @@ impl<'a> NameSearch<'a> {
     }
 }
 
+/// Many names to find in texts (`NameSearch::index_of` for each), looked for
+/// together: asked of each name in turn, a text was read once a name — a
+/// method_read of ten methods over 5,000 registered queries read them 50,000
+/// times (20–40 ms). One pass over the folded text tells the names whose
+/// folding is in it, the check `index_of` starts with; only those are
+/// looked for as it does.
+pub struct NameFinder<'a> {
+    names: &'a [String],
+    /// Each folded key once, with the names that fold to it.
+    /// None when the automaton could not be built: every name is checked.
+    keys: Option<aho_corasick::AhoCorasick>,
+    holders: Vec<Vec<usize>>,
+}
+
+impl<'a> NameFinder<'a> {
+    pub fn new(names: &'a [String]) -> Self {
+        let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut patterns: Vec<String> = vec![];
+        let mut holders: Vec<Vec<usize>> = vec![];
+        for (i, name) in names.iter().enumerate() {
+            let key = name_key(name);
+            if key.is_empty() {
+                continue;
+            }
+            let at = *index.entry(folded(&key)).or_insert_with_key(|pattern| {
+                patterns.push(pattern.clone());
+                holders.push(vec![]);
+                patterns.len() - 1
+            });
+            holders[at].push(i);
+        }
+        let keys = aho_corasick::AhoCorasick::new(&patterns).ok();
+        Self { names, keys, holders }
+    }
+
+    /// Each name written in `text` as `index_of` finds it: (byte position,
+    /// index in the names), in the names' order.
+    pub fn find_in(&self, text: &str) -> Vec<(usize, usize)> {
+        let search = NameSearch::new(text);
+        let mut present: Vec<usize> = match &self.keys {
+            Some(keys) => keys
+                .find_overlapping_iter(&search.folded)
+                .flat_map(|found| self.holders[found.pattern().as_usize()].iter().copied())
+                .collect(),
+            None => (0..self.names.len()).collect(),
+        };
+        present.sort_unstable();
+        present.dedup();
+        present.into_iter().filter_map(|i| search.index_of(&self.names[i]).map(|at| (at, i))).collect()
+    }
+}
+
 /// `;`-separated target DB names, trimmed and deduplicated by `name_key`,
 /// keeping the first spelling.
 pub fn target_db_names(raw: &str) -> Vec<String> {
@@ -285,6 +337,33 @@ mod tests {
         // Punctuation, spaces and Korean are not part of a name.
         assert_eq!(name_index_of("`batch_job`(재실행)", "batch_job"), Some(1));
         assert_eq!(name_index_of("주문조회하기", "주문조회"), Some(0));
+    }
+
+    #[test]
+    fn many_names_are_found_as_each_is_alone() {
+        let names: Vec<String> = [
+            "batch_job", "batch_job_status", "Batch_Job", "query1", "query10", "주문조회", "find customer", "ΟΔΟΣ", "οδοσ",
+            "  ", "", "İstanbul", "x", "ab", "b", "q_ς",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .chain((0..200).map(|i| format!("zz_query_{i}_list")))
+        .collect();
+        let texts = [
+            "1. batch_job_status로 상태를 본다. 2. 실패면 BATCH_JOB 재실행을 안내한다.",
+            "query10 then query1, 주문조회하기 and FIND CUSTOMER 다음 ΟΔΟΣ와 i̇stanbul",
+            "zz_query_7_list 로 조회하고 zz_query_17_list, zz_query_170_list 도 본다 q_σ abab xb",
+            "",
+            "아무 이름도 없다",
+        ];
+        let finder = NameFinder::new(&names);
+        for text in texts {
+            let search = NameSearch::new(text);
+            let each: Vec<(usize, usize)> =
+                names.iter().enumerate().filter_map(|(i, name)| search.index_of(name).map(|at| (at, i))).collect();
+            assert_eq!(finder.find_in(text), each, "{text}");
+        }
+        assert!(!finder.find_in(texts[2]).is_empty());
     }
 
     #[test]
