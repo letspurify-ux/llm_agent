@@ -1041,6 +1041,9 @@ async fn settings_put(State(app): State<Arc<App>>, headers: HeaderMap, body: Byt
     Ok(record(settings_view(&app, &stored), StatusCode::OK))
 }
 
+/// How long the settings screen's Oracle client check waits for the load.
+const CLIENT_CHECK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Tries a connection with the draft settings without saving them.
 async fn settings_check(State(app): State<Arc<App>>, body: Bytes) -> ApiResult<Json<Value>> {
     let body = body_json(&body)?;
@@ -1093,10 +1096,17 @@ async fn settings_check(State(app): State<Arc<App>>, body: Bytes) -> ApiResult<J
             ))
         }
         .await,
-        "oracle_client" => match app.oracle.load_client(&app.started.oracle).await {
-            Ok(version) => Ok(format!("Oracle 클라이언트 {version}을(를) 불러왔습니다.")),
-            Err(e) => Err(anyhow::anyhow!(
+        // A load whose folder does not answer (a network drive gone) never
+        // ends; the check waited for it with the request, and the settings
+        // screen with it.
+        "oracle_client" => match tokio::time::timeout(CLIENT_CHECK_WAIT, app.oracle.load_client(&app.started.oracle)).await {
+            Ok(Ok(version)) => Ok(format!("Oracle 클라이언트 {version}을(를) 불러왔습니다.")),
+            Ok(Err(e)) => Err(anyhow::anyhow!(
                 "Oracle 클라이언트를 불러오지 못했습니다: {e} (폴더 설정은 서버를 다시 시작해야 적용됩니다)"
+            )),
+            Err(_) => Err(anyhow::anyhow!(
+                "Oracle 클라이언트를 {}초 안에 불러오지 못해 아직 불러오는 중입니다 — 클라이언트 폴더가 응답하지 않는 네트워크 드라이브일 수 있습니다. 잠시 뒤 다시 확인해주세요.",
+                CLIENT_CHECK_WAIT.as_secs()
             )),
         },
         _ => return Err(ApiError::new(400, "확인할 대상을 llm, embedding, mariadb, oracle_client 중에서 골라주세요.")),

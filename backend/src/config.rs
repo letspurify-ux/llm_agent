@@ -720,15 +720,22 @@ impl Config {
     }
 
     /// Writes `config.toml` and the secrets file atomically. The secrets
-    /// file keeps owner-only permissions.
+    /// file keeps owner-only permissions. Both are written in full before
+    /// either replaces its file: written one after the other, a secrets file
+    /// that could not be written (a full disk) failed the save with
+    /// `config.toml` already changed, and the next start paired the settings
+    /// saved with the secrets of before — a new LLM address with the old key,
+    /// which then went to it.
     pub fn save(&self, path: &Path) -> Result<()> {
         self.validate()?;
-        write_atomic(path, toml::to_string_pretty(self)?.as_bytes(), false)?;
-        write_atomic(
+        let settings = written(path, toml::to_string_pretty(self)?.as_bytes(), false)?;
+        let secrets = written(
             &credentials_path(path),
             serde_json::to_string_pretty(&self.credentials())?.as_bytes(),
             true,
         )?;
+        secrets.persist(credentials_path(path))?;
+        settings.persist(path)?;
         Ok(())
     }
 
@@ -850,7 +857,9 @@ pub fn dotenv_map() -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
+/// `bytes` written and synced to a file beside `path`, to replace it with
+/// (`persist`).
+fn written(path: &Path, bytes: &[u8], private: bool) -> Result<tempfile::NamedTempFile> {
     use std::io::Write;
     let parent = path
         .parent()
@@ -871,13 +880,34 @@ fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
             .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     temp.as_file().sync_all()?;
-    temp.persist(path)?;
-    Ok(())
+    Ok(temp)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backend review, 2026-10-23: config.toml was replaced before the
+    /// secrets file was written; one that could not be (a full disk) failed
+    /// the save with the settings already changed, and the next start paired
+    /// them with the secrets of before. Neither file changes now.
+    #[test]
+    fn a_save_that_cannot_write_its_secrets_changes_neither_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.save(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let secrets = credentials_path(&path);
+        std::fs::remove_file(&secrets).unwrap();
+        std::fs::create_dir(&secrets).unwrap();
+        config.llm.base_url = "http://elsewhere.example/v1".into();
+        assert!(config.save(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        std::fs::remove_dir(&secrets).unwrap();
+        config.save(&path).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("elsewhere.example"));
+    }
 
     #[test]
     fn mcp_servers_keep_their_secrets_in_the_secrets_file() {
