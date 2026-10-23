@@ -482,6 +482,33 @@ async fn an_account_without_alter_syncs_on_and_with_it_rebuilds_by_its_own_count
     db.close().await;
 }
 
+/// Backend review, 2026-10-23: a rebuild the account was refused stopped
+/// every rebuild of the process for good: the ALTER the log asked for, once
+/// granted, took a restart. The same process now tries again after its wait.
+#[tokio::test]
+async fn a_rebuild_refused_is_tried_again_once_granted() {
+    let _turn = SYNCING.lock().await;
+    let Some(test_db) = TestDb::create("sync_rebuild_again") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let users = Users::create(&test_db, "SELECT, INSERT, UPDATE, DELETE");
+    let mut config = users.config();
+    config.embedding.url = String::new();
+    let rows: u64 = test_db.scalar("SELECT COUNT(*) FROM qa_method").parse().unwrap();
+    add_vectors(&test_db, "qa_method");
+    add_vectors(&test_db, "seq_1000_to_1299");
+    let db = Db::default();
+    let sync = EmbedSync::retrying_rebuilds_after(Duration::ZERO);
+    let summary = sync.run(&db, &config, &CancellationToken::new()).await.unwrap();
+    assert_eq!((summary.deleted, summary.rebuilt), (300, 0), "{summary}");
+
+    users.grant("ALTER ON {db}.vec_qa_method");
+    let summary = sync.run(&db, &config, &CancellationToken::new()).await.unwrap();
+    assert_eq!(summary.rebuilt, 1, "{summary}");
+    assert_eq!(index_entries(&test_db), rows);
+    db.close().await;
+}
+
 /// Rows whose vector is out of date leave an index entry behind only once
 /// a new vector replaces the old. Counted as replaced whether or not they
 /// were, rows the embedding server refused (or could not be reached for)

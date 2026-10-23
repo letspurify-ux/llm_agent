@@ -124,11 +124,13 @@ impl std::fmt::Display for Summary {
 #[derive(Default)]
 pub struct EmbedSync {
     running: AtomicBool,
-    /// By `vec_*` table, since this process last looked at its index.
+    /// By management DB, account and `vec_*` table (`index_key`), since this
+    /// process last looked at the index.
     indexes: Mutex<HashMap<String, IndexState>>,
-    /// The account may not rebuild a table (no ALTER privilege): told once.
-    rebuild_denied: AtomicBool,
     refused: Mutex<Refused>,
+    /// How long a table whose rebuild failed or was refused waits before
+    /// another try: `REBUILD_RETRY` unless set (`retrying_rebuilds_after`).
+    retry: Option<Duration>,
 }
 
 /// Rows the embedding server refused (an HTTP 4xx, a vector of the wrong
@@ -193,11 +195,29 @@ struct IndexState {
     /// last rebuilt or counted: the count when the server's own cannot be
     /// read (it takes the PROCESS privilege).
     stale: u64,
-    /// When a rebuild last failed.
+    /// When a rebuild last failed, or was refused.
     failed_at: Option<Instant>,
+    /// The account may not rebuild the table (no ALTER privilege): told
+    /// once, and tried again as a failed rebuild is. Refused once, the
+    /// tables were never looked at again until a restart, the ALTER the log
+    /// asked for granted or not.
+    denied: bool,
+}
+
+/// What `IndexState` is kept by: the table in the management DB as the
+/// account sees it. By table name alone, the counts and refusals of one DB
+/// or account held for another the settings were changed to.
+fn index_key(cfg: &crate::config::MariaDbConfig, vec: &str) -> String {
+    format!("{}:{}/{}\0{}\0{vec}", cfg.host.trim().to_ascii_lowercase(), cfg.port, cfg.database, cfg.user)
 }
 
 impl EmbedSync {
+    /// A sync whose failed or refused rebuilds are tried again after `wait`.
+    #[doc(hidden)]
+    pub fn retrying_rebuilds_after(wait: Duration) -> Self {
+        Self { retry: Some(wait), ..Default::default() }
+    }
+
     pub async fn run(&self, db: &Db, config: &Config, stop: &CancellationToken) -> Result<Summary> {
         if self.running.swap(true, Ordering::AcqRel) {
             return Ok(Summary {
@@ -503,15 +523,18 @@ async fn rebuild_index(
 ) -> Result<()> {
     let cfg = &config.mariadb;
     let vec = vec_table(table);
+    let key = index_key(cfg, &vec);
+    let retry = state.retry.unwrap_or(REBUILD_RETRY);
     let counted = {
         let mut indexes = state.indexes.lock().unwrap_or_else(|p| p.into_inner());
-        let seen = indexes.contains_key(&vec);
-        let index = indexes.entry(vec.clone()).or_default();
+        let seen = indexes.contains_key(&key);
+        let index = indexes.entry(key.clone()).or_default();
         index.stale += left;
-        if (seen && left == 0)
+        // A table whose rebuild failed is looked at again once its wait is over.
+        let retrying = index.failed_at.is_some_and(|at| at.elapsed() >= retry);
+        if (seen && left == 0 && !retrying)
             || stop.is_cancelled()
-            || state.rebuild_denied.load(Ordering::Acquire)
-            || index.failed_at.is_some_and(|at| at.elapsed() < REBUILD_RETRY)
+            || index.failed_at.is_some_and(|at| at.elapsed() < retry)
         {
             return Ok(());
         }
@@ -537,7 +560,7 @@ async fn rebuild_index(
     };
     let update = |change: &dyn Fn(&mut IndexState)| {
         let mut indexes = state.indexes.lock().unwrap_or_else(|p| p.into_inner());
-        change(indexes.entry(vec.clone()).or_default());
+        change(indexes.entry(key.clone()).or_default());
     };
     if stale < rows.max(STALE_ENTRIES_MIN) {
         if entries.is_some() {
@@ -559,9 +582,16 @@ async fn rebuild_index(
             );
         }
         Err(e) if db::server_code(&e) == Some(db::ER_TABLEACCESS_DENIED) => {
-            if !state.rebuild_denied.swap(true, Ordering::AcqRel) {
+            // Told the first time; tried again, as a failed rebuild is.
+            let told = {
+                let mut indexes = state.indexes.lock().unwrap_or_else(|p| p.into_inner());
+                let index = indexes.entry(key.clone()).or_default();
+                index.failed_at = Some(Instant::now());
+                std::mem::replace(&mut index.denied, true)
+            };
+            if !told {
                 eprintln!(
-                    "[embed] the vector index of {vec} holds about {stale} entries of deleted or replaced rows ({rows} rows): MariaDB drops them only when the table is rebuilt, which the management DB account may not do — grant it ALTER on the vec_* tables (README, MariaDB schema), or run `ALTER TABLE {vec} ALGORITHM=COPY, FORCE` now and then"
+                    "[embed] the vector index of {vec} holds about {stale} entries of deleted or replaced rows ({rows} rows): MariaDB drops them only when the table is rebuilt, which the management DB account may not do — grant it ALTER on the vec_* tables (README, MariaDB schema), or run `ALTER TABLE {vec} ALGORITHM=COPY, FORCE` now and then; tried again every hour"
                 );
             }
         }
