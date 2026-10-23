@@ -22,6 +22,12 @@ pub const CHUNK_OVERFETCH: usize = 3;
 pub const MAX_CANDIDATES: usize = 600;
 /// Candidate lists one knowledge search reads at most.
 const KNOWLEDGE_ROUNDS: usize = 6;
+/// Searches that read every vector of a table (`nearest`), for tests.
+#[doc(hidden)]
+pub static VECTOR_SCANS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Times the vector index is asked, the candidates out of date or broken
+/// left out each time, before every vector is read instead (`nearest`).
+const INDEX_ROUNDS: usize = 3;
 const MIN_SAFE_NORM: &str = "1.0842021724855044e-19";
 const MAX_SAFE_NORM: &str = "1.844674352395373e19";
 static ZERO_VECTOR: LazyLock<String> =
@@ -72,7 +78,7 @@ async fn nearest(db: &Db, config: &Config, table: &str, vector: &[f32], limit: u
     } else {
         let marks = db::marks(without_docs.len());
         (
-            format!("WHERE seq NOT IN (SELECT kc.seq FROM knowledge_chunk kc WHERE kc.doc_seq IN ({marks}))"),
+            format!("seq NOT IN (SELECT kc.seq FROM knowledge_chunk kc WHERE kc.doc_seq IN ({marks}))"),
             format!("AND t.doc_seq NOT IN ({marks})"),
         )
     };
@@ -84,35 +90,78 @@ async fn nearest(db: &Db, config: &Config, table: &str, vector: &[f32], limit: u
     // With each statement rather than on a connection kept for both.
     let settings = format!("mhnsw_ef_search={}", config.embedding.ef_search);
     let vec = vec_table(table);
-    let candidates = db.query_with(
-        cfg,
-        &settings,
-        &format!(
-            "SELECT t.*, v._dist,
-               (t.seq IS NULL OR v.embed_hash <> {current}) AS _stale,
-               (COALESCE(v._norm, 0) NOT BETWEEN {MIN_SAFE_NORM} AND {MAX_SAFE_NORM}) AS _invalid FROM (
-               SELECT seq, embed_hash, VEC_DISTANCE_COSINE(embedding, VEC_FromText(?)) AS _dist,
-                 VEC_DISTANCE_EUCLIDEAN(embedding, VEC_FromText(?)) AS _norm
-               FROM {vec} {inner_without} ORDER BY _dist LIMIT {n}
-             ) v LEFT JOIN {table} t ON t.seq = v.seq
-             ORDER BY v._dist, v.seq LIMIT {n}"
-        ),
-        [p(model.clone()), p(encoded.clone()), p(ZERO_VECTOR.clone())].into_iter().chain(without()).collect(),
-    )
-    .await?;
-    let total = candidates.len();
-    let valid: Vec<Row> = candidates
+    // Candidates out of date (a row edited or deleted since its vector, one
+    // the embedding server refused) or with a broken vector are passed over:
+    // the index is asked again without them, as it reads past a filter to
+    // fill its limit. Only when they keep coming is every vector read
+    // (`refill`): that scan was the next step at once, and it cost seconds
+    // a search on a table of tens of thousands of rows (20,000: 7 s against
+    // 0.2 s), for every search near a document edited before the next sync,
+    // or near a row the embedding server keeps refusing, for good.
+    let mut passed: Vec<i64> = vec![];
+    let mut valid: Vec<Row> = vec![];
+    for round in 0..INDEX_ROUNDS {
+        let filter: Vec<String> = [
+            (!inner_without.is_empty()).then(|| inner_without.clone()),
+            (!passed.is_empty()).then(|| format!("seq NOT IN ({})", db::marks(passed.len()))),
+        ]
         .into_iter()
-        .filter(|r| db::int(r, "_stale") == 0 && db::int(r, "_invalid") == 0)
-        .map(|mut r| {
-            r.remove("_stale");
-            r.remove("_invalid");
-            r
-        })
+        .flatten()
         .collect();
-    if valid.len() == total {
-        return Ok(valid);
+        let filter = if filter.is_empty() { String::new() } else { format!("WHERE {}", filter.join(" AND ")) };
+        let asked = db
+            .query_with(
+                cfg,
+                &settings,
+                &format!(
+                    "SELECT t.*, v._dist, v.seq AS _candidate,
+                       (t.seq IS NULL OR v.embed_hash <> {current}) AS _stale,
+                       (COALESCE(v._norm, 0) NOT BETWEEN {MIN_SAFE_NORM} AND {MAX_SAFE_NORM}) AS _invalid FROM (
+                       SELECT seq, embed_hash, VEC_DISTANCE_COSINE(embedding, VEC_FromText(?)) AS _dist,
+                         VEC_DISTANCE_EUCLIDEAN(embedding, VEC_FromText(?)) AS _norm
+                       FROM {vec} {filter} ORDER BY _dist LIMIT {n}
+                     ) v LEFT JOIN {table} t ON t.seq = v.seq
+                     ORDER BY v._dist, v.seq LIMIT {n}"
+                ),
+                [p(model.clone()), p(encoded.clone()), p(ZERO_VECTOR.clone())]
+                    .into_iter()
+                    .chain(without())
+                    .chain(passed.iter().map(|seq| db::n(*seq)))
+                    .collect(),
+            )
+            .await;
+        let candidates = match asked {
+            Ok(candidates) => candidates,
+            Err(e) if round == 0 => return Err(e),
+            Err(e) if !valid.is_empty() => {
+                eprintln!("[search] candidate refill failed on {table} — keeping validated matches: {e}");
+                return Ok(valid);
+            }
+            Err(e) => return Err(e),
+        };
+        let mut bad = vec![];
+        valid = candidates
+            .into_iter()
+            .filter_map(|mut r| {
+                let candidate = db::int(&r, "_candidate");
+                let ok = db::int(&r, "_stale") == 0 && db::int(&r, "_invalid") == 0;
+                for helper in ["_stale", "_invalid", "_candidate"] {
+                    r.remove(helper);
+                }
+                if ok {
+                    Some(r)
+                } else {
+                    bad.push(candidate);
+                    None
+                }
+            })
+            .collect();
+        if bad.is_empty() {
+            return Ok(valid);
+        }
+        passed.extend(bad);
     }
+    VECTOR_SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let refill = db.query_with(
         cfg,
         &settings,
