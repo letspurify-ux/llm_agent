@@ -347,12 +347,7 @@ impl Oracle {
             cfg.timeout_ms.div_ceil(1000).max(1),
             oracle::Version::client().map_or(0, |v| v.major()),
         );
-        let mut hash = Sha256::new();
-        for part in [connect.clone(), db::text(row, "db_user"), password.to_owned()] {
-            hash.update(part.len().to_le_bytes());
-            hash.update(part.as_bytes());
-        }
-        let fingerprint = hex::encode(hash.finalize());
+        let fingerprint = pool_fingerprint(&connect, &db::text(row, "db_user"), password, cfg.timeout_ms);
         let mut pools = self.pools.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = pools.get_mut(&name)
             && entry.fingerprint == fingerprint
@@ -408,6 +403,20 @@ impl Oracle {
     pub fn pool_count(&self) -> usize {
         self.pools.lock().map_or(0, |pools| pools.len())
     }
+}
+
+/// What a pool is made with, the time limit its session wait keeps
+/// (`GetMode::TimedWait`) too: a pool is made again when any of it changes.
+/// The limit reached the connect string only where the form takes one, so a
+/// tnsnames alias kept its pool's wait at the limit it was made with, the
+/// limit set in the settings since or not, until the pool went idle.
+fn pool_fingerprint(connect: &str, user: &str, password: &str, timeout_ms: u64) -> String {
+    let mut hash = Sha256::new();
+    for part in [connect, user, password, &timeout_ms.to_string()] {
+        hash.update(part.len().to_le_bytes());
+        hash.update(part.as_bytes());
+    }
+    hex::encode(hash.finalize())
 }
 
 /// Closes pools on a thread of their own (closing waits on the network). A
@@ -1068,6 +1077,20 @@ pub fn public_error(error: &anyhow::Error) -> (String, Option<String>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backend review, 2026-10-23: a pool was made again only when its
+    /// connect string, account or password changed, and the time limit
+    /// reached the string only where its form takes one: a tnsnames alias
+    /// kept its pool's session wait at the limit it was made with.
+    #[test]
+    fn a_pool_is_made_again_for_another_time_limit() {
+        assert_eq!(bounded_connect("ORCLPDB", 30, 23), bounded_connect("ORCLPDB", 60, 23));
+        let made = |timeout_ms| pool_fingerprint(&bounded_connect("ORCLPDB", 30, 23), "voc", "pw", timeout_ms);
+        assert_ne!(made(30_000), made(60_000));
+        assert_eq!(made(30_000), made(30_000));
+        // Each part is its own: one moved into another is another pool.
+        assert_ne!(pool_fingerprint("a", "bc", "", 1), pool_fingerprint("ab", "c", "", 1));
+    }
 
     /// Backend review, 2026-10-23: a thread that could not be started
     /// panicked (`std::thread::spawn`), ending the housekeeping job for good.

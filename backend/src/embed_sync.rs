@@ -60,7 +60,8 @@ pub enum Skipped {
     Busy,
     /// No embedding server is configured; search cannot run.
     Unconfigured,
-    /// The embedding server did not answer; the rest waits for the next run.
+    /// The embedding server did not answer, or failed every row it was sent
+    /// (`SERVER_ERRORS_DOWN`); the rest waits for the next run.
     Unavailable,
     /// Stopped for shutdown; the next run continues.
     Stopped,
@@ -114,7 +115,7 @@ impl std::fmt::Display for Summary {
             Skipped::None => "",
             Skipped::Busy => " — skipped, another sync is already in progress",
             Skipped::Unconfigured => " — no embedding URL set, embedding skipped; search cannot run without it",
-            Skipped::Unavailable => " — could not reach the embedding server; the remaining rows stay unsearchable until the next run",
+            Skipped::Unavailable => " — the embedding server could not be reached, or failed every row it was sent; the remaining rows stay unsearchable until the next run",
             Skipped::Stopped => " — stopped early for shutdown; the remaining rows are picked up on the next run",
         };
         f.write_str(note)
