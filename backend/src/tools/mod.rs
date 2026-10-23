@@ -652,24 +652,35 @@ struct Rule {
 }
 impl Rules {
     pub(crate) fn new(project: &Project) -> Result<Self> {
-        use unicode_normalization::UnicodeNormalization;
-        let compile = |pattern: &String| -> Result<Rule> {
-            let pattern = rule_pattern(pattern);
-            nested_glob(&pattern)?;
-            let normalized_pattern: String = pattern.nfc().collect();
-            Ok(Rule {
-                normalized: glob_regex(&globset::GlobBuilder::new(&normalized_pattern).case_insensitive(true).build()?)?,
-                folded: globset::Glob::new(&folded_alias_key(&pattern))
-                    .ok()
-                    .and_then(|glob| glob_regex(&glob).ok()),
-                anywhere: !pattern.contains('/'),
-            })
-        };
+        let compile = |pattern: &String| Rule::new(pattern);
         Ok(Self {
             include: project.include.iter().map(compile).collect::<Result<_>>()?,
             exclude: project.exclude.iter().map(compile).collect::<Result<_>>()?,
         })
     }
+}
+impl Rule {
+    fn new(pattern: &str) -> Result<Self> {
+        use unicode_normalization::UnicodeNormalization;
+        let pattern = rule_pattern(pattern);
+        nested_glob(&pattern)?;
+        let normalized_pattern: String = pattern.nfc().collect();
+        Ok(Rule {
+            normalized: glob_regex(&globset::GlobBuilder::new(&normalized_pattern).case_insensitive(true).build()?)?,
+            folded: globset::Glob::new(&folded_alias_key(&pattern))
+                .ok()
+                .and_then(|glob| glob_regex(&glob).ok()),
+            anywhere: !pattern.contains('/'),
+        })
+    }
+}
+
+/// Whether an include/exclude pattern compiles as the walk compiles it
+/// (`Rules::new`). Checked by globset alone, a pattern the walk's regular
+/// expression refuses (past its size limit) was saved, and every source
+/// call of the project failed on it.
+pub(crate) fn check_rule(pattern: &str) -> Result<()> {
+    Rule::new(pattern).map(drop)
 }
 
 /// An include/exclude pattern as written in an ignore file: `secrets/` names

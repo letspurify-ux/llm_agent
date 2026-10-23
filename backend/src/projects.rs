@@ -29,9 +29,7 @@ pub fn validate(p: &Project) -> Result<()> {
         }
     }
     for pattern in p.include.iter().chain(&p.exclude) {
-        crate::tools::nested_glob(pattern)
-            .map_err(|e| anyhow::anyhow!("파일 패턴 {pattern:?}이 올바르지 않습니다: {e}"))?;
-        globset::Glob::new(pattern)
+        crate::tools::check_rule(pattern)
             .map_err(|e| anyhow::anyhow!("파일 패턴 {pattern:?}이 올바르지 않습니다: {e}"))?;
     }
     Ok(())
@@ -85,6 +83,20 @@ mod tests {
         assert!(validate(&p).is_err());
         p.include.clear();
         p.name = " ".into();
+        assert!(validate(&p).is_err());
+    }
+
+    /// Backend review, 2026-10-23: a pattern was checked by globset alone,
+    /// while the walk compiles it to a regular expression of its own, which
+    /// refuses one past its size limit; saved, every source call of the
+    /// project failed on it.
+    #[test]
+    fn a_pattern_the_walk_cannot_compile_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let pattern = "?".repeat(50_000);
+        assert!(globset::Glob::new(&pattern).is_ok());
+        let p = Project { name: "app".into(), root: dir.path().into(), exclude: vec![pattern], ..Default::default() };
+        assert!(crate::tools::Rules::new(&p).is_err());
         assert!(validate(&p).is_err());
     }
 }
