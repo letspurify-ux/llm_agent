@@ -1067,3 +1067,14 @@ headless Chrome `--use-angle=metal --enable-gpu`)와 프로덕션 번들로 쟀�
 - 9월 검토 뒤 들어온 코드의 런타임 API: Object.hasOwn·Array.prototype.at은 polyfills.js가 채우고, replaceAll(Chrome 85·
   Safari 13.1)·queueMicrotask·ResizeObserver는 빌드 대상(chrome87·safari14) 안이다. robotScene의 관찰자는 RobotIcon의
   try가 감싼다. findLast·structuredClone·AbortSignal.timeout·toSorted 같은 대상 밖 API는 소스에 없다.
+
+## 전체 검토 6차 — 2026-10-24 (CSV 내려받기 · 페이지 수준 설정) — 결함 0
+
+5차 뒤 frontend 변경 없음. 코드 변경 없이 기록만 남긴다.
+
+### 확인해 결함이 아닌 것 (재조사 금지)
+
+- toCsv: 수식으로 읽히는 첫 글자(= @ + - 탭 CR)로 시작하는 문자열은 `'`로 고정하고(숫자 표기·'-' 하나는 예외), 머리글 행도
+  같은 문을 지난다. 객체 값은 JSON이라 `{`·`[`로 시작한다. BOM으로 엑셀의 한글 깨짐을 막는다. 파일 이름은 못 쓰는 글자를 `_`로.
+- index.html: CSP는 img-src 'self' data:뿐(답변 그림은 앱이 이미 링크로 바꾼다), 키보드 고정(keyboard-open)은 @media screen
+  안이라 인쇄를 건드리지 않는다. iOS 입력칸 16px은 -webkit-touch-callout 지원 엔진에서만.
