@@ -26,6 +26,10 @@ export default function McpPanel({ api, onStateChange }) {
   const [checking, setChecking] = useState(false);
   const [picker, setPicker] = useState(false);
   const feedback = useRef(null);
+  // 연결 확인의 차례 번호. 편집기를 열고 닫을 때 올린다 — 확인은 최대 30초라, 그사이 다른 서버를 연 편집기에
+  // 늦게 온 결과(앞 서버의 도구 목록)가 서면 그 도구를 골라 이 서버의 허용 목록에 남의 도구 이름을 넣게 된다.
+  const probeTurn = useRef(0);
+  const dropProbe = () => { probeTurn.current += 1; setProbe(null); setChecking(false); };
   const dirty = !!form && JSON.stringify(form) !== baseline;
 
   useEffect(() => { onStateChange({ dirty, busy }); }, [dirty, busy, onStateChange]);
@@ -60,11 +64,11 @@ export default function McpPanel({ api, onStateChange }) {
     if (dirty && !window.confirm('저장하지 않은 변경 사항을 버리시겠습니까?')) return;
     const next = server ? formOf(server) : blankForm();
     setSelected(server ? server.name : ''); setForm(next); setBaseline(JSON.stringify(next));
-    setRevision(server?.revision || ''); setProbe(null); setSecretDraft({ name: '', value: '' }); setError(''); setNotice('');
+    setRevision(server?.revision || ''); dropProbe(); setSecretDraft({ name: '', value: '' }); setError(''); setNotice('');
   }
   function close() {
     if (dirty && !window.confirm('저장하지 않은 변경 사항을 버리시겠습니까?')) return;
-    setSelected(null); setForm(null); setBaseline(''); setProbe(null); setError('');
+    setSelected(null); setForm(null); setBaseline(''); dropProbe(); setError('');
   }
   const update = (key, value) => setForm(f => ({ ...f, [key]: value }));
 
@@ -97,7 +101,7 @@ export default function McpPanel({ api, onStateChange }) {
     setBusy(true); setError(''); setNotice('');
     try {
       await api(`mcp/${encodeURIComponent(selected)}`, { method: 'DELETE', headers: { 'If-Match': `"${revision}"` } });
-      setSelected(null); setForm(null); setBaseline(''); setProbe(null);
+      setSelected(null); setForm(null); setBaseline(''); dropProbe();
       setNotice('MCP 서버를 삭제했습니다.');
       await load();
     } catch (err) { setError(err.message); }
@@ -115,10 +119,13 @@ export default function McpPanel({ api, onStateChange }) {
   async function check() {
     let body;
     try { body = request(); } catch (err) { setProbe({ ok: false, message: err.message }); return; }
+    const turn = ++probeTurn.current;
     setChecking(true); setProbe({ pending: true, message: '연결하는 중…(최대 30초)' });
-    try { setProbe(await api('mcp-check', { method: 'POST', body: JSON.stringify({ ...body, original: selected || undefined }) })); }
-    catch (err) { setProbe({ ok: false, message: err.message }); }
-    finally { setChecking(false); }
+    let result;
+    try { result = await api('mcp-check', { method: 'POST', body: JSON.stringify({ ...body, original: selected || undefined }) }); }
+    catch (err) { result = { ok: false, message: err.message }; }
+    if (turn !== probeTurn.current) return;
+    setProbe(result); setChecking(false);
   }
 
   function toggle(tool, on) {

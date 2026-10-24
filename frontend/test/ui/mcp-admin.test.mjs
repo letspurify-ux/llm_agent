@@ -65,6 +65,9 @@ test('MCP 탭 서버 목록·상태·허용 도구 저장·비밀값 지우기·
         opts.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
       });
       if (path === 'mcp' && method === 'GET') return window.__refreshFails ? json({ error: '서버에 연결하지 못했습니다.' }, 503) : json(window.__mcp);
+      if (path === 'mcp-check' && window.__holdCheck) return new Promise(resolve => {
+        window.__releaseCheck = () => { window.__holdCheck = false; resolve(window.fetch(url, opts)); };
+      });
       if (path === 'mcp-check') return json({ ok: true, message: '연결됨: wiki-mcp 1.0, 도구 2개', tools: [
         { name: 'search_pages', exposed: 'wiki__search_pages', description: '페이지 검색', annotations: { readOnlyHint: true }, allowed: false, tokens: 55 },
         { name: 'edit_page', exposed: 'wiki__edit_page', description: '페이지 편집', annotations: null, allowed: false, tokens: 70 }], log: [] });
@@ -249,5 +252,22 @@ test('MCP 탭 서버 목록·상태·허용 도구 저장·비밀값 지우기·
   assert.equal(await page.eval(`document.activeElement === document.querySelector('.admin-picker-path input')`), true, '상태를 다시 읽자 폴더 경로 칸의 초점이 빠졌다');
   await page.eval(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
   await page.until(`!document.querySelector('.admin-picker-path')`);
+
+  // 연결 확인(최대 30초)을 기다리는 사이 다른 서버를 열면, 늦게 온 확인 결과는 버린다. 그대로 받으면 새 편집기에
+  // 앞 서버의 도구 목록과 '연결됨'이 서서, 그 도구를 골라 저장하면 이 서버의 허용 목록에 남의 도구 이름이 들어갔다.
+  await page.eval('window.__holdCheck = true');
+  await clickText('.admin-mcp-check button', '연결 확인');
+  await page.until(`document.querySelector('.admin-mcp-check [role=status]')?.textContent.includes('연결하는 중')`);
+  await clickText('.admin-mcp-caption button', '＋');
+  await page.until(`document.querySelector('#mcp-name')?.value === ''`);
+  assert.equal(await page.eval(`[...document.querySelectorAll('.admin-mcp-check button')].find(b => b.textContent === '연결 확인').disabled`), false,
+    '새 편집기에서는 앞 편집기의 확인을 기다리지 않고 연결 확인을 누를 수 있다');
+  await page.eval('window.__releaseCheck()');
+  await sleep(300);
+  const stale = await page.eval(`({ status: document.querySelector('.admin-mcp-check [role=status]')?.textContent ?? '',
+    tools: [...document.querySelectorAll('.admin-mcp-tools label')].map(l => l.innerText) })`);
+  assert.equal(stale.status, '', `앞 편집기의 연결 확인 결과가 새 편집기에 섰다: ${stale.status}`);
+  assert.ok(!stale.tools.some(t => t.startsWith('search_pages')), `앞 편집기의 도구가 새 서버의 허용 목록 후보로 섰다: ${stale.tools}`);
+  await clickText('.admin-form-actions button', '닫기');
   await page.eval('window.__fastPoll = false');
 });
