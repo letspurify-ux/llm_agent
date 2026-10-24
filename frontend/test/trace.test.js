@@ -114,8 +114,15 @@ test('trace는 화면이 그릴 수 있는 모양으로만 들어온다 — 어�
 test('검색 결과 문구: 적중 수·검색 불가·찾지 않은 대상을 가른다', () => {
   assert.equal(searchLabel({ hits: { knowledge: 2, qaMethods: null, queries: 3 } }), '지식 2건 · 쿼리 3건');
   assert.equal(searchLabel({ hits: { knowledge: 0 }, failed: ['qa_method', 'query'] }), '지식 0건 · 처리방법 검색 불가 · 쿼리 검색 불가');
-  assert.equal(searchLabel({}), '결과 없음');
-  assert.equal(searchLabel({ hits: 'x', failed: 'y' }), '결과 없음', '모양이 어긋난 값에 죽지 않는다');
+  // 검색이 돌면 서버는 찾은 대상마다 건수나 검색 불가를 준다(backend/src/voc_tools.rs search_tool). 둘 다 없으면
+  // 검색이 돌지 않은 것이다(빈 검색어로 거절됨·시간 한도로 멈춤) — '결과 없음'은 0건으로 읽혀 자료가 없다는 말이 된다.
+  assert.equal(searchLabel({}), '검색하지 못함');
+  assert.equal(searchLabel({ hits: 'x', failed: 'y' }), '검색하지 못함', '모양이 어긋난 값에 죽지 않는다');
+  let list = applyProgress([], { type: 'search', id: 1, text: '', targets: ['knowledge', 'qa_method', 'query'] });
+  list = applyProgress(list, { type: 'search_done', id: 1, text: '', targets: ['knowledge', 'qa_method', 'query'], hits: {} });
+  assert.equal(progressText(list[0]), '검색 "" (지식·처리방법·쿼리) → 검색하지 못함');
+  const [step] = normalizeTrace([{ search: '', targets: ['knowledge', 'qa_method', 'query'], hits: {} }]);
+  assert.equal(stepLabel(step), '검색하지 못함');
   assert.equal(targetsLabel(['knowledge', 'query', 'bogus']), '지식·쿼리·bogus');
   assert.equal(targetsLabel([]), '전체');
 });

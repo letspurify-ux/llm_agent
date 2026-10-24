@@ -54,7 +54,9 @@ export function searchLabel(t) {
     const n = hits[HIT_KEY[k]];
     return typeof n === 'number' ? `${TARGET_LABEL[k]} ${n}건` : null;
   }).filter(Boolean);
-  return parts.length ? parts.join(' · ') : '결과 없음';
+  // 검색이 돌면 서버는 찾은 대상마다 건수나 검색 불가를 준다(backend/src/voc_tools.rs search_tool). 둘 다 없으면
+  // 검색 자체가 돌지 않았다(빈 검색어로 거절됨·시간 한도로 멈춤) — '결과 없음'이라 하면 자료가 없다는 말로 읽힌다.
+  return parts.length ? parts.join(' · ') : '검색하지 못함';
 }
 
 // 패널 머리띠의 문구 — '검색 1회 · 실행된 쿼리 2건'. 검색이 없으면 예전 그대로 '실행된 쿼리 N건'이다.
