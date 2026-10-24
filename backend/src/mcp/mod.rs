@@ -1886,7 +1886,7 @@ async fn connect(slot: &Arc<Slot>, server: &McpServer) -> Result<Connection> {
     let calls = (!server.url.trim().is_empty()).then(|| tokio::sync::Semaphore::new(HTTP_CALLS));
     let link = Arc::new(Link { calls, ..Default::default() });
     let service = if server.url.trim().is_empty() {
-        let process = spawn(slot, server)?;
+        let process = spawn(slot, server).await?;
         handler.serve_with_ct(Answering::new(process, slot, &link), close.clone()).await
     } else {
         install_tls();
@@ -2101,17 +2101,115 @@ fn environment(server: &McpServer) -> Result<Vec<(String, std::ffi::OsString)>> 
     Ok(env)
 }
 
-fn spawn(slot: &Arc<Slot>, server: &McpServer) -> Result<ChildTransport> {
-    use process_wrap::tokio::{CommandWrap, KillOnDrop};
+/// How long a start may wait on the file system (the working folder, the
+/// command looked up in the PATH, the process entering its folder) before a
+/// start of the same connection after it is refused rather than left to
+/// wait beside it (`Starting`).
+const STUCK_START: Duration = Duration::from_secs(10);
+
+/// What starts a server's process (`start_process`; another in tests).
+type Starter = fn(&McpServer, Vec<(String, std::ffi::OsString)>) -> Result<Box<dyn process_wrap::tokio::ChildWrapper>>;
+
+/// Starts the server's process and takes its input and output.
+async fn spawn(slot: &Arc<Slot>, server: &McpServer) -> Result<ChildTransport> {
+    spawn_with(slot, server, start_process, STUCK_START).await
+}
+
+/// `spawn`, the process started by `start` on a blocking thread: it looks
+/// at the file system, and the start waits for the process to enter its
+/// working folder. On the runtime's own threads a folder that stopped
+/// answering (a network drive gone) held a thread that serves every
+/// request — the questions', the screen's — and the connection's time
+/// limit, which only a thread free to run it ends, did not end it. Given
+/// up, the start is left to end on its thread (a process it starts then
+/// is killed with its group as it is let go); while it has waited past
+/// `stuck`, a start of the same connection is refused: retried every
+/// minute, each would have held one more blocking thread, which the Oracle
+/// queries, source tools and token counts share.
+async fn spawn_with(slot: &Arc<Slot>, server: &McpServer, start: Starter, stuck: Duration) -> Result<ChildTransport> {
     // What the server writes from here on is this attempt's (it may not
     // even start).
     {
         let mut state = slot.state();
         state.output_from = state.logged;
     }
+    let program = server.command.trim().to_owned();
+    let environment = environment(server)?;
+    let starting = Starting::begin(&slot.connection, stuck).map_err(|waited| {
+        anyhow!(
+            "앞선 시작이 {}초 넘게 작업 폴더나 실행 명령 확인에서 돌아오지 않아(응답하지 않는 네트워크 드라이브일 수 있습니다) 새로 시작하지 않았습니다",
+            waited.as_secs()
+        )
+    })?;
+    let settings = server.clone();
+    let mut child = tokio::task::spawn_blocking(move || {
+        let _starting = starting;
+        start(&settings, environment)
+    })
+    .await
+    .map_err(|_| anyhow!("{program}을(를) 실행하는 작업이 예기치 않게 멈췄습니다"))??;
+    slot.state().pid = child.id();
+    let (Some(stdin), Some(stdout)) = (child.stdin().take(), child.stdout().take()) else {
+        let _ = child.start_kill();
+        bail!("{program}의 입출력을 열지 못했습니다");
+    };
+    let output = CancellationToken::new();
+    if let Some(stderr) = child.stderr().take() {
+        tokio::spawn(read_output(Arc::downgrade(slot), stderr, output.clone()));
+    }
+    Ok(ChildTransport {
+        lines: LineLimit::new(stdout, Arc::downgrade(slot)),
+        input: Arc::new(tokio::sync::Mutex::new(Some(stdin))),
+        child: Some(child),
+        output,
+        slot: Arc::downgrade(slot),
+        exited: None,
+    })
+}
+
+/// A server start under way on a blocking thread, by its connection, until
+/// the thread lets go of it.
+struct Starting {
+    id: u64,
+}
+
+/// The starts under way: their connection, ID and when each began.
+static STARTS: Mutex<Vec<(String, u64, Instant)>> = Mutex::new(Vec::new());
+
+impl Starting {
+    /// A start of `connection`, unless one began more than `stuck` ago and
+    /// has not ended (how long it has waited, then).
+    fn begin(connection: &str, stuck: Duration) -> std::result::Result<Self, Duration> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut starts = STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(waited) = starts
+            .iter()
+            .filter(|(known, ..)| known == connection)
+            .map(|(.., at)| at.elapsed())
+            .find(|waited| *waited >= stuck)
+        {
+            return Err(waited);
+        }
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        starts.push((connection.to_owned(), id, Instant::now()));
+        Ok(Self { id })
+    }
+}
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        STARTS.lock().unwrap_or_else(|p| p.into_inner()).retain(|(_, id, _)| *id != self.id);
+    }
+}
+
+/// The server's process, started as its settings say: its command found,
+/// in its working folder, with `environment` alone, in a process group of
+/// its own (a job object on Windows) that ends when let go of. Looks at the
+/// file system: run on a blocking thread (`spawn_with`).
+fn start_process(server: &McpServer, environment: Vec<(String, std::ffi::OsString)>) -> Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
+    use process_wrap::tokio::{CommandWrap, KillOnDrop};
     let program = server.command.trim();
     let path = std::path::Path::new(program);
-    let environment = environment(server)?;
     // A bare name is looked up in the PATH the command gets (the server's
     // own `env` may set it): on Windows that finds npx.cmd, which a plain
     // spawn does not.
@@ -2153,24 +2251,7 @@ fn spawn(slot: &Arc<Slot>, server: &McpServer) -> Result<ChildTransport> {
     // Ended with the backend however it ends (`guardian`).
     #[cfg(unix)]
     let child = guardian::watched(child);
-    let mut child = child;
-    slot.state().pid = child.id();
-    let (Some(stdin), Some(stdout)) = (child.stdin().take(), child.stdout().take()) else {
-        let _ = child.start_kill();
-        bail!("{program}의 입출력을 열지 못했습니다");
-    };
-    let output = CancellationToken::new();
-    if let Some(stderr) = child.stderr().take() {
-        tokio::spawn(read_output(Arc::downgrade(slot), stderr, output.clone()));
-    }
-    Ok(ChildTransport {
-        lines: LineLimit::new(stdout, Arc::downgrade(slot)),
-        input: Arc::new(tokio::sync::Mutex::new(Some(stdin))),
-        child: Some(child),
-        output,
-        slot: Arc::downgrade(slot),
-        exited: None,
-    })
+    Ok(child)
 }
 
 /// Descriptors below this are looked at in a starting server (a soft limit
@@ -2766,6 +2847,78 @@ mod tests {
         let mut lines = LineLimit::new(long.as_slice(), Weak::new());
         assert_eq!(lines.next().await.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(lines.line.capacity(), 0);
+    }
+
+    /// A start that waits a moment on the file system (a working folder on
+    /// a slow network drive), then starts a process that waits for input.
+    #[cfg(unix)]
+    fn slow_start(server: &McpServer, environment: Vec<(String, std::ffi::OsString)>) -> Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
+        std::thread::sleep(Duration::from_millis(600));
+        start_process(server, environment)
+    }
+
+    /// Tool review, 2026-10-24: the working folder was checked, the command
+    /// looked up and the process started on the runtime's own thread, which
+    /// a folder that stopped answering held, the connection's time limit
+    /// with it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_slow_start_holds_no_runtime_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = McpServer { name: "slowstart".into(), command: "/bin/cat".into(), cwd: dir.path().display().to_string(), ..Default::default() };
+        let slot = Slot::new(server.clone());
+        let started = Instant::now();
+        let ticked = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            started.elapsed()
+        });
+        let transport = spawn_with(&slot, &server, slow_start, STUCK_START).await.unwrap();
+        let ticked = ticked.await.unwrap();
+        assert!(ticked < Duration::from_millis(400), "the runtime's thread waited for the start: {ticked:?}");
+        assert!(slot.state().pid.is_some());
+        drop(transport);
+        end_attempt(&slot).await;
+        assert!(STARTS.lock().unwrap().iter().all(|(connection, ..)| *connection != slot.connection), "the start let go when it ended");
+    }
+
+    /// While a start has waited past its limit, a start of the same
+    /// connection is refused rather than given a blocking thread to wait on
+    /// beside it; another connection starts, and once the first returns, so
+    /// does its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_start_stuck_on_the_file_system_holds_back_the_next_of_its_connection() {
+        static BEGUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn stuck(server: &McpServer, environment: Vec<(String, std::ffi::OsString)>) -> Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
+            BEGUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(1_200));
+            start_process(server, environment)
+        }
+        let limit = Duration::from_millis(200);
+        let server = McpServer { name: "stuckstart".into(), command: "/bin/cat".into(), ..Default::default() };
+        let first = Slot::new(server.clone());
+        let waiting = {
+            let (first, server) = (first.clone(), server.clone());
+            tokio::spawn(async move { spawn_with(&first, &server, stuck, limit).await.map(drop) })
+        };
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        // The supervisor's next attempt, or a connection check of the same settings.
+        let again = Slot::new(server.clone());
+        let asked = Instant::now();
+        let refused = spawn_with(&again, &server, stuck, limit).await.map(drop).unwrap_err().to_string();
+        assert!(asked.elapsed() < Duration::from_millis(100), "{:?}", asked.elapsed());
+        assert!(refused.contains("새로 시작하지 않았습니다"), "{refused}");
+        assert_eq!(BEGUN.load(std::sync::atomic::Ordering::SeqCst), 1, "no thread was given to the refused start");
+        // Another server starts meanwhile.
+        let other = McpServer { name: "otherstart".into(), ..server.clone() };
+        let other_slot = Slot::new(other.clone());
+        drop(spawn_with(&other_slot, &other, start_process, limit).await.unwrap());
+        end_attempt(&other_slot).await;
+        // Returned, the stuck start no longer holds its connection back.
+        waiting.await.unwrap().unwrap();
+        end_attempt(&first).await;
+        drop(spawn_with(&again, &server, start_process, limit).await.unwrap());
+        end_attempt(&again).await;
     }
 
     #[test]
