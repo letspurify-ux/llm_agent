@@ -545,6 +545,8 @@ pub fn normalize_arguments(name: &str, args: &mut Value) -> Vec<String> {
                 || properties[key]["enum"].is_array());
         !declared || required.contains(key) || !(value.is_null() || blank)
     });
+    let continues = fields.get("cursor").and_then(Value::as_str).is_some_and(|cursor| !cursor.trim().is_empty());
+    let mut left_out = vec![];
     for (key, value) in fields.iter_mut() {
         let schema = &properties[key];
         let kind = &schema["type"];
@@ -599,15 +601,25 @@ pub fn normalize_arguments(name: &str, args: &mut Value) -> Vec<String> {
         // A start position counted from 0 means the first: the read takes it
         // so (knowledge_read clamps its start to 1 itself), but the call was
         // refused before it ran, and a small model sent 0 again and again
-        // until it gave the read up.
+        // until it gave the read up. Beside a cursor it is left out: a start
+        // there begins a new range, and 0 (a provider's filler for a field
+        // it always fills) took the read back to its first line or chunk.
         if *kind == "integer"
             && key.starts_with("start_")
             && schema["minimum"] == 1
             && *value == 0
         {
-            *value = json!(1);
-            adjusted.push(format!("{key} 0 was taken as 1, the first (positions count from 1)"));
+            if continues {
+                left_out.push(key.clone());
+                adjusted.push(format!("{key} 0 was left out; the cursor goes on where the read stopped"));
+            } else {
+                *value = json!(1);
+                adjusted.push(format!("{key} 0 was taken as 1, the first (positions count from 1)"));
+            }
         }
+    }
+    for key in left_out {
+        fields.remove(&key);
     }
     adjusted
 }
@@ -3840,6 +3852,27 @@ mod tests {
         // Not a position: a step 0 names none, and stays refused.
         assert!(repaired("result_read", json!({"step":0})).is_err());
         assert!(repaired("file_read", json!({"path":"a.rs","start_line":-1})).is_err());
+    }
+
+    /// Tool review, 2026-10-24: a start of 0 beside a cursor, a provider's
+    /// filler for a field it fills always, was taken as 1, which beside a
+    /// cursor starts a new range: the read went back to the document's first
+    /// chunk or the file's first line instead of going on.
+    #[test]
+    fn a_start_of_zero_beside_a_cursor_leaves_the_cursor_to_go_on() {
+        let repaired = |name: &str, mut args: Value| {
+            let adjusted = normalize_arguments(name, &mut args);
+            ToolRegistry::validate(name, &args).map(|_| (args, adjusted)).map_err(|e| e.to_string())
+        };
+        let (args, adjusted) = repaired("knowledge_read", json!({"cursor":"k7:5","start_chunk":0})).unwrap();
+        assert_eq!(args, json!({"cursor":"k7:5"}));
+        assert_eq!(adjusted, ["start_chunk 0 was left out; the cursor goes on where the read stopped"]);
+        let (args, _) = repaired("file_read", json!({"cursor":"R3","start_line":0,"force_read":false})).unwrap();
+        assert_eq!(args, json!({"cursor":"R3","force_read":false}));
+        // A start the call names beside its cursor stays: a new range.
+        assert_eq!(repaired("file_read", json!({"cursor":"R3","start_line":40})).unwrap().0["start_line"], 40);
+        // A blank cursor is no cursor: the start is the first.
+        assert_eq!(repaired("knowledge_read", json!({"id":"k7","cursor":"","start_chunk":0})).unwrap().0, json!({"id":"k7","start_chunk":1}));
     }
 
     #[test]
