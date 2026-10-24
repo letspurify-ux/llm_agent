@@ -2149,15 +2149,11 @@ async fn spawn_with(slot: &Arc<Slot>, server: &McpServer, start: Starter, stuck:
         if sent.is_closed() {
             return;
         }
-        // Given up meanwhile, the process ends with its group, as an attempt
-        // given up does: let go of, only its leader was killed (kill on
-        // drop), what it had started was left running, and the guardian no
-        // longer watched its group.
-        if let Err(Ok(mut child)) = sent.send(start(&settings, environment)) {
-            let _ = child.start_kill();
-        }
+        // Given up meanwhile — before the send, or after it with the process
+        // still in the channel — it ends with its group (`Started`).
+        let _ = sent.send(start(&settings, environment).map(|child| Started(Some(child))));
     });
-    let mut child = started.await.map_err(|_| anyhow!("{program}을(를) 실행하는 작업이 예기치 않게 멈췄습니다"))??;
+    let mut child = started.await.map_err(|_| anyhow!("{program}을(를) 실행하는 작업이 예기치 않게 멈췄습니다"))??.take();
     slot.state().pid = child.id();
     let (Some(stdin), Some(stdout)) = (child.stdin().take(), child.stdout().take()) else {
         let _ = child.start_kill();
@@ -2175,6 +2171,30 @@ async fn spawn_with(slot: &Arc<Slot>, server: &McpServer, start: Starter, stuck:
         slot: Arc::downgrade(slot),
         exited: None,
     })
+}
+
+/// A process a start made, on its way to the connection that waits for it.
+/// Let go of before the connection takes it (the connection given up), it
+/// is ended with its group, as an attempt given up is: let go of as it is,
+/// only its leader was killed (kill on drop), what it had started was left
+/// running, and the guardian no longer watched its group. The send of a
+/// start that ended after the connection was given up left it so, and so
+/// did one sent just before: a value left in a channel is let go of with it.
+struct Started(Option<Box<dyn process_wrap::tokio::ChildWrapper>>);
+
+impl Started {
+    /// The process, now the connection's.
+    fn take(mut self) -> Box<dyn process_wrap::tokio::ChildWrapper> {
+        self.0.take().expect("taken once")
+    }
+}
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.start_kill();
+        }
+    }
 }
 
 /// A server start under way on a blocking thread, by its connection, until
@@ -2966,6 +2986,44 @@ mod tests {
         }
         let helper = helper.expect("the server started its helper");
         assert!(!alive(helper), "the helper of a start given up is still running");
+    }
+
+    /// Tool and MCP review, 2026-10-24 (third session): a start sent just
+    /// before its connection was given up stayed in the channel, which let
+    /// go of it as it was — its leader killed alone, its helper left running.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_start_left_in_its_channel_ends_its_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("helper.pid");
+        let server = McpServer {
+            name: "leftstart".into(),
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 60 & echo $! > \"$0\"; wait".into(), file.display().to_string()],
+            ..Default::default()
+        };
+        let child = start_process(&server, environment(&server).unwrap()).unwrap();
+        let mut helper = None;
+        for _ in 0..300 {
+            helper = std::fs::read_to_string(&file).ok().and_then(|pid| pid.trim().parse::<libc::pid_t>().ok());
+            if helper.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let helper = helper.expect("the server started its helper");
+        let alive = |pid: libc::pid_t| unsafe { libc::kill(pid, 0) == 0 };
+        assert!(alive(helper));
+        let (sent, started) = tokio::sync::oneshot::channel::<Result<Started>>();
+        assert!(sent.send(Ok(Started(Some(child)))).is_ok());
+        drop(started);
+        for _ in 0..300 {
+            if !alive(helper) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!alive(helper), "the helper of a start left in its channel is still running");
     }
 
     #[test]
