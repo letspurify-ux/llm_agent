@@ -268,7 +268,7 @@ export default function McpPanel({ api, onStateChange }) {
               <button type="submit" className="admin-primary" disabled={!editable || busy || (!!selected && !dirty)}>{busy ? '처리 중…' : '저장'}</button></div>
           </div>
         </form>
-        {status && <ServerStatus status={status} />}
+        {status && <ServerStatus key={selected} status={status} />}
       </section>}
     </div>
     <p className="admin-footnote">MCP 서버의 도구는 이름이 서버__도구 형식으로 에이전트에 보입니다. 연결이 끊긴 서버는 1초부터 최대 60초 간격으로 다시 연결하며, 그동안 다른 도구는 그대로 쓰입니다. 호출 수는 backend를 다시 시작하면 처음부터 셉니다.</p>
@@ -278,8 +278,11 @@ export default function McpPanel({ api, onStateChange }) {
 
 function ServerStatus({ status }) {
   const log = useRef(null);
+  // 새 줄은 바닥에 있을 때만 따라간다 — 위로 올려 지난 오류를 읽는 중에 상태 읽기가 새 줄을 가져오면(재연결이 잦은
+  // 서버는 몇 초마다) 읽던 자리에서 바닥으로 끌려갔다.
+  const atBottom = useRef(true);
   const last = status.log[status.log.length - 1];
-  useEffect(() => { if (log.current) log.current.scrollTop = log.current.scrollHeight; }, [last?.at, last?.text]);
+  useEffect(() => { if (log.current && atBottom.current) log.current.scrollTop = log.current.scrollHeight; }, [last?.at, last?.text]);
   const info = status.server_info || {};
   return <div className="admin-mcp-status" aria-label="연결 상태">
     <h4>연결 상태</h4>
@@ -300,7 +303,8 @@ function ServerStatus({ status }) {
       </tr>)}</tbody>
     </table></div>}
     <h4>최근 기록</h4>
-    {status.log.length ? <pre ref={log} className="admin-mcp-log">{status.log.map(line => `${when(line.at)} [${line.source}] ${line.text}`).join('\n')}</pre>
+    {status.log.length ? <pre ref={log} className="admin-mcp-log"
+      onScroll={e => { const el = e.currentTarget; atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 8; }}>{status.log.map(line => `${when(line.at)} [${line.source}] ${line.text}`).join('\n')}</pre>
       : <p className="admin-settings-help">아직 기록이 없습니다.</p>}
   </div>;
 }

@@ -253,6 +253,22 @@ test('MCP 탭 서버 목록·상태·허용 도구 저장·비밀값 지우기·
   await page.eval(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
   await page.until(`!document.querySelector('.admin-picker-path')`);
 
+  // 최근 기록을 위로 올려 읽는 동안 새 줄이 와도 끌어내리지 않는다(바닥에 있을 때만 따라간다). 상태 읽기마다 새 줄이
+  // 오면 무조건 바닥으로 내려, 재연결이 잦은 서버에서는 지난 오류를 읽을 수가 없었다.
+  const logLine = text => page.eval(`window.__mcp.servers[0].status.log.push({ at: '2026-10-17T01:00:00Z', source: 'event', text: ${JSON.stringify(text)} })`);
+  for (let i = 0; i < 60; i++) await logLine(`기록 ${i}`);
+  await page.until(`document.querySelector('.admin-mcp-log')?.textContent.includes('기록 59')`);
+  await page.until(`(() => { const el = document.querySelector('.admin-mcp-log'); return el.scrollHeight > el.clientHeight + 100 && el.scrollHeight - el.scrollTop - el.clientHeight < 8; })()`);
+  await page.eval(`(() => { const el = document.querySelector('.admin-mcp-log'); el.scrollTop = 0; el.dispatchEvent(new Event('scroll')); })()`);
+  await logLine('읽는 중에 온 줄');
+  await page.until(`document.querySelector('.admin-mcp-log').textContent.includes('읽는 중에 온 줄')`);
+  await sleep(100);
+  assert.equal(await page.eval(`document.querySelector('.admin-mcp-log').scrollTop`), 0, '위로 올려 읽던 기록이 새 줄에 바닥으로 끌려갔다');
+  await page.eval(`(() => { const el = document.querySelector('.admin-mcp-log'); el.scrollTop = el.scrollHeight; el.dispatchEvent(new Event('scroll')); })()`);
+  await logLine('바닥에서 본 줄');
+  await page.until(`document.querySelector('.admin-mcp-log').textContent.includes('바닥에서 본 줄')`);
+  await page.until(`(() => { const el = document.querySelector('.admin-mcp-log'); return el.scrollHeight - el.scrollTop - el.clientHeight < 8; })()`);
+
   // 연결 확인(최대 30초)을 기다리는 사이 다른 서버를 열면, 늦게 온 확인 결과는 버린다. 그대로 받으면 새 편집기에
   // 앞 서버의 도구 목록과 '연결됨'이 서서, 그 도구를 골라 저장하면 이 서버의 허용 목록에 남의 도구 이름이 들어갔다.
   await page.eval('window.__holdCheck = true');
