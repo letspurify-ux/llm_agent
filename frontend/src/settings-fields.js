@@ -81,23 +81,26 @@ const FIELDS = SETTING_GROUPS.flatMap(g => g.fields);
 const MIB = 1024 * 1024;
 const get = (config, key) => key.split('.').reduce((v, k) => (v == null ? undefined : v[k]), config);
 
+// 서버 값 하나 → 입력 글자.
+const textOf = (type, value) => (type === 'boolean' ? !!value
+  : value == null ? ''
+    : type === 'percent' ? String(Math.round(Number(value) * 1000) / 10)
+      : type === 'mib' ? String(Math.round((Number(value) / MIB) * 100) / 100)
+        : type === 'list' ? (Array.isArray(value) ? value.join(', ') : '')
+          : String(value));
+
 // 서버 값 → 입력 글자.
 export function formOf(config) {
   const form = {};
-  for (const [key, , type] of FIELDS) {
-    const value = get(config, key);
-    form[key] = type === 'boolean' ? !!value
-      : value == null ? ''
-        : type === 'percent' ? String(Math.round(Number(value) * 1000) / 10)
-          : type === 'mib' ? String(Math.round((Number(value) / MIB) * 100) / 100)
-            : type === 'list' ? (Array.isArray(value) ? value.join(', ') : '')
-              : String(value);
-  }
+  for (const [key, , type] of FIELDS) form[key] = textOf(type, get(config, key));
   return form;
 }
 
 // 입력 글자 → 서버 값. 숫자가 아닌 글자는 problems로 모아 저장 전에 알린다.
-export function configOf(form) {
+// original(읽어 온 서버 설정)을 주면, 반올림해 보이는 칸(%·MiB)의 글자가 그 값이 보이던 글자 그대로일 때 서버 값을
+// 그대로 돌려준다. 보이는 글자에서 다시 셈하면 config.toml에 직접 적은 딱 떨어지지 않는 값(history_bytes 100000)이
+// 다른 칸 하나를 고쳐 저장할 때마다 반올림된 값(104858)으로 조용히 바뀐다.
+export function configOf(form, original) {
   const config = {};
   const problems = [];
   for (const [key, label, type] of FIELDS) {
@@ -109,6 +112,8 @@ export function configOf(form) {
     else if (type === 'text' || type === 'url' || type === 'folder' || type === 'effort') value = key === 'embedding.query_prefix' ? raw : text;
     else if (type === 'list') value = String(raw ?? '').split(',').map(v => v.trim()).filter(Boolean);
     else if (type === 'optionalNumber' && text === '') value = null;
+    else if ((type === 'percent' || type === 'mib') && original && get(original, key) != null
+      && text === textOf(type, get(original, key))) value = get(original, key);
     else {
       const n = Number(text);
       const integer = type === 'number' || type === 'optionalNumber';

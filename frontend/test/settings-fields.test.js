@@ -45,3 +45,20 @@ test('모든 항목은 서버 구역 안에 있다', () => {
     for (const [key] of group.fields) assert.ok(key.split('.')[0] in SERVER, key);
   }
 });
+
+test('반올림해 보이는 칸은 손대지 않으면 서버의 값 그대로 돌아간다', () => {
+  // MiB·% 칸은 화면에 소수 둘째·첫째 자리로 보인다. 그 글자를 다시 바꾸면 config.toml에 직접 적은 딱 떨어지지 않는
+  // 값이 다른 칸 하나를 고쳐 저장할 때마다 조용히 바뀌었다(실측: history_bytes 100000 → 104858).
+  const server = { ...SERVER, agent: { ...SERVER.agent, history_bytes: 100_000, result_store_bytes: 1_000_000, high_water: 0.9255, low_water: 0.333 } };
+  const form = formOf(server);
+  assert.equal(form['agent.history_bytes'], '0.1');
+  const { config, problems } = configOf({ ...form, 'server.port': '3002' }, server);
+  assert.deepEqual(problems, []);
+  assert.deepEqual(config.agent, server.agent);
+  assert.equal(config.server.port, 3002);
+  // 고친 칸은 고친 값으로 간다 — 앞뒤 공백만 다른 것은 고친 것이 아니다.
+  const edited = configOf({ ...form, 'agent.history_bytes': '2', 'agent.high_water': ' 92.6 ' }, server).config.agent;
+  assert.equal(edited.history_bytes, 2 * 1024 * 1024);
+  assert.equal(edited.high_water, 0.9255);
+  assert.equal(configOf({ ...form, 'agent.high_water': '92.5' }, server).config.agent.high_water, 0.925);
+});

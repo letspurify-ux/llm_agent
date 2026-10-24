@@ -37,7 +37,7 @@ export default function SettingsPanel({ api, onStateChange }) {
   useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   function body() {
-    const { config, problems } = configOf(form);
+    const { config, problems } = configOf(form, loaded.config);
     if (problems.length) throw new Error(problems.join(' '));
     return { config, secrets };
   }
