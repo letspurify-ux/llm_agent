@@ -1110,3 +1110,17 @@ headless Chrome `--use-angle=metal --enable-gpu`)와 프로덕션 번들로 쟀�
 - 검색 적중 키(knowledge·qaMethods·queries)와 대상 이름은 서버와 같다. 거절된 검색은 서버가 failed에 대상 전부를 넣는다.
 - 서버가 종료되는 중(app.shutdown)이면 스트림이 done·error 없이 닫혀 화면은 '답변을 만들지 못했습니다'를 보인다 — 서버 쪽 동작.
 - 대상 목록의 모르는 이름은 서버가 버리지만(다 모르면 셋 다 찾는다) 진행 줄은 받은 이름을 그대로 보인다 — '모르는 이름은 그대로' 결정.
+
+## 전체 검토 9차 — 2026-10-24 (남은 서버 계약 대조: 답의 참조·바인드 설정·대화 번호) — 결함 0
+
+8차 뒤 frontend 변경 없음. 코드 변경 없이 기록만 남긴다.
+
+### 확인해 결함이 아닌 것 (재조사 금지)
+
+- done의 refs(`{step, rows, omittedColumnKey?}`, backend/src/agent.rs references)와 trace 조회 스텝(`rows` 전부·`rowCount`=행 수·
+  `capped`·`omittedColumnKey`)을 fillAnswer가 받는 모양이 같다. 서버는 omittedRows를 더 보내지 않지만 countLabel의 그 갈래는 무해하다.
+  fillAnswer의 스텝 상한 100,000은 서버 정규식(6자리)보다 작지만 서버가 실제로 가진 스텝만 refs에 싣는다.
+- 바인드 설정(admin-bindings.js)과 서버 execution_spec: 입력(OUT 아닌 것) 20개·출력 30개·커서 단독·maxSize 1~32767·
+  함수 반환값 OUT·이름 128자가 같다. 화면의 sqlBindNames는 q'…' 인용을 모르지만, 루틴 SQL은 서버 routine_pattern이
+  리터럴·주석을 아예 받지 않아 차이가 드러날 자리가 없다(QUERY는 바인드 설정을 비워 보낸다).
+- 대화 번호: 화면이 만드는 UUID·`c…` 대비 번호 모두 서버 허용 형식(영숫자·-·_, 100바이트 이하) 안이다.
