@@ -261,11 +261,18 @@ impl ToolRegistry {
     }
 
     pub fn validate(name: &str, args: &Value) -> Result<ToolSpec> {
-        Self::validate_inner(name, args).map_err(|error| arguments::annotate(error, name, args))
+        Self::validate_inner(name, args, None).map_err(|error| arguments::annotate(error, name, args))
     }
 
-    fn validate_inner(name: &str, args: &Value) -> Result<ToolSpec> {
-        let spec = Self::specs()
+    /// `validate` against the definitions the settings' tool groups give the
+    /// model (`voc_tools::fit_definitions`): what they leave out is refused,
+    /// and the refusal names only what they allow.
+    pub fn validate_for(name: &str, args: &Value, assistant: &crate::config::AssistantConfig) -> Result<ToolSpec> {
+        Self::validate_inner(name, args, Some(assistant)).map_err(|error| arguments::annotate(error, name, args))
+    }
+
+    fn validate_inner(name: &str, args: &Value, assistant: Option<&crate::config::AssistantConfig>) -> Result<ToolSpec> {
+        let mut spec = Self::specs()
             .into_iter()
             .find(|t| t.name == name)
             .ok_or_else(|| {
@@ -275,6 +282,11 @@ impl ToolRegistry {
                     None => anyhow::anyhow!("unsupported_tool: {name} does not exist"),
                 }
             })?;
+        if let Some(assistant) = assistant
+            && spec.name == "search"
+        {
+            crate::voc_tools::narrow_targets(&mut spec.parameters, assistant);
+        }
         let object = args.as_object().ok_or_else(|| {
             arguments::failure(
                 name,

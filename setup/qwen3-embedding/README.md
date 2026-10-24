@@ -1,6 +1,6 @@
 # qwen3-embedding 임베딩 서버 (Windows)
 
-SPACE VOC Agent의 벡터 검색에 쓰는 임베딩 모델(`qwen3-embedding:0.6b`, 1024차원)을 Windows에서 기동한다.
+이 에이전트(llm_agent)의 벡터 검색에 쓰는 임베딩 모델(`qwen3-embedding:0.6b`, 1024차원)을 Windows에서 기동한다.
 백엔드의 기본 임베딩 모델이다. `bge-m3`(setup/bge-m3)와 같은 자리를 대신하는 모델이므로 둘 중 하나만 쓴다.
 
 **임베딩 서버는 필수다.** 검색이 벡터 단일 경로라 없으면 지식·처리방법·쿼리를 하나도 찾지 못하고,

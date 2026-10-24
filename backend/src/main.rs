@@ -230,7 +230,9 @@ fn background_jobs(app: &Arc<App>) -> Vec<tokio::task::JoinHandle<()>> {
     let warm = app.clone();
     let warm = tokio::spawn(async move {
         let config = warm.config();
+        // Only a role that searches embeds anything.
         if config.embedding.enabled()
+            && config.assistant.searches()
             && llm_agent::embedding::embed(&config.embedding, &["warm-up".to_owned()], &warm.shutdown)
                 .await
                 .is_ok()

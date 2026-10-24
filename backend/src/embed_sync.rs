@@ -65,6 +65,9 @@ pub enum Skipped {
     Unavailable,
     /// Stopped for shutdown; the next run continues.
     Stopped,
+    /// The settings turn both tool groups off: this server searches nothing,
+    /// and another role's server on the same DB syncs what it searches.
+    NotSearched,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -115,6 +118,7 @@ impl std::fmt::Display for Summary {
             Skipped::None => "",
             Skipped::Busy => " — skipped, another sync is already in progress",
             Skipped::Unconfigured => " — no embedding URL set, embedding skipped; search cannot run without it",
+            Skipped::NotSearched => " — this assistant searches nothing (its knowledge and DB tools are off in the settings); nothing to sync",
             Skipped::Unavailable => " — the embedding server could not be reached, or failed every row it was sent; the remaining rows stay unsearchable until the next run",
             Skipped::Stopped => " — stopped early for shutdown; the remaining rows are picked up on the next run",
         };
@@ -220,6 +224,13 @@ impl EmbedSync {
     }
 
     pub async fn run(&self, db: &Db, config: &Config, stop: &CancellationToken) -> Result<Summary> {
+        // Nothing of this server's is searched: no lock, no reads.
+        if !config.assistant.searches() {
+            return Ok(Summary {
+                skipped: Skipped::NotSearched,
+                ..Default::default()
+            });
+        }
         if self.running.swap(true, Ordering::AcqRel) {
             return Ok(Summary {
                 skipped: Skipped::Busy,
@@ -391,13 +402,22 @@ async fn sync(state: &EmbedSync, db: &Db, config: &Config, stop: &CancellationTo
         skipped: if enabled { Skipped::None } else { Skipped::Unconfigured },
         ..Default::default()
     };
-    if let Err(e) = rebuild_chunks(db, config, stop, &mut out).await {
+    // Only what this server's tool groups search: the chunks and their
+    // vectors with knowledge, the methods' and queries' with the DB tools.
+    // A server of another role on the same management DB syncs the rest.
+    let assistant = &config.assistant;
+    if assistant.knowledge
+        && let Err(e) = rebuild_chunks(db, config, stop, &mut out).await
+    {
         out.chunks_failed += 1;
         eprintln!("[embed] chunk rebuild failed — vector sync continues with existing chunks: {e}");
     }
     let model = config.embedding.model.clone();
     let mut unavailable = false;
-    for (table, cols) in SEARCH_COLUMNS {
+    let searched = SEARCH_COLUMNS
+        .into_iter()
+        .filter(|(table, _)| if *table == "knowledge_chunk" { assistant.knowledge } else { assistant.database });
+    for (table, cols) in searched {
         if stop.is_cancelled() {
             out.skipped = Skipped::Stopped;
             break;

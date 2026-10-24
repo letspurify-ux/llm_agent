@@ -6,6 +6,7 @@ import McpPanel from './McpPanel.jsx';
 import SettingsPanel from './SettingsPanel.jsx';
 import { useChangedState } from './changed-state.js';
 import { readBindings, serializeBindings } from './admin-bindings.js';
+import { DEFAULT_PROFILE, normalizeProfile, sectionShown } from './assistant.js';
 
 const SECTIONS = {
   databases: { label: 'DB', title: '조회 대상 DB 설정', description: '에이전트가 실제로 조회할 Oracle DB의 접속 정보를 관리합니다. 관리용 MariaDB 접속은 설정 탭에서 관리합니다.', name: 'db_name', search: 'DB 이름, 접속 주소, 사용자명 검색',
@@ -13,11 +14,11 @@ const SECTIONS = {
       ['db_name', 'DB 이름', 'text', 100, true, '예: ORDER_DB'],
       ['db_type', 'DB 유형', 'select', 20, true],
       ['connection_info', '접속 주소', 'text', 500, true, '예: localhost:1521/FREEPDB1'],
-      ['db_user', '사용자명', 'text', 100, true, '예: VOC_READER'],
+      ['db_user', '사용자명', 'text', 100, true, '예: APP_READER'],
       ['db_password', '조회 대상 DB 비밀번호 또는 환경변수 참조', 'password', 200, true, '예: ENV:ORDER_DB_PASSWORD'],
     ] },
   knowledge: { label: '지식', title: '지식 관리', description: '답변의 근거가 되는 문서와 업무 지식을 관리합니다.', name: 'title', search: '지식 제목 또는 본문 검색',
-    fields: [['title', '제목', 'text', 200, true, '예: SPACE 시스템 소개'], ['content', '지식 본문', 'textarea', null, true, '업무 지식이나 문서 내용을 입력하세요.']] },
+    fields: [['title', '제목', 'text', 200, true, '예: 주문 시스템 소개'], ['content', '지식 본문', 'textarea', null, true, '업무 지식이나 문서 내용을 입력하세요.']] },
   methods: { label: '방법', title: 'Q&A 처리 방법', description: '질문을 해결하는 절차와 사용할 쿼리를 관리합니다.', name: 'title', search: '방법 제목, 처리 절차, 쿼리 이름 검색',
     fields: [['title', '제목', 'text', 200, true, '예: 주문 상태 확인'], ['method', '처리 방법', 'textarea', null, true, '처리 순서와 사용할 쿼리 이름을 구체적으로 입력하세요.']] },
   queries: { label: '쿼리', title: '쿼리 관리', description: '답변에 사용할 조회 SQL, 프로시저, 함수와 입력·출력 설명을 관리합니다.', name: 'query_name', search: '쿼리 이름, SQL, 설명, 대상 DB 검색',
@@ -33,7 +34,7 @@ const SECTIONS = {
     ] },
   projects: { label: '프로젝트', title: '프로젝트 소스', description: '질문이 프로젝트의 동작·코드에 관한 것이면 에이전트가 설명을 보고 프로젝트를 골라 소스와 참고 문서를 읽어 답합니다. 파일은 읽기만 합니다.', name: 'name', search: '프로젝트 이름, 설명, 폴더 검색',
     fields: [
-      ['name', '프로젝트 이름', 'text', 100, true, '예: SPACE 백엔드'],
+      ['name', '프로젝트 이름', 'text', 100, true, '예: 주문 시스템 백엔드'],
       ['description', '설명', 'textarea', 2000, false, '무슨 프로젝트인지, 어떤 질문에 쓰는지 적으세요. 에이전트가 프로젝트를 고르는 근거입니다.'],
       ['root', '프로젝트 폴더', 'folder', null, true, '서버 PC의 절대 경로'],
       ['docs', '참고 문서 (md)', 'textarea', null, false, '한 줄에 하나 — 프로젝트 폴더 기준 상대 경로 또는 절대 경로 (예: docs/architecture.md)'],
@@ -41,7 +42,7 @@ const SECTIONS = {
       ['exclude', '제외 패턴', 'textarea', null, false, '한 줄에 하나 (예: **/*.log, secrets/, .env — 폴더는 그 아래 전부, / 없는 이름은 어느 깊이에서나). .git·node_modules·target·dist·build는 항상 제외됩니다.'],
     ] },
   mcp: { label: 'MCP', title: 'MCP 도구 서버', description: '외부 시스템의 도구를 MCP 서버로 연결해 에이전트가 쓰게 합니다. 서버마다 허용한 도구만 모델에 보이며, 저장하면 다음 질문부터 적용됩니다.', singleton: true, fields: [] },
-  settings: { label: '설정', title: '서버 설정', description: '모델 연결, 임베딩, 관리 DB, Oracle 클라이언트, 실행 한도를 관리합니다. 저장하면 다음 질문부터 적용됩니다.', singleton: true, fields: [] },
+  settings: { label: '설정', title: '서버 설정', description: '어시스턴트의 이름·역할·도구, 모델 연결, 임베딩, 관리 DB, Oracle 클라이언트, 실행 한도를 관리합니다. 저장하면 다음 질문부터 적용됩니다.', singleton: true, fields: [] },
 };
 const blank = kind => Object.fromEntries(SECTIONS[kind].fields.map(([key]) => [key, key === 'db_type' ? 'oracle' : key === 'query_type' ? 'QUERY' : key === 'bind_config' ? readBindings('') : '']));
 const valuesOf = (kind, row) => Object.fromEntries(SECTIONS[kind].fields.map(([key]) => [key,
@@ -50,8 +51,10 @@ const valuesOf = (kind, row) => Object.fromEntries(SECTIONS[kind].fields.map(([k
 const dbNames = text => text.split(';').map(s => s.trim()).filter(Boolean);
 const REQUIRED_ERROR = '필수 입력 항목을 확인해주세요.';
 
-export default function AdminPanel({ onStateChange }) {
-  const [kind, setKind] = useState('databases');
+// profile: 이 서버의 역할(assistant.js). 꺼진 도구 묶음의 탭은 보이지 않는다 — 탭이 바뀌는 것은 설정을 저장할 때뿐이고
+// 그때는 설정 탭에 있으므로, 보던 탭이 사라지는 일은 없다.
+export default function AdminPanel({ onStateChange, profile = DEFAULT_PROFILE, onProfile }) {
+  const [kind, setKind] = useState(() => Object.keys(SECTIONS).find(key => sectionShown(key, profile)));
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
   const [refresh, setRefresh] = useState(0);
@@ -260,7 +263,7 @@ export default function AdminPanel({ onStateChange }) {
   return <main className="admin" aria-label="관리자 화면">
     <div className="admin-shell">
       <nav className="admin-tabs" aria-label="관리 항목">
-        {Object.entries(SECTIONS).map(([key, section], index) => <button type="button" key={key}
+        {Object.entries(SECTIONS).filter(([key]) => sectionShown(key, profile)).map(([key, section], index) => <button type="button" key={key}
           aria-current={kind === key ? 'page' : undefined} disabled={working} onClick={() => changeSection(key)}>
           <span className="admin-tab-number" aria-hidden="true">0{index + 1}</span>{section.label}
         </button>)}
@@ -277,7 +280,7 @@ export default function AdminPanel({ onStateChange }) {
         <div className="admin-section-heading"><div><h3>{config.title}</h3><p>{config.description}</p></div>
           {!config.singleton && <button className="admin-primary" type="button" disabled={busy || opening || loading} onClick={() => openEditor(null)}><span aria-hidden="true">＋</span> {config.label} 추가</button>}
         </div>
-        {config.singleton ? kind === 'mcp' ? <McpPanel api={api} onStateChange={setSettingsState} /> : <SettingsPanel api={api} onStateChange={setSettingsState} /> : <>
+        {config.singleton ? kind === 'mcp' ? <McpPanel api={api} onStateChange={setSettingsState} /> : <SettingsPanel api={api} onStateChange={setSettingsState} onSaved={config => onProfile?.(normalizeProfile(config.assistant))} /> : <>
         <div className="admin-feedback" aria-live="polite">
           {error && <div ref={feedbackRef} role="alert" className="admin-error">{error}</div>}
           {notice && <div role="status" className="admin-success">{notice}</div>}

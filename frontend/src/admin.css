@@ -143,6 +143,9 @@
 .admin-settings-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px 18px; }
 .admin-settings-grid .admin-field small, .admin-secret small { display: block; margin-top: 6px; font-size: 11px; color: var(--muted); line-height: 1.5; }
 .admin-field-check > label { font-weight: 600; gap: 8px; }
+/* 여러 줄 글(역할 지시문)과 예시 질문 칸은 한 줄을 다 쓴다. */
+.admin-settings-grid .admin-field-wide { grid-column: 1 / -1; }
+.admin-examples { display: grid; gap: 8px; }
 .admin-secret { margin-top: 16px; padding-top: 14px; border-top: 1px dashed var(--border); display: grid; gap: 8px; font-size: 13px; }
 .admin-secret input { border: 1px solid #dce1eb; border-radius: 7px; padding: 9px 11px; font-size: 13px; min-width: 0; }
 .admin-badge { font-size: 11px; border-radius: 20px; padding: 2px 9px; margin-left: 6px; background: #f3f4f7; color: var(--muted); border: 1px solid var(--border); }

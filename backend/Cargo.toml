@@ -3,7 +3,7 @@ name = "llm-agent"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "SPACE VOC Agent backend: knowledge, Q&A methods, registered queries and project sources"
+description = "LLM agent backend, its role set in the settings: knowledge, Q&A methods, registered queries, project sources and MCP tools"
 license = "MIT"
 default-run = "llm-agent"
 

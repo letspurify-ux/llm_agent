@@ -2739,3 +2739,316 @@ async fn a_refusal_counting_past_any_context_ends_the_question_plainly() {
     let error = ask(&app, "review4", "질문", vec![]).await.0.err().expect("refused");
     assert!(error.downcast_ref::<agent::UserFacing>().is_some(), "{error}");
 }
+
+/// Settings, 2026-10-24: a server is one role, chosen in the settings. Its
+/// persona opens the system prompt; with search optional the
+/// general-knowledge line stands unsearched; a tool group turned off is
+/// neither defined nor run, and search takes only the targets left on.
+#[tokio::test]
+async fn the_settings_choose_the_role_its_tools_and_whether_to_search_first() {
+    let system = |request: &Value| request["messages"][0]["content"].as_str().unwrap().to_owned();
+    let names = |request: &Value| -> Vec<String> {
+        request["tools"].as_array().map_or(vec![], |tools| tools.iter().map(|t| t["function"]["name"].as_str().unwrap().to_owned()).collect())
+    };
+
+    // Search optional: the line stands without a search, in one request.
+    let mut config = no_db("gpt-4o");
+    config.assistant.search_first = false;
+    let llm = Scripted::new(vec![text(GENERAL_LINE)]);
+    let (optional, _optional_dir) = app(config, llm.clone());
+    let (r, events) = ask(&optional, "o", "일론 머스크가 누구야?", vec![]).await;
+    let answer = r.unwrap();
+    assert_eq!((answer.answer.as_str(), llm.requests().len()), (GENERAL_LINE, 1));
+    assert_eq!(preview(&events), GENERAL_LINE);
+    assert!(answer.log.get("searchFirst").is_none());
+    let prompt = system(&llm.requests()[0]);
+    assert!(!prompt.contains("등록된 지식에 없는 내용") && prompt.contains("일반 지식·글쓰기·번역·요약"), "{prompt}");
+    assert!(names(&llm.requests()[0]).contains(&"search".to_owned()));
+
+    // Knowledge only: the DB tools are not offered, nor the DB targets of search.
+    let mut config = no_db("gpt-4o");
+    config.assistant.database = false;
+    config.assistant.persona = "당신은 제품 매뉴얼로 답하는 문서 도우미다.".into();
+    let llm = Scripted::new(vec![
+        calls(vec![
+            call("k1", "query_run", json!({"query_name":"batch_job_status"})),
+            call("k2", "search", json!({"query":"배치","targets":["knowledge","query"]})),
+        ]),
+        text("매뉴얼에는 없습니다."),
+    ]);
+    let (documents, _documents_dir) = app(config, llm.clone());
+    let (r, _) = ask(&documents, "k", "배치 상태 알려줘", vec![]).await;
+    assert_eq!(r.unwrap().answer, "매뉴얼에는 없습니다.");
+    let requests = llm.requests();
+    assert_eq!(names(&requests[0]), ["search", "knowledge_read"]);
+    let search = requests[0]["tools"].as_array().unwrap().iter().find(|t| t["function"]["name"] == "search").unwrap();
+    assert_eq!(search["function"]["parameters"]["properties"]["targets"]["items"]["enum"], json!(["knowledge"]));
+    assert!(!search["function"]["description"].as_str().unwrap().contains("quer"), "{search}");
+    assert!(system(&requests[0]).starts_with("당신은 제품 매뉴얼로 답하는 문서 도우미다. 사용자의 질문 언어로 답한다."));
+    assert!(!system(&requests[0]).contains("query_run"));
+    assert_eq!(tool_result(&requests[1], "k1")["status"], "unsupported");
+    let refused = tool_result(&requests[1], "k2").to_string();
+    assert!(refused.contains(r#"invalid_argument_value: targets[1] \"query\" is not one of: knowledge"#), "{refused}");
+
+    // No tool group, no project, no MCP server: no tools, answered at once.
+    let mut config = no_db("gpt-4o");
+    config.assistant.knowledge = false;
+    config.assistant.database = false;
+    let llm = Scripted::new(vec![text("안녕하세요!")]);
+    let (plain, _plain_dir) = app(config, llm.clone());
+    let (r, _) = ask(&plain, "p", "안녕", vec![]).await;
+    assert_eq!(r.unwrap().answer, "안녕하세요!");
+    let request = &llm.requests()[0];
+    assert!(request.get("tools").is_none(), "{request}");
+    let state = state_of(request);
+    assert_eq!(state["run_guidance"]["instruction"], "질문에 답하라.");
+    // No embedding server is set, which only a role that searches is told.
+    assert!(state.get("search").is_none(), "{state}");
+    assert!(!system(request).contains("도구를 부르는 응답"));
+}
+
+/// Role settings review, 2026-10-24: with one tool group on, a search that
+/// names no targets searches that group's alone — and the progress lines,
+/// the trace and the chat_log summary said all three. A search the tool
+/// refused (a blank query) searched nothing, yet counted as a look: the
+/// general-knowledge line then passed the search-first guard.
+#[tokio::test]
+async fn a_one_group_role_names_what_it_searched_and_a_refused_search_is_no_look() {
+    let mut config = no_db("gpt-4o");
+    config.assistant.database = false;
+    let llm = Scripted::new(vec![calls(vec![call("s1", "search", json!({"query":"휴가 규정"}))]), text("휴가는 규정에 따릅니다.")]);
+    let (documents, _documents_dir) = app(config.clone(), llm.clone());
+    let (r, events) = ask(&documents, "g1", "휴가 규정 알려줘", vec![]).await;
+    let answer = r.unwrap();
+    assert_eq!(ev(&events, "search")[0]["targets"], json!(["knowledge"]));
+    assert_eq!(ev(&events, "search_done")[0]["targets"], json!(["knowledge"]));
+    let step = answer.trace.iter().find(|s| s["search"].is_string()).unwrap();
+    assert_eq!(step["targets"], json!(["knowledge"]), "{step}");
+    assert_eq!(answer.log["search"]["targets"], json!(["knowledge"]));
+
+    let llm = Scripted::new(vec![
+        // A blank query passes the definition and is refused by the tool.
+        calls(vec![call("r1", "search", json!({"query":"  "}))]),
+        text(GENERAL_LINE),
+        calls(vec![call("r2", "search", json!({"query":"일론 머스크"}))]),
+        text(GENERAL_LINE),
+    ]);
+    let (refused, _refused_dir) = app(config, llm.clone());
+    let (r, _) = ask(&refused, "g2", "일론 머스크가 누구야?", vec![]).await;
+    let answer = r.unwrap();
+    assert_eq!(answer.answer, GENERAL_LINE);
+    assert_eq!(llm.requests().len(), 4, "the line after a refused search was asked to search");
+    assert_eq!(answer.log["searchFirst"], true);
+}
+
+/// Role settings review, second pass (2026-10-24): arguments were checked
+/// against the full search definition. A target outside it was refused
+/// with all three targets as the ones allowed (and a did-you-mean among
+/// them), so a knowledge-only assistant pointed the model at targets it
+/// then refused — a request lost for each. The check now allows what the
+/// definition the model was given allows.
+#[tokio::test]
+async fn a_refused_search_target_is_told_the_targets_this_assistant_searches() {
+    let mut config = no_db("gpt-4o");
+    config.assistant.database = false;
+    let llm = Scripted::new(vec![
+        calls(vec![
+            call("t1", "search", json!({"query":"규정","targets":["docs"]})),
+            call("t2", "search", json!({"query":"규정","targets":["query"]})),
+        ]),
+        text("끝"),
+    ]);
+    let (documents, _documents_dir) = app(config, llm.clone());
+    let (r, events) = ask(&documents, "t", "규정 찾아줘", vec![]).await;
+    assert_eq!(r.unwrap().answer, "끝");
+    let request = &llm.requests()[1];
+    for id in ["t1", "t2"] {
+        let refused = tool_result(request, id).to_string();
+        assert!(refused.contains("invalid_argument_value: targets[0]") && refused.contains("is not one of: knowledge"), "{id}: {refused}");
+        assert!(!refused.contains("qa_method"), "{id}: {refused}");
+    }
+    // Refused before they ran: no search step, and the lines close as not searched.
+    assert!(ev(&events, "search_done").iter().all(|d| d["hits"] == json!({})), "{events:?}");
+}
+
+/// A model for `random_roles_keep_every_request_to_their_tools`: it calls
+/// the knowledge, DB, source and history tools at random, whatever the role
+/// offers, including a search target outside every definition.
+struct RoleModel {
+    seed: std::sync::Mutex<u64>,
+    rounds: std::sync::Mutex<usize>,
+    next_call: std::sync::Mutex<usize>,
+    requests: std::sync::Mutex<Vec<Value>>,
+}
+impl RoleModel {
+    fn next(&self, n: usize) -> usize {
+        let mut seed = self.seed.lock().unwrap();
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 33) as usize) % n.max(1)
+    }
+}
+#[async_trait::async_trait]
+impl llm_agent::llm::LlmClient for RoleModel {
+    async fn complete(&self, request: Value, config: &llm_agent::config::LlmConfig, _c: CancellationToken, _d: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<llm_agent::llm::Completion> {
+        let input = llm_agent::context::count(&request, &config.model);
+        self.requests.lock().unwrap().push(request);
+        let rounds = {
+            let mut rounds = self.rounds.lock().unwrap();
+            *rounds += 1;
+            *rounds
+        };
+        let mut out = text("");
+        out.usage = Some(llm_agent::llm::Usage { input, output: 50, cached: None });
+        match if rounds > 6 { 99 } else { self.next(100) } {
+            0..=54 => {
+                for _ in 0..1 + self.next(3) {
+                    let id = {
+                        let mut next = self.next_call.lock().unwrap();
+                        *next += 1;
+                        format!("r{next}")
+                    };
+                    let targets = [json!(null), json!(["knowledge"]), json!(["qa_method", "query"]), json!(["docs"]), json!([])][self.next(5)].clone();
+                    let query = ["규정", "  ", "배치 상태"][self.next(3)];
+                    let mut search = json!({"query":query});
+                    if !targets.is_null() {
+                        search["targets"] = targets;
+                    }
+                    out.calls.push(match self.next(9) {
+                        0 | 1 => call(&id, "search", search),
+                        2 => call(&id, "knowledge_read", json!({"id":"k1"})),
+                        3 => call(&id, "method_read", json!({"ids":["m1"]})),
+                        4 => call(&id, "query_run", json!({"query_name":"batch_job_status","params":{"job_id":"B1"}})),
+                        5 => call(&id, "result_read", json!({"step":1})),
+                        6 => call(&id, "file_read", json!({"path":"a.txt"})),
+                        7 => call(&id, "history", json!({"action":"search","query":"규정"})),
+                        _ => call(&id, "query_describe", json!({"names":["batch_job_status"]})),
+                    });
+                }
+            }
+            55..=64 => {
+                out.text = GENERAL_LINE.into();
+            }
+            65..=69 => {}
+            _ => {
+                out.text = format!("답{}", self.next(1000));
+                *self.rounds.lock().unwrap() = 0;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Role settings review, fourth pass (2026-10-24): random roles (each tool
+/// group on or off, searching first or not, with or without a project) in
+/// random conversations. Every request keeps its shape, defines only the
+/// tools the role offers (and no tool_choice without tools), and its system
+/// prompt speaks of those and no others; every question ends in an answer
+/// or a message the user may see. ROLE_FUZZ sets the number of
+/// conversations. Needs no MariaDB.
+#[tokio::test]
+async fn random_roles_keep_every_request_to_their_tools() {
+    let runs: usize = std::env::var("ROLE_FUZZ").ok().and_then(|n| n.parse().ok()).unwrap_or(16);
+    let mut seed: u64 = 0x701e;
+    let mut next = |n: usize| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as usize) % n.max(1)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "규정 본문\n".repeat(50)).unwrap();
+    let voc = ["search", "knowledge_read", "method_read", "query_describe", "query_run", "result_read"];
+    for run in 0..runs {
+        let mut config = no_db("gpt-4o");
+        config.llm.context_tokens = [16_000, 32_000, 128_000][next(3)];
+        config.llm.output_tokens = 2_000;
+        config.assistant.knowledge = next(2) == 0;
+        config.assistant.database = next(2) == 0;
+        config.assistant.search_first = next(2) == 0;
+        let project = next(2) == 0;
+        if project {
+            config.projects.push(llm_agent::config::Project { name: "app".into(), root: root.clone(), ..Default::default() });
+        }
+        let a = config.assistant.clone();
+        let searches = a.knowledge || a.database;
+        let llm = std::sync::Arc::new(RoleModel {
+            seed: std::sync::Mutex::new(next(1 << 30) as u64 + 1),
+            rounds: Default::default(),
+            next_call: Default::default(),
+            requests: Default::default(),
+        });
+        let (role_app, _role_dir) = app(config.clone(), llm.clone());
+        let profile = format!("run {run} knowledge {} database {} search_first {} project {project}", a.knowledge, a.database, a.search_first);
+        for q in 0..3 {
+            let before = llm.requests.lock().unwrap().len();
+            let (result, events) = ask(&role_app, &format!("role{run}"), &format!("질문 {q} {}", "자료 ".repeat(next(400))), vec![]).await;
+            if let Err(error) = &result {
+                assert!(error.downcast_ref::<agent::UserFacing>().is_some(), "{profile} question {q}: {error:#}");
+            }
+            let requests = llm.requests.lock().unwrap().clone();
+            for (i, request) in requests.iter().enumerate().skip(before) {
+                if let Err(broken) = request_shape(request) {
+                    panic!("{profile} question {q} request {i}: {broken}");
+                }
+                let names: Vec<&str> = request["tools"].as_array().map_or(vec![], |t| t.iter().filter_map(|t| t["function"]["name"].as_str()).collect());
+                assert!(request.get("tool_choice").is_none() || !names.is_empty(), "{profile} request {i}: tool_choice without tools");
+                for name in &names {
+                    let offered = match *name {
+                        "search" => searches,
+                        "knowledge_read" => a.knowledge,
+                        "file_read" | "source_search" | "file_list" => project,
+                        "history" => true,
+                        name if voc.contains(&name) => a.database,
+                        other => panic!("{profile} request {i}: unexpected tool {other}"),
+                    };
+                    assert!(offered, "{profile} request {i}: {name} defined");
+                }
+                if let Some(search) = request["tools"].as_array().into_iter().flatten().find(|t| t["function"]["name"] == "search") {
+                    let allowed: Vec<&str> = search["function"]["parameters"]["properties"]["targets"]["items"]["enum"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+                    let expected: Vec<&str> = llm_agent::voc_tools::search_targets(&a);
+                    assert_eq!(allowed, expected, "{profile} request {i}");
+                }
+                let system = request["messages"][0]["content"].as_str().unwrap();
+                assert_eq!(system.contains("knowledge_read"), a.knowledge, "{profile} request {i}");
+                assert_eq!(system.contains("query_run"), a.database, "{profile} request {i}");
+                assert_eq!(system.contains("file_read"), project, "{profile} request {i}");
+                assert_eq!(system.contains("등록된 지식에 없는 내용"), searches && a.search_first, "{profile} request {i}");
+                assert_eq!(system.contains("도구를 부르는 응답"), searches || project, "{profile} request {i}");
+                // Tool results answer every call, and a tool the role does not
+                // offer is refused, never run.
+                for message in request["messages"].as_array().unwrap() {
+                    if message["role"] != "tool" {
+                        continue;
+                    }
+                    let content: Value = serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+                    let call_name = request["messages"].as_array().unwrap().iter()
+                        .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
+                        .find(|c| c["id"] == message["tool_call_id"])
+                        .and_then(|c| c["function"]["name"].as_str()).unwrap_or_default().to_owned();
+                    let offered_now = names.contains(&call_name.as_str());
+                    if !offered_now && call_name != "history" {
+                        assert_eq!(content["status"], "unsupported", "{profile} request {i}: {call_name} ran: {content}");
+                    }
+                }
+            }
+            // Progress lines name only targets the role searches.
+            for event in ev(&events, "search").iter().chain(ev(&events, "search_done").iter()) {
+                if !searches {
+                    continue;
+                }
+                for target in event["targets"].as_array().unwrap() {
+                    let target = target.as_str().unwrap();
+                    let named_by_call = ["knowledge", "qa_method", "query"].contains(&target);
+                    assert!(named_by_call, "{profile}: {event}");
+                }
+            }
+            let id = format!("role{run}");
+            let claim = role_app.sessions.open(&id, std::time::Duration::from_secs(60), 10, CancellationToken::new());
+            let kept = continuations_kept(&claim.conversation.lock().await.history);
+            role_app.sessions.finish(&id, claim.run);
+            if let Err(lost) = kept {
+                panic!("{profile} question {q}: {lost}");
+            }
+        }
+    }
+}

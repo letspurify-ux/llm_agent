@@ -17,7 +17,7 @@
          사용자의 창에서도, '콘솔이 조용한가'를 보는 검사에서도. 빈 data:로 그 요청 자체를 없앤다
          (위 CSP의 img-src가 data:를 허용한다). 진짜 아이콘이 생기면 이 줄만 바꾸면 된다. -->
     <link rel="icon" href="data:," />
-    <title>SPACE Assistant</title>
+    <title>AI Assistant</title>
     <style>
       :root {
         --bg: #f5f7fb;
@@ -89,9 +89,10 @@
       .robot-ready canvas { animation: robot-reveal 850ms cubic-bezier(0.22, 1, 0.36, 1) both; }
       @keyframes robot-reveal { from { opacity: 0; } to { opacity: 1; } }
       .brand-copy { display: flex; flex-direction: column; min-width: 0; }
-      .brand-title { font-size: 17px; font-weight: 800; letter-spacing: -0.2px; }
+      /* 이름·부제는 설정에서 온다(50·100자까지) — 긴 이름이 헤더의 단추를 밀어내지 않게 한 줄로 줄인다. */
+      .brand-title { font-size: 17px; font-weight: 800; letter-spacing: -0.2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .brand-title > span { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
-      .brand-subtitle { margin-top: 1px; font-size: 12px; color: var(--muted); }
+      .brand-subtitle { margin-top: 1px; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       /* 대화를 접고 첫 화면(빈 상태)으로 되돌리는 단추. 화면이 하나뿐인 앱이라
          '홈'은 이동할 다른 주소가 아니라 대화를 비운 그 첫 화면이다. */
       .home-btn {

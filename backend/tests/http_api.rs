@@ -507,6 +507,7 @@ async fn a_run_that_panics_ends_with_an_error() {
 async fn the_binary_serves_the_built_screen() {
     let mut config = llm_agent::config::Config::default();
     config.mariadb.port = 9;
+    config.assistant.name = "SPACE <Assistant>".into();
     let (app, _dir) = app(config, Scripted::new(vec![]));
     let get = |method: &str, path: &str| {
         let router = web::router(app.clone());
@@ -521,6 +522,9 @@ async fn the_binary_serves_the_built_screen() {
     assert_eq!(index.headers()[header::CONTENT_TYPE], "text/html; charset=utf-8");
     assert_eq!(index.headers()[header::CACHE_CONTROL], "no-cache");
     let html = String::from_utf8(index.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    // The settings' name and profile are in the page before any script runs.
+    assert!(html.contains("<title>SPACE &lt;Assistant&gt;</title><meta name=\"assistant-profile\" content=\"{&quot;"), "{html}");
+    assert_eq!(html.matches("<title>").count(), 1);
     let script = html.split("src=\"").nth(1).and_then(|rest| rest.split('"').next()).expect("index.html loads a script");
     let asset = get("GET", script).await;
     assert_eq!(asset.status(), StatusCode::OK, "{script}");
@@ -787,4 +791,53 @@ async fn requests_by_a_name_the_server_does_not_know_are_refused() {
     for host in ["127.0.0.1:5173", "localhost:5173", "[::1]:5173", "voc.corp.local:5173"] {
         assert_eq!(send(host, "/api/health").await, StatusCode::OK, "{host}");
     }
+}
+
+/// Settings, 2026-10-24: the screen's name, subtitle and examples come from
+/// the settings, readable without the admin key, and follow a save.
+#[tokio::test]
+async fn the_assistant_profile_is_public_and_follows_the_settings() {
+    let mut config = llm_agent::config::Config::default();
+    config.mariadb.port = 9;
+    config.admin_token = Some(Secret("key".into()));
+    let (app, _dir) = app(config, Scripted::new(vec![]));
+    let public = Client { router: web::router(app.clone()), token: None };
+    let profile = public.send("GET", "/api/assistant", None, None, false).await;
+    assert_eq!(profile.status, StatusCode::OK);
+    assert_eq!(
+        profile.body,
+        json!({"name":"AI Assistant","subtitle":"","examples":["너는 어떤 일을 할 수 있어?"],"knowledge":true,"database":true})
+    );
+    // The persona and the search setting are the server's own.
+    assert!(profile.body.get("persona").is_none() && profile.body.get("search_first").is_none());
+
+    let admin = Client { router: web::router(app.clone()), token: Some("key".into()) };
+    let settings = admin.admin("GET", "settings", None, None).await;
+    assert_eq!(settings.body["config"]["assistant"]["persona"], llm_agent::config::DEFAULT_PERSONA);
+    let revision = settings.body["revision"].as_str().unwrap().to_owned();
+    let too_many = json!({"config":{"assistant":{"examples":["a","b","c","d"]}}});
+    let refused = admin.admin("PUT", "settings", Some(too_many), Some(&revision)).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert!(refused.body["error"].as_str().unwrap().contains("3개"), "{}", refused.text);
+    let edit = json!({"config":{"assistant":{"name":"문서 도우미","subtitle":"매뉴얼 기반","examples":["설치 방법은?","오류 코드 E12는?"],"database":false}}});
+    let saved = admin.admin("PUT", "settings", Some(edit), Some(&revision)).await;
+    assert_eq!(saved.status, StatusCode::OK, "{}", saved.text);
+    assert_eq!(saved.body["config"]["assistant"]["knowledge"], true, "a partial section keeps its other fields");
+    let profile = public.send("GET", "/api/assistant", None, None, false).await;
+    assert_eq!(
+        profile.body,
+        json!({"name":"문서 도우미","subtitle":"매뉴얼 기반","examples":["설치 방법은?","오류 코드 E12는?"],"knowledge":true,"database":false})
+    );
+    // Saved to config.toml: the next start has it.
+    let reloaded = llm_agent::config::Config::load(&app.config_path).unwrap();
+    assert_eq!(reloaded.assistant.name, "문서 도우미");
+    assert!(!reloaded.assistant.database);
+    // A screen from before the role settings (a tab left open across the
+    // update) saves its sections only: the role stays as it was.
+    let revision = saved.body["revision"].as_str().unwrap().to_owned();
+    let older_screen = json!({"config":{"server":{"chat_log_retention_days":7}}});
+    let kept = admin.admin("PUT", "settings", Some(older_screen), Some(&revision)).await;
+    assert_eq!(kept.status, StatusCode::OK, "{}", kept.text);
+    assert_eq!(kept.body["config"]["assistant"]["name"], "문서 도우미");
+    assert_eq!(kept.body["config"]["assistant"]["examples"], json!(["설치 방법은?","오류 코드 E12는?"]));
 }

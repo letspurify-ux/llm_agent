@@ -53,6 +53,85 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// The role of this server: what the screen calls it, what the system
+/// prompt opens with, and which groups of the agent's own tools it offers.
+/// Another role is another server, run from a folder of its own.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AssistantConfig {
+    /// Shown in the screen's header and the browser's title.
+    pub name: String,
+    /// Shown under the name and on the start screen; empty hides it.
+    pub subtitle: String,
+    /// The opening of the system prompt: who the assistant is and what it
+    /// is for. The rules of the tools it has and of the answer's format
+    /// follow it, written by the server.
+    pub persona: String,
+    /// Questions offered on the start screen, `MAX_EXAMPLES` at most.
+    pub examples: Vec<String>,
+    /// search over knowledge, and knowledge_read.
+    pub knowledge: bool,
+    /// search over Q&A methods and queries, method_read, the query tools
+    /// and result_read.
+    pub database: bool,
+    /// Search the registered material before any answer, however much the
+    /// question looks like general knowledge, and say so when it had nothing
+    /// (held to it by the agent's search-first guard). Off, the model
+    /// searches when the question needs it.
+    pub search_first: bool,
+}
+pub const DEFAULT_ASSISTANT_NAME: &str = "AI Assistant";
+pub const DEFAULT_PERSONA: &str = "당신은 사용자의 질문에 답하고 작업을 돕는 AI 어시스턴트다.";
+pub const MAX_EXAMPLES: usize = 3;
+const MAX_NAME_CHARS: usize = 50;
+const MAX_SUBTITLE_CHARS: usize = 100;
+const MAX_PERSONA_CHARS: usize = 4_000;
+const MAX_EXAMPLE_CHARS: usize = 200;
+impl Default for AssistantConfig {
+    fn default() -> Self {
+        Self {
+            name: DEFAULT_ASSISTANT_NAME.into(),
+            subtitle: String::new(),
+            persona: DEFAULT_PERSONA.into(),
+            examples: vec!["너는 어떤 일을 할 수 있어?".into()],
+            knowledge: true,
+            database: true,
+            search_first: true,
+        }
+    }
+}
+impl AssistantConfig {
+    /// Whether the search tool is offered: it finds knowledge, and the
+    /// methods and queries of the DB group.
+    pub fn searches(&self) -> bool {
+        self.knowledge || self.database
+    }
+    pub fn validate(&self) -> Result<()> {
+        let one_line = |text: &str| !text.chars().any(char::is_control);
+        let name = crate::text::js_trim(&self.name);
+        if name.is_empty() || name.chars().count() > MAX_NAME_CHARS || !one_line(name) {
+            bail!("어시스턴트 이름은 줄바꿈 없이 1~{MAX_NAME_CHARS}자로 입력해주세요.");
+        }
+        if self.subtitle.chars().count() > MAX_SUBTITLE_CHARS || !one_line(&self.subtitle) {
+            bail!("부제는 줄바꿈 없이 {MAX_SUBTITLE_CHARS}자 이내로 입력해주세요.");
+        }
+        let persona = crate::text::js_trim(&self.persona);
+        if persona.is_empty() || persona.chars().count() > MAX_PERSONA_CHARS {
+            bail!("역할 지시문은 1~4,000자로 입력해주세요.");
+        }
+        if self.examples.len() > MAX_EXAMPLES {
+            bail!("예시 질문은 {MAX_EXAMPLES}개까지 입력할 수 있습니다.");
+        }
+        for example in &self.examples {
+            let text = crate::text::js_trim(example);
+            if text.is_empty() || text.chars().count() > MAX_EXAMPLE_CHARS || !one_line(text) {
+                bail!("예시 질문은 하나에 줄바꿈 없이 1~{MAX_EXAMPLE_CHARS}자로 입력해주세요.");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct LlmConfig {
@@ -499,6 +578,7 @@ impl Default for McpServer {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub assistant: AssistantConfig,
     pub llm: LlmConfig,
     pub embedding: EmbeddingConfig,
     pub mariadb: MariaDbConfig,
@@ -562,6 +642,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.assistant.validate()?;
         self.llm.validate()?;
         self.embedding.validate()?;
         self.mariadb.validate()?;
@@ -886,6 +967,38 @@ fn written(path: &Path, bytes: &[u8], private: bool) -> Result<tempfile::NamedTe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_assistant_settings_are_checked_and_an_older_file_takes_the_defaults() {
+        let older: Config = toml::from_str("[llm]\nmodel = \"m\"\n").unwrap();
+        assert_eq!(older.assistant, AssistantConfig::default());
+        assert_eq!(older.assistant.name, "AI Assistant");
+        assert!(older.assistant.knowledge && older.assistant.database && older.assistant.search_first);
+        let check = |edit: fn(&mut AssistantConfig)| {
+            let mut config = Config::default();
+            edit(&mut config.assistant);
+            config.validate().map_err(|e| e.to_string())
+        };
+        assert!(check(|_| {}).is_ok());
+        assert!(check(|a| a.examples = vec!["a".into(), "b".into(), "c".into()]).is_ok());
+        assert!(check(|a| a.subtitle = String::new()).is_ok());
+        for (edit, says) in [
+            ((|a: &mut AssistantConfig| a.name = "  ".into()) as fn(&mut AssistantConfig), "이름"),
+            (|a| a.name = "가".repeat(51), "이름"),
+            (|a| a.name = "두\n줄".into(), "이름"),
+            (|a| a.subtitle = "가".repeat(101), "부제"),
+            (|a| a.persona = " \n ".into(), "역할 지시문"),
+            (|a| a.persona = "가".repeat(4_001), "역할 지시문"),
+            (|a| a.examples = vec!["a".into(), "b".into(), "c".into(), "d".into()], "3개"),
+            (|a| a.examples = vec![" ".into()], "예시 질문"),
+            (|a| a.examples = vec!["가".repeat(201)], "예시 질문"),
+        ] {
+            let error = check(edit).unwrap_err();
+            assert!(error.contains(says), "{error}");
+        }
+        // A persona of several lines is a persona.
+        assert!(check(|a| a.persona = "당신은 번역가다.\n원문의 어조를 지켜라.".into()).is_ok());
+    }
 
     /// Backend review, 2026-10-23: config.toml was replaced before the
     /// secrets file was written; one that could not be (a full disk) failed

@@ -113,7 +113,7 @@ pub fn describe(message: &str) -> Value {
         (Class::Unavailable, "answer_with_gathered_evidence")
     } else if code == "query_unrunnable" {
         (Class::Prerequisite, "choose_another_query_or_answer")
-    } else if code == "bind_value_problem" || code == "target_db_required" {
+    } else if code == "bind_value_problem" || code == "target_db_required" || code == "unsupported_target" {
         (Class::InvalidInput, "correct_arguments")
     } else if code == "mcp_rate_limited" {
         (Class::Transient, "answer_with_gathered_evidence")
@@ -224,6 +224,10 @@ mod tests {
             assert_eq!((described["code"].as_str(), described["action"].as_str()), (Some(code), Some("choose_allowed_path")));
         }
         assert_eq!(error_code("8bit: x"), "tool_error", "a code starts with a letter");
+        // A search target the settings turn off: the call is corrected, not
+        // given up for other tools as an unsupported one would be.
+        let target = describe("unsupported_target: query is not searched by this assistant; targets can be knowledge");
+        assert_eq!((target["class"].as_str(), target["action"].as_str()), (Some("invalid_input"), Some("correct_arguments")));
     }
 
     /// Context management review, eighth pass: a history id that was

@@ -3607,3 +3607,30 @@ async fn an_answer_past_what_one_message_may_be_is_not_read() {
         hub.shutdown().await;
     }
 }
+
+/// Role settings review, 2026-10-24: with the knowledge and DB tools turned
+/// off, a model calling an MCP tool by its server's own name `search` was
+/// refused as one of the agent's own tools — which this assistant never
+/// offers. That name is the MCP tool's here; with the agent's search on, it
+/// stays the agent's.
+#[tokio::test]
+async fn an_mcp_tool_named_as_an_agent_tool_the_settings_turn_off_runs_by_that_name() {
+    if node_missing() {
+        return;
+    }
+    let mut config = config(vec![fake("web", &["search"], &[("FAKE_MCP_SEARCH", "1")])]);
+    config.assistant.knowledge = false;
+    config.assistant.database = false;
+    let llm = Scripted::new(vec![calls(vec![support::call("w1", "search", json!({"query":"날씨"}))]), text("끝")]);
+    let (app, _dir) = app(config.clone(), llm.clone());
+    app.mcp.apply(&config.mcp_servers);
+    ready(&app.mcp, "web").await;
+    let (result, _) = ask(&app, "오늘 날씨 찾아줘").await;
+    assert_eq!(result.unwrap().answer, "끝");
+    let requests = llm.requests();
+    let tools: Vec<&str> = requests[0]["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+    assert_eq!(tools, ["web__search"]);
+    let found = tool_result(&requests[1], "w1");
+    assert_eq!(found["data"]["text"], "web: 날씨", "{found}");
+    assert_eq!(found["data"]["adjusted_arguments"], json!(["tool name search was taken as web__search; call it web__search"]));
+}

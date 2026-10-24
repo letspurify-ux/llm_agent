@@ -228,7 +228,7 @@ async fn run(
     let question_bundle = c
         .history
         .push(vec![json!({"role":"user","content":message})], true);
-    let mut system = context::system_prompt(&mcp.prompt());
+    let mut system = context::system_prompt(config, &mcp.prompt());
     let deadline = timing.started + Duration::from_secs(config.agent.run_seconds);
     let mut trace: Vec<Value> = vec![];
     let mut tracker = FailureTracker::default();
@@ -294,6 +294,7 @@ async fn run(
             let usable: &[String] = if withheld_tools { &[] } else { &offered };
             let state = runtime_state(config, message, remaining, final_round, usable, partial.is_empty(), round_notice.clone());
             let mut definitions = ToolRegistry::definitions(&offered.iter().map(String::as_str).collect());
+            voc_tools::fit_definitions(&mut definitions, &config.assistant);
             tools::require_project(&mut definitions, &config.projects);
             // After require_project: an MCP tool's own `project` field is its own.
             definitions.extend(mcp.definitions());
@@ -339,14 +340,20 @@ async fn run(
             let frame_tokens = context::count(&context::request_with(&system, &Default::default(), &bare, &model, definitions), &model);
             // The MCP tools' definitions and section are what does not fit:
             // the settings are not too small, the allowed tools too many.
-            if !fits(frame_tokens) && mcp_count > 0 && fits(context::count(&context::request(&Default::default(), &bare, &model, own), &model)) {
+            let alone_system = context::system_prompt(config, "");
+            if !fits(frame_tokens) && mcp_count > 0 && fits(context::count(&context::request_with(&alone_system, &Default::default(), &bare, &model, own), &model)) {
                 eprintln!("[mcp] the allowed MCP tools' definitions (~{frame_tokens} tokens with the frame) do not fit the context");
                 bail!(UserFacing(MCP_TOO_LARGE.into()));
             }
             bail!(too_long(fits(frame_tokens), fits(alone)));
         }
         rounds += 1;
-        let search_first = !withheld_tools && !search_first_asked && !previous_claimed && !looked(&trace);
+        let search_first = config.assistant.search_first
+            && offered.iter().any(|t| t == "search")
+            && !withheld_tools
+            && !search_first_asked
+            && !previous_claimed
+            && !looked(&trace);
         let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(64);
         let relay_events = events.clone();
         let writing = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -566,7 +573,7 @@ async fn run(
                         eprintln!("[mcp] the model endpoint refused the definitions of {}; asking without them", refused.join(", "));
                         mcp.refuse(&refused, config, &refusal);
                         mcp = mcp.without(&refused);
-                        system = context::system_prompt(&mcp.prompt());
+                        system = context::system_prompt(config, &mcp.prompt());
                         discard();
                         rounds -= 1;
                         notice = round_notice;
@@ -1009,7 +1016,16 @@ fn opening(text: &str, done: bool) -> Lead {
 /// they ran, or another tool that answered (a registered project's files, an
 /// MCP tool). A call refused before it ran looked at nothing.
 fn looked(trace: &[Value]) -> bool {
-    trace.iter().any(|step| step.get("tool").is_none() || step["status"] == "ok")
+    trace.iter().any(|step| {
+        if step.get("search").is_some() {
+            // A search that ran says something of each target it searched
+            // (a count, or that it could not); one the tool refused (an empty
+            // query, a target of a tool group turned off) searched nothing.
+            step["hits"].as_object().is_some_and(|hits| !hits.is_empty())
+        } else {
+            step.get("tool").is_none() || step["status"] == "ok"
+        }
+    })
 }
 
 /// Whether the newest bundle holds the pieces of an answer being continued.
@@ -1025,15 +1041,15 @@ fn last_is_partial(c: &Conversation) -> bool {
 /// history tool): a request's other tools are the MCP tools'.
 fn most_agent_tools(config: &Config) -> usize {
     let source = if config.projects.is_empty() { 0 } else { ToolRegistry::source_specs().iter().filter(|s| s.source).count() };
-    voc_tools::specs().len() + source + 1
+    voc_tools::offered(&config.assistant).count() + source + 1
 }
 
-/// Tools defined this round: the knowledge and query tools always, the
-/// source tools when projects exist, the history tool once something left
-/// the context, then the question's MCP tools. A round that withholds them
-/// still defines them.
+/// Tools defined this round: the knowledge and query tools of the groups
+/// the settings turn on, the source tools when projects exist, the history
+/// tool once something left the context, then the question's MCP tools. A
+/// round that withholds them still defines them.
 fn offered_tools(config: &Config, c: &Conversation, mcp: &mcp::Snapshot) -> Vec<String> {
-    let mut names: Vec<String> = voc_tools::specs().iter().map(|s| s.name.to_owned()).collect();
+    let mut names: Vec<String> = voc_tools::offered(&config.assistant).map(str::to_owned).collect();
     if !config.projects.is_empty() {
         names.extend(
             ToolRegistry::source_specs()
@@ -1071,6 +1087,9 @@ fn runtime_state(
         "이전 응답이 출력 한도에서 끊겼다. 끊긴 곳에서 바로 이어 써라. 앞부분을 반복하거나 머리말을 붙이지 말고, 이미 연 코드블록을 다시 열지 마라."
     } else if final_round {
         "도구를 더 쓸 수 없다. 지금까지 확보한 근거로 최종 답변을 써라. 확인하지 못한 부분은 그렇다고 밝혀라."
+    } else if offered.is_empty() {
+        // A role with no tools at all: nothing to gather first.
+        "질문에 답하라."
     } else {
         "질문에 필요한 근거를 도구로 확보하고, 충분하면 도구 없이 최종 답변을 써라."
     };
@@ -1086,7 +1105,7 @@ fn runtime_state(
         "now":format!("{} ({}) KST", now.format("%Y-%m-%d %H:%M"), weekday(now.weekday().num_days_from_monday())),
         "current_question":crate::text::clip_marked(message, STATE_QUESTION_LEN),
     });
-    if !config.embedding.enabled() {
+    if !config.embedding.enabled() && config.assistant.searches() {
         state["search"] = json!("unavailable: 임베딩이 설정되지 않아 의미 검색을 쓸 수 없다. 제목·쿼리 이름·설명의 낱말 일치만 된다.");
     }
     if !config.projects.is_empty() && offered.iter().any(|t| t == "file_read") {
@@ -1291,7 +1310,10 @@ async fn execute_batch(
                 // tool by the server's name for it: the one MCP tool of that
                 // name runs, and the result says the name to use — unless
                 // the name is one of the agent's own tools, which it may mean.
-                let known = ToolRegistry::specs().iter().any(|s| s.name == call.name);
+                let own = ToolRegistry::specs().iter().any(|s| s.name == call.name);
+                // One the settings turn off is never offered here: the model
+                // cannot mean it, and an MCP tool of that name it can.
+                let known = own && !voc_tools::turned_off(&config.assistant, &call.name);
                 match if known { Ok(None) } else { mcp.find_raw(&call.name) } {
                     Ok(Some(tool)) => {
                         let mut args = parsed.clone()?;
@@ -1308,7 +1330,7 @@ async fn execute_batch(
                 }
                 // An MCP tool the conversation called before is told why it
                 // is not there, not as one that does not exist.
-                return Err(if known {
+                return Err(if own {
                     format!("unsupported_tool: {} is not offered now; use the offered tools", call.name)
                 } else {
                     app.mcp.unoffered(&call.name).unwrap_or_else(|| tools::unknown_tool(&call.name, offered))
@@ -1322,7 +1344,7 @@ async fn execute_batch(
                 return Ok(Prepared::Mcp { args, tool, renamed: None });
             }
             let adjusted = tools::normalize_arguments(&call.name, &mut args);
-            ToolRegistry::validate(&call.name, &args).map_err(|e| format!("{e:#}"))?;
+            ToolRegistry::validate_for(&call.name, &args, &config.assistant).map_err(|e| format!("{e:#}"))?;
             if !adjusted.is_empty() {
                 args["__adjusted"] = json!(adjusted);
             }
@@ -1408,7 +1430,7 @@ async fn execute_batch(
             continue;
         }
         match call.name.as_str() {
-            "search" => events.send(json!({"type":"search","id":id,"text":args["query"],"targets":search_targets(&args)})),
+            "search" => events.send(json!({"type":"search","id":id,"text":args["query"],"targets":search_targets(&args, config)})),
             "query_run" => {
                 let mut event = json!({"type":"run_query","id":id,"query_name":args["query_name"],"params":voc_tools::clean_params(&args)});
                 if let Some(db) = args["target_db"].as_str() {
@@ -1597,7 +1619,7 @@ async fn execute_batch(
                         Prepared::Voc { args } => args.clone(),
                         _ => Value::Null,
                     };
-                    let mut event = json!({"type":"search_done","id":id,"text":args["query"],"targets":search_targets(&args),"hits":hits});
+                    let mut event = json!({"type":"search_done","id":id,"text":args["query"],"targets":search_targets(&args, config),"hits":hits});
                     if !failed.is_empty() {
                         event["failed"] = json!(failed);
                     }
@@ -1734,7 +1756,7 @@ async fn execute_batch(
         }
         if call.name == "search" {
             let (hits, failed) = run.hits.unwrap_or((json!({}), vec![]));
-            let mut step_trace = json!({"search":args["query"],"targets":search_targets(&args),"hits":hits});
+            let mut step_trace = json!({"search":args["query"],"targets":search_targets(&args, config),"hits":hits});
             if !failed.is_empty() {
                 step_trace["failed"] = json!(failed);
             }
@@ -1801,7 +1823,7 @@ async fn execute_batch(
             let id = ids[index];
             let raw: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
             if call.name == "search" {
-                events.send(json!({"type":"search_done","id":id,"text":raw["query"],"targets":search_targets(&raw),"hits":{},"failed":search_targets(&raw)}));
+                events.send(json!({"type":"search_done","id":id,"text":raw["query"],"targets":search_targets(&raw, config),"hits":{},"failed":search_targets(&raw, config)}));
             } else {
                 events.send(json!({"type":"run_query_done","id":id,"query_name":raw["query_name"],"error":"조회를 실행하지 않았습니다."}));
             }
@@ -1888,11 +1910,9 @@ fn guarded_bound(ws: &mut Workspace, call: &ToolCall, args: &Value, result: Valu
         .unwrap_or_else(|_| tools::envelope(Err(anyhow::anyhow!(TOOL_PANIC))))
 }
 
-fn search_targets(args: &Value) -> Value {
-    match args["targets"].as_array() {
-        Some(t) if !t.is_empty() => json!(t),
-        _ => json!(["knowledge", "qa_method", "query"]),
-    }
+/// What a search call searches, as `voc_tools::search_tool` runs it.
+fn search_targets(args: &Value, config: &Config) -> Value {
+    json!(voc_tools::named_targets(args, &config.assistant))
 }
 
 fn row_count(rows: u64, capped: bool) -> Value {

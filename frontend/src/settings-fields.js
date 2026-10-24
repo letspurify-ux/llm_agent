@@ -1,9 +1,22 @@
 // 설정 화면의 항목 정의와 값 변환. 화면은 입력 글자를 다루고, 서버는 backend/src/config.rs의 타입을 받는다 —
 // 두 모양 사이의 변환을 여기 한 곳에 둔다(순수 함수라 회귀 테스트가 붙는다).
 //   [키 (구역.이름), 이름표, 종류, 도움말]
-//   종류: text · url · list(쉼표로 구분한 목록) · optionalText(비우면 없음) · number(0 이상 정수) · optionalNumber(비우면 기본값)
+//   종류: text · textarea(여러 줄 글) · url · list(쉼표로 구분한 목록) · examples(칸 EXAMPLE_SLOTS개, 빈 칸은 빠지는 목록)
+//         · optionalText(비우면 없음) · number(0 이상 정수) · optionalNumber(비우면 기본값)
 //         · decimal(소수) · percent(화면 %, 서버 0~1) · mib(화면 MiB, 서버 바이트) · boolean · effort · folder
+export const EXAMPLE_SLOTS = 3;
 export const SETTING_GROUPS = [
+  { id: 'assistant', title: '어시스턴트 (역할)',
+    description: '이 서버가 맡는 역할입니다. 화면에 보일 이름, 역할 지시문, 쓸 도구를 정합니다. 다른 역할은 다른 폴더에서 서버를 따로 띄워 운영합니다.',
+    fields: [
+      ['assistant.name', '이름', 'text', '화면 머리글과 브라우저 제목에 보입니다. 첫 낱말이 강조됩니다.'],
+      ['assistant.subtitle', '부제', 'text', '이름 아래와 첫 화면에 보입니다. 비우면 숨깁니다.'],
+      ['assistant.persona', '역할 지시문', 'textarea', '시스템 프롬프트 맨 앞에 들어갑니다(예: 당신은 사내 규정을 안내하는 도우미다.). 도구 사용법과 답변 형식 규칙은 서버가 켜진 도구에 맞춰 붙입니다. 4,000자까지.'],
+      ['assistant.examples', '예시 질문', 'examples', `첫 화면에 보이는 질문 버튼입니다. ${EXAMPLE_SLOTS}개까지, 빈 칸은 빠집니다.`],
+      ['assistant.knowledge', '지식 문서 사용', 'boolean', '등록 지식을 찾아 읽습니다(search·knowledge_read). 끄면 지식 탭과 지식 임베딩 동기화도 빠집니다.'],
+      ['assistant.database', 'DB 조회 사용', 'boolean', 'Q&A 처리 방법과 등록 쿼리로 조회 대상 DB를 조회합니다. 끄면 DB·방법·쿼리 탭과 그 임베딩 동기화도 빠집니다.'],
+      ['assistant.search_first', '답하기 전에 등록 자료 먼저 찾기', 'boolean', '켜면 일반 지식처럼 보이는 질문도 먼저 찾아보고, 찾아도 없으면 "등록된 지식에 없는 내용이라…" 문구를 붙입니다. 끄면 필요할 때만 찾습니다. 지식·DB 조회를 모두 끄면 쓰이지 않습니다.'],
+    ] },
   { id: 'llm', title: '모델 연결 (LLM)', check: 'llm',
     description: 'OpenAI 호환 /chat/completions 주소와 모델입니다. OpenRouter, vLLM, Ollama(/v1) 모두 이 형식입니다.',
     fields: [
@@ -83,11 +96,13 @@ const get = (config, key) => key.split('.').reduce((v, k) => (v == null ? undefi
 
 // 서버 값 하나 → 입력 글자.
 const textOf = (type, value) => (type === 'boolean' ? !!value
-  : value == null ? ''
-    : type === 'percent' ? String(Math.round(Number(value) * 1000) / 10)
-      : type === 'mib' ? String(Math.round((Number(value) / MIB) * 100) / 100)
-        : type === 'list' ? (Array.isArray(value) ? value.join(', ') : '')
-          : String(value));
+  // 칸 수가 고정이라 서버 값이 없거나 모자라도 늘 그 수의 글자다.
+  : type === 'examples' ? Array.from({ length: EXAMPLE_SLOTS }, (_, i) => (Array.isArray(value) && typeof value[i] === 'string' ? value[i] : ''))
+    : value == null ? ''
+      : type === 'percent' ? String(Math.round(Number(value) * 1000) / 10)
+        : type === 'mib' ? String(Math.round((Number(value) / MIB) * 100) / 100)
+          : type === 'list' ? (Array.isArray(value) ? value.join(', ') : '')
+            : String(value));
 
 // 서버 값 → 입력 글자.
 export function formOf(config) {
@@ -109,7 +124,8 @@ export function configOf(form, original) {
     let value;
     if (type === 'boolean') value = !!raw;
     else if (type === 'optionalText') value = text ? text : (key === 'embedding.url' ? '' : null);
-    else if (type === 'text' || type === 'url' || type === 'folder' || type === 'effort') value = key === 'embedding.query_prefix' ? raw : text;
+    else if (type === 'text' || type === 'textarea' || type === 'url' || type === 'folder' || type === 'effort') value = key === 'embedding.query_prefix' ? raw : text;
+    else if (type === 'examples') value = (Array.isArray(raw) ? raw : []).map(v => String(v ?? '').trim()).filter(Boolean);
     else if (type === 'list') value = String(raw ?? '').split(',').map(v => v.trim()).filter(Boolean);
     else if (type === 'optionalNumber' && text === '') value = null;
     else if ((type === 'percent' || type === 'mib') && original && get(original, key) != null

@@ -2239,7 +2239,8 @@ it('응답 중지는 요청을 끊고 보이던 조각을 남긴 뒤 다음 질�
   await page.key('Enter', 'Enter', 13);
   await page.until(`window.__streams.length === 2`);
   assert.deepStrictEqual(await page.eval(`window.__requests[1].history.map(m => [m.role, m.text])`), [
-    ['user', 'SPACE 시스템이 뭐야?'], ['assistant', partial],
+    // 첫 예시 질문 칩 — 화면에 meta가 없으면 기본 역할의 예시다(src/assistant.js DEFAULT_PROFILE).
+    ['user', '너는 어떤 일을 할 수 있어?'], ['assistant', partial],
   ]);
   await emitMixed(1, { type: 'done', answer: '이어진 답' });
   await page.until(`!document.querySelector('.typing') && document.querySelectorAll('.row.assistant').length === 2`);

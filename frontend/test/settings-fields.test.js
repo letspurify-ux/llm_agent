@@ -5,6 +5,8 @@ import { SETTING_GROUPS, formOf, configOf } from '../src/settings-fields.js';
 // 서버 설정(backend config.rs)의 모양과 입력 글자 사이 변환은 왕복이 맞아야 한다 — 어긋나면
 // 저장할 때마다 값이 조금씩 바뀌거나(비율·MiB) 비운 값이 0으로 저장된다.
 const SERVER = {
+  assistant: { name: 'SPACE Assistant', subtitle: '지식 · 운영 DB 조회 기반', persona: '당신은 SPACE VOC 에이전트다.\n사내 용어를 쓴다.',
+    examples: ['SPACE 시스템이 뭐야?', '너는 어떤 일을 할 수 있어?'], knowledge: true, database: false, search_first: true },
   llm: { base_url: 'http://x/v1', model: 'm', proxy: null, disable_proxy: false, context_tokens: 128000, output_tokens: 16384,
     reasoning_effort: 'low', enable_thinking: true, legacy_max_tokens: false, stream_usage: true, request_timeout_secs: 120, retries: 2 },
   embedding: { url: '', model: 'bge-m3', query_prefix: 'Instruct\\nQuery: ', sync_interval_secs: 60, max_distance: 0.4, ef_search: 150, timeout_secs: 60 },
@@ -61,4 +63,17 @@ test('반올림해 보이는 칸은 손대지 않으면 서버의 값 그대로 
   assert.equal(edited.history_bytes, 2 * 1024 * 1024);
   assert.equal(edited.high_water, 0.9255);
   assert.equal(configOf({ ...form, 'agent.high_water': '92.5' }, server).config.agent.high_water, 0.925);
+});
+
+test('예시 질문은 고정된 세 칸이고 빈 칸은 빠진다', () => {
+  const form = formOf(SERVER);
+  assert.deepEqual(form['assistant.examples'], ['SPACE 시스템이 뭐야?', '너는 어떤 일을 할 수 있어?', '']);
+  assert.equal(form['assistant.persona'], '당신은 SPACE VOC 에이전트다.\n사내 용어를 쓴다.');
+  const edited = configOf({ ...form, 'assistant.examples': [' 첫 질문 ', '', '셋째 질문'] }).config.assistant;
+  assert.deepEqual(edited.examples, ['첫 질문', '셋째 질문']);
+  assert.deepEqual(configOf({ ...form, 'assistant.examples': ['', ' ', ''] }).config.assistant.examples, []);
+  // 예시가 없거나 모양이 어긋난 서버 값도 세 칸으로 보인다.
+  assert.deepEqual(formOf({ ...SERVER, assistant: { ...SERVER.assistant, examples: undefined } })['assistant.examples'], ['', '', '']);
+  assert.deepEqual(formOf({ ...SERVER, assistant: { ...SERVER.assistant, examples: ['a', 3, 'b', 'c'] } })['assistant.examples'], ['a', '', 'b']);
+  assert.equal(SETTING_GROUPS[0].id, 'assistant', '역할이 설정 화면의 맨 앞이다');
 });

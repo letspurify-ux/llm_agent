@@ -196,6 +196,7 @@ fn keep_alive(stream: &mut tokio::net::TcpStream) {
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/api/health", get(|| async { Json(json!({"ok":true})) }))
+        .route("/api/assistant", get(assistant))
         .route("/api/chat", post(chat).layer(DefaultBodyLimit::max(CHAT_BODY_LIMIT)))
         .nest("/api/admin", crate::admin::router(app.clone()))
         .fallback(fallback)
@@ -252,13 +253,19 @@ pub fn host_allowed(host: &str, allowed: &[String]) -> bool {
         || allowed.iter().any(|known| known.trim().trim_end_matches('.').eq_ignore_ascii_case(&name))
 }
 
+/// The screen's name, subtitle and example questions from the settings,
+/// and the tool groups whose admin tabs it shows. Public, as the screen is.
+async fn assistant(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(crate::ui::profile(&app.config().assistant))
+}
+
 /// Unknown API paths answer JSON; any other GET is the built-in screen.
-async fn fallback(method: Method, uri: Uri) -> Response {
+async fn fallback(State(app): State<Arc<App>>, method: Method, uri: Uri) -> Response {
     let api = uri.path() == "/api" || uri.path().starts_with("/api/");
     if api || !matches!(method, Method::GET | Method::HEAD) {
         return error(StatusCode::NOT_FOUND, "요청한 경로를 찾을 수 없습니다.");
     }
-    crate::ui::serve(uri).await
+    crate::ui::serve(uri, &app.config().assistant).await
 }
 
 fn error(status: StatusCode, message: &str) -> Response {
@@ -347,9 +354,13 @@ pub fn record_chat_log(app: &Arc<App>, question: &str, answer: Option<String>, t
         }
         format!("{}{}", &answer[..end], crate::text::TRUNC_MARK)
     });
-    let trace = fit_trace(trace);
+    let mut trace = fit_trace(trace);
+    let config = app.config();
+    // Servers of other roles may keep their logs in the same management DB.
+    if let Some(fields) = trace.as_object_mut() {
+        fields.insert("assistant".into(), json!(config.assistant.name));
+    }
     tokio::spawn(async move {
-        let config = app.config();
         if let Err(e) =
             crate::db::insert_chat_log(&app.db, &config.mariadb, &question, answer.as_deref(), &trace).await
         {

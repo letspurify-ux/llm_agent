@@ -1871,7 +1871,9 @@ impl ClientHandler for Handler {
     fn get_info(&self) -> ClientConfig {
         let mut info = Implementation::default();
         info.name = "llm-agent".into();
-        info.title = Some("SPACE VOC Agent".into());
+        // The software, not the role the settings give it (a server's name
+        // for its client stays the same when the role changes).
+        info.title = Some("LLM Agent".into());
         info.version = env!("CARGO_PKG_VERSION").into();
         ClientConfig::new(ClientCapabilities::default(), info)
     }

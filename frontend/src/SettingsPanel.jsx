@@ -4,7 +4,8 @@ import { SETTING_GROUPS, SECRETS, formOf, configOf } from './settings-fields.js'
 
 // 서버 설정(backend/config.toml) 화면. 비밀값(API 키·관리 DB 비밀번호·관리자 인증 키)은 서버가 돌려주지 않는다 —
 // 등록 여부만 보이고, 새 값을 넣거나 지울 수만 있다. 저장은 다른 화면과 같은 revision 대조(If-Match)를 거친다.
-export default function SettingsPanel({ api, onStateChange }) {
+// onSaved는 저장된 설정을 받는다 — 화면 머리글·예시 질문·관리 탭이 다시 불러오지 않고 바로 따라간다(assistant.js).
+export default function SettingsPanel({ api, onStateChange, onSaved }) {
   const [loaded, setLoaded] = useState(null);
   const [form, setForm] = useState(null);
   const [baseline, setBaseline] = useState('');
@@ -51,6 +52,7 @@ export default function SettingsPanel({ api, onStateChange }) {
     try {
       const result = await api('settings', { method: 'PUT', body: JSON.stringify(request), headers: { 'If-Match': `"${loaded.revision}"` } });
       accept(result);
+      onSaved?.(result.config);
       setNotice(result.restart_required?.length
         ? `설정을 저장했습니다. 다음 항목은 서버를 다시 시작해야 적용됩니다: ${result.restart_required.join(', ')}`
         : '설정을 저장했습니다. 다음 질문부터 적용됩니다.');
@@ -83,11 +85,19 @@ export default function SettingsPanel({ api, onStateChange }) {
       <div className="admin-settings-grid">
         {group.fields.map(([key, label, type, help]) => {
           const id = `setting-${key.replace('.', '-')}`;
-          return <div key={key} className={`admin-field${type === 'boolean' ? ' admin-field-check' : ''}`}>
+          const wide = type === 'textarea' || type === 'examples';
+          return <div key={key} className={`admin-field${type === 'boolean' ? ' admin-field-check' : ''}${wide ? ' admin-field-wide' : ''}`}
+            role={type === 'examples' ? 'group' : undefined} aria-labelledby={type === 'examples' ? `${id}-label` : undefined}>
             {type === 'boolean'
               ? <label htmlFor={id}><input id={id} type="checkbox" checked={!!form[key]} onChange={e => update(key, e.target.checked)} /> {label}</label>
-              : <label htmlFor={id}>{label}</label>}
-            {type === 'effort' ? <select id={id} value={form[key]} onChange={e => update(key, e.target.value)}>
+              : type === 'examples' ? <span className="admin-field-label" id={`${id}-label`}>{label}</span>
+                : <label htmlFor={id}>{label}</label>}
+            {type === 'textarea' ? <textarea id={id} rows={4} value={form[key]} onChange={e => update(key, e.target.value)} />
+              : type === 'examples' ? <div className="admin-examples">
+                {form[key].map((value, index) => <input key={index} id={index ? undefined : id} value={value} aria-label={`${label} ${index + 1}`}
+                  onChange={e => { const typed = e.target.value; setForm(f => ({ ...f, [key]: f[key].map((v, i) => (i === index ? typed : v)) })); }} />)}
+              </div>
+                : type === 'effort' ? <select id={id} value={form[key]} onChange={e => update(key, e.target.value)}>
               <option value="">보내지 않음</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option>
             </select>
               : type === 'folder' ? <div className="admin-input-action">

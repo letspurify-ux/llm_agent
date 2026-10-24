@@ -101,6 +101,8 @@ if (env.FAKE_MCP_HEIR) tools.push({ name: 'spawn_heir', description: 'Start a pr
 // `detached`, the new one out of the server's process group).
 if (env.FAKE_MCP_HEIR) tools.push({ name: 'hand_over', description: 'Hand this server\'s streams to a new server process and exit; return its pid.', inputSchema: { type: 'object' } });
 if (env.FAKE_MCP_DUPLICATE) tools.push({ name: 'echo', description: 'A second echo.', inputSchema: { type: 'object' } });
+// A tool named as one of the agent's own (a web search server's "search").
+if (env.FAKE_MCP_SEARCH) tools.push({ name: 'search', description: 'Search the web.', inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } });
 for (let i = 0; i < Number(env.FAKE_MCP_MANY_BAD || 0); i++) tools.push({ name: `bad_${i}`, description: 'a schema that is a string', inputSchema: 'nope' });
 if (env.FAKE_MCP_BAD_LIST) tools.push({ name: 'no_schema', description: 'A tool without inputSchema.' }, { name: 'string_schema', description: 'A tool whose schema is a string.', inputSchema: 'nope' });
 const cancelled = new Set();
@@ -177,6 +179,7 @@ async function handle(message, notify) {
       case 'echo':
         if (String(args.text).startsWith('raw:')) return { raw: args.text.slice(4).replaceAll('@ID@', JSON.stringify(id)) };
         if (String(args.text).startsWith('shape:')) return { id, ...JSON.parse(args.text.slice(6)) }; return result(id, { content: [text(args.text === 'cut emoji' ? '잘림 😀'.slice(0, 4) : args.text === 'bad bytes' ? 'raw <0xFF> byte' : `echo: ${args.text}`)] });
+      case 'search': return result(id, { content: [text(`web: ${args.query}`)] });
       case 'add': { const sum = args.a + args.b; return result(id, { content: [text(JSON.stringify({ sum }))], structuredContent: { sum } }); }
       case 'structured_only': return result(id, { content: [], structuredContent: { ok: true, items: [1, 2] } });
       case 'slow': {

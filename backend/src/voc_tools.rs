@@ -5,7 +5,7 @@
 
 use crate::{
     app::App,
-    config::Config,
+    config::{AssistantConfig, Config},
     db::{self, Row, marks, n},
     execution::input_bind_names,
     search,
@@ -109,6 +109,78 @@ pub fn specs() -> Vec<ToolSpec> {
     ]
 }
 
+/// The tools of `specs` the settings' tool groups offer, in their order:
+/// knowledge_read for knowledge, the method, query and result tools for the
+/// DB, and search for either.
+pub fn offered(assistant: &AssistantConfig) -> impl Iterator<Item = &'static str> + '_ {
+    specs().into_iter().map(|spec| spec.name).filter(move |name| match *name {
+        "search" => assistant.searches(),
+        "knowledge_read" => assistant.knowledge,
+        _ => assistant.database,
+    })
+}
+
+/// Whether `name` is one of these tools and the settings' tool groups leave
+/// it out.
+pub fn turned_off(assistant: &AssistantConfig, name: &str) -> bool {
+    specs().iter().any(|spec| spec.name == name) && !offered(assistant).any(|offered| offered == name)
+}
+
+/// The targets search takes with the settings' tool groups.
+pub fn search_targets(assistant: &AssistantConfig) -> Vec<&'static str> {
+    let mut targets = vec![];
+    if assistant.knowledge {
+        targets.push("knowledge");
+    }
+    if assistant.database {
+        targets.extend(["qa_method", "query"]);
+    }
+    targets
+}
+
+/// The targets a search call runs: the known names it gives, once each in
+/// their order, or every target the settings' tool groups search when it
+/// names none. Progress lines, the trace and the chat_log summary name
+/// these, so they say what was searched.
+pub fn named_targets(args: &Value, assistant: &AssistantConfig) -> Vec<String> {
+    let mut named: Vec<String> = vec![];
+    for target in args["targets"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        // A target named twice ran its searches twice for one result.
+        if matches!(target, "knowledge" | "qa_method" | "query") && !named.iter().any(|t| t == target) {
+            named.push(target.to_owned());
+        }
+    }
+    if named.is_empty() {
+        named = search_targets(assistant).into_iter().map(str::to_owned).collect();
+    }
+    named
+}
+
+const SEARCH_KNOWLEDGE: &str = "Semantic search over the registered knowledge (concepts, policies, procedures, manuals). Returns ranked summaries with IDs and cosine distance (smaller is closer), not full text: read knowledge with knowledge_read. limit is the number of results (default 10, max 50); offset continues the same search past results already received. The first page also puts up to 5 items whose title contains the search words first, marked title_match; title_matches counts all such items. status search_unavailable means the search could not run (not that nothing exists).";
+const SEARCH_DATABASE: &str = "Semantic search over the Q&A methods (lookup procedures for kinds of questions) and registered queries. Returns ranked summaries with IDs and cosine distance (smaller is closer), not full text: read methods with method_read and queries with query_describe. targets chooses what to search (default both). limit is per target (default 10, max 50); offset continues the same search past results already received. An exact registered query name returns that query first. The first page also puts up to 5 items whose title (queries: name or description) contains the search words first, marked title_match; title_matches counts all such items. status search_unavailable means the search could not run (not that nothing exists).";
+
+/// The search definition sent to the model, for the targets the settings'
+/// tool groups offer: a target it may not search is neither listed nor
+/// described.
+pub fn fit_definitions(definitions: &mut [Value], assistant: &AssistantConfig) {
+    let description = match (assistant.knowledge, assistant.database) {
+        (true, false) => SEARCH_KNOWLEDGE,
+        (false, true) => SEARCH_DATABASE,
+        _ => return,
+    };
+    if let Some(function) = definitions.iter_mut().map(|d| &mut d["function"]).find(|f| f["name"] == "search") {
+        function["description"] = json!(description);
+        narrow_targets(&mut function["parameters"], assistant);
+    }
+}
+
+/// search's parameters with the targets the settings' tool groups search
+/// (all three when both groups are on).
+pub fn narrow_targets(parameters: &mut Value, assistant: &AssistantConfig) {
+    if assistant.knowledge != assistant.database {
+        parameters["properties"]["targets"]["items"]["enum"] = json!(search_targets(assistant));
+    }
+}
 
 /// Values the model was shown cut short: a bind value equal to one of them
 /// is a clipped copy, not the stored value.
@@ -493,15 +565,19 @@ async fn search_tool(cx: &Context<'_>, args: &Value) -> Run {
         return Run::plain(Err(anyhow::anyhow!("missing_argument: query must name what to find")));
     }
     let text = clip_utf16(&text, 500).to_owned();
-    let mut targets: Vec<String> = args["targets"]
-        .as_array()
-        .map(|t| t.iter().filter_map(Value::as_str).map(str::to_owned).collect())
-        .unwrap_or_default();
-    // A target named twice ran its searches twice for one result.
-    let mut seen = BTreeSet::new();
-    targets.retain(|t| matches!(t.as_str(), "knowledge" | "qa_method" | "query") && seen.insert(t.clone()));
+    let targets = named_targets(args, &cx.config.assistant);
+    // A target of a tool group the settings turn off (named from an earlier
+    // answer, or by a model that ignores the definition) is refused: quietly
+    // dropped, the search answered something else than what was asked.
+    let offered = search_targets(&cx.config.assistant);
+    if let Some(target) = targets.iter().find(|t| !offered.contains(&t.as_str())) {
+        return Run::plain(Err(anyhow::anyhow!(
+            "unsupported_target: {target} is not searched by this assistant; targets can be {}",
+            offered.join(", ")
+        )));
+    }
     if targets.is_empty() {
-        targets = vec!["knowledge".into(), "qa_method".into(), "query".into()];
+        return Run::plain(Err(anyhow::anyhow!("unsupported_tool: search is not offered by this assistant")));
     }
     let limit = limit_arg(args, "limit", SEARCH_DEFAULT, SEARCH_MAX);
     let offset = args["offset"].as_u64().unwrap_or(0).min(MAX_OFFSET) as usize;
@@ -1433,6 +1509,41 @@ fn result_read(cx: &Context<'_>, args: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Settings, 2026-10-24: the tool groups choose the tools and the
+    /// targets of search, and the definition the model reads says no more.
+    #[test]
+    fn tool_groups_choose_the_tools_and_search_targets() {
+        let mut assistant = AssistantConfig::default();
+        let names = |a: &AssistantConfig| offered(a).collect::<Vec<_>>();
+        assert_eq!(names(&assistant), specs().iter().map(|s| s.name).collect::<Vec<_>>());
+        assert_eq!(search_targets(&assistant), ["knowledge", "qa_method", "query"]);
+        let all = crate::tools::ToolRegistry::definitions(&offered(&assistant).collect());
+        let mut fitted = all.clone();
+        fit_definitions(&mut fitted, &assistant);
+        assert_eq!(fitted, all, "both groups keep the definition as written");
+        let search = |definitions: &[Value]| definitions.iter().find(|d| d["function"]["name"] == "search").cloned().unwrap();
+        for (knowledge, database, tools, targets) in [
+            (true, false, vec!["search", "knowledge_read"], vec!["knowledge"]),
+            (false, true, vec!["search", "method_read", "query_describe", "query_run", "result_read"], vec!["qa_method", "query"]),
+            (false, false, vec![], vec![]),
+        ] {
+            assistant.knowledge = knowledge;
+            assistant.database = database;
+            assert_eq!(names(&assistant), tools);
+            assert_eq!(search_targets(&assistant), targets);
+            if tools.is_empty() {
+                continue;
+            }
+            let mut definitions = crate::tools::ToolRegistry::definitions(&offered(&assistant).collect());
+            fit_definitions(&mut definitions, &assistant);
+            let search = search(&definitions);
+            assert_eq!(search["function"]["parameters"]["properties"]["targets"]["items"]["enum"], json!(targets));
+            let description = search["function"]["description"].as_str().unwrap();
+            assert_eq!(description.contains("knowledge_read"), knowledge);
+            assert_eq!(description.contains("query_describe"), database);
+        }
+    }
 
     #[test]
     fn knowledge_reads_start_where_their_cursor_says_or_are_refused() {

@@ -27,6 +27,7 @@ import { PreviewPre } from './preview.js';
 import { linkTarget, imageTarget, mdProps, scopeMarkdownIds } from './markdown.js';
 import InlineMath from './InlineMath.jsx';
 import AdminPanel from './AdminPanel.jsx';
+import { profileFromPage, brandParts } from './assistant.js';
 import RobotIcon from './RobotIcon.jsx';
 
 const NO_REHYPE = [];
@@ -57,12 +58,6 @@ const clipTurn = s => sliceSafe(String(s ?? ''), HISTORY_LEN);
 const REQUEST_TIMEOUT_MS = 450_000;
 // 답변 조각을 화면에 올리는 간격(ms). 눈에는 연속으로 보이면서 markdown 파싱은 초당 여덟 번을 넘지 않는다.
 const PREVIEW_FLUSH_MS = 120;
-
-const EXAMPLES = [
-  'SPACE 시스템이 뭐야?',
-  'VM Agent Dashboard 현황 알려줘',
-  '너는 어떤 일을 할 수 있어?',
-];
 
 // 차트 블록 안의 표만 렌더할 때의 파이프라인. 값은 조회 결과 그대로라 수식 처리는 필요 없다.
 const TABLE_PLUGINS = [remarkGfm];
@@ -474,6 +469,10 @@ const BUSY_MS = 600;
 const SCROLL_KEYS = new Set(['PageUp', 'PageDown', 'ArrowUp', 'ArrowDown', 'Home', 'End', ' ']);
 
 export default function App() {
+  // 이름·부제·예시 질문은 서버 설정(어시스턴트)의 것이다(assistant.js) — 다른 역할은 다른 폴더의 다른 서버다.
+  const [profile, setProfile] = useState(profileFromPage);
+  useEffect(() => { document.title = profile.name; }, [profile.name]);
+  const [brandLead, brandRest] = brandParts(profile.name);
   const [adminOpen, setAdminOpen] = useState(false);
   const [adminState, setAdminState] = useState({ dirty: false, busy: false });
   const previewPlugins = useMarkdownPlugins(REHYPE_PLUGINS);
@@ -1260,7 +1259,7 @@ export default function App() {
       <header className="header">
         <button type="button" className="brand-home" onClick={goHomeFromBrand} aria-label="홈으로 이동">
           <span className="logo" aria-hidden="true"><RobotIcon /></span>
-          <span className="brand-copy"><span className="brand-title"><span>SPACE</span> Assistant</span><span className="brand-subtitle">지식 · 운영 DB 조회 기반</span></span>
+          <span className="brand-copy" title={profile.subtitle ? `${profile.name} — ${profile.subtitle}` : profile.name}><span className="brand-title"><span>{brandLead}</span>{brandRest}</span>{profile.subtitle && <span className="brand-subtitle">{profile.subtitle}</span>}</span>
         </button>
         {/* 대화가 없고 기다리는 것도 없으면 되돌아갈 곳이 없다 — 그때는 눌리지 않게 둔다
             (입력창의 초안은 홈이 아니어도 남는 것이므로 이 판단에 넣지 않는다). */}
@@ -1285,7 +1284,7 @@ export default function App() {
           }}>{adminOpen ? '채팅으로' : '관리자'}</button>
       </header>
 
-      {adminOpen && <AdminPanel onStateChange={setAdminState} />}
+      {adminOpen && <AdminPanel onStateChange={setAdminState} profile={profile} onProfile={setProfile} />}
 
       {/* 답이 도착한 것을 알리는 한 줄. 늘 그 자리에 있어야 한다 — 알릴 때 이 요소를 함께 만들어 넣으면
           화면낭독기가 '바뀐 것'으로 보지 못해 아무것도 읽지 않는 브라우저가 있다. 비어 있는 동안에는
@@ -1298,12 +1297,13 @@ export default function App() {
             <div className="empty">
               <div className="empty-icon" aria-hidden="true"><RobotIcon variant="standing" /></div>
               <h2>무엇을 도와드릴까요?</h2>
-              <p>저장된 지식과 운영 DB 조회를 결합해 답변합니다.</p>
-              <div className="chips">
-                {EXAMPLES.map(x => (
-                  <button key={x} className="chip" onClick={() => ask(x)}>{x}</button>
+              {profile.subtitle && <p>{profile.subtitle}</p>}
+              {profile.examples.length > 0 && <div className="chips">
+                {/* 같은 질문을 두 칸에 적어도 React key가 겹치지 않게 자리로 짚는다. */}
+                {profile.examples.map((x, i) => (
+                  <button key={i} className="chip" onClick={() => ask(x)}>{x}</button>
                 ))}
-              </div>
+              </div>}
             </div>
           )}
 

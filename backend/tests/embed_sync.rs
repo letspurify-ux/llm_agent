@@ -824,3 +824,49 @@ async fn a_table_that_refuses_its_first_rows_waits_with_the_rest() {
     }
     db.close().await;
 }
+
+/// Settings, 2026-10-24: a server syncs what its tool groups search — the
+/// knowledge chunks with knowledge, the methods' and queries' vectors with
+/// the DB tools. A server of another role on the same management DB syncs
+/// the rest.
+#[tokio::test]
+async fn a_sync_leaves_what_its_tool_groups_do_not_search() {
+    let _turn = SYNCING.lock().await;
+    let Some(test_db) = TestDb::create("sync_groups") else {
+        return skip("LLM_AGENT_TEST_MARIADB is not set");
+    };
+    let mut config = test_db.config();
+    config.embedding.url = String::new();
+    test_db.sql_in("INSERT INTO knowledge (title, content) VALUES ('역할별 동기화', '지식을 쓰는 서버만 나눈다.');");
+    // The vector of a method that is gone: a sync over the methods removes it.
+    add_vectors(&test_db, "(SELECT 999999 AS seq) AS gone");
+    let chunks = || test_db.scalar("SELECT COUNT(*) FROM knowledge_chunk");
+    let orphans = || test_db.scalar("SELECT COUNT(*) FROM vec_qa_method WHERE seq = 999999");
+    let db = Db::default();
+    let sync = |config: llm_agent::config::Config| {
+        let db = &db;
+        async move { EmbedSync::default().run(db, &config, &CancellationToken::new()).await.unwrap() }
+    };
+
+    let (mut nothing, mut knowledge) = (config.clone(), config.clone());
+    nothing.assistant.knowledge = false;
+    nothing.assistant.database = false;
+    let summary = sync(nothing).await;
+    assert_eq!((summary.chunks, summary.deleted), (0, 0), "{summary}");
+    // Said as what it is, not as a missing embedding server.
+    assert_eq!(summary.skipped, Skipped::NotSearched);
+    assert!(summary.to_string().contains("searches nothing"), "{summary}");
+    assert_eq!((chunks(), orphans()), ("0".to_owned(), "1".to_owned()));
+
+    knowledge.assistant.database = false;
+    let summary = sync(knowledge).await;
+    assert!(summary.chunks > 0, "{summary}");
+    assert_eq!(chunks(), summary.chunks.to_string(), "the seed's documents and this one are chunked");
+    assert_eq!(orphans(), "1", "the methods' vectors are another role's");
+
+    config.assistant.knowledge = false;
+    let summary = sync(config).await;
+    assert_eq!(summary.deleted, 1, "{summary}");
+    assert_eq!(orphans(), "0");
+    db.close().await;
+}

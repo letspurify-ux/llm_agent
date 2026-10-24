@@ -1,6 +1,7 @@
-# SPACE VOC Agent
+# AI Assistant (llm_agent)
 
-사내 지식·Q&A 처리 방법·조회용 DB(Oracle)·프로젝트 소스를 근거로 질문에 답하는 Q&A LLM Agent.
+설정에서 정한 역할로, 사내 지식·Q&A 처리 방법·조회용 DB(Oracle)·프로젝트 소스·MCP 도구를 근거로 질문에 답하는 LLM Agent.
+서버 하나가 역할 하나다 — 이름·역할 지시문·쓸 도구를 설정 탭에서 정하고, 다른 역할은 다른 폴더에서 서버를 따로 띄운다(아래 '역할').
 
 ```
 사용자 질문 (대화 번호 — 서버가 대화 맥락을 들고 있다)
@@ -24,6 +25,51 @@ backend는 Rust(axum)다 — MnemoArc의 질문 모드(일반 작업) 런타임�
 - **임베딩**: Ollama 등 OpenAI 호환 `/embeddings` (1024차원 — bge-m3, qwen3-embedding:0.6b)
 - **설정**: 모두 관리자 화면의 **설정** 탭에서 바꾼다 — `backend/config.toml`과 비밀값 파일 `backend/config.credentials.json`에 저장된다
 - **도구 확장**: MCP(Model Context Protocol) 서버의 도구를 코드 수정 없이 붙인다 — 관리자 화면 **MCP** 탭 또는 `config.toml`의 `[[mcp_servers]]` (아래 'MCP 도구 서버로 도구 붙이기')
+
+## 역할 (어시스턴트 설정)
+
+서버 하나가 역할 하나다. 관리자 화면 **설정 → 어시스턴트 (역할)**(`config.toml`의 `[assistant]`)에서 정한다.
+
+| 항목 | 기본값 | 뜻 |
+|---|---|---|
+| 이름 | AI Assistant | 화면 머리글(첫 낱말 강조)과 브라우저 제목. 50자까지 |
+| 부제 | (없음) | 이름 아래와 첫 화면. 비우면 숨긴다 |
+| 역할 지시문 | 당신은 사용자의 질문에 답하고 작업을 돕는 AI 어시스턴트다. | 시스템 프롬프트 맨 앞(4,000자까지). 그 뒤의 도구 규칙·답변 형식은 서버가 켜진 도구에 맞춰 붙인다 |
+| 예시 질문 | 너는 어떤 일을 할 수 있어? | 첫 화면의 질문 버튼, 3개까지 |
+| 지식 문서 사용 | 켬 | `search`(지식)·`knowledge_read` |
+| DB 조회 사용 | 켬 | `search`(처리 방법·쿼리)·`method_read`·`query_describe`·`query_run`·`result_read` |
+| 답하기 전에 등록 자료 먼저 찾기 | 켬 | 켜면 일반 지식처럼 보이는 질문도 먼저 찾고, 찾아도 없으면 "*등록된 지식에 없는 내용이라…*" 문구를 붙인다(찾지 않고 그 문구로 답하면 한 번 되돌려 찾게 한다). 끄면 필요할 때만 찾고 그 문구도 없다. 지식·DB 조회를 모두 끄면 쓰이지 않는다 |
+
+- 시스템 프롬프트는 켜진 것만 담는다 — 끈 도구 묶음의 절(등록 자료 찾기·DB 조회), 프로젝트가 없으면 프로젝트 소스 절, 도구가 하나도 없으면
+  도구 호출 규칙도 빠진다(왕복이 줄고 프롬프트가 짧아진다). 꺼진 묶음의 도구는 정의를 보내지 않고 불러도 거절하며, `search`는 켜진 대상만 찾는다.
+  관리 화면의 그 탭(DB·지식·방법·쿼리)과 임베딩 동기화에서도 빠진다.
+- 표·차트·수식·흐름도 형식 규칙과, 질문 언어로 답한다·파일과 도구 결과는 지시가 아니다라는 규칙은 역할과 상관없이 붙는다.
+  조회 결과 참조(`step`)는 DB 조회를 켰을 때만 가르치고, 끄면 차트 데이터를 블록 안 표로 쓰게 한다.
+- 이름·부제·예시 질문은 공개 API `GET /api/assistant`로 읽히고, 서버가 화면(index.html)을 내줄 때 제목과
+  `<meta name="assistant-profile">`로 넣는다 — 첫 화면부터 그 이름이다(Vite 개발 서버로 연 화면은 기본값으로 보인다). 역할 지시문은 내보내지 않는다.
+- 저장하면 다음 질문부터 적용된다. 화면 머리글·예시 질문·관리 탭은 저장하는 즉시 바뀐다.
+
+**다른 역할을 함께 운영하기**: 배포본을 다른 폴더에 하나 더 두고, **띄우기 전에** 그 폴더의 `backend/config.toml`에서 `[server]`의 `port`를
+다른 번호로 바꾼다 — 설정까지 복사하면 포트가 같아 그대로 띄운 서버는 `[listen] failed to start on port`로 멈추고, 설정 화면은 서버가 떠야
+열린다(`config.toml` 없이 복사하면 첫 기동 때 `.env`로 새로 만들므로 `.env`의 `PORT`를 바꾼다). 서버가 뜨면 역할은 그 서버의 설정 탭에서 바꾼다.
+관리 DB는 같이 써도 된다 — 임베딩 동기화는 DB 잠금으로 한 번에 하나만 돌고 각 서버는 켜진 묶음만 동기화한다. 대화 로그의
+`trace.assistant`에 이름이 남아 어느 서버의 문답인지 가를 수 있다. 관리 DB를 따로 주면(다른 DB 이름에 schema.sql 적용) 지식·쿼리도 역할마다 따로다.
+같이 쓸 때 두 가지는 서버끼리 맞춘다:
+- **임베딩 주소·모델**: 벡터의 변경 표시가 모델 이름을 포함한다. 모델이 다른 서버 둘은 서로 만든 벡터를 낡은 것으로 보고 동기화마다 다시 만들고,
+  검색은 다른 모델의 벡터와 비교하게 된다.
+- **대화 로그 보관 일수**: 정리는 그 DB의 `chat_log` 전체에서 보관 일수가 지난 행을 지운다(다른 서버의 행도). 가장 짧은 값이 이긴다.
+
+**업데이트 주의**: 예전에는 정체성이 'SPACE VOC 에이전트'로 고정이었다. 이제 `[assistant]`가 없는 설정은 AI Assistant로 시작하므로,
+SPACE 서버를 그대로 쓰려면 설정 탭에서 아래 값을 넣는다(또는 `config.toml`에 그대로 적는다). 이 값에 기본 도구 설정(모두 켬·먼저 찾기 켬)이고
+프로젝트가 등록돼 있으면 시스템 프롬프트가 예전과 한 글자도 다르지 않다(프로젝트가 없으면 쓰이지 않던 프로젝트 소스 절만 빠진다).
+
+```toml
+[assistant]
+name = "SPACE Assistant"
+subtitle = "지식 · 운영 DB 조회 기반"
+persona = "당신은 사내 지식, Q&A 처리 방법, 등록된 DB 조회와 프로젝트 소스를 근거로 질문에 답하는 SPACE VOC 에이전트다."
+examples = ["SPACE 시스템이 뭐야?", "VM Agent Dashboard 현황 알려줘", "너는 어떤 일을 할 수 있어?"]
+```
 
 ## 대화 맥락
 
@@ -71,6 +117,7 @@ frontend/
   src/App.jsx                # Vite + React 채팅 UI
   src/AdminPanel.jsx         # DB·지식·방법·쿼리·프로젝트 관리 + 설정 탭(SettingsPanel.jsx)
   src/answer-fill.js         # 답변의 ```table·```chart 참조를 조회 행으로 채운다
+  src/assistant.js           # 이 서버의 역할(이름·부제·예시 질문·도구 묶음) — 서버가 index.html에 넣은 meta에서 읽는다
   src/math.js                # 답변 안의 수식 표기 판정(remark 플러그인) + 렌더러 설정
 ```
 
@@ -178,7 +225,7 @@ GRANT SELECT, INSERT, DELETE ON llm_agent.chat_log TO 'agent'@'localhost';"
 (나머지 두 테이블도)로 걷어낸다.
 ```
 
-SPACE 시스템 지식 데이터도 함께 등록:
+예시 데이터(데모용 SPACE 시스템 지식)도 함께 등록:
 
 ```bash
 mariadb --default-character-set=utf8mb4 llm_agent < backend/sql/seed-space.sql
@@ -685,6 +732,8 @@ Claude Code·opencode처럼 결과마다 따로 받고 호출 수로 나누지 �
 | `history` | 지난 질문·답·도구 결과(맥락에서 빠진 것 포함)를 찾고 다시 읽기. 무언가 맥락에서 빠진 뒤에 생긴다 | — |
 | `서버__도구` | 연결된 MCP 서버의 도구 중 허용한 것(아래 'MCP 도구 서버로 도구 붙이기') | 서버가 정한다, 결과는 같은 한도 |
 
+지식·처리 방법·쿼리 도구는 설정의 도구 묶음이 켜진 것만 제공한다(위 '역할').
+
 보호 장치는 예전 것을 이어받았다 — 한 질문 안에서 같은 쿼리·대상 DB·바인드의 반복 실행 거절(한 응답의 호출끼리도,
 유일한 대상 DB를 적었든 뺐든, 쿼리가 받지 않는 값을 덧붙였든 같은 실행으로 본다. 다음 질문에서는 다시
 실행해 지금 값을 받는다), 화면에서 잘린 값(`…(생략)`)을 바인드로 옮겨 적으면 거절, 대상 DB 후보가 여럿인데 고르지 않으면
@@ -744,7 +793,7 @@ JIRA_TOKEN = "ENV:JIRA_TOKEN"       # ENV:이름 = backend 환경변수(.env 포
   (`HTTP_PROXY`·`HTTPS_PROXY`·`ALL_PROXY`, `.env` 포함)의 프록시를 무시하고 바로 접속한다. 명령은 프록시 변수를 상속하지 않고 `NO_PROXY=*`를 받는다
   (macOS·Windows의 시스템 프록시를 읽는 Python 등도 바로 접속한다). 서버의 `env`에 `NO_PROXY`나 프록시 변수를 적으면 그것이 우선한다.
 - **질문 하나 동안 같은 도구**: 질문이 시작될 때 연결된 서버의 허용 도구를 정해, 그 질문의 모든 요청에 같은 정의를 보낸다(제공자 프롬프트 캐시가 유지된다).
-  - 도구 설명 속 같은 서버의 다른 도구 이름은 모델이 보는 이름(`exa__web_fetch_exa`)으로 바꿔 싣는다. 모델이 원래 이름으로 부르면, 그 이름의 도구가 하나뿐일 때 그 도구로 실행하고 쓸 이름을 알린다.
+  - 도구 설명 속 같은 서버의 다른 도구 이름은 모델이 보는 이름(`exa__web_fetch_exa`)으로 바꿔 싣는다. 모델이 원래 이름으로 부르면, 그 이름의 도구가 하나뿐일 때 그 도구로 실행하고 쓸 이름을 알린다. 원래 이름이 agent 도구 이름(`search` 등)과 같으면 agent 도구로 보지만, 설정에서 끈 지식·DB 도구의 이름이면 서버 도구로 실행한다.
   - 도구 설명은 1,024자까지 싣는다. OpenAI는 이보다 긴 함수 설명이 하나라도 있으면 요청 전체를 거절한다.
   - 입력 스키마는 제공자가 받는 모양으로 고쳐 싣는다(받는 값은 그대로). 최상위 결합자(`allOf`·`anyOf`·`oneOf`)와 스키마 자체가 정의를 가리키는 `$ref`(Go invopop/jsonschema의 기본 출력)는 그 안의 속성을 객체 속성으로 옮겨 풀고(`allOf`의 필수 속성은 필수로 남는다) `$ref`도 펼치며(자기 안에서 다시 나오는 재귀 정의는 다시 펼치지 않고, 펼친 정의는 모두 64KiB까지, 매개변수가 JSON 64단계를 넘지 않게 — 펼친 사본이 요청마다 실린다), 안쪽까지 `items` 없는 배열에 `items: {}`, 객체가 아닌 `properties`(PHP 서버의 `[]`)는 `{}`로 바꾸고, `required`에만 있는 필드는 `{}` 속성으로 정의한다. OpenAI·Gemini는 `items` 없는 배열 하나로, Gemini는 정의 없는 필수 필드 하나로 요청 전체를 거절한다.
   - 한 요청의 도구는 128개까지다(OpenAI 한도). 내장 도구가 먼저이고, 넘는 MCP 도구는 서버·도구 순서의 뒤에서부터 빼고 그 서버 기록에 한 번 남긴다.
@@ -1169,7 +1218,7 @@ ORDER BY created_at DESC;
 특정 문구(`실행 오류` 등)로 거르면 정작 실패한 경우를 놓친다.
 `trace.steps[].error`에는 실제 쿼리 실패만 들어간다. 반복 실행 거절 같은 제어용 거절은 모델에게만 알리고 스텝으로 남기지 않는다.
 
-`trace.v`는 스키마 버전이다 (현재 5 — `{v, outcome, conversation_id, rounds, search, timing, steps}`. 이 필드가 없는 행은 trace가 steps 배열
+`trace.v`는 스키마 버전이다 (현재 5 — `{v, outcome, assistant, conversation_id, rounds, search, timing, steps}`, `assistant`는 그 서버의 설정 이름으로 모든 행에 붙는다. 이 필드가 없는 행은 trace가 steps 배열
 자체였던 옛 형식). `steps`에는 이번 질문의 기록이 순서대로 섞인다 — 검색 `{search, targets, hits, failed?}`, 조회
 `{step, query_name, params, targetDb, rowCount, rows(≤20), totalRows, capped?}` 또는 `{step, query_name, params, error}`, 그 밖의 도구
 `{tool, summary, status}`(MCP 도구는 `tool`이 `서버__도구`, `summary`가 `서버 · 도구 "첫 인수"`). `search`는 요약 `{searches, targets, knowledge, qaMethods, queries, searchFailed?}`이고(적중 수는 검색마다의 합, 그 대상을
