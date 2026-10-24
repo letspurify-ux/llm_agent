@@ -307,6 +307,16 @@ test('도구 줄: 지식·소스 읽기는 서버가 준 한 줄 설명으로 �
   assert.equal(progressText(list[1]), '검색 "x" (지식) → 지식 2건');
 });
 
+test('시간 한도에 멈춘 도구(status cancelled)는 실패가 아니라 멈춤으로 보인다', () => {
+  // 서버는 답을 쓸 몫(final reserve)에 닿으면 도는 도구를 멈추고 그 결과를 cancelled로 준 뒤 답을 이어 쓴다
+  // (backend/src/agent.rs TOOLS_STOPPED). 진행 줄과 패널이 그것을 '실패'라 하면 도구가 오류를 낸 것으로 읽힌다.
+  let list = applyProgress([], { type: 'tool', id: 1, name: 'file_read', summary: '파일 읽기 a.rs' });
+  list = applyProgress(list, { type: 'tool_done', id: 1, name: 'file_read', status: 'cancelled' });
+  assert.equal(progressText(list[0]), '파일 읽기 a.rs → 시간 한도로 멈춤');
+  const [step] = normalizeTrace([{ tool: 'file_read', summary: '파일 읽기 a.rs', status: 'cancelled' }]);
+  assert.equal(stepLabel(step), '시간 한도로 멈춤');
+});
+
 test('trace의 도구 항목은 표 없는 한 줄이고, 머리띠 문구가 그 수를 센다', () => {
   const trace = normalizeTrace([
     { search: 'x', targets: ['knowledge'], hits: { knowledge: 1 } },

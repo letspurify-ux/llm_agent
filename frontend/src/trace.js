@@ -31,7 +31,10 @@ export const isSearchStep = t => !!t && typeof t === 'object' && typeof t.search
 // 지식 읽기·처리 방법 읽기·쿼리 정의 보기와 프로젝트 소스 도구(파일 읽기·소스 검색 등)는 표가 없는
 // 한 줄이다 — 서버가 만든 한 줄 설명(summary, 예: '[앱] 파일 읽기 src/a.rs:1-120')과 결과 상태만 보인다.
 export const isToolStep = t => !!t && typeof t === 'object' && typeof t.tool === 'string';
-export const toolStatusLabel = status => (status === 'ok' ? '완료' : status === undefined ? '' : '실패');
+// cancelled는 오류가 아니다 — 서버가 답을 쓸 몫(final reserve)에 닿아 도는 도구를 멈춘 것이고, 답은 이어서 온다
+// (backend/src/agent.rs TOOLS_STOPPED). 질문을 멈춘 경우에는 진행 줄도 패널도 남지 않으니 화면에서는 늘 시간 한도다.
+export const toolStatusLabel = status =>
+  status === 'ok' ? '완료' : status === 'cancelled' ? '시간 한도로 멈춤' : status === undefined ? '' : '실패';
 
 // 대상 목록의 표기 — '지식·처리방법'. 모르는 이름은 그대로 보인다(감추면 무엇을 찾았는지 알 수 없다).
 // 표는 자기가 담은 이름만 안다 — 객체의 [] 조회는 프로토타입까지 올라가서, 'constructor' 같은 이름이 오면

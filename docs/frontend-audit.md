@@ -1078,3 +1078,19 @@ headless Chrome `--use-angle=metal --enable-gpu`)와 프로덕션 번들로 쟀�
   같은 문을 지난다. 객체 값은 JSON이라 `{`·`[`로 시작한다. BOM으로 엑셀의 한글 깨짐을 막는다. 파일 이름은 못 쓰는 글자를 `_`로.
 - index.html: CSP는 img-src 'self' data:뿐(답변 그림은 앱이 이미 링크로 바꾼다), 키보드 고정(keyboard-open)은 @media screen
   안이라 인쇄를 건드리지 않는다. iOS 입력칸 16px은 -webkit-touch-callout 지원 엔진에서만.
+
+## 전체 검토 7차 — 2026-10-24 (진행 줄·패널의 도구 상태와 서버 이벤트 대조)
+
+6차 뒤 frontend 변경 없음. 결함 1건.
+
+- **시간 한도에 멈춘 도구가 '실패'로 보였다** (trace.js toolStatusLabel). 서버는 답을 쓸 몫(final reserve)에 닿으면 도는
+  도구를 멈추고 그 결과를 `status: "cancelled"`로 준 뒤 답을 이어 쓴다(backend/src/agent.rs TOOLS_STOPPED; MCP 도구·소스
+  도구 모두). 화면은 ok가 아닌 상태를 모두 '실패'로 적어, 진행 줄과 답 아래 패널이 오류 없이 멈춘 도구를 오류를 낸 도구로
+  보였다(관리자 MCP 탭은 이미 실패와 멈춤을 따로 센다). '시간 한도로 멈춤'으로 적는다 — 사용자가 질문을 멈춘 경우는 스트림이
+  닫혀 진행 줄도 패널도 남지 않으므로 화면에 서는 cancelled는 늘 시간 한도다. 시험: trace.test(원래 코드에서 실패 확인).
+
+### 확인해 결함이 아닌 것 (재조사 금지)
+
+- 진행 이벤트의 짝짓기: 서버는 tool·search·run_query의 시작·끝 모두에 번호(id)를 준다 — 번호 짝짓기 경로만 실제로 탄다.
+- 진행 줄은 memo가 아니어서 입력·미리보기 갱신마다 다시 그려지지만, 줄 하나가 글자 둘이라 수백 줄에서도 비용이 작다.
+- remark-rich-table blocksOf의 `LLMCELLNODE` 토큰: 원문 글자도 모두 토큰이 되고 접두는 구두점뿐이라 원문과 부딪히지 않는다.
