@@ -44,10 +44,15 @@ export default function McpPanel({ api, onStateChange }) {
     } catch (e) { if (!signal?.aborted) setRefreshError(e.message); }
   }, [api]);
   // 상태는 몇 초마다 다시 읽는다(연결·재연결·호출 수가 계속 바뀐다).
+  // 앞 읽기가 아직 끝나지 않았으면 이번 차례는 건너뛴다. 답이 늦는 동안(요청 한도 60초) 5초마다 새로 걸면
+  // 걸린 요청이 열둘까지 쌓이는데, 브라우저가 한 주소에 여는 연결은 여섯뿐이라 30초면 그 연결을 다 차지한다 —
+  // 그 뒤로는 이 화면의 저장도, 다른 탭의 질문(/api/chat)도 그 줄 뒤에서 기다린다.
   useEffect(() => {
     const controller = new AbortController();
-    load(controller.signal);
-    const timer = setInterval(() => { if (!document.hidden) load(controller.signal); }, REFRESH_MS);
+    let reading = null;
+    const poll = () => { reading ??= load(controller.signal).finally(() => { reading = null; }); };
+    poll();
+    const timer = setInterval(() => { if (!document.hidden) poll(); }, REFRESH_MS);
     return () => { clearInterval(timer); controller.abort(); };
   }, [load]);
 

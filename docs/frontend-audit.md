@@ -975,3 +975,33 @@ headless Chrome `--use-angle=metal --enable-gpu`)와 프로덕션 번들로 쟀�
 - 홈 뒤 DOM 노드가 질문마다 +2개: 힙 스냅샷 차분에서 `InsertNodeBeforeCommand`·`RemoveNodeCommand`·
   `InsertIntoTextNodeCommand`·Text가 질문마다 하나씩 — 입력창에 넣은 글의 브라우저 실행 취소 기록이다(Blink 상한 1,000).
 - headless는 탭을 바꿔도 `document.hidden`이 안 바뀌어 숨은 탭은 못 잰다 — 코드상 visibilitychange에서 타이머·rAF를 멈춘다.
+
+## 전체 검토 — 2026-10-24 (성능·교착·패닉·자원 누수·기타 버그)
+
+13차 누수 검토 뒤 바뀐 코드(viewport.js 초점 기준 해제·설정의 목록 필드·Vite 프록시 changeOrigin)와 App.jsx·stream.js·
+관리자 화면(AdminPanel·McpPanel·SettingsPanel·DirectoryPicker·BindConfigEditor)·Mermaid.jsx를 다시 읽었다. 결함 4건을
+고쳤고, 넷 다 고치기 전 코드에서 시험이 실패하는 것을 확인했다.
+
+1. **흐름도 대기열이 내려간 말풍선의 그림까지 그렸다** (Mermaid.jsx renderDiagram). mermaid 설정이 전역이라 그림은 한 줄로
+   서서 하나씩 그리는데, 말풍선이 내려가도(홈) 줄에 선 그림은 끝까지 그려졌다 — 흐름도 40개 답에서 홈 뒤에 37개를 더
+   그려 주 스레드가 바빴고, 다음 답의 흐름도는 그 뒤에 섰다. 차례가 왔을 때 그 그림을 아직 보여 줄 곳이 있는지(wanted)
+   묻고, 없으면 그리지 않는다(이미 그리기 시작한 하나는 끝까지 — 도중에 끊으면 다음 그림이 반쯤 바뀐 설정을 물려받는다).
+   시험: ui.test '홈으로 돌아가면 차례를 기다리던 흐름도는 그리지 않는다'(body에 붙는 #dmmd… 상자 수).
+2. **MCP 탭의 5초 상태 읽기가 앞 읽기를 기다리지 않았다** (McpPanel). 답이 늦으면(요청 한도 60초) 걸린 요청이 열둘까지
+   쌓이는데 브라우저가 한 주소에 여는 연결은 여섯뿐이라, 30초면 그 연결을 다 차지해 이 화면의 저장도 다른 탭의 질문
+   (/api/chat)도 그 뒤에서 기다렸다. 앞 읽기가 끝나지 않았으면 그 차례를 건너뛴다(↻ 단추는 그대로 바로 읽는다).
+   시험: mcp-admin.test에 답하지 않는 읽기(1초 동안 원래 코드 20개 → 0) + 풀린 뒤 다시 읽기.
+3. **인증이 통과하면 목록을 두 번 읽었다** (AdminPanel api). api가 authAttempted에 의존해, 통과한 답의
+   `setAuthAttempted(false)`가 api를 바꾸고 api를 보는 효과(목록·DB 선택지)가 같은 요청을 한 번 더 냈다. authAttempted는
+   ref로 읽는다. 시험: admin.test(dev·production) 맞는 키 뒤 목록 읽기 1번.
+4. **폴더 선택 창이 부모가 다시 그려질 때마다 초점을 빼앗았다** (DirectoryPicker). 초점 주기 효과가 onClose(부르는 쪽이
+   렌더마다 새로 만든다)에 의존해, MCP 탭에서는 5초 상태 읽기마다 경로 칸에 치던 초점이 창으로 빠졌다. 처음 열 때 한 번만
+   준다(Escape는 ref로 최신 onClose를 부른다). 시험: mcp-admin.test 경로 칸 초점 유지.
+
+### 확인해 결함이 아닌 것 (재조사 금지)
+
+- viewport.js: 초점 오갈 때 타이머 6개는 다음 오감·정리에서 지운다. 창 scroll·resize 듣기는 이 문서가 스스로 스크롤되지
+  않아 키보드가 옮겨 둘 때만 온다. 체크박스 같은 비글자 INPUT도 '쓰는 칸'으로 치지만 그때는 키보드가 없어 높이 조건에 안 걸린다.
+- 관리 목록의 페이지가 지운 뒤 끝을 넘어도 서버가 page를 마지막 쪽으로 깎아 돌려주고 화면은 그 값으로 이전·다음을 센다.
+- stream.js: 끊긴 읽기는 read()가 먼저 거부돼 releaseLock이 걸린 읽기 없이 불린다. done 뒤에만 cancel한다.
+- ask(): 세대(sessionRef) 대조로 홈 뒤 늦은 답·플래그를 건드리지 않고, 정지·시간 초과·통신 실패 모두 finally가 sendingRef를 내린다.

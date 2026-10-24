@@ -261,6 +261,33 @@ it('Mermaid의 여러 줄·verb·미완성 수식과 실패 라벨은 중첩 차
   await page.until(`document.querySelector('.empty') && !document.querySelector('.math-error, .mermaid, .row')`);
 });
 
+it('홈으로 돌아가면 차례를 기다리던 흐름도는 그리지 않는다', async () => {
+  // 흐름도는 한 줄로 서서 하나씩 그린다(Mermaid.jsx renderQueue — mermaid 설정이 전역이다). 말풍선이 내려가도 그
+  // 줄에 선 그림은 끝까지 그려졌다 — 버릴 SVG를 만드느라 홈 뒤에도 주 스레드가 바빴고, 새 답의 흐름도는 그 뒤에 섰다.
+  // mermaid.render는 그릴 때마다 body에 #d<id> 상자를 붙였다 뗀다 — 그것을 센다.
+  const n = 40;
+  const answer = Array.from({ length: n }, (_, i) => '```mermaid\nflowchart LR\n'
+    + Array.from({ length: 8 }, (_, j) => `N${i}_${j}[노드 ${i}-${j}] --> N${i}_${j + 1}`).join('\n') + '\n```').join('\n\n');
+  await page.viewport(1000, 760);
+  await page.goto(url(), '.chip');
+  await page.eval(`window.__drawn = 0;
+    new MutationObserver(ms => { for (const m of ms) for (const x of m.addedNodes) if (/^dmmd/.test(x.id ?? '')) window.__drawn++; })
+      .observe(document.body, { childList: true });
+    window.fetch = async () => new Response(JSON.stringify({ answer: ${JSON.stringify(answer)} }), { headers: { 'Content-Type': 'application/json' } });
+    document.querySelector('.chip').click()`);
+  await page.until(`document.querySelectorAll('.mermaid svg').length >= 1`);
+  const before = await page.eval(`(() => { document.querySelector('.home-btn').click(); return window.__drawn; })()`);
+  assert.ok(before < n, `검사의 전제: 홈을 누를 때 아직 그리지 않은 흐름도가 남아 있다 (${before}/${n})`);
+  await page.until(`!!document.querySelector('.empty')`);
+  await sleep(1500);
+  const after = await page.eval('window.__drawn');
+  assert.ok(after - before <= 1, `홈 뒤에 내려간 말풍선의 흐름도 ${after - before}개를 더 그렸다`);
+  // 줄이 막히지 않았다 — 다음 답의 흐름도는 곧바로 선다.
+  await page.eval(`window.fetch = async () => new Response(JSON.stringify({ answer: '\`\`\`mermaid\\nflowchart LR\\nA --> B\\n\`\`\`' }), { headers: { 'Content-Type': 'application/json' } });
+    document.querySelector('.chip').click()`);
+  await page.until(`document.querySelectorAll('.mermaid svg').length === 1 && !document.querySelector('.typing')`);
+});
+
 it('200개 수식 표: 데스크톱·모바일에서 모든 행의 원문과 실제 조판 영역을 검증한다', async () => {
   for (const width of [1000, 380]) {
     await answered(width, 760, { c: 'latex200' });

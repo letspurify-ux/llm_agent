@@ -224,8 +224,13 @@ test(`${production ? 'production' : 'dev'} 관리 화면 검색·페이지 이�
   await fill('#admin-token', 'wrong-key'); await click('.admin-auth [type=submit]');
   await page.until(`document.querySelector('.admin-auth .admin-error')`);
   assert.match(await page.eval(`document.querySelector('.admin-auth .admin-error').textContent`), /인증에 실패했습니다/);
+  const listReads = () => page.eval(`window.__requests.filter(r => r.method === 'GET' && r.url.startsWith('/api/admin/databases?')).length`);
+  const readsBeforeKey = await listReads();
   await fill('#admin-token', 'test-admin-key'); await click('.admin-auth [type=submit]');
   await page.until(`document.querySelector('.admin-record')`);
+  await sleep(300);
+  // 인증이 통과한 답이 요청 함수(api)를 바꿔 목록을 한 번 더 읽던 것 — 맞는 키 하나에 목록 읽기는 하나다.
+  assert.equal(await listReads() - readsBeforeKey, 1, '맞는 키를 넣은 뒤 목록을 한 번만 읽는다');
   await click('[aria-label="채팅으로 돌아가기"]'); await click('[aria-label="관리자 화면 열기"]');
   await page.until(`document.querySelector('#admin-token')`);
   assert.equal(await page.eval(`document.querySelector('#admin-token').value`), '', '인증 키는 관리자 화면을 닫으면 폐기된다');

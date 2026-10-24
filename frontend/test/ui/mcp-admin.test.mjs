@@ -45,6 +45,12 @@ test('MCP 탭 서버 목록·상태·허용 도구 저장·비밀값 지우기·
     }] };
     window.__requests = [];
     window.confirm = () => true;
+    // 5초 상태 읽기를 시험 안에서 볼 수 있게 줄인다(__fastPoll을 켠 뒤 패널이 새로 설 때부터).
+    const realSetInterval = window.setInterval.bind(window);
+    window.setInterval = (fn, ms, ...rest) => realSetInterval(fn, window.__fastPoll && ms === 5000 ? 50 : ms, ...rest);
+    // __stallMcp: 상태 읽기가 답하지 않는다(끊으면 진짜 fetch처럼 AbortError). __release()가 걸린 것을 한꺼번에 답한다.
+    window.__stalled = [];
+    window.__release = () => { window.__stallMcp = false; window.__stalled.splice(0).forEach(f => f()); };
     const realFetch = window.fetch.bind(window);
     window.fetch = async (url, opts = {}) => {
       if (!String(url).startsWith('/api/admin/')) return realFetch(url, opts);
@@ -54,6 +60,10 @@ test('MCP 탭 서버 목록·상태·허용 도구 저장·비밀값 지우기·
       window.__requests.push({ path, method, ifMatch: opts.headers['If-Match'], body });
       const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
       if (window.__requireToken && opts.headers['X-Admin-Token'] !== 'test-admin-key') return json({ error: '관리자 인증 키를 입력해주세요.' }, 401);
+      if (path === 'mcp' && method === 'GET' && window.__stallMcp) return new Promise((resolve, reject) => {
+        window.__stalled.push(() => resolve(json(window.__mcp)));
+        opts.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+      });
       if (path === 'mcp' && method === 'GET') return window.__refreshFails ? json({ error: '서버에 연결하지 못했습니다.' }, 503) : json(window.__mcp);
       if (path === 'mcp-check') return json({ ok: true, message: '연결됨: wiki-mcp 1.0, 도구 2개', tools: [
         { name: 'search_pages', exposed: 'wiki__search_pages', description: '페이지 검색', annotations: { readOnlyHint: true }, allowed: false, tokens: 55 },
@@ -206,4 +216,38 @@ test('MCP 탭 서버 목록·상태·허용 도구 저장·비밀값 지우기·
   await fill('#admin-token', 'test-admin-key'); await click('.admin-auth [type=submit]');
   await page.until(`!document.querySelector('.admin-auth') && document.querySelector('.admin-section-heading h3')?.textContent === '서버 설정'`);
   assert.ok((await page.eval(`window.__requests.filter(r => r.path === 'settings').length`)) >= 1, '설정 탭의 인증도 요청으로 확인한다');
+
+  // 상태 읽기가 답하지 않는 동안에는 다음 차례를 건너뛴다. 5초마다 새로 걸면 요청 한도(60초) 안에 열둘이 쌓여
+  // 브라우저가 한 주소에 여는 연결 여섯을 다 차지했다 — 그 뒤로는 저장도, 다른 탭의 질문도 그 줄 뒤에 섰다.
+  const statusReads = () => page.eval(`window.__requests.filter(r => r.path === 'mcp' && r.method === 'GET').length`);
+  await page.eval('window.__fastPoll = true');
+  await clickText('.admin-tabs button', '06');
+  await page.until(`!!document.querySelector('.admin-mcp .admin-record')`);
+  await sleep(200);
+  assert.ok((await statusReads()) >= 3, '검사의 전제: 줄인 간격으로 상태를 거듭 읽는다');
+  await page.eval('window.__stallMcp = true');
+  await sleep(150);
+  const stalledAt = await statusReads();
+  await sleep(1000);
+  assert.ok((await statusReads()) - stalledAt <= 1, `답하지 않는 상태 읽기 위에 ${(await statusReads()) - stalledAt}개를 더 걸었다`);
+  // 걸린 읽기가 답하면 다시 차례대로 읽는다.
+  await page.eval('window.__release()');
+  const releasedAt = await statusReads();
+  await page.until(`window.__requests.filter(r => r.path === 'mcp' && r.method === 'GET').length >= ${releasedAt + 3}`);
+
+  // 폴더 선택 창은 상태 읽기가 패널을 다시 그려도 입력칸의 초점을 가져가지 않는다. 창이 여닫이(onClose)가 바뀔
+  // 때마다 자기 자신에 초점을 주어, 경로를 치는 중에도 5초마다 초점이 입력칸에서 빠졌다.
+  await page.eval('window.__mcp.editable = true');
+  await page.until(`!document.querySelector('.admin-mcp-readonly')`);
+  await click('.admin-mcp .admin-record');
+  await page.until(`document.querySelector('#mcp-cwd') && !document.querySelector('.admin-editor fieldset').disabled`);
+  await clickText('.admin-input-action button', '폴더 선택');
+  await page.until(`!!document.querySelector('.admin-picker-path input')`);
+  await page.eval(`document.querySelector('.admin-picker-path input').focus()`);
+  const typingAt = await statusReads();
+  await page.until(`window.__requests.filter(r => r.path === 'mcp' && r.method === 'GET').length >= ${typingAt + 3}`);
+  assert.equal(await page.eval(`document.activeElement === document.querySelector('.admin-picker-path input')`), true, '상태를 다시 읽자 폴더 경로 칸의 초점이 빠졌다');
+  await page.eval(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
+  await page.until(`!document.querySelector('.admin-picker-path')`);
+  await page.eval('window.__fastPoll = false');
 });

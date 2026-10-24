@@ -47,9 +47,15 @@ mermaid.initialize(MERMAID_CONFIG);
 
 // 설정은 전역이므로 설정 변경과 실제 렌더를 같은 직렬 작업으로 묶는다. 수식 라벨은
 // 본문과 같은 제한의 KaTeX가 만든 MathML을 주입하고 라벨 HTML은 잠긴 설정으로 정화한다.
+// 줄에 선 동안 말풍선이 내려간 그림(홈, 대화 바꿈)은 차례가 와도 그리지 않는다 — wanted가 그것을 묻는다.
+// 그대로 그리면 버릴 SVG를 만드느라 홈 뒤에도 주 스레드가 그림 수만큼 바쁘고(실측: 흐름도 40개 답에서 홈 뒤
+// 37개를 더 그렸다), 다음 답의 흐름도는 그 뒤에 선다. 이미 그리기 시작한 하나는 끝까지 간다(설정이 전역이라
+// 도중에 끊으면 다음 그림이 반쯤 바뀐 설정을 물려받는다).
+const CANCELLED = Symbol('mermaid render cancelled');
 let renderQueue = Promise.resolve();
-function renderDiagram(id, text) {
+function renderDiagram(id, text, wanted = () => true) {
   const task = renderQueue.then(async () => {
+    if (!wanted()) throw CANCELLED;
     // 직전 그림의 본문 설정과 무관한 기본 설정에서 종류를 판정한다.
     mermaid.initialize(MERMAID_CONFIG);
     const candidate = mermaidMathLabels(text, mermaid.detectType(text.replace(/\r\n?/g, '\n')));
@@ -86,7 +92,8 @@ export default function Mermaid({ text }) {
       return;
     }
     // 그리지 못하면(문법 오류 등) svg를 null로 둔 채 끝낸다 — 아래에서 원문을 코드로 보여준다.
-    renderDiagram(id, text).then(r => { if (alive) setRendered(r); }, e => console.warn('[mermaid] render failed:', e?.message ?? e));
+    renderDiagram(id, text, () => alive).then(r => { if (alive) setRendered(r); },
+      e => { if (e !== CANCELLED) console.warn('[mermaid] render failed:', e?.message ?? e); });
     return () => { alive = false; };
   }, [text, id]);
   // 그림 안의 링크(`click A "주소"`)는 답변의 링크와 같은 규칙으로 연다 — 새 탭, 페이지 안 앵커만

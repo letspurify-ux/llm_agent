@@ -28,12 +28,16 @@ export default function DirectoryPicker({ api, start, onPick, onClose }) {
     }
   }
   useEffect(() => { open(start || ''); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // 초점은 처음 열 때 한 번만 창에 준다. onClose는 부르는 쪽이 렌더마다 새로 만드는 함수라 의존성에 두면 이 효과가
+  // 부모의 렌더마다 다시 돌아, 경로 칸에 치는 중에도 초점을 창으로 빼앗았다(MCP 탭은 5초마다 상태를 읽어 다시 그린다).
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
   useEffect(() => {
-    const onKey = e => { if (e.key === 'Escape') onClose(); };
+    const onKey = e => { if (e.key === 'Escape') closeRef.current(); };
     window.addEventListener('keydown', onKey);
     dialog.current?.focus();
     return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
+  }, []);
 
   return <div className="admin-modal-backdrop" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
     <div className="admin-modal" role="dialog" aria-modal="true" aria-label="폴더 선택" tabIndex={-1} ref={dialog}>

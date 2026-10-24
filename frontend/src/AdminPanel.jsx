@@ -88,6 +88,10 @@ export default function AdminPanel({ onStateChange }) {
   const dirty = editorDirty || (config.singleton && settingsState.dirty);
   const working = busy || (config.singleton && settingsState.busy);
 
+  // api는 authAttempted를 ref로 읽는다. 의존성에 두면 인증이 통과한 답(setAuthAttempted(false))이 api를 바꾸고,
+  // api를 보는 효과(목록·DB 선택지·MCP 상태)가 방금 받은 것을 끊고 같은 요청을 한 번 더 냈다.
+  const attemptedRef = useRef(authAttempted);
+  attemptedRef.current = authAttempted;
   const api = useCallback(async (path, { signal, headers, ...init } = {}) => {
     const controller = new AbortController();
     const abort = () => controller.abort();
@@ -102,7 +106,7 @@ export default function AdminPanel({ onStateChange }) {
       const data = await response.json().catch(() => { throw new Error('서버 응답을 읽지 못했습니다. 백엔드 실행 상태를 확인해주세요.'); });
       if (response.status === 401) {
         setNeedsAuth(true); setList(null);
-        if (authAttempted) setAuthError('인증에 실패했습니다. 관리자 인증 키를 확인한 후 다시 입력해주세요.');
+        if (attemptedRef.current) setAuthError('인증에 실패했습니다. 관리자 인증 키를 확인한 후 다시 입력해주세요.');
         throw new Error(data.error || '요청을 처리하지 못했습니다.');
       }
       // 401이 아니면 키는 통과했다: 관리 DB가 꺼져 목록이 500이어도 DB가 필요 없는 탭(MCP·설정)은 열린다.
@@ -117,7 +121,7 @@ export default function AdminPanel({ onStateChange }) {
       clearTimeout(timer);
       signal?.removeEventListener('abort', abort);
     }
-  }, [token, authAttempted]);
+  }, [token]);
 
   useEffect(() => {
     onStateChange({ dirty, busy: working });
