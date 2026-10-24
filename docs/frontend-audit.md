@@ -1054,3 +1054,16 @@ headless Chrome `--use-angle=metal --enable-gpu`)와 프로덕션 번들로 쟀�
   입력 형식의 한계, 저장 전 형식 오류로 알린다).
 - 관리 목록의 DB 선택: 체크는 대소문자 무시, × 는 그 이름만 뗀다 — 대소문자만 다른 이름이 둘 들어가는 길은 체크가 막는다.
 - admin-bindings: 따옴표·주석 안의 `:이름`은 바인드로 세지 않고, `:=`는 이름이 아니다.
+
+## 전체 검토 5차 — 2026-10-24 (화면·서버 상한 대조 · 빌드 대상 밖 런타임 API) — 결함 0
+
+4차 뒤 frontend 변경 없음. 코드 변경 없이 기록만 남긴다.
+
+### 확인해 결함이 아닌 것 (재조사 금지)
+
+- 화면의 상한이 서버와 같다: 질문 20,000자(MAX_QUESTION_LEN), 이력 턴 6·턴당 10,000자(MAX_CHAT_TURNS·MAX_CHAT_LEN).
+- 요청 시간 한도 450초는 설정 agent.run_seconds(최대 86,400)보다 짧을 수 있지만, 설정 칸 도움말이 '화면은 450초에 요청을
+  끊습니다'라고 밝힌 결정이다.
+- 9월 검토 뒤 들어온 코드의 런타임 API: Object.hasOwn·Array.prototype.at은 polyfills.js가 채우고, replaceAll(Chrome 85·
+  Safari 13.1)·queueMicrotask·ResizeObserver는 빌드 대상(chrome87·safari14) 안이다. robotScene의 관찰자는 RobotIcon의
+  try가 감싼다. findLast·structuredClone·AbortSignal.timeout·toSorted 같은 대상 밖 API는 소스에 없다.
