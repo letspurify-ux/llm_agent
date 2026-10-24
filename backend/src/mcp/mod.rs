@@ -2142,12 +2142,22 @@ async fn spawn_with(slot: &Arc<Slot>, server: &McpServer, start: Starter, stuck:
         )
     })?;
     let settings = server.clone();
-    let mut child = tokio::task::spawn_blocking(move || {
+    let (sent, started) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
         let _starting = starting;
-        start(&settings, environment)
-    })
-    .await
-    .map_err(|_| anyhow!("{program}을(를) 실행하는 작업이 예기치 않게 멈췄습니다"))??;
+        // Given up before its turn came, nothing is started.
+        if sent.is_closed() {
+            return;
+        }
+        // Given up meanwhile, the process ends with its group, as an attempt
+        // given up does: let go of, only its leader was killed (kill on
+        // drop), what it had started was left running, and the guardian no
+        // longer watched its group.
+        if let Err(Ok(mut child)) = sent.send(start(&settings, environment)) {
+            let _ = child.start_kill();
+        }
+    });
+    let mut child = started.await.map_err(|_| anyhow!("{program}을(를) 실행하는 작업이 예기치 않게 멈췄습니다"))??;
     slot.state().pid = child.id();
     let (Some(stdin), Some(stdout)) = (child.stdin().take(), child.stdout().take()) else {
         let _ = child.start_kill();
@@ -2919,6 +2929,43 @@ mod tests {
         end_attempt(&first).await;
         drop(spawn_with(&again, &server, start_process, limit).await.unwrap());
         end_attempt(&again).await;
+    }
+
+    /// Tool and MCP review, 2026-10-24 (second session): a start that
+    /// returned after its connection was given up let go of its process,
+    /// which killed its leader alone (kill on drop): what the leader had
+    /// started went on running, its group no longer watched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_start_returning_after_it_was_given_up_ends_its_group() {
+        fn late(server: &McpServer, environment: Vec<(String, std::ffi::OsString)>) -> Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
+            let child = start_process(server, environment);
+            // The server starts a process of its own before the start returns.
+            std::thread::sleep(Duration::from_millis(400));
+            child
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("helper.pid");
+        let server = McpServer {
+            name: "latestart".into(),
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 60 & echo $! > \"$0\"; wait".into(), file.display().to_string()],
+            ..Default::default()
+        };
+        let slot = Slot::new(server.clone());
+        assert!(tokio::time::timeout(Duration::from_millis(100), spawn_with(&slot, &server, late, STUCK_START)).await.is_err());
+        let alive = |pid: libc::pid_t| unsafe { libc::kill(pid, 0) == 0 };
+        let mut helper = None;
+        for _ in 0..300 {
+            let released = STARTS.lock().unwrap().iter().all(|(connection, ..)| *connection != slot.connection);
+            helper = helper.or_else(|| std::fs::read_to_string(&file).ok().and_then(|pid| pid.trim().parse::<libc::pid_t>().ok()));
+            if released && helper.is_some_and(|pid| !alive(pid)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let helper = helper.expect("the server started its helper");
+        assert!(!alive(helper), "the helper of a start given up is still running");
     }
 
     #[test]
